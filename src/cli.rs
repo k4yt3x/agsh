@@ -86,13 +86,23 @@ pub enum SessionAction {
         #[arg(long)]
         include_children: bool,
     },
-    /// Export a session as Markdown
+    /// Export a session as Markdown or JSON
     Export {
         /// Session UUID to export
         session_id: uuid::Uuid,
-        /// Output file (default: `session-<id>.md`; `-` = stdout)
+        /// Output file (`-` for stdout)
+        ///
+        /// Defaults to `session-<id>.md` for markdown or `session-<id>.json`
+        /// for json, written to the current directory.
         #[arg(short, long)]
         output: Option<String>,
+        /// Export format: markdown or json
+        ///
+        /// `json` is structured and round-trippable via `meka session import`,
+        /// and includes any sub-agent child sessions. `markdown` is rendered
+        /// and covers the single session only.
+        #[arg(long, value_parser = parse_session_export_format, default_value = "markdown")]
+        format: SessionExportFormat,
     },
     /// Delete one or more sessions
     Delete {
@@ -101,6 +111,14 @@ pub enum SessionAction {
         /// Delete all sessions
         #[arg(long)]
         all: bool,
+    },
+    /// Import a session from a JSON export
+    ///
+    /// Recreates the session and any sub-agent children under fresh IDs so it
+    /// can be resumed with `meka -c <new-id>`. Prints the new root session ID.
+    Import {
+        /// Export file to read (`-` for stdin)
+        input: String,
     },
 }
 
@@ -283,6 +301,26 @@ fn parse_output_format(s: &str) -> std::result::Result<OutputFormat, String> {
         "json" => Ok(OutputFormat::Json),
         other => Err(format!(
             "unknown format '{}' (expected plain or json)",
+            other
+        )),
+    }
+}
+
+/// Output format for `meka session export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExportFormat {
+    /// Rendered Markdown (single session).
+    Markdown,
+    /// Structured JSON (round-trippable; includes sub-agent children).
+    Json,
+}
+
+fn parse_session_export_format(s: &str) -> std::result::Result<SessionExportFormat, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "markdown" | "md" => Ok(SessionExportFormat::Markdown),
+        "json" => Ok(SessionExportFormat::Json),
+        other => Err(format!(
+            "unknown format '{}' (expected markdown or json)",
             other
         )),
     }

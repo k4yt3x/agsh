@@ -69,7 +69,7 @@ impl SessionStats {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionStatsSnapshot {
     pub turns: u64,
     pub input_tokens: u64,

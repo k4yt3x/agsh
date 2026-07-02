@@ -1063,7 +1063,14 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Export => match &session_id {
                         Some(id) => {
-                            if let Err(error) = export_session(&session_manager, *id, None).await {
+                            if let Err(error) = export_session(
+                                &session_manager,
+                                *id,
+                                None,
+                                cli::SessionExportFormat::Markdown,
+                            )
+                            .await
+                            {
                                 render::render_error(&error);
                             }
                         }
@@ -1324,42 +1331,284 @@ async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
     }
 }
 
+/// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
+/// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
+/// session import` rejects versions it doesn't recognize.
+const SESSION_EXPORT_FORMAT_VERSION: u32 = 1;
+
+/// Root envelope for a JSON session export. Carries the session plus any sub-agent descendants as a
+/// flat, root-first list; parent links are by original id and get remapped on import. Deliberately
+/// secret-free: credentials live in separate global tables and the `token_id` fingerprint is
+/// omitted.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionExport {
+    format_version: u32,
+    meka_version: String,
+    exported_at: String,
+    root_session_id: String,
+    sessions: Vec<ExportedSession>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExportedSession {
+    id: String,
+    parent_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    cwd: Option<String>,
+    permission: Option<String>,
+    capabilities_json: Option<String>,
+    stats: crate::stats::SessionStatsSnapshot,
+    events: Vec<ExportedEvent>,
+    tool_outputs: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExportedEvent {
+    /// RFC 3339 timestamp the event row was persisted; preserved across import.
+    at: String,
+    event: crate::conversation::Event,
+}
+
 async fn export_session(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
     output: Option<&str>,
+    format: cli::SessionExportFormat,
 ) -> anyhow::Result<()> {
     if !session_manager.session_exists(session_id).await? {
         anyhow::bail!("session not found: {}", session_id);
     }
 
-    // Export the full event log so pre-compaction turns are included. Compaction only hides older
-    // turns from the model (it appends a boundary, never deletes), so the export walks the raw log
-    // and renders every turn plus a marker at each compaction point.
-    let events = session_manager.load_events(session_id).await?;
-    let tool_outputs: std::collections::HashMap<String, String> = session_manager
-        .load_all_tool_outputs(session_id)
-        .await?
-        .into_iter()
-        .collect();
-    let markdown = format_session_as_markdown(session_id, &events, &tool_outputs);
+    let (body, default_ext) = match format {
+        cli::SessionExportFormat::Markdown => {
+            // Export the full event log so pre-compaction turns are included. Compaction only hides
+            // older turns from the model (it appends a boundary, never deletes), so the export
+            // walks the raw log and renders every turn plus a marker at each compaction point.
+            let events = session_manager.load_events(session_id).await?;
+            let tool_outputs: std::collections::HashMap<String, String> = session_manager
+                .load_all_tool_outputs(session_id)
+                .await?
+                .into_iter()
+                .collect();
+            (
+                format_session_as_markdown(session_id, &events, &tool_outputs),
+                "md",
+            )
+        }
+        cli::SessionExportFormat::Json => {
+            let export = build_session_export(session_manager, session_id).await?;
+            (serde_json::to_string_pretty(&export)?, "json")
+        }
+    };
 
     match output {
         Some("-") => {
-            print!("{}", markdown);
+            print!("{}", body);
         }
         Some(path) => {
-            std::fs::write(path, &markdown)?;
+            std::fs::write(path, &body)?;
             tracing::info!("exported session to {}", path);
         }
         None => {
-            let path = format!("session-{}.md", session_id);
-            std::fs::write(&path, &markdown)?;
+            let path = format!("session-{}.{}", session_id, default_ext);
+            std::fs::write(&path, &body)?;
             tracing::info!("exported session to {}", path);
         }
     }
 
     Ok(())
+}
+
+/// Assemble the structured JSON export envelope for a session and every sub-agent descendant.
+/// Per-event timestamps and cumulative stats are preserved; `token_id` is intentionally excluded.
+async fn build_session_export(
+    session_manager: &SessionManager,
+    root: uuid::Uuid,
+) -> anyhow::Result<SessionExport> {
+    let tree = session_manager.load_session_tree(root).await?;
+    let mut sessions = Vec::with_capacity(tree.len());
+    for meta in tree {
+        let events = session_manager
+            .load_events_with_timestamps(meta.id)
+            .await?
+            .into_iter()
+            .map(|(at, event)| ExportedEvent { at, event })
+            .collect();
+        let tool_outputs = session_manager
+            .load_all_tool_outputs(meta.id)
+            .await?
+            .into_iter()
+            .collect();
+        let stats = session_manager.load_session_stats(meta.id).await?;
+        sessions.push(ExportedSession {
+            id: meta.id.to_string(),
+            parent_id: meta.parent_id.map(|id| id.to_string()),
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            cwd: meta.cwd,
+            permission: meta.permission,
+            capabilities_json: meta.capabilities_json,
+            stats,
+            events,
+            tool_outputs,
+        });
+    }
+    Ok(SessionExport {
+        format_version: SESSION_EXPORT_FORMAT_VERSION,
+        meka_version: env!("CARGO_PKG_VERSION").to_string(),
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        root_session_id: root.to_string(),
+        sessions,
+    })
+}
+
+/// Import a session (and any sub-agent children) from a JSON export produced by
+/// `meka session export --format json`. Reads `input` (a file path, or `-` for stdin), mints fresh
+/// IDs for every session, rewires parent links, and persists the whole tree in one transaction.
+/// Prints the new root session ID to stdout.
+async fn import_session(session_manager: &SessionManager, input: &str) -> anyhow::Result<()> {
+    let raw = if input == "-" {
+        use std::io::Read as _;
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        buffer
+    } else {
+        std::fs::read_to_string(input)
+            .map_err(|error| anyhow::anyhow!("failed to read '{}': {}", input, error))?
+    };
+
+    let export: SessionExport = serde_json::from_str(&raw)
+        .map_err(|error| anyhow::anyhow!("invalid session export JSON: {}", error))?;
+    let (records, root_new_id) = plan_import(export)?;
+
+    let count = records.len();
+    session_manager.import_sessions(records).await?;
+    tracing::info!("imported {} session(s) from {}", count, input);
+    // Human-facing confirmation and resume guidance go to stderr; the bare root ID stays on stdout
+    // so `id=$(meka session import ...)` and piping keep working. Plain (unstyled) to match the
+    // other one-shot CLI messages; `render_hint`'s dark-grey styling is for the REPL.
+    if count > 1 {
+        eprintln!(
+            "Imported session with {} sub-agent(s). Resume with: meka -c {}",
+            count - 1,
+            root_new_id
+        );
+    } else {
+        eprintln!("Imported session. Resume with: meka -c {}", root_new_id);
+    }
+    println!("{}", root_new_id);
+    Ok(())
+}
+
+/// Turn a deserialized [`SessionExport`] into the parents-first
+/// [`crate::session::ImportSessionRecord`] list to persist, plus the freshly-minted root session
+/// ID. Validates the format version, mints a new ID per session, and remaps parent links (a parent
+/// pointing outside the exported set collapses to `None`, importing that session as a new top-level
+/// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
+fn plan_import(
+    export: SessionExport,
+) -> anyhow::Result<(Vec<crate::session::ImportSessionRecord>, uuid::Uuid)> {
+    if export.format_version != SESSION_EXPORT_FORMAT_VERSION {
+        anyhow::bail!(
+            "unsupported session export format_version {} (this build supports {})",
+            export.format_version,
+            SESSION_EXPORT_FORMAT_VERSION
+        );
+    }
+    if export.sessions.is_empty() {
+        anyhow::bail!("session export contains no sessions");
+    }
+
+    let remap: std::collections::HashMap<String, uuid::Uuid> = export
+        .sessions
+        .iter()
+        .map(|session| (session.id.clone(), uuid::Uuid::new_v4()))
+        .collect();
+    let root_new_id = remap
+        .get(&export.root_session_id)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("root_session_id is not present in the sessions list"))?;
+
+    let nodes: Vec<(String, Option<String>)> = export
+        .sessions
+        .iter()
+        .map(|session| (session.id.clone(), session.parent_id.clone()))
+        .collect();
+    let order = parents_first_order(&nodes)?;
+
+    let mut slots: Vec<Option<ExportedSession>> = export.sessions.into_iter().map(Some).collect();
+    let mut records = Vec::with_capacity(order.len());
+    for index in order {
+        let session = slots[index]
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("duplicate session index while ordering import"))?;
+        let new_id = remap
+            .get(&session.id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("internal error: session id missing from ID remap"))?;
+        let new_parent_id = session
+            .parent_id
+            .as_ref()
+            .and_then(|parent| remap.get(parent).copied());
+        records.push(crate::session::ImportSessionRecord {
+            new_id,
+            new_parent_id,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            cwd: session.cwd,
+            permission: session.permission,
+            capabilities_json: session.capabilities_json,
+            stats: session.stats,
+            events: session
+                .events
+                .into_iter()
+                .map(|event| (event.at, event.event))
+                .collect(),
+            tool_outputs: session.tool_outputs.into_iter().collect(),
+        });
+    }
+
+    Ok((records, root_new_id))
+}
+
+/// Order sessions parents-first (a topological sort over `parent_id` edges, considering only
+/// parents present in the set) so an importer can insert each session after its parent and satisfy
+/// the `parent_session_id` foreign key. Returns indices into `nodes`. Errors on a cyclic
+/// relationship. Sessions whose parent is absent from the set are treated as roots.
+fn parents_first_order(nodes: &[(String, Option<String>)]) -> anyhow::Result<Vec<usize>> {
+    use std::collections::{HashMap, VecDeque};
+
+    let index_of: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), index))
+        .collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    let mut indegree = vec![0usize; nodes.len()];
+    for (index, (_, parent)) in nodes.iter().enumerate() {
+        if let Some(parent) = parent
+            && let Some(&parent_index) = index_of.get(parent.as_str())
+        {
+            children[parent_index].push(index);
+            indegree[index] += 1;
+        }
+    }
+    let mut queue: VecDeque<usize> = (0..nodes.len()).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    while let Some(node) = queue.pop_front() {
+        order.push(node);
+        for &child in &children[node] {
+            indegree[child] -= 1;
+            if indegree[child] == 0 {
+                queue.push_back(child);
+            }
+        }
+    }
+    if order.len() != nodes.len() {
+        anyhow::bail!("session export has a cyclic parent relationship");
+    }
+    Ok(order)
 }
 
 async fn run_mcp_subcommand(
@@ -1830,12 +2079,15 @@ async fn run_session_subcommand(
             limit,
             include_children,
         } => list_sessions(session_manager, *limit, *include_children).await,
-        cli::SessionAction::Export { session_id, output } => {
-            export_session(session_manager, *session_id, output.as_deref()).await
-        }
+        cli::SessionAction::Export {
+            session_id,
+            output,
+            format,
+        } => export_session(session_manager, *session_id, output.as_deref(), *format).await,
         cli::SessionAction::Delete { session_ids, all } => {
             delete_sessions(session_manager, session_ids, *all).await
         }
+        cli::SessionAction::Import { input } => import_session(session_manager, input).await,
     }
 }
 
@@ -2224,6 +2476,199 @@ async fn load_session_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parents_first_order_orders_parents_before_children() {
+        // Given out of order (child, root, middle), each node must land after its parent.
+        let nodes = vec![
+            ("c".to_string(), Some("b".to_string())),
+            ("a".to_string(), None),
+            ("b".to_string(), Some("a".to_string())),
+        ];
+        let order = parents_first_order(&nodes).expect("order");
+        let position = |id: &str| order.iter().position(|&i| nodes[i].0 == id).unwrap();
+        assert!(position("a") < position("b"));
+        assert!(position("b") < position("c"));
+    }
+
+    #[test]
+    fn test_parents_first_order_treats_external_parent_as_root() {
+        // A parent absent from the set (e.g. the exported root was itself a sub-agent) is not an
+        // error; the node is ordered as a root.
+        let nodes = vec![("only".to_string(), Some("outside".to_string()))];
+        assert_eq!(parents_first_order(&nodes).expect("order"), vec![0]);
+    }
+
+    #[test]
+    fn test_parents_first_order_rejects_cycle() {
+        let nodes = vec![
+            ("a".to_string(), Some("b".to_string())),
+            ("b".to_string(), Some("a".to_string())),
+        ];
+        assert!(parents_first_order(&nodes).is_err());
+    }
+
+    #[test]
+    fn test_plan_import_rejects_unknown_format_version() {
+        let export = SessionExport {
+            format_version: SESSION_EXPORT_FORMAT_VERSION + 1,
+            meka_version: "test".into(),
+            exported_at: "now".into(),
+            root_session_id: "r".into(),
+            sessions: Vec::new(),
+        };
+        assert!(plan_import(export).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_session_export_import_round_trip() {
+        use std::path::Path;
+
+        use crate::{
+            conversation::Event,
+            provider::{ContentBlock, ImageSource, Message, Role, ToolResultContent},
+        };
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+
+        // Root session with a representative mix of events: plain text, an input image, a
+        // tool_use/tool_result pair, and a compaction boundary.
+        let root = manager.create_session(None).await.expect("root");
+        let image = ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "aGk=".to_string(),
+        };
+        let root_events = vec![
+            Event::Append(Message::user("hello")),
+            Event::Append(Message::user_with_images("look", vec![image])),
+            Event::Append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/x"}),
+                }],
+            }),
+            Event::Append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "u1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            }),
+            Event::CompactBoundary {
+                summary: Message::user("[summary]"),
+                replaced_count: 2,
+                loaded_tools_snapshot: Default::default(),
+            },
+        ];
+        for event in &root_events {
+            manager
+                .save_event(root, event)
+                .await
+                .expect("save root event");
+        }
+        manager
+            .save_tool_output(root, "tool_1_output", "big output")
+            .await
+            .expect("tool output");
+        let stats = crate::stats::SessionStatsSnapshot {
+            turns: 3,
+            input_tokens: 1000,
+            ..Default::default()
+        };
+        manager
+            .save_session_stats(root, &stats)
+            .await
+            .expect("stats");
+
+        // A sub-agent child of the root.
+        let child = manager
+            .create_child_session(root, None)
+            .await
+            .expect("child");
+        for event in [
+            Event::Append(Message::user("sub task")),
+            Event::Append(Message::assistant_text("sub done")),
+        ] {
+            manager.save_event(child, &event).await.expect("save child");
+        }
+
+        // Export -> JSON -> back.
+        let export = build_session_export(&manager, root).await.expect("export");
+        assert_eq!(export.sessions.len(), 2, "root + child");
+        assert_eq!(export.sessions[0].id, root.to_string(), "root first");
+        let json = serde_json::to_string_pretty(&export).expect("serialize");
+        assert!(
+            !json.contains("token_id"),
+            "the fingerprint must not be exported"
+        );
+        let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
+
+        // Import under fresh IDs.
+        let (records, root_new_id) = plan_import(reparsed).expect("plan");
+        assert_ne!(root_new_id, root, "import mints a new id");
+        manager.import_sessions(records).await.expect("import");
+
+        // The tree came back: root + child, with the child's parent rewired to the new root.
+        let tree = manager.load_session_tree(root_new_id).await.expect("tree");
+        assert_eq!(tree.len(), 2);
+        let child_new = tree
+            .iter()
+            .find(|meta| meta.id != root_new_id)
+            .expect("child present");
+        assert_eq!(child_new.parent_id, Some(root_new_id));
+
+        // The event log round-trips byte-for-byte against the untouched original.
+        let imported = manager
+            .load_events(root_new_id)
+            .await
+            .expect("load imported");
+        let original = manager.load_events(root).await.expect("load original");
+        assert_eq!(
+            serde_json::to_string(&imported).unwrap(),
+            serde_json::to_string(&original).unwrap(),
+        );
+        assert!(
+            imported.iter().any(|event| match event {
+                Event::Append(message) => message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image { .. })),
+                _ => false,
+            }),
+            "the input image must survive the round trip",
+        );
+
+        // Child events, stats, and tool_outputs are preserved.
+        assert_eq!(
+            manager
+                .load_events(child_new.id)
+                .await
+                .expect("load child events")
+                .len(),
+            2,
+        );
+        let imported_stats = manager
+            .load_session_stats(root_new_id)
+            .await
+            .expect("load stats");
+        assert_eq!(imported_stats.turns, 3);
+        assert_eq!(imported_stats.input_tokens, 1000);
+        assert_eq!(
+            manager
+                .load_all_tool_outputs(root_new_id)
+                .await
+                .expect("load outputs"),
+            vec![("tool_1_output".to_string(), "big output".to_string())],
+        );
+    }
 
     #[test]
     fn test_auth_status_from_credential() {

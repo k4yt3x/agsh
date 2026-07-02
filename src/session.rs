@@ -46,6 +46,38 @@ pub struct CreatedSession {
     pub created_at: String,
 }
 
+/// Metadata for one session row, used by JSON session export to reconstruct a session and its
+/// sub-agent tree. Omits the derived `preview` and the `token_id` fingerprint (which is tied to the
+/// exporting deployment and must not travel).
+#[derive(Debug, Clone)]
+pub struct SessionMetaRow {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub cwd: Option<String>,
+    pub permission: Option<String>,
+    pub capabilities_json: Option<String>,
+}
+
+/// One session's worth of data for [`SessionManager::import_sessions`]. IDs are already freshly
+/// minted and parent links remapped by the caller; the records must be ordered parents-first so
+/// the `parent_session_id` foreign key is satisfied on insert.
+pub struct ImportSessionRecord {
+    pub new_id: Uuid,
+    pub new_parent_id: Option<Uuid>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub cwd: Option<String>,
+    pub permission: Option<String>,
+    pub capabilities_json: Option<String>,
+    pub stats: crate::stats::SessionStatsSnapshot,
+    /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
+    pub events: Vec<(String, crate::conversation::Event)>,
+    /// `(name, content)` scratchpad entries referenced by name from tool-call inputs.
+    pub tool_outputs: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: Uuid,
@@ -874,6 +906,116 @@ impl SessionManager {
             })
     }
 
+    /// Persist a set of imported sessions (a root plus its sub-agent descendants) in a single
+    /// transaction: the `sessions` rows (preserving timestamps and cumulative stats, but never the
+    /// `token_id` fingerprint), each session's event log (preserving per-event timestamps), and its
+    /// `tool_outputs`. `records` MUST be ordered parents-first so every `new_parent_id` references
+    /// an already-inserted row (the `parent_session_id` foreign key is enforced). All-or-nothing:
+    /// any failure rolls back the whole import, leaving no partial tree.
+    pub async fn import_sessions(&self, records: Vec<ImportSessionRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // Encode every event up front so a serialization failure aborts before any DB I/O.
+        struct EncodedSession {
+            id: String,
+            parent_id: Option<String>,
+            created_at: String,
+            updated_at: String,
+            cwd: Option<String>,
+            permission: Option<String>,
+            capabilities_json: Option<String>,
+            stats: crate::stats::SessionStatsSnapshot,
+            events: Vec<(String, String, String)>,
+            tool_outputs: Vec<(String, String)>,
+        }
+        let mut encoded = Vec::with_capacity(records.len());
+        for record in records {
+            let mut events = Vec::with_capacity(record.events.len());
+            for (at, event) in &record.events {
+                let (role, content) = encode_event_for_db(event).map_err(|error| {
+                    MekaError::Database(format!("failed to encode event: {}", error))
+                })?;
+                events.push((role, content, at.clone()));
+            }
+            encoded.push(EncodedSession {
+                id: record.new_id.to_string(),
+                parent_id: record.new_parent_id.map(|id| id.to_string()),
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+                cwd: record.cwd,
+                permission: record.permission,
+                capabilities_json: record.capabilities_json,
+                stats: record.stats,
+                events,
+                tool_outputs: record.tool_outputs,
+            });
+        }
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let txn = connection.transaction()?;
+                for session in &encoded {
+                    txn.execute(
+                        "INSERT INTO sessions (
+                             id, created_at, updated_at, parent_session_id, cwd, permission,
+                             capabilities_json, stat_turns, stat_input_tokens, stat_output_tokens,
+                             stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
+                             stat_redactions, stat_redacted_images, stat_redacted_bytes
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        rusqlite::params![
+                            session.id,
+                            session.created_at,
+                            session.updated_at,
+                            session.parent_id,
+                            session.cwd,
+                            session.permission,
+                            session.capabilities_json,
+                            session.stats.turns as i64,
+                            session.stats.input_tokens as i64,
+                            session.stats.output_tokens as i64,
+                            session.stats.cache_creation_input_tokens as i64,
+                            session.stats.cache_read_input_tokens as i64,
+                            session.stats.redactions as i64,
+                            session.stats.redacted_images as i64,
+                            session.stats.redacted_bytes as i64,
+                        ],
+                    )?;
+                    {
+                        let mut insert_event = txn.prepare(
+                            "INSERT INTO messages (session_id, role, content, created_at) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                        )?;
+                        for (role, content, created_at) in &session.events {
+                            insert_event.execute(rusqlite::params![
+                                session.id,
+                                role,
+                                content,
+                                created_at
+                            ])?;
+                        }
+                    }
+                    {
+                        let mut insert_output = txn.prepare(
+                            "INSERT INTO tool_outputs (session_id, name, content, created_at) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                        )?;
+                        for (name, content) in &session.tool_outputs {
+                            insert_output.execute(rusqlite::params![
+                                session.id,
+                                name,
+                                content,
+                                session.created_at
+                            ])?;
+                        }
+                    }
+                }
+                txn.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to import sessions: {}", error)))
+    }
+
     /// Load every event for a session in chronological order. Legacy rows (role ∈ {`user`,
     /// `assistant`, `tool_results`}) are reconstructed as `Event::Append`; rows with role
     /// `compact_boundary` are deserialized from the JSON envelope. Unknown roles are skipped with a
@@ -925,6 +1067,56 @@ impl SessionManager {
             }
         }
         Ok(events)
+    }
+
+    /// Load a session together with every descendant sub-agent session (recursively via
+    /// `parent_session_id`), ordered root-first (breadth-first by depth). Used by JSON session
+    /// export to capture an entire agent tree, and the root-first order lets an importer insert
+    /// parents before children so the `parent_session_id` foreign key is always satisfied. Returns
+    /// an empty vec when the root session doesn't exist.
+    pub async fn load_session_tree(&self, root: Uuid) -> Result<Vec<SessionMetaRow>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "WITH RECURSIVE tree(id, depth) AS (
+                         SELECT id, 0 FROM sessions WHERE id = ?1
+                         UNION ALL
+                         SELECT s.id, tree.depth + 1
+                         FROM sessions s JOIN tree ON s.parent_session_id = tree.id
+                     )
+                     SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
+                            s.cwd, s.permission, s.capabilities_json
+                     FROM sessions s JOIN tree ON s.id = tree.id
+                     ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
+                )?;
+                let parse_uuid = |value: String| {
+                    Uuid::parse_str(&value)
+                        .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))
+                };
+                let rows = statement.query_map(rusqlite::params![root.to_string()], |row| {
+                    let id = parse_uuid(row.get::<_, String>(0)?)?;
+                    let parent_id = match row.get::<_, Option<String>>(1)? {
+                        Some(value) => Some(parse_uuid(value)?),
+                        None => None,
+                    };
+                    Ok(SessionMetaRow {
+                        id,
+                        parent_id,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        cwd: row.get(4)?,
+                        permission: row.get(5)?,
+                        capabilities_json: row.get(6)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to load session tree: {}", error)))
     }
 
     /// Persist a single row into the `messages` table. Internal helper for [`Self::save_event`];
@@ -2089,6 +2281,13 @@ pub fn strip_context_tags(text: &str) -> &str {
 /// legacy `user`/`assistant`/`tool_results` roles without a schema migration.
 const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
 
+/// Pseudo-role for a `Role::User` message that carries non-text blocks (input images). Its full
+/// `Vec<ContentBlock>` is stored as JSON, because flattening to `text_content()` (as the plain
+/// `user` role does) would silently drop the images. Text-only user turns stay plaintext under
+/// `user` so `list_sessions`'s raw-content preview subquery keeps working. Added without a schema
+/// migration, mirroring [`COMPACT_BOUNDARY_ROLE`].
+const USER_BLOCKS_ROLE: &str = "user_blocks";
+
 /// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
 /// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary` writes a JSON
 /// envelope under the [`COMPACT_BOUNDARY_ROLE`] pseudo-role.
@@ -2110,6 +2309,14 @@ fn encode_event_for_db(
                         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
                     {
                         ("tool_results", serde_json::to_string(&message.content)?)
+                    } else if message
+                        .content
+                        .iter()
+                        .any(|block| !matches!(block, ContentBlock::Text { .. }))
+                    {
+                        // A user turn carrying non-text blocks (input images) can't be flattened to
+                        // plain text without losing them, so persist the full block list as JSON.
+                        (USER_BLOCKS_ROLE, serde_json::to_string(&message.content)?)
                     } else {
                         ("user", message.text_content())
                     }
@@ -2154,6 +2361,15 @@ fn decode_event_from_row(
             }))),
             Err(error) => Err(error),
         },
+        role if role == USER_BLOCKS_ROLE => {
+            match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
+                Ok(content) => Ok(Some(Event::Append(Message {
+                    role: Role::User,
+                    content,
+                }))),
+                Err(error) => Err(error),
+            }
+        }
         role if role == COMPACT_BOUNDARY_ROLE => {
             let event: Event = serde_json::from_str(&row.content)?;
             Ok(Some(event))
@@ -2312,6 +2528,66 @@ mod tests {
                 assert_eq!(summary.text_content(), "[summary]");
             }
             _ => panic!("expected CompactBoundary"),
+        }
+    }
+
+    /// A user turn carrying an input image is persisted under the `user_blocks` role as full JSON
+    /// so the image survives the round trip, while a text-only user turn still stores as plaintext
+    /// under `user` (keeping `list_sessions`'s raw-content preview intact).
+    #[tokio::test]
+    async fn test_user_input_image_round_trips_via_user_blocks_role() {
+        use crate::{
+            conversation::Event,
+            provider::{ContentBlock, ImageSource, Message, Role},
+        };
+
+        let manager = test_manager().await;
+        let sid = manager.create_session(None).await.expect("create session");
+
+        let image = ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        };
+        let image_event = Event::Append(Message::user_with_images("look at this", vec![image]));
+        let text_event = Event::Append(Message::user("plain text only"));
+        manager
+            .save_event(sid, &image_event)
+            .await
+            .expect("save image event");
+        manager
+            .save_event(sid, &text_event)
+            .await
+            .expect("save text event");
+
+        // Storage roles: the image-bearing turn is JSON under `user_blocks`; the text-only turn
+        // stays plaintext under `user`.
+        let rows = manager.load_messages(sid).await.expect("load messages");
+        assert_eq!(rows[0].role, "user_blocks");
+        assert_eq!(rows[1].role, "user");
+        assert_eq!(rows[1].content, "plain text only");
+
+        // The image block survives the decode round trip.
+        let loaded = manager.load_events(sid).await.expect("load events");
+        match &loaded[0] {
+            Event::Append(message) => {
+                assert_eq!(message.role, Role::User);
+                assert_eq!(message.content.len(), 2);
+                assert!(matches!(
+                    &message.content[0],
+                    ContentBlock::Text { text } if text == "look at this"
+                ));
+                assert!(matches!(
+                    &message.content[1],
+                    ContentBlock::Image { source }
+                        if source.data == "aGVsbG8=" && source.media_type == "image/png"
+                ));
+            }
+            other => panic!("expected user Append, got {other:?}"),
+        }
+        match &loaded[1] {
+            Event::Append(message) => assert_eq!(message.text_content(), "plain text only"),
+            other => panic!("expected user Append, got {other:?}"),
         }
     }
 

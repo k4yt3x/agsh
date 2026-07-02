@@ -181,6 +181,38 @@ To print to stdout (for piping):
 meka session export 550e8400-e29b-41d4-a716-446655440000 -o -
 ```
 
+### JSON (structured, round-trippable)
+
+Pass `--format json` for a structured export instead of rendered Markdown:
+
+```bash
+meka session export 550e8400-e29b-41d4-a716-446655440000 --format json
+```
+
+This writes `session-<id>.json`, a lossless dump of the session's event log (including input images and compaction boundaries), its cumulative stats, and scratchpad entries. Unlike Markdown, a JSON export also includes any **sub-agent child sessions** spawned during the conversation, and it can be re-imported with `meka session import`. It deliberately contains **no credentials**: API keys and OAuth tokens live in separate tables and are never part of an export.
+
+## Importing a Session
+
+Recreate a session from a JSON export:
+
+```bash
+meka session import session-550e8400-e29b-41d4-a716-446655440000.json
+```
+
+meka assigns the imported session (and any sub-agent children) **new** UUIDs so they can't collide with existing sessions, then prints the new root session ID. Resume it like any other session:
+
+```bash
+meka -c <new-id>
+```
+
+Read from stdin with `-`:
+
+```bash
+cat session.json | meka session import -
+```
+
+The import preserves the full conversation, per-message timestamps, cumulative stats, and scratchpad entries. Because the provider and model are chosen at run time (not stored per session), a resumed import uses your currently-active provider.
+
 ## Deleting Sessions
 
 Delete specific sessions by UUID:

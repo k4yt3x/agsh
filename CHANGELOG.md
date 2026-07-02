@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `meka session export --format json` writes a structured, round-trippable export (with sub-agents).
+- `meka session import <file>` recreates a session tree from a JSON export under fresh IDs.
+
+### Fixed
+
+- Persist user input images instead of dropping them at save time, so they survive resume/export.
+
 ## [0.30.0] - 2026-07-02
 
 ### Added
