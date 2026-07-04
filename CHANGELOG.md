@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-07-04
+
+### Added
+
+- Syntax-highlight fenced code blocks by their language in the terminal renderer (syntect mode).
+
+### Changed
+
+- **Breaking:** Rename the `bat` render mode to `syntect`, after the actual highlighter.
+
 ## [0.31.0] - 2026-07-02
 
 ### Added

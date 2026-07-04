@@ -259,11 +259,11 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 
 | Value | Description |
 |-------|-------------|
-| `bat` | Syntax-highlighted markdown via bat (default) |
+| `syntect` | Syntax-highlighted markdown via `syntect`, incl. per-language code blocks (default) |
 | `termimad` | Terminal formatting via termimad (box-drawn code blocks, reflowed paragraphs). Alias: `rich` |
 | `raw` | Raw markdown printed verbatim with aligned tables |
 
-Default: `bat`
+Default: `syntect`
 
 ```toml
 [display]

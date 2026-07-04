@@ -12,7 +12,7 @@ use regex::Regex;
 use syntect::{
     easy::HighlightLines,
     highlighting::{Theme, ThemeSet},
-    parsing::SyntaxSet,
+    parsing::{SyntaxReference, SyntaxSet},
     util::{LinesWithEndings, as_24_bit_terminal_escaped},
 };
 use termimad::MadSkin;
@@ -76,8 +76,10 @@ impl OutputSpacing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
+    /// syntect-based highlighter (default). Named after the `syntect` crate that does the
+    /// in-process highlighting.
     #[default]
-    Bat,
+    Syntect,
     Termimad,
     Raw,
     /// Emits no output to stdout/stderr. Used by sub-agents and any other in-process
@@ -90,7 +92,7 @@ pub enum RenderMode {
 impl std::fmt::Display for RenderMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RenderMode::Bat => write!(formatter, "bat"),
+            RenderMode::Syntect => write!(formatter, "syntect"),
             RenderMode::Termimad => write!(formatter, "termimad"),
             RenderMode::Raw => write!(formatter, "raw"),
             RenderMode::Silent => write!(formatter, "silent"),
@@ -103,12 +105,12 @@ impl std::str::FromStr for RenderMode {
 
     fn from_str(string: &str) -> std::result::Result<Self, Self::Err> {
         match string.to_lowercase().as_str() {
-            "bat" => Ok(RenderMode::Bat),
+            "syntect" => Ok(RenderMode::Syntect),
             "rich" | "termimad" => Ok(RenderMode::Termimad),
             "raw" => Ok(RenderMode::Raw),
             "silent" => Ok(RenderMode::Silent),
             other => Err(format!(
-                "unknown render mode '{}' (expected 'bat', 'termimad', 'raw', or 'silent')",
+                "unknown render mode '{}' (expected 'syntect', 'termimad', 'raw', or 'silent')",
                 other
             )),
         }
@@ -157,7 +159,7 @@ impl StreamingRenderer {
         self.buffer.push_str(delta);
 
         match self.mode {
-            RenderMode::Bat => self.flush_bat(),
+            RenderMode::Syntect => self.flush_syntect(),
             RenderMode::Termimad => self.flush_termimad(),
             RenderMode::Raw => self.flush_raw(),
             RenderMode::Silent => Ok(()),
@@ -169,7 +171,7 @@ impl StreamingRenderer {
             return Ok(());
         }
         match self.mode {
-            RenderMode::Bat => {
+            RenderMode::Syntect => {
                 if !self.buffer.is_empty() {
                     let remaining = std::mem::take(&mut self.buffer);
                     let trimmed = remaining.trim_end_matches('\n');
@@ -180,28 +182,28 @@ impl StreamingRenderer {
                         if !self.code_block_lines.is_empty() {
                             self.code_block_lines.push(line.to_string());
                             if is_fence {
-                                self.flush_bat_code_block()?;
+                                self.flush_syntect_code_block()?;
                                 needs_newline = false;
                             }
                         } else if is_fence {
-                            self.flush_bat_table()?;
+                            self.flush_syntect_table()?;
                             self.code_block_lines.push(line.to_string());
                             needs_newline = false;
                         } else if is_table_line(line) {
                             self.raw_table_lines.push(line.to_string());
                             needs_newline = false;
                         } else if line.is_empty() {
-                            self.flush_bat_table()?;
+                            self.flush_syntect_table()?;
                             println!();
                             needs_newline = false;
                         } else {
-                            self.flush_bat_table()?;
+                            self.flush_syntect_table()?;
                             print_highlighted_markdown(line);
                             needs_newline = true;
                         }
                     }
-                    self.flush_bat_code_block()?;
-                    self.flush_bat_table()?;
+                    self.flush_syntect_code_block()?;
+                    self.flush_syntect_table()?;
                     if needs_newline {
                         println!();
                     }
@@ -237,7 +239,7 @@ impl StreamingRenderer {
         io::stdout().flush()
     }
 
-    fn flush_bat(&mut self) -> io::Result<()> {
+    fn flush_syntect(&mut self) -> io::Result<()> {
         self.buffer = normalize_spacing(&self.buffer);
 
         while let Some(newline_pos) = self.buffer.find('\n') {
@@ -249,7 +251,7 @@ impl StreamingRenderer {
                 self.buffer = self.buffer[newline_pos + 1..].to_string();
                 self.code_block_lines.push(line);
                 if is_fence {
-                    self.flush_bat_code_block()?;
+                    self.flush_syntect_code_block()?;
                 }
                 continue;
             }
@@ -257,7 +259,7 @@ impl StreamingRenderer {
             // Opening fence starts a new code block
             if is_fence {
                 self.buffer = self.buffer[newline_pos + 1..].to_string();
-                self.flush_bat_table()?;
+                self.flush_syntect_table()?;
                 self.code_block_lines.push(line);
                 continue;
             }
@@ -267,7 +269,7 @@ impl StreamingRenderer {
             if is_table_line(&line) {
                 self.raw_table_lines.push(line);
             } else {
-                self.flush_bat_table()?;
+                self.flush_syntect_table()?;
                 if line.is_empty() {
                     println!();
                 } else {
@@ -279,19 +281,16 @@ impl StreamingRenderer {
         Ok(())
     }
 
-    fn flush_bat_code_block(&mut self) -> io::Result<()> {
+    fn flush_syntect_code_block(&mut self) -> io::Result<()> {
         if self.code_block_lines.is_empty() {
             return Ok(());
         }
-
         let lines = std::mem::take(&mut self.code_block_lines);
-        let block_text = lines.join("\n");
-        print_highlighted_markdown(&block_text);
-        println!();
+        print!("{}", render_code_block_to_string(&lines));
         io::stdout().flush()
     }
 
-    fn flush_bat_table(&mut self) -> io::Result<()> {
+    fn flush_syntect_table(&mut self) -> io::Result<()> {
         if self.raw_table_lines.is_empty() {
             return Ok(());
         }
@@ -462,6 +461,15 @@ fn highlight_markdown_to_string(text: &str) -> String {
         .find_syntax_by_name("Markdown")
         .or_else(|| highlighter.syntax_set.find_syntax_by_extension("md"))
         .unwrap_or_else(|| highlighter.syntax_set.find_syntax_plain_text());
+    highlight_with_syntax(text, syntax)
+}
+
+/// Highlight `text` line-by-line with an explicit syntect grammar and return 24-bit ANSI escapes.
+/// Shared core of the Markdown-prose path and the per-language code-block path; the passed `syntax`
+/// must come from the same static [`highlighter`] so its context indices match the `syntax_set`
+/// used to resolve embeds.
+fn highlight_with_syntax(text: &str, syntax: &SyntaxReference) -> String {
+    let highlighter = highlighter();
     let mut highlight = HighlightLines::new(syntax, &highlighter.theme);
 
     let mut out = String::new();
@@ -479,6 +487,78 @@ fn highlight_markdown_to_string(text: &str) -> String {
     }
     // Reset ANSI so colors don't bleed into the next prompt.
     out.push_str("\x1b[0m");
+    out
+}
+
+/// A markdown code-fence line, e.g. ```` ```rust ```` or a bare ```` ``` ````. Indentation is
+/// tolerated.
+fn is_code_fence(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
+/// Extract the language token from an opening code fence: ```` ```rust ````→`Some("rust")`,
+/// ```` ``` ````→`None`, ```` ```rust,ignore ````/```` ```js title=x ````→the first token. The
+/// token is whatever precedes the first whitespace or comma after the backticks.
+fn parse_fence_language(fence_line: &str) -> Option<&str> {
+    let after = fence_line.trim_start().trim_start_matches('`');
+    let token = after
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .next()
+        .unwrap_or("")
+        .trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Resolve a fence language tag to a syntect grammar, falling back to plain text for an absent or
+/// unrecognized tag (which then renders uncolored rather than erroring). `find_syntax_by_token` is
+/// already case-insensitive on both extension and grammar name in syntect 5.x, so lowercase tags
+/// like `rust`/`python`/`json` resolve directly; the alias arm only covers tags that are neither a
+/// file extension nor a grammar name.
+fn syntax_for_language(lang: Option<&str>) -> &'static SyntaxReference {
+    let set = &highlighter().syntax_set;
+    let Some(lang) = lang.map(str::trim).filter(|value| !value.is_empty()) else {
+        return set.find_syntax_plain_text();
+    };
+    let resolved = match lang.to_ascii_lowercase().as_str() {
+        "text" | "plain" | "plaintext" => Some(set.find_syntax_plain_text()),
+        "shell" | "console" => set.find_syntax_by_extension("sh"),
+        _ => set.find_syntax_by_token(lang),
+    };
+    resolved.unwrap_or_else(|| set.find_syntax_plain_text())
+}
+
+/// Render a fenced code block to ANSI-highlighted text. `lines` is
+/// `[opening_fence, body…, closing_fence?]` (the closing fence is absent when the stream ended
+/// mid-block). The fence lines keep the Markdown coloring they've always had; the body is
+/// highlighted with the block's own language grammar (falling back to plain text for an
+/// absent/unknown tag). Every line ends in a single `\n`, matching the prior `join("\n")` +
+/// `println!()` output.
+fn render_code_block_to_string(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let language = parse_fence_language(&lines[0]);
+    let has_closing = lines.len() > 1 && is_code_fence(&lines[lines.len() - 1]);
+    let body_end = if has_closing {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
+
+    let mut out = highlight_markdown_to_string(&format!("{}\n", lines[0]));
+    if body_end > 1 {
+        let body: String = lines[1..body_end]
+            .iter()
+            .map(|line| format!("{}\n", line))
+            .collect();
+        out.push_str(&highlight_with_syntax(&body, syntax_for_language(language)));
+    }
+    if has_closing {
+        out.push_str(&highlight_markdown_to_string(&format!(
+            "{}\n",
+            lines[body_end]
+        )));
+    }
     out
 }
 
@@ -1470,6 +1550,127 @@ mod tests {
         assert_eq!(theme.name.as_deref(), Some("Monokai Extended"));
     }
 
+    #[test]
+    fn test_parse_fence_language() {
+        assert_eq!(parse_fence_language("```rust"), Some("rust"));
+        assert_eq!(parse_fence_language("```"), None);
+        assert_eq!(parse_fence_language("```rust,ignore"), Some("rust"));
+        assert_eq!(parse_fence_language("  ```python "), Some("python"));
+        assert_eq!(parse_fence_language("```js title=x"), Some("js"));
+    }
+
+    #[test]
+    fn test_syntax_for_language_resolves_and_falls_back() {
+        assert_eq!(syntax_for_language(Some("rust")).name, "Rust");
+        assert_eq!(syntax_for_language(Some("py")).name, "Python");
+        // Absent / unknown tags fall back to the plain-text grammar rather than erroring.
+        let plain = highlighter()
+            .syntax_set
+            .find_syntax_plain_text()
+            .name
+            .clone();
+        assert_eq!(syntax_for_language(None).name, plain);
+        assert_eq!(syntax_for_language(Some("nope-lang-xyz")).name, plain);
+        // Alias: `shell`/`console` map to the shell grammar (not a syntect name/extension).
+        assert!(
+            syntax_for_language(Some("shell"))
+                .name
+                .to_ascii_lowercase()
+                .contains("bash")
+                || syntax_for_language(Some("shell"))
+                    .name
+                    .to_ascii_lowercase()
+                    .contains("shell"),
+            "shell alias resolved to {:?}",
+            syntax_for_language(Some("shell")).name,
+        );
+    }
+
+    #[test]
+    fn test_code_block_body_is_language_highlighted() {
+        // Regression guard for the whole feature: the Rust grammar tokenizes the body into several
+        // colors, where the Markdown grammar (the old behavior) rendered it flat.
+        let rust = "fn main() {\n    let x = 42;\n    println!(\"hi\");\n}\n";
+        let rust_colors = distinct_fg_colors(&highlight_with_syntax(
+            rust,
+            syntax_for_language(Some("rust")),
+        ));
+        let markdown = highlighter()
+            .syntax_set
+            .find_syntax_by_name("Markdown")
+            .expect("markdown syntax present");
+        let flat_colors = distinct_fg_colors(&highlight_with_syntax(rust, markdown));
+        assert!(
+            rust_colors > 1,
+            "rust body should be multi-colored, got {rust_colors}",
+        );
+        assert!(
+            rust_colors > flat_colors,
+            "language highlighting ({rust_colors}) should be richer than markdown ({flat_colors})",
+        );
+    }
+
+    #[test]
+    fn test_code_block_highlight_preserves_content() {
+        // Stripping ANSI from a language-highlighted block returns the original code byte-for-byte.
+        let code = "fn main() {\n    let x = 42;\n}\n";
+        let out = highlight_with_syntax(code, syntax_for_language(Some("rust")));
+        assert_eq!(strip_ansi_escapes(&out), code);
+    }
+
+    #[test]
+    fn test_render_code_block_structure_and_body_highlight() {
+        let lines = vec![
+            "```rust".to_string(),
+            "fn main() {".to_string(),
+            "    let x = 42;".to_string(),
+            "}".to_string(),
+            "```".to_string(),
+        ];
+        let out = render_code_block_to_string(&lines);
+        // Fences + body round-trip verbatim, each line ending in exactly one newline.
+        assert_eq!(
+            strip_ansi_escapes(&out),
+            "```rust\nfn main() {\n    let x = 42;\n}\n```\n",
+        );
+        // The body is language-highlighted (multiple colors), not flat.
+        assert!(distinct_fg_colors(&out) > 1);
+    }
+
+    #[test]
+    fn test_render_code_block_handles_unterminated_and_empty() {
+        // Unterminated block (no closing fence) still renders the opening fence + body.
+        let unterminated = vec!["```rust".to_string(), "let x = 1;".to_string()];
+        assert_eq!(
+            strip_ansi_escapes(&render_code_block_to_string(&unterminated)),
+            "```rust\nlet x = 1;\n",
+        );
+        // Empty block (fences only) renders both fences and no body.
+        let empty = vec!["```rust".to_string(), "```".to_string()];
+        assert_eq!(
+            strip_ansi_escapes(&render_code_block_to_string(&empty)),
+            "```rust\n```\n",
+        );
+        // No panic on the degenerate single-fence case.
+        assert_eq!(
+            strip_ansi_escapes(&render_code_block_to_string(&["```".to_string()])),
+            "```\n",
+        );
+    }
+
+    /// Count distinct 24-bit foreground colors (`ESC[38;2;R;G;B`) in ANSI-escaped output.
+    fn distinct_fg_colors(ansi: &str) -> usize {
+        let mut colors = std::collections::BTreeSet::new();
+        let mut rest = ansi;
+        while let Some(pos) = rest.find("\x1b[38;2;") {
+            rest = &rest[pos + 7..];
+            if let Some(end) = rest.find('m') {
+                colors.insert(rest[..end].to_string());
+            }
+        }
+        colors.len()
+    }
+
     fn strip_ansi_escapes(input: &str) -> String {
         // Minimal CSI stripper for test assertions: drops `ESC [ ... letter`.
         let mut out = String::with_capacity(input.len());
@@ -1736,7 +1937,27 @@ mod tests {
 
     #[test]
     fn test_render_mode_default() {
-        assert_eq!(RenderMode::default(), RenderMode::Bat);
+        assert_eq!(RenderMode::default(), RenderMode::Syntect);
+    }
+
+    #[test]
+    fn test_render_mode_parses_syntect_only() {
+        assert_eq!("syntect".parse(), Ok(RenderMode::Syntect));
+        assert_eq!("rich".parse(), Ok(RenderMode::Termimad));
+        assert_eq!(RenderMode::Syntect.to_string(), "syntect");
+        // `bat` is no longer accepted (the alias was removed).
+        assert!("bat".parse::<RenderMode>().is_err());
+        assert!("nope".parse::<RenderMode>().is_err());
+    }
+
+    #[test]
+    fn test_render_mode_config_rejects_bat() {
+        assert_eq!(
+            serde_json::from_str::<RenderMode>("\"syntect\"").unwrap(),
+            RenderMode::Syntect,
+        );
+        // `render_mode = "bat"` no longer deserializes after the rename.
+        assert!(serde_json::from_str::<RenderMode>("\"bat\"").is_err());
     }
 
     #[test]

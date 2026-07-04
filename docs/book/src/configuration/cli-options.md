@@ -120,9 +120,9 @@ meka --no-stream
 
 ### `--render-mode <MODE>`
 
-Set the output render mode. Accepts `bat` (default), `termimad` (or `rich`), or `raw`.
+Set the output render mode. Accepts `syntect` (default), `termimad` (or `rich`), or `raw`.
 
-- `bat`: Syntax-highlighted markdown output via bat.
+- `syntect`: Syntax-highlighted markdown via the `syntect` library, including per-language code blocks.
 - `termimad`: Full terminal formatting (box-drawn code blocks, reflowed paragraphs, formatted tables).
 - `raw`: Raw markdown printed verbatim with aligned tables.
 
