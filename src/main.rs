@@ -286,15 +286,7 @@ async fn async_main(
         let Some(prompt) = config.prompt.clone() else {
             unreachable!("--oneshot requires a prompt or --skill; rejected by Cli validation");
         };
-        return run_oneshot(
-            config,
-            session_manager,
-            token_store,
-            prompt,
-            mcp_manager,
-            mcp_context,
-        )
-        .await;
+        return run_oneshot(config, session_manager, token_store, prompt, mcp_manager).await;
     }
 
     let initial_prompt = config.prompt.clone();
@@ -304,7 +296,6 @@ async fn async_main(
         token_store,
         initial_prompt,
         mcp_manager,
-        mcp_context,
     )
     .await
 }
@@ -334,9 +325,6 @@ pub struct SharedDeps {
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
 /// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
 /// `Agent` + `ToolRegistry`.
-///
-/// `mcp_context.set_provider(...)` is called here so MCP sampling callbacks can reach the provider.
-/// Per-session cwd routing happens at MCP tool dispatch time (task-local cwd).
 pub async fn build_shared_deps(
     config: ResolvedConfig,
     session_manager: SessionManager,
@@ -411,10 +399,6 @@ pub async fn build_shared_deps(
         mcp_grace: config.mcp_grace,
         system_prompt_override: None,
     };
-
-    // Publish the provider on the MCP client context so sampling callbacks can reach it. Registry
-    // plumbing now flows through `McpClientManager::attach_registry` per session.
-    mcp_context.set_provider(Arc::clone(&provider));
 
     // Kick off the MCP background connector once for the whole process. The connector writes tool
     // discoveries through `update_server_tools`, which fans them out to every attached registry,
@@ -593,7 +577,6 @@ async fn create_agent_from_config(
     token_store: TokenStore,
     credential: AuthCredential,
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
-    mcp_context: Option<&Arc<mcp::McpClientContext>>,
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::agent::SharedCwd,
     session_stats: Arc<stats::SessionStats>,
@@ -704,14 +687,6 @@ async fn create_agent_from_config(
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(config));
     }
 
-    // Now that provider exists, publish it on the MCP client context so sampling callbacks
-    // (`sampling/createMessage`) can reach it. The MCP-side tool registry plumbing now lives on the
-    // manager (see `attach_registry` above); no `set_registry` call here.
-    if let Some(context) = mcp_context {
-        context.set_provider(Arc::clone(&provider));
-        context.set_cwd(Arc::clone(&cwd));
-    }
-
     Ok(agent)
 }
 
@@ -750,7 +725,6 @@ async fn run_oneshot(
     token_store: TokenStore,
     prompt: String,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
-    mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
     if config.permission == crate::permission::Permission::Read {
@@ -789,7 +763,6 @@ async fn run_oneshot(
         token_store,
         credential,
         mcp_manager.as_ref(),
-        Some(&mcp_context),
         oneshot_frontend,
         cwd,
         Arc::clone(&session_stats),
@@ -826,7 +799,6 @@ async fn run_interactive(
     token_store: TokenStore,
     initial_prompt: Option<String>,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
-    mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
     // Per-session working directory, initialised from process cwd at startup. Shared by reference
     // between the REPL (prompt + `/cd`) and the agent (file/shell/find/grep tools +
@@ -988,7 +960,6 @@ async fn run_interactive(
         token_store.clone(),
         credential,
         mcp_manager.as_ref(),
-        Some(&mcp_context),
         Arc::clone(&repl_frontend),
         Arc::clone(&cwd),
         Arc::clone(&session_stats),
@@ -1157,15 +1128,13 @@ async fn run_interactive(
                                     let mut body = String::new();
                                     for message in &result.messages {
                                         let role = match message.role {
-                                            rmcp::model::PromptMessageRole::User => "user",
-                                            rmcp::model::PromptMessageRole::Assistant => {
-                                                "assistant"
-                                            }
+                                            rmcp::model::Role::User => "user",
+                                            rmcp::model::Role::Assistant => "assistant",
                                         };
-                                        if let rmcp::model::PromptMessageContent::Text { text } =
+                                        if let rmcp::model::ContentBlock::Text(text) =
                                             &message.content
                                         {
-                                            body.push_str(&format!("{}: {}\n", role, text));
+                                            body.push_str(&format!("{}: {}\n", role, text.text));
                                         }
                                     }
                                     let user_input = body.trim().to_string();
@@ -1655,8 +1624,6 @@ async fn run_mcp_subcommand(
             scope,
             redirect_port,
             permission,
-            sampling,
-            sampling_limit,
             no_login,
             allow_tool,
             disable_tool,
@@ -1681,8 +1648,6 @@ async fn run_mcp_subcommand(
                     scope: scope.clone(),
                     redirect_port: *redirect_port,
                     permission: permission.clone(),
-                    sampling: *sampling,
-                    sampling_limit: *sampling_limit,
                     no_login: *no_login,
                     allow_tool: allow_tool.clone(),
                     disable_tool: disable_tool.clone(),

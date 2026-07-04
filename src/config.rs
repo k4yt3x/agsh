@@ -170,14 +170,6 @@ pub struct McpServerConfig {
     /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
     /// permission at registration time.
     pub tool_permissions: Option<std::collections::HashMap<String, String>>,
-    /// Allow this server to issue `sampling/createMessage` requests. When false (default), any
-    /// such request is rejected with `METHOD_NOT_FOUND`. Use with caution: sampling lets the
-    /// server inject arbitrary messages into your LLM context and spend your provider quota.
-    #[serde(default)]
-    pub sampling: bool,
-    /// Cap on the number of sampling calls this server may issue per meka session. Only meaningful
-    /// when `sampling = true`. Default: 10.
-    pub sampling_limit: Option<u32>,
     /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
     /// attempt is made. Lets users mute a flaky or in-development server without removing the
     /// entry.
@@ -1743,8 +1735,6 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
-            sampling: false,
-            sampling_limit: None,
             disabled: false,
         }
     }

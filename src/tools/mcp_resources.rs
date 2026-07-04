@@ -108,7 +108,9 @@ impl Tool for ListMcpResourcesTool {
             match crate::mcp::list_resources(&entry).await {
                 Ok(resources) => {
                     for resource in resources {
-                        let raw = &resource.raw;
+                        // rmcp 2.1 flattened `Resource` (the fields that used to sit under `.raw`
+                        // are now directly on the struct).
+                        let raw = &resource;
                         let mime = raw.mime_type.as_deref().unwrap_or("");
                         let description = raw.description.as_deref().unwrap_or("");
                         let description =
@@ -265,6 +267,8 @@ fn format_resource_contents(
                     blob
                 ));
             }
+            // `ResourceContents` is non-exhaustive; skip any content kind this build doesn't know.
+            _ => {}
         }
     }
     chunks
@@ -453,30 +457,37 @@ impl Tool for GetMcpPromptTool {
         }
 
         for message in &result.messages {
+            // rmcp 2.1: `PromptMessage` carries a plain `Role` and a `ContentBlock` (the same
+            // content enum used everywhere else), replacing the old `PromptMessageRole` /
+            // `PromptMessageContent` types.
             let role_label = match message.role {
-                rmcp::model::PromptMessageRole::User => "user",
-                rmcp::model::PromptMessageRole::Assistant => "assistant",
+                rmcp::model::Role::User => "user",
+                rmcp::model::Role::Assistant => "assistant",
             };
             match &message.content {
-                rmcp::model::PromptMessageContent::Text { text } => {
-                    lines.push(format!("{}: {}", role_label, sanitize_text(text)));
+                rmcp::model::ContentBlock::Text(text) => {
+                    lines.push(format!("{}: {}", role_label, sanitize_text(&text.text)));
                 }
-                rmcp::model::PromptMessageContent::Image { .. } => {
+                rmcp::model::ContentBlock::Image(_) => {
                     lines.push(format!("{}: [image content]", role_label));
                 }
-                rmcp::model::PromptMessageContent::Resource { resource } => {
+                rmcp::model::ContentBlock::Audio(_) => {
+                    lines.push(format!("{}: [audio content]", role_label));
+                }
+                rmcp::model::ContentBlock::Resource(embedded) => {
                     lines.push(format!(
                         "{}: [embedded resource: {:?}]",
-                        role_label, resource.resource
+                        role_label, embedded.resource
                     ));
                 }
-                rmcp::model::PromptMessageContent::ResourceLink { link } => {
+                rmcp::model::ContentBlock::ResourceLink(link) => {
                     lines.push(format!(
                         "{}: [resource link: {}]",
                         role_label,
                         sanitize_text(&link.uri)
                     ));
                 }
+                _ => lines.push(format!("{}: [unsupported content]", role_label)),
             }
         }
 
@@ -840,8 +851,6 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
-            sampling: false,
-            sampling_limit: None,
             disabled: false,
         };
         let context = McpClientContext::new();

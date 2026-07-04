@@ -1,12 +1,13 @@
-//! Client-side MCP handler: dispatches server-initiated sampling / `list_roots` / elicitation
-//! requests to the rest of the agent, forwards `tools/list_changed` notifications through the
-//! manager, and adapts the remote tool list into the `crate::tools` trait so the provider loop can
-//! call them like any other tool.
+//! Client-side MCP handler: dispatches server-initiated `elicitation/create` requests to the rest
+//! of the agent, forwards `tools/list_changed` notifications through the manager, and adapts the
+//! remote tool list into the `crate::tools` trait so the provider loop can call them like any other
+//! tool.
+//!
+//! meka does not implement the MCP sampling / roots / logging handlers: those features are
+//! deprecated by SEP-2577 and slated for removal from the protocol, so the rmcp defaults apply
+//! (sampling → `method_not_found`, roots → empty, logging → ignored).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rmcp::{
@@ -14,64 +15,33 @@ use rmcp::{
     handler::client::ClientHandler,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-        CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-        CreateMessageResult, ErrorCode, ListRootsResult, Meta, ProgressNotificationParam, Role,
-        Root, SamplingMessage, SamplingMessageContent, ServerResult,
+        ElicitRequestParams, ElicitResult, Meta, ProgressNotificationParam, ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    ALLOWED_IMAGE_MIME_TYPES, MAX_MCP_IMAGE_BYTES, MCP_SAMPLING_PROVIDER_TIMEOUT, McpClientContext,
-    ServerEntry,
-};
+use super::{ALLOWED_IMAGE_MIME_TYPES, MAX_MCP_IMAGE_BYTES, McpClientContext, ServerEntry};
 use crate::{
-    config::McpServerConfig,
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
     tools::{Tool, ToolOutput},
 };
 
-/// Permission for each server to issue sampling requests. Mirrors the `sampling` / `sampling_limit`
-/// fields on `McpServerConfig`.
-#[derive(Clone)]
-pub struct SamplingPolicy {
-    allowed: bool,
-    limit: u32,
-    count: Arc<AtomicU32>,
-}
-
-impl SamplingPolicy {
-    pub(super) fn from_config(config: &McpServerConfig) -> Self {
-        Self {
-            allowed: config.sampling,
-            limit: config.sampling_limit.unwrap_or(10),
-            count: Arc::new(AtomicU32::new(0)),
-        }
-    }
-}
-
-/// Client-side MCP handler. Dispatches server-initiated requests (`sampling/createMessage`,
-/// `roots/list`, `elicitation/create`) and notifications (`tools/list_changed`, etc.) to the rest
-/// of the agent via the shared [`McpClientContext`].
+/// Client-side MCP handler. Dispatches server-initiated `elicitation/create` requests and
+/// notifications (`tools/list_changed`, progress, etc.) to the rest of the agent via the shared
+/// [`McpClientContext`]. Sampling / roots / logging are intentionally not handled (SEP-2577).
 #[derive(Clone)]
 pub struct MekaClientHandler {
     server_name: Arc<str>,
-    sampling: SamplingPolicy,
     context: Arc<McpClientContext>,
 }
 
 impl MekaClientHandler {
-    pub fn new(
-        server_name: String,
-        sampling: SamplingPolicy,
-        context: Arc<McpClientContext>,
-    ) -> Self {
+    pub fn new(server_name: String, context: Arc<McpClientContext>) -> Self {
         Self {
             server_name: Arc::from(server_name),
-            sampling,
             context,
         }
     }
@@ -186,60 +156,29 @@ impl ClientHandler for MekaClientHandler {
         }
     }
 
-    fn on_logging_message(
+    /// Notification (new in rmcp 2.1 / MCP URL elicitation) that a server-side URL elicitation the
+    /// user was sent to complete has finished. meka's [`Self::create_elicitation`] already returned
+    /// its response synchronously, so nothing needs to drive here; log it for observability.
+    fn on_url_elicitation_notification_complete(
         &self,
-        params: rmcp::model::LoggingMessageNotificationParam,
+        params: rmcp::model::ElicitationResponseNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let server = Arc::clone(&self.server_name);
         async move {
             tracing::debug!(
-                "MCP server '{}' log [{:?}]: {}",
+                "MCP server '{}' completed URL elicitation '{}'",
                 server,
-                params.level,
-                params.data
+                params.elicitation_id
             );
-        }
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn list_roots(
-        &self,
-        _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = std::result::Result<ListRootsResult, McpError>> + Send + '_ {
-        async move {
-            // Task-local override wins: when an MCP tool runs inside `with_session_cwd(session.cwd,
-            // …)`, this query reads that session's cwd. Outside such a scope (connection- time
-            // queries, REPL paths) the process default seeded on the context applies.
-            let cwd = match self.context.cwd() {
-                Some(default) => crate::mcp::current_roots_cwd(default),
-                None => std::env::current_dir().map_err(|error| {
-                    McpError::internal_error(format!("current dir unavailable: {}", error), None)
-                })?,
-            };
-            let uri = url::Url::from_directory_path(&cwd).map_err(|_| {
-                McpError::internal_error(
-                    format!("failed to convert {:?} to file:// URL", cwd),
-                    None,
-                )
-            })?;
-            let name = cwd
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("root")
-                .to_string();
-            Ok(ListRootsResult::new(vec![
-                Root::new(uri.as_str()).with_name(name),
-            ]))
         }
     }
 
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = std::result::Result<CreateElicitationResult, McpError>> + Send + '_
-    {
+    ) -> impl Future<Output = std::result::Result<ElicitResult, McpError>> + Send + '_ {
         let server = Arc::clone(&self.server_name);
         async move {
             use crate::mcp::elicitation::{
@@ -247,7 +186,7 @@ impl ClientHandler for MekaClientHandler {
             };
 
             let (kind, message) = match &request {
-                CreateElicitationRequestParams::FormElicitationParams {
+                ElicitRequestParams::FormElicitationParams {
                     message,
                     requested_schema,
                     ..
@@ -256,9 +195,17 @@ impl ClientHandler for MekaClientHandler {
                         .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
                     (ElicitationKind::Form { schema }, message.clone())
                 }
-                CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
+                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
                     (ElicitationKind::Url { url: url.clone() }, message.clone())
                 }
+                // Forward-compat: an elicitation kind this build doesn't recognize falls back to a
+                // generic form prompt rather than failing the request.
+                _ => (
+                    ElicitationKind::Form {
+                        schema: serde_json::json!({"type": "object", "properties": {}}),
+                    },
+                    "unsupported elicitation request".to_string(),
+                ),
             };
 
             let prompt = ElicitationPrompt {
@@ -307,167 +254,6 @@ impl ClientHandler for MekaClientHandler {
             Ok(response.into_result())
         }
     }
-
-    fn create_message(
-        &self,
-        params: CreateMessageRequestParams,
-        _context: RequestContext<RoleClient>,
-    ) -> impl Future<Output = std::result::Result<CreateMessageResult, McpError>> + Send + '_ {
-        let server_name = Arc::clone(&self.server_name);
-        let policy = self.sampling.clone();
-        let provider = self.context.provider();
-
-        async move {
-            if !policy.allowed {
-                tracing::info!(
-                    "MCP server '{}' requested sampling/createMessage: rejected (sampling=false)",
-                    server_name
-                );
-                return Err(McpError::new(
-                    ErrorCode::METHOD_NOT_FOUND,
-                    "sampling is not enabled for this MCP server in meka's config",
-                    None,
-                ));
-            }
-
-            let current = policy.count.fetch_add(1, Ordering::SeqCst);
-            if current >= policy.limit {
-                tracing::warn!(
-                    "MCP server '{}' exceeded sampling_limit ({})",
-                    server_name,
-                    policy.limit
-                );
-                return Err(McpError::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!(
-                        "sampling_limit ({}) exhausted for server '{}'",
-                        policy.limit, server_name
-                    ),
-                    None,
-                ));
-            }
-
-            let Some(provider) = provider else {
-                return Err(McpError::internal_error(
-                    "sampling provider not wired (agent not yet started)",
-                    None,
-                ));
-            };
-
-            tracing::info!(
-                "MCP server '{}' sampling/createMessage: {} messages, max_tokens={}",
-                server_name,
-                params.messages.len(),
-                params.max_tokens
-            );
-
-            let (system_prompt, converted) = convert_sampling_params(&params).map_err(|error| {
-                // The slot was reserved for a call that never reached the provider; free it so a
-                // well-formed retry isn't rejected.
-                policy.count.fetch_sub(1, Ordering::SeqCst);
-                McpError::invalid_params(format!("sampling conversion failed: {}", error), None)
-            })?;
-
-            // Sampling calls out to the provider with no MCP tools exposed: the server asked for
-            // pure reasoning, not tool-use. The empty tool list forces the provider into a plain
-            // text completion. Bounded by `MCP_SAMPLING_PROVIDER_TIMEOUT` so a hung provider can't
-            // pin the MCP request open indefinitely.
-            let completion = tokio::time::timeout(
-                MCP_SAMPLING_PROVIDER_TIMEOUT,
-                provider.complete(&system_prompt, &converted, &[]),
-            )
-            .await;
-
-            // MCP sampling has no user-facing frontend in scope here; provider notices are logged
-            // at info level so they're at least visible with `-v`. Item #5 in the front-end
-            // refactor plan will plumb a per-session frontend through the task-local so this path
-            // can route them too.
-            let (assistant_message, _stop_reason, _usage) = match completion {
-                Ok(Ok((message, stop_reason, usage, notices))) => {
-                    for notice in notices {
-                        tracing::info!("mcp sampling: provider notice: {}", notice.text);
-                    }
-                    (message, stop_reason, usage)
-                }
-                Ok(Err(error)) => {
-                    // Provider returned an error before the timeout elapsed. No quota was really
-                    // consumed on our side, so hand the sampling slot back.
-                    policy.count.fetch_sub(1, Ordering::SeqCst);
-                    return Err(McpError::internal_error(
-                        format!("provider completion failed: {}", error),
-                        None,
-                    ));
-                }
-                Err(_) => {
-                    policy.count.fetch_sub(1, Ordering::SeqCst);
-                    return Err(McpError::internal_error(
-                        format!(
-                            "provider completion timed out after {}s",
-                            MCP_SAMPLING_PROVIDER_TIMEOUT.as_secs()
-                        ),
-                        None,
-                    ));
-                }
-            };
-
-            let text = assistant_message.text_content();
-            let message = SamplingMessage::assistant_text(text);
-            Ok(CreateMessageResult::new(
-                message,
-                provider.name().to_string(),
-            ))
-        }
-    }
-}
-
-/// Convert MCP `CreateMessageRequestParams` into the provider's `(system_prompt, Vec<Message>)`
-/// shape, flattening text content. Non-text sampling content (image, audio, tool_use, tool_result)
-/// is replaced with a placeholder string: none of meka's providers accept these inside sampling
-/// calls.
-fn convert_sampling_params(
-    params: &CreateMessageRequestParams,
-) -> std::result::Result<(String, Vec<crate::provider::Message>), String> {
-    use crate::provider::{ContentBlock, Message, Role as ProviderRole};
-
-    // Defensive sanitisation: the system prompt is server-controlled and gets forwarded to the
-    // configured provider. Strip any Unicode Cc/Cf codepoints so a hostile server can't smuggle
-    // terminal escapes or homographs into our provider call.
-    let system_prompt = params
-        .system_prompt
-        .as_deref()
-        .map(crate::mcp::sanitize::sanitize_text)
-        .unwrap_or_default();
-
-    let mut messages = Vec::with_capacity(params.messages.len());
-    for sampling_message in &params.messages {
-        let role = match sampling_message.role {
-            Role::User => ProviderRole::User,
-            Role::Assistant => ProviderRole::Assistant,
-        };
-        let mut text = String::new();
-        for content_item in sampling_message.content.iter() {
-            match content_item {
-                SamplingMessageContent::Text(t) => {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&t.text);
-                }
-                SamplingMessageContent::Image(_) => text.push_str("[image content omitted]"),
-                SamplingMessageContent::Audio(_) => text.push_str("[audio content omitted]"),
-                SamplingMessageContent::ToolUse(_) => text.push_str("[tool_use content omitted]"),
-                SamplingMessageContent::ToolResult(_) => {
-                    text.push_str("[tool_result content omitted]")
-                }
-            }
-        }
-        messages.push(Message {
-            role,
-            content: vec![ContentBlock::Text { text }],
-        });
-    }
-
-    Ok((system_prompt, messages))
 }
 
 pub struct McpToolAdapter {
@@ -583,10 +369,10 @@ impl McpToolAdapter {
             let request_id = request_id.clone();
             let server_name = self.entry.server_name().to_string();
             async move {
-                let send = peer.notify_cancelled(CancelledNotificationParam {
-                    request_id,
-                    reason: Some(reason.to_string()),
-                });
+                let send = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some(reason.to_string()),
+                ));
                 match tokio::time::timeout(CANCEL_NOTIFY_TIMEOUT, send).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
@@ -770,7 +556,7 @@ impl Tool for McpToolAdapter {
 /// them; audio, embedded resources, and resource links collapse to informative text placeholders
 /// (no provider accepts them as tool-result blocks yet).
 fn convert_tool_result_content(
-    items: &[rmcp::model::Content],
+    items: &[rmcp::model::ContentBlock],
 ) -> Vec<crate::provider::ToolResultContent> {
     use crate::provider::{ImageSource, ToolResultContent};
 
@@ -786,14 +572,14 @@ fn convert_tool_result_content(
     };
 
     for item in items {
-        match &item.raw {
-            rmcp::model::RawContent::Text(text_content) => {
+        match item {
+            rmcp::model::ContentBlock::Text(text_content) => {
                 if !text_buf.is_empty() {
                     text_buf.push('\n');
                 }
                 text_buf.push_str(&text_content.text);
             }
-            rmcp::model::RawContent::Image(image) => {
+            rmcp::model::ContentBlock::Image(image) => {
                 let mime_ok = ALLOWED_IMAGE_MIME_TYPES
                     .iter()
                     .any(|allowed| image.mime_type.eq_ignore_ascii_case(allowed));
@@ -826,7 +612,7 @@ fn convert_tool_result_content(
                     });
                 }
             }
-            rmcp::model::RawContent::Audio(audio) => {
+            rmcp::model::ContentBlock::Audio(audio) => {
                 if !text_buf.is_empty() {
                     text_buf.push('\n');
                 }
@@ -836,7 +622,7 @@ fn convert_tool_result_content(
                     audio.data.len()
                 ));
             }
-            rmcp::model::RawContent::Resource(resource) => {
+            rmcp::model::ContentBlock::Resource(resource) => {
                 if !text_buf.is_empty() {
                     text_buf.push('\n');
                 }
@@ -857,13 +643,22 @@ fn convert_tool_result_content(
                             blob.len()
                         ));
                     }
+                    _ => text_buf.push_str("[embedded resource omitted]"),
                 }
             }
-            rmcp::model::RawContent::ResourceLink(link) => {
+            rmcp::model::ContentBlock::ResourceLink(link) => {
                 if !text_buf.is_empty() {
                     text_buf.push('\n');
                 }
                 text_buf.push_str(&format!("[resource link: {}]", link.uri));
+            }
+            // `ContentBlock` is non-exhaustive; a block kind this build doesn't recognize collapses
+            // to a placeholder rather than being dropped silently.
+            _ => {
+                if !text_buf.is_empty() {
+                    text_buf.push('\n');
+                }
+                text_buf.push_str("[unsupported content omitted]");
             }
         }
     }
@@ -882,64 +677,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sampling_policy_rejects_when_disabled() {
-        let policy = SamplingPolicy {
-            allowed: false,
-            limit: 10,
-            count: Arc::new(AtomicU32::new(0)),
-        };
-        assert!(!policy.allowed);
-    }
-
-    #[test]
-    fn test_sampling_policy_limit_enforcement() {
-        let policy = SamplingPolicy {
-            allowed: true,
-            limit: 2,
-            count: Arc::new(AtomicU32::new(0)),
-        };
-        // Simulate three requests; only first two should be under the limit.
-        assert!(policy.count.fetch_add(1, Ordering::SeqCst) < policy.limit);
-        assert!(policy.count.fetch_add(1, Ordering::SeqCst) < policy.limit);
-        assert!(policy.count.fetch_add(1, Ordering::SeqCst) >= policy.limit);
-    }
-
-    #[test]
-    fn test_convert_sampling_params_flattens_text() {
-        let mut params = rmcp::model::CreateMessageRequestParams::new(
-            vec![
-                SamplingMessage::user_text("hello"),
-                SamplingMessage::assistant_text("world"),
-            ],
-            100,
-        );
-        params.system_prompt = Some("you are a test".to_string());
-        let (system_prompt, messages) = convert_sampling_params(&params).unwrap();
-        assert_eq!(system_prompt, "you are a test");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, crate::provider::Role::User);
-        assert_eq!(messages[1].role, crate::provider::Role::Assistant);
-    }
-
-    #[test]
     fn test_convert_tool_result_content_text_only() {
-        use rmcp::model::{Content, RawContent, RawTextContent};
-        let items = vec![
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "hello".to_string(),
-                    meta: None,
-                }),
-                None,
-            ),
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "world".to_string(),
-                    meta: None,
-                }),
-                None,
-            ),
-        ];
+        use rmcp::model::ContentBlock;
+        let items = vec![ContentBlock::text("hello"), ContentBlock::text("world")];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
@@ -952,15 +692,8 @@ mod tests {
 
     #[test]
     fn test_convert_tool_result_content_image_passthrough() {
-        use rmcp::model::{Content, RawContent, RawImageContent};
-        let items = vec![Content::new(
-            RawContent::Image(RawImageContent {
-                data: "BASE64DATA".to_string(),
-                mime_type: "image/png".to_string(),
-                meta: None,
-            }),
-            None,
-        )];
+        use rmcp::model::ContentBlock;
+        let items = vec![ContentBlock::image("BASE64DATA", "image/png")];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
@@ -975,15 +708,8 @@ mod tests {
 
     #[test]
     fn test_convert_tool_result_content_image_rejects_disallowed_mime() {
-        use rmcp::model::{Content, RawContent, RawImageContent};
-        let items = vec![Content::new(
-            RawContent::Image(RawImageContent {
-                data: "BASE64DATA".to_string(),
-                mime_type: "image/svg+xml".to_string(),
-                meta: None,
-            }),
-            None,
-        )];
+        use rmcp::model::ContentBlock;
+        let items = vec![ContentBlock::image("BASE64DATA", "image/svg+xml")];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
@@ -997,16 +723,9 @@ mod tests {
 
     #[test]
     fn test_convert_tool_result_content_image_rejects_oversize() {
-        use rmcp::model::{Content, RawContent, RawImageContent};
+        use rmcp::model::ContentBlock;
         let oversized = "X".repeat(MAX_MCP_IMAGE_BYTES + 1);
-        let items = vec![Content::new(
-            RawContent::Image(RawImageContent {
-                data: oversized,
-                mime_type: "image/png".to_string(),
-                meta: None,
-            }),
-            None,
-        )];
+        let items = vec![ContentBlock::image(oversized, "image/png")];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
@@ -1019,46 +738,12 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_sampling_params_sanitises_system_prompt() {
-        let mut params = rmcp::model::CreateMessageRequestParams::new(
-            vec![SamplingMessage::user_text("hi")],
-            32,
-        );
-        // RTL override + ANSI escape must both be stripped.
-        params.system_prompt = Some("safe\u{202E}evil\x1b[2J".to_string());
-        let (system_prompt, _) = convert_sampling_params(&params).unwrap();
-        assert!(!system_prompt.contains('\u{202E}'));
-        assert!(!system_prompt.contains('\x1b'));
-        assert!(system_prompt.contains("safe"));
-        assert!(system_prompt.contains("evil"));
-    }
-
-    #[test]
     fn test_convert_tool_result_content_mixed_keeps_ordering() {
-        use rmcp::model::{Content, RawContent, RawImageContent, RawTextContent};
+        use rmcp::model::ContentBlock;
         let items = vec![
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "before".to_string(),
-                    meta: None,
-                }),
-                None,
-            ),
-            Content::new(
-                RawContent::Image(RawImageContent {
-                    data: "IMG".to_string(),
-                    mime_type: "image/png".to_string(),
-                    meta: None,
-                }),
-                None,
-            ),
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "after".to_string(),
-                    meta: None,
-                }),
-                None,
-            ),
+            ContentBlock::text("before"),
+            ContentBlock::image("IMG", "image/png"),
+            ContentBlock::text("after"),
         ];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 3);

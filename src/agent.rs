@@ -160,9 +160,8 @@ pub struct Agent {
     /// [`crate::frontend::SilentFrontend`], and [`crate::frontend::PermissionForwardingFrontend`].
     frontend: Arc<dyn Frontend>,
     /// Per-session working directory. Initialised from `std::env::current_dir()` at startup;
-    /// updated by `/cd`; read by the file/shell/find/grep tools, the REPL prompt, the per-turn
-    /// environment-context block, and the MCP `roots/list` handler. Process `cwd` is no longer
-    /// mutated.
+    /// updated by `/cd`; read by the file/shell/find/grep tools, the REPL prompt, and the per-turn
+    /// environment-context block. Process `cwd` is no longer mutated.
     cwd: SharedCwd,
     /// Total tokens of this agent's most recent provider round: the live, cache-write, and
     /// cache-read input tiers plus output. That equals everything in context as of the last
@@ -1344,7 +1343,7 @@ impl Agent {
                 .await;
         }
 
-        Self::run_tool(&*tool, input, cancellation, &self.cwd, &self.frontend).await
+        Self::run_tool(&*tool, input, cancellation, &self.frontend).await
     }
 
     async fn execute_with_approval(
@@ -1366,7 +1365,7 @@ impl Agent {
             .await;
         match outcome {
             PermissionOutcome::Allow => {
-                Self::run_tool(tool, input, cancellation, &self.cwd, &self.frontend).await
+                Self::run_tool(tool, input, cancellation, &self.frontend).await
             }
             PermissionOutcome::Deny => {
                 crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)
@@ -1377,34 +1376,28 @@ impl Agent {
         }
     }
 
-    /// Invoke a tool, scoping the per-session cwd and frontend into task-locals so MCP-originated
-    /// callbacks fired during the call (`roots/list`, `notifications/progress`,
-    /// `elicitation/create`) reach the calling session's UI rather than the process default.
-    /// Built-in tools ignore both task-locals: they read cwd from their own `SharedCwd` field and
-    /// never produce MCP callbacks, so the wrap is cheap on those paths.
+    /// Invoke a tool, scoping the per-session frontend into a task-local so MCP-originated
+    /// callbacks fired during the call (`notifications/progress`, `elicitation/create`) reach
+    /// the calling session's UI rather than the process default. Built-in tools ignore the
+    /// task-local (they never produce MCP callbacks), so the wrap is cheap on those paths.
     async fn run_tool(
         tool: &dyn crate::tools::Tool,
         input: &serde_json::Value,
         cancellation: CancellationToken,
-        cwd: &SharedCwd,
         frontend: &Arc<dyn Frontend>,
     ) -> crate::tools::ToolOutput {
         let input = input.clone();
         let frontend = Arc::clone(frontend);
-        crate::mcp::with_session_cwd(cwd.clone(), async move {
-            crate::mcp::with_session_frontend(frontend, async move {
-                match tool.execute(input, cancellation).await {
-                    Ok(output) => output,
-                    Err(MekaError::Interrupted) => crate::tools::ToolOutput::text(
-                        "Tool execution interrupted.".to_string(),
-                        true,
-                    ),
-                    Err(error) => {
-                        crate::tools::ToolOutput::text(format!("Tool error: {}", error), true)
-                    }
+        crate::mcp::with_session_frontend(frontend, async move {
+            match tool.execute(input, cancellation).await {
+                Ok(output) => output,
+                Err(MekaError::Interrupted) => {
+                    crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
                 }
-            })
-            .await
+                Err(error) => {
+                    crate::tools::ToolOutput::text(format!("Tool error: {}", error), true)
+                }
+            }
         })
         .await
     }

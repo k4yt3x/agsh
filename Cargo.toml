@@ -7,7 +7,7 @@ description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
 
 [dependencies]
-agent-client-protocol = "0.15.1"
+agent-client-protocol = "1.0.1"
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -35,7 +35,7 @@ rand = "0.10"
 reedline = { git = "https://github.com/wtfbbqhax/reedline", rev = "3a457ff1dab28c9021db116f2575eed5116bed88", features = ["external_printer"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
-rmcp = { version = "1.7", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
+rmcp = { version = "2.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -51,7 +51,7 @@ tokio-rusqlite = "0.7"
 tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1"
 toml_edit = "0.25"
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+tower-http = { version = "0.7", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"

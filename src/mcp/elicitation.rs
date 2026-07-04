@@ -10,7 +10,7 @@
 //! outside of a tool call, or the call's progress guard already dropped), the request is auto-
 //! declined: the safe default, matching the pre-refactor "no shell sink installed" behaviour.
 
-use rmcp::model::{CreateElicitationResult, ElicitationAction};
+use rmcp::model::{ElicitResult, ElicitationAction};
 
 /// User-facing payload the frontend renders.
 #[derive(Debug)]
@@ -38,23 +38,16 @@ pub enum ElicitationResponse {
 }
 
 impl ElicitationResponse {
-    pub fn into_result(self) -> CreateElicitationResult {
+    pub fn into_result(self) -> ElicitResult {
         match self {
-            ElicitationResponse::Accept { content } => CreateElicitationResult {
-                action: ElicitationAction::Accept,
-                content,
-                meta: None,
-            },
-            ElicitationResponse::Decline => CreateElicitationResult {
-                action: ElicitationAction::Decline,
-                content: None,
-                meta: None,
-            },
-            ElicitationResponse::Cancel => CreateElicitationResult {
-                action: ElicitationAction::Cancel,
-                content: None,
-                meta: None,
-            },
+            ElicitationResponse::Accept {
+                content: Some(content),
+            } => ElicitResult::new(ElicitationAction::Accept).with_content(content),
+            ElicitationResponse::Accept { content: None } => {
+                ElicitResult::new(ElicitationAction::Accept)
+            }
+            ElicitationResponse::Decline => ElicitResult::new(ElicitationAction::Decline),
+            ElicitationResponse::Cancel => ElicitResult::new(ElicitationAction::Cancel),
         }
     }
 }

@@ -125,9 +125,6 @@ pub async fn run_serve(
             provider: mock,
             ..(*shared).clone()
         };
-        new_inner
-            .mcp_context
-            .set_provider(Arc::clone(&new_inner.provider));
         tracing::info!("MEKA_ACP_MOCK_PROVIDER=1, using scripted mock provider");
         Arc::new(new_inner)
     } else {

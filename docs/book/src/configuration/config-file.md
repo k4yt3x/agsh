@@ -604,8 +604,6 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
 | `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
-| `sampling` | No | Allow this server to call `sampling/createMessage` against your configured LLM provider. Default `false` (reject). Enabling this lets a compromised server inject arbitrary messages into your LLM context and burn your provider quota; opt in per-server, deliberately. |
-| `sampling_limit` | No | Cap on sampling calls per meka session from this server when `sampling = true`. Default `10`. Requests beyond the limit return an `INTERNAL_ERROR` to the server. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Defaults to `false`. |
 
 ### `[mcp]` top-level table
@@ -762,7 +760,6 @@ Manage configured servers without editing `config.toml` by hand:
 | `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
 | `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`ask`/`write`. |
-| `--sampling`, `--sampling-limit <N>` | Opt into server-initiated `sampling/createMessage`. |
 
 #### Example: Notion
 
@@ -853,9 +850,7 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 
 | Feature | meka behaviour |
 |---------|----------------|
-| `roots/list` | Returns a single root: `file://<current-working-directory>` with the directory basename as the name. |
-| `elicitation/create` | Always responds with `Decline` and logs a warning; interactive form/URL input is not wired into the REPL. |
-| `sampling/createMessage` | Rejected with `METHOD_NOT_FOUND` unless the server has `sampling = true` in its config. When allowed, the current provider handles the request; per-session `sampling_limit` caps how many times each server may invoke it. |
+| `elicitation/create` | Routed to the calling session's frontend (REPL / ACP form or URL prompt) with a 60s timeout. Auto-declines when no in-flight tool call's frontend is registered or the user doesn't answer in time. |
 
 ### `[mcp.servers.auth]`
 

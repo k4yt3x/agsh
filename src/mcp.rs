@@ -33,7 +33,6 @@ use crate::{
     config::{McpServerConfig, McpTransport},
     error::{MekaError, Result},
     permission::Permission,
-    provider::Provider,
     session::TokenStore,
 };
 
@@ -46,11 +45,6 @@ pub const MAX_MCP_DESCRIPTION_LENGTH: usize = 2048;
 /// would otherwise be cloned verbatim, forwarded to the provider, billed against the user's API
 /// quota, and risk OOM. Mirrors the 10 MiB body cap on `fetch_url`.
 pub const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-
-/// Wall-clock timeout on `provider.complete` calls invoked from a server's `sampling/createMessage`
-/// request. Without it, a hung provider keeps the MCP request open forever; with it, the server
-/// gets a timely error and the sampling slot is freed.
-pub const MCP_SAMPLING_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Allow-list of image MIME types passed straight through to the provider. Anything else (notably
 /// `image/svg+xml`, which can embed script/link elements) is converted to a text placeholder.
@@ -66,18 +60,9 @@ pub(crate) type McpRunningService =
     rmcp::service::RunningService<RoleClient, handler::MekaClientHandler>;
 
 tokio::task_local! {
-    /// Per-task override for the cwd reported in MCP `roots/list`. When an agent dispatches an MCP
-    /// tool from a multi-session ACP process, the dispatch wraps the tool's `execute` future in
-    /// [`with_session_cwd`] so any `roots/list` callback fired *during* the tool call sees the
-    /// calling session's cwd rather than the process default the MCP context was seeded with at
-    /// startup.
-    ///
-    /// `roots/list` queries outside a tool call (e.g. the connection-establishment handshake before
-    /// any session exists) fall back to the process default via [`current_roots_cwd`].
-    static SESSION_CWD: crate::agent::SharedCwd;
     /// Per-task override for the frontend that should receive MCP-originated UI events fired
     /// during the in-flight tool call. Scoped by [`with_session_frontend`] from the agent dispatch
-    /// site (same place that scopes [`SESSION_CWD`]).
+    /// site.
     ///
     /// **Important**: rmcp's notification / server-request callbacks run on *separately spawned*
     /// handler tasks (see `rmcp::service::spawn_service_task`), so this task-local is NOT visible
@@ -87,44 +72,23 @@ tokio::task_local! {
     /// this task-local exists to source the frontend at the agent-driven call site only; the
     /// progress registry is what carries it across the rmcp task boundary.
     ///
-    /// Outside any `with_session_frontend` scope (connection-time handshakes, REPL startup probes,
-    /// `sampling/createMessage` callbacks) [`current_session_frontend`] returns `None` and the
-    /// caller falls back to either auto-decline (elicitation) or a tracing log (progress).
+    /// Outside any `with_session_frontend` scope (connection-time handshakes, REPL startup probes)
+    /// [`current_session_frontend`] returns `None` and the caller falls back to either auto-decline
+    /// (elicitation) or a tracing log (progress).
     static SESSION_FRONTEND: std::sync::Arc<dyn crate::frontend::Frontend>;
-}
-
-/// Read the cwd MCP should report for `roots/list`. Returns the task-local override if set (active
-/// tool call from a session) or the supplied `default` otherwise (connection-time queries,
-/// REPL/oneshot paths where there's a single process-wide cwd).
-pub(crate) fn current_roots_cwd(default: &crate::agent::SharedCwd) -> std::path::PathBuf {
-    SESSION_CWD
-        .try_with(crate::agent::cwd_snapshot)
-        .unwrap_or_else(|_| crate::agent::cwd_snapshot(default))
-}
-
-/// Scope `cwd` as the task-local override for the duration of `fut`. Used by MCP tool dispatch so a
-/// session's cwd reaches the `roots/list` handler without explicit threading through the rmcp
-/// callback API (which doesn't carry session context).
-pub async fn with_session_cwd<F, T>(cwd: crate::agent::SharedCwd, fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    SESSION_CWD.scope(cwd, fut).await
 }
 
 /// Read the per-session frontend currently in scope, if any. Returns `None` outside a
 /// [`with_session_frontend`] block; callers must treat that as "no UI available" rather than
 /// hitting a panic, because MCP callbacks can legitimately fire before any session exists
-/// (connection-time handshakes) or under code paths that intentionally aren't session-scoped
-/// (e.g. the `sampling/createMessage` handler in this module).
+/// (connection-time handshakes) or under code paths that intentionally aren't session-scoped.
 pub(crate) fn current_session_frontend() -> Option<std::sync::Arc<dyn crate::frontend::Frontend>> {
     SESSION_FRONTEND.try_with(|frontend| frontend.clone()).ok()
 }
 
 /// Scope `frontend` as the task-local override for the duration of `fut`. The agent dispatch site
-/// installs this alongside [`with_session_cwd`] so MCP-originated UI events (progress, elicitation)
-/// route through the calling session's `AcpFrontend` / `ReplFrontend` instead of through a
-/// process-global sink.
+/// installs this so MCP-originated UI events (progress, elicitation) route through the calling
+/// session's `AcpFrontend` / `ReplFrontend` instead of through a process-global sink.
 pub async fn with_session_frontend<F, T>(
     frontend: std::sync::Arc<dyn crate::frontend::Frontend>,
     fut: F,
@@ -1175,21 +1139,15 @@ fn resolve_tool_permission_with_source(
 }
 
 /// Shared context threaded into every [`handler::MekaClientHandler`] so notification callbacks and
-/// server-to-client requests (sampling, list_roots, elicitation) can reach the rest of the agent.
-/// All slots are optional because the handler is constructed before the agent/provider exist; they
-/// are filled in post-construction by `main.rs` using the `set_*` helpers.
+/// server-to-client requests (`elicitation/create`, `tools/list_changed`) can reach the rest of the
+/// agent. The manager slot is optional because the handler is constructed before the manager
+/// exists; it is filled in post-construction via [`McpClientContext::set_manager`].
 #[derive(Default)]
 pub struct McpClientContext {
-    /// LLM provider used to serve `sampling/createMessage` requests. Only consulted when a server
-    /// has `sampling = true` in its config.
-    provider: OnceLock<Arc<dyn Provider>>,
     /// Weak reference to the MCP manager so the notification callback can rediscover tools without
     /// creating an Arc cycle through the handler. Tool registry updates flow through the manager's
     /// attached registries; no per-context registry slot is needed.
     manager: OnceLock<Weak<McpClientManager>>,
-    /// Per-session working directory shared with the agent. Read by the `roots/list` handler so
-    /// the path reported to MCP servers tracks `/cd` rather than the process cwd at startup.
-    cwd: OnceLock<crate::agent::SharedCwd>,
 }
 
 impl McpClientContext {
@@ -1197,30 +1155,10 @@ impl McpClientContext {
         Arc::new(Self::default())
     }
 
-    pub fn set_provider(&self, provider: Arc<dyn Provider>) {
-        if self.provider.set(provider).is_err() {
-            tracing::warn!("MCP client context: provider already set");
-        }
-    }
-
     pub fn set_manager(&self, manager: Weak<McpClientManager>) {
         if self.manager.set(manager).is_err() {
             tracing::warn!("MCP client context: manager already set");
         }
-    }
-
-    pub fn set_cwd(&self, cwd: crate::agent::SharedCwd) {
-        if self.cwd.set(cwd).is_err() {
-            tracing::warn!("MCP client context: cwd already set");
-        }
-    }
-
-    pub(crate) fn cwd(&self) -> Option<&crate::agent::SharedCwd> {
-        self.cwd.get()
-    }
-
-    pub(crate) fn provider(&self) -> Option<Arc<dyn Provider>> {
-        self.provider.get().cloned()
     }
 
     pub(crate) fn manager(&self) -> Option<Weak<McpClientManager>> {
@@ -1385,8 +1323,6 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
-            sampling: false,
-            sampling_limit: None,
             disabled: false,
         }
     }
@@ -1940,74 +1876,6 @@ mod tests {
             registry.get("list_mcp_resources").is_none(),
             "no MCP meta-tools should land on the registry when no servers configured"
         );
-    }
-
-    /// Two concurrent tasks each scoping a different cwd through [`with_session_cwd`] must each
-    /// observe their own cwd from [`current_roots_cwd`], not each other's and not the default. This
-    /// is the property that lets MCP `roots/list` callbacks fired during a per-session tool
-    /// invocation report the right roots even when many sessions race tool calls in parallel.
-    #[tokio::test]
-    async fn current_roots_cwd_is_isolated_per_task_scope() {
-        use std::sync::Arc;
-
-        use tokio::sync::Barrier;
-
-        let cwd_a: crate::agent::SharedCwd =
-            Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("/tmp/a")));
-        let cwd_b: crate::agent::SharedCwd =
-            Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("/tmp/b")));
-        let default: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
-            std::path::PathBuf::from("/tmp/default"),
-        ));
-
-        // Force overlapping task lifetimes so the task-local can't accidentally "win" by being set,
-        // run to completion, and unset before the other task starts.
-        let barrier = Arc::new(Barrier::new(2));
-
-        let task_a = {
-            let cwd_a = cwd_a.clone();
-            let default = default.clone();
-            let barrier = barrier.clone();
-            tokio::spawn(async move {
-                with_session_cwd(cwd_a, async move {
-                    // Both tasks reach the barrier inside the scope so their task-locals coexist
-                    // before the read.
-                    barrier.wait().await;
-                    current_roots_cwd(&default)
-                })
-                .await
-            })
-        };
-        let task_b = {
-            let cwd_b = cwd_b.clone();
-            let default = default.clone();
-            let barrier = barrier.clone();
-            tokio::spawn(async move {
-                with_session_cwd(cwd_b, async move {
-                    barrier.wait().await;
-                    current_roots_cwd(&default)
-                })
-                .await
-            })
-        };
-
-        let observed_a = task_a.await.expect("task A");
-        let observed_b = task_b.await.expect("task B");
-
-        assert_eq!(
-            observed_a,
-            std::path::PathBuf::from("/tmp/a"),
-            "task A must see its own cwd"
-        );
-        assert_eq!(
-            observed_b,
-            std::path::PathBuf::from("/tmp/b"),
-            "task B must see its own cwd, not A's, not the default"
-        );
-
-        // Outside any `with_session_cwd` scope, the fallback path must report the process default.
-        let unscoped = current_roots_cwd(&default);
-        assert_eq!(unscoped, std::path::PathBuf::from("/tmp/default"));
     }
 
     /// `update_server_tools` racing against `attach_registry` must not lose updates: every

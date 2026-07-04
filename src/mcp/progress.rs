@@ -220,12 +220,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_without_registration_is_noop() {
-        dispatch(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(Arc::from("unknown"))),
-            progress: 1.0,
-            total: None,
-            message: None,
-        })
+        dispatch(ProgressNotificationParam::new(
+            ProgressToken(NumberOrString::String(Arc::from("unknown"))),
+            1.0,
+        ))
         .await;
         // If it didn't panic we're fine.
     }
@@ -249,12 +247,14 @@ mod tests {
             NumberOrString::Number(n) => n.to_string(),
         };
 
-        dispatch(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(Arc::from(key))),
-            progress: 0.5,
-            total: Some(1.0),
-            message: Some("halfway".into()),
-        })
+        dispatch(
+            ProgressNotificationParam::new(
+                ProgressToken(NumberOrString::String(Arc::from(key))),
+                0.5,
+            )
+            .with_total(1.0)
+            .with_message("halfway"),
+        )
         .await;
 
         let events = recorder.events();
@@ -303,19 +303,21 @@ mod tests {
             NumberOrString::Number(n) => n.to_string(),
         };
 
-        dispatch(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(Arc::from(key_a))),
-            progress: 1.0,
-            total: None,
-            message: Some("for-a".into()),
-        })
+        dispatch(
+            ProgressNotificationParam::new(
+                ProgressToken(NumberOrString::String(Arc::from(key_a))),
+                1.0,
+            )
+            .with_message("for-a"),
+        )
         .await;
-        dispatch(ProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String(Arc::from(key_b))),
-            progress: 2.0,
-            total: None,
-            message: Some("for-b".into()),
-        })
+        dispatch(
+            ProgressNotificationParam::new(
+                ProgressToken(NumberOrString::String(Arc::from(key_b))),
+                2.0,
+            )
+            .with_message("for-b"),
+        )
         .await;
 
         let events_a = recorder_a.events();

@@ -1698,11 +1698,6 @@ pub async fn run_acp(
             provider: mock,
             ..(*shared).clone()
         };
-        // Re-publish the mock provider on the MCP context (overwriting the real one) so MCP
-        // sampling callbacks hit the mock too.
-        new_inner
-            .mcp_context
-            .set_provider(Arc::clone(&new_inner.provider));
         tracing::info!("MEKA_ACP_MOCK_PROVIDER=1: using scripted mock provider");
         Arc::new(new_inner)
     } else {

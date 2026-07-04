@@ -150,7 +150,6 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
             println!("  - {} = {}", key, perms[key]);
         }
     }
-    println!("sampling:    {}", config.sampling);
     Ok(())
 }
 
@@ -515,8 +514,6 @@ pub struct AddArgs {
     pub scope: Vec<String>,
     pub redirect_port: Option<u16>,
     pub permission: Option<String>,
-    pub sampling: bool,
-    pub sampling_limit: Option<u32>,
     /// Skip the auto-login that runs when the probe reports auth-required or when `--auth oauth`
     /// was explicitly set.
     pub no_login: bool,
@@ -557,8 +554,6 @@ struct ResolvedAddArgs {
     disabled_tools: Option<Vec<String>>,
     eager_load_tools: Option<Vec<String>>,
     tool_permissions: Option<std::collections::HashMap<String, String>>,
-    sampling: bool,
-    sampling_limit: Option<u32>,
     no_login: bool,
     disabled: bool,
 }
@@ -800,8 +795,6 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         scope,
         redirect_port,
         permission,
-        sampling,
-        sampling_limit,
         no_login,
         allow_tool,
         disable_tool,
@@ -926,8 +919,6 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 disabled_tools,
                 eager_load_tools,
                 tool_permissions,
-                sampling,
-                sampling_limit,
                 no_login,
                 disabled,
             })
@@ -973,8 +964,6 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 disabled_tools,
                 eager_load_tools,
                 tool_permissions,
-                sampling,
-                sampling_limit,
                 no_login,
                 disabled,
             })
@@ -1136,8 +1125,6 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         disabled_tools: resolved.disabled_tools.clone(),
         eager_load_tools: resolved.eager_load_tools.clone(),
         tool_permissions: resolved.tool_permissions.clone(),
-        sampling: resolved.sampling,
-        sampling_limit: resolved.sampling_limit,
         disabled: resolved.disabled,
     }
 }
@@ -1194,12 +1181,6 @@ fn build_server_table(resolved: &ResolvedAddArgs) -> toml_edit::Table {
     }
     if let Some(permission) = &resolved.permission {
         table.insert("permission", toml_edit::value(permission.clone()));
-    }
-    if resolved.sampling {
-        table.insert("sampling", toml_edit::value(true));
-    }
-    if let Some(limit) = resolved.sampling_limit {
-        table.insert("sampling_limit", toml_edit::value(limit as i64));
     }
     if resolved.disabled {
         table.insert("disabled", toml_edit::value(true));
@@ -1449,8 +1430,6 @@ mod tests {
             scope: Vec::new(),
             redirect_port: None,
             permission: None,
-            sampling: false,
-            sampling_limit: None,
             no_login: false,
             allow_tool: Vec::new(),
             disable_tool: Vec::new(),

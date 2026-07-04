@@ -132,7 +132,6 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 
 ## Known limitations
 
-- **MCP `roots/list` from background queries.** During a tool call, `roots/list` reflects the calling session's cwd via a task-local override. Outside of a tool call (e.g. server-initiated polling), the handler falls back to the process cwd, since the MCP protocol doesn't carry session context.
 - **Tool-call diff metadata isn't persisted.** A session reopened with `session/load` replays `tool_call_update`s as plain text rather than diffs. The on-disk content is unaffected.
 - **`read` mode + `terminal` capability**: meka runs the local sandboxed shell instead of delegating, to preserve the read-only jail. The shell appears in meka's own output rather than the client's terminal pane until you switch to `ask` or `write`.
 - **Image and regex `read_file`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.

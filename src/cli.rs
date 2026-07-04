@@ -414,14 +414,6 @@ pub enum McpAction {
         #[arg(long)]
         permission: Option<String>,
 
-        /// Allow this server to call sampling/createMessage
-        #[arg(long)]
-        sampling: bool,
-
-        /// Max sampling calls per meka session (default 10)
-        #[arg(long)]
-        sampling_limit: Option<u32>,
-
         /// Raw tool name to allow (repeatable; restricts which register)
         #[arg(long = "allow-tool", value_name = "TOOL")]
         allow_tool: Vec<String>,

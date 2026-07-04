@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::{
     MAX_MCP_DESCRIPTION_LENGTH, McpClientContext, McpClientManager, McpRunningService,
     McpRuntimeConfig, ServerEntry, ServerState,
-    handler::{McpToolAdapter, MekaClientHandler, SamplingPolicy},
+    handler::{McpToolAdapter, MekaClientHandler},
     resolve_tool_permission, tool_is_allowed,
     transport::{build_http_transport_config, build_stdio_command},
     truncate, warn_on_stale_tool_config,
@@ -151,13 +151,15 @@ async fn connect_one(
 
     // Capture InitializeResult.instructions on the first Connected transition. Immutable per MCP
     // spec so reconnects don't overwrite.
+    // rmcp 2.1: `peer_info()` returns `Option<Arc<InitializeResult>>` (owned) rather than a borrow,
+    // so clone the instructions string out of the `Arc` before truncating.
     let captured = connected
         .peer()
         .peer_info()
-        .and_then(|info| info.instructions.as_ref())
+        .and_then(|info| info.instructions.clone())
         .map(|raw| {
             crate::mcp::truncate(
-                &crate::mcp::sanitize::sanitize_text(raw),
+                &crate::mcp::sanitize::sanitize_text(&raw),
                 MAX_MCP_DESCRIPTION_LENGTH,
             )
         });
@@ -372,11 +374,7 @@ pub(super) async fn connect_server(
 ) -> Result<McpRunningService> {
     use rmcp::ServiceExt;
 
-    let handler = MekaClientHandler::new(
-        server_name.to_string(),
-        SamplingPolicy::from_config(config),
-        Arc::clone(client_context),
-    );
+    let handler = MekaClientHandler::new(server_name.to_string(), Arc::clone(client_context));
 
     match config.transport {
         McpTransport::Stdio => {
@@ -509,8 +507,6 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
-            sampling: false,
-            sampling_limit: None,
             disabled: false,
         }
     }
