@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.32.0"
+version = "0.32.1"
 edition = "2024"
 license = "MIT"
 description = "A general-purpose AI agent harness"

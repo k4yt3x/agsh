@@ -750,13 +750,14 @@ struct OAuthRateLimit {
 /// The `extra_usage` block from `GET /api/oauth/usage`. The credit figures are carried inline here
 /// (not in a separate top-level object): `used_credits` and `monthly_limit` are both in cents (the
 /// API's minor unit), so divide by 100 for dollars. Credits are billed in USD, so no currency is
-/// reported.
+/// reported. Typed `f64` because the live API sends them as JSON floats (e.g. `1832.0`), which a
+/// stricter `i64` field would reject.
 #[derive(Deserialize)]
 struct OAuthExtraUsage {
     is_enabled: Option<bool>,
     utilization: Option<f64>,
-    used_credits: Option<i64>,
-    monthly_limit: Option<i64>,
+    used_credits: Option<f64>,
+    monthly_limit: Option<f64>,
 }
 
 impl OAuthUsageResponse {
@@ -778,10 +779,10 @@ impl OAuthUsageResponse {
 /// dollars; `balance` is the remaining allowance (`monthly_limit - used_credits`) in dollars.
 fn oauth_extra_usage(extra_usage: Option<OAuthExtraUsage>) -> Option<ExtraUsage> {
     let extra_usage = extra_usage?;
-    let used = extra_usage.used_credits.map(|cents| cents as f64 / 100.0);
+    let used = extra_usage.used_credits.map(|cents| cents / 100.0);
     let balance = extra_usage
         .monthly_limit
-        .map(|limit| (limit - extra_usage.used_credits.unwrap_or(0)) as f64 / 100.0);
+        .map(|limit| (limit - extra_usage.used_credits.unwrap_or(0.0)) / 100.0);
     Some(ExtraUsage {
         enabled: extra_usage.is_enabled.unwrap_or(false),
         utilization: extra_usage.utilization,
@@ -1332,11 +1333,12 @@ mod tests {
 
     #[test]
     fn test_oauth_extra_usage_maps_credits() {
-        // Credit dollars are carried inline in `extra_usage`, in cents: used_credits=350 -> $3.50
-        // spent, monthly_limit=1000 -> $10.00 cap, so balance = (1000 - 350)/100 = $6.50.
+        // Credit dollars are carried inline in `extra_usage`, in cents. The live API sends them as
+        // JSON floats (e.g. `1832.0`), so the fields must be `f64`: used_credits=1832.0 -> $18.32
+        // spent, monthly_limit=5000.0 -> $50.00 cap, so balance = (5000 - 1832)/100 = $31.68.
         let body = r#"{
             "five_hour": {"utilization": 8.0, "resets_at": null},
-            "extra_usage": {"is_enabled": true, "utilization": 35.0, "used_credits": 350, "monthly_limit": 1000}
+            "extra_usage": {"is_enabled": true, "utilization": 35.0, "used_credits": 1832.0, "monthly_limit": 5000.0}
         }"#;
         let extra = serde_json::from_str::<OAuthUsageResponse>(body)
             .expect("parse usage")
@@ -1345,8 +1347,8 @@ mod tests {
             .expect("extra_usage");
         assert!(extra.enabled);
         assert_eq!(extra.utilization, Some(35.0));
-        assert_eq!(extra.used, Some(3.5));
-        assert_eq!(extra.balance, Some(6.5));
+        assert_eq!(extra.used, Some(18.32));
+        assert_eq!(extra.balance, Some(31.68));
         assert_eq!(extra.currency, None);
     }
 
