@@ -97,9 +97,13 @@ Task statuses are `pending`, `in_progress`, `completed`, and `cancelled`. Callin
 
 ## `spawn_agent`
 
-Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent inherits the parent's permission level, gets its own private todo list (`todo` operates on the sub-agent's own state), and cannot recursively spawn further sub-agents. The sub-agent runs silently (its tool calls are not surfaced to the terminal) and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
+Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private todo list (`todo` operates on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
 
 Multiple `spawn_agent` calls in one assistant turn run in parallel; useful when independent investigations can proceed concurrently.
+
+**Recursion.** Sub-agents may themselves spawn further sub-agents, so an agent can orchestrate a team. Nesting is bounded by [`session.subagent_max_depth`](../configuration/config-file.md#sessionsubagent_max_depth) (default 3; `1` reproduces the old "sub-agents can't spawn" behavior, `0` disables `spawn_agent` entirely). Pass the optional `max_depth` parameter to tune how deep a given subtree may recurse; a built-in absolute cap always bounds real nesting so recursion can't run away.
+
+**Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `ask` / `write`) to run it at a *more restricted* level: the value is clamped to the parent's level as a ceiling, so a sub-agent can never be escalated above its parent. This lets a write-mode orchestrator hand untrusted or risky work to a read-only sub-agent.
 
 ## `skill`
 

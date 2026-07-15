@@ -14,7 +14,11 @@ use std::{
 
 use crossterm::style::Color;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Permission levels in increasing order of autonomy (`None < Read < Ask < Write`). The derived
+/// `Ord` follows the `#[repr(u8)]` discriminant and exists so a sub-agent's level can be clamped to
+/// its parent's as a ceiling (`min`); it is deliberately distinct from [`Permission::allows`], a
+/// capability predicate that treats `Ask` and `Write` as equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Permission {
     None = 0,
@@ -243,6 +247,18 @@ mod tests {
         assert!(!Permission::None.allows(Permission::Read));
         assert!(!Permission::None.allows(Permission::Ask));
         assert!(!Permission::None.allows(Permission::Write));
+    }
+
+    #[test]
+    fn test_permission_ordering() {
+        assert!(Permission::None < Permission::Read);
+        assert!(Permission::Read < Permission::Ask);
+        assert!(Permission::Ask < Permission::Write);
+        // `min` is the clamp used to bound a sub-agent's level to its parent's ceiling.
+        assert_eq!(Permission::Read.min(Permission::Write), Permission::Read);
+        assert_eq!(Permission::Write.min(Permission::Read), Permission::Read);
+        assert_eq!(Permission::Ask.min(Permission::Write), Permission::Ask);
+        assert_eq!(Permission::Write.min(Permission::Write), Permission::Write);
     }
 
     #[test]

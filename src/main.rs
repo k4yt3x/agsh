@@ -440,6 +440,8 @@ struct AgentAssembly<'a> {
     builtin_filter: crate::tools::BuiltinToolFilter,
     agent_options: AgentOptions,
     session_stats: Arc<stats::SessionStats>,
+    /// Seeds the root `SpawnAgentTool`'s recursion budget from `session.subagent_max_depth`.
+    subagent_max_depth: usize,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -480,7 +482,9 @@ async fn assemble_agent(
         Arc::clone(&frontend),
     )?;
 
-    if bundle.builtin_filter.admits("spawn_agent") {
+    // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `spawn_agent`); `>= 1`
+    // seeds the root's soft recursion budget. The `absolute_depth` starts at 0 for the root.
+    if bundle.subagent_max_depth >= 1 && bundle.builtin_filter.admits("spawn_agent") {
         tool_registry.register(Arc::new(crate::tools::subagent::SpawnAgentTool {
             provider: Arc::clone(&bundle.provider),
             parent_permission: shared_permission.clone(),
@@ -501,6 +505,8 @@ async fn assemble_agent(
                 parent_frontend: Arc::clone(&frontend),
             },
             user_instructions: bundle.user_instructions.clone(),
+            remaining_depth: bundle.subagent_max_depth,
+            absolute_depth: 0,
         }))?;
     }
 
@@ -562,6 +568,7 @@ pub async fn build_session_agent(
         builtin_filter: shared.builtin_filter.clone(),
         agent_options: shared.agent_options.clone(),
         session_stats: Arc::clone(&shared.session_stats),
+        subagent_max_depth: shared.config.subagent_max_depth,
     };
     assemble_agent(bundle, shared_permission, frontend, cwd).await
 }
@@ -672,6 +679,7 @@ async fn create_agent_from_config(
         builtin_filter: builtin_filter.clone(),
         agent_options: agent_options.clone(),
         session_stats: Arc::clone(&session_stats),
+        subagent_max_depth: config.subagent_max_depth,
     };
     let (agent, _tool_registry) =
         assemble_agent(bundle, shared_permission, frontend, Arc::clone(&cwd)).await?;

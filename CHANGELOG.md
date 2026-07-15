@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Codex login accepts a pasted callback URL when the loopback callback can't be reached.
+- Recursive sub-agents, bounded by `session.subagent_max_depth` (default 3) and `max_depth`.
+- `spawn_agent` gains a `permission` param to restrict a sub-agent below the parent's level.
 
 ### Changed
 

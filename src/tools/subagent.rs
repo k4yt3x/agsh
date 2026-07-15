@@ -14,10 +14,16 @@ use crate::{
     context::build_environment_context,
     conversation::Conversation,
     error::{MekaError, Result},
-    permission::{Permission, SharedPermission},
+    permission::{EnabledPermissions, Permission, SharedPermission},
     provider::{Provider, ToolDefinition},
     session::SessionManager,
 };
+
+/// Hard ceiling on sub-agent nesting depth, independent of the tunable
+/// `session.subagent_max_depth` budget. Guarantees recursion always terminates even if an agent
+/// re-grants `max_depth` at every level: no agent nested deeper than this is given a `spawn_agent`
+/// tool, so the tree can never exceed this height.
+const SUBAGENT_ABSOLUTE_MAX_DEPTH: usize = 16;
 
 /// Parameters needed to build a fresh ToolRegistry for sub-agents.
 #[derive(Clone)]
@@ -73,6 +79,15 @@ pub struct SpawnAgentTool {
     pub parent_permission: SharedPermission,
     pub tool_builder_params: ToolBuilderParams,
     pub user_instructions: Option<String>,
+    /// Soft, agent-tunable recursion budget for sub-agents spawned by this tool. The root tool is
+    /// seeded from `session.subagent_max_depth`; each level hands the child `remaining_depth - 1`
+    /// unless the caller overrides it via the `max_depth` param. A nested `spawn_agent` is granted
+    /// only while the child's budget is `>= 1`.
+    pub remaining_depth: usize,
+    /// Monotonic absolute nesting depth of the agent holding this tool (root = 0). Unlike
+    /// `remaining_depth` it can't be reset by `max_depth`, so it bounds real recursion at
+    /// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`] regardless of what the agent requests.
+    pub absolute_depth: usize,
 }
 
 #[async_trait]
@@ -93,7 +108,10 @@ impl Tool for SpawnAgentTool {
                           sub-agent later, set the `scratchpad` parameter on the originating \
                           tool call (e.g. `execute_command({command: \"...\", scratchpad: \
                           \"build_log\"})`) so the entry has a semantic name you can pass \
-                          through `inherit_scratchpad`."
+                          through `inherit_scratchpad`. Sub-agents may themselves spawn further \
+                          sub-agents up to a configured depth; tune a subtree's depth with \
+                          `max_depth`. Pass `permission` to run the sub-agent at a more \
+                          restricted level than your own (you can restrict but never escalate)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -126,6 +144,23 @@ impl Tool for SpawnAgentTool {
                                         targeting an inherited name return an error so the \
                                         sub-agent can't silently shadow your copy. Names that \
                                         don't exist in the parent are silently skipped."
+                    },
+                    "permission": {
+                        "type": "string",
+                        "enum": ["none", "read", "ask", "write"],
+                        "description": "Permission level for the sub-agent, clamped to your own \
+                                        level as a ceiling: you can restrict but never escalate. \
+                                        Defaults to your current level. Use a lower level (e.g. \
+                                        \"read\") to sandbox untrusted or risky work."
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Override how many further levels of sub-agents this \
+                                        sub-agent may itself spawn. Defaults to one less than your \
+                                        own remaining budget. 0 forbids it from spawning further; \
+                                        larger values are still bounded by a built-in absolute \
+                                        recursion cap."
                     }
                 }
             }),
@@ -200,9 +235,24 @@ impl Tool for SpawnAgentTool {
             })
             .unwrap_or_default();
 
-        // Inherit the parent's permission level directly. Ask-mode prompts route through
-        // `PermissionForwardingFrontend` so they surface in the parent's UI.
-        let sub_perm = self.parent_permission.get();
+        // Resolve the sub-agent's permission: an optional `permission` param clamped to the
+        // parent's level as a ceiling (restrict-only, never escalate); absent keeps the parent's
+        // level. Ask-mode prompts route through `PermissionForwardingFrontend` so they surface in
+        // the parent's UI.
+        let requested_permission = input["permission"]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let sub_perm =
+            resolve_subagent_permission(requested_permission, self.parent_permission.get())?;
+
+        // Optional `max_depth`: the caller's override for how deep this sub-agent's own subtree may
+        // recurse. Consumed by `child_spawn_depth` when deciding whether to grant a nested
+        // `spawn_agent` below.
+        let max_depth_override = input
+            .get("max_depth")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
 
         // Resolve parent session ID. By the time a tool runs, `Agent::run_turn` has already written
         // `shared_session_id` before dispatching tools. A missing value here means an agent ran a
@@ -257,10 +307,15 @@ impl Tool for SpawnAgentTool {
             None => None,
         };
 
-        // Build a sub-agent tool registry: no `spawn_agent` (no recursive spawning) and a fresh,
-        // private todo list so the sub-agent's `todo` calls don't touch the parent's task
-        // tracking. Scratchpad and render_image use the new sub-session ID.
-        let sub_shared_perm = SharedPermission::new(sub_perm, self.parent_permission.enabled());
+        // Build a sub-agent tool registry with a fresh, private todo list so the sub-agent's `todo`
+        // calls don't touch the parent's task tracking; scratchpad and render_image use the new
+        // sub-session ID. A nested `spawn_agent` is added after the registry is built, when the
+        // recursion budget allows (see `child_spawn_depth` below). The enabled-permission set is
+        // clamped to the sub-agent's level too, so the ceiling can't be re-escalated.
+        let sub_shared_perm = SharedPermission::new(
+            sub_perm,
+            clamp_enabled_permissions(self.parent_permission.enabled(), sub_perm),
+        );
         let sub_todo_list: super::todo::SharedTodoList =
             Arc::new(tokio::sync::RwLock::new(super::todo::TodoState::default()));
         // Snapshot the parent's cwd at sub-agent build time so a parent `/cd` mid-sub-agent
@@ -294,7 +349,7 @@ impl Tool for SpawnAgentTool {
                 Some(parent_sid)
             },
             inherited_scratchpad.clone(),
-            sub_cwd,
+            sub_cwd.clone(),
             Arc::clone(&self.tool_builder_params.parent_frontend),
         )
         .map_err(|error| MekaError::ToolExecution {
@@ -312,6 +367,38 @@ impl Tool for SpawnAgentTool {
             if let Some(manager) = weak.upgrade() {
                 manager.install_tools_on(&sub_registry).await;
             }
+        }
+
+        // Grant the sub-agent its own `spawn_agent` when its recursion budget allows, so it can
+        // orchestrate a team of its own sub-agents. Registered here (before the tool catalogue is
+        // snapshotted for the system prompt below) and outside `build_for_subagent`, mirroring the
+        // root registration in `assemble_agent` (main.rs). `child_spawn_depth` bounds nesting with
+        // two counters: `remaining_depth` is the soft, `max_depth`-tunable budget; `absolute_depth`
+        // is the hard cap that guarantees termination.
+        let (child_remaining_depth, child_absolute_depth, allow_nested_spawn) = child_spawn_depth(
+            self.remaining_depth,
+            self.absolute_depth,
+            max_depth_override,
+        );
+        if allow_nested_spawn
+            && self
+                .tool_builder_params
+                .builtin_filter
+                .admits("spawn_agent")
+        {
+            let child_params = ToolBuilderParams {
+                parent_shared_session_id: sub_shared_session_id.clone(),
+                parent_cwd: sub_cwd,
+                ..self.tool_builder_params.clone()
+            };
+            sub_registry.register(Arc::new(SpawnAgentTool {
+                provider: Arc::clone(&self.provider),
+                parent_permission: sub_shared_perm.clone(),
+                tool_builder_params: child_params,
+                user_instructions: self.user_instructions.clone(),
+                remaining_depth: child_remaining_depth,
+                absolute_depth: child_absolute_depth,
+            }))?;
         }
 
         // Build the sub-agent's system prompt against the fully-loaded registry (registry now
@@ -383,6 +470,63 @@ impl Tool for SpawnAgentTool {
             .unwrap_or_else(|| "(sub-agent produced no final text)".to_string());
         Ok(ToolOutput::text(report, false))
     }
+}
+
+/// Parse an optional caller-supplied permission string and clamp it to the parent's level as a
+/// ceiling. `None` keeps the parent's level (inherit verbatim). A sub-agent can only ever run at an
+/// equal-or-more-restricted level than its parent (`min` over the discriminant order
+/// `None < Read < Ask < Write`), so a parent turn can hand risky work to a locked-down sub-agent
+/// but can never escalate one. An unrecognized string is a hard error, not a silent fallback.
+fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> Result<Permission> {
+    match requested {
+        Some(text) => {
+            let requested =
+                text.parse::<Permission>()
+                    .map_err(|message| MekaError::ToolExecution {
+                        tool_name: "spawn_agent".to_string(),
+                        message,
+                    })?;
+            Ok(requested.min(parent))
+        }
+        None => Ok(parent),
+    }
+}
+
+/// Restrict an `EnabledPermissions` set to modes at or below `ceiling`. Defense-in-depth for the
+/// permission clamp: sub-agents have no runtime permission-switch path today, so their initial
+/// level is what governs, but bounding the enabled set means any future switch path can't climb a
+/// sub-agent back above the ceiling its parent set. Falls back to a singleton `{ceiling}` set when
+/// the intersection is empty (e.g. the parent enabled only higher modes).
+fn clamp_enabled_permissions(
+    enabled: EnabledPermissions,
+    ceiling: Permission,
+) -> EnabledPermissions {
+    EnabledPermissions::from_modes(enabled.iter().filter(|mode| *mode <= ceiling)).unwrap_or_else(
+        || EnabledPermissions::from_modes([ceiling]).unwrap_or(EnabledPermissions::DEFAULT),
+    )
+}
+
+/// Compute the recursion budget for a sub-agent one level below a `SpawnAgentTool` with the given
+/// `remaining_depth` / `absolute_depth`, honoring an optional `max_depth` override.
+///
+/// Returns `(child_remaining, child_absolute, allow_nested)`. `remaining_depth` is the soft,
+/// agent-tunable budget seeded from `session.subagent_max_depth`; `max_depth` may raise it.
+/// `absolute_depth` is the monotonic hard counter: it always increments and, once it reaches
+/// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], no further `spawn_agent` is granted, so recursion terminates
+/// even if the agent re-grants `max_depth` at every level. A nested `spawn_agent` is granted only
+/// when both budgets allow it.
+fn child_spawn_depth(
+    remaining_depth: usize,
+    absolute_depth: usize,
+    max_depth_override: Option<usize>,
+) -> (usize, usize, bool) {
+    let child_remaining = match max_depth_override {
+        Some(requested) => requested,
+        None => remaining_depth.saturating_sub(1),
+    };
+    let child_absolute = absolute_depth + 1;
+    let allow_nested = child_remaining >= 1 && child_absolute < SUBAGENT_ABSOLUTE_MAX_DEPTH;
+    (child_remaining, child_absolute, allow_nested)
 }
 
 /// Compose the sub-agent's first-turn task from an optional parent directive and an optional
@@ -536,6 +680,102 @@ mod tests {
             Some("skill body".to_string()),
         );
         assert_eq!(compose_subagent_task(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_subagent_permission_inherits_when_absent() {
+        assert_eq!(
+            resolve_subagent_permission(None, Permission::Write).unwrap(),
+            Permission::Write
+        );
+        assert_eq!(
+            resolve_subagent_permission(None, Permission::Read).unwrap(),
+            Permission::Read
+        );
+    }
+
+    #[test]
+    fn test_resolve_subagent_permission_clamps_to_parent_ceiling() {
+        // Requesting a higher level than the parent is clamped down: a sub-agent can never be
+        // escalated above its parent.
+        assert_eq!(
+            resolve_subagent_permission(Some("write"), Permission::Read).unwrap(),
+            Permission::Read
+        );
+        assert_eq!(
+            resolve_subagent_permission(Some("ask"), Permission::Read).unwrap(),
+            Permission::Read
+        );
+        // Requesting a lower level restricts the sub-agent below the parent.
+        assert_eq!(
+            resolve_subagent_permission(Some("read"), Permission::Write).unwrap(),
+            Permission::Read
+        );
+        assert_eq!(
+            resolve_subagent_permission(Some("none"), Permission::Write).unwrap(),
+            Permission::None
+        );
+    }
+
+    #[test]
+    fn test_resolve_subagent_permission_rejects_invalid() {
+        assert!(resolve_subagent_permission(Some("admin"), Permission::Write).is_err());
+    }
+
+    #[test]
+    fn test_clamp_enabled_permissions_drops_higher_modes() {
+        let clamped = clamp_enabled_permissions(EnabledPermissions::ALL, Permission::Read);
+        assert!(clamped.is_enabled(Permission::None));
+        assert!(clamped.is_enabled(Permission::Read));
+        assert!(!clamped.is_enabled(Permission::Ask));
+        assert!(!clamped.is_enabled(Permission::Write));
+    }
+
+    #[test]
+    fn test_clamp_enabled_permissions_falls_back_to_singleton() {
+        // Parent enabled only Write; clamping to Read leaves an empty intersection, so we fall back
+        // to a singleton set of the ceiling itself rather than an invalid empty set.
+        let only_write = EnabledPermissions::from_modes([Permission::Write]).unwrap();
+        let clamped = clamp_enabled_permissions(only_write, Permission::Read);
+        assert!(clamped.is_enabled(Permission::Read));
+        assert!(!clamped.is_enabled(Permission::Write));
+    }
+
+    #[test]
+    fn test_child_spawn_depth_natural_decrement() {
+        let (remaining, absolute, allow) = child_spawn_depth(3, 0, None);
+        assert_eq!(remaining, 2);
+        assert_eq!(absolute, 1);
+        assert!(allow);
+    }
+
+    #[test]
+    fn test_child_spawn_depth_leaf_when_budget_exhausted() {
+        // remaining_depth = 1 reproduces the historical "root spawns, sub-agents can't" behavior:
+        // the child gets 0 and is not granted a nested spawn_agent.
+        let (remaining, _absolute, allow) = child_spawn_depth(1, 0, None);
+        assert_eq!(remaining, 0);
+        assert!(!allow);
+    }
+
+    #[test]
+    fn test_child_spawn_depth_override_raises_soft_budget() {
+        // An explicit max_depth raises the soft budget above the natural decrement.
+        let (remaining, _absolute, allow) = child_spawn_depth(1, 0, Some(5));
+        assert_eq!(remaining, 5);
+        assert!(allow);
+        // max_depth = 0 explicitly forbids the sub-agent from spawning further.
+        let (_remaining, _absolute, allow_zero) = child_spawn_depth(3, 0, Some(0));
+        assert!(!allow_zero);
+    }
+
+    #[test]
+    fn test_child_spawn_depth_absolute_cap_forces_leaf() {
+        // Even with a large soft budget, the monotonic absolute counter stops recursion at the cap.
+        let (_remaining, absolute, allow) =
+            child_spawn_depth(100, SUBAGENT_ABSOLUTE_MAX_DEPTH - 1, Some(100));
+        assert_eq!(absolute, SUBAGENT_ABSOLUTE_MAX_DEPTH);
+        assert!(!allow);
     }
 
     async fn test_session_manager() -> SessionManager {

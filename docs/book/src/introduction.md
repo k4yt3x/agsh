@@ -27,7 +27,7 @@ The same agent core is exposed through four front-ends:
 - **Permission model**: control what the agent can do (none/read/ask/write), switchable mid-session
 - **Sessions**: conversations persisted in SQLite; resume, export, or compact any session
 - **Working memory**: a session-scoped scratchpad for intermediate results that stays out of the context window
-- **Sub-agents**: delegate research or analysis to sub-agents that inherit the parent's permission level
+- **Sub-agents**: delegate research or analysis to sub-agents that can orchestrate their own sub-agent teams and be run at a restricted permission level
 - **Skills**: load reusable, user-authored instruction packages on demand
 - **Context management**: automatic compaction keeps long sessions under the model's context limit
 - **Extended thinking**: `claude-api` and `claude-oauth` support extended thinking for complex reasoning

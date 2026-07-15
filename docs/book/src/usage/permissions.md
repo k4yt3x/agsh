@@ -91,7 +91,7 @@ Any built-in tool's required permission can be overridden from `config.toml` wit
 
 ### Sub-agent permissions
 
-Sub-agents spawned via `spawn_agent` inherit the parent's permission level. In write mode the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; in read mode it's confined to read-only tools. To run delegated work with reduced privileges, cycle the parent into read mode before issuing the spawning prompt.
+Sub-agents spawned via `spawn_agent` inherit the parent's permission level by default. In write mode the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; in read mode it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `spawn_agent({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. Alternatively, cycle the parent into a lower mode before issuing the spawning prompt to restrict every sub-agent it spawns.
 
 ## Examples
 

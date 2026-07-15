@@ -517,6 +517,17 @@ Override the model's context window size (in tokens). Used for auto-compact thre
 context_window = 200000
 ```
 
+### `session.subagent_max_depth`
+
+Maximum recursion depth for sub-agents spawned via [`spawn_agent`](../tools/overview.md#spawn_agent). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `spawn_agent`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `spawn_agent` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
+
+Default: `3`
+
+```toml
+[session]
+subagent_max_depth = 3
+```
+
 ## `[thinking]`
 
 Settings for extended thinking (`claude-api` and `claude-oauth` providers). Claude 4.6+ models use adaptive thinking automatically; older models use a fixed token budget.

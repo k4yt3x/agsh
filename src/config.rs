@@ -383,6 +383,8 @@ const DEFAULT_RETENTION_DAYS: u64 = 90;
 const DEFAULT_MAX_STORAGE_BYTES: u64 = 50 * 1024 * 1024;
 /// Default extended-thinking token budget.
 const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
+/// Default maximum sub-agent recursion depth (root spawns down to grandchild).
+const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ShellConfig {
@@ -442,6 +444,7 @@ pub struct SessionConfig {
     pub max_storage_bytes: Option<u64>,
     pub auto_compact: Option<bool>,
     pub context_window: Option<u64>,
+    pub subagent_max_depth: Option<usize>,
 }
 
 /// One named provider profile from `[providers.<name>]`. Holds only non-secret settings; the
@@ -543,6 +546,10 @@ pub struct ResolvedConfig {
     pub redact_thinking: bool,
     pub auto_compact: bool,
     pub context_window: Option<u64>,
+    /// Maximum sub-agent recursion depth. `1` matches the historical "root spawns, sub-agents
+    /// can't" behavior; `0` disables `spawn_agent` entirely. Seeds the root `SpawnAgentTool`'s
+    /// depth budget in `main.rs`.
+    pub subagent_max_depth: usize,
     /// Whether the active profile's model accepts image input (the ACP `image` prompt capability).
     /// Resolved from `[providers.<name>].vision`, defaulting to `true`.
     pub vision: bool,
@@ -1484,6 +1491,9 @@ impl ResolvedConfig {
             context_window: active
                 .and_then(|profile| profile.context_window)
                 .or(file_session.context_window),
+            subagent_max_depth: file_session
+                .subagent_max_depth
+                .unwrap_or(DEFAULT_SUBAGENT_MAX_DEPTH),
             vision: active.and_then(|profile| profile.vision).unwrap_or(true),
             max_output_tokens: active.and_then(|profile| profile.max_output_tokens),
             mcp_servers,
@@ -2427,10 +2437,12 @@ context_messages = 50
         let context_messages = file_session.context_messages.or(Some(200));
         let retention_days = file_session.retention_days.or(Some(90));
         let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
+        let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(context_messages, Some(200));
         assert_eq!(retention_days, Some(90));
         assert_eq!(max_storage_bytes, Some(52_428_800));
+        assert_eq!(subagent_max_depth, 3);
     }
 
     #[test]
@@ -2484,16 +2496,19 @@ permission = "write"
 context_messages = 50
 retention_days = 30
 max_storage_bytes = 10485760
+subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let file_session = config.session.unwrap_or_default();
         let context_messages = file_session.context_messages.or(Some(200));
         let retention_days = file_session.retention_days.or(Some(90));
         let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
+        let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(context_messages, Some(50));
         assert_eq!(retention_days, Some(30));
         assert_eq!(max_storage_bytes, Some(10_485_760));
+        assert_eq!(subagent_max_depth, 5);
     }
 
     #[test]
