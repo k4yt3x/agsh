@@ -4,7 +4,7 @@
 //! credential — an API key or OAuth bundle — is stored in the database keyed by profile name and
 //! acquired here via `add` / `login`. This replaces the old one-shot `meka setup` wizard.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt;
@@ -83,8 +83,6 @@ async fn run_add(
         None => prompt_backend()?,
     };
 
-    let credential = acquire_credential(&backend, api_key_stdin, None).await?;
-
     let model = match model_flag {
         Some(model) => model,
         None => {
@@ -110,6 +108,11 @@ async fn run_add(
             (!input.is_empty()).then_some(input)
         }
     };
+
+    // Acquire the credential last: the Codex OAuth login races a pasted-callback-URL reader against
+    // the loopback callback, and if the callback wins it can leave a stdin read parked. Keeping the
+    // interactive prompts above (which read stdin) before this ensures nothing reads stdin after.
+    let credential = acquire_credential(&backend, api_key_stdin, None).await?;
 
     token_store
         .save_provider_credential(name, &credential)
@@ -216,7 +219,7 @@ fn validate_backend(value: &str) -> anyhow::Result<&str> {
 fn default_model_for(backend: &str) -> Option<&'static str> {
     match backend {
         "claude-api" | "claude-oauth" => Some("claude-opus-4-8"),
-        "openai-api" | "openai-codex" => Some("gpt-5.5"),
+        "openai-api" | "openai-codex" => Some("gpt-5.6-sol"),
         _ => None,
     }
 }
@@ -514,37 +517,103 @@ async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> 
     let client_id = client_id.unwrap_or(DEFAULT_OPENAI_CODEX_CLIENT_ID);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
-
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", CODEX_REDIRECT_PORT))
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to bind callback listener on 127.0.0.1:{}: {}. \
-                 Is another login already running?",
-                CODEX_REDIRECT_PORT,
-                error
-            )
-        })?;
     let redirect_uri = format!("http://localhost:{}/auth/callback", CODEX_REDIRECT_PORT);
     let url = build_codex_authorize_url(client_id, &code_challenge, &state, &redirect_uri)?;
+
+    // The loopback callback only works when the browser runs on this machine. On a remote/headless
+    // box the redirect lands on the user's laptop instead, so a TTY session can still finish by
+    // pasting the callback URL; a bind failure there degrades to paste-only rather than aborting.
+    let paste_enabled = io::stdin().is_terminal();
+    let listener =
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", CODEX_REDIRECT_PORT)).await {
+            Ok(listener) => Some(listener),
+            Err(error) if paste_enabled => {
+                tracing::warn!(
+                    "failed to bind callback listener on 127.0.0.1:{}: {}. \
+                     Falling back to pasting the callback URL.",
+                    CODEX_REDIRECT_PORT,
+                    error
+                );
+                None
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "failed to bind callback listener on 127.0.0.1:{}: {}. \
+                     Is another login already running?",
+                    CODEX_REDIRECT_PORT,
+                    error
+                );
+            }
+        };
 
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser for Codex login: {}", error);
     }
     eprintln!("\nTo authorize, open this URL in your browser:");
     eprintln!("    {}\n", url);
-    eprintln!(
-        "Waiting up to {}s for the callback on 127.0.0.1:{}...",
-        CODEX_CALLBACK_TIMEOUT.as_secs(),
-        CODEX_REDIRECT_PORT
-    );
+    if listener.is_some() {
+        eprintln!(
+            "Waiting up to {}s for the callback on 127.0.0.1:{}...",
+            CODEX_CALLBACK_TIMEOUT.as_secs(),
+            CODEX_REDIRECT_PORT
+        );
+    }
+    if paste_enabled {
+        eprintln!(
+            "Or, if your browser is on another machine, paste the full callback URL here and press Enter."
+        );
+    }
 
-    let (received_code, received_state) =
-        accept_codex_callback(listener, CODEX_CALLBACK_TIMEOUT).await?;
+    // Race the loopback callback against a pasted-URL reader when both are viable. The accept
+    // future carries the timeout that bounds the whole wait; the paste reader parks on EOF so a
+    // non-interactive stdin can never win the race against a real callback.
+    let (received_code, received_state) = match (listener, paste_enabled) {
+        (Some(listener), true) => tokio::select! {
+            result = accept_codex_callback(listener, CODEX_CALLBACK_TIMEOUT) => result?,
+            result = read_pasted_codex_callback() => result?,
+        },
+        (Some(listener), false) => accept_codex_callback(listener, CODEX_CALLBACK_TIMEOUT).await?,
+        (None, _) => read_pasted_codex_callback().await?,
+    };
     if received_state != state {
         anyhow::bail!("OAuth state mismatch, possible CSRF; aborting");
     }
     exchange_codex_code(&received_code, &code_verifier, client_id, &redirect_uri).await
+}
+
+/// Read a manually pasted callback URL from stdin, the fallback for when the loopback callback
+/// can't reach this machine. Blank lines re-prompt; an unparseable line prints a hint and
+/// re-prompts (a mis-paste must not abort while a real callback may still arrive); EOF parks the
+/// future forever so a non-interactive stdin can't win the `select!` against the callback branch.
+async fn read_pasted_codex_callback() -> anyhow::Result<(String, String)> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut reader = BufReader::new(tokio::io::stdin());
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Err(error) => anyhow::bail!("failed to read pasted callback URL: {}", error),
+            Ok(0) => std::future::pending::<()>().await,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match extract_codex_paste(&line) {
+                    CodexCallback::Match { code, state } => return Ok((code, state)),
+                    CodexCallback::AuthError(message) => {
+                        anyhow::bail!("authorization server returned error: {}", message)
+                    }
+                    CodexCallback::NotCallback | CodexCallback::Malformed(_) => {
+                        eprintln!(
+                            "Could not find 'code' and 'state' in that input; paste the full \
+                             callback URL and press Enter."
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn build_codex_authorize_url(
@@ -675,11 +744,17 @@ fn parse_codex_callback_query(request: &str) -> CodexCallback {
     if query_string.is_empty() {
         return CodexCallback::Malformed("no query parameters in callback URL".to_string());
     }
+    code_state_from_query(query_string)
+}
 
+/// Extract `(code, state)` from a URL query string (percent-decoded). Shared by the loopback
+/// callback and the pasted-URL fallback so both validate identically. An `error` param wins over
+/// `code`/`state`, so an explicit authorization denial surfaces as [`CodexCallback::AuthError`].
+fn code_state_from_query(query: &str) -> CodexCallback {
     let mut code = None;
     let mut state = None;
     let mut error_param: Option<String> = None;
-    for pair in query_string.split('&') {
+    for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
@@ -701,6 +776,21 @@ fn parse_codex_callback_query(request: &str) -> CodexCallback {
         (Some(code), Some(state)) => CodexCallback::Match { code, state },
         _ => CodexCallback::Malformed("callback missing 'code' or 'state' parameter".to_string()),
     }
+}
+
+/// Parse a manually pasted callback URL, or a bare `code=...&state=...` query. Accepts the full URL
+/// the browser tried to load: strips any `#fragment` and takes the substring after the first `?`.
+fn extract_codex_paste(input: &str) -> CodexCallback {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return CodexCallback::Malformed("no callback URL pasted".to_string());
+    }
+    let before_hash = trimmed.split('#').next().unwrap_or(trimmed);
+    let query = match before_hash.split_once('?') {
+        Some((_, query)) => query,
+        None => before_hash,
+    };
+    code_state_from_query(query)
 }
 
 async fn exchange_codex_code(
@@ -851,8 +941,8 @@ mod tests {
     fn test_default_model_for_known_backends() {
         assert_eq!(default_model_for("claude-api"), Some("claude-opus-4-8"));
         assert_eq!(default_model_for("claude-oauth"), Some("claude-opus-4-8"));
-        assert_eq!(default_model_for("openai-api"), Some("gpt-5.5"));
-        assert_eq!(default_model_for("openai-codex"), Some("gpt-5.5"));
+        assert_eq!(default_model_for("openai-api"), Some("gpt-5.6-sol"));
+        assert_eq!(default_model_for("openai-codex"), Some("gpt-5.6-sol"));
         assert_eq!(default_model_for("unknown"), None);
         // Every supported backend has a default, so the prompt never forces a manual answer.
         for backend in SUPPORTED_PROVIDERS {
@@ -887,6 +977,45 @@ mod tests {
             CodexCallback::AuthError(message) => assert_eq!(message, "access_denied"),
             _ => panic!("expected AuthError"),
         }
+    }
+
+    #[test]
+    fn test_extract_codex_paste_full_url() {
+        // A real redirect URL: base64url code with '.'/'-'/'_', '+' in scope, all left intact.
+        let url = "http://localhost:1455/auth/callback?code=ac_K0pPCDWiHyd5jWO_FqWeDB8-52rj9Dw-YxgEnqp5HAo.zDNcq5vdPneTieVAgYERv7yr5AhoiUbMAgpMjEuGnhs&scope=openid+profile+email+offline_access+api.connectors.read+api.connectors.invoke&state=uw-OxzrtaH6ZqtaJtuN7dvDZY0eM5ka7yn_zshisEi0";
+        match extract_codex_paste(url) {
+            CodexCallback::Match { code, state } => {
+                assert_eq!(
+                    code,
+                    "ac_K0pPCDWiHyd5jWO_FqWeDB8-52rj9Dw-YxgEnqp5HAo.zDNcq5vdPneTieVAgYERv7yr5AhoiUbMAgpMjEuGnhs"
+                );
+                assert_eq!(state, "uw-OxzrtaH6ZqtaJtuN7dvDZY0eM5ka7yn_zshisEi0");
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_extract_codex_paste_bare_query_and_trim_and_fragment() {
+        match extract_codex_paste("  code=abc&state=xyz#frag \n") {
+            CodexCallback::Match { code, state } => {
+                assert_eq!(code, "abc");
+                assert_eq!(state, "xyz");
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_extract_codex_paste_error_and_missing() {
+        match extract_codex_paste("http://localhost:1455/auth/callback?error=access_denied") {
+            CodexCallback::AuthError(message) => assert_eq!(message, "access_denied"),
+            _ => panic!("expected AuthError"),
+        }
+        assert!(matches!(
+            extract_codex_paste("http://localhost:1455/auth/callback?code=only"),
+            CodexCallback::Malformed(_)
+        ));
     }
 
     #[test]

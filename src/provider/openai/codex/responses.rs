@@ -9,6 +9,8 @@
 //! - input items:   `temp/codex/codex-rs/protocol/src/models.rs:686`
 //! - SSE events:    `temp/codex/codex-rs/codex-api/src/sse/responses.rs:283`
 
+use std::time::Duration;
+
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -21,6 +23,12 @@ use crate::{
         ToolResultContent,
     },
 };
+
+/// Abort the SSE read if no event arrives within this window. The ChatGPT backend can silently
+/// stall a stream; without a ceiling the turn would hang forever. Matches codex's own
+/// `stream_idle_timeout` default (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a
+/// [`MekaError::StreamError`], which the agent retries when no output has been forwarded yet.
+const CODEX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Build the JSON body POSTed to `/responses`. Translates the meka internal `Message` /
 /// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
@@ -210,6 +218,11 @@ fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
 pub(super) struct SseState {
     active_tool_call: Option<ActiveToolCall>,
     in_reasoning: bool,
+    /// Whether this response emitted any `function_call` output item. The Responses API reports
+    /// `status: "completed"` even for tool-call turns, so the stop reason has to be inferred from
+    /// the presence of function calls rather than the status (mirrors the Chat Completions
+    /// `finish_reason: "tool_calls"` mapping).
+    emitted_tool_call: bool,
     /// Once `response.completed` (or `response.failed` / `response.incomplete`) has been
     /// processed, the driver should stop pulling new events.
     pub(super) finished: bool,
@@ -275,6 +288,7 @@ pub(super) fn process_event(
                 state.active_tool_call = Some(ActiveToolCall {
                     arguments_buffer: String::new(),
                 });
+                state.emitted_tool_call = true;
                 out.push(StreamEvent::ToolUseStart { id, name });
             }
         }
@@ -343,12 +357,23 @@ pub(super) fn process_event(
                         ..TokenUsage::default()
                     }));
                 }
-                let stop_reason = response
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(parse_response_status)
-                    .unwrap_or(StopReason::EndTurn);
+                // The Responses API reports `status: "completed"` even when the output is function
+                // calls, so a tool-call turn must be surfaced as `ToolUse` regardless of status;
+                // otherwise the agent warns and mislabels the turn as `EndTurn`.
+                let stop_reason = if state.emitted_tool_call {
+                    StopReason::ToolUse
+                } else {
+                    response
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(parse_response_status)
+                        .unwrap_or(StopReason::EndTurn)
+                };
                 out.push(StreamEvent::MessageEnd { stop_reason });
+            } else if state.emitted_tool_call {
+                out.push(StreamEvent::MessageEnd {
+                    stop_reason: StopReason::ToolUse,
+                });
             } else {
                 out.push(StreamEvent::MessageEnd {
                     stop_reason: StopReason::EndTurn,
@@ -446,7 +471,26 @@ pub(super) async fn drive_responses_sse_stream(
             _ = cancellation.cancelled() => {
                 return Err(MekaError::Interrupted);
             }
-            event = event_stream.next() => {
+            event = tokio::time::timeout(CODEX_STREAM_IDLE_TIMEOUT, event_stream.next()) => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(_elapsed) => {
+                        // No event for the idle window: treat a stalled stream as a transport
+                        // error so the agent can retry rather than hang forever.
+                        let message = format!(
+                            "idle timeout waiting for Codex SSE event after {}s",
+                            CODEX_STREAM_IDLE_TIMEOUT.as_secs()
+                        );
+                        if event_sender
+                            .send(StreamEvent::Error(message.clone()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::trace!("stream event receiver dropped");
+                        }
+                        return Err(MekaError::StreamError(message));
+                    }
+                };
                 let Some(event) = event else { break };
                 let event = match event {
                     Ok(event) => event,
@@ -831,9 +875,32 @@ mod tests {
             StreamEvent::ToolUseEnd { input } => assert_eq!(input["path"], "/tmp/x"),
             other => panic!("expected ToolUseEnd, got {:?}", other),
         }
+        // The Responses API reports `status: "completed"` even for tool-call turns; the presence of
+        // the function call must still surface as `ToolUse`, not `EndTurn`.
         assert!(matches!(events[4], StreamEvent::MessageEnd {
-            stop_reason: StopReason::EndTurn
+            stop_reason: StopReason::ToolUse
         }));
+    }
+
+    #[test]
+    fn test_process_event_completed_without_tool_call_is_end_turn() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_text.delta",
+                serde_json::json!({"delta": "final answer"}),
+            ),
+            (
+                "response.completed",
+                serde_json::json!({"response": {"id": "r1", "status": "completed"}}),
+            ),
+        ]);
+        outcome.expect("clean stream");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn
+            })
+        ));
     }
 
     #[test]

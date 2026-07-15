@@ -1615,6 +1615,14 @@ fn should_retry_provider_error(
                 *retry_after,
             ))
         }
+        // A mid-stream transport failure (SSE decode error, dropped connection, idle timeout) is
+        // transient: retry it with backoff, but only before any output reached the frontend, so a
+        // retry can't double-emit. Mirrors codex's `retry_transport` behaviour.
+        MekaError::StreamError(_)
+            if !content_started && retries < crate::provider::retry::MAX_PROVIDER_RETRIES =>
+        {
+            Some(crate::provider::retry::backoff_delay(retries + 1, None))
+        }
         _ => None,
     }
 }
@@ -1808,6 +1816,23 @@ mod tests {
                 crate::provider::retry::MAX_PROVIDER_RETRIES - 1
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_retries_stream_error_before_output() {
+        // A mid-stream transport failure (SSE decode error, dropped connection, idle timeout) is
+        // retryable under the same content-started / cap guards as a RetryableProvider error.
+        let stream_error = MekaError::StreamError("error decoding response body".to_string());
+        assert!(should_retry_provider_error(&stream_error, false, 0).is_some());
+        assert_eq!(should_retry_provider_error(&stream_error, true, 0), None);
+        assert_eq!(
+            should_retry_provider_error(
+                &stream_error,
+                false,
+                crate::provider::retry::MAX_PROVIDER_RETRIES
+            ),
+            None
         );
     }
 

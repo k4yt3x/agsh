@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Codex login accepts a pasted callback URL when the loopback callback can't be reached.
+
+### Changed
+
+- Default OpenAI model for new provider profiles is now `gpt-5.6-sol`.
+
+### Fixed
+
+- Report Codex tool-call turns as `tool_use`, not `end_turn`, so they no longer warn.
+- Retry a transient mid-stream transport error before any output, instead of failing the turn.
+- Add a Codex SSE idle timeout so a hung stream fails fast and retries instead of blocking.
+
 ## [0.32.1] - 2026-07-06
 
 ### Fixed

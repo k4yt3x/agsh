@@ -25,6 +25,8 @@ meka provider add chatgpt --type openai-codex --model gpt-5
 
 `meka provider add` binds a local listener on `127.0.0.1:1455` to receive the OAuth callback, matching the redirect URI registered with OpenAI's auth server. If port 1455 is already in use (e.g. you're already running the Codex CLI), free it first.
 
+On a remote or headless machine (SSH, container) the browser runs elsewhere, so the redirect to `http://localhost:1455/...` can't reach meka. In that case, after approving in your browser, copy the full callback URL from the address bar (visible even though the page failed to load) and paste it at the prompt; meka picks the `code` and `state` out of it. The paste prompt runs alongside the local listener, so on a local machine the callback still completes automatically with nothing to paste.
+
 ## Config File
 
 `meka provider add` writes this for you (the token bundle stays in the database):
