@@ -21,9 +21,9 @@ use self::{
 use crate::{
     error::{MekaError, Result},
     provider::{
-        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage,
-        ExtraUsage, Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-        UsageHistory, UsageWindow,
+        AccountIdentity, AccountUsage, AuthCredential, ContentBlock,
+        DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage, ExtraUsage, Message, Notice, Provider, Role,
+        StopReason, StreamEvent, TokenUsage, ToolDefinition, UsageHistory, UsageWindow,
     },
     session::TokenStore,
 };
@@ -361,25 +361,119 @@ impl OpenAiCodexProvider {
     }
 }
 
+/// Fold a [`StreamEvent`] stream into the tuple [`Provider::complete`] returns. Mirrors the
+/// accumulation in `Agent::run_streaming_attempt` but without any frontend emission, so a
+/// streaming-only provider can satisfy the non-streaming completion contract by silently consuming
+/// its own SSE. Text deltas concatenate into a trailing `Text` block; tool-call and thinking events
+/// fold into their blocks; usage tiers merge; notices collect; `MessageEnd` sets the stop reason.
+/// `StreamEvent::Error` is logged, not returned: the typed error surfaces from the
+/// concurrently-awaited `stream` future in [`OpenAiCodexProvider::complete`].
+async fn aggregate_stream(
+    mut receiver: mpsc::Receiver<StreamEvent>,
+) -> (Message, StopReason, TokenUsage, Vec<Notice>) {
+    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    let mut current_text = String::new();
+    let mut current_thinking = String::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut stop_reason = StopReason::EndTurn;
+    let mut token_usage = TokenUsage::default();
+    let mut notices: Vec<Notice> = Vec::new();
+
+    while let Some(event) = receiver.recv().await {
+        match event {
+            StreamEvent::TextDelta(text) => current_text.push_str(&text),
+            StreamEvent::ThinkingDelta(text) => current_thinking.push_str(&text),
+            StreamEvent::ThinkingComplete { signature } => {
+                let thinking = std::mem::take(&mut current_thinking);
+                if !thinking.is_empty() || signature.is_some() {
+                    content_blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+            StreamEvent::RedactedThinking { data } => {
+                content_blocks.push(ContentBlock::RedactedThinking { data });
+            }
+            StreamEvent::ToolUseStart { id, name } => {
+                if !current_text.is_empty() {
+                    content_blocks.push(ContentBlock::Text {
+                        text: std::mem::take(&mut current_text),
+                    });
+                }
+                current_tool_id = id;
+                current_tool_name = name;
+            }
+            // The full arguments object arrives whole in `ToolUseEnd`; the incremental JSON only
+            // feeds the live renderer, which this silent path has none of.
+            StreamEvent::ToolInputDelta(_) => {}
+            StreamEvent::ToolUseEnd { input } => {
+                content_blocks.push(ContentBlock::ToolUse {
+                    id: std::mem::take(&mut current_tool_id),
+                    name: std::mem::take(&mut current_tool_name),
+                    input,
+                });
+            }
+            StreamEvent::ToolCallRejected { id, name, reason } => {
+                let input = serde_json::json!({
+                    crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
+                });
+                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            StreamEvent::MessageEnd {
+                stop_reason: reason,
+            } => stop_reason = reason,
+            StreamEvent::Usage(usage) => token_usage.merge_stream(&usage),
+            StreamEvent::Notice(notice) => notices.push(notice),
+            StreamEvent::Error(error) => {
+                tracing::error!("codex complete: stream error: {}", error);
+            }
+        }
+    }
+
+    if !current_text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text: current_text });
+    }
+
+    (
+        Message {
+            role: Role::Assistant,
+            content: content_blocks,
+        },
+        stop_reason,
+        token_usage,
+        notices,
+    )
+}
+
 #[async_trait]
 impl Provider for OpenAiCodexProvider {
     async fn complete(
         &self,
-        _system_prompt: &str,
-        _messages: &[Message],
-        _tools: &[ToolDefinition],
-    ) -> Result<(
-        Message,
-        StopReason,
-        TokenUsage,
-        Vec<crate::provider::Notice>,
-    )> {
-        // The Responses API on chatgpt.com only ever returns SSE; there is no non-streaming JSON
-        // response shape to parse. The agent layer calls `stream` for openai-codex.
-        Err(MekaError::Provider(
-            "openai-codex does not support non-streaming completion; use streaming mode"
-                .to_string(),
-        ))
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)> {
+        // The Responses API on chatgpt.com is SSE-only; there is no non-streaming JSON shape to
+        // parse. Satisfy the `complete` contract by consuming our own stream: drive `stream` into a
+        // local channel and fold the events into the tuple a non-streaming provider would return.
+        // Used by the provider-agnostic compaction path, which needs a full completion. Runs the
+        // stream and the drain concurrently so a summary longer than the channel buffer can't
+        // deadlock; the typed error (if any) surfaces from `stream_result`.
+        let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
+        let (stream_result, aggregated) = tokio::join!(
+            self.stream(
+                system_prompt,
+                messages,
+                tools,
+                event_sender,
+                CancellationToken::new(),
+            ),
+            aggregate_stream(event_receiver),
+        );
+        stream_result?;
+        Ok(aggregated)
     }
 
     async fn stream(
@@ -934,11 +1028,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_returns_unsupported_error() {
-        // openai-codex is streaming-only; complete() must error explicitly rather than silently
-        // fall back to a non-streaming code path that doesn't exist for this endpoint.
-        let provider = test_provider();
-        let result = provider.complete("", &[], &[]).await;
-        assert!(matches!(result, Err(MekaError::Provider(_))));
+    async fn test_aggregate_stream_folds_events_into_message() {
+        // openai-codex is streaming-only; it satisfies `complete` by folding its own SSE. Feed the
+        // event sequence a summary turn would emit and assert it aggregates into one assistant text
+        // message carrying the reported stop reason, with no spurious notices.
+        let (sender, receiver) = mpsc::channel::<StreamEvent>(16);
+        sender
+            .send(StreamEvent::TextDelta("Summary: ".to_string()))
+            .await
+            .unwrap();
+        sender
+            .send(StreamEvent::TextDelta("all done.".to_string()))
+            .await
+            .unwrap();
+        sender
+            .send(StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn,
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        let (message, stop_reason, _usage, notices) = aggregate_stream(receiver).await;
+        assert_eq!(message.text_content(), "Summary: all done.");
+        assert!(matches!(stop_reason, StopReason::EndTurn));
+        assert!(notices.is_empty());
     }
 }
