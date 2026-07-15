@@ -227,10 +227,8 @@ fn classify_probe_response(status: u16, www_authenticate: Option<&str>) -> McpAu
 /// Returns `None` if the key isn't present.
 fn extract_bearer_param(header: &str, key: &str) -> Option<String> {
     // Drop the `Bearer` scheme prefix; everything after is a comma-separated parameter list.
-    let params = match header.find(|c: char| c.is_whitespace()) {
-        Some(idx) => &header[idx..],
-        None => return None,
-    };
+    let idx = header.find(|c: char| c.is_whitespace())?;
+    let params = &header[idx..];
     for pair in params.split(',') {
         let pair = pair.trim();
         let Some((k, v)) = pair.split_once('=') else {
