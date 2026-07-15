@@ -421,6 +421,15 @@ impl SessionManager {
                         server_name TEXT PRIMARY KEY,
                         needs_auth INTEGER NOT NULL,
                         cached_at INTEGER NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS model_context_cache (
+                        provider_profile TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        context_window INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        fetched_at INTEGER NOT NULL,
+                        PRIMARY KEY (provider_profile, model)
                     );",
                 )?;
 
@@ -2255,6 +2264,76 @@ impl TokenStore {
                 MekaError::Database(format!("failed to clear MCP auth probe cache: {}", error))
             })
     }
+
+    /// Load the cached model context window for `(profile, model)`. Returns
+    /// `(context_window, source, age_seconds)` where `source` is `"api"` or `"resolver"`; the
+    /// caller applies the per-source TTL. `None` when no row exists.
+    pub async fn load_model_context(
+        &self,
+        profile: &str,
+        model: &str,
+    ) -> Result<Option<(u64, String, i64)>> {
+        let profile = profile.to_string();
+        let model = model.to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let result = connection.query_row(
+                    "SELECT context_window, source, fetched_at FROM model_context_cache
+                     WHERE provider_profile = ?1 AND model = ?2",
+                    rusqlite::params![profile, model],
+                    |row| {
+                        let context_window: i64 = row.get(0)?;
+                        let source: String = row.get(1)?;
+                        let fetched_at: i64 = row.get(2)?;
+                        Ok((context_window, source, fetched_at))
+                    },
+                );
+                match result {
+                    Ok((context_window, source, fetched_at)) => {
+                        Ok(Some((context_window as u64, source, now - fetched_at)))
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load model context cache: {}", error))
+            })
+    }
+
+    /// Upsert the cached model context window for `(profile, model)`, stamping `fetched_at = now`.
+    pub async fn save_model_context(
+        &self,
+        profile: &str,
+        model: &str,
+        context_window: u64,
+        source: &str,
+    ) -> Result<()> {
+        let profile = profile.to_string();
+        let model = model.to_string();
+        let source = source.to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO model_context_cache
+                         (provider_profile, model, context_window, source, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(provider_profile, model) DO UPDATE SET
+                         context_window = excluded.context_window,
+                         source = excluded.source,
+                         fetched_at = excluded.fetched_at",
+                    rusqlite::params![profile, model, context_window as i64, source, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save model context cache: {}", error))
+            })
+    }
 }
 
 impl SessionManager {
@@ -2435,6 +2514,52 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    #[tokio::test]
+    async fn test_model_context_cache_roundtrip() {
+        let store = test_manager().await.token_store();
+        // Miss before any write.
+        assert!(
+            store
+                .load_model_context("chatgpt", "gpt-5.6-sol")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Save + read back value and source.
+        store
+            .save_model_context("chatgpt", "gpt-5.6-sol", 1_050_000, "api")
+            .await
+            .unwrap();
+        let (window, source, age) = store
+            .load_model_context("chatgpt", "gpt-5.6-sol")
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(window, 1_050_000);
+        assert_eq!(source, "api");
+        assert!(age >= 0);
+        // Composite key isolation: a different model (same profile) is a miss.
+        assert!(
+            store
+                .load_model_context("chatgpt", "other-model")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Upsert overwrites value + source in place.
+        store
+            .save_model_context("chatgpt", "gpt-5.6-sol", 999, "resolver")
+            .await
+            .unwrap();
+        let (window, source, _) = store
+            .load_model_context("chatgpt", "gpt-5.6-sol")
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(window, 999);
+        assert_eq!(source, "resolver");
     }
 
     /// Persist one of every event variant via `save_event` and read it back through `load_events`.

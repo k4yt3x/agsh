@@ -13,10 +13,36 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-        ToolResultContent,
+        ContentBlock, Message, ModelInfo, Role, StopReason, StreamEvent, TokenUsage,
+        ToolDefinition, ToolResultContent,
     },
 };
+
+/// Subset of the Anthropic `GET /v1/models/{id}` body carrying the model's token limits.
+#[derive(serde::Deserialize)]
+struct ClaudeModelResponse {
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+}
+
+/// Parse an Anthropic model object into [`ModelInfo`]. Shared by both Claude providers (same wire
+/// shape). `Err` on malformed JSON. The API reports `0` for an unset limit, so treat `0` as unknown
+/// (`None`); returns `Ok(None)` when neither limit is known.
+pub(super) fn model_info_from_claude_model(body: &str) -> Result<Option<ModelInfo>> {
+    let parsed: ClaudeModelResponse = serde_json::from_str(body)
+        .map_err(|error| MekaError::Provider(format!("invalid Claude model JSON: {}", error)))?;
+    let context_window = parsed.max_input_tokens.filter(|value| *value > 0);
+    let max_output_tokens = parsed.max_tokens.filter(|value| *value > 0);
+    if context_window.is_none() && max_output_tokens.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ModelInfo {
+        context_window,
+        max_output_tokens,
+    }))
+}
 
 /// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom for headers, URL,
 /// attestation patches, and serialization slack. Bodies above this threshold are reactively shrunk
@@ -1011,6 +1037,25 @@ where
 mod tests {
     use super::*;
     use crate::provider::ImageSource;
+
+    #[test]
+    fn test_model_info_from_claude_model() {
+        let info = model_info_from_claude_model(
+            r#"{"id":"claude-opus-4-6","max_input_tokens":200000,"max_tokens":64000}"#,
+        )
+        .unwrap()
+        .expect("known limits");
+        assert_eq!(info.context_window, Some(200_000));
+        assert_eq!(info.max_output_tokens, Some(64_000));
+        // The API reports 0 for an unset limit → treated as unknown.
+        assert!(
+            model_info_from_claude_model(r#"{"max_input_tokens":0,"max_tokens":0}"#)
+                .unwrap()
+                .is_none()
+        );
+        // Malformed JSON → Err.
+        assert!(model_info_from_claude_model("{nope").is_err());
+    }
 
     #[test]
     fn test_is_retryable_claude_error_type() {

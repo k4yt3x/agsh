@@ -17,7 +17,9 @@ use super::shared::{
 };
 use crate::{
     error::{MekaError, Result},
-    provider::{Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
+    provider::{
+        Message, ModelInfo, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+    },
 };
 
 pub struct ClaudeApiProvider {
@@ -226,6 +228,32 @@ impl Provider for ClaudeApiProvider {
             Some(true) => 1,
         };
         self.thinking_override.store(value, Ordering::Relaxed);
+    }
+
+    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
+        let request = self.apply_headers(
+            self.client
+                .get(format!("{}/v1/models/{}", self.base_url, self.model)),
+        );
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "model info request failed: {}",
+                crate::error::format_reqwest_error(&error),
+            ))
+        })?;
+        let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
+        let text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read model info response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(
+                status,
+                &text,
+                retry_after,
+            ));
+        }
+        super::shared::model_info_from_claude_model(&text)
     }
 }
 

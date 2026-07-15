@@ -4,6 +4,8 @@
 mod claude;
 /// `meka provider` subcommand suite (add/list/use/remove/login) and the provider OAuth login flows.
 pub mod cli;
+/// Resolving a model's context window (config override > built-in table > DB cache > API probe).
+pub(crate) mod context_window;
 /// Scripted provider used by the ACP integration test. Available in debug builds only; release
 /// builds don't pay the binary-size cost. Activated by the `MEKA_ACP_MOCK_PROVIDER` env var inside
 /// `acp::run_acp`; never reachable from production paths otherwise.
@@ -96,6 +98,18 @@ pub struct AccountUsage {
     /// Optional one-line addendum (e.g. the plan name) shown beneath the windows. `None` when the
     /// provider offered nothing extra.
     pub note: Option<String>,
+}
+
+/// Model metadata resolved from a provider's models API (Codex's `/backend-api/codex/models`,
+/// Anthropic's `/v1/models/{id}`). Fields are optional because the two providers report different
+/// subsets and an unknown model yields nothing. Used to resolve the context window when the
+/// built-in table doesn't recognize a model; `max_output_tokens` is carried for future use.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModelInfo {
+    /// Maximum total context window in tokens, if the provider reported it.
+    pub context_window: Option<u64>,
+    /// Maximum output (completion) tokens, if reported. Not yet wired into config resolution.
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Pay-as-you-go / extra-usage (overage credits) state. Normalized from Anthropic's `extra_usage` +
@@ -554,6 +568,14 @@ pub trait Provider: Send + Sync {
     /// Fetch the account's historical usage (lifetime tokens, streaks, per-day counts, first-used
     /// date). Same `Ok(None)` contract as [`Self::fetch_usage`].
     async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+        Ok(None)
+    }
+
+    /// Fetch metadata for the provider's active model (`self.model`) from its models API, used to
+    /// resolve the context window when the built-in table doesn't recognize the model. Returns
+    /// `Ok(None)` for providers/models with no such endpoint (the default; the public OpenAI API
+    /// exposes nothing here). Codex and the Anthropic backends override it.
+    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
         Ok(None)
     }
 }

@@ -22,8 +22,9 @@ use crate::{
     error::{MekaError, Result},
     provider::{
         AccountIdentity, AccountUsage, AuthCredential, ContentBlock,
-        DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage, ExtraUsage, Message, Notice, Provider, Role,
-        StopReason, StreamEvent, TokenUsage, ToolDefinition, UsageHistory, UsageWindow,
+        DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage, ExtraUsage, Message, ModelInfo, Notice,
+        Provider, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition, UsageHistory,
+        UsageWindow,
     },
     session::TokenStore,
 };
@@ -142,6 +143,18 @@ impl OpenAiCodexProvider {
         } else {
             format!("{}/backend-api/wham/profiles/me", trimmed)
         }
+    }
+
+    /// URL of the ChatGPT-backend models endpoint (`/backend-api/codex/models`), which lists each
+    /// model's `context_window`. The `client_version` query mirrors the first-party Codex CLI.
+    fn models_url(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        let base = if trimmed.contains("/backend-api") {
+            format!("{}/codex/models", trimmed)
+        } else {
+            format!("{}/backend-api/codex/models", trimmed)
+        };
+        format!("{}?client_version={}", base, env!("CARGO_PKG_VERSION"))
     }
 
     /// GET `/wham/usage` and parse it. Shared by `fetch_usage` (rate-limit windows) and
@@ -572,6 +585,72 @@ impl Provider for OpenAiCodexProvider {
             role: None,
         }))
     }
+
+    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
+        let (bearer, account_id) = self.ensure_valid_credential().await?;
+        // Same inline-header shape as `fetch_wham_usage`; `apply_headers` sets the SSE `Accept`,
+        // but the models endpoint returns plain JSON.
+        let mut request = self
+            .client
+            .get(self.models_url())
+            .header("Authorization", format!("Bearer {}", bearer))
+            .header("originator", ORIGINATOR)
+            .header("User-Agent", &self.user_agent)
+            .header("Accept", "application/json");
+        if let Some(account_id) = account_id.as_deref() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "Codex models request failed: {}",
+                crate::error::format_reqwest_error(&error)
+            ))
+        })?;
+        let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
+        let response_text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read Codex models response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(
+                status,
+                &response_text,
+                retry_after,
+            ));
+        }
+        model_info_from_codex_models(&response_text, &self.model)
+    }
+}
+
+/// Subset of the `GET /backend-api/codex/models` body: the model list, each entry carrying a `slug`
+/// (the model id) and its `context_window`.
+#[derive(Deserialize)]
+struct CodexModelsResponse {
+    #[serde(default)]
+    models: Vec<CodexModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct CodexModelEntry {
+    slug: String,
+    #[serde(default)]
+    context_window: Option<u64>,
+}
+
+/// Find the entry whose `slug` matches `model` and return its context window. Extracted for
+/// testing. `Err` on malformed JSON; `Ok(None)` when the model isn't listed; the model's
+/// `context_window` may itself be `None` if the backend omitted it.
+fn model_info_from_codex_models(body: &str, model: &str) -> Result<Option<ModelInfo>> {
+    let parsed: CodexModelsResponse = serde_json::from_str(body)
+        .map_err(|error| MekaError::Provider(format!("invalid Codex models JSON: {}", error)))?;
+    Ok(parsed
+        .models
+        .into_iter()
+        .find(|entry| entry.slug == model)
+        .map(|entry| ModelInfo {
+            context_window: entry.context_window,
+            max_output_tokens: None,
+        }))
 }
 
 /// Subset of the ChatGPT backend `GET /wham/usage` body that we render. Mirrors the fields the
@@ -1025,6 +1104,26 @@ mod tests {
         .expect("provider");
         let result = provider.ensure_valid_credential().await;
         assert!(matches!(result, Err(MekaError::Provider(ref m)) if m.contains("expired")));
+    }
+
+    #[test]
+    fn test_model_info_from_codex_models() {
+        let body = r#"{"models":[
+            {"slug":"gpt-5.6-sol","context_window":1050000},
+            {"slug":"gpt-other","context_window":272000}
+        ]}"#;
+        let info = model_info_from_codex_models(body, "gpt-5.6-sol")
+            .unwrap()
+            .expect("slug should match");
+        assert_eq!(info.context_window, Some(1_050_000));
+        // Unlisted model → Ok(None).
+        assert!(
+            model_info_from_codex_models(body, "no-such-model")
+                .unwrap()
+                .is_none()
+        );
+        // Malformed JSON → Err.
+        assert!(model_info_from_codex_models("{not json", "x").is_err());
     }
 
     #[tokio::test]

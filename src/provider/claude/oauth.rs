@@ -24,7 +24,7 @@ use crate::{
     error::{MekaError, Result},
     provider::{
         AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, ExtraUsage,
-        Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        Message, ModelInfo, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
         UsageHistory, UsageWindow,
     },
     session::TokenStore,
@@ -724,6 +724,37 @@ impl Provider for ClaudeOAuthProvider {
             first_used: parsed.first_token_date,
             daily: Vec::new(),
         }))
+    }
+
+    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
+        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
+        let request = attestation::apply_headers(
+            self.client
+                .get(format!("{}/v1/models/{}", self.base_url, self.model)),
+            auth_name,
+            &auth_value,
+            &self.session_id,
+            None,
+        );
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "model info request failed: {}",
+                crate::error::format_reqwest_error(&error),
+            ))
+        })?;
+        let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
+        let text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read model info response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(
+                status,
+                &text,
+                retry_after,
+            ));
+        }
+        super::shared::model_info_from_claude_model(&text)
     }
 }
 

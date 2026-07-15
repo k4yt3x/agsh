@@ -1585,17 +1585,41 @@ fn validate_max_output_tokens(
     Ok(())
 }
 
-pub fn context_window_for_model(model: &str) -> u64 {
+/// Best-effort context-window inference from a model name. `Some(n)` for a recognized family;
+/// `None` when the model is unknown, which signals the caller to probe the provider API (and floor
+/// at 128k if that fails). Coarse substring matching; numbers track OpenAI's / Anthropic's
+/// published windows and will drift, so a config override or a successful API probe wins over a
+/// `Some` here. Returning `None` (not `Some(128_000)`) for unknowns is deliberate: it stops the
+/// 128k default from masquerading as knowledge and short-circuiting the probe.
+pub fn context_window_for_model(model: &str) -> Option<u64> {
     if model.contains("claude") {
-        200_000
+        // Opus 4.6/4.7/4.8, Sonnet 4.6, and the Fable/Mythos 5 family ship a 1M window; Haiku and
+        // pre-4.6 models are 200k. `model_supports_adaptive_thinking` is the same era boundary meka
+        // uses to gate the `context-1m` beta (see `claude::shared::model_has_1m_context`), so this
+        // stays in sync with what the request actually sends. Caveat: claude-api doesn't send that
+        // beta, so its effective window for the 1M models is 200k; this value suits the common
+        // claude-oauth path, and an over-estimate is caught by overflow recovery.
+        if crate::provider::model_supports_adaptive_thinking(model) {
+            Some(1_000_000)
+        } else {
+            Some(200_000)
+        }
     } else if model.contains("gpt-4.1") {
-        1_047_576
+        Some(1_047_576)
     } else if model.contains("gpt-4o") {
-        128_000
+        Some(128_000)
+    } else if model.contains("gpt-5.4") || model.contains("gpt-5.5") || model.contains("gpt-5.6") {
+        // gpt-5.4 / 5.5 / 5.6 (incl. the 5.6 sol/terra/luna tiers). Above 272k input, OpenAI bills
+        // a premium tier, but the window is still one request.
+        Some(1_050_000)
+    } else if model.contains("gpt-5") {
+        // Legacy gpt-5, and unrecognized future gpt-5.x conservatively floored here rather than at
+        // the larger 5.4+ window.
+        Some(400_000)
     } else if model.contains("o3") || model.contains("o4-mini") || model.contains("o1") {
-        200_000
+        Some(200_000)
     } else {
-        128_000
+        None
     }
 }
 
@@ -2509,6 +2533,36 @@ subagent_max_depth = 5
         assert_eq!(retention_days, Some(30));
         assert_eq!(max_storage_bytes, Some(10_485_760));
         assert_eq!(subagent_max_depth, 5);
+    }
+
+    #[test]
+    fn test_context_window_for_model() {
+        // gpt-5.4 / 5.5 / 5.6 family (incl. the 5.6 sol/terra/luna tiers) = 1.05M.
+        assert_eq!(context_window_for_model("gpt-5.6-sol"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.6-terra"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.5"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.4"), Some(1_050_000));
+        // Legacy / bare gpt-5 floors lower.
+        assert_eq!(context_window_for_model("gpt-5"), Some(400_000));
+        assert_eq!(context_window_for_model("gpt-5-codex"), Some(400_000));
+        // Unchanged families.
+        assert_eq!(context_window_for_model("gpt-4.1"), Some(1_047_576));
+        assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
+        assert_eq!(context_window_for_model("o3"), Some(200_000));
+        assert_eq!(context_window_for_model("o4-mini"), Some(200_000));
+        // Claude: Opus 4.6+/Sonnet 4.6/Fable 5 ship 1M; Haiku 4.5 and pre-4.6 stay at 200k.
+        assert_eq!(context_window_for_model("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-6"),
+            Some(1_000_000)
+        );
+        assert_eq!(context_window_for_model("claude-fable-5"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(context_window_for_model("claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(context_window_for_model("claude-3-5-sonnet"), Some(200_000));
+        // Unknown model → None (the resolver then probes the API / floors at 128k).
+        assert_eq!(context_window_for_model("some-unknown-model"), None);
     }
 
     #[test]

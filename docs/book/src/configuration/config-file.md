@@ -510,7 +510,9 @@ auto_compact = false
 
 ### `session.context_window`
 
-Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this; if neither is set, meka infers the context window from the model name.
+Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this.
+
+When neither is set, meka resolves the window automatically: a built-in table for recognized models, otherwise a live query of the provider's models API (supported for `openai-codex` and the Claude backends; not the public OpenAI API), falling back to a 128k floor. The resolved value is cached in the session database (keyed by profile and model) so later runs don't re-query. Setting this option pins the window and skips both the table and the API lookup.
 
 ```toml
 [session]

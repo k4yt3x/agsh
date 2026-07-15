@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Detect a model's context window from the provider API when unknown, cached in the DB.
+
+### Fixed
+
+- Infer real context windows for gpt-5 models (1.05M for 5.4/5.5/5.6, 400k for gpt-5), not 128k.
+- Infer 1M context for Claude Opus 4.6+/Sonnet 4.6/Fable 5 (was 200k); Haiku/older stay 200k.
+
 ## [0.33.1] - 2026-07-15
 
 ### Fixed

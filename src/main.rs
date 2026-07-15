@@ -382,18 +382,20 @@ pub async fn build_shared_deps(
         config.builtin_tool_permissions.clone(),
     );
 
+    let context_window = crate::provider::context_window::resolve_context_window(
+        config.context_window,
+        &provider,
+        &session_manager.token_store(),
+        config.active_profile.as_deref(),
+        config.model.as_deref(),
+    )
+    .await;
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
-        context_window: config.context_window.unwrap_or_else(|| {
-            config
-                .model
-                .as_deref()
-                .map(crate::config::context_window_for_model)
-                .unwrap_or(128_000)
-        }),
+        context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
@@ -645,18 +647,20 @@ async fn create_agent_from_config(
     // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
     // sub-agents to inherit `sandboxed_shell` / `context_messages` / `user_instructions` via
     // `Agent::new_subagent`.
+    let context_window = crate::provider::context_window::resolve_context_window(
+        config.context_window,
+        &provider,
+        &session_manager.token_store(),
+        config.active_profile.as_deref(),
+        config.model.as_deref(),
+    )
+    .await;
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
-        context_window: config.context_window.unwrap_or_else(|| {
-            config
-                .model
-                .as_deref()
-                .map(crate::config::context_window_for_model)
-                .unwrap_or(128_000)
-        }),
+        context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
@@ -904,13 +908,16 @@ async fn run_interactive(
     // hold it; the agent adopts the same atomic via `set_context_tokens`. Seeded with an
     // estimate when resuming so the gauge isn't blank until the first new turn measures the
     // context exactly.
-    let context_window = config.context_window.unwrap_or_else(|| {
-        config
-            .model
-            .as_deref()
-            .map(crate::config::context_window_for_model)
-            .unwrap_or(128_000)
-    });
+    // Probe-free (no provider handle here): override / table / cache / floor. The agent built below
+    // runs the full resolver, which caches any API-probed value, so an unrecognized model's gauge
+    // converges to the accurate window on the next launch (and matches immediately otherwise).
+    let context_window = crate::provider::context_window::resolve_context_window_cached(
+        config.context_window,
+        &session_manager.token_store(),
+        config.active_profile.as_deref(),
+        config.model.as_deref(),
+    )
+    .await;
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if !messages.is_empty() {
         context_tokens.store(

@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::Result,
-    provider::{Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
+    provider::{Message, ModelInfo, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
 };
 
 /// Serialized event used by [`MockProvider`]. Mirrors the runtime [`StreamEvent`] enum but uses
@@ -105,12 +105,25 @@ impl From<MockStopReason> for StopReason {
 #[derive(Debug, Default)]
 pub struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
+    /// Canned response for [`Provider::fetch_model_info`]; `None` mimics a provider/model with no
+    /// models API (returns `Ok(None)`).
+    model_info: Option<ModelInfo>,
 }
 
 impl MockProvider {
     pub fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),
+            model_info: None,
+        }
+    }
+
+    /// Build a mock whose `fetch_model_info` returns `info`, for context-window resolver tests.
+    #[cfg(test)]
+    pub fn with_model_info(info: ModelInfo) -> Self {
+        Self {
+            rounds: Mutex::new(VecDeque::new()),
+            model_info: Some(info),
         }
     }
 }
@@ -134,6 +147,10 @@ impl Provider for MockProvider {
         Err(crate::error::MekaError::Provider(
             "MockProvider::complete is not implemented".to_string(),
         ))
+    }
+
+    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
+        Ok(self.model_info.clone())
     }
 
     async fn stream(
