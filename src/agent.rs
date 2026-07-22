@@ -335,6 +335,12 @@ impl Agent {
         )
     }
 
+    /// The reasoning-effort value this agent's provider will send on the wire, or `None` when it
+    /// sends none. Used by the `/status` model block.
+    pub fn resolved_effort(&self) -> Option<String> {
+        self.provider.resolved_effort()
+    }
+
     /// Fetch the account's rate-limit usage from the active provider, for the `/usage` command.
     /// `Ok(None)` when the provider has no per-account usage endpoint.
     pub async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {

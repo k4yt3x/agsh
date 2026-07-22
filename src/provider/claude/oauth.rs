@@ -590,6 +590,10 @@ impl Provider for ClaudeOAuthProvider {
         "claude-oauth"
     }
 
+    fn resolved_effort(&self) -> Option<String> {
+        self.wire_effort()
+    }
+
     fn set_thinking_override(&self, enabled: Option<bool>) {
         let value = match enabled {
             None => -1,

@@ -551,6 +551,10 @@ impl Provider for OpenAiCodexProvider {
         "openai-codex"
     }
 
+    fn resolved_effort(&self) -> Option<String> {
+        self.wire_effort()
+    }
+
     fn refine_effort(&self, fetched: Option<&ModelInfo>) {
         // Codex is the one provider with a post-build effort catalog: `/models` reports
         // authoritative reasoning levels, which decide the default here, falling back to
@@ -979,6 +983,26 @@ mod tests {
         // Effort pinned (absolute override): the catalog can't change the result, so the resolver
         // skips the `/models` probe when the window is already known.
         assert!(!build(Some("high")).needs_effort_catalog());
+    }
+
+    #[test]
+    fn test_resolved_effort_reflects_wire_effort() {
+        // The `/status` accessor mirrors the settled effort slot the request body reads.
+        assert_eq!(test_provider().resolved_effort().as_deref(), Some("high"));
+        // A non-reasoning model sends no effort, so `/status` shows none.
+        let non_reasoning = OpenAiCodexProvider::new(
+            test_credential(),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            None,
+            None,
+            "test".to_string(),
+            None,
+            None,
+        )
+        .expect("provider");
+        assert_eq!(non_reasoning.resolved_effort(), None);
     }
 
     #[test]

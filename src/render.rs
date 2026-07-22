@@ -792,10 +792,24 @@ pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
     );
 }
 
+/// The resolved model parameters shown at the top of the `/status` report, borrowed from the active
+/// config plus the provider's settled effort. All optional so a mis-selected profile still renders.
+pub struct ModelStatus<'a> {
+    pub model: Option<&'a str>,
+    /// Active profile name (e.g. `claude-max`).
+    pub profile: Option<&'a str>,
+    /// Backend type (e.g. `claude-oauth`).
+    pub backend: Option<&'a str>,
+    /// The reasoning effort sent on the wire, or `None` when the model sends none.
+    pub effort: Option<&'a str>,
+    pub thinking: bool,
+}
+
 /// Multi-line cumulative session report shown by the `/status` slash command. Goes to stderr
 /// (matches the rest of REPL UI feedback).
 pub fn render_session_status(
     snap: &crate::stats::SessionStatsSnapshot,
+    model: &ModelStatus,
     message_count: usize,
     context_tokens: u64,
     context_window: u64,
@@ -803,6 +817,21 @@ pub fn render_session_status(
     let total_in = snap.total_input_tokens();
     let header = "Session status".with(Color::Cyan);
     eprintln!("{}", header);
+    if let Some(name) = model.model {
+        eprintln!("  Model:           {}", name);
+    }
+    match (model.profile, model.backend) {
+        (Some(profile), Some(backend)) => eprintln!("  Provider:        {} ({})", profile, backend),
+        (None, Some(backend)) => eprintln!("  Provider:        {}", backend),
+        _ => {}
+    }
+    if let Some(effort) = model.effort {
+        eprintln!("  Effort:          {}", effort);
+    }
+    eprintln!(
+        "  Thinking:        {}",
+        if model.thinking { "on" } else { "off" }
+    );
     eprintln!("  Turns:           {}", snap.turns);
     // Live context occupancy: how full the window was on the last request. Distinct from the
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.

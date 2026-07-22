@@ -115,7 +115,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/mcp login <server>` | Run the OAuth flow from the REPL |
 | `/mcp logout <server>` | Revoke cached credentials for a server |
 | `/mcp <server>:<prompt> [args...]` | Render a server-defined prompt and send it to the agent |
-| `/status` | Show session stats: live context-window usage, plus cumulative turns, tokens, cache hit ratio, redactions, message count |
+| `/status` | Show the resolved model/provider/effort/thinking, plus live context-window usage and cumulative turns, tokens, cache hit ratio, redactions, message count |
 | `/usage` | Show the account's rate-limit usage (subscription providers): session/weekly windows, percent used, reset times |
 | `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
 
@@ -131,10 +131,14 @@ For users who always want extra context at resume time, set [`display.resume_sho
 
 ### `/status`
 
-Print a snapshot of the current session's counters:
+Print the session's resolved model parameters followed by its cumulative counters:
 
 ```
 Session status
+  Model:           claude-opus-4-8
+  Provider:        claude-max (claude-oauth)
+  Effort:          xhigh
+  Thinking:        on
   Turns:           23
   Context:         128.4k / 1.0M (13% used, 871.6k left)
   Input tokens:    234.5k  (cache hit: 92%)
@@ -142,6 +146,8 @@ Session status
   Redactions:      2 (12 images, ~38 MiB freed)
   Messages:        47
 ```
+
+The top block reports what the session actually resolved to: the model, the active profile and its backend, the reasoning `Effort` sent on the wire (the line is omitted for models with no effort knob), and whether thinking is on. This is where a model-aware default such as `xhigh` becomes visible. The rest are cumulative counters for the session.
 
 `Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `spawn_agent` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). The line is omitted until the first turn completes. Set [`display.show_context_in_prompt`](../configuration/config-file.md#displayshow_context_in_prompt) to show the same gauge in the prompt itself.
 

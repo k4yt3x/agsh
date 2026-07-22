@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `claude-api` now supports the `output_config.effort` knob.
 - Detect a model's context window from the provider API when unknown, cached in the DB.
+- `/status` now shows the resolved model, provider, reasoning effort, and thinking state.
 
 ### Changed
 

@@ -1233,8 +1233,16 @@ async fn run_interactive(
                     repl::SlashCommand::Status => {
                         let snap = agent.session_stats_snapshot();
                         let (context_tokens, context_window) = agent.context_usage();
+                        let effort = agent.resolved_effort();
                         render::render_session_status(
                             &snap,
+                            &render::ModelStatus {
+                                model: config.model.as_deref(),
+                                profile: config.active_profile.as_deref(),
+                                backend: config.provider_name.as_deref(),
+                                effort: effort.as_deref(),
+                                thinking: config.thinking_enabled,
+                            },
                             messages.len(),
                             context_tokens,
                             context_window,

@@ -254,6 +254,10 @@ impl Provider for ClaudeApiProvider {
         "claude-api"
     }
 
+    fn resolved_effort(&self) -> Option<String> {
+        self.wire_effort()
+    }
+
     fn set_thinking_override(&self, enabled: Option<bool>) {
         let value = match enabled {
             None => -1,

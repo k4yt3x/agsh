@@ -580,6 +580,10 @@ impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
         "openai-api"
     }
+
+    fn resolved_effort(&self) -> Option<String> {
+        self.wire_effort()
+    }
 }
 
 fn parse_openai_stop_reason(reason: &str) -> StopReason {

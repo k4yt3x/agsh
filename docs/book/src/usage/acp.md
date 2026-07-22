@@ -115,7 +115,7 @@ Sticky decisions live in meka's process memory; they reset on session close.
 
 Two kinds of slash command are advertised through `session/update: available_commands_update` (after `session/new` / `session/load` / `session/resume`, and refreshed at the top of every `session/prompt` so a skill installed mid-session shows up without a reconnect):
 
-- **Built-in local commands** — `/status` (model, context usage, tokens, mode) and `/mcp` (configured MCP servers and their connection status). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
+- **Built-in local commands** — `/status` (model, effort, context usage, tokens, mode) and `/mcp` (configured MCP servers and their connection status). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
 - **Skills** (see [Skills](./skills.md)) — each installed skill is a top-level command carrying a free-form input hint (`"additional context (optional)"`).
 
 When the user picks one from the palette, the client typically inserts `/<name> ` and lets the user type extra context. meka parses the prompt as follows:

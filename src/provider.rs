@@ -717,6 +717,14 @@ pub trait Provider: Send + Sync {
     fn needs_effort_catalog(&self) -> bool {
         false
     }
+
+    /// The reasoning-effort value this provider will send on the wire (its settled
+    /// `output_config.effort` / `reasoning.effort`), or `None` when it sends none. For display only
+    /// (the `/status` model block); the request path reads the same settled slot. Default: `None`
+    /// (providers with no effort knob).
+    fn resolved_effort(&self) -> Option<String> {
+        None
+    }
 }
 
 struct ToolCallAccumulator {

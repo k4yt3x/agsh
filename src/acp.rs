@@ -1296,6 +1296,9 @@ fn build_status_text(runtime: &SessionRuntime, shared: &crate::SharedDeps) -> St
     if let Some(model) = shared.config.model.as_deref() {
         let _ = writeln!(out, "  Model:    {model}");
     }
+    if let Some(effort) = runtime.agent.resolved_effort() {
+        let _ = writeln!(out, "  Effort:   {effort}");
+    }
     let _ = writeln!(
         out,
         "  Mode:     {}",
