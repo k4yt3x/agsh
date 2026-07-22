@@ -84,16 +84,44 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
+      - name: Extract the changelog section for this version
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          # Take the body of "## [<version>] ..." up to the next "## [" heading, then trim blank lines
+          # off the top and bottom. index()==1 is a literal prefix match, so the version's dots are not
+          # treated as regex and 0.34.0 cannot match 0.34.01 (the closing "]" is part of the prefix).
+          notes="$(
+            awk -v ver="$version" '
+              BEGIN { prefix = "## [" ver "]" }
+              index($0, prefix) == 1 { grab = 1; next }
+              grab && /^## \[/ { exit }
+              grab { print }
+            ' CHANGELOG.md | sed '/./,$!d' | tac | sed '/./,$!d' | tac
+          )"
+          if [ -z "$notes" ]; then
+            echo "::error::No CHANGELOG.md section found for '## [$version]' — add it before tagging."
+            exit 1
+          fi
+          printf '%s\n' "$notes" > release-notes.md
+          echo "--- release notes for $version ---"
+          cat release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           draft: true
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
           files: artifacts/*
 
   container:
