@@ -32,8 +32,8 @@ default_provider = "work"
 
 [providers.work]
 type = "claude-oauth"
-model = "claude-opus-4-6"
-effort = "high"          # optional; "low" | "medium" | "high"
+model = "claude-opus-4-8"
+effort = "xhigh"         # optional; "low"|"medium"|"high"|"xhigh"|"max"
 redact_thinking = true   # optional; default on, matching Claude Code
 # device_id, oauth_token_url, client_id are all optional overrides
 ```
@@ -44,7 +44,7 @@ See [Configuration → Config File](../configuration/config-file.md) for the ful
 
 ### `effort`
 
-Sent as `output_config.effort` for effort-capable models (`opus-4-6`, `sonnet-4-6`). Accepts `"low"`, `"medium"`, or `"high"`. Defaults to `"high"`. Mirrors Claude Code's effort knob in `utils/effort.ts`. Older models (Sonnet 4.0, Opus 4.1, Haiku 4.5) ignore this field on the wire and the body field is omitted automatically.
+Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset it defaults to `"xhigh"` where the model supports it (Opus 4.7+, Sonnet 5, Fable/Mythos 5) and `"high"` on the effort-capable-but-no-`xhigh` generation (Opus 4.5, Opus 4.6, Sonnet 4.6); models with no effort knob (Sonnet 4.0/4.5, Opus 4.1, Haiku 4.5) omit the field automatically. An explicit value is absolute: sent verbatim (beta included), with no validation or clamping, and applied even to a model the default would skip. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
 
 ### `redact_thinking`
 
@@ -96,7 +96,7 @@ Any model your Claude Code subscription exposes. Current line-up (per [Anthropic
 
 Older but still available: `claude-opus-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-opus-4-1`. Deprecated and retiring 2026-06-15: `claude-opus-4-20250514`, `claude-sonnet-4-20250514`.
 
-meka forwards the model string verbatim; it doesn't gate which strings are valid. Per-model behaviour depends on capability gates baked into the request shape (see [Beta header](#beta-header)). The current gates target `opus-4-6` / `sonnet-4-6` for adaptive-thinking and effort; newer models (e.g. Opus 4.7) fall through to the conservative defaults until the gates are updated.
+meka forwards the model string verbatim; it doesn't gate which strings are valid. Per-model behaviour depends on capability gates baked into the request shape (see [Beta header](#beta-header)). The gates are a denylist: only known pre-4.6 models are excluded from adaptive thinking, so Claude 4.6+ and any newly released family are enabled by default. Effort uses the same denylist with one exception: Opus 4.5 predates adaptive thinking but is effort-capable (`low`/`medium`/`high`, no `xhigh`), so it is not excluded from effort.
 
 ## API Details
 
@@ -114,18 +114,23 @@ meka forwards the model string verbatim; it doesn't gate which strings are valid
 
 ### Beta header
 
-Composed dynamically from the model + thinking settings, mirroring Claude Code's `getAllModelBetas` (`utils/betas.ts`). Order is significant; wire dumps from Claude Code show this exact ordering:
+Composed dynamically from the model + thinking settings, mirroring Claude Code's `getAllModelBetas`. Order is significant; the list below matches the Claude Code 2.1.217 interactive-CLI wire capture (opus-4-8, tools present) exactly:
 
 | Beta | When |
 |------|------|
 | `claude-code-20250219` | All models *except* Haiku family |
 | `oauth-2025-04-20` | Always (subscription auth) |
-| `adaptive-thinking-2026-01-28` | Thinking on AND model is `opus-4-6` / `sonnet-4-6` |
-| `interleaved-thinking-2025-05-14` | Thinking on AND model is older Claude 4 (Sonnet 4.0, etc.) |
+| `interleaved-thinking-2025-05-14` | Any modern Claude (4.x+) |
 | `redact-thinking-2026-02-12` | Any modern Claude (4.x+); on by default, `redact_thinking = false` opts out |
+| `thinking-token-count-2026-05-13` | Any modern Claude (4.x+) |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
-| `effort-2025-11-24` | `opus-4-6` / `sonnet-4-6` only |
+| `mid-conversation-system-2026-04-07` | Opus 4.8 / Fable 5 / Mythos 5 |
+| `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
+| `effort-2025-11-24` | Whenever `output_config.effort` is sent: effort-capable models by default (Claude 4.6+ and Opus 4.5), or any explicit `effort` override on any model |
+| `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
+
+meka does **not** send `context-1m-2025-08-07`: Claude Code 2.1.217 dropped it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
 
 ### System prompt
 
@@ -141,7 +146,7 @@ Only block 3 is marked for caching, matching the captured Claude Code CLI wire s
 
 - `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "", "session_id": "..."}` (`device_id` from the profile's `device_id`; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
-- `output_config.effort`: present for effort-capable models, value from the profile's `effort`.
+- `output_config.effort`: present for effort-capable models. Uses the profile's `effort` when set, otherwise a model-aware default (`xhigh` where supported, else `high`).
 - `temperature: 1` (only when thinking is disabled).
 - `max_tokens`: `64_000` for adaptive-thinking models, `max(thinking_budget * 2, 32_000)` for legacy thinking models, `32_000` otherwise.
 

@@ -58,9 +58,15 @@ pub struct OpenAiCodexProvider {
     /// Profile name this provider's credential is stored under, so refreshed tokens are written
     /// back to the correct `provider_credentials` row.
     credential_key: String,
-    /// `low` / `medium` / `high` for reasoning models (gpt-5, o-series). Forwarded as
-    /// `reasoning.effort` in the request body. `None` skips the reasoning block entirely.
+    /// The profile's explicit `reasoning.effort` override, or `None` for the model-aware default.
+    /// Consumed only to (re)compute [`Self::resolved_effort`]; the wire body reads the settled
+    /// slot.
     reasoning_effort: Option<String>,
+    /// The settled `reasoning.effort` for the request body. Initialized to the name-predicate
+    /// resolution at construction and overwritten by [`Provider::refine_effort`] with the
+    /// `/models` catalog's authoritative levels once known. Set once before any turn, then read
+    /// per request. `None` skips the reasoning block entirely.
+    resolved_effort: std::sync::Mutex<Option<String>>,
     /// Per-request output token cap from the profile; `None` leaves the Responses API default.
     max_output_tokens: Option<u64>,
     user_agent: String,
@@ -91,6 +97,10 @@ impl OpenAiCodexProvider {
                 ))
             })?;
 
+        let resolved_effort = std::sync::Mutex::new(super::resolve_reasoning_effort(
+            reasoning_effort.as_deref(),
+            &model,
+        ));
         Ok(Self {
             client,
             credential: tokio::sync::RwLock::new(credential),
@@ -101,6 +111,7 @@ impl OpenAiCodexProvider {
             token_store,
             credential_key,
             reasoning_effort,
+            resolved_effort,
             max_output_tokens,
             user_agent: format!(
                 "meka/{} ({}; {})",
@@ -109,6 +120,14 @@ impl OpenAiCodexProvider {
                 std::env::consts::ARCH
             ),
         })
+    }
+
+    /// The settled reasoning-effort to send as `reasoning.effort` (see [`Self::resolved_effort`]).
+    fn wire_effort(&self) -> Option<String> {
+        self.resolved_effort
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Returns the URL the request POSTs to. Codex's own client appends `/backend-api`
@@ -497,12 +516,13 @@ impl Provider for OpenAiCodexProvider {
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        let reasoning_effort = self.wire_effort();
         let body = build_request_body(
             &self.model,
             system_prompt,
             messages,
             tools,
-            self.reasoning_effort.as_deref(),
+            reasoning_effort.as_deref(),
             self.max_output_tokens,
             true,
         );
@@ -529,6 +549,36 @@ impl Provider for OpenAiCodexProvider {
 
     fn name(&self) -> &str {
         "openai-codex"
+    }
+
+    fn refine_effort(&self, fetched: Option<&ModelInfo>) {
+        // Codex is the one provider with a post-build effort catalog: `/models` reports
+        // authoritative reasoning levels, which decide the default here, falling back to
+        // the name predicates for a model missing from the catalog. The other providers
+        // have no catalog, so they settle effort at construction and leave this a no-op.
+        let resolved = crate::provider::resolve_effort_with_catalog(
+            self.reasoning_effort.as_deref(),
+            fetched.and_then(|info| info.effort_levels.as_deref()),
+            super::model_supports_effort(&self.model),
+            super::model_supports_xhigh(&self.model),
+        );
+        if let Ok(mut slot) = self.resolved_effort.lock() {
+            *slot = resolved;
+        }
+    }
+
+    fn needs_effort_catalog(&self) -> bool {
+        // Codex has an effort catalog, but only probe for it when the effort isn't already pinned:
+        // an explicit override is absolute (see `resolve_effort_with_catalog`), so the catalog's
+        // levels would be ignored anyway. With effort pinned and the window table-known (or config
+        // -pinned), this lets the resolver skip the `/models` probe entirely. A blank override
+        // counts as unset (matching the resolver), so the catalog is still probed for a real
+        // default.
+        self.reasoning_effort
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
     }
 
     async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
@@ -623,7 +673,7 @@ impl Provider for OpenAiCodexProvider {
 }
 
 /// Subset of the `GET /backend-api/codex/models` body: the model list, each entry carrying a `slug`
-/// (the model id) and its `context_window`.
+/// (the model id), its `context_window`, and the reasoning-effort tiers it supports.
 #[derive(Deserialize)]
 struct CodexModelsResponse {
     #[serde(default)]
@@ -633,13 +683,33 @@ struct CodexModelsResponse {
 #[derive(Deserialize)]
 struct CodexModelEntry {
     slug: String,
+    /// The standard-tier context window. The catalog also carries a larger `max_context_window`
+    /// (the premium/extended tier); we prefer that as the real usable window, matching how meka's
+    /// built-in table follows the model card rather than the conservative standard tier.
     #[serde(default)]
     context_window: Option<u64>,
+    #[serde(default)]
+    max_context_window: Option<u64>,
+    /// The catalog's `supported_reasoning_levels`: each element is `{effort, description}`; we
+    /// keep only the `effort` tier. Absent/empty for non-reasoning models.
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
 }
 
-/// Find the entry whose `slug` matches `model` and return its context window. Extracted for
-/// testing. `Err` on malformed JSON; `Ok(None)` when the model isn't listed; the model's
-/// `context_window` may itself be `None` if the backend omitted it.
+/// One `supported_reasoning_levels` entry; only the `effort` tier is used (the `description` is
+/// ignored). Field name matches the raw `/models` wire shape.
+#[derive(Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+/// Find the entry whose `slug` matches `model` and map it to [`ModelInfo`]. Extracted for testing.
+/// `Err` on malformed JSON; `Ok(None)` when the model isn't listed; the window prefers the
+/// catalog's larger `max_context_window` (premium tier) over `context_window` (standard tier), and
+/// may be `None` if the backend omitted both. A listed model's `supported_reasoning_levels` become
+/// [`ModelInfo::effort_levels`] (lowercased) - always `Some` for a found entry, so an empty list
+/// (`Some([])`) authoritatively marks a non-reasoning model and omits effort, distinct from the
+/// `None` an *unlisted* model yields (which falls back to the name predicates).
 fn model_info_from_codex_models(body: &str, model: &str) -> Result<Option<ModelInfo>> {
     let parsed: CodexModelsResponse = serde_json::from_str(body)
         .map_err(|error| MekaError::Provider(format!("invalid Codex models JSON: {}", error)))?;
@@ -648,8 +718,14 @@ fn model_info_from_codex_models(body: &str, model: &str) -> Result<Option<ModelI
         .into_iter()
         .find(|entry| entry.slug == model)
         .map(|entry| ModelInfo {
-            context_window: entry.context_window,
-            max_output_tokens: None,
+            context_window: entry.max_context_window.or(entry.context_window),
+            effort_levels: Some(
+                entry
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| level.effort.to_ascii_lowercase())
+                    .collect(),
+            ),
         }))
 }
 
@@ -883,6 +959,81 @@ mod tests {
     }
 
     #[test]
+    fn test_needs_effort_catalog_gated_on_effort_override() {
+        let build = |effort: Option<&str>| {
+            OpenAiCodexProvider::new(
+                test_credential(),
+                "gpt-5.6-sol".to_string(),
+                None,
+                None,
+                None,
+                None,
+                "test".to_string(),
+                effort.map(str::to_string),
+                None,
+            )
+            .expect("provider")
+        };
+        // No pinned effort: Codex still needs the catalog probe for a catalog-accurate default.
+        assert!(build(None).needs_effort_catalog());
+        // Effort pinned (absolute override): the catalog can't change the result, so the resolver
+        // skips the `/models` probe when the window is already known.
+        assert!(!build(Some("high")).needs_effort_catalog());
+    }
+
+    #[test]
+    fn test_refine_effort_prefers_catalog_over_name_predicate() {
+        // gpt-5.1's name predicate tops out at "high" (no xhigh); effort unset.
+        let provider = OpenAiCodexProvider::new(
+            test_credential(),
+            "gpt-5.1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            "test".to_string(),
+            None,
+            None,
+        )
+        .expect("provider");
+        // Construction seeds the settled effort from the name predicate: high.
+        assert_eq!(provider.wire_effort().as_deref(), Some("high"));
+        // A catalog advertising xhigh overrides the name guess.
+        let with_xhigh = ModelInfo {
+            context_window: Some(400_000),
+            effort_levels: Some(vec!["low".into(), "high".into(), "xhigh".into()]),
+        };
+        provider.refine_effort(Some(&with_xhigh));
+        assert_eq!(provider.wire_effort().as_deref(), Some("xhigh"));
+        // A catalog capped at high pins it to high (authoritative, even if a name guessed higher).
+        let capped = ModelInfo {
+            context_window: Some(400_000),
+            effort_levels: Some(vec!["low".into(), "medium".into(), "high".into()]),
+        };
+        provider.refine_effort(Some(&capped));
+        assert_eq!(provider.wire_effort().as_deref(), Some("high"));
+        // A catalog capped BELOW high defaults to its strongest tier (medium), not an
+        // out-of-catalog "high" the API would reject.
+        let capped_medium = ModelInfo {
+            context_window: Some(400_000),
+            effort_levels: Some(vec!["low".into(), "medium".into()]),
+        };
+        provider.refine_effort(Some(&capped_medium));
+        assert_eq!(provider.wire_effort().as_deref(), Some("medium"));
+        // An authoritative empty catalog (non-reasoning model) omits effort, even though the name
+        // predicate would send it.
+        let non_reasoning = ModelInfo {
+            context_window: Some(400_000),
+            effort_levels: Some(vec![]),
+        };
+        provider.refine_effort(Some(&non_reasoning));
+        assert_eq!(provider.wire_effort(), None);
+        // No catalog (None) → fall back to the name predicate.
+        provider.refine_effort(None);
+        assert_eq!(provider.wire_effort().as_deref(), Some("high"));
+    }
+
+    #[test]
     fn test_usage_url_default_appends_backend_api_wham() {
         assert_eq!(
             test_provider().usage_url(),
@@ -1109,13 +1260,46 @@ mod tests {
     #[test]
     fn test_model_info_from_codex_models() {
         let body = r#"{"models":[
-            {"slug":"gpt-5.6-sol","context_window":1050000},
+            {"slug":"gpt-5.6-sol","context_window":1050000,"supported_reasoning_levels":[
+                {"effort":"Low","description":"low"},
+                {"effort":"medium","description":"medium"},
+                {"effort":"high","description":"high"},
+                {"effort":"xhigh","description":"xhigh"}
+            ]},
             {"slug":"gpt-other","context_window":272000}
         ]}"#;
         let info = model_info_from_codex_models(body, "gpt-5.6-sol")
             .unwrap()
             .expect("slug should match");
         assert_eq!(info.context_window, Some(1_050_000));
+        // The catalog's supported_reasoning_levels become lowercased effort_levels.
+        assert_eq!(
+            info.effort_levels.as_deref(),
+            Some(
+                ["low", "medium", "high", "xhigh"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        // A listed model with no reasoning levels → Some([]) (authoritatively non-reasoning: effort
+        // is omitted), distinct from the None an unlisted model yields (name-predicate fallback).
+        let plain = model_info_from_codex_models(body, "gpt-other")
+            .unwrap()
+            .expect("slug should match");
+        assert_eq!(plain.effort_levels, Some(vec![]));
+        // The larger `max_context_window` (premium tier) is preferred over the standard
+        // `context_window`, matching the model-card window meka uses for known models.
+        let tiered = r#"{"models":[
+            {"slug":"gpt-5.7","context_window":272000,"max_context_window":1050000,
+             "supported_reasoning_levels":[]}
+        ]}"#;
+        assert_eq!(
+            model_info_from_codex_models(tiered, "gpt-5.7")
+                .unwrap()
+                .expect("slug should match")
+                .context_window,
+            Some(1_050_000)
+        );
         // Unlisted model → Ok(None).
         assert!(
             model_info_from_codex_models(body, "no-such-model")

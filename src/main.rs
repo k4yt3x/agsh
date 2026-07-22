@@ -357,7 +357,6 @@ pub async fn build_shared_deps(
             None
         })
         .thinking(config.thinking_enabled, config.thinking_budget_tokens)
-        .reasoning_effort(config.reasoning_effort.clone())
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
@@ -382,14 +381,15 @@ pub async fn build_shared_deps(
         config.builtin_tool_permissions.clone(),
     );
 
-    let context_window = crate::provider::context_window::resolve_context_window(
+    let context_window = crate::provider::model_metadata::resolve_model_metadata(
         config.context_window,
         &provider,
         &session_manager.token_store(),
         config.active_profile.as_deref(),
         config.model.as_deref(),
     )
-    .await;
+    .await
+    .context_window;
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -613,7 +613,6 @@ async fn create_agent_from_config(
             None
         })
         .thinking(config.thinking_enabled, config.thinking_budget_tokens)
-        .reasoning_effort(config.reasoning_effort.clone())
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
@@ -647,14 +646,15 @@ async fn create_agent_from_config(
     // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
     // sub-agents to inherit `sandboxed_shell` / `context_messages` / `user_instructions` via
     // `Agent::new_subagent`.
-    let context_window = crate::provider::context_window::resolve_context_window(
+    let context_window = crate::provider::model_metadata::resolve_model_metadata(
         config.context_window,
         &provider,
         &session_manager.token_store(),
         config.active_profile.as_deref(),
         config.model.as_deref(),
     )
-    .await;
+    .await
+    .context_window;
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -911,7 +911,7 @@ async fn run_interactive(
     // Probe-free (no provider handle here): override / table / cache / floor. The agent built below
     // runs the full resolver, which caches any API-probed value, so an unrecognized model's gauge
     // converges to the accurate window on the next launch (and matches immediately otherwise).
-    let context_window = crate::provider::context_window::resolve_context_window_cached(
+    let context_window = crate::provider::model_metadata::resolve_context_window_cached(
         config.context_window,
         &session_manager.token_store(),
         config.active_profile.as_deref(),

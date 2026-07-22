@@ -18,6 +18,7 @@ use crate::{
 /// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form;
 /// `resolve_config` merges it with CLI flags and env vars to produce a [`ResolvedConfig`].
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     /// Name of the profile to use when no `--provider` flag is given.
     pub default_provider: Option<String>,
@@ -41,6 +42,7 @@ pub struct ConfigFile {
 /// defaults, but at least one `[[serve.tokens]]` entry is required; the server refuses to
 /// start without one.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServeConfig {
     /// Listen address. Default `127.0.0.1:8080`: bind to loopback so a fresh deploy isn't
     /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
@@ -76,6 +78,7 @@ pub struct ServeConfig {
 /// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See
 /// the Auth section of the HTTP API docs for the full scope catalogue.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServeTokenConfig {
     /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
     /// exclusive with `token_file`.
@@ -92,6 +95,7 @@ pub struct ServeTokenConfig {
 /// `[permissions]` table: choose which modes are reachable at runtime and which mode the session
 /// starts in. See `docs/book/src/usage/permissions.md`.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionsConfig {
     pub default: Option<String>,
     pub enabled: Option<Vec<String>>,
@@ -100,6 +104,7 @@ pub struct PermissionsConfig {
 /// Built-in tool filters, mirroring the per-server knobs on [`McpServerConfig`]. Applied at
 /// registration time by [`crate::tools::ToolRegistry`].
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     pub allowed_tools: Option<Vec<String>>,
     pub disabled_tools: Option<Vec<String>>,
@@ -107,11 +112,13 @@ pub struct ToolsConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PromptConfig {
     pub instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ThinkingConfig {
     pub enabled: Option<bool>,
     pub budget_tokens: Option<u64>,
@@ -119,6 +126,7 @@ pub struct ThinkingConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
     /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
@@ -137,6 +145,7 @@ pub struct McpConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
     pub transport: McpTransport,
@@ -210,6 +219,7 @@ pub enum McpAuthConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DisplayConfig {
     pub newline_before_prompt: Option<bool>,
     pub newline_after_prompt: Option<bool>,
@@ -230,6 +240,7 @@ pub struct DisplayConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WebConfig {
     pub user_agent: Option<String>,
     pub request_timeout_seconds: Option<u64>,
@@ -387,6 +398,7 @@ const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ShellConfig {
     pub sandbox: Option<bool>,
     /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
@@ -438,6 +450,7 @@ impl std::str::FromStr for SandboxBackend {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     pub context_messages: Option<usize>,
     pub retention_days: Option<u64>,
@@ -451,6 +464,7 @@ pub struct SessionConfig {
 /// credential (API key or OAuth bundle) is stored in the DB keyed by the profile name and is
 /// acquired via `meka provider add` / `login`.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderProfile {
     /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
     #[serde(rename = "type")]
@@ -459,7 +473,7 @@ pub struct ProviderProfile {
     pub base_url: Option<String>,
     /// Override the model's context window (total tokens the model can hold), used for the context
     /// gauge and auto-compaction. When unset, falls back to `[session].context_window` and then to
-    /// the model-name inference in [`context_window_for_model`].
+    /// the model-name inference in [`crate::provider::context_window_for_model`].
     pub context_window: Option<u64>,
     /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
     /// the ACP frontend from advertising / accepting images for a text-only model.
@@ -468,13 +482,12 @@ pub struct ProviderProfile {
     /// built-in default. On Claude the value must exceed the thinking budget.
     pub max_output_tokens: Option<u64>,
     pub oauth_token_url: Option<String>,
-    pub reasoning_effort: Option<String>,
     pub device_id: Option<String>,
     /// OAuth client ID override (advanced; `claude-oauth` / `openai-codex`).
     pub client_id: Option<String>,
-    /// `claude-oauth` only: value emitted as `output_config.effort`. Mirrors Claude Code's effort
-    /// knob. See `temp/claude-code/src/utils/effort.ts`. Accepted values: `"low" | "medium" |
-    /// "high"`. Defaults to `"high"`.
+    /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
+    /// `reasoning.effort`. Passed through verbatim; when unset the provider picks a model-aware
+    /// default (`xhigh` where supported, else `high`, omitted on models with no effort knob).
     pub effort: Option<String>,
     /// `claude-oauth` only: when true, meka sends the `redact-thinking-2026-02-12` beta header so
     /// the server returns `redacted_thinking` blocks instead of full thinking summaries (saves
@@ -534,13 +547,14 @@ pub struct ResolvedConfig {
     pub thinking_enabled: bool,
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
-    pub reasoning_effort: Option<String>,
     /// Stable per-device identifier for `claude-oauth`'s `metadata.user_id`. Empty string for
     /// non-`claude-oauth` providers (the value is ignored downstream).
     pub device_id: String,
-    /// `claude-oauth` `output_config.effort` value. Always one of `"low" | "medium" | "high"`
-    /// after `validate()`. Default `"high"`.
-    pub effort: String,
+    /// The user's explicit reasoning-effort override for every backend (Claude
+    /// `output_config.effort`, OpenAI `reasoning.effort`), or `None` when unset (the provider then
+    /// picks a model-aware default: `xhigh` where supported, else `high`, omitted on models with
+    /// no effort knob). Passed through verbatim.
+    pub effort: Option<String>,
     /// `claude-oauth`: when true, request `redacted_thinking` blocks via
     /// `redact-thinking-2026-02-12` beta. Default false.
     pub redact_thinking: bool,
@@ -1396,7 +1410,6 @@ impl ResolvedConfig {
             active_profile.as_deref(),
             active.and_then(|profile| profile.device_id.as_deref()),
         );
-        let effort = effort::resolve(active.and_then(|profile| profile.effort.as_deref()));
         // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
         // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
         let redact_thinking = active
@@ -1481,9 +1494,11 @@ impl ResolvedConfig {
                     .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
             }),
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
-            reasoning_effort: active.and_then(|profile| profile.reasoning_effort.clone()),
             device_id,
-            effort,
+            // Pure passthrough for every backend: whatever the profile sets goes to the provider
+            // verbatim (the provider trims/lowercases and applies the model-aware default when
+            // unset). An invalid value is the user's to own; the API rejects it.
+            effort: active.and_then(|profile| profile.effort.clone()),
             redact_thinking,
             auto_compact: file_session.auto_compact.unwrap_or(true),
             // Precedence: profile > `[session].context_window` > model-name inference (applied at
@@ -1585,44 +1600,6 @@ fn validate_max_output_tokens(
     Ok(())
 }
 
-/// Best-effort context-window inference from a model name. `Some(n)` for a recognized family;
-/// `None` when the model is unknown, which signals the caller to probe the provider API (and floor
-/// at 128k if that fails). Coarse substring matching; numbers track OpenAI's / Anthropic's
-/// published windows and will drift, so a config override or a successful API probe wins over a
-/// `Some` here. Returning `None` (not `Some(128_000)`) for unknowns is deliberate: it stops the
-/// 128k default from masquerading as knowledge and short-circuiting the probe.
-pub fn context_window_for_model(model: &str) -> Option<u64> {
-    if model.contains("claude") {
-        // Opus 4.6/4.7/4.8, Sonnet 4.6, and the Fable/Mythos 5 family ship a 1M window; Haiku and
-        // pre-4.6 models are 200k. `model_supports_adaptive_thinking` is the same era boundary meka
-        // uses to gate the `context-1m` beta (see `claude::shared::model_has_1m_context`), so this
-        // stays in sync with what the request actually sends. Caveat: claude-api doesn't send that
-        // beta, so its effective window for the 1M models is 200k; this value suits the common
-        // claude-oauth path, and an over-estimate is caught by overflow recovery.
-        if crate::provider::model_supports_adaptive_thinking(model) {
-            Some(1_000_000)
-        } else {
-            Some(200_000)
-        }
-    } else if model.contains("gpt-4.1") {
-        Some(1_047_576)
-    } else if model.contains("gpt-4o") {
-        Some(128_000)
-    } else if model.contains("gpt-5.4") || model.contains("gpt-5.5") || model.contains("gpt-5.6") {
-        // gpt-5.4 / 5.5 / 5.6 (incl. the 5.6 sol/terra/luna tiers). Above 272k input, OpenAI bills
-        // a premium tier, but the window is still one request.
-        Some(1_050_000)
-    } else if model.contains("gpt-5") {
-        // Legacy gpt-5, and unrecognized future gpt-5.x conservatively floored here rather than at
-        // the larger 5.4+ window.
-        Some(400_000)
-    } else if model.contains("o3") || model.contains("o4-mini") || model.contains("o1") {
-        Some(200_000)
-    } else {
-        None
-    }
-}
-
 /// Stable per-device identity for `claude-oauth` (embedded in `metadata.user_id`). Other providers
 /// get an empty string; we don't write a stub config file just to hold an unused value.
 mod device_id {
@@ -1720,31 +1697,6 @@ mod device_id {
         table.insert("device_id", toml_edit::value(id));
 
         write_config_atomic(path, &doc.to_string())
-    }
-}
-
-/// `[providers.<name>].effort` normalisation for Claude Code's `output_config.effort`.
-mod effort {
-    /// Resolves to one of `"low" | "medium" | "high"`, falling back to `"high"` for missing or
-    /// unrecognised values (with a warn log for the latter so a typo isn't silently lost).
-    pub(super) fn resolve(configured: Option<&str>) -> String {
-        const DEFAULT: &str = "high";
-        let Some(value) = configured else {
-            return DEFAULT.to_string();
-        };
-        let trimmed = value.trim();
-        match trimmed.to_ascii_lowercase().as_str() {
-            "low" | "medium" | "high" => trimmed.to_ascii_lowercase(),
-            other => {
-                tracing::warn!(
-                    "ignoring effort = {:?}: expected one of \"low\", \"medium\", \"high\"; \
-                     falling back to \"{}\"",
-                    other,
-                    DEFAULT,
-                );
-                DEFAULT.to_string()
-            }
-        }
     }
 }
 
@@ -2126,28 +2078,6 @@ type = "claude-oauth"
     }
 
     #[test]
-    fn test_resolve_effort_default_high() {
-        assert_eq!(effort::resolve(None), "high");
-    }
-
-    #[test]
-    fn test_resolve_effort_recognized_values() {
-        assert_eq!(effort::resolve(Some("low")), "low");
-        assert_eq!(effort::resolve(Some("medium")), "medium");
-        assert_eq!(effort::resolve(Some("high")), "high");
-        // Case-insensitive + trims surrounding whitespace.
-        assert_eq!(effort::resolve(Some("  Medium ")), "medium");
-        assert_eq!(effort::resolve(Some("HIGH")), "high");
-    }
-
-    #[test]
-    fn test_resolve_effort_unknown_falls_back_to_high() {
-        assert_eq!(effort::resolve(Some("max")), "high");
-        assert_eq!(effort::resolve(Some("")), "high");
-        assert_eq!(effort::resolve(Some("ultra")), "high");
-    }
-
-    #[test]
     fn test_resolve_device_id_returns_empty_for_non_claude_oauth() {
         // Should not generate / persist anything when the provider doesn't need a device_id. Empty
         // string flows through but is ignored by non-claude-oauth providers.
@@ -2315,6 +2245,31 @@ redact_thinking = true
             .expect("profile should be present");
         assert_eq!(profile.effort.as_deref(), Some("medium"));
         assert_eq!(profile.redact_thinking, Some(true));
+    }
+
+    #[test]
+    fn test_unknown_config_keys_are_rejected() {
+        // `deny_unknown_fields`: a typo or a removed key errors at load instead of silently doing
+        // nothing. An unknown key inside a provider profile (here the removed `reasoning_effort`).
+        let stale_profile = r#"
+[providers.work]
+type = "openai-codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+"#;
+        let error = toml::from_str::<ConfigFile>(stale_profile)
+            .expect_err("unknown profile key must be rejected")
+            .to_string();
+        assert!(
+            error.contains("reasoning_effort") || error.contains("unknown field"),
+            "{error}"
+        );
+        // A typo'd key inside `[session]`.
+        assert!(toml::from_str::<ConfigFile>("[session]\ncontex_window = 1000").is_err());
+        // A typo'd top-level section.
+        assert!(toml::from_str::<ConfigFile>("[sesion]\nfoo = 1").is_err());
+        // The corrected config still parses.
+        assert!(toml::from_str::<ConfigFile>("[session]\ncontext_window = 1000000").is_ok());
     }
 
     #[test]
@@ -2533,36 +2488,6 @@ subagent_max_depth = 5
         assert_eq!(retention_days, Some(30));
         assert_eq!(max_storage_bytes, Some(10_485_760));
         assert_eq!(subagent_max_depth, 5);
-    }
-
-    #[test]
-    fn test_context_window_for_model() {
-        // gpt-5.4 / 5.5 / 5.6 family (incl. the 5.6 sol/terra/luna tiers) = 1.05M.
-        assert_eq!(context_window_for_model("gpt-5.6-sol"), Some(1_050_000));
-        assert_eq!(context_window_for_model("gpt-5.6-terra"), Some(1_050_000));
-        assert_eq!(context_window_for_model("gpt-5.5"), Some(1_050_000));
-        assert_eq!(context_window_for_model("gpt-5.4"), Some(1_050_000));
-        // Legacy / bare gpt-5 floors lower.
-        assert_eq!(context_window_for_model("gpt-5"), Some(400_000));
-        assert_eq!(context_window_for_model("gpt-5-codex"), Some(400_000));
-        // Unchanged families.
-        assert_eq!(context_window_for_model("gpt-4.1"), Some(1_047_576));
-        assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
-        assert_eq!(context_window_for_model("o3"), Some(200_000));
-        assert_eq!(context_window_for_model("o4-mini"), Some(200_000));
-        // Claude: Opus 4.6+/Sonnet 4.6/Fable 5 ship 1M; Haiku 4.5 and pre-4.6 stay at 200k.
-        assert_eq!(context_window_for_model("claude-opus-4-6"), Some(1_000_000));
-        assert_eq!(context_window_for_model("claude-opus-4-8"), Some(1_000_000));
-        assert_eq!(
-            context_window_for_model("claude-sonnet-4-6"),
-            Some(1_000_000)
-        );
-        assert_eq!(context_window_for_model("claude-fable-5"), Some(1_000_000));
-        assert_eq!(context_window_for_model("claude-haiku-4-5"), Some(200_000));
-        assert_eq!(context_window_for_model("claude-sonnet-4-5"), Some(200_000));
-        assert_eq!(context_window_for_model("claude-3-5-sonnet"), Some(200_000));
-        // Unknown model → None (the resolver then probes the API / floors at 128k).
-        assert_eq!(context_window_for_model("some-unknown-model"), None);
     }
 
     #[test]

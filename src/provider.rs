@@ -4,13 +4,13 @@
 mod claude;
 /// `meka provider` subcommand suite (add/list/use/remove/login) and the provider OAuth login flows.
 pub mod cli;
-/// Resolving a model's context window (config override > built-in table > DB cache > API probe).
-pub(crate) mod context_window;
 /// Scripted provider used by the ACP integration test. Available in debug builds only; release
 /// builds don't pay the binary-size cost. Activated by the `MEKA_ACP_MOCK_PROVIDER` env var inside
 /// `acp::run_acp`; never reachable from production paths otherwise.
 #[cfg(debug_assertions)]
 pub(crate) mod mock;
+/// Resolving a model's metadata (context window + reasoning effort) in one cached, post-build pass.
+pub(crate) mod model_metadata;
 pub(crate) mod openai;
 /// Backoff policy for retrying [`crate::error::MekaError::RetryableProvider`] failures.
 pub(crate) mod retry;
@@ -101,15 +101,133 @@ pub struct AccountUsage {
 }
 
 /// Model metadata resolved from a provider's models API (Codex's `/backend-api/codex/models`,
-/// Anthropic's `/v1/models/{id}`). Fields are optional because the two providers report different
-/// subsets and an unknown model yields nothing. Used to resolve the context window when the
-/// built-in table doesn't recognize a model; `max_output_tokens` is carried for future use.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Anthropic's `/v1/models/{id}`) and cached per `(profile, model)`. Every field is optional
+/// because providers report different subsets and an unknown model yields nothing. Drives the
+/// context-window resolution when the built-in table doesn't recognize a model, and (for providers
+/// whose catalog reports it) the reasoning-effort default via [`resolve_effort_with_catalog`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// Maximum total context window in tokens, if the provider reported it.
     pub context_window: Option<u64>,
-    /// Maximum output (completion) tokens, if reported. Not yet wired into config resolution.
-    pub max_output_tokens: Option<u64>,
+    /// Reasoning-effort tiers the provider's models catalog reports for this model, lowercased
+    /// (e.g. `["low", "medium", "high", "xhigh"]`). `None` means no effort catalog was consulted
+    /// (Anthropic's models API exposes none, so always `None` for Claude); `Some` means a catalog
+    /// answered, where an empty list authoritatively marks a non-reasoning model (effort omitted).
+    /// When present it is authoritative for the effort default; otherwise the provider's
+    /// name-based predicates decide.
+    pub effort_levels: Option<Vec<String>>,
+}
+
+/// The shared reasoning-effort policy, applied identically by every provider that exposes an effort
+/// knob (Claude `output_config.effort`, OpenAI `reasoning.effort`). The provider supplies two
+/// model-capability booleans; this decides the wire value:
+///
+/// - an explicit override -> passed through verbatim (lowercased), **absolute**: never clamped to a
+///   lower tier and never dropped, even on a model meka wouldn't pick effort for by default. The
+///   user owns correctness for their chosen model/endpoint;
+/// - no override, model supports effort -> the strongest default tier (`xhigh` where available,
+///   else `high`), so a fresh profile gets strong reasoning without configuration;
+/// - no override, model has no effort knob (legacy Claude, non-reasoning / unrecognized OpenAI
+///   models) -> `None`, so the caller omits the field.
+pub(crate) fn resolve_effort_level(
+    configured: Option<&str>,
+    supports_effort: bool,
+    supports_xhigh: bool,
+) -> Option<String> {
+    // A blank override (empty or whitespace-only) is treated as unset, falling through to the
+    // model-aware default rather than sending an empty `effort` the API would reject. A non-blank
+    // value passes through verbatim (trimmed + lowercased); the user owns its correctness.
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => Some(value.to_ascii_lowercase()),
+        None if supports_xhigh => Some("xhigh".to_string()),
+        None if supports_effort => Some("high".to_string()),
+        None => None,
+    }
+}
+
+/// Reasoning-effort tiers meka considers when picking a *default* from a catalog, ordered weakest
+/// to strongest and capped at `xhigh`. `max`/`ultra` are deliberately omitted: they are never
+/// auto-selected (they stay opt-in via an explicit override), matching the name-based default.
+const DEFAULT_EFFORT_TIERS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
+/// The strongest tier meka will default to from a catalog's advertised `levels`: the highest-ranked
+/// member of [`DEFAULT_EFFORT_TIERS`] present in the list. `None` when the catalog lists none of
+/// those tiers (an empty list for a non-reasoning model, or the degenerate case of only
+/// `max`/`ultra` being offered), which the caller turns into an omitted field. Picking from the
+/// list - rather than a constant - keeps the default in-catalog: a model that caps at `medium`
+/// defaults to `medium`, not an out-of-catalog `high` the API would reject.
+fn strongest_catalog_tier(levels: &[String]) -> Option<String> {
+    DEFAULT_EFFORT_TIERS
+        .iter()
+        .rev()
+        .find(|tier| levels.iter().any(|level| level == *tier))
+        .map(|tier| (*tier).to_string())
+}
+
+/// Apply the shared effort policy with the *catalog* as the authoritative capability source when
+/// present, falling back to the provider's name-based predicates otherwise. `fetched_levels` is a
+/// model's [`ModelInfo::effort_levels`] (the provider's `/models` catalog): when `Some`, the
+/// default is the strongest tier the catalog actually offers (see [`strongest_catalog_tier`]) - an
+/// empty list means no effort knob, so the field is omitted; when `None` (no catalog: Claude
+/// always, the public OpenAI API, an unlisted model) the `name_supports_*` booleans decide. An
+/// explicit override is absolute either way. This is the single place the "catalog beats name
+/// predicate" ladder lives; only Codex has a catalog, so only its `refine_effort` calls this (the
+/// other providers, having no catalog, settle effort at construction via [`resolve_effort_level`]).
+pub(crate) fn resolve_effort_with_catalog(
+    configured: Option<&str>,
+    fetched_levels: Option<&[String]>,
+    name_supports_effort: bool,
+    name_supports_xhigh: bool,
+) -> Option<String> {
+    // An explicit (non-blank) override is absolute: passed through verbatim (lowercased), whatever
+    // the catalog or predicates say. A blank override is treated as unset (see
+    // [`resolve_effort_level`]).
+    if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+        return Some(value.to_ascii_lowercase());
+    }
+    match fetched_levels {
+        Some(levels) => strongest_catalog_tier(levels),
+        None => resolve_effort_level(None, name_supports_effort, name_supports_xhigh),
+    }
+}
+
+/// Best-effort context-window inference from a model name. `Some(n)` for a recognized family;
+/// `None` when the model is unknown, which signals the caller to probe the provider API (and floor
+/// at 128k if that fails). This table is meka's *authoritative* source for recognized models: it
+/// encodes each model's real window as meka's request receives it, so it reflects the window the
+/// request truly gets and wins over the live `/models` probe - which runs only for models this
+/// table returns `None` for. A config override still wins over everything. Returning `None` (not
+/// `Some(128_000)`) for unknowns is deliberate: it stops the 128k default from masquerading as
+/// knowledge and short-circuiting the probe.
+pub(crate) fn context_window_for_model(model: &str) -> Option<u64> {
+    if model.contains("claude") {
+        // Opus 4.6/4.7/4.8, Sonnet 4.6, and the Fable/Mythos 5 family ship a 1M window; Haiku and
+        // pre-4.6 models are 200k. `model_supports_adaptive_thinking` is the same era boundary that
+        // marks the 1M models. 1M is the default on the direct Messages API with no beta header for
+        // these models, so neither claude-api nor claude-oauth sends `context-1m` (matching Claude
+        // Code 2.1.217); this value is the window the request actually gets on both backends.
+        if model_supports_adaptive_thinking(model) {
+            Some(1_000_000)
+        } else {
+            Some(200_000)
+        }
+    } else if model.contains("gpt-4.1") {
+        Some(1_047_576)
+    } else if model.contains("gpt-4o") {
+        Some(128_000)
+    } else if model.contains("gpt-5.4") || model.contains("gpt-5.5") || model.contains("gpt-5.6") {
+        // gpt-5.4 / 5.5 / 5.6 (incl. the 5.6 sol/terra/luna tiers). Above 272k input, OpenAI bills
+        // a premium tier, but the window is still one request.
+        Some(1_050_000)
+    } else if model.contains("gpt-5") {
+        // Legacy gpt-5, and unrecognized future gpt-5.x conservatively floored here rather than at
+        // the larger 5.4+ window.
+        Some(400_000)
+    } else if model.contains("o3") || model.contains("o4-mini") || model.contains("o1") {
+        Some(200_000)
+    } else {
+        None
+    }
 }
 
 /// Pay-as-you-go / extra-usage (overage credits) state. Normalized from Anthropic's `extra_usage` +
@@ -578,6 +696,27 @@ pub trait Provider: Send + Sync {
     async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
         Ok(None)
     }
+
+    /// Resolve this model's reasoning-effort default from `fetched` (the provider's `/models`
+    /// catalog, authoritative when it reports effort levels) or, absent that, the provider's
+    /// name-based predicates, and store the result for the request body. Called once post-build by
+    /// [`crate::provider::model_metadata::resolve_model_metadata`] before any turn, so the wire
+    /// path reads a settled value instead of re-deriving it per request. Default: no-op
+    /// (providers with no effort knob). Effort-sending providers override; the shared ladder is
+    /// [`resolve_effort_with_catalog`].
+    fn refine_effort(&self, _fetched: Option<&ModelInfo>) {}
+
+    /// Whether [`crate::provider::model_metadata::resolve_model_metadata`] should probe the models
+    /// catalog to settle this model's reasoning effort. `true` only when the provider *has* an
+    /// effort catalog (Codex) *and* the effort isn't already pinned by an explicit override: in
+    /// that case the resolver probes even when the context window is table-known, so effort is
+    /// catalog-accurate rather than name-guessed (cached, so once per `(profile, model)` per TTL).
+    /// Returns `false` when there is no catalog (Claude, the public OpenAI API) or when an explicit
+    /// `effort` override already determines the value (the catalog would change nothing, so a
+    /// table-known window needs no probe at all). Default: `false`.
+    fn needs_effort_catalog(&self) -> bool {
+        false
+    }
 }
 
 struct ToolCallAccumulator {
@@ -659,9 +798,8 @@ pub struct ProviderBuilder {
     credential_key: Option<String>,
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
-    reasoning_effort: Option<String>,
     device_id: String,
-    effort: String,
+    effort: Option<String>,
     redact_thinking: bool,
     max_output_tokens: Option<u64>,
     session_stats: Option<Arc<crate::stats::SessionStats>>,
@@ -684,9 +822,8 @@ impl ProviderBuilder {
             credential_key: None,
             thinking_enabled: false,
             thinking_budget_tokens: 0,
-            reasoning_effort: None,
             device_id: String::new(),
-            effort: "high".to_string(),
+            effort: None,
             redact_thinking: true,
             max_output_tokens: None,
             session_stats: None,
@@ -733,21 +870,16 @@ impl ProviderBuilder {
         self
     }
 
-    /// OpenAI-only: maps to `reasoning.effort` for reasoning models.
-    pub fn reasoning_effort(mut self, value: Option<String>) -> Self {
-        self.reasoning_effort = value;
-        self
-    }
-
     /// Stable device identity embedded in `metadata.user_id`. Only consumed by `claude-oauth`.
     pub fn device_id(mut self, value: String) -> Self {
         self.device_id = value;
         self
     }
 
-    /// Claude Code `output_config.effort` (`low` / `medium` / `high`). Only consumed by
-    /// `claude-oauth`.
-    pub fn effort(mut self, value: String) -> Self {
+    /// The user's explicit reasoning-effort override (`low` / `medium` / `high` / `xhigh` / `max`),
+    /// or `None` to let the provider pick a model-aware default. Consumed by every backend: Claude
+    /// maps it to `output_config.effort`, OpenAI to `reasoning.effort`.
+    pub fn effort(mut self, value: Option<String>) -> Self {
         self.effort = value;
         self
     }
@@ -783,7 +915,7 @@ impl ProviderBuilder {
                     api_key,
                     self.model,
                     self.base_url,
-                    self.reasoning_effort,
+                    self.effort,
                     self.max_output_tokens,
                 )))
             }
@@ -804,6 +936,7 @@ impl ProviderBuilder {
                     self.base_url,
                     self.thinking_enabled,
                     self.thinking_budget_tokens,
+                    self.effort,
                     self.max_output_tokens,
                     self.session_stats,
                 )))
@@ -851,7 +984,7 @@ impl ProviderBuilder {
                     self.token_store,
                     self.credential_key
                         .unwrap_or_else(|| self.provider_name.clone()),
-                    self.reasoning_effort,
+                    self.effort,
                     self.max_output_tokens,
                 )?))
             }
@@ -867,6 +1000,129 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_effort_with_catalog() {
+        let levels = |items: &[&str]| Some(items.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Catalog present + contains xhigh → strongest default is xhigh, regardless of name
+        // guesses.
+        assert_eq!(
+            resolve_effort_with_catalog(
+                None,
+                levels(&["low", "high", "xhigh"]).as_deref(),
+                false,
+                false
+            )
+            .as_deref(),
+            Some("xhigh")
+        );
+        // Catalog present without xhigh → high, even if the name predicate wrongly claimed xhigh.
+        assert_eq!(
+            resolve_effort_with_catalog(
+                None,
+                levels(&["low", "medium", "high"]).as_deref(),
+                true,
+                true
+            )
+            .as_deref(),
+            Some("high")
+        );
+        // Catalog capped BELOW high → its strongest present tier (medium), not an out-of-catalog
+        // "high" the API would reject. This is the crux of catalog-authoritative defaults.
+        assert_eq!(
+            resolve_effort_with_catalog(None, levels(&["low", "medium"]).as_deref(), true, true)
+                .as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            resolve_effort_with_catalog(
+                None,
+                levels(&["none", "minimal", "low"]).as_deref(),
+                true,
+                true
+            )
+            .as_deref(),
+            Some("low")
+        );
+        // Empty catalog → no effort support → omit (name guesses ignored).
+        assert_eq!(
+            resolve_effort_with_catalog(None, Some(&[][..]), true, true),
+            None
+        );
+        // No catalog → fall back to the name predicates.
+        assert_eq!(
+            resolve_effort_with_catalog(None, None, true, true).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort_with_catalog(None, None, true, false).as_deref(),
+            Some("high")
+        );
+        assert_eq!(resolve_effort_with_catalog(None, None, false, false), None);
+        // An explicit override is absolute: passed through verbatim whatever the
+        // catalog/predicates.
+        assert_eq!(
+            resolve_effort_with_catalog(
+                Some("low"),
+                levels(&["high", "xhigh"]).as_deref(),
+                true,
+                true
+            )
+            .as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            resolve_effort_with_catalog(Some("xhigh"), Some(&[][..]), false, false).as_deref(),
+            Some("xhigh")
+        );
+        // A blank override (empty / whitespace) is treated as unset: it must not short-circuit to
+        // an empty wire value; it falls through to the catalog default or the name
+        // predicate.
+        assert_eq!(
+            resolve_effort_with_catalog(Some("  "), None, true, true).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort_with_catalog(
+                Some(""),
+                levels(&["low", "medium"]).as_deref(),
+                true,
+                true
+            )
+            .as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn test_context_window_for_model() {
+        // gpt-5.4 / 5.5 / 5.6 family (incl. the 5.6 sol/terra/luna tiers) = 1.05M.
+        assert_eq!(context_window_for_model("gpt-5.6-sol"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.6-terra"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.5"), Some(1_050_000));
+        assert_eq!(context_window_for_model("gpt-5.4"), Some(1_050_000));
+        // Legacy / bare gpt-5 floors lower.
+        assert_eq!(context_window_for_model("gpt-5"), Some(400_000));
+        assert_eq!(context_window_for_model("gpt-5-codex"), Some(400_000));
+        // Unchanged families.
+        assert_eq!(context_window_for_model("gpt-4.1"), Some(1_047_576));
+        assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
+        assert_eq!(context_window_for_model("o3"), Some(200_000));
+        assert_eq!(context_window_for_model("o4-mini"), Some(200_000));
+        // Claude: Opus 4.6+/Sonnet 4.6/Fable 5 ship 1M; Haiku 4.5 and pre-4.6 stay at 200k.
+        assert_eq!(context_window_for_model("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-6"),
+            Some(1_000_000)
+        );
+        assert_eq!(context_window_for_model("claude-fable-5"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(context_window_for_model("claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(context_window_for_model("claude-3-5-sonnet"), Some(200_000));
+        // Unknown model → None (the resolver then probes the API / floors at 128k).
+        assert_eq!(context_window_for_model("some-unknown-model"), None);
+    }
 
     #[test]
     fn test_user_with_images_appends_image_blocks_after_text() {
@@ -1228,7 +1484,7 @@ mod tests {
             },
             "gpt-5",
         )
-        .reasoning_effort(Some("high".to_string()))
+        .effort(Some("high".to_string()))
         .build();
         assert!(result.is_ok());
     }

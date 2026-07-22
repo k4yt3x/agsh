@@ -19,7 +19,10 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     model: String,
-    reasoning_effort: Option<String>,
+    /// The settled `reasoning_effort` for the request body, resolved once at construction from the
+    /// profile's override and the model's name predicates. The public OpenAI API exposes no models
+    /// catalog, so there is nothing to refine from post-build.
+    resolved_effort: Option<String>,
     max_output_tokens: Option<u64>,
 }
 
@@ -31,14 +34,20 @@ impl OpenAiProvider {
         reasoning_effort: Option<String>,
         max_output_tokens: Option<u64>,
     ) -> Self {
+        let resolved_effort = super::resolve_reasoning_effort(reasoning_effort.as_deref(), &model);
         Self {
             client: reqwest::Client::new(),
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             model,
-            reasoning_effort,
+            resolved_effort,
             max_output_tokens,
         }
+    }
+
+    /// The settled reasoning-effort to send as `reasoning_effort` (see [`Self::resolved_effort`]).
+    fn wire_effort(&self) -> Option<String> {
+        self.resolved_effort.clone()
     }
 
     pub(super) fn build_request_body(
@@ -180,7 +189,8 @@ impl OpenAiProvider {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
 
-        if let Some(effort) = &self.reasoning_effort {
+        let reasoning_effort = self.wire_effort();
+        if let Some(effort) = &reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(effort);
             // A reasoning model needs a generous completion cap or it truncates mid-thought. The
             // profile override wins; otherwise default to 32k.
@@ -682,6 +692,30 @@ mod tests {
         );
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_openai_request_body_reasoning_effort_defaults_by_model() {
+        // Unset effort on a recognized reasoning model resolves to its strongest tier.
+        let provider = OpenAiProvider::new(
+            "test-key".to_string(),
+            "gpt-5.6-sol".to_string(),
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        // An unrecognized (local) model omits the field even with effort unset.
+        let local = OpenAiProvider::new(
+            "test-key".to_string(),
+            "llama3.1".to_string(),
+            None,
+            None,
+            None,
+        );
+        let body = local.build_request_body("", &[Message::user("hi")], &[], false);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

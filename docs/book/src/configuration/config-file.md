@@ -10,6 +10,8 @@ meka looks for a TOML configuration file at a platform-specific location:
 
 The config file is optional. If it does not exist, meka silently skips it.
 
+meka rejects unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
+
 Set the `MEKA_CONFIG_DIR` environment variable to override the default location entirely. The value points at the `meka` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
 
 ## Providers
@@ -100,28 +102,22 @@ Custom OAuth token refresh endpoint. Defaults:
 - `https://api.anthropic.com/v1/oauth/token` for `claude-oauth`
 - `https://auth.openai.com/oauth/token` for `openai-codex`
 
-### `reasoning_effort`
-
-Reasoning effort level for OpenAI o-series models. When set, the `reasoning_effort` parameter is included in API requests and `max_completion_tokens` is used instead of `max_tokens`.
-
-Accepted values: `low`, `medium`, `high`. Omitted by default.
-
-```toml
-[providers.work]
-type             = "openai-api"
-reasoning_effort = "medium"
-```
-
 ### `effort`
 
-`claude-oauth` only. Controls the `output_config.effort` field that the `effort-2025-11-24` beta unlocks for adaptive-thinking-capable models (`opus-4-6`, `sonnet-4-6`). Higher values give the model more time to think; the field is ignored on non-effort-capable models.
+One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-oauth` under the `effort-2025-11-24` beta, `claude-api` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
 
-Accepted values: `low`, `medium`, `high`. Defaults to `high`. Unrecognised values fall back to `high` and are logged at `warn`.
+When unset, meka picks a model-aware default: `xhigh` on models that support it (Claude Opus 4.7+/Sonnet 5/Fable/Mythos 5; OpenAI gpt-5.2+, gpt-5.1-codex-max), `high` on effort-capable models without `xhigh` (Claude Opus 4.5/4.6, Sonnet 4.6; OpenAI o-series, gpt-5, gpt-5.1), and the field is omitted entirely on models with no effort knob (Claude Sonnet 4.0/4.5, Opus 4.1, Haiku 4.5; OpenAI gpt-4o, o1-mini, and unrecognised names such as local models served through `openai-api`).
+
+For `openai-codex`, the supported tiers come from your account's models catalog (`/models`), which is authoritative: the default stays accurate even for models newer than meka, and the name-based lists above are only the fallback when the catalog is unavailable. Claude and the public OpenAI API expose no such catalog, so they always use the name-based lists. The lookup is one bounded, cached probe per model (see [`session.context_window`](#sessioncontext_window)).
+
+An explicit value is absolute: sent verbatim, with no validation or clamping, and applied even to a model the default would omit it for. You own correctness for your model/endpoint; an invalid value is rejected by the API.
+
+Typical values: `low`, `medium`, `high`, `xhigh`, `max`.
 
 ```toml
 [providers.work]
 type   = "claude-oauth"
-effort = "medium"
+effort = "xhigh"
 ```
 
 ### `redact_thinking`
@@ -512,7 +508,7 @@ auto_compact = false
 
 Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this.
 
-When neither is set, meka resolves the window automatically: a built-in table for recognized models, otherwise a live query of the provider's models API (supported for `openai-codex` and the Claude backends; not the public OpenAI API), falling back to a 128k floor. The resolved value is cached in the session database (keyed by profile and model) so later runs don't re-query. Setting this option pins the window and skips both the table and the API lookup.
+When neither is set, meka resolves the window automatically. A built-in table is authoritative for recognized models: it encodes each model's real window as meka's request receives it (for example 1M for Opus 4.8, which is the default on the direct API and what `claude-oauth` negotiates by mirroring Claude Code), so it reflects the window the request truly gets and wins over the live API. For a model the table doesn't recognize, meka makes one bounded query of the provider's models API (supported for `openai-codex` and the Claude backends; not the public OpenAI API), falling back to a 128k floor. That single probe also carries the reasoning-effort levels (for `openai-codex`), so window and [`effort`](#effort) share one lookup, and the whole result is cached in the session database keyed by profile and model so later runs don't re-query. Setting this option pins the window and skips the table and the API lookup for the window (a catalog probe may still run to resolve effort).
 
 ```toml
 [session]

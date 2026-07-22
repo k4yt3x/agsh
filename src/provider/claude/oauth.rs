@@ -16,9 +16,9 @@ use uuid::Uuid;
 
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, model_has_1m_context, model_is_haiku, model_supports_effort,
-    model_supports_mid_conversation_system, model_supports_modern_features,
-    model_supports_temperature, parse_non_streaming_response,
+    drive_claude_sse_stream, model_is_haiku, model_supports_mid_conversation_system,
+    model_supports_modern_features, model_supports_temperature, parse_non_streaming_response,
+    resolve_effort,
 };
 use crate::{
     error::{MekaError, Result},
@@ -60,9 +60,12 @@ pub struct ClaudeOAuthProvider {
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
-    /// Value emitted as `output_config.effort` for effort-capable models. Always one of `"low" |
-    /// "medium" | "high"` (validated by config layer).
-    effort: String,
+    /// The settled `output_config.effort` for the request body, resolved once at construction from
+    /// the profile's override and the model's name predicates (`xhigh` where supported, else
+    /// `high`). Anthropic's models API reports no effort levels, so there is no catalog to refine
+    /// from post-build. Both the body field and the `effort-2025-11-24` beta gate read it, so they
+    /// stay in lockstep.
+    resolved_effort: Option<String>,
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
     redact_thinking: bool,
@@ -85,7 +88,7 @@ impl ClaudeOAuthProvider {
         thinking_enabled: bool,
         thinking_budget_tokens: u64,
         device_id: String,
-        effort: String,
+        effort: Option<String>,
         redact_thinking: bool,
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
@@ -94,6 +97,7 @@ impl ClaudeOAuthProvider {
             AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
             _ => String::new(),
         };
+        let resolved_effort = resolve_effort(effort.as_deref(), &model);
         Self {
             client: reqwest::Client::new(),
             credential: tokio::sync::RwLock::new(credential),
@@ -110,7 +114,7 @@ impl ClaudeOAuthProvider {
             thinking_enabled,
             thinking_budget_tokens,
             thinking_override: AtomicI8::new(-1),
-            effort,
+            resolved_effort,
             redact_thinking,
             max_output_tokens,
             session_stats,
@@ -121,10 +125,23 @@ impl ClaudeOAuthProvider {
         shared::resolve_thinking_enabled(&self.thinking_override, self.thinking_enabled)
     }
 
-    /// Mirrors Claude Code 2.1.185's CLI `getAllModelBetas`, validated against a live wire capture
+    /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]). The
+    /// `effort-2025-11-24` beta gate in [`Self::compute_betas`] reads the same value, keeping the
+    /// body field and the beta header in lockstep.
+    fn wire_effort(&self) -> Option<String> {
+        self.resolved_effort.clone()
+    }
+
+    /// Mirrors Claude Code 2.1.217's CLI `getAllModelBetas`, validated against a live wire capture
     /// (`temp/cc-re/capture/FINDINGS.md`): first-party OAuth subscriber, opus-4-8 with tools and
     /// thinking. `has_tools` gates `advanced-tool-use-2025-11-20` (sent only when the request
     /// carries tools). Adaptive thinking is GA, selected via the body `thinking` param (no beta).
+    ///
+    /// No `context-1m-2025-08-07`: Claude Code 2.1.217 stopped sending it (the 2.1.185 CLI did).
+    /// On the current 1M models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5) the 1M window is the
+    /// default with no beta header, so the beta is redundant. Verified by the 2.1.217
+    /// interactive-CLI wire capture (opus-4-8 turn sends 11 betas, no `context-1m`), matching
+    /// the claude-api path.
     ///
     /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
     /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
@@ -133,16 +150,12 @@ impl ClaudeOAuthProvider {
     /// [`crate::provider::ContentBlock::RedactedThinking`]).
     fn compute_betas(&self, has_tools: bool) -> Option<String> {
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(12);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(11);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
         }
         parts.push("oauth-2025-04-20");
-
-        if model_has_1m_context(model) {
-            parts.push("context-1m-2025-08-07");
-        }
 
         if model_supports_modern_features(model) {
             parts.push("interleaved-thinking-2025-05-14");
@@ -165,7 +178,10 @@ impl ClaudeOAuthProvider {
             parts.push("advanced-tool-use-2025-11-20");
         }
 
-        if model_supports_effort(model) {
+        // Keep the beta in lockstep with the body field: both read the same settled effort slot, so
+        // the beta fires exactly when `output_config.effort` will be sent (the model-aware default
+        // on effort-capable models, or any explicit override, which is absolute).
+        if self.wire_effort().is_some() {
             parts.push("effort-2025-11-24");
         }
 
@@ -428,10 +444,10 @@ impl ClaudeOAuthProvider {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
-        if model_supports_effort(&self.model) {
+        if let Some(effort) = self.wire_effort() {
             body.insert(
                 "output_config".to_string(),
-                serde_json::json!({ "effort": self.effort }),
+                serde_json::json!({ "effort": effort }),
             );
         }
 
@@ -917,7 +933,7 @@ mod tests {
             false,
             10000,
             "a".repeat(64),
-            "high".to_string(),
+            Some("high".to_string()),
             false,
             None,
             None,
@@ -1417,7 +1433,7 @@ mod tests {
             false,
             10000,
             "a".repeat(64),
-            "high".to_string(),
+            Some("high".to_string()),
             false,
             None,
             None,
@@ -1567,6 +1583,25 @@ mod tests {
         provider_full(model, thinking, "high", false)
     }
 
+    fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeOAuthProvider {
+        ClaudeOAuthProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            model.to_string(),
+            None,
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            10000,
+            "a".repeat(64),
+            effort.map(str::to_string),
+            false,
+            None,
+            None,
+        )
+    }
+
     fn provider_full(
         model: &str,
         thinking: bool,
@@ -1584,7 +1619,7 @@ mod tests {
             thinking,
             10000,
             "a".repeat(64),
-            effort.to_string(),
+            Some(effort.to_string()),
             redact_thinking,
             None,
             None,
@@ -1610,10 +1645,10 @@ mod tests {
 
     #[test]
     fn test_betas_modern_thinking_model_full_set() {
-        // opus-4-8 with tools + thinking: matches the live Claude Code 2.1.185 CLI wire capture
-        // exactly, except `redact-thinking-2026-02-12` (CC sends it by default; meka keeps it
-        // behind the `redact_thinking` knob — see `compute_betas`).
-        let betas = provider_with("claude-opus-4-8", true)
+        // opus-4-8 with tools + thinking + redact_thinking on: matches the live Claude Code 2.1.217
+        // CLI wire capture exactly (11 betas, no `context-1m`; `redact-thinking-2026-02-12`
+        // present, which CC sends by default).
+        let betas = provider_full("claude-opus-4-8", true, "high", true)
             .compute_betas(true)
             .unwrap();
         let parts: Vec<&str> = betas.split(',').collect();
@@ -1622,8 +1657,8 @@ mod tests {
             vec![
                 "claude-code-20250219",
                 "oauth-2025-04-20",
-                "context-1m-2025-08-07",
                 "interleaved-thinking-2025-05-14",
+                "redact-thinking-2026-02-12",
                 "thinking-token-count-2026-05-13",
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
@@ -1650,21 +1685,23 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_context_1m_only_for_1m_models() {
-        assert!(
-            provider_with("claude-opus-4-6-20250514", false)
-                .compute_betas(true)
-                .unwrap()
-                .contains("context-1m-2025-08-07")
-        );
-        // Sonnet 4.0 (200K) and Haiku 4.5 (200K) do not get the 1M beta.
-        for model in ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"] {
+    fn test_betas_never_send_context_1m() {
+        // Claude Code 2.1.217 dropped `context-1m-2025-08-07`; 1M is the default (no beta) on the
+        // current 1M models, so meka never sends it either, across the lineup.
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-6-20250514",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
+        ] {
             assert!(
                 !provider_with(model, false)
                     .compute_betas(true)
                     .unwrap()
                     .contains("context-1m-2025-08-07"),
-                "{model} is not a 1M-context model"
+                "{model} must not send context-1m"
             );
         }
     }
@@ -1689,7 +1726,10 @@ mod tests {
 
     #[test]
     fn test_betas_haiku_skips_claude_code_and_effort() {
-        let betas = provider_with("claude-haiku-4-5-20251001", false)
+        // Effort unset: Haiku (pre-4.6) omits the effort beta by default. (An explicit override is
+        // absolute and would send it; see
+        // test_output_config_omitted_when_unset_and_model_lacks_effort.)
+        let betas = provider_effort("claude-haiku-4-5-20251001", None)
             .compute_betas(true)
             .unwrap();
         assert!(!betas.contains("claude-code-20250219"), "{betas}");
@@ -1748,13 +1788,36 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_omitted_when_model_does_not_support_effort() {
-        // sonnet-4 (not 4-6) is not effort-capable.
-        let provider = provider_full("claude-sonnet-4-20250514", false, "high", false);
+    fn test_output_config_effort_defaults_by_model() {
+        // Unset effort resolves, on the wire, to the strongest tier the model supports.
+        let modern = provider_effort("claude-opus-4-8", None);
+        let body = modern.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        // The 4.6 generation has effort but no xhigh, so it falls back to high.
+        let four_six = provider_effort("claude-opus-4-6-20250514", None);
+        let body = four_six.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_output_config_omitted_when_unset_and_model_lacks_effort() {
+        // sonnet-4 (not 4-6) is not effort-capable: with effort unset, the field is omitted.
+        let provider = provider_effort("claude-sonnet-4-20250514", None);
         let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
         assert!(
             body.get("output_config").is_none(),
-            "output_config must be omitted when model lacks effort support"
+            "output_config must be omitted when effort is unset on a non-effort model"
+        );
+        // An explicit override is absolute: it is sent even to a model the default would skip.
+        let forced = provider_effort("claude-sonnet-4-20250514", Some("high"));
+        let body = forced.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(
+            forced
+                .compute_betas(true)
+                .unwrap()
+                .contains("effort-2025-11-24"),
+            "effort beta must accompany an explicit override in the body"
         );
     }
 
@@ -3118,7 +3181,7 @@ mod tests {
             false,
             10000,
             "a".repeat(64),
-            "high".to_string(),
+            Some("high".to_string()),
             false,
             None,
             None,

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, parse_non_streaming_response,
+    drive_claude_sse_stream, parse_non_streaming_response, resolve_effort,
 };
 use crate::{
     error::{MekaError, Result},
@@ -30,6 +30,11 @@ pub struct ClaudeApiProvider {
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
+    /// The settled `output_config.effort` for the request body, resolved once at construction from
+    /// the profile's override and the model's name predicates. Anthropic's models API reports no
+    /// effort levels, so there is no catalog to refine from post-build. The direct Messages API
+    /// takes effort with no beta header.
+    resolved_effort: Option<String>,
     /// Per-request output token cap from the profile; `None` keeps the built-in default.
     max_output_tokens: Option<u64>,
     /// Per-session counters incremented when image-redaction events fire.
@@ -37,15 +42,18 @@ pub struct ClaudeApiProvider {
 }
 
 impl ClaudeApiProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_key: String,
         model: String,
         base_url: Option<String>,
         thinking_enabled: bool,
         thinking_budget_tokens: u64,
+        effort: Option<String>,
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
+        let resolved_effort = resolve_effort(effort.as_deref(), &model);
         Self {
             client: reqwest::Client::new(),
             api_key,
@@ -54,6 +62,7 @@ impl ClaudeApiProvider {
             thinking_enabled,
             thinking_budget_tokens,
             thinking_override: AtomicI8::new(-1),
+            resolved_effort,
             max_output_tokens,
             session_stats,
         }
@@ -63,11 +72,25 @@ impl ClaudeApiProvider {
         shared::resolve_thinking_enabled(&self.thinking_override, self.thinking_enabled)
     }
 
+    /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]).
+    fn wire_effort(&self) -> Option<String> {
+        self.resolved_effort.clone()
+    }
+
     fn compute_betas(&self) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
         if self.is_thinking_enabled() {
-            Some("interleaved-thinking-2025-05-14".to_string())
-        } else {
+            parts.push("interleaved-thinking-2025-05-14");
+        }
+        // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
+        // the current large-context models (Opus 4.6+, Sonnet 4.6, Fable 5) with no beta header,
+        // so `context_window_for_model`'s 1M value is already what the request gets. See
+        // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. (claude-oauth
+        // still sends it, mirroring Claude Code's captured wire.)
+        if parts.is_empty() {
             None
+        } else {
+            Some(parts.join(","))
         }
     }
 
@@ -101,6 +124,16 @@ impl ClaudeApiProvider {
             body.insert(
                 "tools".to_string(),
                 serde_json::json!(convert_tools_to_claude_tools(tools)),
+            );
+        }
+
+        // The direct Messages API takes `output_config.effort` in the body with no beta header
+        // (unlike claude-oauth, which mirrors Claude Code's `effort-2025-11-24` beta). See
+        // <https://platform.claude.com/docs/en/build-with-claude/effort>.
+        if let Some(effort) = self.wire_effort() {
+            body.insert(
+                "output_config".to_string(),
+                serde_json::json!({ "effort": effort }),
             );
         }
 
@@ -262,15 +295,66 @@ mod tests {
     use super::*;
 
     fn test_provider() -> ClaudeApiProvider {
+        provider("claude-sonnet-4-20250514", None)
+    }
+
+    fn provider(model: &str, effort: Option<&str>) -> ClaudeApiProvider {
         ClaudeApiProvider::new(
             "test-key".to_string(),
-            "claude-sonnet-4-20250514".to_string(),
+            model.to_string(),
             None,
             false,
             10000,
+            effort.map(str::to_string),
             None,
             None,
         )
+    }
+
+    #[test]
+    fn test_output_config_effort_wired_and_gated() {
+        // Unset effort defaults to the strongest tier the model supports, no beta header needed.
+        let modern = provider("claude-opus-4-8", None);
+        let body = modern.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        // Explicit override is honored.
+        let explicit = provider("claude-opus-4-8", Some("medium"));
+        let body = explicit.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "medium");
+        // Unset on a legacy (pre-4.6) model omits the field.
+        let legacy_unset = provider("claude-sonnet-4-20250514", None);
+        let body = legacy_unset.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert!(body.get("output_config").is_none());
+        // An explicit override is absolute: sent even on a model the default would skip.
+        let legacy_forced = provider("claude-sonnet-4-20250514", Some("high"));
+        let body = legacy_forced.build_request_body("s", &[Message::user("hi")], &[], false);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_betas_omit_context_1m() {
+        // The direct Messages API serves 1M context by default for 1M-capable models with no beta
+        // header, so claude-api never sends `context-1m-2025-08-07` (unlike claude-oauth, which
+        // mirrors Claude Code's captured wire). A thinking-enabled request still sends only the
+        // interleaved beta.
+        let thinking_on = ClaudeApiProvider::new(
+            "test-key".to_string(),
+            "claude-opus-4-8".to_string(),
+            None,
+            true,
+            10000,
+            None,
+            None,
+            None,
+        );
+        let betas = thinking_on.compute_betas().unwrap_or_default();
+        assert!(betas.contains("interleaved-thinking-2025-05-14"));
+        assert!(
+            !betas.contains("context-1m"),
+            "1M is the API default; no beta expected: {betas}"
+        );
+        // Thinking off on a 1M-capable model → no betas at all.
+        assert!(provider("claude-opus-4-8", None).compute_betas().is_none());
     }
 
     #[test]

@@ -358,7 +358,7 @@ fn claude_user_agent() -> String {
 /// verified against wire captures of real Claude Code traffic. The runtime reports as `node`
 /// (Bun's Node.js compat layer) with a fixed version string.
 const STAINLESS_RUNTIME: &str = "node";
-const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
+const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
 const STAINLESS_SDK_VERSION: &str = "0.94.0";
 
 /// Maps `std::env::consts::ARCH` to Node.js/Bun `process.arch` names.
@@ -406,7 +406,7 @@ pub(super) fn apply_headers(
         .header("x-stainless-runtime", STAINLESS_RUNTIME)
         .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
         .header("anthropic-version", "2023-06-01")
-        // Set by the SDK; observed on real Claude Code 2.1.185 CLI requests.
+        // Set by the SDK; observed on real Claude Code 2.1.217 CLI requests.
         .header("anthropic-dangerous-direct-browser-access", "true")
         // From the SDK's `authHeaders()`.
         .header(auth_header_name, auth_header_value)

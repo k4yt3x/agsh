@@ -18,29 +18,28 @@ use crate::{
     },
 };
 
-/// Subset of the Anthropic `GET /v1/models/{id}` body carrying the model's token limits.
+/// Subset of the Anthropic `GET /v1/models/{id}` body carrying the model's context window.
+/// Anthropic exposes no reasoning-effort levels here, so [`ModelInfo::effort_levels`] is always
+/// `None` for Claude and effort falls to the name-based predicates.
 #[derive(serde::Deserialize)]
 struct ClaudeModelResponse {
     #[serde(default)]
     max_input_tokens: Option<u64>,
-    #[serde(default)]
-    max_tokens: Option<u64>,
 }
 
 /// Parse an Anthropic model object into [`ModelInfo`]. Shared by both Claude providers (same wire
 /// shape). `Err` on malformed JSON. The API reports `0` for an unset limit, so treat `0` as unknown
-/// (`None`); returns `Ok(None)` when neither limit is known.
+/// (`None`); returns `Ok(None)` when the context window is unknown.
 pub(super) fn model_info_from_claude_model(body: &str) -> Result<Option<ModelInfo>> {
     let parsed: ClaudeModelResponse = serde_json::from_str(body)
         .map_err(|error| MekaError::Provider(format!("invalid Claude model JSON: {}", error)))?;
     let context_window = parsed.max_input_tokens.filter(|value| *value > 0);
-    let max_output_tokens = parsed.max_tokens.filter(|value| *value > 0);
-    if context_window.is_none() && max_output_tokens.is_none() {
+    if context_window.is_none() {
         return Ok(None);
     }
     Ok(Some(ModelInfo {
         context_window,
-        max_output_tokens,
+        effort_levels: None,
     }))
 }
 
@@ -154,7 +153,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// replaces whichever default would otherwise apply; on the budgeted path it is clamped to stay
 /// above `budget_tokens` (the API rejects `max_tokens <= thinking.budget_tokens`).
 ///
-/// No `display` field is set: real Claude Code 2.1.185 sends `{type:"adaptive"}` with no `display`
+/// No `display` field is set: real Claude Code 2.1.217 sends `{type:"adaptive"}` with no `display`
 /// (verified by wire capture), so the model default applies.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
@@ -201,18 +200,42 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 }
 
 /// Whether a Claude model supports the `output_config.effort` knob (the `effort-2025-11-24` beta).
-/// Effort shipped alongside adaptive thinking in Claude 4.6, so it follows the same rule: enabled
-/// by default, excluded only for known pre-4.6 models (see [`model_predates_adaptive_thinking`]).
+/// Effort shipped with Claude 4.6, so adaptive-thinking-era models are enabled by default. The one
+/// exception is Opus 4.5, which predates adaptive thinking (manual budgeted thinking, 200K window)
+/// yet still supports effort (`low`/`medium`/`high`, no `xhigh`); it's carved out here so only the
+/// other pre-4.6 gates keep treating it as old (see [`model_predates_adaptive_thinking`]).
 pub(super) fn model_supports_effort(model: &str) -> bool {
-    !model_predates_adaptive_thinking(model)
+    if !model_predates_adaptive_thinking(model) {
+        return true;
+    }
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus") && parse_model_version(&lower) == Some((4, 5))
 }
 
-/// Whether a Claude model ships a 1M-token context window (gating the `context-1m-2025-08-07`
-/// beta). For the current Claude lineup the 1M models are exactly the adaptive-thinking-era ones
-/// (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5); Haiku 4.5 and 4.0-era models are 200K. Revisit
-/// if a 1M model ships that predates adaptive thinking.
-pub(super) fn model_has_1m_context(model: &str) -> bool {
-    !model_predates_adaptive_thinking(model)
+/// Whether a Claude model supports the `xhigh` effort tier. Effort-capable, but excluding the
+/// generations that shipped effort without `xhigh`: Opus 4.5 (caps at `high`) and the 4.6 line
+/// (Opus 4.6, Sonnet 4.6, which have `max` but not `xhigh`). Everything newer (Opus 4.7+, Sonnet 5,
+/// Fable/Mythos 5) and any unrecognized future model supports it, mirroring the optimistic default
+/// in [`model_supports_effort`].
+pub(super) fn model_supports_xhigh(model: &str) -> bool {
+    if !model_supports_effort(model) {
+        return false;
+    }
+    let lower = model.to_ascii_lowercase();
+    let no_xhigh = (lower.contains("opus") || lower.contains("sonnet"))
+        && matches!(parse_model_version(&lower), Some((4, 5)) | Some((4, 6)));
+    !no_xhigh
+}
+
+/// Resolve the `output_config.effort` value for `model` given the profile's explicit override
+/// (`None` = unset). Returns `None` when the model has no effort knob (the caller then omits the
+/// field). See [`crate::provider::resolve_effort_level`] for the shared policy.
+pub(super) fn resolve_effort(configured: Option<&str>, model: &str) -> Option<String> {
+    crate::provider::resolve_effort_level(
+        configured,
+        model_supports_effort(model),
+        model_supports_xhigh(model),
+    )
 }
 
 /// Whether a Claude model accepts the `temperature` sampling parameter. Sampling params are removed
@@ -1044,12 +1067,13 @@ mod tests {
             r#"{"id":"claude-opus-4-6","max_input_tokens":200000,"max_tokens":64000}"#,
         )
         .unwrap()
-        .expect("known limits");
+        .expect("known context window");
         assert_eq!(info.context_window, Some(200_000));
-        assert_eq!(info.max_output_tokens, Some(64_000));
+        // Anthropic exposes no effort levels; effort falls to the name predicates.
+        assert_eq!(info.effort_levels, None);
         // The API reports 0 for an unset limit → treated as unknown.
         assert!(
-            model_info_from_claude_model(r#"{"max_input_tokens":0,"max_tokens":0}"#)
+            model_info_from_claude_model(r#"{"max_input_tokens":0}"#)
                 .unwrap()
                 .is_none()
         );
@@ -1251,7 +1275,11 @@ mod tests {
     fn test_model_supports_effort() {
         assert!(model_supports_effort("claude-opus-4-6-20250514"));
         assert!(model_supports_effort("claude-sonnet-4-6"));
-        // Older / non-4-6 sonnet/opus/haiku are explicitly denied.
+        // Opus 4.5 predates adaptive thinking but still supports effort (the one exception).
+        assert!(model_supports_effort("claude-opus-4-5-20250929"));
+        // Older / non-4-6 sonnet/opus/haiku are explicitly denied (Sonnet 4.5 is NOT
+        // effort-capable).
+        assert!(!model_supports_effort("claude-sonnet-4-5"));
         assert!(!model_supports_effort("claude-sonnet-4-20250514"));
         assert!(!model_supports_effort("claude-opus-4-1"));
         assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
@@ -1260,6 +1288,70 @@ mod tests {
         // New families are effort-capable by default, even with a low version number.
         assert!(model_supports_effort("claude-fable-5"));
         assert!(model_supports_effort("claude-fable-2"));
+    }
+
+    #[test]
+    fn test_model_supports_xhigh() {
+        // Opus 4.5 and the 4.6 generation are effort-capable but have no xhigh.
+        assert!(!model_supports_xhigh("claude-opus-4-5-20250929"));
+        assert!(!model_supports_xhigh("claude-opus-4-6-20250514"));
+        assert!(!model_supports_xhigh("claude-sonnet-4-6"));
+        // 4.7+ / Sonnet 5 / new families support xhigh.
+        assert!(model_supports_xhigh("claude-opus-4-8"));
+        assert!(model_supports_xhigh("claude-opus-4-7"));
+        assert!(model_supports_xhigh("claude-sonnet-5"));
+        assert!(model_supports_xhigh("claude-fable-5"));
+        assert!(model_supports_xhigh("claude-future-experimental-7"));
+        // Non-effort models never reach xhigh.
+        assert!(!model_supports_xhigh("claude-haiku-4-5-20251001"));
+        assert!(!model_supports_xhigh("claude-opus-4-1"));
+    }
+
+    #[test]
+    fn test_resolve_effort() {
+        // Unset: best tier the model supports.
+        assert_eq!(
+            resolve_effort(None, "claude-opus-4-8").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort(None, "claude-opus-4-6").as_deref(),
+            Some("high")
+        );
+        // Explicit values are absolute: passed through verbatim, never clamped.
+        assert_eq!(
+            resolve_effort(Some("xhigh"), "claude-opus-4-6").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort(Some("low"), "claude-opus-4-8").as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            resolve_effort(Some("max"), "claude-opus-4-6").as_deref(),
+            Some("max")
+        );
+        // ...even on a model the default would omit effort for.
+        assert_eq!(
+            resolve_effort(Some("high"), "claude-opus-4-1").as_deref(),
+            Some("high")
+        );
+        // Unset on a legacy / non-effort model omits the field entirely.
+        assert_eq!(resolve_effort(None, "claude-haiku-4-5-20251001"), None);
+        // A blank override (empty / whitespace) is treated as unset → model-aware default, never an
+        // empty `output_config.effort` the API would reject.
+        assert_eq!(
+            resolve_effort(Some("  "), "claude-opus-4-8").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort(Some(""), "claude-opus-4-6").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            resolve_effort(Some("   "), "claude-haiku-4-5-20251001"),
+            None
+        );
     }
 
     #[test]
@@ -1323,27 +1415,6 @@ mod tests {
         assert!(model_is_haiku("claude-haiku-4-5"));
         assert!(!model_is_haiku("claude-opus-4-6-20250514"));
         assert!(!model_is_haiku("claude-sonnet-4-20250514"));
-    }
-
-    #[test]
-    fn test_model_has_1m_context() {
-        // 1M-context lineup (adaptive-era).
-        for model in [
-            "claude-opus-4-6",
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-            "claude-fable-5",
-        ] {
-            assert!(model_has_1m_context(model), "{model}");
-        }
-        // 200K models.
-        for model in [
-            "claude-haiku-4-5-20251001",
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-1",
-        ] {
-            assert!(!model_has_1m_context(model), "{model}");
-        }
     }
 
     #[test]

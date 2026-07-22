@@ -34,6 +34,10 @@ type = "claude-api"
 model = "claude-opus-4-6"
 ```
 
+### `effort`
+
+meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-oauth`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset, meka picks a model-aware default (`xhigh` where supported, else `high`, omitted on models with no effort knob). See the [`effort`](../configuration/config-file.md#effort) config reference for the full per-model matrix and the supported levels.
+
 ## Supported Models
 
 Any model available through the Claude Messages API. Current line-up (per [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview)):

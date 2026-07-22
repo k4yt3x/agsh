@@ -108,22 +108,36 @@ pub struct MockProvider {
     /// Canned response for [`Provider::fetch_model_info`]; `None` mimics a provider/model with no
     /// models API (returns `Ok(None)`).
     model_info: Option<ModelInfo>,
+    /// Value [`Provider::needs_effort_catalog`] returns; `true` mimics Codex wanting its effort
+    /// catalog probed so a resolver test can assert a table-known model still gets probed.
+    reports_effort: bool,
 }
 
 impl MockProvider {
     pub fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),
-            model_info: None,
+            ..Default::default()
         }
     }
 
-    /// Build a mock whose `fetch_model_info` returns `info`, for context-window resolver tests.
+    /// Build a mock whose `fetch_model_info` returns `info`, for model-metadata resolver tests.
     #[cfg(test)]
     pub fn with_model_info(info: ModelInfo) -> Self {
         Self {
-            rounds: Mutex::new(VecDeque::new()),
             model_info: Some(info),
+            ..Default::default()
+        }
+    }
+
+    /// Like [`Self::with_model_info`] but also advertises an effort catalog
+    /// ([`Provider::needs_effort_catalog`] → `true`), mimicking Codex.
+    #[cfg(test)]
+    pub fn with_effort_catalog(info: ModelInfo) -> Self {
+        Self {
+            model_info: Some(info),
+            reports_effort: true,
+            ..Default::default()
         }
     }
 }
@@ -151,6 +165,10 @@ impl Provider for MockProvider {
 
     async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
         Ok(self.model_info.clone())
+    }
+
+    fn needs_effort_catalog(&self) -> bool {
+        self.reports_effort
     }
 
     async fn stream(
