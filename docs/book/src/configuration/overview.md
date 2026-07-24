@@ -5,7 +5,7 @@ meka is configured with named **provider profiles** in a config file at
 is to let `meka provider add` write both for you:
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-4-6
+$ meka provider add work --type claude-oauth --model claude-opus-5
 ```
 
 That command writes a `[providers.work]` profile to the config file, runs the OAuth login (or prompts
@@ -17,7 +17,7 @@ default_provider = "work"
 
 [providers.work]
 type  = "claude-oauth"
-model = "claude-opus-4-6"
+model = "claude-opus-5"
 ```
 
 See [Config File](./config-file.md) for the full reference and the [`meka provider`](./config-file.md#meka-provider-cli) command suite.

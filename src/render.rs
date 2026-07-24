@@ -1011,7 +1011,7 @@ pub fn render_error(error: &dyn std::fmt::Display) {
 /// the wording stays in sync everywhere.
 pub fn render_provider_setup_hint() {
     eprintln!("Configure a provider to use meka.");
-    eprintln!("Example: meka provider add work --type claude-oauth --model claude-opus-4-6");
+    eprintln!("Example: meka provider add work --type claude-oauth --model claude-opus-5");
     eprintln!("Run `meka provider list` to see configured profiles.");
 }
 

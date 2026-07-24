@@ -218,7 +218,7 @@ fn validate_backend(value: &str) -> anyhow::Result<&str> {
 /// sensible default (none currently), where the prompt then requires an explicit answer.
 fn default_model_for(backend: &str) -> Option<&'static str> {
     match backend {
-        "claude-api" | "claude-oauth" => Some("claude-opus-4-8"),
+        "claude-api" | "claude-oauth" => Some("claude-opus-5"),
         "openai-api" | "openai-codex" => Some("gpt-5.6-sol"),
         _ => None,
     }
@@ -939,8 +939,8 @@ mod tests {
 
     #[test]
     fn test_default_model_for_known_backends() {
-        assert_eq!(default_model_for("claude-api"), Some("claude-opus-4-8"));
-        assert_eq!(default_model_for("claude-oauth"), Some("claude-opus-4-8"));
+        assert_eq!(default_model_for("claude-api"), Some("claude-opus-5"));
+        assert_eq!(default_model_for("claude-oauth"), Some("claude-opus-5"));
         assert_eq!(default_model_for("openai-api"), Some("gpt-5.6-sol"));
         assert_eq!(default_model_for("openai-codex"), Some("gpt-5.6-sol"));
         assert_eq!(default_model_for("unknown"), None);

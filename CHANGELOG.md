@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-24
+
+### Added
+
+- Claude Opus 5 and Sonnet 5 to the model catalog.
+
+### Changed
+
+- Default new Claude provider profiles to `claude-opus-5`.
+- Never send reasoning effort to a Claude Haiku model; the tier has no effort knob.
+
+### Fixed
+
+- Don't send `temperature` to Opus 5, Sonnet 5, or any unrecognised model.
+- Default Claude Mythos Preview to `high` effort; it supports `max` but not `xhigh`.
+
 ## [0.34.0] - 2026-07-22
 
 ### Added
@@ -1164,7 +1180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.34.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.35.0...HEAD
+[0.35.0]: https://github.com/k4yt3x/meka/compare/0.34.0...0.35.0
 [0.34.0]: https://github.com/k4yt3x/meka/compare/0.33.1...0.34.0
 [0.33.1]: https://github.com/k4yt3x/meka/compare/0.33.0...0.33.1
 [0.33.0]: https://github.com/k4yt3x/meka/compare/0.32.1...0.33.0

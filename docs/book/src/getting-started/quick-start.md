@@ -7,10 +7,10 @@ flow (OAuth login or API-key prompt) and writes the profile to `~/.config/meka/c
 
 ```bash
 # Claude Code subscription (OAuth)
-meka provider add work --type claude-oauth --model claude-opus-4-6
+meka provider add work --type claude-oauth --model claude-opus-5
 
 # or a Claude API key
-meka provider add work --type claude-api --model claude-opus-4-6
+meka provider add work --type claude-api --model claude-opus-5
 
 # or OpenAI
 meka provider add work --type openai-api --model gpt-4o

@@ -406,7 +406,7 @@ pub(super) fn apply_headers(
         .header("x-stainless-runtime", STAINLESS_RUNTIME)
         .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
         .header("anthropic-version", "2023-06-01")
-        // Set by the SDK; observed on real Claude Code 2.1.217 CLI requests.
+        // Set by the SDK; observed on real Claude Code 2.1.219 CLI requests.
         .header("anthropic-dangerous-direct-browser-access", "true")
         // From the SDK's `authHeaders()`.
         .header(auth_header_name, auth_header_value)

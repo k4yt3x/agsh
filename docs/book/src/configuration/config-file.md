@@ -30,7 +30,7 @@ default_provider = "work"
 
 [providers.work]
 type  = "claude-oauth"
-model = "claude-opus-4-6"
+model = "claude-opus-5"
 
 [providers.local]
 type     = "openai-api"
@@ -74,7 +74,7 @@ The backend the profile uses (required).
 The model identifier to send to the provider. Examples:
 
 - `gpt-4o`, `gpt-4o-mini`, `gpt-5` (OpenAI)
-- `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` (Claude)
+- `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` (Claude)
 - Any model supported by an OpenAI-compatible endpoint
 
 Override per-run with `--model`.
@@ -106,7 +106,7 @@ Custom OAuth token refresh endpoint. Defaults:
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-oauth` under the `effort-2025-11-24` beta, `claude-api` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
 
-When unset, meka picks a model-aware default: `xhigh` on models that support it (Claude Opus 4.7+/Sonnet 5/Fable/Mythos 5; OpenAI gpt-5.2+, gpt-5.1-codex-max), `high` on effort-capable models without `xhigh` (Claude Opus 4.5/4.6, Sonnet 4.6; OpenAI o-series, gpt-5, gpt-5.1), and the field is omitted entirely on models with no effort knob (Claude Sonnet 4.0/4.5, Opus 4.1, Haiku 4.5; OpenAI gpt-4o, o1-mini, and unrecognised names such as local models served through `openai-api`).
+When unset, meka picks a model-aware default: `xhigh` on models that support it (Claude Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5; OpenAI gpt-5.2+, gpt-5.1-codex-max), `high` on effort-capable models without `xhigh` (Claude Opus 4.5/4.6, Sonnet 4.6, Mythos Preview; OpenAI o-series, gpt-5, gpt-5.1), and the field is omitted entirely on models with no effort knob (Claude Sonnet 4.0/4.5, Opus 4.1, and any Haiku; OpenAI gpt-4o, o1-mini, and unrecognised names such as local models served through `openai-api`).
 
 For `openai-codex`, the supported tiers come from your account's models catalog (`/models`), which is authoritative: the default stays accurate even for models newer than meka, and the name-based lists above are only the fallback when the catalog is unavailable. Claude and the public OpenAI API expose no such catalog, so they always use the name-based lists. The lookup is one bounded, cached probe per model (see [`session.context_window`](#sessioncontext_window)).
 
@@ -188,7 +188,7 @@ config file.
 
 | Command | Action |
 |---|---|
-| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-4-8` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-oauth` / `openai-codex`, API-key prompt for `claude-api` / `openai-api`). Sets `default_provider` when it's the first profile. |
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-oauth` / `openai-codex`, API-key prompt for `claude-api` / `openai-api`). Sets `default_provider` when it's the first profile. |
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
 | `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
@@ -205,14 +205,14 @@ $ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-api --mo
 ### Claude OAuth (Claude Code subscription)
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-4-6
+$ meka provider add work --type claude-oauth --model claude-opus-5
 # Opens the browser for the OAuth login, then stores the token in the database.
 ```
 
 ### Claude API
 
 ```console
-$ meka provider add anthropic --type claude-api --model claude-opus-4-6
+$ meka provider add anthropic --type claude-api --model claude-opus-5
 # Prompts for your CLAUDE API key (sk-ant-api03-...).
 ```
 

@@ -201,11 +201,12 @@ pub(crate) fn resolve_effort_with_catalog(
 /// knowledge and short-circuiting the probe.
 pub(crate) fn context_window_for_model(model: &str) -> Option<u64> {
     if model.contains("claude") {
-        // Opus 4.6/4.7/4.8, Sonnet 4.6, and the Fable/Mythos 5 family ship a 1M window; Haiku and
-        // pre-4.6 models are 200k. `model_supports_adaptive_thinking` is the same era boundary that
-        // marks the 1M models. 1M is the default on the direct Messages API with no beta header for
-        // these models, so neither claude-api nor claude-oauth sends `context-1m` (matching Claude
-        // Code 2.1.217); this value is the window the request actually gets on both backends.
+        // Opus 4.6/4.7/4.8/5, Sonnet 4.6/5, and the Fable/Mythos 5 family ship a 1M window; Haiku
+        // and pre-4.6 models are 200k. `model_supports_adaptive_thinking` is the same era boundary
+        // that marks the 1M models. 1M is the default on the direct Messages API with no beta
+        // header for these models, so neither claude-api nor claude-oauth sends
+        // `context-1m` (matching Claude Code 2.1.219); this value is the window the request
+        // actually gets on both backends.
         if model_supports_adaptive_thinking(model) {
             Some(1_000_000)
         } else {
@@ -1120,6 +1121,8 @@ mod tests {
         // Claude: Opus 4.6+/Sonnet 4.6/Fable 5 ship 1M; Haiku 4.5 and pre-4.6 stay at 200k.
         assert_eq!(context_window_for_model("claude-opus-4-6"), Some(1_000_000));
         assert_eq!(context_window_for_model("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-opus-5"), Some(1_000_000));
+        assert_eq!(context_window_for_model("claude-sonnet-5"), Some(1_000_000));
         assert_eq!(
             context_window_for_model("claude-sonnet-4-6"),
             Some(1_000_000)

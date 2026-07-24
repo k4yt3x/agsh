@@ -132,14 +132,14 @@ impl ClaudeOAuthProvider {
         self.resolved_effort.clone()
     }
 
-    /// Mirrors Claude Code 2.1.217's CLI `getAllModelBetas`, validated against a live wire capture
+    /// Mirrors Claude Code 2.1.219's CLI `getAllModelBetas`, validated against a live wire capture
     /// (`temp/cc-re/capture/FINDINGS.md`): first-party OAuth subscriber, opus-4-8 with tools and
     /// thinking. `has_tools` gates `advanced-tool-use-2025-11-20` (sent only when the request
     /// carries tools). Adaptive thinking is GA, selected via the body `thinking` param (no beta).
     ///
-    /// No `context-1m-2025-08-07`: Claude Code 2.1.217 stopped sending it (the 2.1.185 CLI did).
-    /// On the current 1M models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5) the 1M window is the
-    /// default with no beta header, so the beta is redundant. Verified by the 2.1.217
+    /// No `context-1m-2025-08-07`: current Claude Code no longer sends it (the 2.1.185 CLI did;
+    /// 2.1.219 does not). On the current 1M models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5) the 1M
+    /// window is the default with no beta header, so the beta is redundant. Verified by the 2.1.219
     /// interactive-CLI wire capture (opus-4-8 turn sends 11 betas, no `context-1m`), matching
     /// the claude-api path.
     ///
@@ -437,9 +437,9 @@ impl ClaudeOAuthProvider {
             );
         }
 
-        // Claude Code sends `temperature: 1` only when thinking is off AND the model accepts
-        // sampling params. Opus 4.7/4.8 and the Fable/Mythos family reject `temperature` with a
-        // 400.
+        // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
+        // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
+        // Fable/Mythos reject `temperature` with a 400.
         if !self.is_thinking_enabled() && model_supports_temperature(&self.model) {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
@@ -1649,7 +1649,7 @@ mod tests {
 
     #[test]
     fn test_betas_modern_thinking_model_full_set() {
-        // opus-4-8 with tools + thinking + redact_thinking on: matches the live Claude Code 2.1.217
+        // opus-4-8 with tools + thinking + redact_thinking on: matches the live Claude Code 2.1.219
         // CLI wire capture exactly (11 betas, no `context-1m`; `redact-thinking-2026-02-12`
         // present, which CC sends by default).
         let betas = provider_full("claude-opus-4-8", true, "high", true)
@@ -1690,8 +1690,9 @@ mod tests {
 
     #[test]
     fn test_betas_never_send_context_1m() {
-        // Claude Code 2.1.217 dropped `context-1m-2025-08-07`; 1M is the default (no beta) on the
-        // current 1M models, so meka never sends it either, across the lineup.
+        // Current Claude Code (2.1.219) does not send `context-1m-2025-08-07`; 1M is the default
+        // (no beta) on the current 1M models, so meka never sends it either, across the
+        // lineup.
         for model in [
             "claude-opus-4-8",
             "claude-opus-4-6-20250514",
@@ -1865,13 +1866,17 @@ mod tests {
 
     #[test]
     fn test_betas_mid_conversation_system_gated_on_model() {
-        // Opus 4.8 gets it; opus-4-6 and haiku do not (capture-confirmed).
-        assert!(
-            provider_with("claude-opus-4-8", true)
-                .compute_betas(true)
-                .unwrap()
-                .contains("mid-conversation-system-2026-04-07")
-        );
+        // Opus 4.8, Opus 5, and Sonnet 5 get it; opus-4-6 and haiku do not (capture-confirmed
+        // against Claude Code 2.1.219).
+        for model in ["claude-opus-4-8", "claude-opus-5", "claude-sonnet-5"] {
+            assert!(
+                provider_with(model, true)
+                    .compute_betas(true)
+                    .unwrap()
+                    .contains("mid-conversation-system-2026-04-07"),
+                "{model} must send mid-conversation-system"
+            );
+        }
         for model in ["claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"] {
             assert!(
                 !provider_with(model, true)

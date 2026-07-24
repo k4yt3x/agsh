@@ -15,7 +15,7 @@ Providers are configured as named profiles. The easiest way is `meka provider ad
 profile to the config file and stores the secret (API key or OAuth token) in the database:
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-4-6
+$ meka provider add work --type claude-oauth --model claude-opus-5
 ```
 
 This produces a `[providers.work]` entry in `~/.config/meka/config.toml`:
@@ -25,7 +25,7 @@ default_provider = "work"
 
 [providers.work]
 type  = "claude-oauth"
-model = "claude-opus-4-6"
+model = "claude-opus-5"
 ```
 
 ## Selecting a Provider

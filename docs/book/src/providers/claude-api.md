@@ -15,7 +15,7 @@ The `claude-api` provider talks to the [Claude Messages API](https://docs.anthro
 ### Quickest Start
 
 ```bash
-meka provider add anthropic --type claude-api --model claude-opus-4-6
+meka provider add anthropic --type claude-api --model claude-opus-5
 ```
 
 `meka provider add` prompts for your Claude API key, stores it in the database, and writes the
@@ -31,7 +31,7 @@ default_provider = "anthropic"
 
 [providers.anthropic]
 type = "claude-api"
-model = "claude-opus-4-6"
+model = "claude-opus-5"
 ```
 
 ### `effort`
@@ -44,18 +44,19 @@ Any model available through the Claude Messages API. Current line-up (per [Anthr
 
 | Family | Alias | Notes |
 |--------|-------|-------|
-| Opus 4.7 | `claude-opus-4-7` | Latest Opus; most capable, adaptive thinking |
-| Sonnet 4.6 | `claude-sonnet-4-6` | Latest Sonnet, speed + intelligence balance |
-| Haiku 4.5 | `claude-haiku-4-5` | Latest Haiku, fastest |
+| Fable 5 | `claude-fable-5` | Most capable; thinking always on |
+| Opus 5 | `claude-opus-5` | Default for new profiles; complex agentic coding |
+| Sonnet 5 | `claude-sonnet-5` | Speed + intelligence balance |
+| Haiku 4.5 | `claude-haiku-4-5` | Fastest; no effort knob |
 
-Older but still available: `claude-opus-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-opus-4-1`. Deprecated and retiring 2026-06-15: `claude-opus-4-20250514`, `claude-sonnet-4-20250514`.
+Older but still available: `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`. Deprecated and retiring 2026-08-05: `claude-opus-4-1`.
 
 ## Custom Base URL
 
 To use a Claude-API-compatible proxy or gateway:
 
 ```bash
-meka --provider claude-api --model claude-opus-4-6 --base-url https://my-proxy.example.com
+meka --provider claude-api --model claude-opus-5 --base-url https://my-proxy.example.com
 ```
 
 ## API Details

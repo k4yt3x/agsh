@@ -2301,7 +2301,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "meka"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",

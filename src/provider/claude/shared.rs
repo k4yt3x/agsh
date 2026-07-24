@@ -153,7 +153,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// replaces whichever default would otherwise apply; on the budgeted path it is clamped to stay
 /// above `budget_tokens` (the API rejects `max_tokens <= thinking.budget_tokens`).
 ///
-/// No `display` field is set: real Claude Code 2.1.217 sends `{type:"adaptive"}` with no `display`
+/// No `display` field is set: real Claude Code 2.1.219 sends `{type:"adaptive"}` with no `display`
 /// (verified by wire capture), so the model default applies.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
@@ -204,7 +204,16 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 /// exception is Opus 4.5, which predates adaptive thinking (manual budgeted thinking, 200K window)
 /// yet still supports effort (`low`/`medium`/`high`, no `xhigh`); it's carved out here so only the
 /// other pre-4.6 gates keep treating it as old (see [`model_predates_adaptive_thinking`]).
+///
+/// Haiku is excluded by family rather than by version. The tier has never shipped an effort knob,
+/// and the version gate below would wave through a future Haiku whose version clears 4.6, sending a
+/// tier the model rejects. The costs are asymmetric: omitting effort is benign (`high` is defined
+/// as identical to omitting the field) while sending an unsupported one is a 400, so the durable
+/// family rule wins over the optimistic default that serves the frontier models.
 pub(super) fn model_supports_effort(model: &str) -> bool {
+    if model_is_haiku(model) {
+        return false;
+    }
     if !model_predates_adaptive_thinking(model) {
         return true;
     }
@@ -213,15 +222,22 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 }
 
 /// Whether a Claude model supports the `xhigh` effort tier. Effort-capable, but excluding the
-/// generations that shipped effort without `xhigh`: Opus 4.5 (caps at `high`) and the 4.6 line
-/// (Opus 4.6, Sonnet 4.6, which have `max` but not `xhigh`). Everything newer (Opus 4.7+, Sonnet 5,
-/// Fable/Mythos 5) and any unrecognized future model supports it, mirroring the optimistic default
-/// in [`model_supports_effort`].
+/// models that shipped effort without `xhigh`: Opus 4.5 (caps at `high`), the 4.6 line (Opus 4.6,
+/// Sonnet 4.6), and Mythos Preview. The last three have `max` but not `xhigh`, which is why this
+/// can't be derived from effort support alone: "`xhigh` is a newer level; some models that support
+/// `max` don't support `xhigh`." Everything newer (Opus 4.7+, Sonnet 5, Fable/Mythos 5) and any
+/// unrecognized future model supports it, mirroring the optimistic default in
+/// [`model_supports_effort`].
 pub(super) fn model_supports_xhigh(model: &str) -> bool {
     if !model_supports_effort(model) {
         return false;
     }
     let lower = model.to_ascii_lowercase();
+    // Mythos Preview is versionless, so the generation check below can't catch it: it supports
+    // effort (and `max`) but not `xhigh`, and would otherwise default to a tier the API rejects.
+    if lower.contains("mythos-preview") {
+        return false;
+    }
     let no_xhigh = (lower.contains("opus") || lower.contains("sonnet"))
         && matches!(parse_model_version(&lower), Some((4, 5)) | Some((4, 6)));
     !no_xhigh
@@ -238,23 +254,46 @@ pub(super) fn resolve_effort(configured: Option<&str>, model: &str) -> Option<St
     )
 }
 
-/// Whether a Claude model accepts the `temperature` sampling parameter. Sampling params are removed
-/// (400) on Opus 4.7, Opus 4.8, and the Fable/Mythos 5 family; Opus 4.6, Sonnet 4.6, Haiku 4.5, and
-/// older models still accept them.
+/// Whether a Claude model accepts the `temperature` sampling parameter. Mirrors Claude Code
+/// 2.1.219's `mro`, which is an **allowlist** of the older models that still accept sampling
+/// params: the Claude 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, and Haiku 4.5. Everything
+/// newer (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) rejects `temperature` with a 400.
+///
+/// The allowlist direction is the point: an unrecognised model, which in practice means one newer
+/// than this list, resolves to `false` and the parameter is omitted. A denylist would instead send
+/// `temperature` to every future model and earn a 400 until the list was updated. Matching is by
+/// family + [`parse_model_version`] rather than Claude Code's exact string equality because meka
+/// accepts date-stamped ids (`claude-haiku-4-5-20251001`) as well as canonical ones.
 pub(super) fn model_supports_temperature(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    !(lower.contains("opus-4-7")
-        || lower.contains("opus-4-8")
-        || lower.contains("fable-5")
-        || lower.contains("mythos-5"))
+    if lower.contains("claude-3-") {
+        return true;
+    }
+    let Some(version) = parse_model_version(&lower) else {
+        return false;
+    };
+    if lower.contains("opus") {
+        matches!(version, (4, 0) | (4, 1) | (4, 5) | (4, 6))
+    } else if lower.contains("sonnet") {
+        matches!(version, (4, 0) | (4, 5) | (4, 6))
+    } else if lower.contains("haiku") {
+        version == (4, 5)
+    } else {
+        false
+    }
 }
 
 /// Whether a Claude model supports mid-conversation system messages (the
-/// `mid-conversation-system-2026-04-07` beta). Claude Code sends this only for Opus 4.8 and the
-/// newer Fable/Mythos 5 family (verified by wire capture: opus-4-8 sends it, Haiku 4.5 does not).
+/// `mid-conversation-system-2026-04-07` beta). Claude Code sends this for Opus 4.8, Opus 5, Sonnet
+/// 5, and the Fable/Mythos 5 family, but not for Opus 4.7, Sonnet 4.6, or Haiku 4.5 (verified
+/// against Claude Code 2.1.219's `_er` gate plus the per-model `mid_conv_system` capability).
 pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("opus-4-8") || lower.contains("fable-5") || lower.contains("mythos-5")
+    lower.contains("opus-4-8")
+        || lower.contains("opus-5")
+        || lower.contains("sonnet-5")
+        || lower.contains("fable-5")
+        || lower.contains("mythos-5")
 }
 
 pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -1283,6 +1322,17 @@ mod tests {
         assert!(!model_supports_effort("claude-sonnet-4-20250514"));
         assert!(!model_supports_effort("claude-opus-4-1"));
         assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
+        // Haiku is denied by family, not version: a future Haiku that clears the 4.6 boundary must
+        // still omit effort rather than send a tier the tier has never had.
+        for model in [
+            "claude-haiku-5",
+            "claude-haiku-5-1",
+            "claude-haiku-6-20270101",
+        ] {
+            assert!(!model_supports_effort(model), "{model}");
+            assert!(!model_supports_xhigh(model), "{model}");
+            assert_eq!(resolve_effort(None, model), None, "{model}");
+        }
         // Unknown 1P model defaults to true.
         assert!(model_supports_effort("claude-future-experimental-7"));
         // New families are effort-capable by default, even with a low version number.
@@ -1296,15 +1346,24 @@ mod tests {
         assert!(!model_supports_xhigh("claude-opus-4-5-20250929"));
         assert!(!model_supports_xhigh("claude-opus-4-6-20250514"));
         assert!(!model_supports_xhigh("claude-sonnet-4-6"));
-        // 4.7+ / Sonnet 5 / new families support xhigh.
+        // 4.7+ / Opus 5 / Sonnet 5 / new families support xhigh.
         assert!(model_supports_xhigh("claude-opus-4-8"));
         assert!(model_supports_xhigh("claude-opus-4-7"));
+        assert!(model_supports_xhigh("claude-opus-5"));
         assert!(model_supports_xhigh("claude-sonnet-5"));
         assert!(model_supports_xhigh("claude-fable-5"));
         assert!(model_supports_xhigh("claude-future-experimental-7"));
         // Non-effort models never reach xhigh.
         assert!(!model_supports_xhigh("claude-haiku-4-5-20251001"));
         assert!(!model_supports_xhigh("claude-opus-4-1"));
+        // Mythos Preview takes effort and `max` but NOT `xhigh`, and carries no version to sort it
+        // into the 4.5/4.6 carve-out; defaulting it to xhigh would be a 400.
+        assert!(model_supports_effort("claude-mythos-preview"));
+        assert!(!model_supports_xhigh("claude-mythos-preview"));
+        assert_eq!(
+            resolve_effort(None, "claude-mythos-preview").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -1312,6 +1371,14 @@ mod tests {
         // Unset: best tier the model supports.
         assert_eq!(
             resolve_effort(None, "claude-opus-4-8").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort(None, "claude-opus-5").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            resolve_effort(None, "claude-sonnet-5").as_deref(),
             Some("xhigh")
         );
         assert_eq!(
@@ -1386,6 +1453,8 @@ mod tests {
         // Regression: opus 4.8 was wrongly denied by the old hardcoded allowlist.
         assert!(model_supports_adaptive_thinking("claude-opus-4-8"));
         assert!(model_supports_adaptive_thinking("claude-opus-5-0"));
+        assert!(model_supports_adaptive_thinking("claude-opus-5"));
+        assert!(model_supports_adaptive_thinking("claude-sonnet-5"));
         assert!(model_supports_adaptive_thinking("claude-opus-4-6-20250514"));
         // Older than 4.6 -> budgeted thinking.
         assert!(!model_supports_adaptive_thinking("claude-sonnet-4-5"));
@@ -1419,12 +1488,20 @@ mod tests {
 
     #[test]
     fn test_model_supports_temperature() {
-        // Sampling-param models.
+        // The allowlist: the 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, Haiku 4.5. Dated
+        // and canonical spellings both resolve (`claude-sonnet-4-20250514` parses as 4.0).
         for model in [
+            "claude-3-opus-20240229",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-4-0",
+            "claude-opus-4-1",
+            "claude-opus-4-5-20251101",
             "claude-opus-4-6-20250514",
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-5-20250929",
             "claude-sonnet-4-6",
             "claude-haiku-4-5",
-            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
         ] {
             assert!(model_supports_temperature(model), "{model}");
         }
@@ -1432,10 +1509,46 @@ mod tests {
         for model in [
             "claude-opus-4-7",
             "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
             "claude-fable-5",
             "claude-mythos-5",
         ] {
             assert!(!model_supports_temperature(model), "{model}");
+        }
+        // The allowlist fails safe: anything it doesn't recognise (a model newer than this list)
+        // omits `temperature` rather than earning a 400. This is what a denylist got wrong.
+        for model in [
+            "claude-opus-6",
+            "claude-sonnet-6-0",
+            "claude-future-experimental-7",
+            "claude-custom",
+        ] {
+            assert!(!model_supports_temperature(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn test_model_supports_mid_conversation_system() {
+        // Opus 4.8, Opus 5, Sonnet 5, and the Fable/Mythos 5 family send the beta.
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-0",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ] {
+            assert!(model_supports_mid_conversation_system(model), "{model}");
+        }
+        // Opus 4.7, Sonnet 4.6, Haiku 4.5, and older do not.
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-6-20250514",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(!model_supports_mid_conversation_system(model), "{model}");
         }
     }
 

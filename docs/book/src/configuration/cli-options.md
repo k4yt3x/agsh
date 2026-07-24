@@ -13,7 +13,7 @@ Manage provider profiles (add, list, switch, login, remove). `meka provider add`
 `[providers.<name>]` profile to `~/.config/meka/config.toml` and stores its secret in the database.
 
 ```bash
-meka provider add work --type claude-oauth --model claude-opus-4-6
+meka provider add work --type claude-oauth --model claude-opus-5
 meka provider list
 meka provider use work
 meka provider login work

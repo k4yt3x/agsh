@@ -17,7 +17,7 @@ The `claude-oauth` provider authenticates with a Claude Code subscription via OA
 ### Quickest Start
 
 ```bash
-meka provider add work --type claude-oauth --model claude-opus-4-6
+meka provider add work --type claude-oauth --model claude-opus-5
 ```
 
 `meka provider add` opens your browser, walks you through authorization, and saves the tokens to the
@@ -32,7 +32,7 @@ default_provider = "work"
 
 [providers.work]
 type = "claude-oauth"
-model = "claude-opus-4-8"
+model = "claude-opus-5"
 effort = "xhigh"         # optional; "low"|"medium"|"high"|"xhigh"|"max"
 redact_thinking = true   # optional; default on, matching Claude Code
 # device_id, oauth_token_url, client_id are all optional overrides
@@ -44,7 +44,7 @@ See [Configuration → Config File](../configuration/config-file.md) for the ful
 
 ### `effort`
 
-Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset it defaults to `"xhigh"` where the model supports it (Opus 4.7+, Sonnet 5, Fable/Mythos 5) and `"high"` on the effort-capable-but-no-`xhigh` generation (Opus 4.5, Opus 4.6, Sonnet 4.6); models with no effort knob (Sonnet 4.0/4.5, Opus 4.1, Haiku 4.5) omit the field automatically. An explicit value is absolute: sent verbatim (beta included), with no validation or clamping, and applied even to a model the default would skip. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
+Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset it defaults to `"xhigh"` where the model supports it (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) and `"high"` on models that take effort but not `xhigh` (Opus 4.5, Opus 4.6, Sonnet 4.6, Mythos Preview); models with no effort knob (Sonnet 4.0/4.5, Opus 4.1, and any Haiku) omit the field automatically. An explicit value is absolute: sent verbatim (beta included), with no validation or clamping, and applied even to a model the default would skip. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
 
 ### `redact_thinking`
 
@@ -90,13 +90,14 @@ Any model your Claude Code subscription exposes. Current line-up (per [Anthropic
 
 | Family | Alias | Notes |
 |--------|-------|-------|
-| Opus 4.7 | `claude-opus-4-7` | Latest Opus; most capable, no extended-thinking, adaptive thinking |
-| Sonnet 4.6 | `claude-sonnet-4-6` | Latest Sonnet, speed + intelligence balance |
-| Haiku 4.5 | `claude-haiku-4-5` | Latest Haiku, fastest |
+| Fable 5 | `claude-fable-5` | Most capable; thinking always on |
+| Opus 5 | `claude-opus-5` | Default for new profiles; complex agentic coding |
+| Sonnet 5 | `claude-sonnet-5` | Speed + intelligence balance |
+| Haiku 4.5 | `claude-haiku-4-5` | Fastest; no effort knob |
 
-Older but still available: `claude-opus-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-opus-4-1`. Deprecated and retiring 2026-06-15: `claude-opus-4-20250514`, `claude-sonnet-4-20250514`.
+Older but still available: `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`. Deprecated and retiring 2026-08-05: `claude-opus-4-1`.
 
-meka forwards the model string verbatim; it doesn't gate which strings are valid. Per-model behaviour depends on capability gates baked into the request shape (see [Beta header](#beta-header)). The gates are a denylist: only known pre-4.6 models are excluded from adaptive thinking, so Claude 4.6+ and any newly released family are enabled by default. Effort uses the same denylist with one exception: Opus 4.5 predates adaptive thinking but is effort-capable (`low`/`medium`/`high`, no `xhigh`), so it is not excluded from effort.
+meka forwards the model string verbatim; it doesn't gate which strings are valid. Per-model behaviour comes from capability gates baked into the request shape (see [Beta header](#beta-header)). The two kinds of gate deliberately fail in opposite directions. Gates that shape the request (adaptive thinking, the 1M window) are a denylist, so Claude 4.6+ and any newly released family are enabled by default and a new model works without a meka update. Gates whose wrong guess would draw a 400 are allowlists: `temperature` goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older), and effort is skipped for the whole Haiku tier, which has never had the knob. Opus 4.5 is the one pre-4.6 model that is effort-capable (`low`/`medium`/`high`, no `xhigh`).
 
 ## API Details
 
@@ -114,7 +115,7 @@ meka forwards the model string verbatim; it doesn't gate which strings are valid
 
 ### Beta header
 
-Composed dynamically from the model + thinking settings, mirroring Claude Code's `getAllModelBetas`. Order is significant; the list below matches the Claude Code 2.1.217 interactive-CLI wire capture (opus-4-8, tools present) exactly:
+Composed dynamically from the model + thinking settings, mirroring Claude Code's `getAllModelBetas`. Order is significant; the list below matches the Claude Code 2.1.219 interactive-CLI wire capture (opus-4-8, tools present) exactly:
 
 | Beta | When |
 |------|------|
@@ -125,12 +126,12 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `thinking-token-count-2026-05-13` | Any modern Claude (4.x+) |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
-| `mid-conversation-system-2026-04-07` | Opus 4.8 / Fable 5 / Mythos 5 |
+| `mid-conversation-system-2026-04-07` | Opus 4.8 / Opus 5 / Sonnet 5 / Fable 5 / Mythos 5 |
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
 | `effort-2025-11-24` | Whenever `output_config.effort` is sent: effort-capable models by default (Claude 4.6+ and Opus 4.5), or any explicit `effort` override on any model |
 | `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
 
-meka does **not** send `context-1m-2025-08-07`: Claude Code 2.1.217 dropped it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
+meka does **not** send `context-1m-2025-08-07`: current Claude Code (2.1.219) does not send it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
 
 ### System prompt
 
