@@ -47,6 +47,17 @@ The client advertises these in `InitializeRequest.clientCapabilities`; meka stas
 
 If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behaviour is the same as `meka` in the REPL.
 
+### When the client won't serve a path
+
+Editors differ in which paths they will serve: Zed answers only for the project it has open, another client may serve any absolute path. meka models none of these rules. It asks per path and routes on the answer:
+
+- **`ResourceNotFound` (`-32002`)** means the client will not serve this path, so it holds no buffer for it. meka reads or writes the file locally, and a *write* says so in the tool result — the change still appears in that tool call's diff, but not in the editor's buffer or undo history. This is what keeps ACP as capable as the terminal: the agent can read and edit its own skills, prompts, and configuration even though they live outside the project.
+- **Any other error** means the client may own the file and hold unsaved changes for it, so the tool call fails instead of routing around the client. Reading on-disk bytes would hand the model a stale view of a file the user is editing, and writing them back would overwrite unsaved work.
+
+The route is chosen once per tool call by the read, not per request: `edit_file` and `write_file` write back through whichever filesystem they read from, so a diff taken from the editor's buffer isn't applied to disk while the buffer keeps the old content. The read is also the more reliable signal — Zed reports an out-of-project path as `ResourceNotFound` on `fs/read_text_file` but as a generic error on `fs/write_text_file`, so a route chosen from the write's own error would never recognise it.
+
+One case can't honour that: a client advertising `fs.readTextFile` but not `fs.writeTextFile` reads for meka and expects meka to do the write, so the edit lands on disk while the client still holds a buffer for the file. The tool result discloses that too, with its own note.
+
 ## Session lifecycle
 
 meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessions can coexist in one `meka acp` process, each with its own cwd, permission level, conversation, cancellation token, and per-session runtime mutex. Prompts on different sessions run in parallel; a second `session/prompt` for a session that already has one in flight is rejected with `InvalidParams`. The session row is also locked on disk (the same lock the REPL uses), so two `meka` processes can't simultaneously write events for the same session id.

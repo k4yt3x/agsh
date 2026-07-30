@@ -93,6 +93,23 @@ fn invalid_params_error(message: impl ToString) -> agent_client_protocol::Error 
     agent_client_protocol::Error::invalid_params().data(message.to_string())
 }
 
+/// Classify an `fs/*` failure into the one distinction the file tools route on.
+///
+/// `ResourceNotFound` (`-32002`) is the protocol's way for a client to say it will not serve a
+/// path. Which paths those are is the client's business and differs between editors -- Zed answers
+/// it for anything outside the project it has open, another client may serve any absolute path --
+/// which is exactly why meka asks per path instead of modelling any editor's rule. Every other
+/// code (transport, timeout, an internal error inside the client) leaves open the possibility that
+/// the client owns the file and holds unsaved changes for it, so it must not route around it.
+fn classify_fs_error(method: &str, error: &agent_client_protocol::Error) -> FrontendError {
+    let message = format!("{} failed: {}", method, error);
+    if error.code == agent_client_protocol::ErrorCode::ResourceNotFound {
+        FrontendError::unservable_path(message)
+    } else {
+        FrontendError::new(message)
+    }
+}
+
 /// Late-bound view of everything the connected client told us on `initialize`: its advertised
 /// capabilities and its self-identifying `Implementation` (name + version). Default is the
 /// all-`false` `ClientCapabilities` and a `None` identity, so an `AcpFrontend` constructed before
@@ -479,10 +496,7 @@ impl Frontend for AcpFrontend {
         }
         Some(match connection.send_request(request).block_task().await {
             Ok(response) => Ok(response.content),
-            Err(error) => Err(FrontendError::new(format!(
-                "fs/read_text_file failed: {}",
-                error
-            ))),
+            Err(error) => Err(classify_fs_error("fs/read_text_file", &error)),
         })
     }
 
@@ -501,10 +515,7 @@ impl Frontend for AcpFrontend {
             WriteTextFileRequest::new(session_id, path.to_path_buf(), content.to_string());
         Some(match connection.send_request(request).block_task().await {
             Ok(_) => Ok(()),
-            Err(error) => Err(FrontendError::new(format!(
-                "fs/write_text_file failed: {}",
-                error
-            ))),
+            Err(error) => Err(classify_fs_error("fs/write_text_file", &error)),
         })
     }
 

@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     Tool, ToolOutput,
-    util::{redirects_to_scratchpad, require_str},
+    util::{WalkBudget, WalkStop, redirects_to_scratchpad, require_str},
 };
 use crate::{
     error::{MekaError, Result},
@@ -16,6 +16,16 @@ use crate::{
 /// Default inline result cap when the agent isn't redirecting to the scratchpad and didn't pass an
 /// explicit `limit`. Single source of truth for the description and the runtime default.
 const DEFAULT_INLINE_RESULTS: usize = 500;
+
+/// What one walk produced, including the parts the caller has to disclose: a walk that was cut
+/// short reports fewer matches than exist, which is only safe if the output says so.
+struct FindOutcome {
+    matches: Vec<String>,
+    total: usize,
+    unreadable: usize,
+    timed_out: bool,
+    budget_secs: u64,
+}
 
 pub(super) struct FindFilesTool {
     pub cwd: crate::agent::SharedCwd,
@@ -80,7 +90,7 @@ impl Tool for FindFilesTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "find_files")?;
         // Resolve the optional `path` against the agent's per-session cwd so the search runs in the
@@ -111,61 +121,113 @@ impl Tool for FindFilesTool {
             None => DEFAULT_INLINE_RESULTS,
         };
 
-        let result = tokio::task::spawn_blocking(move || {
-            let mut matches: Vec<String> = Vec::new();
-            // Total continues past the storage cap so we can report the real count of matches in
-            // the truncation message. Glob walks are FS-metadata only, so the extra iteration past
-            // the cap is cheap.
-            let mut total: usize = 0;
-            match glob::glob(&full_pattern) {
-                Ok(paths) => {
-                    for entry in paths {
-                        match entry {
-                            Ok(path) => {
-                                total += 1;
-                                if matches.len() < cap {
-                                    matches.push(path.display().to_string());
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!("glob error: {}", error);
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    return Err(MekaError::ToolExecution {
-                        tool_name: "find_files".to_string(),
-                        message: format!("invalid glob pattern '{}': {}", full_pattern, error),
-                    });
-                }
-            }
-            Ok((matches, total, cap))
-        })
-        .await
-        .map_err(|error| MekaError::ToolExecution {
-            tool_name: "find_files".to_string(),
-            message: format!("task join error: {}", error),
-        })??;
+        let budget = WalkBudget::new(cancellation.clone());
+        let walk = tokio::task::spawn_blocking(move || run_walk(&full_pattern, cap, &budget));
 
-        let (matches, total, cap) = result;
-        if matches.is_empty() {
-            Ok(ToolOutput::text(
-                "No files found matching the pattern.".to_string(),
-                false,
-            ))
-        } else {
-            let mut output = matches.join("\n");
-            if total > matches.len() {
-                output.push_str(&format!(
-                    "\n\n... (showed first {} of {} matches; refine `pattern` to narrow, \
-                     pass `limit: <n>` to raise the cap, or pass `scratchpad: \"name\"` to \
-                     collect them all)",
-                    cap, total,
-                ));
+        // Race the walk against the token rather than just awaiting it. The walk checks the same
+        // token itself, but `glob`'s iterator does its directory reads inside `next()`, so a walk
+        // that finds neither a match nor an error for a long stretch sits between checks and would
+        // otherwise hold the turn open. Returning here detaches that thread; its own budget check
+        // stops it shortly after.
+        let outcome = tokio::select! {
+            joined = walk => joined.map_err(|error| MekaError::ToolExecution {
+                tool_name: "find_files".to_string(),
+                message: format!("task join error: {}", error),
+            })??,
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+        };
+
+        Ok(ToolOutput::text(render_outcome(&outcome, cap), false))
+    }
+}
+
+/// The blocking half of `find_files`. Consults `budget` once per entry the glob iterator yields,
+/// which is what makes an over-broad walk stoppable at all: nothing outside this loop can end it,
+/// because a `spawn_blocking` task that has started cannot be aborted.
+fn run_walk(full_pattern: &str, cap: usize, budget: &WalkBudget) -> Result<FindOutcome> {
+    let mut matches: Vec<String> = Vec::new();
+    // Total continues past the storage cap so the truncation message can report the real number of
+    // matches. Note that the cap bounds only what is stored: a pattern that matches nothing never
+    // reaches it, so the cap is not a bound on the walk. `budget` is.
+    let mut total: usize = 0;
+    // A pattern rooted high in the tree crosses directories the user cannot read, one `GlobError`
+    // each. Logging every one at `warn` is what turned a `/`-rooted walk into gigabytes of log
+    // output, so they are counted here and reported once.
+    let mut unreadable: usize = 0;
+    let mut timed_out = false;
+
+    let paths = glob::glob(full_pattern).map_err(|error| MekaError::ToolExecution {
+        tool_name: "find_files".to_string(),
+        message: format!("invalid glob pattern '{}': {}", full_pattern, error),
+    })?;
+
+    for entry in paths {
+        match budget.check() {
+            Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::TimedOut) => {
+                timed_out = true;
+                break;
             }
-            Ok(ToolOutput::text(output, false))
+            None => {}
         }
+        match entry {
+            Ok(path) => {
+                total += 1;
+                if matches.len() < cap {
+                    matches.push(path.display().to_string());
+                }
+            }
+            Err(error) => {
+                unreadable += 1;
+                tracing::debug!("glob error: {}", error);
+            }
+        }
+    }
+
+    Ok(FindOutcome {
+        matches,
+        total,
+        unreadable,
+        timed_out,
+        budget_secs: budget.budget_secs(),
+    })
+}
+
+/// Render the walk for the model. A truncated, timed-out, or error-riddled walk has to say so even
+/// when it found nothing: a bare "No files found" on a search that never finished reads as a
+/// definitive answer, and the model acts on it as one.
+fn render_outcome(outcome: &FindOutcome, cap: usize) -> String {
+    let mut notes: Vec<String> = Vec::new();
+    if outcome.total > outcome.matches.len() {
+        notes.push(format!(
+            "showed first {} of {} matches; refine `pattern` to narrow, pass `limit: <n>` to \
+             raise the cap, or pass `scratchpad: \"name\"` to collect them all",
+            cap, outcome.total,
+        ));
+    }
+    if outcome.timed_out {
+        notes.push(format!(
+            "search was still running after {}s and was stopped, so this list is incomplete: \
+             narrow `path` to a smaller subtree or make `pattern` more specific",
+            outcome.budget_secs,
+        ));
+    }
+    if outcome.unreadable > 0 {
+        notes.push(format!(
+            "{} path(s) could not be read and were skipped",
+            outcome.unreadable,
+        ));
+    }
+
+    let body = if outcome.matches.is_empty() {
+        "No files found matching the pattern.".to_string()
+    } else {
+        outcome.matches.join("\n")
+    };
+    if notes.is_empty() {
+        body
+    } else {
+        format!("{}\n\n... ({})", body, notes.join("; "))
     }
 }
 
@@ -322,5 +384,83 @@ mod tests {
 
         let text = text_content(&result);
         assert!(text.contains("showed first 50 of 600 matches"));
+    }
+
+    #[tokio::test]
+    async fn test_find_files_cancelled_walk_is_interrupted() {
+        // Regression: the tool used to ignore its cancellation token entirely, so an over-broad
+        // walk could not be stopped by Ctrl+C, by ACP `session/cancel`, or by anything else.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..50 {
+            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+        }
+
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                cancellation,
+            )
+            .await
+            .expect_err("a cancelled turn must not run the walk to completion");
+        assert!(matches!(error, MekaError::Interrupted), "got: {}", error);
+    }
+
+    #[test]
+    fn test_run_walk_stops_on_exhausted_budget() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..50 {
+            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+        }
+        let pattern = format!("{}/*.txt", temp_dir.path().to_string_lossy());
+
+        let budget =
+            WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
+        let outcome = run_walk(&pattern, 500, &budget).expect("walk should return, not error");
+        assert!(outcome.timed_out, "expired budget must stop the walk");
+    }
+
+    #[test]
+    fn test_render_outcome_discloses_timeout_with_no_matches() {
+        // The dangerous shape: a walk that was cut short found nothing, and saying only "No files
+        // found" would report that as a definitive answer.
+        let outcome = FindOutcome {
+            matches: Vec::new(),
+            total: 0,
+            unreadable: 3,
+            timed_out: true,
+            budget_secs: 60,
+        };
+        let rendered = render_outcome(&outcome, DEFAULT_INLINE_RESULTS);
+        assert!(rendered.contains("No files found"), "got: {}", rendered);
+        assert!(rendered.contains("incomplete"), "got: {}", rendered);
+        assert!(rendered.contains("after 60s"), "got: {}", rendered);
+        assert!(
+            rendered.contains("3 path(s) could not be read"),
+            "got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn test_render_outcome_clean_walk_has_no_notes() {
+        let outcome = FindOutcome {
+            matches: vec!["/tmp/a.txt".to_string()],
+            total: 1,
+            unreadable: 0,
+            timed_out: false,
+            budget_secs: 60,
+        };
+        assert_eq!(
+            render_outcome(&outcome, DEFAULT_INLINE_RESULTS),
+            "/tmp/a.txt"
+        );
     }
 }

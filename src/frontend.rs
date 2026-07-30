@@ -49,8 +49,14 @@ pub trait Frontend: Send + Sync {
 
     /// Delegate a file read to whatever filesystem the frontend owns (typically the ACP client's
     /// in-buffer view of the file). `Some(Ok(content))` means the frontend handled it;
-    /// `Some(Err(_))` means delegation was attempted and failed (surface the error to the user;
-    /// don't silently fall back); `None` means "no delegate available, do it locally".
+    /// `Some(Err(_))` means delegation was attempted and failed; `None` means "no delegate
+    /// available, do it locally".
+    ///
+    /// The file tools route on the [`DelegateFailure`] carried by `Some(Err(_))`, under one rule:
+    /// **[`DelegateFailure::UnservablePath`] means the local filesystem is the only route and is
+    /// used; anything else means the frontend may own the file, and the operation fails rather
+    /// than routing around it.** Which paths a frontend will serve is its own business and differs
+    /// between editors, so meka models none of them -- it asks per path and believes the answer.
     ///
     /// `line` and `limit` follow ACP's 1-based line / line-count convention.
     async fn delegate_fs_read(
@@ -111,22 +117,61 @@ pub trait Frontend: Send + Sync {
     }
 }
 
+/// Why a delegated operation failed, in the only distinction the routing rule turns on.
+///
+/// Editors differ in which paths they will serve -- some only the project they have open, some
+/// anything absolute -- so meka does not model any editor's rule. It asks, and this is the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateFailure {
+    /// The frontend will not serve this path at all (ACP `ResourceNotFound`). It holds no buffer
+    /// for the file and never will, so the local filesystem is not a degraded substitute for the
+    /// delegate here -- it is the same bytes, and the only route.
+    UnservablePath,
+    /// Anything else: transport, timeout, an internal error inside the client. The frontend may
+    /// well own this file and hold unsaved changes for it, so falling back to the local filesystem
+    /// could read stale bytes or overwrite the user's unsaved work.
+    Transient,
+}
+
 /// Error from a frontend-delegated operation ([`Frontend::delegate_fs_read`],
-/// [`Frontend::delegate_fs_write`], [`Frontend::delegate_execute`]). Wraps whatever the underlying
-/// transport (ACP JSON-RPC, etc.) returned in a stringly form so tools can splice it into their
-/// `ToolOutput` text without depending on the transport crate.
+/// [`Frontend::delegate_fs_write`], [`Frontend::delegate_execute`]). Carries the underlying
+/// transport's message in a stringly form so tools can splice it into their `ToolOutput` text
+/// without depending on the transport crate, plus the [`DelegateFailure`] the routing rule needs.
 #[derive(Debug, Clone)]
-pub struct FrontendError(pub String);
+pub struct FrontendError {
+    message: String,
+    failure: DelegateFailure,
+}
 
 impl FrontendError {
+    /// Construct a [`DelegateFailure::Transient`] error -- the conservative default, since it is
+    /// the classification that never routes around the frontend.
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            failure: DelegateFailure::Transient,
+        }
+    }
+
+    /// Construct a [`DelegateFailure::UnservablePath`] error. Only a transport that can tell the
+    /// two apart on the wire may call this.
+    pub fn unservable_path(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            failure: DelegateFailure::UnservablePath,
+        }
+    }
+
+    /// Whether the local filesystem is a safe route for this path: true only when the frontend
+    /// said it cannot serve the path at all.
+    pub fn is_unservable_path(&self) -> bool {
+        self.failure == DelegateFailure::UnservablePath
     }
 }
 
 impl std::fmt::Display for FrontendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 

@@ -110,13 +110,133 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
     file.flush().await
 }
 
+/// Which filesystem one file tool call is operating through.
+///
+/// Decided **once per tool call**, not per RPC. `edit_file` reads a file and writes it back, and
+/// the two halves have to agree: diffing against the editor's buffer and then writing to disk (or
+/// the reverse) is how unsaved work gets silently overwritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRoute {
+    /// The client serves this path. Reads see unsaved buffers, and writes land in the editor's
+    /// document model where its buffer state and undo history stay coherent.
+    Delegated,
+    /// No client delegate exists at all (the REPL, the HTTP server, a client without the `fs`
+    /// capability). There is no editor view to diverge from, so nothing to disclose.
+    Local,
+    /// A client exists and was asked, and answered that it cannot serve this path. The call runs
+    /// against the local filesystem and says so.
+    LocalUnservable,
+    /// The client served the *read* but offers no `fs.writeTextFile`, so the write had to go to
+    /// disk anyway. Distinct from [`FileRoute::LocalUnservable`] because here the client does hold
+    /// a buffer for the file, which the local write has just diverged from.
+    LocalWriteUnsupported,
+}
+
+impl FileRoute {
+    fn is_delegated(self) -> bool {
+        self == FileRoute::Delegated
+    }
+
+    /// Trailer appended to a *write* result that ended up on the local filesystem while a client
+    /// was present. The tool call still carries its `Diff` metadata either way, so the change is
+    /// visible in the client's agent panel; what it is missing is the editor's own view of the
+    /// file, and that is the part worth saying out loud.
+    fn write_disclosure(self) -> &'static str {
+        match self {
+            FileRoute::LocalUnservable => {
+                "\n\nNote: your editor declined to serve this path, so meka wrote it directly to \
+                 disk. The change is in the diff for this tool call, but not in the editor's \
+                 buffer or undo history."
+            }
+            FileRoute::LocalWriteUnsupported => {
+                "\n\nNote: your editor serves this file but does not accept writes, so meka wrote \
+                 it directly to disk. If you have the file open with unsaved changes, they now \
+                 differ from what is on disk."
+            }
+            FileRoute::Delegated | FileRoute::Local => "",
+        }
+    }
+}
+
+/// Local `old_text` for `write_file`'s diff metadata. A missing file is a create, not a failure,
+/// and any other read error only costs the diff its "before" side, so neither is propagated.
+async fn local_old_text(target: &Path) -> Option<String> {
+    match read_file_to_string(target).await {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::debug!(
+                "write_file: local pre-read of '{}' failed ({}); diff metadata will omit old_text",
+                target.display(),
+                error,
+            );
+            None
+        }
+    }
+}
+
+/// Read a file off the local filesystem, reporting failures as `tool_name`'s error with the path
+/// the caller supplied rather than the canonicalised one.
+async fn read_local_text(canonical: &Path, tool_name: &str, path: &str) -> Result<String> {
+    read_file_to_string(canonical)
+        .await
+        .map_err(|error| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("failed to read '{}': {}", path, error),
+        })
+}
+
+/// Write `content` to `target` through `route`, returning the route the write *actually* took.
+///
+/// The returned route is not always the one passed in: a client may offer `fs.readTextFile`
+/// without `fs.writeTextFile`, reading for us but expecting us to do the write ourselves, so a
+/// delegated read can still end on disk. The disclosure has to be built from what happened rather
+/// than from what was planned, or that case reports nothing while being the one where the client
+/// holds a buffer the write has just diverged from.
+async fn apply_write(
+    frontend: &Arc<dyn crate::frontend::Frontend>,
+    route: FileRoute,
+    target: &Path,
+    path: &str,
+    content: &str,
+    tool_name: &str,
+) -> Result<FileRoute> {
+    if route.is_delegated() {
+        match frontend.delegate_fs_write(target, content).await {
+            Some(Ok(())) => return Ok(FileRoute::Delegated),
+            // The client serves this path, so a write failure is never a reason to write behind
+            // its back: it may be about to show the user its own view of the file.
+            Some(Err(error)) => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: tool_name.to_string(),
+                    message: format!("failed to write '{}': {}", path, error),
+                });
+            }
+            None => {}
+        }
+    }
+
+    write_file_bytes(target, content.as_bytes())
+        .await
+        .map_err(|error| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("failed to write '{}': {}", path, error),
+        })?;
+
+    Ok(match route {
+        FileRoute::Delegated => FileRoute::LocalWriteUnsupported,
+        already_local => already_local,
+    })
+}
+
 pub(super) struct ReadFileTool {
     pub read_tracker: ReadTracker,
     pub cwd: crate::agent::SharedCwd,
     /// When the connected ACP client advertises `fs.read_text_file`, plain-text reads are
     /// delegated to the editor's hosted filesystem so it can serve the in-buffer view of the
-    /// file rather than the on-disk bytes. `None` from the frontend means "fall back to local
-    /// read".
+    /// file rather than the on-disk bytes. `None` (no delegate) and a delegate failure that
+    /// disowns the path both read locally; any other delegate failure is surfaced, since the
+    /// client may hold unsaved changes the on-disk bytes would misrepresent.
     pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -272,17 +392,37 @@ impl Tool for ReadFileTool {
                     .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
                     .unwrap_or(DEFAULT_LINE_LIMIT as u32),
             );
-            if let Some(result) = self
+            match self
                 .frontend
                 .delegate_fs_read(&canonical, delegate_line, delegate_limit)
                 .await
             {
-                let content = result.map_err(|error| MekaError::ToolExecution {
-                    tool_name: "read_file".to_string(),
-                    message: format!("failed to read '{}': {}", path, error),
-                })?;
-                self.read_tracker.write().await.insert(canonical);
-                return Ok(ToolOutput::text(content, false));
+                Some(Ok(content)) => {
+                    self.read_tracker.write().await.insert(canonical);
+                    return Ok(ToolOutput::text(content, false));
+                }
+                // The client will not serve this path, so it holds no buffer for it either: the
+                // local bytes are not a degraded substitute for the delegate's view, they are the
+                // same view. Fall through and read them, rather than turning a readable file into
+                // a tool error -- which is what made skills, prompts, and configuration
+                // unreadable under ACP.
+                Some(Err(error)) if error.is_unservable_path() => {
+                    tracing::debug!(
+                        "read_file: client cannot serve '{}' ({}); reading it locally",
+                        canonical.display(),
+                        error,
+                    );
+                }
+                // Any other failure leaves open that the client owns this file and has unsaved
+                // changes in it. Reading disk bytes would silently hand the model a stale view of
+                // a file the user is editing, so surface the failure instead.
+                Some(Err(error)) => {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: "read_file".to_string(),
+                        message: format!("failed to read '{}': {}", path, error),
+                    });
+                }
+                None => {}
             }
         }
 
@@ -462,25 +602,39 @@ impl Tool for EditFileTool {
             ));
         }
 
-        // Prefer the editor's in-buffer view when offered. A delegate error short-circuits;
-        // silently reading on-disk bytes risks diffing a different document than the one the
-        // editor will apply against.
-        let content =
-            match self.frontend.delegate_fs_read(&canonical, None, None).await {
-                Some(Ok(text)) => text,
-                Some(Err(error)) => {
-                    return Err(MekaError::ToolExecution {
-                        tool_name: "edit_file".to_string(),
-                        message: format!("failed to read '{}': {}", path, error),
-                    });
-                }
-                None => read_file_to_string(&canonical).await.map_err(|error| {
-                    MekaError::ToolExecution {
-                        tool_name: "edit_file".to_string(),
-                        message: format!("failed to read '{}': {}", path, error),
-                    }
-                })?,
-            };
+        // The pre-read picks the route for the whole edit. Prefer the editor's in-buffer view: it
+        // is the document the editor will apply the edit against.
+        let (content, route) = match self.frontend.delegate_fs_read(&canonical, None, None).await {
+            Some(Ok(text)) => (text, FileRoute::Delegated),
+            // The client cannot serve this path, so it holds no buffer for it and will not
+            // accept the write either. Run the whole edit locally rather than refusing: an
+            // editor's project boundary should not decide which files the agent can edit.
+            Some(Err(error)) if error.is_unservable_path() => {
+                tracing::debug!(
+                    "edit_file: client cannot serve '{}' ({}); editing it locally",
+                    canonical.display(),
+                    error,
+                );
+                (
+                    read_local_text(&canonical, "edit_file", &path).await?,
+                    FileRoute::LocalUnservable,
+                )
+            }
+            // Any other failure has to short-circuit. The client may own this file and hold
+            // unsaved changes; diffing against on-disk bytes and then writing the result
+            // through the delegate would overwrite the user's unsaved work with an edit
+            // computed from stale input.
+            Some(Err(error)) => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "edit_file".to_string(),
+                    message: format!("failed to read '{}': {}", path, error),
+                });
+            }
+            None => (
+                read_local_text(&canonical, "edit_file", &path).await?,
+                FileRoute::Local,
+            ),
+        };
 
         if !content.contains(&old_string) {
             return Ok(ToolOutput::text(
@@ -524,29 +678,17 @@ impl Tool for EditFileTool {
             (content.replacen(&old_string, &effective_new_string, 1), 1)
         };
 
-        // Same delegate-or-local fork as `write_file`'s write step. A delegate error short-circuits
-        // to keep our view aligned with the editor's.
-        match self
-            .frontend
-            .delegate_fs_write(&canonical, &new_content)
-            .await
-        {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "edit_file".to_string(),
-                    message: format!("failed to write '{}': {}", path, error),
-                });
-            }
-            None => {
-                write_file_bytes(&canonical, new_content.as_bytes())
-                    .await
-                    .map_err(|error| MekaError::ToolExecution {
-                        tool_name: "edit_file".to_string(),
-                        message: format!("failed to write '{}': {}", path, error),
-                    })?;
-            }
-        }
+        // Write back through whichever filesystem produced `content`. Re-deciding here instead of
+        // reusing the route is what would let a diff taken from the editor's buffer land on disk.
+        let route = apply_write(
+            &self.frontend,
+            route,
+            &canonical,
+            &path,
+            &new_content,
+            "edit_file",
+        )
+        .await?;
 
         let snippet = build_context_snippet(&new_content, first_match_byte, 3);
         let trailer = if count > 1 {
@@ -557,8 +699,12 @@ impl Tool for EditFileTool {
 
         Ok(ToolOutput::text(
             format!(
-                "Successfully edited '{}': {} occurrence(s){}\n\n{}",
-                path, count, trailer, snippet,
+                "Successfully edited '{}': {} occurrence(s){}\n\n{}{}",
+                path,
+                count,
+                trailer,
+                snippet,
+                route.write_disclosure(),
             ),
             false,
         )
@@ -700,48 +846,55 @@ impl Tool for WriteFileTool {
         // and the heuristic is conservative: a truly-empty existing
         // file still loses `old_text`, but the diff content is
         // identical either way.
-        let old_text = match self.frontend.delegate_fs_read(&target, None, None).await {
+        //
+        // The probe also picks the route for the write, the same way `edit_file`'s pre-read does,
+        // and for a reason worth recording: a client may report an unservable path on a *read* but
+        // not on a write. Zed does exactly this -- its `read_text_file` maps a path outside the
+        // open project to `ResourceNotFound`, while its `write_text_file` returns a generic error
+        // for the same path. Routing the write on its own error code would therefore never
+        // recognise the case it exists for. The read is the reliable signal, and it is unambiguous
+        // there: a file that does not exist *yet* inside the project still maps to a project path,
+        // so it comes back as `Ok("")` rather than as not-found.
+        let (old_text, route) = match self.frontend.delegate_fs_read(&target, None, None).await {
             Some(Ok(text)) => {
-                if text.is_empty() && !target.exists() {
+                let old = if text.is_empty() && !target.exists() {
                     None
                 } else {
                     Some(text)
-                }
+                };
+                (old, FileRoute::Delegated)
             }
-            _ => match read_file_to_string(&target).await {
-                Ok(text) => Some(text),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    tracing::debug!(
-                        "write_file: pre-read of '{}' failed ({}); diff metadata will omit old_text",
-                        target.display(),
-                        error,
-                    );
-                    None
-                }
-            },
+            Some(Err(error)) if error.is_unservable_path() => {
+                tracing::debug!(
+                    "write_file: client cannot serve '{}' ({}); writing it locally",
+                    target.display(),
+                    error,
+                );
+                (local_old_text(&target).await, FileRoute::LocalUnservable)
+            }
+            // The client did not disown the path, it just failed this probe. The write still goes
+            // to it; only the diff's `old_text` is degraded, and that is informational.
+            Some(Err(error)) => {
+                tracing::debug!(
+                    "write_file: pre-read of '{}' failed ({}); diff metadata will omit old_text",
+                    target.display(),
+                    error,
+                );
+                (local_old_text(&target).await, FileRoute::Delegated)
+            }
+            None => (local_old_text(&target).await, FileRoute::Local),
         };
 
-        // Delegate the write when the editor offers `fs.write_text_file`. A delegate error surfaces
-        // verbatim; silently falling back to a local write would diverge from the editor's view of
-        // the file.
-        match self.frontend.delegate_fs_write(&target, &content).await {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "write_file".to_string(),
-                    message: format!("failed to write '{}': {}", path, error),
-                });
-            }
-            None => {
-                write_file_bytes(&target, content.as_bytes())
-                    .await
-                    .map_err(|error| MekaError::ToolExecution {
-                        tool_name: "write_file".to_string(),
-                        message: format!("failed to write '{}': {}", path, error),
-                    })?;
-            }
-        }
+        // Write through whichever filesystem the probe selected. Same shape as `edit_file`.
+        let route = apply_write(
+            &self.frontend,
+            route,
+            &target,
+            &path,
+            &content,
+            "write_file",
+        )
+        .await?;
 
         // Record the canonical path so subsequent `edit_file` calls accept it without `force:
         // true`. We just produced the content, so the "must read first" safety check has nothing to
@@ -749,7 +902,12 @@ impl Tool for WriteFileTool {
         self.read_tracker.write().await.insert(target.clone());
 
         Ok(ToolOutput::text(
-            format!("Successfully wrote {} bytes to '{}'", content.len(), path),
+            format!(
+                "Successfully wrote {} bytes to '{}'{}",
+                content.len(),
+                path,
+                route.write_disclosure(),
+            ),
             false,
         )
         .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
@@ -771,6 +929,85 @@ mod tests {
 
     fn test_tracker() -> ReadTracker {
         Arc::new(RwLock::new(HashSet::new()))
+    }
+
+    /// A frontend whose hosted filesystem answers with a scripted outcome, so each branch of the
+    /// routing rule can be driven directly.
+    struct ScriptedDelegateFrontend {
+        read: Option<std::result::Result<String, crate::frontend::FrontendError>>,
+        write: Option<std::result::Result<(), crate::frontend::FrontendError>>,
+        delegated_writes: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    impl ScriptedDelegateFrontend {
+        /// A client that will not serve the path at all, the way an editor answers for files
+        /// outside the project it has open.
+        fn unservable() -> Self {
+            Self {
+                read: Some(Err(crate::frontend::FrontendError::unservable_path(
+                    "fs/read_text_file failed: Resource not found",
+                ))),
+                write: Some(Err(crate::frontend::FrontendError::unservable_path(
+                    "fs/write_text_file failed: Resource not found",
+                ))),
+                delegated_writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A client that owns the path but failed this time round.
+        fn transient() -> Self {
+            Self {
+                read: Some(Err(crate::frontend::FrontendError::new(
+                    "fs/read_text_file failed: Internal error",
+                ))),
+                write: Some(Err(crate::frontend::FrontendError::new(
+                    "fs/write_text_file failed: Internal error",
+                ))),
+                delegated_writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A client serving its in-buffer view, which differs from the on-disk bytes.
+        fn serving(buffer: &str) -> Self {
+            Self {
+                read: Some(Ok(buffer.to_string())),
+                write: Some(Ok(())),
+                delegated_writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::frontend::Frontend for ScriptedDelegateFrontend {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn delegate_fs_read(
+            &self,
+            _path: &Path,
+            _line: Option<u32>,
+            _limit: Option<u32>,
+        ) -> Option<std::result::Result<String, crate::frontend::FrontendError>> {
+            self.read.clone()
+        }
+
+        async fn delegate_fs_write(
+            &self,
+            path: &Path,
+            _content: &str,
+        ) -> Option<std::result::Result<(), crate::frontend::FrontendError>> {
+            self.delegated_writes
+                .lock()
+                .expect("lock")
+                .push(path.to_path_buf());
+            self.write.clone()
+        }
     }
 
     #[tokio::test]
@@ -795,6 +1032,339 @@ mod tests {
         assert!(!result.is_error);
         assert!(text_content(&result).contains("line1"));
         assert!(text_content(&result).contains("line3"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_falls_back_when_client_cannot_serve_path() {
+        // Regression: a delegate failure used to abort the read. Editors serve `fs/read_text_file`
+        // only for the project they have open, so every skill, prompt, and config file read under
+        // ACP became a hard tool error -- with the file sitting right there, readable.
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = temp_dir.path().join("outside-the-project.md");
+        std::fs::write(&file_path, "on-disk contents\n").expect("failed to write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a path the client cannot serve must still be readable locally");
+
+        assert!(!result.is_error);
+        assert!(text_content(&result).contains("on-disk contents"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_surfaces_transient_delegate_failure() {
+        // A client that owns the file and merely failed this time may be holding unsaved changes.
+        // Reading disk bytes would hand the model a stale view of a file the user is editing.
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = temp_dir.path().join("owned-by-the-editor.md");
+        std::fs::write(&file_path, "stale on-disk contents\n").expect("failed to write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::transient()),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a transient delegate failure must not silently read stale bytes");
+        assert!(error.to_string().contains("Internal error"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_runs_locally_when_client_cannot_serve_path() {
+        // ACP must not be less capable than the terminal: an editor's project boundary should not
+        // decide which files the agent is allowed to edit.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("skill.md");
+        std::fs::write(&file_path, "before\n").expect("write");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend::unservable());
+        let tracker = test_tracker();
+        tracker
+            .write()
+            .await
+            .insert(std::fs::canonicalize(&file_path).expect("canonicalize"));
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: frontend.clone(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "before",
+                    "new_string": "after",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an unservable path must still be editable locally");
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "after\n"
+        );
+        // The user has to be told the editor's buffer and undo history do not know about this.
+        assert!(
+            text_content(&result).contains("declined to serve this path"),
+            "local write must be disclosed, got: {}",
+            text_content(&result),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_surfaces_transient_delegate_failure() {
+        // The data-loss shape: if the pre-read fell back to disk while the editor held unsaved
+        // changes, the edit would be computed from stale bytes and then written through the
+        // delegate, overwriting the user's unsaved work.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("owned.md");
+        std::fs::write(&file_path, "before\n").expect("write");
+
+        let tracker = test_tracker();
+        tracker
+            .write()
+            .await
+            .insert(std::fs::canonicalize(&file_path).expect("canonicalize"));
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::transient()),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "before",
+                    "new_string": "after",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a transient pre-read failure must not produce a local edit");
+        assert!(error.to_string().contains("Internal error"), "{}", error);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "before\n",
+            "the file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_writes_back_through_the_route_it_read_from() {
+        // Route consistency: the edit was computed from the client's buffer, so it has to be
+        // applied there. Writing it to disk instead would drop it the moment the buffer is saved.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open-in-editor.md");
+        std::fs::write(&file_path, "stale disk bytes\n").expect("write");
+        let canonical = std::fs::canonicalize(&file_path).expect("canonicalize");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving("unsaved buffer\n"));
+        let tracker = test_tracker();
+        tracker.write().await.insert(canonical.clone());
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: frontend.clone(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "unsaved buffer",
+                    "new_string": "edited buffer",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit against the client's buffer");
+
+        assert!(!result.is_error);
+        assert_eq!(
+            frontend.delegated_writes.lock().expect("lock").as_slice(),
+            &[canonical],
+            "the edit must be applied where it was read from"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "stale disk bytes\n",
+            "a delegated edit must not also touch the local file"
+        );
+        assert!(
+            !text_content(&result).contains("declined to serve"),
+            "a delegated write has nothing to disclose"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_discloses_local_write_when_client_cannot_write() {
+        // A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for us but
+        // expects us to do the write. The edit is then computed from its buffer and lands on disk,
+        // so the file it is showing the user now differs from what is stored -- which the result
+        // has to say, even though the read was delegated.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open.md");
+        std::fs::write(&file_path, "stale disk bytes\n").expect("write");
+        let canonical = std::fs::canonicalize(&file_path).expect("canonicalize");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend {
+            read: Some(Ok("unsaved buffer\n".to_string())),
+            // No `fs.writeTextFile` capability.
+            write: None,
+            delegated_writes: std::sync::Mutex::new(Vec::new()),
+        });
+        let tracker = test_tracker();
+        tracker.write().await.insert(canonical);
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend,
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "unsaved buffer",
+                    "new_string": "edited buffer",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit must still apply");
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "edited buffer\n"
+        );
+        assert!(
+            text_content(&result).contains("does not accept writes"),
+            "divergence from the client's buffer must be disclosed, got: {}",
+            text_content(&result),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_routes_on_the_read_probe_not_the_write_error() {
+        // Zed reports an out-of-project path as `ResourceNotFound` on `read_text_file` but as a
+        // generic error on `write_text_file`. Routing on the write's own error code would never
+        // recognise the case, so the probe decides and the delegated write is not even attempted.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("skills").join("new-skill.md");
+        std::fs::create_dir_all(file_path.parent().expect("parent")).expect("mkdir");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend {
+            read: Some(Err(crate::frontend::FrontendError::unservable_path(
+                "fs/read_text_file failed: Resource not found",
+            ))),
+            // What Zed would answer if we asked: a generic error, not `ResourceNotFound`.
+            write: Some(Err(crate::frontend::FrontendError::new(
+                "fs/write_text_file failed: invalid path",
+            ))),
+            delegated_writes: std::sync::Mutex::new(Vec::new()),
+        });
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: frontend.clone(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "# skill\n",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an out-of-project create must succeed under ACP");
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "# skill\n"
+        );
+        assert!(
+            frontend.delegated_writes.lock().expect("lock").is_empty(),
+            "the write must not be attempted once the probe disowned the path"
+        );
+        assert!(
+            text_content(&result).contains("declined to serve this path"),
+            "local write must be disclosed, got: {}",
+            text_content(&result),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_falls_back_and_discloses_when_unservable() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("config.toml");
+
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "key = 1\n",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an unservable path must still be writable locally");
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "key = 1\n"
+        );
+        assert!(
+            text_content(&result).contains("declined to serve this path"),
+            "local write must be disclosed, got: {}",
+            text_content(&result),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_surfaces_transient_delegate_failure() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("owned.txt");
+
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::transient()),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "x\n",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a transient write failure must not become a local write");
+        assert!(error.to_string().contains("Internal error"), "{}", error);
+        assert!(!file_path.exists(), "nothing should have been written");
     }
 
     #[tokio::test]

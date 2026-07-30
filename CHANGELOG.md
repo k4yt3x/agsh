@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `search_contents` now stops searching once the inline match cap is exceeded.
+
+### Fixed
+
+- `find_files` and `search_contents` now stop after 60 seconds instead of running unbounded.
+- Both search tools now honour Ctrl+C and ACP `session/cancel`.
+- A search that was cut short now says so instead of reporting "no matches".
+- Searching no longer logs one warning per unreadable path.
+- meka can now read and edit files outside the project an ACP editor has open.
+- An ACP write that bypassed the editor now says so in the tool result.
+
 ## [0.35.0] - 2026-07-24
 
 ### Added

@@ -3,9 +3,11 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ToolOutput;
@@ -13,6 +15,65 @@ use crate::error::{MekaError, Result};
 
 /// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
+
+/// Wall-clock ceiling on one filesystem walk (`find_files`, `search_contents`). A walk rooted high
+/// in the tree visits millions of directories -- `/proc` and `/sys` alone are effectively
+/// unbounded -- and the result caps bound only what is *returned*, not what is *examined*, so
+/// without a ceiling a single over-broad call runs until the filesystem is exhausted. Sized well
+/// above any plausible repository-scoped search and well below the point where an unattended run
+/// looks hung.
+const WALK_TIME_BUDGET: Duration = Duration::from_secs(60);
+
+/// Why a walk stopped before it ran out of tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WalkStop {
+    /// The enclosing turn was cancelled (Ctrl+C, ACP `session/cancel`).
+    Cancelled,
+    /// The walk outran [`WALK_TIME_BUDGET`].
+    TimedOut,
+}
+
+/// Stop condition for the blocking filesystem walks.
+///
+/// Both walks run inside `tokio::task::spawn_blocking`, and a blocking task that has already
+/// started cannot be aborted from the outside: dropping its `JoinHandle` detaches the thread but
+/// does not stop it. The walk itself therefore has to be the thing that gives up, which is what
+/// this type is for. Consult it at every step of the traversal.
+pub(super) struct WalkBudget {
+    budget: Duration,
+    deadline: Instant,
+    cancellation: CancellationToken,
+}
+
+impl WalkBudget {
+    pub(super) fn new(cancellation: CancellationToken) -> Self {
+        Self::with_budget(cancellation, WALK_TIME_BUDGET)
+    }
+
+    pub(super) fn with_budget(cancellation: CancellationToken, budget: Duration) -> Self {
+        Self {
+            budget,
+            deadline: Instant::now() + budget,
+            cancellation,
+        }
+    }
+
+    /// Seconds the walk was allowed to run, for the message that reports a [`WalkStop::TimedOut`].
+    pub(super) fn budget_secs(&self) -> u64 {
+        self.budget.as_secs()
+    }
+
+    /// Called once per directory entry, so it stays to one atomic load plus one clock read.
+    pub(super) fn check(&self) -> Option<WalkStop> {
+        if self.cancellation.is_cancelled() {
+            return Some(WalkStop::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Some(WalkStop::TimedOut);
+        }
+        None
+    }
+}
 
 /// Resolve the active session id for a session-scoped tool, erroring if no session is open. Shared
 /// by the scratchpad and recall tool families.
@@ -204,6 +265,34 @@ mod tests {
             "unexpected error message: {}",
             message,
         );
+    }
+
+    #[test]
+    fn test_walk_budget_allows_work_within_budget() {
+        let budget = WalkBudget::new(CancellationToken::new());
+        assert!(budget.check().is_none());
+    }
+
+    #[test]
+    fn test_walk_budget_stops_on_expired_deadline() {
+        let budget = WalkBudget::with_budget(CancellationToken::new(), Duration::from_secs(0));
+        assert_eq!(budget.check(), Some(WalkStop::TimedOut));
+    }
+
+    #[test]
+    fn test_walk_budget_reports_cancellation_before_timeout() {
+        // Both conditions hold; cancellation is the more specific answer and maps to
+        // `MekaError::Interrupted` rather than a partial result.
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let budget = WalkBudget::with_budget(cancellation, Duration::from_secs(0));
+        assert_eq!(budget.check(), Some(WalkStop::Cancelled));
+    }
+
+    #[test]
+    fn test_walk_budget_reports_its_own_budget() {
+        let budget = WalkBudget::with_budget(CancellationToken::new(), Duration::from_secs(5));
+        assert_eq!(budget.budget_secs(), 5);
     }
 
     #[test]
