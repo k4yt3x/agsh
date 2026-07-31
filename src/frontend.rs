@@ -20,6 +20,7 @@
 #[cfg(test)]
 use std::sync::Mutex;
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -102,13 +103,14 @@ pub trait Frontend: Send + Sync {
     /// Handle an MCP `elicitation/create` request: the server asked the user for input (either a
     /// structured form or a URL-consent flow). The frontend is responsible for prompting the user
     /// and returning their response. The default impl declines: the safe behavior when no human
-    /// is reachable (non-interactive subcommands, sub-agents under `PermissionForwardingFrontend`,
-    /// `SilentFrontend`, the test-only `RecordingFrontend`).
+    /// is reachable (non-interactive subcommands, `SilentFrontend`, the test-only
+    /// `RecordingFrontend`).
     ///
     /// Called via the task-local installed in `Agent::run_tool`; see
     /// [`crate::mcp::current_session_frontend`]. Concrete impls today:
     /// [`crate::repl::ReplFrontend`] (routes through the REPL thread), `crate::acp::AcpFrontend`
-    /// (auto-declines with a warn: no ACP protocol primitive for forms yet).
+    /// (issues ACP `elicitation/create`, declining when the client doesn't advertise the mode),
+    /// and [`PermissionForwardingFrontend`] (hands a sub-agent's elicitation to the parent).
     async fn handle_elicitation(
         &self,
         _prompt: crate::mcp::elicitation::ElicitationPrompt,
@@ -279,6 +281,16 @@ pub enum FrontendEvent {
         title: Option<String>,
         items: Vec<TodoItem>,
     },
+    /// A sub-agent running under the `spawn_agent` tool call `tool_call_id` did something worth
+    /// showing. `summary` is the *whole* rolling activity block, not a delta, because ACP's
+    /// `tool_call_update` replaces a tool call's content rather than appending to it.
+    ///
+    /// Emitted by [`PermissionForwardingFrontend`], which is the only place that knows both the
+    /// sub-agent's events and the parent tool call they belong to.
+    SubAgentActivity {
+        tool_call_id: String,
+        summary: String,
+    },
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
     /// User-visible advisory surfaced by the provider layer (e.g. image redaction when the request
@@ -333,32 +345,102 @@ pub enum PermissionOutcome {
 }
 
 /// Frontend wrapper used by sub-agents when the parent is interactive enough to host permission
-/// prompts. Streaming output (text, tool indicators, todos, token usage) is dropped; sub-agents'
-/// final reports flow back through the parent's `spawn_agent` tool result, not through this
-/// frontend. The exceptions are `Notice` (provider-side advisories that the user should still see,
-/// e.g. a redaction during a sub-agent's turn) and `request_permission` (forwarded so the user
-/// is prompted in their original UI: REPL approval line or ACP `session/request_permission`).
+/// prompts. Streaming output (text, thinking, todos, token usage) is dropped; sub-agents' final
+/// reports flow back through the parent's `spawn_agent` tool result, not through this frontend.
+/// The exceptions are:
+///
+/// - `Notice` — provider-side advisories the user should still see, e.g. a redaction during a
+///   sub-agent's turn.
+/// - `request_permission` and `handle_elicitation` — round-trips forwarded so the user is asked in
+///   their original UI (REPL approval line, ACP `session/request_permission` /
+///   `elicitation/create`).
+/// - `ToolCallStarted` — not forwarded as-is, but rolled up into
+///   [`FrontendEvent::SubAgentActivity`] against the parent's `spawn_agent` call so a long
+///   delegated task shows its progress instead of an opaque spinner.
 ///
 /// Constructed in [`crate::tools::subagent::SpawnAgentTool`] with the parent agent's frontend as
 /// the delegate.
 pub struct PermissionForwardingFrontend {
     delegate: Arc<dyn Frontend>,
+    /// The parent's `tool_use_id` for the `spawn_agent` call this sub-agent is running under, when
+    /// one is in scope. `None` outside a tool call (tests, direct construction), which disables
+    /// activity forwarding rather than guessing at a correlation id.
+    tool_call_id: Option<String>,
+    /// Rolling record of what the sub-agent has done, oldest first, capped at
+    /// [`Self::MAX_ACTIVITY_LINES`].
+    activity: std::sync::Mutex<VecDeque<String>>,
 }
 
 impl PermissionForwardingFrontend {
-    pub fn new(delegate: Arc<dyn Frontend>) -> Self {
-        Self { delegate }
+    /// How many activity lines the parent tool call shows. The whole block is resent on every
+    /// update (ACP replaces content), so this bounds per-update payload as well as height.
+    const MAX_ACTIVITY_LINES: usize = 20;
+
+    pub fn new(delegate: Arc<dyn Frontend>, tool_call_id: Option<String>) -> Self {
+        Self {
+            delegate,
+            tool_call_id,
+            activity: std::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Append `line` and return the whole block to send.
+    fn record_activity(&self, line: String) -> Option<String> {
+        let mut activity = self.activity.lock().ok()?;
+        if activity.len() == Self::MAX_ACTIVITY_LINES {
+            activity.pop_front();
+        }
+        activity.push_back(line);
+        Some(
+            activity
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 }
 
 #[async_trait]
 impl Frontend for PermissionForwardingFrontend {
     async fn emit(&self, event: FrontendEvent) {
-        // Forward Notice: provider advisories about the sub-agent's request belong in the user's
-        // primary UI. Everything else (text deltas, thinking, tool indicators, todos, token usage,
-        // session lifecycle) is sub-agent chrome that the user shouldn't see.
-        if matches!(event, FrontendEvent::Notice(_)) {
-            self.delegate.emit(event).await;
+        match event {
+            // Provider advisories about the sub-agent's request belong in the user's primary UI.
+            FrontendEvent::Notice(_) => self.delegate.emit(event).await,
+            // Roll the sub-agent's tool calls up into the parent's `spawn_agent` tool call, so a
+            // long-running sub-agent shows what it is doing instead of an opaque spinner. Only the
+            // call being *started* is recorded: it answers "where is it now", which is the
+            // question an unattended run leaves open, and results still arrive in the report.
+            FrontendEvent::ToolCallStarted {
+                name,
+                display_summary,
+                ..
+            } => {
+                // Without a parent call there is nothing to attach the activity to, so it is
+                // dropped rather than sent against a guessed correlation id.
+                let Some(tool_call_id) = self.tool_call_id.clone() else {
+                    return;
+                };
+                let line = match display_summary {
+                    Some(summary) => format!("{}: {}", name, summary),
+                    None => name,
+                };
+                if let Some(summary) = self.record_activity(line) {
+                    self.delegate
+                        .emit(FrontendEvent::SubAgentActivity {
+                            tool_call_id,
+                            summary,
+                        })
+                        .await;
+                }
+            }
+            // A nested sub-agent's activity is already summarised as a `spawn_agent` line in this
+            // sub-agent's own record; forwarding it too would have two writers fighting over one
+            // tool call's content.
+            FrontendEvent::SubAgentActivity { .. } => {}
+            // Everything else (text deltas, thinking, tool results, todos, token usage, session
+            // lifecycle) is sub-agent chrome the user shouldn't see.
+            _ => {}
         }
     }
 
@@ -395,6 +477,16 @@ impl Frontend for PermissionForwardingFrontend {
         spec: DelegatedExecSpec,
     ) -> Option<Result<DelegatedExecOutput, FrontendError>> {
         self.delegate.delegate_execute(spec).await
+    }
+
+    /// Forwarded for the same reason as [`Self::request_permission`]: an MCP server called from a
+    /// sub-agent needs to reach the same human, and the trait default would decline on their
+    /// behalf without ever asking.
+    async fn handle_elicitation(
+        &self,
+        prompt: crate::mcp::elicitation::ElicitationPrompt,
+    ) -> crate::mcp::elicitation::ElicitationResponse {
+        self.delegate.handle_elicitation(prompt).await
     }
 }
 
@@ -559,7 +651,7 @@ mod tests {
         // UI; the sub-agent's report flows back via the spawn_agent tool result instead.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
 
         forwarder.emit(FrontendEvent::TurnStarted).await;
         forwarder
@@ -572,6 +664,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_rolls_up_sub_agent_tool_calls() {
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+
+        for (name, summary) in [
+            ("read_file", Some("/etc/hosts".to_string())),
+            ("find_files", Some("**/*.rs".to_string())),
+            ("todo", None),
+        ] {
+            forwarder
+                .emit(FrontendEvent::ToolCallStarted {
+                    id: format!("toolu_{}", name),
+                    name: name.to_string(),
+                    input: serde_json::json!({}),
+                    display_summary: summary,
+                })
+                .await;
+        }
+
+        let events = recorder.events();
+        assert_eq!(events.len(), 3, "one update per sub-agent tool call");
+        // Each update carries the whole block, not a delta: ACP replaces tool call content.
+        match &events[2] {
+            FrontendEvent::SubAgentActivity {
+                tool_call_id,
+                summary,
+            } => {
+                assert_eq!(tool_call_id, "toolu_parent");
+                assert_eq!(summary, "read_file: /etc/hosts\nfind_files: **/*.rs\ntodo");
+            }
+            other => panic!("expected SubAgentActivity; got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_caps_activity_lines() {
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+
+        let total = PermissionForwardingFrontend::MAX_ACTIVITY_LINES + 5;
+        for i in 0..total {
+            forwarder
+                .emit(FrontendEvent::ToolCallStarted {
+                    id: format!("toolu_{}", i),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                    display_summary: Some(format!("/file{}", i)),
+                })
+                .await;
+        }
+
+        let events = recorder.events();
+        let FrontendEvent::SubAgentActivity { summary, .. } = events.last().expect("an event")
+        else {
+            panic!("expected SubAgentActivity");
+        };
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(
+            lines.len(),
+            PermissionForwardingFrontend::MAX_ACTIVITY_LINES
+        );
+        assert_eq!(
+            lines[0],
+            format!(
+                "read_file: /file{}",
+                total - PermissionForwardingFrontend::MAX_ACTIVITY_LINES
+            ),
+            "the oldest lines are dropped, not the newest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_without_tool_call_id_stays_silent() {
+        // Outside a tool call there is nothing to correlate the activity with, so it is dropped
+        // rather than sent against a guessed id.
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
+
+        forwarder
+            .emit(FrontendEvent::ToolCallStarted {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+                display_summary: Some("/etc/hosts".into()),
+            })
+            .await;
+
+        assert!(recorder.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_drops_nested_sub_agent_activity() {
+        // A nested sub-agent's roll-up must not reach the parent: it already appears as a
+        // `spawn_agent` line in this level's own record, and two writers on one tool call's
+        // content would overwrite each other.
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+
+        forwarder
+            .emit(FrontendEvent::SubAgentActivity {
+                tool_call_id: "toolu_nested".into(),
+                summary: "read_file: /deep".into(),
+            })
+            .await;
+
+        assert!(recorder.events().is_empty());
+    }
+
     /// Notices are the one event that *does* forward through `PermissionForwardingFrontend`. Image
     /// redaction during a sub-agent's provider call is a side-effect the *user* needs to see; the
     /// sub-agent's report has no place to surface it, and silent redaction without operator
@@ -580,7 +785,7 @@ mod tests {
     async fn test_permission_forwarding_frontend_forwards_notice() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
         forwarder
             .emit(FrontendEvent::Notice(crate::provider::Notice::info(
                 "redacted 2 images",
@@ -601,7 +806,7 @@ mod tests {
     async fn test_permission_forwarding_frontend_delegates_request_permission() {
         let delegate: Arc<dyn Frontend> =
             Arc::new(RecordingFrontend::with_permission(PermissionOutcome::Allow));
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
         let outcome = forwarder
             .request_permission(PermissionRequest {
                 tool_name: "write_file".into(),
@@ -716,7 +921,7 @@ mod tests {
     async fn test_permission_forwarding_frontend_forwards_fs_read() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
         let outcome = forwarder
             .delegate_fs_read(Path::new("/tmp/sub.txt"), None, None)
             .await
@@ -731,7 +936,7 @@ mod tests {
     async fn test_permission_forwarding_frontend_forwards_fs_write() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
         forwarder
             .delegate_fs_write(Path::new("/tmp/sub.txt"), "hi from sub-agent")
             .await
@@ -748,7 +953,7 @@ mod tests {
     async fn test_permission_forwarding_frontend_forwards_execute() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate);
+        let forwarder = PermissionForwardingFrontend::new(delegate, None);
         let spec = DelegatedExecSpec {
             command: "ls".to_string(),
             args: vec!["-la".to_string()],

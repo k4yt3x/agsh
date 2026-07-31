@@ -147,8 +147,12 @@ pub fn translate(
         ),
         // Metadata-only events: the recorder captures them for the blocking JSON / terminal
         // SSE payload but they don't get their own wire events.
+        // `SubAgentActivity` is a progressive rewrite of one tool call's display, which only makes
+        // sense against a stateful view like ACP's; the SSE stream already carries the sub-agent's
+        // `spawn_agent` tool result when it lands.
         FrontendEvent::TodoListUpdated { .. }
         | FrontendEvent::TokenUsage(_)
+        | FrontendEvent::SubAgentActivity { .. }
         | FrontendEvent::McpProgress(_) => return None,
         FrontendEvent::Notice(notice) => (SseEventType::Notice, notice_view(notice)),
         FrontendEvent::SessionStarted { .. } => return None,

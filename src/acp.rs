@@ -31,6 +31,8 @@
 //! [`crate::frontend::PermissionForwardingFrontend`], so their permission prompts, fs delegates,
 //! and terminal delegates all flow through the parent session's editor UI.
 
+mod elicitation;
+
 use std::{
     path::PathBuf,
     pin::Pin,
@@ -56,7 +58,7 @@ use agent_client_protocol::{
         SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
         StopReason, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
+        Usage, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -326,6 +328,18 @@ impl Frontend for AcpFrontend {
                 }
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
             }
+            FrontendEvent::SubAgentActivity {
+                tool_call_id,
+                summary,
+            } => {
+                // ACP has no sub-agent primitive -- no nested sessions, no nested tool calls -- so
+                // a sub-agent is one tool call and its progress is that call's content. Updating
+                // content while the call is still `in_progress` is what turns an opaque spinner
+                // into a live view of what the sub-agent is doing. The client replaces the content
+                // array on each update, which is why `summary` is the whole block.
+                let fields = ToolCallUpdateFields::new().content(vec![text_content_block(summary)]);
+                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tool_call_id, fields))
+            }
             FrontendEvent::Notice(notice) => {
                 // No dedicated ACP primitive for advisories; surface inline as an assistant-message
                 // chunk with an `[meka]` prefix so editor transcripts record the side-effect and
@@ -536,24 +550,62 @@ impl Frontend for AcpFrontend {
         &self,
         prompt: crate::mcp::elicitation::ElicitationPrompt,
     ) -> crate::mcp::elicitation::ElicitationResponse {
-        // ACP has no protocol primitive for arbitrary server forms. The pragmatic stance until one
-        // lands is to auto-decline with an info-level log so editor users can see in their agent
-        // stderr that an elicitation arrived and was passed back to the server. A future per-ACP
-        // path could synthesize a `session/request_permission` round-trip (the only existing
-        // round-trip primitive) by mapping form fields to permission options, but that conflates
-        // tool approval and form input, which is the kind of overload the protocol is likely to
-        // rule out as it grows a proper elicitation surface.
-        tracing::warn!(
-            "ACP session received MCP elicitation from '{}' ({}); auto-declining (no ACP \
-             primitive for form/URL prompts yet): {}",
-            prompt.server_name,
-            match &prompt.kind {
-                crate::mcp::elicitation::ElicitationKind::Form { .. } => "form",
-                crate::mcp::elicitation::ElicitationKind::Url { .. } => "url",
-            },
-            prompt.message,
-        );
-        crate::mcp::elicitation::ElicitationResponse::Decline
+        use crate::mcp::elicitation::{ElicitationKind, ElicitationResponse};
+
+        let kind = match &prompt.kind {
+            ElicitationKind::Form { .. } => "form",
+            ElicitationKind::Url { .. } => "url",
+        };
+        // Form and URL support are advertised independently, so check the mode actually being
+        // asked for. An unadvertised mode must not be sent: the client would reject it, and the
+        // MCP call is blocked on the answer meanwhile.
+        let supported = self
+            .client_state
+            .capabilities()
+            .elicitation
+            .is_some_and(|caps| match &prompt.kind {
+                ElicitationKind::Form { .. } => caps.form.is_some(),
+                ElicitationKind::Url { .. } => caps.url.is_some(),
+            });
+        if !supported {
+            tracing::warn!(
+                "MCP elicitation from '{}' ({}) declined: the client does not support this \
+                 elicitation mode: {}",
+                prompt.server_name,
+                kind,
+                prompt.message,
+            );
+            return ElicitationResponse::Decline;
+        }
+
+        let Some(request) = elicitation::to_acp_request(&prompt, &self.session_id) else {
+            tracing::warn!(
+                "MCP elicitation from '{}' declined: its schema uses a field type ACP cannot \
+                 express, so the client could not render the form: {}",
+                prompt.server_name,
+                prompt.message,
+            );
+            return ElicitationResponse::Decline;
+        };
+
+        match self
+            .connection
+            .clone()
+            .send_request(request)
+            .block_task()
+            .await
+        {
+            Ok(response) => elicitation::from_acp_action(response.action),
+            Err(error) => {
+                tracing::warn!(
+                    "MCP elicitation from '{}' ({}) declined: elicitation/create failed: {}",
+                    prompt.server_name,
+                    kind,
+                    error,
+                );
+                ElicitationResponse::Decline
+            }
+        }
     }
 }
 
@@ -2156,7 +2208,12 @@ async fn run_prompt_turn(
                 agent_client_protocol::schema::v1::TextContent::new(body),
             ))),
         );
-        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+        // Reported here too, even though a local command consumes no tokens: `usage` is
+        // session-cumulative, so omitting it would make a client's running total flicker away on
+        // every `/status` turn.
+        return responder.respond(
+            PromptResponse::new(StopReason::EndTurn).usage(session_usage(&runtime.agent)),
+        );
     }
 
     let original_prompt_text = prompt_text.clone();
@@ -2243,7 +2300,25 @@ async fn run_prompt_turn(
         messages,
     );
 
-    responder.respond(PromptResponse::new(stop_reason))
+    responder.respond(PromptResponse::new(stop_reason).usage(session_usage(agent)))
+}
+
+/// Session-cumulative token counts for `session/prompt`'s response. Complements the per-turn
+/// `usage_update` notification, which carries the context gauge rather than these totals.
+fn session_usage(agent: &Agent) -> Usage {
+    let snapshot = agent.session_stats_snapshot();
+    let mut usage = Usage::new(
+        snapshot
+            .total_input_tokens()
+            .saturating_add(snapshot.output_tokens),
+        snapshot.input_tokens,
+        snapshot.output_tokens,
+    );
+    usage.cached_read_tokens = Some(snapshot.cache_read_input_tokens);
+    usage.cached_write_tokens = Some(snapshot.cache_creation_input_tokens);
+    // `thought_tokens` is left at its `None` default: meka doesn't meter reasoning separately from
+    // output, and reporting a made-up split would be worse than reporting none.
+    usage
 }
 
 /// `session/load`: reopen a previously persisted session and add it to the active sessions map.

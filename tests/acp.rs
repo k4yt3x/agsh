@@ -633,6 +633,46 @@ fn acp_first_turn_emits_session_info_update_title() {
     );
 }
 
+/// `session/prompt` reports session-cumulative token usage on the response, alongside the
+/// per-turn `usage_update` notification that carries the context gauge.
+#[test]
+fn acp_prompt_response_carries_token_usage() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ok" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "hello");
+    let (_updates, response) = harness.collect_updates(&sid, id);
+
+    let usage = &response["result"]["usage"];
+    assert!(
+        usage.is_object(),
+        "expected usage on the prompt response; full response: {}",
+        response
+    );
+    // Every counter is reported, including the cache tiers, rather than left off the wire. The
+    // values are all zero because the mock provider emits no token-usage events by design (see
+    // `provider::mock`), so this pins the shape and the wiring, not the arithmetic.
+    for field in [
+        "totalTokens",
+        "inputTokens",
+        "outputTokens",
+        "cachedReadTokens",
+        "cachedWriteTokens",
+    ] {
+        assert!(
+            usage[field].is_u64(),
+            "expected {} on the usage object; usage: {}",
+            field,
+            usage
+        );
+    }
+    // Omitted deliberately: meka doesn't meter reasoning separately from output.
+    assert!(usage["thoughtTokens"].is_null(), "usage: {}", usage);
+}
+
 /// Outcome the test wants the synthetic ACP client to send back when the agent issues
 /// `session/request_permission`.
 #[derive(Debug, Clone, Copy)]

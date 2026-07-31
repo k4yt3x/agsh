@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ACP clients now see a sub-agent's tool calls stream into its `spawn_agent` tool call.
+- MCP servers can now prompt for input in an ACP editor; these were previously always declined.
+- `session/prompt` responses now carry session-cumulative token usage.
+
 ### Changed
 
+- Upgrade `agent-client-protocol` to 2.0, matching the major version Zed uses.
 - `search_contents` now stops searching once the inline match cap is exceeded.
 
 ### Fixed

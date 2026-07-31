@@ -1369,6 +1369,10 @@ impl Frontend for ReplFrontend {
                 Self::close_text_run(&mut state);
                 render::render_hint(&notice.text);
             }
+            // The REPL already prints the sub-agent's tool indicators as they happen, via the
+            // parent's own renderer; a rolling rewrite of one tool call's content has no place in
+            // a scrolling transcript.
+            FrontendEvent::SubAgentActivity { .. } => {}
             FrontendEvent::McpProgress(update) => {
                 // Forward through the existing REPL channel so the blocking REPL thread renders
                 // the inline status line (carriage-return overwrite via `render_progress_update`).

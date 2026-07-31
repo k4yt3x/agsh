@@ -44,6 +44,7 @@ The client advertises these in `InitializeRequest.clientCapabilities`; meka stas
 - **`fs.readTextFile: true`**: `read_file` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file. Image and regex `read_file` modes have no `fs/*` analogue and stay local.
 - **`fs.writeTextFile: true`**: `write_file` and `edit_file`'s apply step issue `fs/write_text_file { sessionId, path, content }`. meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it.
 - **`terminal: true`**: `execute_command` runs the four-call dance: `terminal/create` → `terminal/wait_for_exit` → `terminal/output` → `terminal/release`. On `session/cancel` or a per-call timeout, meka issues `terminal/kill` and still reads accumulated output. **Exception**: in `read` permission mode meka keeps the local sandboxed shell (Landlock / bwrap / sandbox-exec / Low-Integrity) rather than delegating, so the sandbox isn't bypassed by the client's terminal.
+- **`elicitation.form` / `elicitation.url`**: when an MCP server asks the user for input mid-tool-call, meka issues `elicitation/create` so the prompt renders in the editor. The two modes are advertised independently and checked separately — a server asking for a form when only `url` is advertised is declined rather than sent. Without the capability meka declines every elicitation, which is what it did unconditionally before. Elicitations raised inside a sub-agent forward to the parent session, like permission prompts.
 
 If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behaviour is the same as `meka` in the REPL.
 
@@ -90,6 +91,7 @@ While the turn runs, meka streams `session/update` notifications:
 - `plan` whenever the agent's `todo` tool updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `cancelled` todo status maps to `completed`.
 - `session_info_update` once per session, carrying the title (the first user message preview) so a freshly created or loaded tab gets a label without a `session/list` call.
 - `usage_update` after each turn, carrying `used` (tokens currently in context: all input tiers plus output) and `size` (the model's context window), so clients with a context gauge (e.g. Zed) show how full the window is. Emitted only once both values are known.
+- The `session/prompt` *response* additionally carries `usage`: session-cumulative `totalTokens` / `inputTokens` / `outputTokens` / `cachedReadTokens` / `cachedWriteTokens`. This is the running total for the session, not the gauge — `usage_update` answers "how full is the window", `usage` answers "what has this session cost". `thoughtTokens` is omitted because meka doesn't meter reasoning separately from output.
 
 The response carries a final `stopReason`:
 
@@ -140,6 +142,8 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 ## Sub-agents
 
 `spawn_agent` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts, fs delegates, and terminal delegates all forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
+
+ACP has no sub-agent primitive — no nested sessions, no nested tool calls — so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `spawn_agent` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as a `spawn_agent` line in its parent's list, and two writers on one tool call's content would overwrite each other.
 
 ## Known limitations
 

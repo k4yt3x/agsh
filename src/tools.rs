@@ -214,6 +214,32 @@ impl ToolOutput {
     }
 }
 
+tokio::task_local! {
+    /// The provider's `tool_use_id` for the call executing on this task, scoped by
+    /// `Agent::resolve_and_execute_tool` so it covers the approval path as well as the direct one.
+    /// A task-local rather than a [`Tool::execute`] parameter because exactly
+    /// one tool needs it -- `spawn_agent`, to route its sub-agent's activity back into the tool
+    /// call the client is already displaying -- and threading it through every implementor to
+    /// serve one of them is the wrong trade.
+    ///
+    /// Tool dispatch is concurrent but each call gets its own task, so the value is per-call.
+    static CURRENT_TOOL_CALL_ID: String;
+}
+
+/// The `tool_use_id` of the in-flight tool call, or `None` outside one (tests, direct tool
+/// construction). Callers must treat `None` as "no correlation available" rather than guessing.
+pub(crate) fn current_tool_call_id() -> Option<String> {
+    CURRENT_TOOL_CALL_ID.try_with(|id| id.clone()).ok()
+}
+
+/// Scope `id` as the in-flight tool call for the duration of `fut`.
+pub(crate) async fn with_tool_call_id<F, T>(id: String, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CURRENT_TOOL_CALL_ID.scope(id, fut).await
+}
+
 /// A callable tool surfaced to the model. Built-in tools live under `src/tools/`; MCP tools are
 /// wrapped at registration time. Implementors must be safe to invoke concurrently; the dispatch
 /// loop runs all tool calls in a single assistant message in parallel via `join_all`.

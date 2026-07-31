@@ -1242,8 +1242,8 @@ impl Agent {
 
         // Dispatch concurrently. `join_all` preserves input ordering so the i-th output corresponds
         // to the i-th planned call.
-        let futures = planned.iter().map(|(_, name, input)| {
-            self.resolve_and_execute_tool(name.as_str(), input, cancellation.clone())
+        let futures = planned.iter().map(|(id, name, input)| {
+            self.resolve_and_execute_tool(id.as_str(), name.as_str(), input, cancellation.clone())
         });
         let outputs = futures::future::join_all(futures).await;
 
@@ -1306,6 +1306,7 @@ impl Agent {
 
     async fn resolve_and_execute_tool(
         &self,
+        tool_call_id: &str,
         name: &str,
         input: &serde_json::Value,
         cancellation: CancellationToken,
@@ -1343,13 +1344,20 @@ impl Agent {
             );
         }
 
-        if permission == crate::permission::Permission::Ask {
-            return self
-                .execute_with_approval(&*tool, name, input, cancellation)
-                .await;
-        }
+        // Scope the id across both dispatch paths, so a tool that has to correlate itself with the
+        // client's view of this call -- `spawn_agent`, routing its sub-agent's activity back into
+        // the tool call already on screen -- can read it without every other tool's signature
+        // growing a parameter it ignores.
+        crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
+            if permission == crate::permission::Permission::Ask {
+                return self
+                    .execute_with_approval(&*tool, name, input, cancellation)
+                    .await;
+            }
 
-        Self::run_tool(&*tool, input, cancellation, &self.frontend).await
+            Self::run_tool(&*tool, input, cancellation, &self.frontend).await
+        })
+        .await
     }
 
     async fn execute_with_approval(

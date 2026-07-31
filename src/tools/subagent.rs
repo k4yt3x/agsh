@@ -426,10 +426,13 @@ impl Tool for SpawnAgentTool {
         let augmented_prompt = format!("{}\n{}", environment_context, task);
 
         // Wrap so permission prompts surface in the parent's UI while emits stay silent (sub-agent
-        // output flows back via the spawn_agent tool result, not as live notifications).
+        // output flows back via the spawn_agent tool result, not as live notifications). The one
+        // exception is the sub-agent's tool calls, which are rolled up into this `spawn_agent`
+        // call's own display so a long run isn't an opaque spinner -- hence the tool-call id.
         let sub_frontend: Arc<dyn crate::frontend::Frontend> =
             Arc::new(crate::frontend::PermissionForwardingFrontend::new(
                 Arc::clone(&self.tool_builder_params.parent_frontend),
+                crate::tools::current_tool_call_id(),
             ));
 
         let sub_agent = Agent::new_subagent(

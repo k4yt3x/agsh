@@ -161,9 +161,11 @@ pub async fn dispatch(params: ProgressNotificationParam) {
 ///
 /// Returns the first match (HashMap iteration order is arbitrary). In a multi-session ACP process
 /// where two sessions race calls to the same server, an elicitation arriving during both calls
-/// would route to whichever entry the scan picks, but each session's `AcpFrontend` resolves
-/// elicitation identically (auto-decline today), so the choice is observable only when a future
-/// per-session form-prompt path lands.
+/// routes to whichever entry the scan picks. That choice used to be unobservable because every
+/// frontend auto-declined; now that `AcpFrontend` issues a real `elicitation/create` on its own
+/// connection, a mis-pick surfaces the prompt in the wrong session's editor. Narrowing it needs
+/// protocol-level help: MCP's elicitation is a server-initiated request with no link back to the
+/// tool call that provoked it, so there is nothing here to correlate on.
 pub(crate) fn find_frontend_for_server(server_name: &str) -> Option<Arc<dyn Frontend>> {
     registry()
         .entries
