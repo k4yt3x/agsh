@@ -125,6 +125,35 @@ pub struct SessionManager {
     /// Resolved path to the on-disk database (or `:memory:`). Exposed via [`Self::database_path`]
     /// so the REPL can open a second connection for persistent input history.
     database_path: PathBuf,
+    /// Set only for an in-memory database, whose lock dir is a fresh temp directory nothing else
+    /// would ever clean up. Held behind an `Arc` so the removal happens when the *last* clone of
+    /// this manager drops, not the first: `SessionManager` is cloned into sub-agents and tool
+    /// builders, and any of those may still be locking sessions.
+    _ephemeral_lock_dir: Option<Arc<EphemeralLockDir>>,
+}
+
+/// Removes an in-memory database's temp lock directory on drop.
+///
+/// On-disk databases keep a `locks/` directory beside the database file, which must outlive the
+/// process; in-memory ones get a per-`open()` temp directory instead, so that concurrent tests
+/// can't sweep each other's lock files through [`SessionManager::prune_orphan_lock_files`]. That
+/// isolation is worth keeping, but without this guard each `open()` left an empty directory in
+/// the system temp dir forever.
+struct EphemeralLockDir(PathBuf);
+
+impl Drop for EphemeralLockDir {
+    fn drop(&mut self) {
+        // Any `.lock` files still inside belong to this manager's own sessions; a `SessionLock`
+        // that outlives the manager keeps working, because unlinking an open file on Unix doesn't
+        // invalidate the descriptor the `flock` is held on.
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            tracing::debug!(
+                "failed to remove ephemeral lock dir '{}': {}",
+                self.0.display(),
+                error,
+            );
+        }
+    }
 }
 
 /// RAII handle for an exclusive per-session OS file lock. Holding this value keeps the underlying
@@ -316,6 +345,7 @@ impl SessionManager {
 
         let manager = Self {
             connection: Arc::new(connection),
+            _ephemeral_lock_dir: is_in_memory.then(|| Arc::new(EphemeralLockDir(lock_dir.clone()))),
             lock_dir,
             database_path,
         };
@@ -2541,6 +2571,49 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    /// Regression: every in-memory `open()` mints a temp lock dir, and nothing used to remove it,
+    /// so a few hundred `cargo test` runs left thousands of stray directories in the system temp
+    /// dir.
+    #[tokio::test]
+    async fn in_memory_lock_dir_is_removed_when_the_last_clone_drops() {
+        let manager = test_manager().await;
+        let lock_dir = manager.lock_dir.clone();
+        assert!(lock_dir.exists(), "open() should have created the lock dir");
+
+        // A clone still holding it must keep the directory alive: sub-agents and tool builders
+        // clone the manager, and a lock taken through one of them has to keep working.
+        let clone = manager.clone();
+        drop(manager);
+        assert!(
+            lock_dir.exists(),
+            "the dir must outlive the first clone to drop"
+        );
+
+        drop(clone);
+        assert!(
+            !lock_dir.exists(),
+            "the last clone dropping should remove '{}'",
+            lock_dir.display()
+        );
+    }
+
+    /// The on-disk counterpart must survive: its `locks/` directory lives beside the database and
+    /// outlives the process.
+    #[tokio::test]
+    async fn on_disk_lock_dir_survives_the_manager() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("meka.db");
+        let manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("open on-disk database");
+        let lock_dir = manager.lock_dir.clone();
+        drop(manager);
+        assert!(
+            lock_dir.exists(),
+            "an on-disk lock dir must not be swept away with the manager"
+        );
     }
 
     #[tokio::test]
