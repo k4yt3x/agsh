@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `POST /v1/sessions/{id}/turn` accepts inline `images`, so a remote client can send a picture.
+- `GET /v1/info` reports `vision` so clients can check before attaching an image.
+- `GET /v1/sessions/{id}` reports `turn_in_flight` so a reconnecting client needn't guess.
+- `POST /v1/sessions` accepts `supports_permission_prompts`; false denies gated tools at once.
+- MCP `tools/call` now carries `meka/sessionId` in `_meta` so servers can scope session state.
+
+### Fixed
+
+- ACP clients now see images a tool looked at, instead of an `[image]` placeholder.
+- An MCP server that fails its initial connect is now retried in the background until it comes up.
+- MCP `tools/call` now actually sends `meka/toolUseId`; it was never populated at the call site.
+
 ## [0.36.0] - 2026-08-01
 
 ### Added

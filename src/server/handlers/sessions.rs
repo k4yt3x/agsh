@@ -97,13 +97,12 @@ pub struct CreateSessionRequest {
     /// Permission level the session starts in. Defaults to the server's configured default
     /// from `[permissions].default` (typically `read`). Must be in the enabled set.
     pub permission: Option<String>,
-    /// Per-session capability flags. Currently only `supports_reasoning_stream` is honoured.
-    /// See the HTTP API docs § "Capabilities".
+    /// Per-session capability flags. See the HTTP API docs § "Capabilities".
     #[serde(default)]
     pub capabilities: CapabilitiesBody,
 }
 
-#[derive(Debug, Default, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesBody {
     /// When `true`, the SSE stream includes `thinking.delta` events for extended-thinking
@@ -111,12 +110,32 @@ pub struct CapabilitiesBody {
     /// reasoning inline.
     #[serde(default)]
     pub supports_reasoning_stream: bool,
+    /// When `false`, mid-turn permission requests are denied immediately with a notice instead of
+    /// parking on the SSE channel. Streaming clients with no approval interface set this. Default
+    /// `true`, which is the historical behaviour.
+    #[serde(default = "default_true")]
+    pub supports_permission_prompts: bool,
+}
+
+/// `#[serde(default)]` on a `bool` yields `false`; this is for the fields that default to `true`.
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CapabilitiesBody {
+    fn default() -> Self {
+        Self {
+            supports_reasoning_stream: false,
+            supports_permission_prompts: true,
+        }
+    }
 }
 
 impl From<CapabilitiesBody> for SessionCapabilities {
     fn from(body: CapabilitiesBody) -> Self {
         Self {
             supports_reasoning_stream: body.supports_reasoning_stream,
+            supports_permission_prompts: body.supports_permission_prompts,
         }
     }
 }
@@ -143,9 +162,19 @@ pub struct SessionResponse {
     pub cwd: Option<std::path::PathBuf>,
     pub permission: String,
     pub title: String,
-    /// Per-session capability flags declared at create time (or re-attach). Surfaces
-    /// `supports_reasoning_stream` so clients can confirm their session's wire-shape settings.
+    /// Per-session capability flags declared at create time (or re-attach), echoed back so clients
+    /// can confirm the settings their session actually ended up with.
     pub capabilities: SessionCapabilities,
+    /// Whether a turn is running on this session right now.
+    ///
+    /// Exists so a client whose SSE stream dropped mid-turn can tell "my turn is still running"
+    /// from "my turn died" without submitting a speculative turn and reading the 409. A dropped
+    /// stream does not cancel the turn: the spawned task keeps the runtime lock and dropping the
+    /// `JoinHandle` detaches rather than aborts, so the work completes and resubmitting would
+    /// duplicate a reply the user is about to receive anyway.
+    ///
+    /// Always `false` for a GC-evicted session, since eviction requires an idle session.
+    pub turn_in_flight: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -392,6 +421,7 @@ pub async fn create_session(
             permission: permission.to_string(),
             title,
             capabilities,
+            turn_in_flight: false,
         }),
     ))
 }
@@ -462,6 +492,9 @@ pub async fn list_sessions(
             let capabilities = live
                 .map(|entry| entry.capabilities)
                 .unwrap_or_else(|| capabilities_from_row(row.capabilities_json.as_deref()));
+            let turn_in_flight = live.is_some_and(|entry| {
+                entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
+            });
             SessionResponse {
                 id: row.id,
                 created_at,
@@ -471,6 +504,7 @@ pub async fn list_sessions(
                 permission,
                 title: row.preview,
                 capabilities,
+                turn_in_flight,
             }
         })
         .collect();
@@ -541,6 +575,7 @@ pub async fn get_session(
             permission: entry.permission.get().to_string(),
             title,
             capabilities: entry.capabilities,
+            turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
         }));
     }
     let summary = state
@@ -568,6 +603,7 @@ pub async fn get_session(
         permission: summary.permission.unwrap_or_default(),
         title: summary.preview,
         capabilities,
+        turn_in_flight: false,
     }))
 }
 
@@ -736,6 +772,7 @@ pub async fn patch_session(
         permission: entry.permission.get().to_string(),
         title,
         capabilities: entry.capabilities,
+        turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
     }))
 }
 

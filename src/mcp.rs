@@ -99,6 +99,31 @@ where
     SESSION_FRONTEND.scope(frontend, fut).await
 }
 
+tokio::task_local! {
+    /// Session the tool call executing on this task belongs to, scoped by
+    /// `Agent::resolve_and_execute_tool`. Read by [`crate::mcp::handler::McpToolAdapter`] so
+    /// `tools/call` can carry `meka/sessionId` in `_meta`, letting a server scope per-session state
+    /// (a cache, a workspace, an audit trail) to the conversation that called it.
+    ///
+    /// A sub-agent runs under its own `Agent` with its own child session id, so a call it makes
+    /// reports the child, which is the correct attribution.
+    static SESSION_ID: uuid::Uuid;
+}
+
+/// The session id for the in-flight tool call, or `None` outside one. `None` is legitimate: MCP
+/// callbacks fire during connection-time handshakes, before any session exists.
+pub(crate) fn current_session_id() -> Option<uuid::Uuid> {
+    SESSION_ID.try_with(|id| *id).ok()
+}
+
+/// Scope `session_id` as the session owning the tool call for the duration of `fut`.
+pub async fn with_session_id<F, T>(session_id: uuid::Uuid, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION_ID.scope(session_id, fut).await
+}
+
 pub struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
     /// Global fallback permission from `[mcp].default_permission`. Consulted by

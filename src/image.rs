@@ -186,6 +186,28 @@ pub(crate) fn prepare_image_source(
     })
 }
 
+/// Decode a base64 image attachment supplied by a *client* into an [`ImageSource`]: base64-decode
+/// the payload, classify the format by the declared MIME type falling back to the magic bytes, then
+/// enforce the size cap and convert unsupported formats to PNG. Returns a human-readable message on
+/// failure, suitable for surfacing back to the caller as a validation error.
+///
+/// The magic-byte fallback matters because the declared type is attacker-or-typo controlled: a
+/// client that labels a PNG `application/octet-stream` (or `image/png` for something that isn't)
+/// still gets classified off what the bytes actually are.
+///
+/// Shared by the ACP `session/prompt` handler and the HTTP `POST /turn` handler so both frontends
+/// enforce identical limits on client-supplied images.
+pub(crate) fn decode_base64_image(data: &str, declared_mime: &str) -> Result<ImageSource, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|error| format!("base64 decode failed: {}", error))?;
+    let handling = match classify_content_type(declared_mime) {
+        ImageHandling::Unsupported => classify_bytes(&bytes),
+        handling => handling,
+    };
+    prepare_image_source(handling, &bytes)
+}
+
 /// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
 /// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
 /// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.

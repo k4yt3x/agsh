@@ -1478,6 +1478,241 @@ fn malformed_turn_body_missing_message_returns_422() {
     assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
 }
 
+/// A 1x1 transparent PNG, base64-encoded. Hardcoded rather than synthesized because the `image`
+/// crate is a dependency of the binary, not of the integration-test target.
+const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// Create a session and return its id. The turn-image tests all need one.
+fn create_session_id(harness: &ServeTestHarness) -> String {
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string()
+}
+
+/// The whole point of inline image attachments: a client on another host has no filesystem in
+/// common with the agent, so it can't just name a path. The scripted mock ignores the request
+/// body, so this asserts the validate-and-thread path accepts the attachment end to end.
+#[test]
+fn blocking_turn_accepts_inline_image_attachment() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({
+            "message": "what is in this image?",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["final_text"], "hello from agent");
+}
+
+/// An image with no text is a complete request against prior context ("look at this"), so the
+/// empty-`message` check must not reject it.
+#[test]
+fn turn_with_only_an_image_and_no_text_is_accepted() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({
+            "message": "",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+}
+
+/// Neither text nor images is still an empty turn.
+#[test]
+fn turn_with_neither_message_nor_images_returns_422() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "  ", "images": [], "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+}
+
+#[test]
+fn turn_with_undecodable_image_returns_422() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({
+            "message": "look",
+            "images": [{"media_type": "image/png", "data": "!!!not-base64!!!"}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+    assert!(
+        body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("images[0]"),
+        "{}",
+        body["detail"]
+    );
+}
+
+/// A reconnecting client needs to tell "my turn is still running" from "my turn died" without
+/// submitting a speculative turn and reading the 409. An idle session reports false.
+#[test]
+fn get_session_reports_turn_in_flight() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let idle = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .send()
+        .expect("send");
+    assert_eq!(idle.status(), 200);
+    let body: serde_json::Value = idle.json().expect("parse");
+    assert_eq!(body["turn_in_flight"], false);
+}
+
+/// And it reports true while a turn actually is running. The scripted 2s sleep holds the turn
+/// open long enough to observe it.
+#[test]
+fn get_session_reports_turn_in_flight_during_a_turn() {
+    let script = serde_json::json!([[
+        { "kind": "sleep", "ms": 2000 },
+        { "kind": "text", "text": "done" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = create_session_id(&harness);
+
+    let turn_url = format!("{}/v1/sessions/{}/turn", harness.base_url, id);
+    let token = harness.token.clone();
+    let worker = std::thread::spawn(move || {
+        reqwest::blocking::Client::new()
+            .post(&turn_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "hi", "stream": false}))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .expect("turn send")
+            .status()
+    });
+
+    // Poll rather than sleeping a fixed interval: on a loaded machine the turn may take a moment
+    // to reach the provider, and a fixed sleep would read `false` and flake. The scripted 2s sleep
+    // holds the turn open for the whole poll window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1800);
+    let mut seen_in_flight = false;
+    while std::time::Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if body["turn_in_flight"] == true {
+            seen_in_flight = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        seen_in_flight,
+        "a running turn must be visible without having to trip the 409"
+    );
+
+    assert_eq!(worker.join().expect("worker panicked"), 200);
+
+    let after: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(after["turn_in_flight"], false);
+}
+
+/// A streaming client that declared it has no approval interface must get an immediate deny, not
+/// a 60-second park. The turn completes well inside the timeout if the flag is honoured.
+#[test]
+fn streaming_session_without_prompt_support_does_not_park_on_permission() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "kind": "tool_use_end", "input": {"path": "/tmp/meka-test-noprompt.txt", "content": "x"} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "denied then" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "ask",
+            "capabilities": {"supports_permission_prompts": false},
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let body: serde_json::Value = create.json().expect("parse");
+    assert_eq!(body["capabilities"]["supports_permission_prompts"], false);
+    let id = body["id"].as_str().expect("id").to_string();
+
+    let started = std::time::Instant::now();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it", "stream": true}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body = response.text().expect("text");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "turn took {:?}; it parked on the permission channel instead of denying",
+        elapsed
+    );
+    assert!(
+        !body.contains("permission_required"),
+        "no permission_required event should be emitted; body was:\n{}",
+        body
+    );
+}
+
+/// `vision` on `/v1/info` is how a client discovers whether attaching an image is worth the
+/// base64 payload, instead of finding out from a 422.
+#[test]
+fn info_reports_the_vision_capability() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["vision"], true);
+}
+
 /// Two concurrent turns on two different sessions complete in roughly the same wall time
 /// as a single turn; i.e. the agent loop doesn't serialize across sessions.
 #[test]

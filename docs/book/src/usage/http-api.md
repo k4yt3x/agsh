@@ -110,7 +110,8 @@ When creating a session, specify the working directory and optionally a permissi
   "cwd": "/home/user/project",
   "permission": "write",
   "capabilities": {
-    "supports_reasoning_stream": false
+    "supports_reasoning_stream": false,
+    "supports_permission_prompts": true
   }
 }
 ```
@@ -126,6 +127,27 @@ If `cwd` is omitted, it defaults to the server process's current working directo
 
 Sessions persist server-side until explicitly deleted or evicted by the idle timeout GC (see [Session lifecycle](#session-lifecycle)).
 
+#### Capabilities
+
+| Capability | Default | Meaning |
+|------------|---------|---------|
+| `supports_reasoning_stream` | `false` | Include `thinking.delta` events in the SSE stream |
+| `supports_permission_prompts` | `true` | The client can answer a mid-turn `permission_required` event |
+
+Set `supports_permission_prompts: false` if you stream but have no interface to show an approval
+prompt on, which is the normal case for a service-to-service client streaming for liveness. Gated
+tools are then denied immediately with an explanatory `notice`, the same as blocking mode. Leaving it
+`true` means every gated call parks for 60 seconds and then denies anyway, which is hard to tell
+apart from a hang. Better still, create the session with `permission: "write"` so nothing is gated.
+
+#### Detecting an in-flight turn
+
+Session responses carry `turn_in_flight`, a boolean saying whether a turn is running right now. It
+exists so a client whose SSE stream dropped can tell "my turn is still running" from "my turn died"
+without submitting a speculative turn and reading the `409`. A dropped stream does not cancel the
+turn; the work continues server-side and resubmitting would duplicate a reply the user is about to
+receive. Poll `GET /v1/sessions/{id}` and wait for it to go `false` rather than retrying blind.
+
 ### Turns
 
 A turn is one round-trip: you send a user message, the agent processes it (potentially calling tools in a loop), and returns a result. Turns are ephemeral: they're not stored as their own resource, but the messages they produce are persisted in the session's conversation history.
@@ -137,13 +159,40 @@ POST   /v1/sessions/{id}/cancel   Cancel an in-flight turn
 
 **One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently.
 
-The turn request body accepts three fields:
+The turn request body accepts four fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `message` | string | *(required)* | The user message |
+| `message` | string | *(required)* | The user message. May be empty when `images` is non-empty |
+| `images` | array | `[]` | Image attachments; see [Image attachments](#image-attachments) |
 | `stream` | bool | `false` | `false` → single JSON response; `true` → SSE stream |
 | `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` in the REPL) |
+
+### Image attachments
+
+Each entry in `images` is `{"media_type": "...", "data": "<base64>"}`. Images are inlined rather
+than referenced by path because the API is a network surface: a client on another host shares no
+filesystem with the agent, so it can't name a file for the agent to read.
+
+```bash
+curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"message\": \"what does this diagram show?\",
+       \"images\": [{\"media_type\": \"image/png\", \"data\": \"$(base64 -w0 diagram.png)\"}]}"
+```
+
+- **Requires vision.** Attaching an image to a profile with `vision = false` returns `422`. Check
+  `vision` on [`GET /v1/info`](#discovery-endpoints) before sending one.
+- **`media_type` is a hint.** If it doesn't name a supported format, the payload's magic bytes are
+  used instead, so `application/octet-stream` still works for a real image.
+- **Formats.** PNG, JPEG, GIF, WebP, and BMP pass through; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS,
+  and Farbfeld are converted to PNG. Anything else is a `422`.
+- **Size.** Each image is capped at 3.75 MB decoded (~5 MB of base64). Note this interacts with
+  `max_body_bytes`: the 10 MiB default comfortably fits one image, but a multi-image turn may need
+  it raised.
+- **Errors name the offender.** A bad attachment returns `422` with a detail like
+  `` `images[1]` is invalid: unsupported image format ``.
 
 ### Messages
 
@@ -395,7 +444,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if provider, DB, and MCP servers are healthy. Returns `status`, `session_db`, `provider_configured`, and `mcp_servers_healthy` (boolean, no server names). |
-| `GET /v1/info` | Any read scope | Server version, model, capabilities |
+| `GET /v1/info` | Any read scope | Server version, model, capabilities. `vision` reports whether `POST /turn` accepts [image attachments](#image-attachments) |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
 | `GET /v1/openapi.json` | None | OpenAPI 3 spec |

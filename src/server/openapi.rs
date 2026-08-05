@@ -49,6 +49,7 @@ use crate::server::{handlers, state::ServerState};
         crate::server::handlers::sessions::ListSessionsResponse,
         crate::server::handlers::sessions::PatchSessionRequest,
         crate::server::handlers::turn::TurnRequest,
+        crate::server::handlers::turn::ImageInput,
         crate::server::handlers::turn::TurnOptions,
         crate::server::handlers::turn::TurnResponse,
         crate::server::handlers::turn::ToolCallView,

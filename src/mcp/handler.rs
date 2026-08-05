@@ -345,6 +345,15 @@ impl McpToolAdapter {
             meta.0
                 .insert("meka/toolUseId".to_string(), serde_json::json!(id));
         }
+        // Lets a server scope per-session state (a cache, a workspace, a connection pool, an audit
+        // trail) to the conversation the call came from. `_meta` is the spec's extension point and
+        // already carries `meka/toolUseId`, so this adds no new wire contract.
+        if let Some(session_id) = crate::mcp::current_session_id() {
+            meta.0.insert(
+                "meka/sessionId".to_string(),
+                serde_json::json!(session_id.to_string()),
+            );
+        }
         params.meta = Some(meta);
 
         // Same error surface as an actually-closed transport. The upstream retry logic already
@@ -448,9 +457,13 @@ impl Tool for McpToolAdapter {
 
         let is_timeout = |error: &ServiceError| matches!(error, ServiceError::Cancelled { reason: Some(reason) } if reason.starts_with("timed out"));
 
+        // Correlates this MCP call with the provider's tool-use entry, for `meka/toolUseId` in
+        // `_meta` and for the progress registry. `None` outside an agent-driven dispatch.
+        let tool_use_id = crate::tools::current_tool_call_id();
+
         // First attempt. On TransportClosed, reconnect and retry once.
         let result = match self
-            .call_tool_once(params.clone(), cancellation.clone(), None)
+            .call_tool_once(params.clone(), cancellation.clone(), tool_use_id.clone())
             .await
         {
             Ok(result) => result,
@@ -468,7 +481,7 @@ impl Tool for McpToolAdapter {
             }
             Err(ServiceError::TransportClosed) => {
                 self.entry.reconnect().await?;
-                match self.call_tool_once(params, cancellation, None).await {
+                match self.call_tool_once(params, cancellation, tool_use_id).await {
                     Ok(result) => result,
                     Err(ServiceError::Cancelled { reason })
                         if reason.as_deref() == Some("user interrupt") =>

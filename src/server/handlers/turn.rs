@@ -50,12 +50,30 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct TurnRequest {
     pub message: String,
+    /// Image attachments for this turn. A sibling of `message` rather than a member of
+    /// [`TurnOptions`] because these are user content, not a per-turn knob. Requires the active
+    /// provider profile to have vision enabled; see [`decode_turn_images`].
+    #[serde(default)]
+    pub images: Vec<ImageInput>,
     /// `false` (default) → blocking JSON response. `true` → SSE.
     #[serde(default)]
     pub stream: bool,
     /// Per-turn knobs. See [`TurnOptions`]. Omitting the field is the same as `{}`.
     #[serde(default)]
     pub options: TurnOptions,
+}
+
+/// One inline image attachment. Base64 rather than a path or URL because the API is a network
+/// surface: `[serve].bind` may be non-loopback, so the caller generally shares no filesystem with
+/// the agent and cannot name a file for it to read.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageInput {
+    /// Declared MIME type, e.g. `image/png`. Used as the primary format hint; the payload's magic
+    /// bytes win if this doesn't name a supported format.
+    pub media_type: String,
+    /// Base64-encoded image bytes (standard alphabet, padding required).
+    pub data: String,
 }
 
 /// Per-turn options. `#[serde(deny_unknown_fields)]` here (and only here) so a typo in
@@ -260,14 +278,17 @@ pub async fn submit_turn(
         }
     };
 
-    // Reject empty `message` strings with 422 before hitting the provider.
-    if body.message.trim().is_empty() {
+    // Reject a turn with nothing in it before hitting the provider. An image with no text is
+    // allowed: against prior context "look at this" is a complete request, and ACP permits the
+    // same (`run_prompt_turn` has no empty-text check).
+    if body.message.trim().is_empty() && body.images.is_empty() {
         return Err(ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "`message` must be a non-empty string",
+            "`message` must be a non-empty string, or at least one image must be attached",
         ));
     }
+    let images = decode_turn_images(&body.images, state.shared.config.vision)?;
     let message = if let Some(skill_name) = body.options.skill.as_deref() {
         let snapshot = state.shared.skills.current().await;
         let skill = snapshot
@@ -297,9 +318,10 @@ pub async fn submit_turn(
 
     if body.stream {
         // SSE responses are streamed live and aren't a single envelope we can cache.
-        run_streaming_turn(state, entry, session_id, message, turn_guard).await
+        run_streaming_turn(state, entry, session_id, message, images, turn_guard).await
     } else {
-        let response_result = run_blocking_turn(entry, session_id, message, turn_guard).await;
+        let response_result =
+            run_blocking_turn(entry, session_id, message, images, turn_guard).await;
         // Cache success (2xx) and client-error (4xx) envelopes. Skip server-side errors
         // (5xx) and TurnInFlight: a transient provider 502 or internal 500 would otherwise
         // be replayed for the full 24h TTL, defeating the point of idempotent retries.
@@ -336,6 +358,52 @@ pub async fn submit_turn(
         }
         response_result.map(IntoResponse::into_response)
     }
+}
+
+/// Validate and normalize a turn's image attachments through the shared client-image pipeline
+/// ([`crate::image::decode_base64_image`]), so an HTTP attachment gets exactly the size cap and
+/// format conversion an ACP `image` content block does.
+///
+/// `vision` is the active profile's resolved `[providers.<name>].vision` flag. Attachments are
+/// refused outright when it is off, mirroring ACP, which rejects `image` content blocks with
+/// `InvalidParams` for a text-only profile. This gates on configuration only: whether the named
+/// model *actually* understands images is left to the provider to complain about, which is the
+/// stance documented for ACP.
+///
+/// Every failure is a 422: these are all malformed input, not server faults.
+///
+/// The `allow` matches the rest of this module's validation helpers: `ProblemDetail` is a large
+/// struct by design (RFC 9457 members plus an extensions map) and boxing it here alone would make
+/// the error type inconsistent with every other handler.
+#[allow(clippy::result_large_err)]
+fn decode_turn_images(
+    images: &[ImageInput],
+    vision: bool,
+) -> Result<Vec<crate::provider::ImageSource>, ProblemDetail> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !vision {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "image attachments require a provider profile with vision enabled; set `vision = \
+             true` under `[providers.<name>]` or omit `images`",
+        ));
+    }
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            crate::image::decode_base64_image(&image.data, &image.media_type).map_err(|message| {
+                ProblemDetail::new(
+                    ErrorKind::InvalidBody,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("`images[{}]` is invalid: {}", index, message),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Extract the `Idempotency-Key` header, validating that it isn't empty and stays within
@@ -418,6 +486,7 @@ async fn run_blocking_turn(
     entry: crate::server::state::SessionEntry,
     session_id: Uuid,
     message: String,
+    images: Vec<crate::provider::ImageSource>,
     _turn_guard: TurnGuard,
 ) -> Result<Json<TurnResponse>, ProblemDetail> {
     let mut runtime = entry.runtime.try_lock().map_err(|_| {
@@ -453,7 +522,7 @@ async fn run_blocking_turn(
             &mut session_uuid_opt,
             &mut runtime_inner.messages,
             message,
-            Vec::new(),
+            images,
             cancellation,
         )
         .await;
@@ -481,6 +550,7 @@ async fn run_streaming_turn(
     entry: crate::server::state::SessionEntry,
     session_id: Uuid,
     message: String,
+    images: Vec<crate::provider::ImageSource>,
     turn_guard: TurnGuard,
 ) -> Result<Response, ProblemDetail> {
     // Acquire the runtime mutex up front via `try_lock_owned`. The `OwnedMutexGuard` moves
@@ -530,7 +600,7 @@ async fn run_streaming_turn(
                 &mut session_uuid_opt,
                 &mut runtime_inner.messages,
                 message,
-                Vec::new(),
+                images,
                 cancel_for_task,
             )
             .await;
@@ -1146,5 +1216,96 @@ mod tests {
         );
         assert_eq!(response.refusal_text, None);
         assert_eq!(response.final_text, "hello");
+    }
+
+    fn png_input() -> ImageInput {
+        use base64::Engine as _;
+        let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode png");
+        ImageInput {
+            media_type: "image/png".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }
+    }
+
+    #[test]
+    fn decode_turn_images_accepts_a_png() {
+        let decoded = decode_turn_images(&[png_input()], true).expect("should decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].media_type, "image/png");
+        assert_eq!(decoded[0].source_type, "base64");
+        assert!(!decoded[0].data.is_empty());
+    }
+
+    #[test]
+    fn decode_turn_images_is_a_noop_without_attachments() {
+        // The vision flag is irrelevant when nothing is attached: a text-only profile must still
+        // be able to take ordinary turns.
+        assert!(
+            decode_turn_images(&[], false)
+                .expect("no images")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn decode_turn_images_rejects_attachments_when_vision_is_off() {
+        let problem = decode_turn_images(&[png_input()], false).expect_err("should reject");
+        assert_eq!(problem.status, 422);
+        assert!(problem.detail.unwrap_or_default().contains("vision"));
+    }
+
+    #[test]
+    fn decode_turn_images_rejects_invalid_base64() {
+        let bad = ImageInput {
+            media_type: "image/png".to_string(),
+            data: "!!!not-base64!!!".to_string(),
+        };
+        let problem = decode_turn_images(&[bad], true).expect_err("should reject");
+        assert_eq!(problem.status, 422);
+        assert!(problem.detail.unwrap_or_default().contains("images[0]"));
+    }
+
+    /// The offending index is named so a client sending several attachments knows which one to
+    /// fix, rather than being told only that "an image" was bad.
+    #[test]
+    fn decode_turn_images_names_the_failing_index() {
+        use base64::Engine as _;
+        let garbage = ImageInput {
+            media_type: "application/octet-stream".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(b"not an image"),
+        };
+        let problem = decode_turn_images(&[png_input(), garbage], true).expect_err("should reject");
+        assert_eq!(problem.status, 422);
+        let detail = problem.detail.unwrap_or_default();
+        assert!(detail.contains("images[1]"), "{}", detail);
+    }
+
+    /// A declared MIME type that names no supported format still decodes when the payload's magic
+    /// bytes do, so a client that labels its upload `application/octet-stream` isn't stuck.
+    #[test]
+    fn decode_turn_images_falls_back_to_magic_bytes() {
+        let mut input = png_input();
+        input.media_type = "application/octet-stream".to_string();
+        let decoded = decode_turn_images(&[input], true).expect("should decode via magic bytes");
+        assert_eq!(decoded[0].media_type, "image/png");
+    }
+
+    #[test]
+    fn decode_turn_images_rejects_oversized_payloads() {
+        use base64::Engine as _;
+        let raw = vec![0u8; crate::image::MAX_IMAGE_RAW_BYTES + 1];
+        let oversized = ImageInput {
+            media_type: "image/png".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&raw),
+        };
+        let problem = decode_turn_images(&[oversized], true).expect_err("should reject");
+        assert_eq!(problem.status, 422);
     }
 }

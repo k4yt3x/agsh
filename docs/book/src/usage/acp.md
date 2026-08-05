@@ -82,6 +82,10 @@ A `session/prompt` carries a `prompt` array of `ContentBlock`s. meka accepts:
 
 `audio` blocks (and `image` when `vision = false`) produce `InvalidParams`.
 
+Images travel in the other direction too: when a tool looks at one (`read_file` on an image file,
+`render_image`, `fetch_url` on an image URL), the picture is forwarded on that tool call as an
+`image` content block rather than a placeholder, so the client renders what the model was shown.
+
 While the turn runs, meka streams `session/update` notifications:
 
 - `agent_message_chunk` for each piece of assistant text.

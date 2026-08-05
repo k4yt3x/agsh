@@ -1348,7 +1348,12 @@ impl Agent {
         // client's view of this call -- `spawn_agent`, routing its sub-agent's activity back into
         // the tool call already on screen -- can read it without every other tool's signature
         // growing a parameter it ignores.
-        crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
+        //
+        // The session id rides alongside for the same reason, so an MCP `tools/call` can name the
+        // conversation it came from. `run_turn` populates `shared_session_id` before the tool loop,
+        // so this is only `None` on paths that never established a session.
+        let session_id = *self.shared_session_id.read().await;
+        let dispatch = crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
             if permission == crate::permission::Permission::Ask {
                 return self
                     .execute_with_approval(&*tool, name, input, cancellation)
@@ -1356,8 +1361,11 @@ impl Agent {
             }
 
             Self::run_tool(&*tool, input, cancellation, &self.frontend).await
-        })
-        .await
+        });
+        match session_id {
+            Some(id) => crate::mcp::with_session_id(id, dispatch).await,
+            None => dispatch.await,
+        }
     }
 
     async fn execute_with_approval(

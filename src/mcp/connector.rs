@@ -1,8 +1,11 @@
 //! Background connector that drives `Pending` MCP server entries through initial handshake + tool
 //! discovery + registration. Split into a stdio stream and an HTTP stream, each bounded by its own
 //! concurrency cap.
+//!
+//! Entries that fail their initial connect are retried here in the background until they come up;
+//! see [`retry_until_connected`].
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use super::{
     MAX_MCP_DESCRIPTION_LENGTH, McpClientContext, McpClientManager, McpRunningService,
@@ -19,12 +22,23 @@ use crate::{
     session::TokenStore,
 };
 
+/// First delay after a failed initial connect. Doubles per attempt up to [`MAX_RETRY_BACKOFF`].
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Ceiling on the retry delay. A server that is down for a long time is polled every five minutes
+/// rather than abandoned, because the alternative is a meka that stays broken until someone
+/// restarts it.
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(300);
+
 /// Drive the actual connect work for every `Pending` entry, split into a stdio stream and an HTTP
 /// stream, each bounded by its own concurrency cap. Runs in a spawned task so
 /// [`super::McpClientManager::start_connector`] can return immediately and the REPL paints without
 /// waiting.
 ///
-/// When both streams drain, flips the `settled` watch so the turn gate can short-circuit.
+/// When both streams drain, flips the `settled` watch so the turn gate can short-circuit, then
+/// hands any entry that failed to [`retry_until_connected`]. Settling first is deliberate: the
+/// grace wait in `Agent::await_mcp_ready` must not be held open by a server that is going to take
+/// minutes to appear.
 pub(super) async fn run_connector(
     pending: Vec<Arc<ServerEntry>>,
     manager: Arc<McpClientManager>,
@@ -39,6 +53,10 @@ pub(super) async fn run_connector(
         return;
     }
 
+    // Kept so the post-settle sweep below can find whichever entries ended up `Failed`; the
+    // partition consumes `pending`. `Arc` clones, so this is a vector of pointers.
+    let all_entries = pending.clone();
+
     let (stdio_entries, http_entries): (Vec<_>, Vec<_>) = pending
         .into_iter()
         .partition(|entry| matches!(entry.config.transport, McpTransport::Stdio));
@@ -47,7 +65,7 @@ pub(super) async fn run_connector(
     let http_limit = runtime.http_concurrency.max(1);
     let timeout = runtime.connect_timeout;
     let stdio_manager = Arc::clone(&manager);
-    let http_manager = manager;
+    let http_manager = Arc::clone(&manager);
 
     let stdio_stream = futures::stream::iter(stdio_entries)
         .map(move |entry| {
@@ -71,6 +89,102 @@ pub(super) async fn run_connector(
 
     tokio::join!(stdio_stream, http_stream);
     let _ = settled.send(true);
+
+    // `Failed` is only ever set by `connect_one`, and only from this function, so once both
+    // streams have drained the failed set is complete and final. Without the retry below nothing
+    // ever transitions out of `Failed`: `require_connected` rejects, `needs_reconnect` ignores any
+    // state but `Connected`, and `meka mcp reconnect` builds a throwaway manager rather than
+    // healing this one. A server that was thirty seconds slow to boot would stay dead for the life
+    // of the process, and under `[mcp].strict` (the default) take every turn down with it.
+    for entry in all_entries {
+        if matches!(entry.state().await, ServerState::Failed { .. }) {
+            tokio::spawn(retry_until_connected(
+                entry,
+                Arc::downgrade(&manager),
+                mcp_default_permission,
+                timeout,
+                INITIAL_RETRY_BACKOFF,
+            ));
+        }
+    }
+}
+
+/// Retry one cold-start failure until it connects, with exponential backoff from `initial_backoff`
+/// to [`MAX_RETRY_BACKOFF`]. Returns once the entry leaves `Failed`.
+///
+/// `initial_backoff` is a parameter rather than a direct read of [`INITIAL_RETRY_BACKOFF`] so tests
+/// can drive the loop in milliseconds; the sole production call site passes the constant.
+///
+/// This goes through [`connect_one`] rather than [`ServerEntry::reconnect`] because the two do
+/// different work: `reconnect` only swaps the transport, which is all a *previously connected*
+/// server needs since its tool adapters already exist and resolve the live peer through
+/// `require_connected` at dispatch time. An entry that failed its initial connect never got as far
+/// as `discover_and_register_tools`, so healing it with `reconnect` would leave a server that
+/// reports `connected` and exposes no tools.
+///
+/// `connect_one` re-registers tools through `McpClientManager::update_server_tools`, which fans out
+/// to every attached per-session registry, so sessions created while the server was down pick up
+/// its tools when it recovers.
+///
+/// The manager is held weakly so this loop can't outlive it. `mcp::cli::run_reconnect` builds a
+/// throwaway manager per invocation, and it is reachable from the REPL's `/mcp reconnect` in a
+/// process that keeps running; a strong reference there would leave a task respawning a failing
+/// server every five minutes for a manager nobody is using.
+async fn retry_until_connected(
+    entry: Arc<ServerEntry>,
+    manager: std::sync::Weak<McpClientManager>,
+    mcp_default_permission: Option<Permission>,
+    connect_timeout: Duration,
+    initial_backoff: Duration,
+) {
+    let mut backoff = initial_backoff;
+    loop {
+        tokio::time::sleep(backoff).await;
+
+        // Nothing holds the manager any more, so there is no registry left to heal into.
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+
+        // Cheap pre-check before taking the lock; something else may have healed the entry.
+        if !matches!(entry.state().await, ServerState::Failed { .. }) {
+            return;
+        }
+
+        tracing::debug!(
+            "retrying initial connect to MCP server '{}' after {:?}",
+            entry.server_name(),
+            backoff,
+        );
+
+        // Serialise against `ServerEntry::reconnect`, which takes the same lock, so a tool call
+        // and this loop can't drive two connects into the same entry at once. Re-check under the
+        // lock: the winner of a race leaves the entry `Connected` and the loser must not clobber
+        // it with a second connection.
+        {
+            let _guard = entry.reconnect_lock.lock().await;
+            if !matches!(entry.state().await, ServerState::Failed { .. }) {
+                return;
+            }
+            connect_one(
+                Arc::clone(&entry),
+                manager,
+                mcp_default_permission,
+                connect_timeout,
+            )
+            .await;
+        }
+
+        if !matches!(entry.state().await, ServerState::Failed { .. }) {
+            tracing::info!(
+                "MCP server '{}' recovered after a failed initial connect",
+                entry.server_name(),
+            );
+            return;
+        }
+
+        backoff = std::cmp::min(backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
+    }
 }
 
 /// Connect a single `Pending` server: wrap the existing `connect_server` in a per-server timeout,
@@ -558,5 +672,108 @@ mod tests {
             }
             other => panic!("expected Failed, got: {}", other.label()),
         }
+    }
+
+    /// Build a `Failed` entry whose stdio command is `command`, plus a minimal manager. The
+    /// manager is returned strongly so a test can decide when to drop it.
+    #[cfg(unix)]
+    async fn failed_entry(name: &str, command: &str) -> (Arc<ServerEntry>, Arc<McpClientManager>) {
+        use std::sync::OnceLock;
+        let mut config = bare_server_config(name);
+        config.transport = McpTransport::Stdio;
+        config.command = Some(command.to_string());
+        config.url = None;
+
+        let entry = Arc::new(ServerEntry {
+            server_name: name.to_string(),
+            config,
+            token_store: None,
+            client_context: McpClientContext::new(),
+            state: RwLock::new(ServerState::Failed {
+                error: "initial connect failed".to_string(),
+                at: std::time::Instant::now(),
+            }),
+            reconnect_lock: Mutex::new(()),
+            instructions: OnceLock::new(),
+        });
+        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
+            .await
+            .expect("empty manager");
+        (entry, manager)
+    }
+
+    /// The whole point of the retry: a server that stays down must keep being retried rather than
+    /// being abandoned after some attempt count. `/bin/false` exits immediately, so several
+    /// attempts elapse inside the window and the task must still be looping at the end of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_keeps_going_while_the_server_stays_down() {
+        let (entry, manager) = failed_entry("still-down", "/bin/false").await;
+        let handle = tokio::spawn(retry_until_connected(
+            Arc::clone(&entry),
+            Arc::downgrade(&manager),
+            None,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            !handle.is_finished(),
+            "retry loop gave up on a server that is still down"
+        );
+        assert!(matches!(entry.state().await, ServerState::Failed { .. }));
+        handle.abort();
+    }
+
+    /// The retry must not outlive its manager. `mcp::cli::run_reconnect` builds a throwaway
+    /// manager per invocation and is reachable from the REPL's `/mcp reconnect`, so a strong
+    /// reference here would leave a task respawning a failing server for the life of the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_stops_when_the_manager_is_dropped() {
+        let (entry, manager) = failed_entry("orphaned", "/bin/false").await;
+        let handle = tokio::spawn(retry_until_connected(
+            Arc::clone(&entry),
+            Arc::downgrade(&manager),
+            None,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        ));
+
+        drop(manager);
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            joined.is_ok(),
+            "retry loop outlived the manager it was healing into"
+        );
+        // And it gave up rather than connecting behind the dropped manager's back.
+        assert!(matches!(entry.state().await, ServerState::Failed { .. }));
+    }
+
+    /// And it must stop once the entry is no longer `Failed`, so a recovered server doesn't leave a
+    /// task polling for the life of the process. `Disabled` stands in for the recovered state
+    /// because constructing `Connected` needs a live service.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_stops_once_the_entry_leaves_failed() {
+        let (entry, manager) = failed_entry("recovers", "/bin/false").await;
+        let handle = tokio::spawn(retry_until_connected(
+            Arc::clone(&entry),
+            Arc::downgrade(&manager),
+            None,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+        ));
+
+        *entry.state.write().await = ServerState::Disabled;
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            joined.is_ok(),
+            "retry loop kept polling an entry that is no longer Failed"
+        );
     }
 }

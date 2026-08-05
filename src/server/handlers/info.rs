@@ -39,6 +39,10 @@ pub struct InfoResponse {
     pub model: Option<String>,
     pub default_permission: String,
     pub enabled_permissions: Vec<String>,
+    /// Whether the active profile accepts image attachments on `POST /turn`. The HTTP analogue of
+    /// ACP's `promptCapabilities.image`, so a client can tell whether attaching one is worth the
+    /// base64 payload instead of discovering it from a 422.
+    pub vision: bool,
 }
 
 /// `GET /v1/info`: server identity + model surface. Authenticated; admits any token holding
@@ -72,6 +76,7 @@ pub async fn info(
             .iter()
             .map(|p| p.to_string())
             .collect(),
+        vision: config.vision,
     }))
 }
 

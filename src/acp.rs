@@ -62,7 +62,6 @@ use agent_client_protocol::{
     },
 };
 use async_trait::async_trait;
-use base64::Engine;
 use futures::io::AsyncRead;
 use tokio::sync::Mutex;
 use tokio_util::{
@@ -789,19 +788,10 @@ fn format_embedded_resource(embedded: &EmbeddedResource) -> String {
     }
 }
 
-/// Decode an ACP image content block into meka's internal [`crate::provider::ImageSource`],
-/// normalizing through the shared image pipeline: base64-decode the payload, classify the format
-/// (by the declared MIME type, falling back to the magic bytes), then enforce the size cap and
-/// convert unsupported formats to PNG. Returns a human-readable message on failure.
+/// Decode an ACP image content block into meka's internal [`crate::provider::ImageSource`] via the
+/// shared client-image pipeline, so ACP and the HTTP API enforce the same limits.
 fn decode_acp_image(image: &ImageContent) -> Result<crate::provider::ImageSource, String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image.data.as_bytes())
-        .map_err(|error| format!("base64 decode failed: {}", error))?;
-    let handling = match crate::image::classify_content_type(&image.mime_type) {
-        crate::image::ImageHandling::Unsupported => crate::image::classify_bytes(&bytes),
-        handling => handling,
-    };
-    crate::image::prepare_image_source(handling, &bytes)
+    crate::image::decode_base64_image(&image.data, &image.mime_type)
 }
 
 /// Compute the `locations` entries for a tool call. For tools whose primary argument is a path,
@@ -838,7 +828,9 @@ fn text_content_block(text: impl Into<String>) -> ToolCallContent {
 /// Build the `content` array of a `tool_call_update` from meka's tool output. A populated `Diff`
 /// metadata wins (so clients like Zed get the structured diff for apply-UI). `execute_command`
 /// output is wrapped in a `console` code block so editors render it monospaced (mirrors
-/// claude-agent-acp's no-terminal fallback). Other tools pass their text/image blocks through.
+/// claude-agent-acp's no-terminal fallback). Other tools pass their text and image blocks through
+/// unchanged, so a tool that looked at an image (`read_file` on a PNG, `render_image`, `fetch_url`)
+/// shows the human the same picture the model saw.
 fn build_completion_content(
     tool_name: &str,
     content: &[ToolResultContent],
@@ -870,14 +862,13 @@ fn build_completion_content(
 
     content
         .iter()
-        .map(|block| {
-            let text = match block {
-                ToolResultContent::Text { text } => text.clone(),
-                // No ACP analogue for image content yet; collapse to a text marker so the wire
-                // stays valid.
-                ToolResultContent::Image { .. } => "[image]".to_string(),
-            };
-            text_content_block(text)
+        .map(|block| match block {
+            ToolResultContent::Text { text } => text_content_block(text.clone()),
+            // The payload is already provider-normalized (size-capped, converted to a native
+            // format) by the time it reaches here, so it can go out as-is.
+            ToolResultContent::Image { source } => ToolCallContent::from(ContentBlock::Image(
+                ImageContent::new(source.data.clone(), source.media_type.clone()),
+            )),
         })
         .collect()
 }
@@ -1837,6 +1828,7 @@ pub async fn run_acp(
                         .prompt_capabilities(
                             PromptCapabilities::new()
                                 .image(vision)
+                                .audio(false)
                                 .embedded_context(true),
                         );
                     // Reject the V0 sentinel explicitly. The schema uses V0 as the "couldn't parse
@@ -2831,6 +2823,8 @@ async fn resolve_credential_for_acp(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
     use crate::frontend::PermissionOutcome;
 
@@ -3224,18 +3218,17 @@ mod tests {
         assert!(matches!(blocks[0], ToolCallContent::Content(_)));
     }
 
-    /// Image content has no ACP analogue today, so `build_completion_content` collapses it to a
-    /// `[image]` text marker. Walks the resulting `ContentBlock::Text` to confirm the literal. This
-    /// guards against accidentally swapping in the `ImageContent` ACP variant before the wire
-    /// format is wired through end-to-end.
+    /// Image tool results go out as ACP `image` content blocks rather than a text marker, so the
+    /// client can render the picture the model was shown. Walks into the block to confirm the
+    /// payload and MIME type survive the conversion intact.
     #[test]
-    fn test_build_completion_content_image_falls_back_to_marker() {
+    fn test_build_completion_content_forwards_image_content() {
         use crate::provider::ImageSource;
         let content = vec![ToolResultContent::Image {
             source: ImageSource {
                 source_type: "base64".to_string(),
                 media_type: "image/png".to_string(),
-                data: "irrelevant".to_string(),
+                data: "aGVsbG8=".to_string(),
             },
         }];
         let blocks = build_completion_content("read_file", &content, None);
@@ -3243,10 +3236,45 @@ mod tests {
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
         };
-        let ContentBlock::Text(text) = &chunk.content else {
-            panic!("expected ContentBlock::Text; got {:?}", chunk.content);
+        let ContentBlock::Image(image) = &chunk.content else {
+            panic!("expected ContentBlock::Image; got {:?}", chunk.content);
         };
-        assert_eq!(text.text, "[image]");
+        assert_eq!(image.data, "aGVsbG8=");
+        assert_eq!(image.mime_type, "image/png");
+    }
+
+    /// A tool whose output interleaves text and an image keeps both blocks, in order: the text
+    /// marker `read_file` emits alongside an image (`[Image: path]`) is what names the file in the
+    /// transcript, so dropping either half loses information.
+    #[test]
+    fn test_build_completion_content_preserves_mixed_text_and_image() {
+        use crate::provider::ImageSource;
+        let content = vec![
+            ToolResultContent::Text {
+                text: "[Image: logo.png]".to_string(),
+            },
+            ToolResultContent::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/webp".to_string(),
+                    data: "d2VicA==".to_string(),
+                },
+            },
+        ];
+        let blocks = build_completion_content("read_file", &content, None);
+        assert_eq!(blocks.len(), 2);
+        let ToolCallContent::Content(first) = &blocks[0] else {
+            panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
+        };
+        assert!(
+            matches!(&first.content, ContentBlock::Text(text) if text.text == "[Image: logo.png]")
+        );
+        let ToolCallContent::Content(second) = &blocks[1] else {
+            panic!("expected ToolCallContent::Content; got {:?}", blocks[1]);
+        };
+        assert!(
+            matches!(&second.content, ContentBlock::Image(image) if image.mime_type == "image/webp")
+        );
     }
 
     #[test]

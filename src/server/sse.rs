@@ -235,6 +235,7 @@ mod tests {
         };
         let capabilities = SessionCapabilities {
             supports_reasoning_stream: false,
+            ..Default::default()
         };
         assert!(translate(event, capabilities).is_none());
     }
@@ -247,6 +248,7 @@ mod tests {
         };
         let capabilities = SessionCapabilities {
             supports_reasoning_stream: true,
+            ..Default::default()
         };
         let (event_type, _data) = translate(event, capabilities).expect("translates");
         assert_eq!(event_type, SseEventType::ThinkingDelta);

@@ -61,7 +61,8 @@ pub struct HttpFrontend {
     /// matching oneshot.
     pending: Arc<Mutex<HashMap<String, PermissionPending>>>,
     /// Per-session capabilities, declared at session creation. Controls SSE event filtering
-    /// (currently only `supports_reasoning_stream`).
+    /// (`supports_reasoning_stream`) and whether a gated tool parks for approval or is denied
+    /// outright (`supports_permission_prompts`).
     capabilities: SessionCapabilities,
     /// Sticky `allow_always` set: tools for which the client has chosen "always allow" in this
     /// session short-circuit `request_permission` to `Allow` without ever re-emitting the SSE
@@ -79,13 +80,36 @@ pub struct HttpFrontend {
 /// `Serialize` / `Deserialize` are derived so the value can be persisted on the session row and
 /// re-hydrated by `reattach::ensure_session_loaded` when a GC-evicted session is reconstructed.
 /// `ToSchema` is derived so the field can ride on `SessionResponse` in the OpenAPI spec.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct SessionCapabilities {
     /// When `true`, the SSE stream includes `thinking.delta` events for extended-thinking
     /// content. Default `false` so chat-transcript clients (Telegram bridges, etc.) don't
     /// surface reasoning text inline.
     pub supports_reasoning_stream: bool,
+    /// When `false`, a mid-turn permission request is denied immediately with a notice instead of
+    /// parking on the SSE channel for [`MID_TURN_REQUEST_TIMEOUT`].
+    ///
+    /// Streaming mode otherwise assumes the consumer can answer a prompt, which is wrong for a
+    /// service-to-service client: it wants streaming for liveness on a long turn and has no
+    /// interface to put an approval in front of, so an `ask`-mode session stalls a full minute per
+    /// gated call and then denies anyway. That reads as a hang rather than a misconfiguration.
+    /// Setting this `false` gets blocking mode's behaviour (immediate deny plus an explanatory
+    /// notice), which is the same outcome without the stall and legible in the response rather
+    /// than only in the timing.
+    ///
+    /// Defaults to `true`, so existing clients and sessions persisted before this field existed
+    /// keep parking as before.
+    pub supports_permission_prompts: bool,
+}
+
+impl Default for SessionCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_reasoning_stream: false,
+            supports_permission_prompts: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -303,6 +327,19 @@ impl Frontend for HttpFrontend {
             return PermissionOutcome::Deny;
         }
 
+        if !self.capabilities.supports_permission_prompts {
+            // Streaming, but the client told us it has nowhere to show a prompt. Parking would
+            // burn the full timeout and deny anyway; do it now and say why.
+            self.record_warn_notice(format!(
+                "Permission for '{}' auto-denied: the session declared \
+                 supports_permission_prompts=false, so there is no channel to approve on. \
+                 Configure the session with permission=write to allow these tools.",
+                request.tool_name
+            ))
+            .await;
+            return PermissionOutcome::Deny;
+        }
+
         // Streaming mode: emit a permission_required event and park on a oneshot for the
         // matching POST /responses/{request_id}. Race against per-turn cancellation and the
         // 60s timeout so the agent loop never blocks indefinitely.
@@ -452,6 +489,59 @@ mod tests {
         );
     }
 
+    /// A streaming client that declared it cannot show prompts must be denied immediately rather
+    /// than parked: the default path burns the full 60s `MID_TURN_REQUEST_TIMEOUT` before denying
+    /// anyway, which is indistinguishable from a hang. Bounded well under that timeout so a
+    /// regression to the parking path fails here instead of passing slowly.
+    #[tokio::test]
+    async fn streaming_denies_immediately_when_prompts_are_unsupported() {
+        let frontend = Arc::new(HttpFrontend::with_capabilities(SessionCapabilities {
+            supports_permission_prompts: false,
+            ..Default::default()
+        }));
+        let (_receiver, _ids) = frontend.install_stream(16);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            frontend.request_permission(PermissionRequest {
+                tool_name: "execute_command".into(),
+                primary_param: Some("rm /tmp/x".into()),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            }),
+        )
+        .await
+        .expect("must not park on the SSE channel");
+
+        assert_eq!(outcome, PermissionOutcome::Deny);
+        assert!(
+            frontend
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "nothing should have been parked"
+        );
+        let recorder = frontend.drain();
+        assert!(
+            recorder.iter().any(|event| matches!(
+                event,
+                FrontendEvent::Notice(notice)
+                    if notice.text.contains("supports_permission_prompts")
+            )),
+            "the deny must explain itself in the response, not just in the timing"
+        );
+    }
+
+    /// Sessions persisted before this field existed deserialize without it, and must keep the
+    /// old parking behaviour rather than silently switching to auto-deny.
+    #[test]
+    fn capabilities_from_legacy_json_default_to_supporting_prompts() {
+        let legacy: SessionCapabilities =
+            serde_json::from_str(r#"{"supports_reasoning_stream":true}"#).expect("deserialize");
+        assert!(legacy.supports_reasoning_stream);
+        assert!(legacy.supports_permission_prompts);
+    }
+
     #[tokio::test]
     async fn sticky_allow_short_circuits_subsequent_requests() {
         let frontend = HttpFrontend::new();
@@ -577,6 +667,7 @@ mod tests {
     async fn thinking_delta_streams_when_capability_is_on() {
         let frontend = HttpFrontend::with_capabilities(SessionCapabilities {
             supports_reasoning_stream: true,
+            ..Default::default()
         });
         let (mut receiver, _ids) = frontend.install_stream(16);
         frontend
