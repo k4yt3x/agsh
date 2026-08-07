@@ -52,13 +52,14 @@ use agent_client_protocol::{
         NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
         PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
         ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
-        RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
-        SessionCloseCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
-        SessionListCapabilities, SessionMode, SessionModeId, SessionModeState, SessionNotification,
-        SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
-        StopReason, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        Usage, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
+        RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
+        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+        SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode,
+        SessionModeId, SessionModeState, SessionNotification, SessionResumeCapabilities,
+        SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+        TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
+        ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, Usage,
+        UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -70,7 +71,7 @@ use tokio_util::{
 };
 
 use crate::{
-    agent::{Agent, SharedCwd, resolve_against_cwd},
+    agent::{Agent, SharedCwd, SharedRoots, resolve_against_cwd},
     config::ResolvedConfig,
     conversation::Conversation,
     error::MekaError,
@@ -786,6 +787,23 @@ fn format_embedded_resource(embedded: &EmbeddedResource) -> String {
         // still gets a bare marker so the prompt stays well-formed.
         _ => "<resource/>".to_string(),
     }
+}
+
+/// Validate a client's `additionalDirectories`, rejecting any relative entry.
+///
+/// The spec requires each to be absolute, and meka has no defensible base to resolve a relative one
+/// against: joining to `cwd` would invent a root the client never named. Failing the request is the
+/// honest answer, and it matches how `cwd` itself is validated.
+fn validate_additional_roots(roots: &[PathBuf]) -> Result<(), agent_client_protocol::Error> {
+    for root in roots {
+        if !root.is_absolute() {
+            return Err(invalid_params_error(format!(
+                "additionalDirectories entries must be absolute paths; got `{}`",
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decode an ACP image content block into meka's internal [`crate::provider::ImageSource`] via the
@@ -1804,6 +1822,9 @@ pub async fn run_acp(
                     // Advertise the optional session methods. Each marker is an empty struct;
                     // presence signals support.
                     let session_caps = SessionCapabilities::new()
+                        .additional_directories(Some(
+                            SessionAdditionalDirectoriesCapabilities::new(),
+                        ))
                         .list(Some(SessionListCapabilities::new()))
                         .resume(Some(SessionResumeCapabilities::new()))
                         .close(Some(SessionCloseCapabilities::new()));
@@ -1868,6 +1889,9 @@ pub async fn run_acp(
                             req.cwd.display()
                         )));
                     }
+                    if let Err(error) = validate_additional_roots(&req.additional_directories) {
+                        return responder.respond_with_error(error);
+                    }
                     let session_uuid = match state
                         .shared
                         .session_manager
@@ -1884,6 +1908,18 @@ pub async fn run_acp(
                             );
                         }
                     };
+                    // Persist the roots so `session/list` can report the workspace shape this
+                    // session was opened with. Non-fatal: a session that runs with the right roots
+                    // but forgets them across a restart is far better than refusing to start.
+                    if let Err(error) = state
+                        .shared
+                        .session_manager
+                        .update_session_roots(session_uuid, &req.additional_directories)
+                        .await
+                    {
+                        tracing::warn!("failed to persist additional roots: {}", error);
+                    }
+
                     // Take the OS file lock on the newly created session row so a second `meka acp`
                     // process (or an `meka repl`) can't open the same id and interleave events.
                     let session_lock = match state.shared.session_manager.lock_session(session_uuid)
@@ -1910,6 +1946,7 @@ pub async fn run_acp(
                         session_id_str.clone(),
                         session_uuid,
                         req.cwd.clone(),
+                        req.additional_directories.clone(),
                         Conversation::new(),
                     )
                     .await
@@ -2348,6 +2385,9 @@ async fn handle_load_session(
             req.cwd.display()
         )));
     }
+    if let Err(error) = validate_additional_roots(&req.additional_directories) {
+        return responder.respond_with_error(error);
+    }
 
     let summary = match state
         .shared
@@ -2416,6 +2456,16 @@ async fn handle_load_session(
     }
     let session_id: SessionId = session_id_str.clone().into();
 
+    // Replaces the stored list, including with empty: see `update_session_roots`.
+    if let Err(error) = state
+        .shared
+        .session_manager
+        .update_session_roots(session_uuid, &req.additional_directories)
+        .await
+    {
+        tracing::warn!("failed to persist additional roots: {}", error);
+    }
+
     let runtime = match build_session_runtime(
         &state.shared,
         &state.client_state,
@@ -2425,6 +2475,7 @@ async fn handle_load_session(
         session_id_str.clone(),
         session_uuid,
         req.cwd.clone(),
+        req.additional_directories.clone(),
         conversation,
     )
     .await
@@ -2500,6 +2551,9 @@ async fn handle_list_sessions(
             let cwd = summary.cwd.unwrap_or_else(|| fallback_cwd.clone());
             let mut info =
                 SessionInfo::new(summary.id.to_string(), cwd).updated_at(summary.updated_at);
+            if !summary.additional_roots.is_empty() {
+                info = info.additional_directories(summary.additional_roots);
+            }
             if !summary.preview.is_empty() {
                 info = info.title(summary.preview);
             }
@@ -2544,6 +2598,9 @@ async fn handle_resume_session(
             "cwd must be an absolute path; got `{}`",
             req.cwd.display()
         )));
+    }
+    if let Err(error) = validate_additional_roots(&req.additional_directories) {
+        return responder.respond_with_error(error);
     }
 
     let summary = match state
@@ -2610,6 +2667,16 @@ async fn handle_resume_session(
     }
     let session_id: SessionId = session_id_str.clone().into();
 
+    // Replaces the stored list, including with empty: see `update_session_roots`.
+    if let Err(error) = state
+        .shared
+        .session_manager
+        .update_session_roots(session_uuid, &req.additional_directories)
+        .await
+    {
+        tracing::warn!("failed to persist additional roots: {}", error);
+    }
+
     let runtime = match build_session_runtime(
         &state.shared,
         &state.client_state,
@@ -2619,6 +2686,7 @@ async fn handle_resume_session(
         session_id_str.clone(),
         session_uuid,
         req.cwd.clone(),
+        req.additional_directories.clone(),
         conversation,
     )
     .await
@@ -2754,9 +2822,11 @@ async fn build_session_runtime(
     session_id_str: String,
     session_uuid: uuid::Uuid,
     cwd_path: PathBuf,
+    additional_roots: Vec<PathBuf>,
     messages: Conversation,
 ) -> anyhow::Result<SessionRuntime> {
     let cwd: SharedCwd = Arc::new(std::sync::RwLock::new(cwd_path));
+    let roots: SharedRoots = Arc::new(std::sync::RwLock::new(additional_roots));
     let permission =
         SharedPermission::new(shared.config.permission, shared.config.enabled_permissions);
 
@@ -2773,8 +2843,14 @@ async fn build_session_runtime(
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
-    let (mut agent, tool_registry) =
-        crate::build_session_agent(shared, permission.clone(), frontend, Arc::clone(&cwd)).await?;
+    let (mut agent, tool_registry) = crate::build_session_agent(
+        shared,
+        permission.clone(),
+        frontend,
+        Arc::clone(&cwd),
+        Arc::clone(&roots),
+    )
+    .await?;
     // Point the agent's context counter at the shared atomic and capture its resolved window, so
     // the frontend's `usage_update` reports the same occupancy/size the REPL gauge would.
     agent.set_context_tokens(Arc::clone(&context_tokens));

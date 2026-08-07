@@ -58,6 +58,55 @@ pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) 
     }
 }
 
+/// Workspace roots beyond [`SharedCwd`], as supplied by an ACP client's `additionalDirectories`.
+///
+/// A separate handle rather than a field on `SharedCwd` because only the two search tools and the
+/// environment-context block care: widening [`resolve_against_cwd`] would touch every file tool's
+/// constructor to serve two callers. `cwd` remains the base for relative paths, per the ACP spec,
+/// so these expand *discovery* scope only.
+///
+/// Empty for the REPL, the HTTP API, and any ACP client that sends no extra roots.
+pub type SharedRoots = Arc<RwLock<Vec<PathBuf>>>;
+
+/// Read the current value of [`SharedRoots`], with the same poisoned-lock recovery as
+/// [`cwd_snapshot`] and for the same reason.
+pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
+    roots
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+}
+
+/// The ordered set of roots a search should sweep when the caller named no explicit path: `cwd`
+/// first, then each additional root, with anything already covered by another root dropped.
+///
+/// A root is dropped when some other root *contains* it, which subsumes exact duplicates. Both
+/// shapes are things a client legitimately sends: Zed may repeat `cwd` inside
+/// `additionalDirectories`, and nothing stops a client naming a folder nested inside another. Left
+/// in, the overlapping tree is walked twice, so every file under it is reported twice, consumes two
+/// slots of the result cap, and spends the shared walk budget twice.
+///
+/// Containment is checked in both directions, so a root that is an *ancestor* of `cwd` wins and
+/// `cwd` drops out of the search set. That loses no coverage (the ancestor's walk reaches
+/// everything under `cwd`) and it does not affect `cwd`'s real job: it remains the base for
+/// relative paths and the shell's working directory regardless of what this returns.
+///
+/// Paths are compared as given. A symlink pointing at another root, or a path containing `..`, is
+/// not detected; canonicalising to catch those would resolve symlinked roots to targets the client
+/// never named, which is a worse trade than an occasional duplicate.
+pub fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)) {
+        if kept.iter().any(|existing| path.starts_with(existing)) {
+            continue;
+        }
+        // This root is broader than ones already kept, so those become redundant.
+        kept.retain(|existing| !existing.starts_with(&path));
+        kept.push(path);
+    }
+    kept
+}
+
 /// Construct a fresh [`SharedCwd`] pointing at the process cwd, for use in tests that need to
 /// instantiate a tool but don't exercise the per-session cwd resolution path. Tests using absolute
 /// paths or `tempdir()` are unaffected by the value here.
@@ -66,6 +115,12 @@ pub fn test_cwd() -> SharedCwd {
     Arc::new(RwLock::new(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     ))
+}
+
+/// Construct an empty [`SharedRoots`], for tools under test that don't exercise multi-root search.
+#[cfg(test)]
+pub fn test_roots() -> SharedRoots {
+    Arc::new(RwLock::new(Vec::new()))
 }
 
 use crate::{
@@ -163,6 +218,10 @@ pub struct Agent {
     /// updated by `/cd`; read by the file/shell/find/grep tools, the REPL prompt, and the per-turn
     /// environment-context block. Process `cwd` is no longer mutated.
     cwd: SharedCwd,
+    /// Workspace roots beyond [`Self::cwd`], from an ACP client's `additionalDirectories`. Read by
+    /// the per-turn environment-context block; the search tools hold the same handle. Empty for
+    /// every non-ACP session.
+    roots: SharedRoots,
     /// Total tokens of this agent's most recent provider round: the live, cache-write, and
     /// cache-read input tiers plus output. That equals everything in context as of the last
     /// exchange, i.e. the size the next request re-sends minus the new user prompt. Drives
@@ -200,6 +259,7 @@ impl Agent {
         skills: Arc<SkillCache>,
         frontend: Arc<dyn Frontend>,
         cwd: SharedCwd,
+        roots: SharedRoots,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
         Self {
@@ -214,6 +274,7 @@ impl Agent {
             skills,
             frontend,
             cwd,
+            roots,
             last_context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             mcp_manager: None,
@@ -271,6 +332,7 @@ impl Agent {
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
         parent_cwd: &SharedCwd,
+        parent_roots: &SharedRoots,
         frontend: Arc<dyn Frontend>,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
@@ -307,6 +369,7 @@ impl Agent {
             skills,
             frontend,
             sub_cwd,
+            Arc::clone(parent_roots),
             session_stats,
         );
         // Sub-agents share the parent's `SessionStats` Arc but own a child session row; only the
@@ -476,7 +539,9 @@ impl Agent {
         let augmented_input = {
             let todos = self.todo_list.read().await;
             let cwd_snapshot = cwd_snapshot(&self.cwd);
-            let block = context::build_turn_context(permission, &todos, &cwd_snapshot);
+            let roots_snapshot = roots_snapshot(&self.roots);
+            let block =
+                context::build_turn_context(permission, &todos, &cwd_snapshot, &roots_snapshot);
             format!("{}\n\n{}", block, user_input)
         };
         // Build the user message once (text preamble + any input images) and reuse it for both the
@@ -1574,7 +1639,13 @@ impl Agent {
             .list_tool_outputs(session_id)
             .await
             .unwrap_or_default();
-        context::build_post_compact_context(permission, &todos, &entries, &cwd_snapshot(&self.cwd))
+        context::build_post_compact_context(
+            permission,
+            &todos,
+            &entries,
+            &cwd_snapshot(&self.cwd),
+            &roots_snapshot(&self.roots),
+        )
     }
 }
 
@@ -2020,6 +2091,74 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    /// `cwd` leads and duplicates are dropped: a client is free to repeat `cwd` inside
+    /// `additionalDirectories`, and a repeated root would double every search result and spend the
+    /// shared walk budget twice on the same tree.
+    #[test]
+    fn test_search_roots_puts_cwd_first_and_dedupes() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
+        let roots: SharedRoots = Arc::new(RwLock::new(vec![
+            PathBuf::from("/work/shared"),
+            PathBuf::from("/work/main"),
+            PathBuf::from("/work/shared"),
+            PathBuf::from("/work/docs"),
+        ]));
+
+        assert_eq!(search_roots(&cwd, &roots), vec![
+            PathBuf::from("/work/main"),
+            PathBuf::from("/work/shared"),
+            PathBuf::from("/work/docs"),
+        ]);
+    }
+
+    /// A root nested inside another is covered by it, so keeping both walks that tree twice and
+    /// reports every file in it twice.
+    #[test]
+    fn test_search_roots_drops_roots_nested_in_another() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
+        let roots: SharedRoots = Arc::new(RwLock::new(vec![
+            PathBuf::from("/work/main/nested"),
+            PathBuf::from("/work/other"),
+        ]));
+
+        assert_eq!(search_roots(&cwd, &roots), vec![
+            PathBuf::from("/work/main"),
+            PathBuf::from("/work/other"),
+        ]);
+    }
+
+    /// And the inverse: a root that *contains* `cwd` wins, because its walk already reaches
+    /// everything under `cwd`. Dropping `cwd` from the search set is safe; it stays the base for
+    /// relative paths and the shell either way.
+    #[test]
+    fn test_search_roots_lets_an_ancestor_root_subsume_cwd() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
+        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work")]));
+        assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from("/work")]);
+    }
+
+    /// A shared prefix is not containment: `/work/main2` is not inside `/work/main`.
+    #[test]
+    fn test_search_roots_keeps_sibling_with_shared_prefix() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
+        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work/main2")]));
+        assert_eq!(search_roots(&cwd, &roots), vec![
+            PathBuf::from("/work/main"),
+            PathBuf::from("/work/main2"),
+        ]);
+    }
+
+    /// The single-root case has to stay exactly one path: that is every REPL and HTTP session, and
+    /// every ACP client that sends no extra roots.
+    #[test]
+    fn test_search_roots_without_extras_is_just_cwd() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
+        let roots: SharedRoots = Arc::new(RwLock::new(Vec::new()));
+        assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from(
+            "/work/main"
+        )]);
     }
 
     #[test]

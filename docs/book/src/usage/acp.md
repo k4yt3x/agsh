@@ -30,6 +30,7 @@ These are returned in `InitializeResponse.agentCapabilities`:
 - **`sessionCapabilities.list`**: the client may call `session/list` to browse the persisted session catalogue (cwd-filtered, cursor-paginated; sub-agent audit sessions are hidden).
 - **`sessionCapabilities.resume`**: the client may adopt a persisted session id without replaying history.
 - **`sessionCapabilities.close`**: the client may release the active session slot.
+- **`sessionCapabilities.additionalDirectories`**: the client may send extra workspace roots on `session/new`, `session/load`, and `session/resume` (see [Multi-root workspaces](#multi-root-workspaces)).
 - **`promptCapabilities.embeddedContext: true`**: the client may inline @-mentioned file contents as embedded `resource` blocks (see [Prompt turn](#prompt-turn)).
 - **`promptCapabilities.image`**: follows the active profile's `vision` flag (default `true`; set `vision = false` in `[providers.<name>]` for a text-only model). When `true`, the client may attach `image` blocks.
 
@@ -148,6 +149,24 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 `spawn_agent` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts, fs delegates, and terminal delegates all forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
 
 ACP has no sub-agent primitive — no nested sessions, no nested tool calls — so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `spawn_agent` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as a `spawn_agent` line in its parent's list, and two writers on one tool call's content would overwrite each other.
+
+## Multi-root workspaces
+
+An editor whose workspace holds several folders (Zed's Add Folder to Project) sends the first as `cwd` and the rest as `additionalDirectories`. Clients only send them when the agent advertises `sessionCapabilities.additionalDirectories`, so before meka advertised it every folder but the first was silently dropped and the agent would report files in them as missing.
+
+What the extra roots do and don't change:
+
+- **Search sweeps all of them.** `find_files` and `search_contents` walk every root when you don't pass an explicit `path`. The 60-second walk budget is shared across the whole call, not granted per root, so a four-folder workspace doesn't get a four-minute ceiling. Passing `path` searches exactly that tree, as before.
+- **A truncated `search_contents` says which roots it skipped.** Roots are walked in order starting from `cwd`, so a busy `cwd` can fill the 100-match cap before later roots are reached. When that happens the output names how many roots went unsearched, rather than leaving their absence to read as "nothing there". Pass `path` to search one directly, or `scratchpad` to lift the cap. `find_files` is unaffected: its cap bounds only what it prints, so it still counts matches across every root.
+- **Overlapping roots are collapsed.** A root nested inside another (or a repeat of `cwd`) is dropped, so its tree isn't walked twice and its files aren't reported twice. Symlinked duplicates aren't detected.
+- **The model is told they exist.** Each root is named in the per-turn environment context, alongside the working directory.
+- **Relative paths still resolve against `cwd` only.** This is what the spec requires: `cwd` "remains the base for relative paths". Use an absolute path to reach a file in another root.
+- **The shell still runs in `cwd`.** `execute_command` is unaffected.
+- **A stale root is skipped, not fatal.** A root that no longer exists is passed over so the other roots can still answer; `search_contents` reports "does not exist" only when *no* root existed. Root paths are escaped before they reach the glob engine, so a folder named `2024*` or `notes[1]` matches literally instead of widening the search.
+
+Every entry must be an absolute path; a relative one is rejected with `InvalidParams`.
+
+The list is persisted and reported back on `session/list` as `SessionInfo.additionalDirectories`, which is how a client rebuilds the workspace shape when you pick a session out of its history. `session/load` and `session/resume` carry the *complete resulting* list, so they replace what was stored rather than merging: reopening a session from a window that no longer has the second folder correctly narrows it, and an empty list clears the roots.
 
 ## Known limitations
 

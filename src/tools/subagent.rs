@@ -67,6 +67,15 @@ pub struct ToolBuilderParams {
     /// so a parent `/cd` mid-sub-agent-turn can't change the sub-agent's path resolution
     /// mid-flight.
     pub parent_cwd: crate::agent::SharedCwd,
+    /// Parent's extra workspace roots, so a delegated search sees the same folders the parent
+    /// does.
+    ///
+    /// Shared rather than snapshotted, unlike `parent_cwd`: that one is copied into a fresh `Arc`
+    /// at spawn time so a mid-flight `/cd` in the parent can't move a running sub-agent. Roots
+    /// have no such hazard today because ACP fixes them for a session runtime's lifetime and
+    /// nothing mutates them after construction. If that ever changes, this needs the same
+    /// snapshot.
+    pub parent_roots: crate::agent::SharedRoots,
     /// Parent's frontend. Sub-agents wrap it in a
     /// [`crate::frontend::PermissionForwardingFrontend`] so their permission prompts surface
     /// in the parent's UI (REPL line or ACP `session/request_permission`). Without this,
@@ -350,6 +359,7 @@ impl Tool for SpawnAgentTool {
             },
             inherited_scratchpad.clone(),
             sub_cwd.clone(),
+            Arc::clone(&self.tool_builder_params.parent_roots),
             Arc::clone(&self.tool_builder_params.parent_frontend),
         )
         .map_err(|error| MekaError::ToolExecution {
@@ -389,6 +399,7 @@ impl Tool for SpawnAgentTool {
             let child_params = ToolBuilderParams {
                 parent_shared_session_id: sub_shared_session_id.clone(),
                 parent_cwd: sub_cwd,
+                parent_roots: Arc::clone(&self.tool_builder_params.parent_roots),
                 ..self.tool_builder_params.clone()
             };
             sub_registry.register(Arc::new(SpawnAgentTool {
@@ -422,7 +433,10 @@ impl Tool for SpawnAgentTool {
                 }
             })?;
         let sub_cwd_snapshot = crate::agent::cwd_snapshot(&self.tool_builder_params.parent_cwd);
-        let environment_context = build_environment_context(sub_perm, &sub_cwd_snapshot);
+        let sub_roots_snapshot =
+            crate::agent::roots_snapshot(&self.tool_builder_params.parent_roots);
+        let environment_context =
+            build_environment_context(sub_perm, &sub_cwd_snapshot, &sub_roots_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, task);
 
         // Wrap so permission prompts surface in the parent's UI while emits stay silent (sub-agent
@@ -446,6 +460,7 @@ impl Tool for SpawnAgentTool {
             sub_shared_session_id,
             self.tool_builder_params.skills.clone(),
             &self.tool_builder_params.parent_cwd,
+            &self.tool_builder_params.parent_roots,
             sub_frontend,
             self.tool_builder_params.session_stats.clone(),
         );
@@ -822,6 +837,7 @@ mod tests {
             None,
             Vec::new(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("subagent registry should build");

@@ -357,17 +357,36 @@ pub fn build_permission_context(permission: Permission) -> String {
     )
 }
 
-/// Build the per-turn environment context block (pwd, date). Returns an empty string in `None`
-/// permission mode so system info isn't leaked. The `cwd` argument is the agent's per-session
-/// working directory; passing it explicitly (rather than reading process state) lets multiple
-/// sessions in one process report their own cwds correctly.
-pub fn build_environment_context(permission: Permission, cwd: &std::path::Path) -> String {
+/// Build the per-turn environment context block (pwd, extra workspace roots, date). Returns an
+/// empty string in `None` permission mode so system info isn't leaked. The `cwd` argument is the
+/// agent's per-session working directory; passing it explicitly (rather than reading process state)
+/// lets multiple sessions in one process report their own cwds correctly.
+///
+/// `roots` are the workspace roots beyond `cwd` (an ACP client's `additionalDirectories`). Naming
+/// them is the whole point of tracking them: without this line the model has no way to learn the
+/// other folders exist, and would report a file it cannot find as absent rather than looking. Emits
+/// nothing when the list is empty, so single-root output is unchanged.
+pub fn build_environment_context(
+    permission: Permission,
+    cwd: &std::path::Path,
+    roots: &[std::path::PathBuf],
+) -> String {
     if permission == Permission::None {
         return String::new();
     }
 
     let mut context = String::from("[Environment context]\n");
     context.push_str(&format!("Working directory: {}\n", cwd.display()));
+
+    if !roots.is_empty() {
+        context.push_str(
+            "Additional workspace roots (searched alongside the working directory; \
+             relative paths still resolve against the working directory):\n",
+        );
+        for root in roots {
+            context.push_str(&format!("  {}\n", root.display()));
+        }
+    }
 
     let now = chrono::Local::now().to_rfc2822();
     context.push_str(&format!("Date: {}\n", now));
@@ -382,6 +401,7 @@ pub fn build_turn_context(
     permission: Permission,
     todos: &TodoState,
     cwd: &std::path::Path,
+    roots: &[std::path::PathBuf],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -391,7 +411,7 @@ pub fn build_turn_context(
         sections.push(todo::format_todo_state(todos));
     }
 
-    let environment_context = build_environment_context(permission, cwd);
+    let environment_context = build_environment_context(permission, cwd, roots);
     if !environment_context.is_empty() {
         sections.push(environment_context);
     }
@@ -406,10 +426,11 @@ pub fn build_post_compact_context(
     todos: &TodoState,
     scratchpad_entries: &[ToolOutputSummary],
     cwd: &std::path::Path,
+    roots: &[std::path::PathBuf],
 ) -> String {
     let mut parts = Vec::new();
 
-    let env = build_environment_context(permission, cwd);
+    let env = build_environment_context(permission, cwd, roots);
     if !env.is_empty() {
         parts.push(env);
     }
@@ -856,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_environment_context() {
-        let context = build_environment_context(Permission::Read, std::path::Path::new("."));
+        let context = build_environment_context(Permission::Read, std::path::Path::new("."), &[]);
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
         assert!(context.contains("Date:"));
@@ -864,8 +885,34 @@ mod tests {
 
     #[test]
     fn test_environment_context_none_mode() {
-        let context = build_environment_context(Permission::None, std::path::Path::new("."));
+        let context = build_environment_context(Permission::None, std::path::Path::new("."), &[]);
         assert!(context.is_empty());
+    }
+
+    /// Single-root output must be untouched: every REPL, HTTP, and single-folder ACP session goes
+    /// through here, and an extra line would change the prompt for all of them.
+    #[test]
+    fn test_environment_context_omits_roots_when_empty() {
+        let context =
+            build_environment_context(Permission::Read, std::path::Path::new("/work"), &[]);
+        assert!(context.contains("Working directory: /work"));
+        assert!(!context.contains("Additional workspace roots"));
+    }
+
+    /// Naming the extra roots is the point of tracking them: without this the model cannot learn
+    /// the other folders exist and reports files in them as missing.
+    #[test]
+    fn test_environment_context_names_additional_roots() {
+        let roots = vec![
+            std::path::PathBuf::from("/work/shared"),
+            std::path::PathBuf::from("/work/docs"),
+        ];
+        let context =
+            build_environment_context(Permission::Read, std::path::Path::new("/work/main"), &roots);
+        assert!(context.contains("Working directory: /work/main"));
+        assert!(context.contains("Additional workspace roots"));
+        assert!(context.contains("/work/shared"));
+        assert!(context.contains("/work/docs"));
     }
 
     #[test]
@@ -874,6 +921,7 @@ mod tests {
             Permission::None,
             &TodoState::default(),
             std::path::Path::new("."),
+            &[],
         );
         assert!(context.starts_with("<context>\n"));
         assert!(context.ends_with("</context>"));
@@ -886,6 +934,7 @@ mod tests {
             Permission::Read,
             &TodoState::default(),
             std::path::Path::new("."),
+            &[],
         );
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
@@ -897,7 +946,7 @@ mod tests {
             items: vec![sample_todo("write tests", todo::TodoStatus::InProgress)],
             ..Default::default()
         };
-        let context = build_turn_context(Permission::Read, &todos, std::path::Path::new("."));
+        let context = build_turn_context(Permission::Read, &todos, std::path::Path::new("."), &[]);
         assert!(context.contains("write tests"));
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("[Permission context]"));
@@ -909,7 +958,7 @@ mod tests {
             items: vec![sample_todo("do a thing", todo::TodoStatus::Pending)],
             ..Default::default()
         };
-        let context = build_turn_context(Permission::None, &todos, std::path::Path::new("."));
+        let context = build_turn_context(Permission::None, &todos, std::path::Path::new("."), &[]);
         assert!(context.contains("do a thing"));
         assert!(context.contains("[Permission context]"));
         assert!(!context.contains("[Environment context]"));
@@ -922,6 +971,7 @@ mod tests {
             &TodoState::default(),
             &[],
             std::path::Path::new("."),
+            &[],
         );
         assert!(result.is_empty());
     }
@@ -938,6 +988,7 @@ mod tests {
             &todos,
             &entries,
             std::path::Path::new("."),
+            &[],
         );
         assert!(result.contains("[Environment context]"));
         assert!(result.contains("keep working"));
@@ -953,6 +1004,7 @@ mod tests {
             &TodoState::default(),
             &entries,
             std::path::Path::new("."),
+            &[],
         );
         assert!(result.contains("[Scratchpad entries]"));
         assert!(result.contains("\"log\""));

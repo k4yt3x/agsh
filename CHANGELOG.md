@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/sessions/{id}` reports `turn_in_flight` so a reconnecting client needn't guess.
 - `POST /v1/sessions` accepts `supports_permission_prompts`; false denies gated tools at once.
 - MCP `tools/call` now carries `meka/sessionId` in `_meta` so servers can scope session state.
+- ACP multi-root workspaces: extra folders are searched and named, not silently dropped.
 
 ### Fixed
 

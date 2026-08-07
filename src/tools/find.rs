@@ -29,6 +29,9 @@ struct FindOutcome {
 
 pub(super) struct FindFilesTool {
     pub cwd: crate::agent::SharedCwd,
+    /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
+    /// multi-root ACP session.
+    pub roots: crate::agent::SharedRoots,
 }
 
 #[async_trait]
@@ -60,7 +63,7 @@ impl Tool for FindFilesTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to search in. Defaults to current directory. Prefer the smallest subtree that can answer the question."
+                        "description": "Directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to narrow to the smallest subtree that can answer the question."
                     },
                     "limit": {
                         "type": "integer",
@@ -93,18 +96,27 @@ impl Tool for FindFilesTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "find_files")?;
-        // Resolve the optional `path` against the agent's per-session cwd so the search runs in the
-        // right tree regardless of where the process was launched. Absolute paths pass through
-        // unchanged.
-        let base_path = input["path"]
-            .as_str()
-            .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
-            .unwrap_or_else(|| crate::agent::cwd_snapshot(&self.cwd));
-        let full_pattern = format!(
-            "{}/{}",
-            base_path.to_string_lossy().trim_end_matches('/'),
-            pattern,
-        );
+        // An explicit `path` searches exactly that tree, resolved against the per-session cwd so
+        // the search runs in the right place regardless of where the process was launched. With no
+        // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
+        // silently misses whole folders the user can see in their editor.
+        let base_paths = match input["path"].as_str() {
+            Some(raw) => vec![crate::agent::resolve_against_cwd(&self.cwd, raw)],
+            None => crate::agent::search_roots(&self.cwd, &self.roots),
+        };
+        let full_patterns: Vec<String> = base_paths
+            .iter()
+            .map(|base| {
+                // The base is escaped, the caller's `pattern` is not: a root is a literal
+                // directory, and a client is free to have one named `2024*` or `notes[1]`. Without
+                // this those parse as wildcards, silently widening the search past the named roots.
+                format!(
+                    "{}/{}",
+                    glob::Pattern::escape(base.to_string_lossy().trim_end_matches('/')),
+                    pattern,
+                )
+            })
+            .collect();
 
         // Cap precedence:
         //   1. explicit `limit` parameter: honoured verbatim
@@ -121,8 +133,11 @@ impl Tool for FindFilesTool {
             None => DEFAULT_INLINE_RESULTS,
         };
 
+        // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
+        // construction, so a per-root budget would silently give a four-root workspace four times
+        // the ceiling. `run_walk` walks the roots in order under this single deadline.
         let budget = WalkBudget::new(cancellation.clone());
-        let walk = tokio::task::spawn_blocking(move || run_walk(&full_pattern, cap, &budget));
+        let walk = tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget));
 
         // Race the walk against the token rather than just awaiting it. The walk checks the same
         // token itself, but `glob`'s iterator does its directory reads inside `next()`, so a walk
@@ -144,7 +159,12 @@ impl Tool for FindFilesTool {
 /// The blocking half of `find_files`. Consults `budget` once per entry the glob iterator yields,
 /// which is what makes an over-broad walk stoppable at all: nothing outside this loop can end it,
 /// because a `spawn_blocking` task that has started cannot be aborted.
-fn run_walk(full_pattern: &str, cap: usize, budget: &WalkBudget) -> Result<FindOutcome> {
+///
+/// `full_patterns` holds one rooted glob per workspace root, walked in order under a single shared
+/// `budget`. Counts accumulate across roots so the caller's cap and truncation message describe the
+/// whole search rather than its last leg, and a timeout part-way through root two still reports the
+/// matches root one produced.
+fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result<FindOutcome> {
     let mut matches: Vec<String> = Vec::new();
     // Total continues past the storage cap so the truncation message can report the real number of
     // matches. Note that the cap bounds only what is stored: a pattern that matches nothing never
@@ -156,30 +176,49 @@ fn run_walk(full_pattern: &str, cap: usize, budget: &WalkBudget) -> Result<FindO
     let mut unreadable: usize = 0;
     let mut timed_out = false;
 
-    let paths = glob::glob(full_pattern).map_err(|error| MekaError::ToolExecution {
-        tool_name: "find_files".to_string(),
-        message: format!("invalid glob pattern '{}': {}", full_pattern, error),
-    })?;
-
-    for entry in paths {
+    'roots: for full_pattern in full_patterns {
+        // Checked here as well as per entry, for the same reason `walk_directory` checks at the top
+        // of its outer loop: a root whose glob yields nothing never enters the inner loop, so a run
+        // of empty or missing roots would advance through the whole list without consulting the
+        // budget once, ignoring both the deadline and a `session/cancel`.
         match budget.check() {
             Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
             Some(WalkStop::TimedOut) => {
                 timed_out = true;
-                break;
+                break 'roots;
             }
             None => {}
         }
-        match entry {
-            Ok(path) => {
-                total += 1;
-                if matches.len() < cap {
-                    matches.push(path.display().to_string());
+
+        // Escaping the base means the root can no longer make the combined pattern invalid, so a
+        // compile failure here is the caller's `pattern` and every root would fail the same way.
+        // That is a caller mistake worth reporting loudly: degrading it to "no files found" would
+        // hand the model a definitive-looking answer to a question that was never asked.
+        let paths = glob::glob(full_pattern).map_err(|error| MekaError::ToolExecution {
+            tool_name: "find_files".to_string(),
+            message: format!("invalid glob pattern '{}': {}", full_pattern, error),
+        })?;
+
+        for entry in paths {
+            match budget.check() {
+                Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+                Some(WalkStop::TimedOut) => {
+                    timed_out = true;
+                    break 'roots;
                 }
+                None => {}
             }
-            Err(error) => {
-                unreadable += 1;
-                tracing::debug!("glob error: {}", error);
+            match entry {
+                Ok(path) => {
+                    total += 1;
+                    if matches.len() < cap {
+                        matches.push(path.display().to_string());
+                    }
+                }
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::debug!("glob error: {}", error);
+                }
             }
         }
     }
@@ -245,6 +284,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -272,6 +312,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -301,6 +342,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -330,6 +372,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -368,6 +411,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -397,6 +441,7 @@ mod tests {
 
         let tool = FindFilesTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -423,8 +468,99 @@ mod tests {
 
         let budget =
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
-        let outcome = run_walk(&pattern, 500, &budget).expect("walk should return, not error");
+        let outcome = run_walk(&[pattern], 500, &budget).expect("walk should return, not error");
         assert!(outcome.timed_out, "expired budget must stop the walk");
+    }
+
+    /// A malformed `pattern` is the caller's mistake and must surface as an error. Returning
+    /// "no files found" instead would read as a definitive answer to a search that never ran.
+    #[test]
+    fn test_run_walk_errors_on_a_malformed_caller_pattern() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pattern = format!(
+            "{}/{}",
+            glob::Pattern::escape(temp.path().to_string_lossy().trim_end_matches('/')),
+            "[unterminated",
+        );
+        let budget = WalkBudget::new(CancellationToken::new());
+        let Err(error) = run_walk(&[pattern], 500, &budget) else {
+            panic!("a malformed caller pattern must not be swallowed");
+        };
+        assert!(
+            format!("{}", error).contains("invalid glob pattern"),
+            "got: {}",
+            error
+        );
+    }
+
+    /// A root is a literal directory. Without escaping, one named `star*dir` would be read as a
+    /// wildcard and pull in paths the client never named.
+    #[test]
+    fn test_glob_metacharacters_in_a_root_are_literal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let literal = temp.path().join("star*dir");
+        let decoy = temp.path().join("starXdir");
+        std::fs::create_dir_all(&literal).expect("mkdir literal");
+        std::fs::create_dir_all(&decoy).expect("mkdir decoy");
+        std::fs::write(literal.join("a.txt"), "").expect("write");
+        std::fs::write(decoy.join("b.txt"), "").expect("write");
+
+        let pattern = format!(
+            "{}/{}",
+            glob::Pattern::escape(literal.to_string_lossy().trim_end_matches('/')),
+            "*.txt",
+        );
+        let budget = WalkBudget::new(CancellationToken::new());
+        let outcome = run_walk(&[pattern], 500, &budget).expect("walk");
+
+        assert_eq!(outcome.total, 1, "must not match the decoy directory");
+        assert!(outcome.matches[0].ends_with("a.txt"));
+    }
+
+    /// Multi-root walks accumulate into one outcome rather than reporting only the last root.
+    #[test]
+    fn test_run_walk_accumulates_across_roots() {
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        std::fs::write(first.path().join("a.txt"), "").expect("write");
+        std::fs::write(second.path().join("b.txt"), "").expect("write");
+        let patterns = vec![
+            format!("{}/*.txt", first.path().to_string_lossy()),
+            format!("{}/*.txt", second.path().to_string_lossy()),
+        ];
+
+        let budget = WalkBudget::new(CancellationToken::new());
+        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+
+        assert_eq!(outcome.total, 2, "both roots must be searched");
+        assert!(outcome.matches.iter().any(|m| m.ends_with("a.txt")));
+        assert!(outcome.matches.iter().any(|m| m.ends_with("b.txt")));
+        assert!(!outcome.timed_out);
+    }
+
+    /// The budget spans the whole call rather than resetting per root. A budget already spent when
+    /// the walk begins must stop it at the first root, not grant each root a fresh deadline: that
+    /// is what would silently multiply the 60s ceiling by the workspace's root count.
+    #[test]
+    fn test_run_walk_shares_one_budget_across_roots() {
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        std::fs::write(first.path().join("a.txt"), "").expect("write");
+        std::fs::write(second.path().join("b.txt"), "").expect("write");
+        let patterns = vec![
+            format!("{}/*.txt", first.path().to_string_lossy()),
+            format!("{}/*.txt", second.path().to_string_lossy()),
+        ];
+
+        let budget =
+            WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
+        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+
+        assert!(outcome.timed_out, "expired budget must stop the walk");
+        assert_eq!(
+            outcome.total, 0,
+            "an expired budget must not let a later root start a fresh deadline"
+        );
     }
 
     #[test]

@@ -98,6 +98,10 @@ pub struct SessionSummary {
     /// JSON-encoded per-session capability flags (currently just
     /// `{"supports_reasoning_stream": bool}`). Same NULL-for-legacy semantics as `permission`.
     pub capabilities_json: Option<String>,
+    /// Workspace roots beyond `cwd`, from an ACP client's `additionalDirectories`. Empty for every
+    /// non-ACP session and for legacy rows written before the column existed, both of which were
+    /// single-root.
+    pub additional_roots: Vec<PathBuf>,
     /// SHA-256 fingerprint of the bearer token that created this session. `None` for legacy
     /// rows and for sessions not created via the HTTP API.
     pub token_id: Option<String>,
@@ -372,7 +376,8 @@ impl SessionManager {
                         cwd TEXT,
                         permission TEXT,
                         capabilities_json TEXT,
-                        token_id TEXT
+                        token_id TEXT,
+                        additional_roots_json TEXT
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
@@ -637,6 +642,31 @@ impl SessionManager {
                     > 0;
                 if !has_token_id_col {
                     connection.execute_batch("ALTER TABLE sessions ADD COLUMN token_id TEXT")?;
+                }
+
+                // Migration: add `sessions.additional_roots_json` so an ACP client's
+                // `additionalDirectories` survives a restart and `session/list` can report the
+                // workspace shape a session was last used with. NULL on legacy rows decodes to an
+                // empty list, i.e. single-root, which is what those sessions were.
+                //
+                // Runs after the cascade-FK rebuild for the same reason as the three migrations
+                // above: the rebuild's `sessions_new` schema lists only id/created_at/updated_at/
+                // parent_session_id/cwd, so it silently drops any column added before it. Adding
+                // this one next to the `cwd` migration looked natural and was wrong: on a pre-0.24
+                // database the column was created, then dropped by the rebuild, and every query
+                // naming it failed for the rest of that process's life.
+                let has_roots_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'additional_roots_json'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_roots_col {
+                    connection.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN additional_roots_json TEXT",
+                    )?;
                 }
 
                 // Migration: per-session cumulative stat columns (surfaced by `/status`) so the
@@ -1428,7 +1458,7 @@ impl SessionManager {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.token_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -1463,8 +1493,9 @@ impl SessionManager {
                     let cwd: Option<String> = row.get(3)?;
                     let permission: Option<String> = row.get(4)?;
                     let capabilities_json: Option<String> = row.get(5)?;
-                    let token_id: Option<String> = row.get(6)?;
-                    let preview: String = row.get(7)?;
+                    let additional_roots_json: Option<String> = row.get(6)?;
+                    let token_id: Option<String> = row.get(7)?;
+                    let preview: String = row.get(8)?;
                     Ok((
                         id_str,
                         created_at,
@@ -1472,6 +1503,7 @@ impl SessionManager {
                         cwd,
                         permission,
                         capabilities_json,
+                        additional_roots_json,
                         token_id,
                         preview,
                     ))
@@ -1486,6 +1518,7 @@ impl SessionManager {
                         cwd,
                         permission,
                         capabilities_json,
+                        additional_roots_json,
                         token_id,
                         preview,
                     ) = row?;
@@ -1501,6 +1534,7 @@ impl SessionManager {
                         cwd: cwd.map(PathBuf::from),
                         permission,
                         capabilities_json,
+                        additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
                     });
                 }
@@ -1527,7 +1561,7 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.token_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -1544,8 +1578,9 @@ impl SessionManager {
                     let cwd: Option<String> = row.get(3)?;
                     let permission: Option<String> = row.get(4)?;
                     let capabilities_json: Option<String> = row.get(5)?;
-                    let token_id: Option<String> = row.get(6)?;
-                    let preview: String = row.get(7)?;
+                    let additional_roots_json: Option<String> = row.get(6)?;
+                    let token_id: Option<String> = row.get(7)?;
+                    let preview: String = row.get(8)?;
                     Ok((
                         id_str,
                         created_at,
@@ -1553,6 +1588,7 @@ impl SessionManager {
                         cwd,
                         permission,
                         capabilities_json,
+                        additional_roots_json,
                         token_id,
                         preview,
                     ))
@@ -1566,6 +1602,7 @@ impl SessionManager {
                             cwd,
                             permission,
                             capabilities_json,
+                            additional_roots_json,
                             token_id,
                             preview,
                         ) = row?;
@@ -1579,6 +1616,9 @@ impl SessionManager {
                             preview: truncate_preview(&preview, 80),
                             cwd: cwd.map(PathBuf::from),
                             permission,
+                            additional_roots: decode_additional_roots(
+                                additional_roots_json.as_deref(),
+                            ),
                             capabilities_json,
                             token_id,
                         }))
@@ -1759,6 +1799,45 @@ impl SessionManager {
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to update session capabilities: {}", error))
+            })
+    }
+
+    /// Replace a session's workspace roots (the ACP `additionalDirectories` list).
+    ///
+    /// Replace rather than merge, and an empty `roots` clears the column: per the ACP spec a
+    /// non-empty list "is the complete resulting additional-root list", while omitted or empty
+    /// means no additional roots are activated. The stored value is therefore the last activated
+    /// set, which is exactly what `session/list` should report. A client reopening a session from a
+    /// window that no longer has the second folder correctly narrows it.
+    ///
+    /// Unlike the sibling updaters this does *not* touch `updated_at`: activating roots is a
+    /// property of how a session is being opened, not conversation activity, and bumping the
+    /// timestamp would reorder the client's session list on every load.
+    pub async fn update_session_roots(
+        &self,
+        session_id: Uuid,
+        roots: &[std::path::PathBuf],
+    ) -> Result<usize> {
+        // `None` for the empty case keeps "no extra roots" as NULL, matching legacy rows, so the
+        // column has one representation for one meaning rather than NULL and `[]` both appearing.
+        let encoded = if roots.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(roots).map_err(|error| {
+                MekaError::Database(format!("failed to encode additional roots: {}", error))
+            })?)
+        };
+        let id_string = session_id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET additional_roots_json = ?1 WHERE id = ?2",
+                    rusqlite::params![encoded, id_string],
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to update session roots: {}", error))
             })
     }
 
@@ -2549,6 +2628,17 @@ fn decode_list_cursor(token: &str) -> Result<(String, String)> {
     Ok((cursor.updated_at, cursor.id))
 }
 
+/// Decode the persisted `additional_roots_json` column into workspace roots.
+///
+/// NULL (legacy rows, and every session that never carried extra roots) and unparseable JSON both
+/// yield an empty list. Failing soft is right here: a session whose root list can't be read is
+/// still perfectly usable as a single-root session, and refusing to load it would be a far worse
+/// outcome than silently narrowing its search scope.
+fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
+    json.and_then(|raw| serde_json::from_str::<Vec<PathBuf>>(raw).ok())
+        .unwrap_or_default()
+}
+
 /// Derive a short, single-line preview from a stored user message: strip the agent's `<context>`
 /// preamble, take the first line, and cap it at `max_chars` (appending `…` when cut). Used both for
 /// the `session/list` preview column and the ACP live session title.
@@ -2571,6 +2661,78 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    #[tokio::test]
+    async fn additional_roots_round_trip_through_the_database() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session(Some(PathBuf::from("/work/main")))
+            .await
+            .expect("create session");
+
+        // A fresh session has none: the column starts NULL.
+        let summary = manager.session_info(id).await.expect("info").expect("row");
+        assert!(summary.additional_roots.is_empty());
+
+        let roots = vec![PathBuf::from("/work/shared"), PathBuf::from("/work/docs")];
+        manager
+            .update_session_roots(id, &roots)
+            .await
+            .expect("store roots");
+        let summary = manager.session_info(id).await.expect("info").expect("row");
+        assert_eq!(summary.additional_roots, roots);
+
+        // `session/list` reports the same set, since that is what a client rebuilds a workspace
+        // from when picking a session out of its history.
+        let (listed, _cursor) = manager
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
+        let row = listed
+            .iter()
+            .find(|row| row.id == id)
+            .expect("session should be listed");
+        assert_eq!(row.additional_roots, roots);
+    }
+
+    /// Load and resume carry the complete resulting list, so an empty one clears rather than
+    /// merges: reopening a session from a window that no longer has the second folder has to
+    /// narrow the session, not silently keep searching a folder the user removed.
+    #[tokio::test]
+    async fn empty_additional_roots_clears_the_stored_list() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session(Some(PathBuf::from("/work/main")))
+            .await
+            .expect("create session");
+        manager
+            .update_session_roots(id, &[PathBuf::from("/work/shared")])
+            .await
+            .expect("store roots");
+
+        manager
+            .update_session_roots(id, &[])
+            .await
+            .expect("clear roots");
+
+        let summary = manager.session_info(id).await.expect("info").expect("row");
+        assert!(
+            summary.additional_roots.is_empty(),
+            "an empty list must clear, not merge"
+        );
+    }
+
+    /// Legacy rows predate the column, and unparseable JSON shouldn't make a session unloadable:
+    /// both mean "single root", which is what those sessions always were.
+    #[test]
+    fn decode_additional_roots_fails_soft() {
+        assert!(decode_additional_roots(None).is_empty());
+        assert!(decode_additional_roots(Some("not json")).is_empty());
+        assert_eq!(decode_additional_roots(Some(r#"["/a","/b"]"#)), vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+        ]);
     }
 
     /// Regression: every in-memory `open()` mints a temp lock dir, and nothing used to remove it,
@@ -3506,6 +3668,7 @@ mod tests {
             permission,
             &crate::tools::todo::TodoState::default(),
             std::path::Path::new("."),
+            &[],
         );
         format!("{}\n\n{}", block, user_input)
     }

@@ -5215,3 +5215,80 @@ model = "claude-sonnet-4-5"
         response,
     );
 }
+
+/// The capability is the switch that makes a multi-root client send anything at all: Zed reads
+/// `sessionCapabilities.additionalDirectories` and, when it's absent, silently drops every
+/// workspace folder but the first before it ever reaches meka.
+#[test]
+fn acp_advertises_additional_directories_capability() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    let response = harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+    assert!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["additionalDirectories"]
+            .is_object(),
+        "expected additionalDirectories to be advertised; got: {}",
+        response,
+    );
+}
+
+/// A session created with extra roots reports them back on `session/list`, which is what a client
+/// rebuilds its workspace from when picking a session out of history.
+#[test]
+fn acp_session_new_accepts_and_reports_additional_directories() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+
+    let cwd = harness.config_dir.clone();
+    let extra = cwd.join("shared");
+    std::fs::create_dir_all(&extra).expect("mkdir extra root");
+
+    let response = harness.request(
+        "session/new",
+        serde_json::json!({
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [extra],
+        }),
+    );
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .to_string();
+
+    let listed = harness.request("session/list", serde_json::json!({}));
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+    let row = sessions
+        .iter()
+        .find(|row| row["sessionId"] == session_id.as_str())
+        .unwrap_or_else(|| panic!("session not listed: {}", listed));
+    assert_eq!(
+        row["additionalDirectories"],
+        serde_json::json!([extra]),
+        "session/list must report the roots the session was opened with; got: {}",
+        row,
+    );
+}
+
+/// The spec requires absolute paths, and meka has no defensible base to resolve a relative one
+/// against: joining to `cwd` would invent a root the client never named.
+#[test]
+fn acp_session_new_rejects_relative_additional_directory() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+
+    let response = harness.request(
+        "session/new",
+        serde_json::json!({
+            "cwd": harness.config_dir.clone(),
+            "mcpServers": [],
+            "additionalDirectories": ["relative/path"],
+        }),
+    );
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "expected invalid_params; got: {}",
+        response,
+    );
+}

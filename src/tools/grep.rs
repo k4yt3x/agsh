@@ -20,6 +20,9 @@ const MAX_INLINE_MATCHES: usize = 100;
 
 pub(super) struct SearchContentsTool {
     pub cwd: crate::agent::SharedCwd,
+    /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
+    /// multi-root ACP session.
+    pub roots: crate::agent::SharedRoots,
 }
 
 #[async_trait]
@@ -50,7 +53,7 @@ impl Tool for SearchContentsTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory to search in. Defaults to current directory. Prefer the smallest subtree that can answer the question."
+                        "description": "File or directory to search in. Omit to search every workspace root (the working directory plus any additional roots listed in the environment context). Set it to narrow to the smallest subtree that can answer the question."
                     },
                     "glob": {
                         "type": "string",
@@ -77,14 +80,16 @@ impl Tool for SearchContentsTool {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "search_contents")?;
-        // Resolve the optional `path` against the agent's per-session cwd so the search runs in the
-        // right tree regardless of where the process was launched.
-        let search_path = input["path"]
-            .as_str()
-            .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
-            .unwrap_or_else(|| crate::agent::cwd_snapshot(&self.cwd))
-            .to_string_lossy()
-            .into_owned();
+        // An explicit `path` searches exactly that tree, resolved against the per-session cwd. With
+        // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
+        // `cwd` silently misses whole folders the user can see in their editor.
+        let search_paths: Vec<String> = match input["path"].as_str() {
+            Some(raw) => vec![crate::agent::resolve_against_cwd(&self.cwd, raw)],
+            None => crate::agent::search_roots(&self.cwd, &self.roots),
+        }
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
         // Cap match count for inline use; lift it when redirecting output to the scratchpad so the
         // agent can collect an unbounded result set.
@@ -94,11 +99,13 @@ impl Tool for SearchContentsTool {
             MAX_INLINE_MATCHES
         };
 
+        // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
+        // construction, so a per-root budget would silently multiply the ceiling by the root count.
         let budget = WalkBudget::new(cancellation.clone());
         let search = tokio::task::spawn_blocking(move || {
             search_with_grep(
                 &pattern,
-                &search_path,
+                &search_paths,
                 file_glob.as_deref(),
                 max_results,
                 &budget,
@@ -120,9 +127,13 @@ impl Tool for SearchContentsTool {
     }
 }
 
+/// `search_paths` holds one workspace root per entry (or the single tree the caller named via
+/// `path`), walked in order under a single shared `budget`. Results, the truncation cap, and the
+/// timeout note all span the whole set, so the output describes the search rather than its last
+/// leg.
 fn search_with_grep(
     pattern: &str,
-    search_path: &str,
+    search_paths: &[String],
     file_glob: Option<&str>,
     max_results: usize,
     budget: &WalkBudget,
@@ -144,34 +155,81 @@ fn search_with_grep(
         })?;
 
     let mut results = Vec::new();
-    let path = std::path::Path::new(search_path);
     let mut timed_out = false;
+    // A root that doesn't exist is skipped rather than fatal, because one stale entry in a
+    // multi-root workspace shouldn't sink a search the other roots can answer. With a single
+    // explicit `path` this reduces to today's behaviour exactly: nothing existed, so the error
+    // below fires with the same message.
+    let mut searched_any = false;
+    // Compiled lazily and at most once. Deliberately inside the directory branch rather than
+    // hoisted above the loop: hoisting would report an invalid `glob` for a path that doesn't
+    // exist, or for a single file where the glob is irrelevant, changing single-root behaviour.
+    let mut glob_pattern: Option<glob::Pattern> = None;
+    // Roots left unsearched because the match cap filled up first. cwd is always root #1, so a
+    // busy cwd would otherwise starve every other root and report only "truncated", which reads as
+    // "the other folders had nothing" -- the exact failure multi-root support exists to prevent.
+    let mut unsearched_roots = 0usize;
 
-    if path.is_file() {
-        search_file(&matcher, path, &mut results, max_results)?;
-    } else if path.is_dir() {
-        let glob_pattern = match file_glob {
-            Some(g) => Some(
-                glob::Pattern::new(g).map_err(|error| MekaError::ToolExecution {
-                    tool_name: "search_contents".to_string(),
-                    message: format!("invalid glob pattern '{}': {}", g, error),
-                })?,
-            ),
-            None => None,
-        };
+    for search_path in search_paths {
+        // Checked per root as well as inside `walk_directory`: a root that is a plain file, or that
+        // doesn't exist, never reaches the walk, so a long list of them would advance without
+        // consulting the budget once and ignore both the deadline and a `session/cancel`.
+        match budget.check() {
+            Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::TimedOut) => {
+                timed_out = true;
+                break;
+            }
+            None => {}
+        }
 
-        timed_out = walk_directory(
-            path,
-            &matcher,
-            &glob_pattern,
-            &mut results,
-            max_results,
-            budget,
-        )?;
-    } else {
+        // Stop before the walk, not after, so the remaining roots are counted rather than silently
+        // dropped.
+        if results.len() > max_results {
+            unsearched_roots += 1;
+            continue;
+        }
+
+        let path = std::path::Path::new(search_path.as_str());
+        if path.is_file() {
+            searched_any = true;
+            search_file(&matcher, path, &mut results, max_results)?;
+        } else if path.is_dir() {
+            searched_any = true;
+            if glob_pattern.is_none()
+                && let Some(g) = file_glob
+            {
+                glob_pattern =
+                    Some(
+                        glob::Pattern::new(g).map_err(|error| MekaError::ToolExecution {
+                            tool_name: "search_contents".to_string(),
+                            message: format!("invalid glob pattern '{}': {}", g, error),
+                        })?,
+                    );
+            }
+            if walk_directory(
+                path,
+                &matcher,
+                &glob_pattern,
+                &mut results,
+                max_results,
+                budget,
+            )? {
+                timed_out = true;
+                break;
+            }
+        } else {
+            continue;
+        }
+    }
+
+    // Only claim the path is missing when we actually looked. A budget that expired before the
+    // first root was examined leaves `searched_any` false while saying nothing about whether the
+    // path exists, and "does not exist" is a definitive answer the model will act on.
+    if !searched_any && !timed_out {
         return Err(MekaError::ToolExecution {
             tool_name: "search_contents".to_string(),
-            message: format!("path '{}' does not exist", search_path),
+            message: format!("path '{}' does not exist", search_paths.join("', '")),
         });
     }
 
@@ -187,6 +245,12 @@ fn search_with_grep(
     let mut notes: Vec<String> = Vec::new();
     if truncated {
         notes.push(format!("truncated, showing first {} matches", max_results));
+    }
+    if unsearched_roots > 0 {
+        notes.push(format!(
+            "{} workspace root(s) were not searched because the match cap filled first: pass              `path` to search one of them directly, or `scratchpad` to lift the cap",
+            unsearched_roots,
+        ));
     }
     if timed_out {
         notes.push(format!(
@@ -327,6 +391,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -359,6 +424,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -384,6 +450,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -406,6 +473,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let err = tool
             .execute(
@@ -434,6 +502,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let result = tool
             .execute(
@@ -471,6 +540,7 @@ mod tests {
 
         let tool = SearchContentsTool {
             cwd: crate::agent::test_cwd(),
+            roots: crate::agent::test_roots(),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -487,6 +557,61 @@ mod tests {
         assert!(matches!(error, MekaError::Interrupted), "got: {}", error);
     }
 
+    /// cwd is always root #1, so a busy cwd filling the cap would otherwise starve every other
+    /// root while the output said only "truncated" -- which reads as "the other folders had
+    /// nothing", the exact failure multi-root support exists to prevent.
+    #[test]
+    fn test_search_discloses_roots_left_unsearched_when_the_cap_fills() {
+        let busy = tempfile::tempdir().expect("tempdir");
+        let other = tempfile::tempdir().expect("tempdir");
+        // More matches than the cap, all in the first root.
+        let body = (0..MAX_INLINE_MATCHES + 20)
+            .map(|_| "needle\n")
+            .collect::<String>();
+        std::fs::write(busy.path().join("busy.txt"), body).expect("write");
+        std::fs::write(other.path().join("other.txt"), "needle\n").expect("write");
+
+        let budget = WalkBudget::new(CancellationToken::new());
+        let output = search_with_grep(
+            "needle",
+            &[
+                busy.path().to_string_lossy().into_owned(),
+                other.path().to_string_lossy().into_owned(),
+            ],
+            None,
+            MAX_INLINE_MATCHES,
+            &budget,
+        )
+        .expect("search should return, not error");
+
+        assert!(output.contains("truncated"), "got: {}", output);
+        assert!(
+            output.contains("not searched"),
+            "an unsearched root must be disclosed, not implied by absence; got: {}",
+            output
+        );
+    }
+
+    /// A budget that expired before any root was examined says nothing about whether the path
+    /// exists, so it must not report "does not exist" -- a definitive answer the model acts on.
+    #[test]
+    fn test_expired_budget_reports_timeout_not_missing_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("a.txt"), "needle\n").expect("write");
+
+        let budget =
+            WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
+        let output = search_with_grep(
+            "needle",
+            &[temp.path().to_string_lossy().into_owned()],
+            None,
+            MAX_INLINE_MATCHES,
+            &budget,
+        )
+        .expect("an expired budget must not be reported as a missing path");
+        assert!(output.contains("still running"), "got: {}", output);
+    }
+
     #[test]
     fn test_search_with_grep_discloses_timeout_with_no_matches() {
         // The dangerous shape: the budget expires before anything is found, and reporting a bare
@@ -498,7 +623,7 @@ mod tests {
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
         let output = search_with_grep(
             "needle",
-            &temp_dir.path().to_string_lossy(),
+            &[temp_dir.path().to_string_lossy().into_owned()],
             None,
             MAX_INLINE_MATCHES,
             &budget,

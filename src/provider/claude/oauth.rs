@@ -2209,6 +2209,7 @@ mod tests {
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
@@ -2226,6 +2227,7 @@ mod tests {
                 Permission::Read,
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
+                &[],
             );
             format!("{}\n\n{}", block, "list files under /tmp")
         };
@@ -2245,6 +2247,7 @@ mod tests {
                 Permission::Write,
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
+                &[],
             );
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
@@ -2325,6 +2328,7 @@ mod tests {
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
@@ -2343,6 +2347,7 @@ mod tests {
                 Permission::Write,
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
+                &[],
             );
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
@@ -2460,6 +2465,7 @@ mod tests {
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
@@ -2564,6 +2570,7 @@ mod tests {
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");

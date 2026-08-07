@@ -461,6 +461,7 @@ async fn assemble_agent(
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::agent::SharedCwd,
+    roots: crate::agent::SharedRoots,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let todo_list: crate::tools::todo::SharedTodoList = std::sync::Arc::new(
         tokio::sync::RwLock::new(crate::tools::todo::TodoState::default()),
@@ -481,6 +482,7 @@ async fn assemble_agent(
         bundle.skills.clone(),
         bundle.builtin_filter.clone(),
         cwd.clone(),
+        Arc::clone(&roots),
         Arc::clone(&frontend),
     )?;
 
@@ -504,6 +506,7 @@ async fn assemble_agent(
                 session_stats: Arc::clone(&bundle.session_stats),
                 parent_options: bundle.agent_options.clone(),
                 parent_cwd: Arc::clone(&cwd),
+                parent_roots: Arc::clone(&roots),
                 parent_frontend: Arc::clone(&frontend),
             },
             user_instructions: bundle.user_instructions.clone(),
@@ -534,6 +537,7 @@ async fn assemble_agent(
         bundle.skills.clone(),
         frontend,
         cwd,
+        roots,
         Arc::clone(&bundle.session_stats),
     );
     if let Some(manager) = bundle.mcp_manager {
@@ -555,6 +559,7 @@ pub async fn build_session_agent(
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::agent::SharedCwd,
+    roots: crate::agent::SharedRoots,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let bundle = AgentAssembly {
         web_client: shared.config.web_client.clone(),
@@ -572,7 +577,7 @@ pub async fn build_session_agent(
         session_stats: Arc::clone(&shared.session_stats),
         subagent_max_depth: shared.config.subagent_max_depth,
     };
-    assemble_agent(bundle, shared_permission, frontend, cwd).await
+    assemble_agent(bundle, shared_permission, frontend, cwd, roots).await
 }
 
 // Top-level entry point for assembling the agent; splitting its inputs further would force callers
@@ -685,8 +690,16 @@ async fn create_agent_from_config(
         session_stats: Arc::clone(&session_stats),
         subagent_max_depth: config.subagent_max_depth,
     };
-    let (agent, _tool_registry) =
-        assemble_agent(bundle, shared_permission, frontend, Arc::clone(&cwd)).await?;
+    let (agent, _tool_registry) = assemble_agent(
+        bundle,
+        shared_permission,
+        frontend,
+        Arc::clone(&cwd),
+        // The REPL and one-shot paths have no multi-root concept; only ACP supplies extra
+        // workspace roots.
+        Arc::new(std::sync::RwLock::new(Vec::new())),
+    )
+    .await?;
 
     crate::tools::warn_on_stale_builtin_tool_config(&builtin_filter);
 
@@ -1733,6 +1746,7 @@ async fn run_tools_subcommand(
                 crate::skills::SkillCache::for_root(None),
                 crate::tools::BuiltinToolFilter::default(),
                 std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
+                std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
                 std::sync::Arc::new(crate::frontend::SilentFrontend),
             )?;
 

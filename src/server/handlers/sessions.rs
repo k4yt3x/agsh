@@ -365,6 +365,8 @@ pub async fn create_session(
         shared_permission.clone(),
         frontend_dyn,
         cwd.clone(),
+        // The HTTP API is single-root: additional workspace roots are an ACP-only surface.
+        Arc::new(std::sync::RwLock::new(Vec::new())),
     )
     .await
     .map_err(|error| ProblemDetail::internal_sanitized("failed to build session agent", error))?;

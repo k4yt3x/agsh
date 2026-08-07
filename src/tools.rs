@@ -498,6 +498,7 @@ impl ToolRegistry {
         sandbox_backend: crate::config::SandboxBackend,
         backend_probe: crate::sandbox::BackendProbe,
         cwd: crate::agent::SharedCwd,
+        roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<()> {
         let read_tracker = self.read_tracker.clone();
@@ -516,8 +517,14 @@ impl ToolRegistry {
             cwd: cwd.clone(),
             frontend: Arc::clone(&frontend),
         }));
-        self.register_builtin(Arc::new(find::FindFilesTool { cwd: cwd.clone() }));
-        self.register_builtin(Arc::new(grep::SearchContentsTool { cwd: cwd.clone() }));
+        self.register_builtin(Arc::new(find::FindFilesTool {
+            cwd: cwd.clone(),
+            roots: roots.clone(),
+        }));
+        self.register_builtin(Arc::new(grep::SearchContentsTool {
+            cwd: cwd.clone(),
+            roots,
+        }));
         // A malformed proxy URL or unreadable CA file surfaces as a startup error rather than
         // silently falling back to an unconfigured client (which would ignore the user's intent).
         let web_client = web::build_web_client(web_client_config)?;
@@ -662,6 +669,7 @@ impl ToolRegistry {
         skills: Arc<crate::skills::SkillCache>,
         builtin_filter: BuiltinToolFilter,
         cwd: crate::agent::SharedCwd,
+        roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
@@ -673,6 +681,7 @@ impl ToolRegistry {
             sandbox_backend,
             backend_probe,
             cwd.clone(),
+            roots,
             frontend,
         )?;
         registry.register_session_scoped_tools(
@@ -711,6 +720,7 @@ impl ToolRegistry {
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
+        roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
@@ -722,6 +732,7 @@ impl ToolRegistry {
             sandbox_backend,
             backend_probe,
             cwd.clone(),
+            roots,
             frontend,
         )?;
         registry.register_session_scoped_tools(
@@ -784,6 +795,7 @@ pub(crate) mod tests {
             crate::skills::SkillCache::for_root(None),
             filter,
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly")
@@ -1433,6 +1445,7 @@ pub(crate) mod tests {
             None,
             Vec::new(),
             crate::agent::test_cwd(),
+            crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
