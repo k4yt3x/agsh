@@ -26,6 +26,7 @@ use crate::server::{handlers, state::ServerState};
     ),
     paths(
         handlers::sessions::create_session,
+        handlers::sessions::fork_session,
         handlers::sessions::list_sessions,
         handlers::sessions::get_session,
         handlers::sessions::patch_session,
@@ -43,6 +44,7 @@ use crate::server::{handlers, state::ServerState};
     components(schemas(
         crate::server::errors::ProblemDetail,
         crate::server::handlers::sessions::CreateSessionRequest,
+        crate::server::handlers::sessions::ForkSessionBody,
         crate::server::handlers::sessions::CapabilitiesBody,
         crate::server::http_frontend::SessionCapabilities,
         crate::server::handlers::sessions::SessionResponse,

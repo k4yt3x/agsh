@@ -29,6 +29,7 @@ These are returned in `InitializeResponse.agentCapabilities`:
 - **`loadSession: true`**: the client may call `session/load` with any persisted session id.
 - **`sessionCapabilities.list`**: the client may call `session/list` to browse the persisted session catalogue (cwd-filtered, cursor-paginated; sub-agent audit sessions are hidden).
 - **`sessionCapabilities.resume`**: the client may adopt a persisted session id without replaying history.
+- **`sessionCapabilities.fork`**: the client may branch a copy off a persisted session (see [Forking](#forking)). **Unstable** in the protocol.
 - **`sessionCapabilities.close`**: the client may release the active session slot.
 - **`sessionCapabilities.additionalDirectories`**: the client may send extra workspace roots on `session/new`, `session/load`, and `session/resume` (see [Multi-root workspaces](#multi-root-workspaces)).
 - **`promptCapabilities.embeddedContext: true`**: the client may inline @-mentioned file contents as embedded `resource` blocks (see [Prompt turn](#prompt-turn)).
@@ -68,6 +69,7 @@ meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessi
 - **`session/load { sessionId, cwd, mcpServers }`**: replays the persisted conversation as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins.
 - **`session/list { cwd?, cursor? }`**: paginated index. Filtered to the requested cwd when present; sub-agent sessions are always hidden. `nextCursor` is opaque; round-trip it back to keep paging.
 - **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behaviour as `session/load`.
+- **`session/fork { sessionId, cwd, additionalDirectories, mcpServers }`**: copies the session's conversation into a new persisted session, adopts the copy as active, and returns its id. The source is left open and untouched. See [Forking](#forking).
 - **`session/close { sessionId }`**: cancels any in-flight prompt, releases the on-disk session lock, and removes the entry from the map.
 - **`session/cancel { sessionId }`**: interrupts the active `session/prompt`. The response carries `stopReason: "cancelled"`. If a cancel arrives between turns (after one prompt completed and before the next is installed), meka latches the signal and cancels the next prompt immediately on arrival.
 - **`session/set_mode { sessionId, modeId }`**: flips the agent's `Permission` cell. Modes outside `[permissions].enabled` from the config become JSON-RPC errors. On success, meka emits `session/update: current_mode_update`. The flip is atomic and applies to the *next* tool call within an in-flight turn; no need to wait for the turn to finish.
@@ -167,6 +169,18 @@ What the extra roots do and don't change:
 Every entry must be an absolute path; a relative one is rejected with `InvalidParams`.
 
 The list is persisted and reported back on `session/list` as `SessionInfo.additionalDirectories`, which is how a client rebuilds the workspace shape when you pick a session out of its history. `session/load` and `session/resume` carry the *complete resulting* list, so they replace what was stored rather than merging: reopening a session from a window that no longer has the second folder correctly narrows it, and an empty list clears the roots.
+
+## Forking
+
+`session/fork` branches a copy off a persisted session: the new session starts with the source's full conversation and continues from there, while the source stays open and unchanged. It's the protocol's way to explore a direction, or run something like a summary, without writing into the conversation the user is looking at.
+
+The request is a session-*creation* request, not a row copy: it carries its own `cwd` and `additionalDirectories`, and meka applies those to the fork rather than inheriting the source's. `mcpServers` is ignored, as on `session/new`. The response returns the new `sessionId` and the current `SessionMode` state, and the fork is registered as active immediately, so it can be prompted without a further `session/load` or `session/resume`.
+
+There is no replay: unlike `session/load`, forking emits no `session/update` stream for the copied history, since a client that just forked already has the transcript rendered.
+
+Sub-agent child transcripts are not copied, and the fork records no link back to its source. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
+
+This method is marked **unstable** in the protocol: it is not part of the spec yet and may change or be removed. Zed does not currently call it.
 
 ## Known limitations
 

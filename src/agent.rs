@@ -77,8 +77,13 @@ pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
 }
 
-/// The ordered set of roots a search should sweep when the caller named no explicit path: `cwd`
-/// first, then each additional root, with anything already covered by another root dropped.
+/// The ordered set of roots a **recursive** search should sweep when the caller named no explicit
+/// path: `cwd` first, then each additional root, with anything already covered by another root
+/// dropped.
+///
+/// Only correct for a walker that descends, which today means `search_contents`. A tool that
+/// anchors a pattern at each root instead wants [`glob_roots`]; dropping a contained root would
+/// drop the files under it.
 ///
 /// A root is dropped when some other root *contains* it, which subsumes exact duplicates. Both
 /// shapes are things a client legitimately sends: Zed may repeat `cwd` inside
@@ -87,9 +92,9 @@ pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
 /// slots of the result cap, and spends the shared walk budget twice.
 ///
 /// Containment is checked in both directions, so a root that is an *ancestor* of `cwd` wins and
-/// `cwd` drops out of the search set. That loses no coverage (the ancestor's walk reaches
-/// everything under `cwd`) and it does not affect `cwd`'s real job: it remains the base for
-/// relative paths and the shell's working directory regardless of what this returns.
+/// `cwd` drops out of the search set. A descending walk from the ancestor still reaches everything
+/// under `cwd`, and this does not affect `cwd`'s real job: it remains the base for relative paths
+/// and the shell's working directory regardless of what this returns.
 ///
 /// Paths are compared as given. A symlink pointing at another root, or a path containing `..`, is
 /// not detected; canonicalising to catch those would resolve symlinked roots to targets the client
@@ -103,6 +108,26 @@ pub fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
         // This root is broader than ones already kept, so those become redundant.
         kept.retain(|existing| !existing.starts_with(&path));
         kept.push(path);
+    }
+    kept
+}
+
+/// The ordered set of roots to anchor a glob at when the caller named no explicit path: `cwd`
+/// first, then each additional root, with only *exact* repeats dropped.
+///
+/// The counterpart to [`search_roots`] for a tool that builds one rooted pattern per root rather
+/// than descending from it. Containment must not drop anything here: `find_files` turns each root
+/// into `<root>/<pattern>`, and a glob's `*` does not cross `/`, so a workspace of `/work` plus
+/// `cwd = /work/main` would answer `*.md` from `/work/*.md` alone and miss
+/// `/work/main/README.md` entirely. That is the exact "the agent says a file you can see doesn't
+/// exist" failure multi-root support was added to prevent, so nested roots are all kept and the
+/// caller deduplicates the matches instead.
+pub fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)) {
+        if !kept.contains(&path) {
+            kept.push(path);
+        }
     }
     kept
 }

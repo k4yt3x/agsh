@@ -183,14 +183,19 @@ fn search_with_grep(
             None => {}
         }
 
+        let path = std::path::Path::new(search_path.as_str());
+
         // Stop before the walk, not after, so the remaining roots are counted rather than silently
-        // dropped.
+        // dropped. Checked after `exists`, not before: counting a stale root here would advertise
+        // "pass `path` to search one of them directly" about a directory that is gone, and the
+        // model spends a round trip discovering that.
         if results.len() > max_results {
-            unsearched_roots += 1;
+            if path.exists() {
+                unsearched_roots += 1;
+            }
             continue;
         }
 
-        let path = std::path::Path::new(search_path.as_str());
         if path.is_file() {
             searched_any = true;
             search_file(&matcher, path, &mut results, max_results)?;
@@ -248,7 +253,8 @@ fn search_with_grep(
     }
     if unsearched_roots > 0 {
         notes.push(format!(
-            "{} workspace root(s) were not searched because the match cap filled first: pass              `path` to search one of them directly, or `scratchpad` to lift the cap",
+            "{} workspace root(s) were not searched because the match cap filled first: pass \
+             `path` to search one of them directly, or `scratchpad` to lift the cap",
             unsearched_roots,
         ));
     }
@@ -407,6 +413,43 @@ mod tests {
         assert!(!result.is_error);
         assert!(text_content(&result).contains("hello world"));
         assert!(text_content(&result).contains("hello again"));
+    }
+
+    /// The counterpart to `find_files`' nested-root test, pinning why the two tools use different
+    /// root sets. `search_contents` descends, so `search_roots` pruning `cwd` in favour of an
+    /// ancestor genuinely loses nothing here. If that ever stops holding, this fails rather than
+    /// the tool quietly reporting a file in `cwd` as absent.
+    #[tokio::test]
+    async fn test_search_contents_reaches_cwd_through_an_ancestor_root() {
+        let top = tempfile::tempdir().expect("tempdir");
+        let nested = top.path().join("main");
+        std::fs::create_dir(&nested).expect("mkdir");
+        std::fs::write(nested.join("README.md"), "needle here\n").expect("write");
+
+        let tool = SearchContentsTool {
+            cwd: std::sync::Arc::new(std::sync::RwLock::new(nested.clone())),
+            roots: std::sync::Arc::new(std::sync::RwLock::new(vec![top.path().to_path_buf()])),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "needle" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("needle here"),
+            "a descending walk from the ancestor must still reach cwd; got: {}",
+            text,
+        );
+        assert_eq!(
+            text.matches("README.md").count(),
+            1,
+            "and must not report it twice; got: {}",
+            text,
+        );
     }
 
     #[tokio::test]
@@ -586,8 +629,48 @@ mod tests {
 
         assert!(output.contains("truncated"), "got: {}", output);
         assert!(
-            output.contains("not searched"),
+            output.contains("1 workspace root(s) were not searched"),
             "an unsearched root must be disclosed, not implied by absence; got: {}",
+            output
+        );
+        // The note is prose the model reads and acts on, so pin it as prose: a `\`-continued string
+        // literal that loses its leading-whitespace escape silently ships a run of spaces
+        // mid-sentence, which no substring assertion would notice.
+        assert!(
+            !output.contains("  "),
+            "the disclosure must not contain runs of whitespace; got: {}",
+            output
+        );
+    }
+
+    /// A root that no longer exists must not be counted into the cap-filled disclosure. It was not
+    /// skipped because the cap filled, and telling the model to `path`-search it directly buys a
+    /// round trip that can only answer "does not exist".
+    #[test]
+    fn test_search_does_not_blame_the_cap_for_a_stale_root() {
+        let busy = tempfile::tempdir().expect("tempdir");
+        let body = (0..MAX_INLINE_MATCHES + 20)
+            .map(|_| "needle\n")
+            .collect::<String>();
+        std::fs::write(busy.path().join("busy.txt"), body).expect("write");
+
+        let budget = WalkBudget::new(CancellationToken::new());
+        let output = search_with_grep(
+            "needle",
+            &[
+                busy.path().to_string_lossy().into_owned(),
+                "/nonexistent-workspace-root".to_string(),
+            ],
+            None,
+            MAX_INLINE_MATCHES,
+            &budget,
+        )
+        .expect("search should return, not error");
+
+        assert!(output.contains("truncated"), "got: {}", output);
+        assert!(
+            !output.contains("not searched"),
+            "a stale root is not a root the cap starved; got: {}",
             output
         );
     }

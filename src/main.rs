@@ -1075,6 +1075,31 @@ async fn run_interactive(
                         }
                         None => eprintln!("No active session to export."),
                     },
+                    repl::SlashCommand::Fork => match session_id {
+                        Some(id) => match fork_and_lock(&session_manager, id).await {
+                            Ok(ForkHandoff::Switched { id, lock }) => {
+                                // Assigning over `session_lock` drops the original guard only now
+                                // that the new one is held; see `fork_and_lock`.
+                                session_lock = Some(lock);
+                                session_id = Some(id);
+                                // `messages` is deliberately untouched, so the branch happens at
+                                // the current head and the next turn continues in the copy.
+                                render::render_session_id("Forked session", &id.to_string());
+                            }
+                            Ok(ForkHandoff::LockFailed { id, error }) => {
+                                render::render_error(&error);
+                                render::render_hint(&format!(
+                                    "Staying in the original. The copy exists: {}",
+                                    id
+                                ));
+                            }
+                            Ok(ForkHandoff::SourceGone) => {
+                                eprintln!("Session no longer exists: {}", id);
+                            }
+                            Err(error) => eprintln!("Failed to fork session: {}", error),
+                        },
+                        None => eprintln!("No active session to fork."),
+                    },
                     repl::SlashCommand::McpList => {
                         if let Err(error) =
                             mcp::cli::run_list(&config.mcp_servers, mcp_manager.as_ref()).await
@@ -1363,6 +1388,12 @@ struct ExportedSession {
     cwd: Option<String>,
     permission: Option<String>,
     capabilities_json: Option<String>,
+    /// Workspace roots beyond `cwd`. `#[serde(default)]` rather than a `format_version` bump:
+    /// [`plan_import`] rejects any version it doesn't equal exactly, so bumping would make every
+    /// export written before this field unimportable, while an absent field already means the
+    /// single-root sessions those exports describe.
+    #[serde(default)]
+    additional_roots: Vec<std::path::PathBuf>,
     stats: crate::stats::SessionStatsSnapshot,
     events: Vec<ExportedEvent>,
     tool_outputs: std::collections::BTreeMap<String, String>,
@@ -1454,6 +1485,7 @@ async fn build_session_export(
             cwd: meta.cwd,
             permission: meta.permission,
             capabilities_json: meta.capabilities_json,
+            additional_roots: meta.additional_roots,
             stats,
             events,
             tool_outputs,
@@ -1503,6 +1535,72 @@ async fn import_session(session_manager: &SessionManager, input: &str) -> anyhow
         eprintln!("Imported session. Resume with: meka -c {}", root_new_id);
     }
     println!("{}", root_new_id);
+    Ok(())
+}
+
+/// Result of the REPL's `/fork`, which has to hand the on-disk session lock from the session it is
+/// leaving to the copy it is entering.
+enum ForkHandoff {
+    /// The copy exists and its lock is held. The caller assigns this over its current lock, which
+    /// releases the original only once the new one is owned.
+    Switched {
+        id: uuid::Uuid,
+        lock: crate::session::SessionLock,
+    },
+    /// The copy exists but its lock could not be taken, so the caller stays where it is. The id is
+    /// carried so the user can still be told where the copy went.
+    LockFailed {
+        id: uuid::Uuid,
+        error: crate::error::MekaError,
+    },
+    /// The session being forked no longer exists.
+    SourceGone,
+}
+
+/// Fork `source` and take the copy's lock, in that order and without touching the caller's own.
+///
+/// The ordering is the point. Releasing the current lock first and then failing to acquire the new
+/// one would leave the REPL running against an unlocked session that a second `meka` process could
+/// open and interleave events into. Acquiring first means the failure path is simply "stay put",
+/// and the caller drops its old lock only by overwriting it with the new one.
+async fn fork_and_lock(
+    session_manager: &SessionManager,
+    source: uuid::Uuid,
+) -> anyhow::Result<ForkHandoff> {
+    let Some(forked) = session_manager
+        .fork_session(source, crate::session::ForkOverrides::default())
+        .await?
+    else {
+        return Ok(ForkHandoff::SourceGone);
+    };
+    match session_manager.lock_session(forked.id) {
+        Ok(lock) => Ok(ForkHandoff::Switched {
+            id: forked.id,
+            lock,
+        }),
+        Err(error) => Ok(ForkHandoff::LockFailed {
+            id: forked.id,
+            error,
+        }),
+    }
+}
+
+/// `meka session fork <id>`: copy a session's conversation into a new one and print the new ID.
+///
+/// Output split mirrors [`import_session`]: the bare ID on stdout so `id=$(meka session fork …)`
+/// works, the resume hint on stderr.
+async fn fork_session_command(
+    session_manager: &SessionManager,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let forked = session_manager
+        .fork_session(session_id, crate::session::ForkOverrides::default())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
+
+    tracing::info!("forked session {} into {}", session_id, forked.id);
+    eprintln!("Forked session. Resume with: meka -c {}", forked.id);
+    println!("{}", forked.id);
     Ok(())
 }
 
@@ -1560,10 +1658,10 @@ fn plan_import(
             new_id,
             new_parent_id,
             created_at: session.created_at,
-            updated_at: session.updated_at,
             cwd: session.cwd,
             permission: session.permission,
             capabilities_json: session.capabilities_json,
+            additional_roots: session.additional_roots,
             stats: session.stats,
             events: session
                 .events
@@ -2090,6 +2188,9 @@ async fn run_session_subcommand(
             delete_sessions(session_manager, session_ids, *all).await
         }
         cli::SessionAction::Import { input } => import_session(session_manager, input).await,
+        cli::SessionAction::Fork { session_id } => {
+            fork_session_command(session_manager, *session_id).await
+        }
     }
 }
 
@@ -2669,6 +2770,170 @@ mod tests {
                 .await
                 .expect("load outputs"),
             vec![("tool_1_output".to_string(), "big output".to_string())],
+        );
+    }
+
+    /// `/fork` must own the copy's lock before the REPL lets go of the one it is holding. That
+    /// ordering is now structural rather than tested: [`fork_and_lock`] is handed no lock, so it
+    /// has no way to release the caller's, and the caller can only give its up by assigning the
+    /// returned one over it.
+    ///
+    /// What this pins is the pair of facts that make the structure sound: the returned lock is
+    /// genuinely held on the copy (not a stale handle the REPL would rely on), and the source's
+    /// lock is untouched, so the failure path really is "stay put".
+    #[tokio::test]
+    async fn test_fork_and_lock_holds_both_locks_at_the_handoff() {
+        use std::path::Path;
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+        let source = manager.create_session(None).await.expect("create");
+        let source_lock = manager.lock_session(source).expect("lock source");
+
+        let handoff = fork_and_lock(&manager, source).await.expect("fork");
+        let ForkHandoff::Switched { id, lock } = handoff else {
+            panic!("expected a switch");
+        };
+
+        assert!(
+            manager.lock_session(id).is_err(),
+            "the returned lock must actually be held on the copy"
+        );
+        assert!(
+            manager.lock_session(source).is_err(),
+            "and the source's lock must still be held: releasing it first is the bug"
+        );
+
+        // Only once the caller drops the old guard does the source become available again.
+        drop(source_lock);
+        manager.lock_session(source).expect("source is free again");
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn test_fork_and_lock_reports_a_missing_source() {
+        use std::path::Path;
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+        assert!(matches!(
+            fork_and_lock(&manager, uuid::Uuid::new_v4())
+                .await
+                .expect("fork"),
+            ForkHandoff::SourceGone,
+        ));
+    }
+
+    /// Multi-root sessions used to come back from an export as single-root: the column existed but
+    /// no export/import struct carried it.
+    #[tokio::test]
+    async fn test_session_export_preserves_additional_roots() {
+        use std::path::{Path, PathBuf};
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+        let root = manager
+            .create_session(Some(PathBuf::from("/work/main")))
+            .await
+            .expect("root");
+        let roots = vec![PathBuf::from("/work/shared"), PathBuf::from("/work/docs")];
+        manager
+            .update_session_roots(root, &roots)
+            .await
+            .expect("roots");
+
+        let export = build_session_export(&manager, root).await.expect("export");
+        let json = serde_json::to_string(&export).expect("serialize");
+        let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
+        let (records, new_id) = plan_import(reparsed).expect("plan");
+        manager.import_sessions(records).await.expect("import");
+
+        assert_eq!(
+            manager
+                .session_info(new_id)
+                .await
+                .expect("info")
+                .expect("row")
+                .additional_roots,
+            roots,
+        );
+    }
+
+    /// An export written before `additional_roots` existed must still import. This is why the field
+    /// is `#[serde(default)]` instead of a `format_version` bump, which `plan_import` would reject.
+    #[test]
+    fn test_plan_import_accepts_an_export_without_additional_roots() {
+        let json = serde_json::json!({
+            "format_version": SESSION_EXPORT_FORMAT_VERSION,
+            "meka_version": "0.0.0",
+            "exported_at": "2020-01-01T00:00:00Z",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": null,
+                "capabilities_json": null,
+                "stats": crate::stats::SessionStatsSnapshot::default(),
+                "events": [],
+                "tool_outputs": {},
+            }],
+        });
+        let export: SessionExport = serde_json::from_value(json).expect("deserialize");
+        let (records, _) = plan_import(export).expect("plan");
+        assert!(records[0].additional_roots.is_empty());
+    }
+
+    /// Regression: import restored the export's `updated_at`, and retention GC deletes by that
+    /// column at every agent startup, so restoring an archive older than `retention_days` was
+    /// undone by the next launch before anyone could resume it.
+    #[tokio::test]
+    async fn test_import_survives_retention_gc() {
+        use std::path::Path;
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+        let stale = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        let records = vec![crate::session::ImportSessionRecord {
+            new_id: uuid::Uuid::new_v4(),
+            new_parent_id: None,
+            created_at: stale.clone(),
+            cwd: None,
+            permission: None,
+            capabilities_json: None,
+            additional_roots: Vec::new(),
+            stats: crate::stats::SessionStatsSnapshot::default(),
+            events: Vec::new(),
+            tool_outputs: Vec::new(),
+        }];
+        let imported_id = records[0].new_id;
+        manager.import_sessions(records).await.expect("import");
+
+        assert_eq!(
+            manager
+                .delete_expired_sessions(90)
+                .await
+                .expect("retention sweep"),
+            0,
+            "a freshly imported archive must not be swept on the next launch"
+        );
+        assert!(manager.session_exists(imported_id).await.expect("exists"));
+
+        // `created_at` still carries the original for provenance.
+        assert_eq!(
+            manager
+                .session_info(imported_id)
+                .await
+                .expect("info")
+                .expect("row")
+                .created_at,
+            stale,
         );
     }
 

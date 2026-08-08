@@ -120,6 +120,14 @@ pub enum SessionAction {
         /// Export file to read (`-` for stdin)
         input: String,
     },
+    /// Fork a session into an independent copy
+    ///
+    /// The copy carries the original's full conversation and continues from
+    /// there; the original is untouched. Prints the new session ID.
+    Fork {
+        /// Session UUID to fork
+        session_id: uuid::Uuid,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -738,6 +746,18 @@ mod tests {
                 action: SessionAction::Export { output, .. },
             }) => assert_eq!(output.as_deref(), Some("-")),
             other => panic!("expected session export, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_session_fork_subcommand() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let cli = Cli::parse_from(["meka", "session", "fork", id]);
+        match cli.command {
+            Some(Command::Session {
+                action: SessionAction::Fork { session_id },
+            }) => assert_eq!(session_id.to_string(), id),
+            other => panic!("expected session fork, got {:?}", other),
         }
     }
 

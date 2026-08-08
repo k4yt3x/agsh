@@ -140,7 +140,19 @@ pub async fn ensure_session_loaded(
             ProblemDetail::internal_sanitized("failed to load session events", error)
                 .with("session_id", id.to_string())
         })?;
-    let conversation = Conversation::from_events(events);
+    let mut conversation = Conversation::from_events(events);
+    // Drop an orphaned `tool_use` (no following `tool_result`) before adopting the session; the
+    // provider rejects orphans on the next request. Matches the ACP load/resume/fork paths and REPL
+    // resume, so every route back into a persisted session sanitises the same way: without this an
+    // evicted session whose log stopped mid-tool-call came back only to fail its next turn.
+    let dropped = conversation.sanitize_orphans();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "dropped {} orphaned assistant message(s) with unmatched tool calls while re-attaching session {}",
+            dropped.len(),
+            id,
+        );
+    }
 
     let http_frontend = Arc::new(HttpFrontend::with_capabilities(capabilities));
     let frontend_dyn: Arc<dyn crate::frontend::Frontend> = http_frontend.clone();

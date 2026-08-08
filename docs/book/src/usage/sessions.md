@@ -213,6 +213,36 @@ cat session.json | meka session import -
 
 The import preserves the full conversation, per-message timestamps, cumulative stats, and scratchpad entries. Because the provider and model are chosen at run time (not stored per session), a resumed import uses your currently-active provider.
 
+`updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than your `retention_days` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
+
+## Forking a Session
+
+Branch off an existing conversation without disturbing it:
+
+```bash
+meka session fork 550e8400-e29b-41d4-a716-446655440000
+```
+
+The copy starts with the original's full conversation and continues from there under a new UUID, which is printed on stdout so it can be captured:
+
+```bash
+meka -c "$(meka session fork 550e8400-e29b-41d4-a716-446655440000)"
+```
+
+Use it to try a different direction from a known-good point, to run a throwaway question against a large accumulated context, or to keep a conversation you're about to compact.
+
+What the copy carries: the full event log, scratchpad entries, working directory, permission level, additional workspace roots, and cumulative stats. What it does **not**: sub-agent child transcripts (the sub-agent's result already sits in the parent conversation as a tool result, so the copy is complete without them), and the timestamps, which are stamped fresh.
+
+A fork records no link back to the session it came from; it is a top-level session like any other.
+
+Forking copies what has been committed to the database, so forking a session with a turn in flight can capture that turn partially: the user message is persisted before the model is called, and each assistant round lands together with its tool results as it completes. The copy may therefore end mid-turn, with a user message that has no reply yet, or an assistant round that was not the last. Because each round and its tool results are written as one unit, the copy is never internally inconsistent, just short. Fork between turns if you want an exact copy.
+
+The same operation is available from the REPL as `/fork`, which switches you into the copy and leaves the original where you branched; over HTTP as `POST /v1/sessions/{id}/fork`; and over ACP as `session/fork`.
+
+### Fork or export/import?
+
+Both produce a runnable copy under a new ID. Reach for `fork` to branch a conversation you're working on, and for `export` + `import` to move a session between machines or keep an archive. Export/import also copies sub-agent transcripts and preserves `created_at`, because an archive should restore whole.
+
 ## Deleting Sessions
 
 Delete specific sessions by UUID:

@@ -102,7 +102,7 @@ impl Tool for FindFilesTool {
         // silently misses whole folders the user can see in their editor.
         let base_paths = match input["path"].as_str() {
             Some(raw) => vec![crate::agent::resolve_against_cwd(&self.cwd, raw)],
-            None => crate::agent::search_roots(&self.cwd, &self.roots),
+            None => crate::agent::glob_roots(&self.cwd, &self.roots),
         };
         let full_patterns: Vec<String> = base_paths
             .iter()
@@ -166,6 +166,12 @@ impl Tool for FindFilesTool {
 /// matches root one produced.
 fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result<FindOutcome> {
     let mut matches: Vec<String> = Vec::new();
+    // Roots are kept even when one nests inside another (see `glob_roots`), so a pattern that
+    // crosses directories can match the same file from two of them: with roots `/work` and
+    // `/work/main`, `**/*.md` finds `/work/main/README.md` under both. Deduplicate here rather
+    // than by pruning roots, which is what would lose files. Skipped for a single pattern, which
+    // cannot repeat a path, so the common case allocates nothing.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Total continues past the storage cap so the truncation message can report the real number of
     // matches. Note that the cap bounds only what is stored: a pattern that matches nothing never
     // reaches it, so the cap is not a bound on the walk. `budget` is.
@@ -210,9 +216,13 @@ fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result
             }
             match entry {
                 Ok(path) => {
+                    let rendered = path.display().to_string();
+                    if full_patterns.len() > 1 && !seen.insert(rendered.clone()) {
+                        continue;
+                    }
                     total += 1;
                     if matches.len() < cap {
-                        matches.push(path.display().to_string());
+                        matches.push(rendered);
                     }
                 }
                 Err(error) => {
@@ -301,6 +311,39 @@ mod tests {
         assert!(text_content(&result).contains("a.txt"));
         assert!(text_content(&result).contains("b.txt"));
         assert!(!text_content(&result).contains("c.rs"));
+    }
+
+    /// End-to-end guard for the root set `execute` picks. [`crate::agent::search_roots`] and
+    /// [`crate::agent::glob_roots`] have identical signatures, so swapping one for the other still
+    /// compiles and the `run_walk` tests (which take patterns, not roots) stay green. Only a
+    /// tool-level search of a workspace whose roots nest catches it.
+    #[tokio::test]
+    async fn test_find_files_sweeps_cwd_when_an_additional_root_contains_it() {
+        let top = tempfile::tempdir().expect("tempdir");
+        let nested = top.path().join("main");
+        std::fs::create_dir(&nested).expect("mkdir");
+        std::fs::write(nested.join("README.md"), "").expect("write");
+        std::fs::write(top.path().join("top.md"), "").expect("write");
+
+        let tool = FindFilesTool {
+            cwd: std::sync::Arc::new(std::sync::RwLock::new(nested.clone())),
+            roots: std::sync::Arc::new(std::sync::RwLock::new(vec![top.path().to_path_buf()])),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({ "pattern": "*.md" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("README.md"),
+            "a file in cwd must be found even when the workspace also names cwd's parent; got: {}",
+            text,
+        );
+        assert!(text.contains("top.md"), "got: {}", text);
     }
 
     #[tokio::test]
@@ -536,6 +579,61 @@ mod tests {
         assert!(outcome.matches.iter().any(|m| m.ends_with("a.txt")));
         assert!(outcome.matches.iter().any(|m| m.ends_with("b.txt")));
         assert!(!outcome.timed_out);
+    }
+
+    /// A file under `cwd` must still be found when the workspace also names an ancestor of `cwd`.
+    /// `find_files` anchors the caller's pattern at each root and a glob's `*` does not cross `/`,
+    /// so pruning the nested root (which is right for a descending walk, and what `search_roots`
+    /// does) would answer `*.md` from the ancestor alone and report the file as missing.
+    #[test]
+    fn test_run_walk_finds_files_under_a_root_nested_in_another() {
+        let top = tempfile::tempdir().expect("tempdir");
+        let nested = top.path().join("main");
+        std::fs::create_dir(&nested).expect("mkdir");
+        std::fs::write(top.path().join("top.md"), "").expect("write");
+        std::fs::write(nested.join("README.md"), "").expect("write");
+
+        // The order `glob_roots` produces for cwd = <top>/main with an additional root of <top>.
+        let patterns = vec![
+            format!("{}/*.md", nested.to_string_lossy()),
+            format!("{}/*.md", top.path().to_string_lossy()),
+        ];
+        let budget = WalkBudget::new(CancellationToken::new());
+        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+
+        assert!(
+            outcome.matches.iter().any(|m| m.ends_with("README.md")),
+            "the file under the nested root must be found; got: {:?}",
+            outcome.matches,
+        );
+        assert!(outcome.matches.iter().any(|m| m.ends_with("top.md")));
+        assert_eq!(outcome.total, 2);
+    }
+
+    /// Keeping nested roots means a directory-crossing pattern can match one file from two of them.
+    /// The dedupe is what makes that safe; without it the file is listed twice and burns two slots
+    /// of the result cap.
+    #[test]
+    fn test_run_walk_reports_a_doubly_matched_file_once() {
+        let top = tempfile::tempdir().expect("tempdir");
+        let nested = top.path().join("main");
+        std::fs::create_dir(&nested).expect("mkdir");
+        std::fs::write(nested.join("README.md"), "").expect("write");
+
+        let patterns = vec![
+            format!("{}/**/*.md", top.path().to_string_lossy()),
+            format!("{}/**/*.md", nested.to_string_lossy()),
+        ];
+        let budget = WalkBudget::new(CancellationToken::new());
+        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+
+        assert_eq!(
+            outcome.matches.len(),
+            1,
+            "a file reachable from two roots must be listed once; got: {:?}",
+            outcome.matches,
+        );
+        assert_eq!(outcome.total, 1, "and must not be double-counted");
     }
 
     /// The budget spans the whole call rather than resetting per root. A budget already spent when

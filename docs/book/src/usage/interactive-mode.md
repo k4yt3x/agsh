@@ -109,6 +109,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/session` | Show the current session ID |
 | `/permission [none\|read\|ask\|write]` | Show or set the permission level |
 | `/compact` | Summarize and compact the session history |
+| `/fork` | Branch into a copy of this session, freezing the original where you are |
 | `/cd [path]` | Change working directory |
 | `/mcp list` | List configured MCP servers with their live state (`pending` / `connected` / `failed` / `disabled`) |
 | `/mcp reconnect <server>` | Smoke-test connect for one server |
@@ -172,6 +173,14 @@ This is distinct from `/status`, which reports this session's own token counters
 The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
 After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
+
+### `/fork`
+
+`/fork` copies the current session and switches you into the copy, printing its ID. Your conversation carries over untouched, so the branch happens exactly where you are; the original stops there and keeps everything up to that point.
+
+Use it before trying a direction you might want to back out of, or before `/compact` if you'd rather keep the uncompacted conversation around. To go back, exit and resume the original with `meka -c <old-id>`.
+
+The copy is a fully independent session with no link back to its source. See [Forking a Session](./sessions.md#forking-a-session) for exactly what it carries.
 
 ## Shell Escape
 

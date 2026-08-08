@@ -222,6 +222,10 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             "/v1/sessions/{id}/messages",
             get(handlers::messages::list_messages),
         )
+        .route(
+            "/v1/sessions/{id}/fork",
+            post(handlers::sessions::fork_session),
+        )
         .route("/v1/sessions/{id}/turn", post(handlers::turn::submit_turn))
         .route(
             "/v1/sessions/{id}/cancel",

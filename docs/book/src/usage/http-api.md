@@ -96,11 +96,12 @@ data: {"turn_id":"...","session_id":"...","stop_reason":"end_turn","usage":{"inp
 A session is a persistent conversation with its own working directory, permission level, and message history. Sessions are stored in the same SQLite database as REPL and ACP sessions; they're interchangeable.
 
 ```
-POST   /v1/sessions          Create a session
+POST   /v1/sessions           Create a session
 GET    /v1/sessions           List sessions (paginated)
 GET    /v1/sessions/{id}      Get session details
 PATCH  /v1/sessions/{id}      Update permission or cwd
 DELETE /v1/sessions/{id}      Close and clean up
+POST   /v1/sessions/{id}/fork Branch a copy off a session
 ```
 
 When creating a session, specify the working directory and optionally a permission level and capabilities:
@@ -139,6 +140,24 @@ prompt on, which is the normal case for a service-to-service client streaming fo
 tools are then denied immediately with an explanatory `notice`, the same as blocking mode. Leaving it
 `true` means every gated call parks for 60 seconds and then denies anyway, which is hard to tell
 apart from a hang. Better still, create the session with `permission: "write"` so nothing is gated.
+
+#### Forking a session
+
+`POST /v1/sessions/{id}/fork` copies a session's conversation into a new session and returns it with
+`201` and the usual session body. The copy starts with the source's full history and is immediately
+usable; the source is left untouched, and does not have to be in memory, so a GC-evicted session
+forks as well as a live one.
+
+The body is optional and inherits everything by default. The only field is `cwd`, matching ACP's
+`session/fork`, which likewise carries a workspace but no permission or capability fields:
+
+```json
+{ "cwd": "/home/user/other-project" }
+```
+
+Permission and capabilities are inherited and remain changeable afterwards via
+`PATCH /v1/sessions/{id}`. Sub-agent child transcripts are not copied, and the fork records no link
+back to its source. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
 
 #### Detecting an in-flight turn
 
@@ -636,6 +655,7 @@ Key points:
 | GET | `/v1/sessions/{id}` | `sessions:r` | Get session |
 | PATCH | `/v1/sessions/{id}` | `sessions:w` | Update session |
 | DELETE | `/v1/sessions/{id}` | `sessions:w` | Delete session |
+| POST | `/v1/sessions/{id}/fork` | `sessions:w` | Fork session |
 | GET | `/v1/sessions/{id}/messages` | `sessions:r` | List messages |
 | POST | `/v1/sessions/{id}/turn` | `sessions:w` | Submit turn |
 | POST | `/v1/sessions/{id}/cancel` | `sessions:w` | Cancel turn |

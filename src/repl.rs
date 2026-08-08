@@ -82,6 +82,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "",
     },
     CommandSpec {
+        name: "fork",
+        aliases: &[],
+        help: "Fork this session and continue in the copy",
+        arg_hint: "",
+    },
+    CommandSpec {
         name: "cd",
         aliases: &[],
         help: "Change working directory",
@@ -480,6 +486,9 @@ pub enum SlashCommand {
     Permission(Option<String>),
     Compact,
     Export,
+    /// `/fork`: copy the current session and continue in the copy. The in-memory conversation is
+    /// untouched, so the branch happens at the current head and the original freezes where it was.
+    Fork,
     Cd(Option<String>),
     /// `/mcp <server>:<prompt> [args...]`: render an MCP prompt and send its messages as the next
     /// user turn.
@@ -569,6 +578,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
         "export" => Some(SlashCommand::Export),
+        "fork" => Some(SlashCommand::Fork),
         "cd" => Some(SlashCommand::Cd(argument)),
         "mcp" => parse_mcp_slash(argument.as_deref().unwrap_or("")),
         "skill" => Some(parse_skill_slash(argument.as_deref().unwrap_or(""))),
@@ -854,6 +864,7 @@ pub fn run_repl(
                             command @ (SlashCommand::Session
                             | SlashCommand::Compact
                             | SlashCommand::Export
+                            | SlashCommand::Fork
                             | SlashCommand::McpPrompt { .. }
                             | SlashCommand::McpList
                             | SlashCommand::McpReconnect { .. }
@@ -1820,6 +1831,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slash_command_fork() {
+        assert!(matches!(
+            parse_slash_command("/fork"),
+            Some(SlashCommand::Fork)
+        ));
+    }
+
+    #[test]
     fn test_parse_slash_command_history_no_args() {
         assert!(matches!(
             parse_slash_command("/history"),
@@ -2093,6 +2112,7 @@ mod tests {
             Some(SlashCommand::Permission(_)) => "Permission",
             Some(SlashCommand::Compact) => "Compact",
             Some(SlashCommand::Export) => "Export",
+            Some(SlashCommand::Fork) => "Fork",
             Some(SlashCommand::Cd(_)) => "Cd",
             Some(SlashCommand::McpList) => "McpList",
             Some(SlashCommand::McpReconnect { .. }) => "McpReconnect",

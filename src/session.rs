@@ -58,6 +58,23 @@ pub struct SessionMetaRow {
     pub cwd: Option<String>,
     pub permission: Option<String>,
     pub capabilities_json: Option<String>,
+    /// Workspace roots beyond `cwd`. Empty for every non-ACP session and for rows written before
+    /// the column existed, both of which were single-root.
+    pub additional_roots: Vec<PathBuf>,
+}
+
+/// Per-surface overrides applied to the copy produced by [`SessionManager::fork_session`]. Each
+/// `None` field inherits the source session's value.
+///
+/// `cwd` and `additional_roots` exist because ACP models `session/fork` as a session-*creation*
+/// request: it carries its own workspace, which may legitimately differ from the source's.
+/// `token_id` is never inherited (it fingerprints the bearer token that created a session, so the
+/// forking caller's token is the only correct value); `None` simply leaves it NULL.
+#[derive(Debug, Default, Clone)]
+pub struct ForkOverrides {
+    pub cwd: Option<std::path::PathBuf>,
+    pub additional_roots: Option<Vec<PathBuf>>,
+    pub token_id: Option<String>,
 }
 
 /// One session's worth of data for [`SessionManager::import_sessions`]. IDs are already freshly
@@ -67,10 +84,12 @@ pub struct ImportSessionRecord {
     pub new_id: Uuid,
     pub new_parent_id: Option<Uuid>,
     pub created_at: String,
-    pub updated_at: String,
     pub cwd: Option<String>,
     pub permission: Option<String>,
     pub capabilities_json: Option<String>,
+    /// Workspace roots beyond `cwd`, carried across an export/import round trip. Defaults to empty
+    /// for exports written before the field existed.
+    pub additional_roots: Vec<PathBuf>,
     pub stats: crate::stats::SessionStatsSnapshot,
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub events: Vec<(String, crate::conversation::Event)>,
@@ -788,6 +807,117 @@ impl SessionManager {
         Ok(session_id)
     }
 
+    /// Copy `source`'s conversation into a brand-new top-level session and return it, or `Ok(None)`
+    /// when `source` doesn't exist (callers map that to their own not-found shape). The whole copy
+    /// is one transaction, so a failure leaves no half-built session behind.
+    ///
+    /// What travels: the event log verbatim (per-event timestamps included), `tool_outputs`,
+    /// `permission`, `capabilities_json`, the cumulative stats, and `cwd` / `additional_roots`
+    /// unless [`ForkOverrides`] replaces them.
+    ///
+    /// What deliberately does not:
+    ///
+    /// - **`created_at` / `updated_at`**, both stamped to now. Retention GC deletes by `updated_at`
+    ///   at every agent startup, so inheriting the source's would let a fork of an old session be
+    ///   swept before its first turn.
+    /// - **`parent_session_id`**, left NULL. That column means "sub-agent parent", and
+    ///   [`Self::list_sessions`] hides rows that have one, so reusing it for fork lineage would
+    ///   make every fork invisible to `meka session list`.
+    /// - **Sub-agent children.** A child links to its parent only through `parent_session_id`,
+    ///   while the sub-agent's *result* already sits in the parent's own event log as a tool
+    ///   result, so the copy is self-contained without them. This is the intended divergence from
+    ///   [`Self::import_sessions`], which copies the tree because an archive should restore whole.
+    ///
+    /// Copying in SQL rather than through the export/import structs is deliberate: routing a fork
+    /// through that envelope is precisely how `additional_roots` came to be silently dropped. The
+    /// column list below lives next to the schema, and `fork_copies_every_session_column` fails
+    /// when a new column appears without a decision about it.
+    pub async fn fork_session(
+        &self,
+        source: Uuid,
+        overrides: ForkOverrides,
+    ) -> Result<Option<CreatedSession>> {
+        let new_id = Uuid::new_v4();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let cwd_override = overrides.cwd.map(|path| path.display().to_string());
+        // A flag rather than a nested `Option`: "inherit" and "override with no roots" both encode
+        // to SQL NULL, so `COALESCE` alone can't tell them apart and would resurrect the source's
+        // roots when a caller explicitly asked for none.
+        let (override_roots, roots_override) = match overrides.additional_roots {
+            Some(roots) => (true, encode_additional_roots(&roots)?),
+            None => (false, None),
+        };
+
+        let created_at_for_db = created_at.clone();
+        let inserted = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<bool> {
+                let txn = connection.transaction()?;
+                let source_id = source.to_string();
+                let new_id_string = new_id.to_string();
+
+                // The enclosing transaction is what makes the three statements below a consistent
+                // snapshot: the first `INSERT` takes SQLite's write lock, so no other connection
+                // can append an event to the source between the row copy and the message copy.
+                let rows = txn.execute(
+                    "INSERT INTO sessions (
+                         id, created_at, updated_at, parent_session_id, cwd, permission,
+                         capabilities_json, token_id, additional_roots_json, stat_turns,
+                         stat_input_tokens, stat_output_tokens,
+                         stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
+                         stat_redactions, stat_redacted_images, stat_redacted_bytes
+                     )
+                     SELECT ?1, ?2, ?2, NULL, COALESCE(?3, cwd), permission,
+                            capabilities_json, ?4,
+                            CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, stat_turns,
+                            stat_input_tokens, stat_output_tokens,
+                            stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
+                            stat_redactions, stat_redacted_images, stat_redacted_bytes
+                     FROM sessions WHERE id = ?7",
+                    rusqlite::params![
+                        new_id_string,
+                        created_at_for_db,
+                        cwd_override,
+                        overrides.token_id,
+                        override_roots,
+                        roots_override,
+                        source_id,
+                    ],
+                )?;
+                if rows == 0 {
+                    // No source row: nothing was inserted, so the rollback is a formality.
+                    txn.rollback()?;
+                    return Ok(false);
+                }
+
+                txn.execute(
+                    "INSERT INTO messages (session_id, role, content, created_at)
+                     SELECT ?1, role, content, created_at
+                     FROM messages WHERE session_id = ?2 ORDER BY id ASC",
+                    rusqlite::params![new_id_string, source_id],
+                )?;
+                txn.execute(
+                    "INSERT INTO tool_outputs (session_id, name, content, created_at)
+                     SELECT ?1, name, content, created_at
+                     FROM tool_outputs WHERE session_id = ?2",
+                    rusqlite::params![new_id_string, source_id],
+                )?;
+
+                txn.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to fork session: {}", error)))?;
+
+        if !inserted {
+            return Ok(None);
+        }
+        Ok(Some(CreatedSession {
+            id: new_id,
+            created_at,
+        }))
+    }
+
     /// Acquire an exclusive OS file lock on the session. Returns a [`SessionLock`] handle whose
     /// lifetime owns the lock; drop it (or let the process exit) to release.
     ///
@@ -978,11 +1108,17 @@ impl SessionManager {
     }
 
     /// Persist a set of imported sessions (a root plus its sub-agent descendants) in a single
-    /// transaction: the `sessions` rows (preserving timestamps and cumulative stats, but never the
-    /// `token_id` fingerprint), each session's event log (preserving per-event timestamps), and its
-    /// `tool_outputs`. `records` MUST be ordered parents-first so every `new_parent_id` references
-    /// an already-inserted row (the `parent_session_id` foreign key is enforced). All-or-nothing:
-    /// any failure rolls back the whole import, leaving no partial tree.
+    /// transaction: the `sessions` rows (preserving `created_at` and cumulative stats, but never
+    /// the `token_id` fingerprint), each session's event log (preserving per-event timestamps), and
+    /// its `tool_outputs`. `records` MUST be ordered parents-first so every `new_parent_id`
+    /// references an already-inserted row (the `parent_session_id` foreign key is enforced).
+    /// All-or-nothing: any failure rolls back the whole import, leaving no partial tree.
+    ///
+    /// `updated_at` is stamped to the import time rather than restored from the export. Retention
+    /// GC deletes by `updated_at` ([`Self::delete_expired_sessions`], run at every agent startup),
+    /// so restoring the original value meant an archive older than `retention_days` was swept on
+    /// the next launch, before anyone could resume it. `created_at` still carries the original for
+    /// provenance.
     pub async fn import_sessions(&self, records: Vec<ImportSessionRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -992,14 +1128,15 @@ impl SessionManager {
             id: String,
             parent_id: Option<String>,
             created_at: String,
-            updated_at: String,
             cwd: Option<String>,
             permission: Option<String>,
             capabilities_json: Option<String>,
+            additional_roots_json: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String)>,
             tool_outputs: Vec<(String, String)>,
         }
+        let imported_at = chrono::Utc::now().to_rfc3339();
         let mut encoded = Vec::with_capacity(records.len());
         for record in records {
             let mut events = Vec::with_capacity(record.events.len());
@@ -1013,10 +1150,10 @@ impl SessionManager {
                 id: record.new_id.to_string(),
                 parent_id: record.new_parent_id.map(|id| id.to_string()),
                 created_at: record.created_at,
-                updated_at: record.updated_at,
                 cwd: record.cwd,
                 permission: record.permission,
                 capabilities_json: record.capabilities_json,
+                additional_roots_json: encode_additional_roots(&record.additional_roots)?,
                 stats: record.stats,
                 events,
                 tool_outputs: record.tool_outputs,
@@ -1029,18 +1166,20 @@ impl SessionManager {
                     txn.execute(
                         "INSERT INTO sessions (
                              id, created_at, updated_at, parent_session_id, cwd, permission,
-                             capabilities_json, stat_turns, stat_input_tokens, stat_output_tokens,
+                             capabilities_json, additional_roots_json, stat_turns,
+                             stat_input_tokens, stat_output_tokens,
                              stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                              stat_redactions, stat_redacted_images, stat_redacted_bytes
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
-                            session.updated_at,
+                            imported_at,
                             session.parent_id,
                             session.cwd,
                             session.permission,
                             session.capabilities_json,
+                            session.additional_roots_json,
                             session.stats.turns as i64,
                             session.stats.input_tokens as i64,
                             session.stats.output_tokens as i64,
@@ -1156,7 +1295,7 @@ impl SessionManager {
                          FROM sessions s JOIN tree ON s.parent_session_id = tree.id
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
-                            s.cwd, s.permission, s.capabilities_json
+                            s.cwd, s.permission, s.capabilities_json, s.additional_roots_json
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -1178,6 +1317,9 @@ impl SessionManager {
                         cwd: row.get(4)?,
                         permission: row.get(5)?,
                         capabilities_json: row.get(6)?,
+                        additional_roots: decode_additional_roots(
+                            row.get::<_, Option<String>>(7)?.as_deref(),
+                        ),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1818,15 +1960,7 @@ impl SessionManager {
         session_id: Uuid,
         roots: &[std::path::PathBuf],
     ) -> Result<usize> {
-        // `None` for the empty case keeps "no extra roots" as NULL, matching legacy rows, so the
-        // column has one representation for one meaning rather than NULL and `[]` both appearing.
-        let encoded = if roots.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(roots).map_err(|error| {
-                MekaError::Database(format!("failed to encode additional roots: {}", error))
-            })?)
-        };
+        let encoded = encode_additional_roots(roots)?;
         let id_string = session_id.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -2628,6 +2762,18 @@ fn decode_list_cursor(token: &str) -> Result<(String, String)> {
     Ok((cursor.updated_at, cursor.id))
 }
 
+/// Encode an additional-root list for the `additional_roots_json` column. `None` for the empty case
+/// keeps "no extra roots" as NULL, matching legacy rows, so the column has one representation for
+/// one meaning rather than NULL and `[]` both appearing.
+fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String>> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(roots).map(Some).map_err(|error| {
+        MekaError::Database(format!("failed to encode additional roots: {}", error))
+    })
+}
+
 /// Decode the persisted `additional_roots_json` column into workspace roots.
 ///
 /// NULL (legacy rows, and every session that never carried extra roots) and unparseable JSON both
@@ -2661,6 +2807,411 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    /// Populate a session with the full spread of state a fork has to carry.
+    async fn seeded_session(manager: &SessionManager) -> Uuid {
+        use crate::{conversation::Event, provider::Message};
+
+        let id = manager
+            .create_session(Some(PathBuf::from("/work/main")))
+            .await
+            .expect("create session");
+        // Enough alternating turns that a copy which reordered the conversation would show it
+        // rather than coincidentally matching. This does not prove the `ORDER BY id` in
+        // `fork_session` is load-bearing: SQLite's index scan yields rowid order anyway, so the
+        // clause states the requirement rather than repairing a scramble.
+        for turn in 0..20 {
+            for event in [
+                Event::Append(Message::user(format!("ask {}", turn))),
+                Event::Append(Message::assistant_text(format!("reply {}", turn))),
+            ] {
+                manager.save_event(id, &event).await.expect("save event");
+            }
+        }
+        manager
+            .save_tool_output(id, "tool_1_output", "scratch")
+            .await
+            .expect("tool output");
+        manager
+            .update_session_roots(id, &[PathBuf::from("/work/shared")])
+            .await
+            .expect("roots");
+        manager
+            .save_session_stats(id, &crate::stats::SessionStatsSnapshot {
+                turns: 3,
+                input_tokens: 4242,
+                ..Default::default()
+            })
+            .await
+            .expect("stats");
+        id
+    }
+
+    #[tokio::test]
+    async fn fork_copies_the_conversation_and_leaves_the_source_alone() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+
+        let forked = manager
+            .fork_session(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+        assert_ne!(forked.id, source);
+
+        let copy_events = manager.load_events(forked.id).await.expect("copy events");
+        let source_events = manager.load_events(source).await.expect("source events");
+        assert_eq!(
+            serde_json::to_string(&copy_events).expect("serialize copy"),
+            serde_json::to_string(&source_events).expect("serialize source"),
+            "the copy starts from the source's exact conversation"
+        );
+        assert_eq!(
+            manager
+                .load_all_tool_outputs(forked.id)
+                .await
+                .expect("copy outputs"),
+            manager
+                .load_all_tool_outputs(source)
+                .await
+                .expect("source outputs"),
+            "scratchpad entries are referenced by name from tool inputs, so they must travel"
+        );
+
+        let copy = manager
+            .session_info(forked.id)
+            .await
+            .expect("info")
+            .expect("row");
+        let original = manager
+            .session_info(source)
+            .await
+            .expect("info")
+            .expect("row");
+        assert_eq!(copy.cwd, original.cwd);
+        assert_eq!(copy.additional_roots, original.additional_roots);
+        assert_eq!(copy.preview, original.preview);
+        let copy_stats = manager
+            .load_session_stats(forked.id)
+            .await
+            .expect("copy stats");
+        assert_eq!(copy_stats.turns, 3);
+        assert_eq!(copy_stats.input_tokens, 4242);
+        assert!(
+            copy.token_id.is_none(),
+            "the bearer-token fingerprint is never inherited"
+        );
+
+        // The source is untouched: same event count, and still a listable top-level session.
+        assert_eq!(
+            manager.load_events(source).await.expect("source").len(),
+            40,
+            "forking must not mutate the source"
+        );
+    }
+
+    /// Regression: retention GC deletes by `updated_at` and runs at every agent startup, so a fork
+    /// that inherited a stale timestamp was swept before its first turn.
+    #[tokio::test]
+    async fn fork_stamps_fresh_timestamps_so_retention_gc_spares_it() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+
+        let stale = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        let source_string = source.to_string();
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![stale, source_string],
+                )
+            })
+            .await
+            .expect("age the source");
+
+        let forked = manager
+            .fork_session(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+
+        let deleted = manager
+            .delete_expired_sessions(90)
+            .await
+            .expect("retention sweep");
+        assert_eq!(deleted, 1, "only the stale source is swept");
+        assert!(
+            manager.session_exists(forked.id).await.expect("exists"),
+            "the fork must survive the sweep that removes its stale source"
+        );
+    }
+
+    /// A child links to its parent only through `parent_session_id`, and the sub-agent's *result*
+    /// already sits in the parent's own event log, so the copy is self-contained without it.
+    #[tokio::test]
+    async fn fork_does_not_copy_sub_agent_children() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+        manager
+            .create_child_session(source, None)
+            .await
+            .expect("child");
+
+        let forked = manager
+            .fork_session(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+
+        let tree = manager.load_session_tree(forked.id).await.expect("tree");
+        assert_eq!(tree.len(), 1, "the fork stands alone");
+        assert_eq!(
+            tree[0].parent_id, None,
+            "a fork is top-level: `parent_session_id` means sub-agent parent, and list_sessions \
+             hides rows that have one"
+        );
+        assert_eq!(
+            manager
+                .load_session_tree(source)
+                .await
+                .expect("source tree")
+                .len(),
+            2,
+            "the source keeps its child"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_overrides_replace_the_workspace() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+
+        let forked = manager
+            .fork_session(source, ForkOverrides {
+                cwd: Some(PathBuf::from("/elsewhere")),
+                additional_roots: Some(vec![PathBuf::from("/elsewhere/docs")]),
+                token_id: Some("token-fingerprint".to_string()),
+            })
+            .await
+            .expect("fork")
+            .expect("source exists");
+
+        let copy = manager
+            .session_info(forked.id)
+            .await
+            .expect("info")
+            .expect("row");
+        assert_eq!(copy.cwd, Some(PathBuf::from("/elsewhere")));
+        assert_eq!(copy.additional_roots, vec![PathBuf::from(
+            "/elsewhere/docs"
+        )]);
+        assert_eq!(copy.token_id.as_deref(), Some("token-fingerprint"));
+    }
+
+    /// `Some(vec![])` means "activate no additional roots", which is what ACP's fork request sends
+    /// when `additionalDirectories` is omitted. It must not be confused with "inherit": both encode
+    /// to SQL NULL, so a `COALESCE` alone would resurrect the source's roots.
+    #[tokio::test]
+    async fn fork_can_override_additional_roots_to_empty() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+
+        let forked = manager
+            .fork_session(source, ForkOverrides {
+                additional_roots: Some(Vec::new()),
+                ..Default::default()
+            })
+            .await
+            .expect("fork")
+            .expect("source exists");
+
+        let copy = manager
+            .session_info(forked.id)
+            .await
+            .expect("info")
+            .expect("row");
+        assert!(
+            copy.additional_roots.is_empty(),
+            "an explicit empty override must narrow the workspace, not inherit it"
+        );
+        assert_eq!(
+            manager
+                .session_info(source)
+                .await
+                .expect("info")
+                .expect("row")
+                .additional_roots,
+            vec![PathBuf::from("/work/shared")],
+            "and it must not disturb the source"
+        );
+    }
+
+    /// Several clients forking one session at once must each get a whole, distinct copy. The copy
+    /// spans three statements, so an interleaving that let a second fork observe the first's
+    /// half-built session would show up as a short or empty event log.
+    #[tokio::test]
+    async fn concurrent_forks_of_one_source_each_get_a_complete_copy() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+        let expected = manager.load_events(source).await.expect("source").len();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            handles.push(tokio::spawn(async move {
+                manager
+                    .fork_session(source, ForkOverrides::default())
+                    .await
+                    .expect("fork")
+                    .expect("source exists")
+                    .id
+            }));
+        }
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.expect("join"));
+        }
+
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "every fork must be its own session"
+        );
+        for id in &ids {
+            assert_eq!(
+                manager.load_events(*id).await.expect("copy").len(),
+                expected,
+                "every concurrent fork must carry the whole conversation"
+            );
+        }
+    }
+
+    /// A fork is a top-level session, not a child, so deleting what it was forked from must not
+    /// take it with it. Had fork reused `parent_session_id` for lineage, the FK cascade would
+    /// destroy every fork the moment its source was deleted.
+    #[tokio::test]
+    async fn deleting_the_source_leaves_the_fork_intact() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+        let expected = manager.load_events(source).await.expect("source").len();
+
+        let forked = manager
+            .fork_session(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+        assert!(manager.delete_session(source).await.expect("delete"));
+
+        assert!(manager.session_exists(forked.id).await.expect("exists"));
+        assert_eq!(
+            manager.load_events(forked.id).await.expect("copy").len(),
+            expected,
+            "the fork keeps its own copy of the conversation"
+        );
+        assert_eq!(
+            manager
+                .load_all_tool_outputs(forked.id)
+                .await
+                .expect("outputs")
+                .len(),
+            1,
+        );
+    }
+
+    /// Deleting a fork must sweep the rows it copied. `discard_failed_fork` in the ACP handler
+    /// relies on this to undo a fork whose runtime wouldn't build; if the cascade missed, a failed
+    /// fork would leave an orphaned transcript with no session row pointing at it.
+    #[tokio::test]
+    async fn deleting_a_fork_removes_the_rows_it_copied() {
+        let manager = test_manager().await;
+        let source = seeded_session(&manager).await;
+        let forked = manager
+            .fork_session(source, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("source exists");
+
+        assert!(manager.delete_session(forked.id).await.expect("delete"));
+        assert!(
+            manager
+                .load_events(forked.id)
+                .await
+                .expect("events")
+                .is_empty(),
+            "the copied event log must go with the row"
+        );
+        assert!(
+            manager
+                .load_all_tool_outputs(forked.id)
+                .await
+                .expect("outputs")
+                .is_empty(),
+            "and so must the copied scratchpad entries"
+        );
+        // The source is untouched by the fork's deletion.
+        assert!(
+            !manager
+                .load_events(source)
+                .await
+                .expect("source")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_of_an_unknown_session_is_none() {
+        let manager = test_manager().await;
+        assert!(
+            manager
+                .fork_session(Uuid::new_v4(), ForkOverrides::default())
+                .await
+                .expect("fork")
+                .is_none(),
+            "callers map None to their own not-found shape rather than parsing an error"
+        );
+    }
+
+    /// Drift guard for [`SessionManager::fork_session`], whose `INSERT ... SELECT` names every
+    /// column explicitly. A new column silently omitted there would be dropped from every fork,
+    /// which is exactly how `additional_roots` came to be lost by export/import. If this fails,
+    /// decide whether the new column should be copied, reset, or overridden, then update both the
+    /// fork statement and this list.
+    #[tokio::test]
+    async fn fork_copies_every_session_column() {
+        let manager = test_manager().await;
+        let columns = manager
+            .connection
+            .call(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT name FROM pragma_table_info('sessions')")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await
+            .expect("read schema");
+
+        assert_eq!(columns, vec![
+            "id",
+            "created_at",
+            "updated_at",
+            "parent_session_id",
+            "cwd",
+            "permission",
+            "capabilities_json",
+            "token_id",
+            "additional_roots_json",
+            "stat_turns",
+            "stat_input_tokens",
+            "stat_output_tokens",
+            "stat_cache_creation_input_tokens",
+            "stat_cache_read_input_tokens",
+            "stat_redactions",
+            "stat_redacted_images",
+            "stat_redacted_bytes",
+        ]);
     }
 
     #[tokio::test]

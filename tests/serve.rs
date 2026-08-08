@@ -346,6 +346,232 @@ fn blocking_turn_returns_final_text_from_mock_provider() {
 }
 
 #[test]
+fn fork_copies_the_conversation_into_a_new_session() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    // Deliberately not the server's configured default (`write`): a fork that dropped the
+    // `permission` column entirely would still report `write`, because the re-attach path falls
+    // back to the config default when the column is NULL.
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "read",
+        }))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "hi", "stream": false}))
+        .send()
+        .expect("send");
+
+    // An empty body is the common case: inherit everything from the source.
+    let fork = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .send()
+        .expect("send");
+    assert_eq!(fork.status(), 201);
+    let forked: serde_json::Value = fork.json().expect("parse");
+    let fork_id = forked["id"].as_str().expect("id").to_string();
+    assert_ne!(fork_id, id, "the fork is a distinct session");
+    assert_eq!(forked["permission"], "read", "permission is inherited");
+
+    let messages_of = |session: &str| -> serde_json::Value {
+        harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/messages", session),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    assert_eq!(
+        messages_of(&fork_id)["messages"],
+        messages_of(&id)["messages"],
+        "the fork starts from the source's exact conversation",
+    );
+
+    // The fork is immediately usable, and using it leaves the source alone.
+    let turn = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/turn", fork_id),
+        )
+        .json(&serde_json::json!({"message": "again", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+    assert!(
+        messages_of(&fork_id)["messages"]
+            .as_array()
+            .expect("array")
+            .len()
+            > messages_of(&id)["messages"]
+                .as_array()
+                .expect("array")
+                .len(),
+        "the branch diverges: the source must not grow when the fork runs a turn",
+    );
+}
+
+/// Forking reads the database directly while the source's runtime mutex is held by a running
+/// turn. It must neither block on that mutex nor produce a broken copy: the fork's own first turn
+/// has to succeed, which is only true if the conversation it copied loaded cleanly.
+#[test]
+fn fork_during_an_in_flight_turn_does_not_block_or_corrupt() {
+    let slow = serde_json::json!([
+        { "kind": "sleep", "ms": 1500 },
+        { "kind": "text", "text": "source done" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]);
+    let quick = serde_json::json!([
+        { "kind": "text", "text": "fork done" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]);
+    let harness = ServeTestHarness::spawn("", serde_json::json!([slow, quick]));
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_for_turn = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_turn))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "slow one"}))
+            .send()
+            .expect("turn send")
+    });
+
+    // Let the turn acquire the source's runtime mutex and enter the mock provider's sleep.
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let fork = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .send()
+        .expect("send");
+    let elapsed = started.elapsed();
+
+    assert_eq!(fork.status(), 201);
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "fork must not wait on the source's runtime mutex; took {:?}",
+        elapsed,
+    );
+    let fork_id = fork.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // The copy is usable despite having been taken mid-turn.
+    let fork_turn = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/turn", fork_id),
+        )
+        .json(&serde_json::json!({"message": "on the fork", "stream": false}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        fork_turn.status(),
+        200,
+        "a fork taken mid-turn must still run: {}",
+        fork_turn.text().unwrap_or_default(),
+    );
+
+    assert_eq!(turn.join().expect("join").status(), 200);
+}
+
+#[test]
+fn fork_accepts_a_cwd_override() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let elsewhere = std::env::temp_dir().join("meka-fork-cwd");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir");
+    let fork = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .json(&serde_json::json!({"cwd": elsewhere.to_string_lossy()}))
+        .send()
+        .expect("send");
+    assert_eq!(fork.status(), 201);
+    let forked: serde_json::Value = fork.json().expect("parse");
+    assert_eq!(forked["cwd"], elsewhere.to_string_lossy().as_ref());
+}
+
+#[test]
+fn fork_rejects_a_relative_cwd_and_an_unknown_session() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let relative = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .json(&serde_json::json!({"cwd": "relative/path"}))
+        .send()
+        .expect("send");
+    assert_eq!(relative.status(), 422);
+
+    let unknown = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/fork", uuid::Uuid::new_v4()),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(unknown.status(), 404);
+}
+
+#[test]
+fn fork_requires_write_scope() {
+    let harness =
+        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+    let response = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/fork", uuid::Uuid::new_v4()),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 403);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/auth-scope");
+}
+
+#[test]
 fn idempotency_key_replays_return_cached_body() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness

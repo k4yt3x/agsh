@@ -46,20 +46,21 @@ use agent_client_protocol::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
         ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
-        EmbeddedResource, EmbeddedResourceResource, EnvVariable, ImageContent, Implementation,
-        InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
-        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-        PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
-        ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
-        RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse,
-        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-        SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode,
-        SessionModeId, SessionModeState, SessionNotification, SessionResumeCapabilities,
-        SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-        TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus,
-        ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, Usage,
-        UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
+        EmbeddedResource, EmbeddedResourceResource, EnvVariable, ForkSessionRequest,
+        ForkSessionResponse, ImageContent, Implementation, InitializeRequest, InitializeResponse,
+        KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+        PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+        ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+        SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities, SessionId,
+        SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+        SetSessionModeRequest, SetSessionModeResponse, StopReason, TerminalOutputRequest, ToolCall,
+        ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        ToolKind, UnstructuredCommandInput, Usage, UsageUpdate, WaitForTerminalExitRequest,
+        WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -1827,6 +1828,7 @@ pub async fn run_acp(
                         ))
                         .list(Some(SessionListCapabilities::new()))
                         .resume(Some(SessionResumeCapabilities::new()))
+                        .fork(Some(SessionForkCapabilities::new()))
                         .close(Some(SessionCloseCapabilities::new()));
                     // meka accepts `text`, `resource_link`, and embedded `resource` (@-mention)
                     // blocks in `session/prompt`, so `embedded_context` is advertised true. `image`
@@ -2030,6 +2032,15 @@ pub async fn run_acp(
                 let state = Arc::clone(&state);
                 async move |req: ResumeSessionRequest, responder, cx: ConnectionTo<Client>| {
                     handle_resume_session(Arc::clone(&state), req, responder, cx).await
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: ForkSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_fork_session(Arc::clone(&state), req, responder, cx).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2720,6 +2731,181 @@ async fn handle_resume_session(
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
     responder.respond(ResumeSessionResponse::new().modes(modes))
+}
+
+/// Delete a fork whose runtime could not be built, so a failed `session/fork` doesn't leave a full
+/// copy of the conversation in the database under an id the client was never told.
+///
+/// `session/new` has the same failure shape but leaves its row behind; there the orphan is an empty
+/// session, whereas a fork's is an entire transcript, and an auto-retrying client would multiply it
+/// on every attempt. Best-effort: a failed cleanup is worth a warning, not a second error replacing
+/// the one the client needs to see.
+async fn discard_failed_fork(state: &Arc<ServerState>, session_uuid: uuid::Uuid) {
+    match state
+        .shared
+        .session_manager
+        .delete_session(session_uuid)
+        .await
+    {
+        Ok(_) => tracing::info!("session/fork: discarded unusable fork {}", session_uuid),
+        Err(error) => tracing::warn!(
+            "session/fork: failed to discard unusable fork {}: {}",
+            session_uuid,
+            error,
+        ),
+    }
+}
+
+/// `session/fork`: copy an existing session's conversation into a new session and adopt the copy as
+/// active. The source is left open and untouched.
+///
+/// **UNSTABLE** in the protocol: gated behind the SDK's `unstable_session_fork` feature and subject
+/// to change.
+///
+/// Shaped like [`handle_resume_session`], with one difference that matters: ACP models fork as a
+/// session-*creation* request, so `cwd` and `additionalDirectories` come from the request rather
+/// than the source session, and may legitimately differ from it.
+async fn handle_fork_session(
+    state: Arc<ServerState>,
+    req: ForkSessionRequest,
+    responder: agent_client_protocol::Responder<ForkSessionResponse>,
+    cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let source_id_str = req.session_id.0.as_ref().to_string();
+    let source_uuid = match uuid::Uuid::parse_str(&source_id_str) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return responder.respond_with_error(invalid_params_error(format!(
+                "malformed sessionId: {}",
+                source_id_str
+            )));
+        }
+    };
+
+    if !req.cwd.is_absolute() {
+        return responder.respond_with_error(invalid_params_error(format!(
+            "cwd must be an absolute path; got `{}`",
+            req.cwd.display()
+        )));
+    }
+    if let Err(error) = validate_additional_roots(&req.additional_directories) {
+        return responder.respond_with_error(error);
+    }
+
+    let forked = match state
+        .shared
+        .session_manager
+        .fork_session(source_uuid, crate::session::ForkOverrides {
+            cwd: Some(req.cwd.clone()),
+            // Always `Some`: per the spec an omitted or empty list means "no additional roots are
+            // activated", which is an override to none rather than a request to inherit.
+            additional_roots: Some(req.additional_directories.clone()),
+            token_id: None,
+        })
+        .await
+    {
+        Ok(Some(forked)) => forked,
+        Ok(None) => {
+            return responder.respond_with_error(invalid_params_error(format!(
+                "unknown sessionId: {}",
+                source_uuid
+            )));
+        }
+        Err(error) => {
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("failed to fork session: {}", error),
+            ));
+        }
+    };
+
+    let session_uuid = forked.id;
+    let session_id_str = session_uuid.to_string();
+    let session_id: SessionId = session_id_str.clone().into();
+
+    let session_lock = match state.shared.session_manager.lock_session(session_uuid) {
+        Ok(lock) => Arc::new(lock),
+        Err(error) => {
+            discard_failed_fork(&state, session_uuid).await;
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("failed to lock session: {}", error),
+            ));
+        }
+    };
+
+    let events = match state.shared.session_manager.load_events(session_uuid).await {
+        Ok(events) => events,
+        Err(error) => {
+            discard_failed_fork(&state, session_uuid).await;
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("failed to load session events: {}", error),
+            ));
+        }
+    };
+    let mut conversation = Conversation::from_events(events);
+    // Same reasoning as resume: an orphaned `tool_use` copied from a source that was interrupted
+    // mid-turn would make the fork's first prompt fail at the provider.
+    let dropped = conversation.sanitize_orphans();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "dropped {} orphaned assistant message(s) with unmatched tool calls while forking session {}",
+            dropped.len(),
+            source_uuid,
+        );
+    }
+
+    let runtime = match build_session_runtime(
+        &state.shared,
+        &state.client_state,
+        &state.transport_dead,
+        cx.clone(),
+        session_id.clone(),
+        session_id_str.clone(),
+        session_uuid,
+        req.cwd.clone(),
+        req.additional_directories.clone(),
+        conversation,
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            discard_failed_fork(&state, session_uuid).await;
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("failed to build session runtime: {}", error),
+            ));
+        }
+    };
+
+    if !req.mcp_servers.is_empty() {
+        tracing::warn!(
+            "session/fork: client provided {} mcpServers, ignored (config-driven MCP servers are \
+             still active)",
+            req.mcp_servers.len(),
+        );
+    }
+
+    let permission = runtime.permission.clone();
+    let frontend = Arc::clone(&runtime.frontend);
+    // The copied history already carries the first user message, so the title is known now.
+    let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
+    let entry = SessionEntry {
+        runtime: Arc::new(Mutex::new(runtime)),
+        cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+        cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        title_sent,
+        permission: permission.clone(),
+        frontend,
+        session_lock,
+    };
+    state.sessions.write().await.insert(session_id_str, entry);
+
+    tracing::info!("session/fork: {} forked into {}", source_uuid, session_uuid);
+
+    let modes = build_mode_state(&permission);
+    emit_available_commands(&cx, &session_id, &state.shared.skills).await;
+
+    responder.respond(ForkSessionResponse::new(session_id).modes(modes))
 }
 
 /// `session/close`: remove a session from the active map. Cancels any in-flight prompt for that

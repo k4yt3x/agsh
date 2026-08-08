@@ -5292,3 +5292,239 @@ fn acp_session_new_rejects_relative_additional_directory() {
         response,
     );
 }
+
+#[test]
+fn acp_advertises_fork_capability() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    let response = harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+    assert!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["fork"].is_object(),
+        "expected fork to be advertised; got: {}",
+        response,
+    );
+}
+
+/// `session/fork` mints a new session carrying the source's conversation, and leaves the source
+/// open: both are addressable afterwards.
+#[test]
+fn acp_session_fork_creates_a_usable_copy() {
+    let turn = [
+        serde_json::json!({ "kind": "text", "text": "ok" }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+    ];
+    // One script entry per prompt: seed the source, then a turn on the fork, then one on the
+    // source to prove forking left it usable.
+    let script = serde_json::json!([turn, turn, turn]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let source_id = harness.new_session();
+    let id = harness.prompt(&source_id, "hello");
+    harness.collect_updates(&source_id, id);
+
+    let forked = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir.clone(),
+            "mcpServers": [],
+        }),
+    );
+    let fork_id = forked["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/fork failed: {}", forked))
+        .to_string();
+    assert_ne!(fork_id, source_id, "the fork is a distinct session");
+
+    // The title is derived from the first user message, so matching titles mean the source's
+    // conversation actually came across rather than the fork starting empty.
+    let listed = harness.request("session/list", serde_json::json!({}));
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+    let title_of = |wanted: &str| -> serde_json::Value {
+        sessions
+            .iter()
+            .find(|row| row["sessionId"] == wanted)
+            .unwrap_or_else(|| panic!("session {} not listed: {}", wanted, listed))["title"]
+            .clone()
+    };
+    assert_eq!(title_of(&fork_id), serde_json::json!("hello"));
+    assert_eq!(title_of(&fork_id), title_of(&source_id));
+
+    // The copy is immediately promptable, which is only true if its conversation loaded cleanly.
+    let id = harness.prompt(&fork_id, "again");
+    let (_updates, response) = harness.collect_updates(&fork_id, id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the forked session must accept a prompt; got: {}",
+        response,
+    );
+
+    // Forking does not close the source.
+    let id = harness.prompt(&source_id, "still here");
+    let (_updates, response) = harness.collect_updates(&source_id, id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "forking must leave the source session usable; got: {}",
+        response,
+    );
+}
+
+/// ACP models fork as a session-*creation* request, so the workspace comes from the request rather
+/// than the source. The source here has no extra roots, so the fork reporting one proves the
+/// request's list was applied instead of inherited.
+#[test]
+fn acp_session_fork_applies_the_requests_additional_directories() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+
+    let cwd = harness.config_dir.clone();
+    let extra = cwd.join("shared");
+    std::fs::create_dir_all(&extra).expect("mkdir extra root");
+
+    let response = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let source_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .to_string();
+
+    let forked = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [extra],
+        }),
+    );
+    let fork_id = forked["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/fork failed: {}", forked))
+        .to_string();
+
+    let listed = harness.request("session/list", serde_json::json!({}));
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+    let row_of = |wanted: &str| {
+        sessions
+            .iter()
+            .find(|row| row["sessionId"] == wanted)
+            .unwrap_or_else(|| panic!("session {} not listed: {}", wanted, listed))
+    };
+    assert_eq!(
+        row_of(&fork_id)["additionalDirectories"],
+        serde_json::json!([extra]),
+        "the fork must carry the roots the request named; got: {}",
+        row_of(&fork_id),
+    );
+    assert!(
+        row_of(&source_id)["additionalDirectories"].is_null(),
+        "and must not write them back onto the source; got: {}",
+        row_of(&source_id),
+    );
+}
+
+/// The realistic client flow: pick a session out of `session/list` and branch from it without
+/// opening it first. Fork reads the database, so the source never has to be in the active map --
+/// and forking must not implicitly adopt it either, or the client would be left holding a session
+/// it never asked to open (and its on-disk lock).
+#[test]
+fn acp_session_fork_works_on_a_session_that_was_never_loaded() {
+    let turn = [
+        serde_json::json!({ "kind": "text", "text": "ok" }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+    ];
+    let script = serde_json::json!([turn, turn]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+
+    // Seed a session, then close it so only its persisted row remains.
+    let source_id = harness.new_session();
+    let id = harness.prompt(&source_id, "seed");
+    harness.collect_updates(&source_id, id);
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": source_id }),
+    );
+    assert!(
+        closed["error"].is_null(),
+        "session/close failed: {}",
+        closed
+    );
+
+    let forked = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir.clone(),
+            "mcpServers": [],
+        }),
+    );
+    let fork_id = forked["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("forking an unloaded session failed: {}", forked))
+        .to_string();
+
+    // The fork is live...
+    let id = harness.prompt(&fork_id, "go");
+    let (_updates, response) = harness.collect_updates(&fork_id, id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    // ...and the source stayed closed rather than being silently adopted.
+    let reclose = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": source_id }),
+    );
+    assert!(
+        !reclose["error"].is_null(),
+        "forking must not adopt the source session; got: {}",
+        reclose,
+    );
+}
+
+#[test]
+fn acp_session_fork_rejects_bad_input() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+
+    let cwd = harness.config_dir.clone();
+    let response = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let source_id = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .to_string();
+
+    let unknown = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": "9f1d4c2e-0000-4000-8000-000000000000",
+            "cwd": cwd,
+            "mcpServers": [],
+        }),
+    );
+    assert_eq!(
+        unknown["error"]["code"], -32602,
+        "an unknown source must be invalid_params; got: {}",
+        unknown,
+    );
+
+    let relative_root = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": ["relative/path"],
+        }),
+    );
+    assert_eq!(
+        relative_root["error"]["code"], -32602,
+        "expected invalid_params for a relative additional root; got: {}",
+        relative_root,
+    );
+}

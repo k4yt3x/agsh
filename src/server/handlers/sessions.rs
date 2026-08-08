@@ -428,6 +428,148 @@ pub async fn create_session(
     ))
 }
 
+/// Body for `POST /v1/sessions/{id}/fork`. Every field is optional; omitted means "inherit from
+/// the session being forked".
+///
+/// Only `cwd` is offered, mirroring ACP's `session/fork` request, which likewise carries a
+/// workspace but no permission or capability fields. Both of those are inherited and remain
+/// changeable afterwards via `PATCH /v1/sessions/{id}`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionBody {
+    /// Absolute path for the forked session. Absent → inherit the source's.
+    #[schema(value_type = Option<String>)]
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+/// POST /v1/sessions/{id}/fork: copy a session's conversation into a new one.
+///
+/// Requires scope `sessions:w`. The copy starts with the source's full conversation and is
+/// immediately usable; the source is left untouched and is not required to be in memory, so an
+/// evicted session forks just as well as a live one.
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/fork",
+    tag = "sessions",
+    params(("id" = Uuid, Path, description = "Session UUID to fork")),
+    request_body = Option<ForkSessionBody>,
+    responses(
+        (status = 201, description = "Forked session", body = SessionResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 422, description = "Invalid body", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub async fn fork_session(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+    raw_body: Bytes,
+) -> Result<(StatusCode, Json<SessionResponse>), ProblemDetail> {
+    if !principal.has_scope("sessions:w") {
+        return Err(ProblemDetail::new(
+            ErrorKind::AuthScope,
+            StatusCode::FORBIDDEN,
+            "scope `sessions:w` is required to fork sessions",
+        ));
+    }
+
+    // An empty body is the common case (`inherit everything`), and axum hands it to us as zero
+    // bytes, which is not valid JSON.
+    let body: ForkSessionBody = if raw_body.is_empty() {
+        ForkSessionBody::default()
+    } else {
+        serde_json::from_slice(&raw_body).map_err(|_| {
+            ProblemDetail::new(
+                ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid session fork request body",
+            )
+        })?
+    };
+    if let Some(path) = body.cwd.as_deref() {
+        validate_cwd(path)?;
+    }
+
+    let forked = state
+        .shared
+        .session_manager
+        .fork_session(id, crate::session::ForkOverrides {
+            cwd: body.cwd,
+            // The HTTP API is single-root, but the copy keeps whatever the source recorded so a
+            // later ACP `session/load` still sees the workspace shape. HTTP runtimes ignore the
+            // column either way, exactly as re-attach already does for ACP-created sessions.
+            additional_roots: None,
+            // Never inherited: this fingerprints the token that created a session, and the token
+            // doing the forking is the only correct answer.
+            token_id: Some(principal.token_id.clone()),
+        })
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to fork session", error))?
+        .ok_or_else(|| {
+            ProblemDetail::new(
+                ErrorKind::SessionNotFound,
+                StatusCode::NOT_FOUND,
+                format!("session '{}' does not exist", id),
+            )
+            .with("session_id", id.to_string())
+        })?;
+
+    // Build the copy's runtime through the re-attach path rather than duplicating it: the row was
+    // just written, so re-attach resolves permission, capabilities, cwd, and `token_id` straight
+    // from it, hydrates the conversation, takes the lock, and registers the entry.
+    let entry = match crate::server::reattach::ensure_session_loaded(&state, forked.id).await {
+        Ok(entry) => entry,
+        Err(problem) => {
+            // The row exists but is unusable; drop it rather than leaving an orphan the caller
+            // was never told about.
+            if let Err(error) = state.shared.session_manager.delete_session(forked.id).await {
+                tracing::warn!(
+                    "failed to roll back fork {} after runtime build failed: {}",
+                    forked.id,
+                    error
+                );
+            }
+            return Err(problem);
+        }
+    };
+
+    tracing::info!(
+        "session forked: source={} id={} token={}",
+        id,
+        forked.id,
+        principal.token_id,
+    );
+
+    let title = state
+        .shared
+        .session_manager
+        .session_info(forked.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|info| info.preview)
+        .unwrap_or_default();
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SessionResponse {
+            id: forked.id,
+            created_at: forked.created_at.clone(),
+            updated_at: forked.created_at,
+            last_turn_at: None,
+            cwd: Some(crate::agent::cwd_snapshot(&entry.cwd)),
+            permission: entry.permission.get().to_string(),
+            title,
+            capabilities: entry.capabilities,
+            turn_in_flight: false,
+        }),
+    ))
+}
+
 /// GET /v1/sessions: paginated list. Returns persisted sessions from the DB (not just
 /// in-memory entries) so audit consumers can see everything regardless of GC state.
 #[utoipa::path(

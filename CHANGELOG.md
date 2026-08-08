@@ -15,10 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /v1/sessions` accepts `supports_permission_prompts`; false denies gated tools at once.
 - MCP `tools/call` now carries `meka/sessionId` in `_meta` so servers can scope session state.
 - ACP multi-root workspaces: extra folders are searched and named, not silently dropped.
+- Fork a session into an independent copy from the CLI, REPL, HTTP, or ACP.
 
 ### Fixed
 
 - ACP clients now see images a tool looked at, instead of an `[image]` placeholder.
+- `meka session import` no longer leaves a restored session for retention GC to delete.
+- Session export/import no longer drops a session's additional workspace roots.
+- Re-attaching a session over HTTP now drops orphaned tool calls that broke its next turn.
 - An MCP server that fails its initial connect is now retried in the background until it comes up.
 - MCP `tools/call` now actually sends `meka/toolUseId`; it was never populated at the call site.
 
