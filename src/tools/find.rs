@@ -536,13 +536,17 @@ mod tests {
         );
     }
 
-    /// A root is a literal directory. Without escaping, one named `star*dir` would be read as a
-    /// wildcard and pull in paths the client never named.
+    /// A root is a literal directory. Without escaping, one named `notes[1]` would be read as a
+    /// character class and match a sibling named `notes1` instead of the root the client asked for.
+    ///
+    /// Brackets rather than `*`: Windows reserves `*` in filenames, so the fixture could not even
+    /// be created there, and a root containing one is unreachable on that platform anyway.
+    /// Brackets are legal on both, so this keeps the escaping covered everywhere CI runs.
     #[test]
     fn test_glob_metacharacters_in_a_root_are_literal() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let literal = temp.path().join("star*dir");
-        let decoy = temp.path().join("starXdir");
+        let literal = temp.path().join("notes[1]");
+        let decoy = temp.path().join("notes1");
         std::fs::create_dir_all(&literal).expect("mkdir literal");
         std::fs::create_dir_all(&decoy).expect("mkdir decoy");
         std::fs::write(literal.join("a.txt"), "").expect("write");
