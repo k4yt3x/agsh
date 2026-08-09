@@ -228,6 +228,18 @@ pub struct Agent {
     /// arguments, or a rewrite that changes nothing) doesn't re-render the list. Private to this
     /// `Agent`; sub-agents route through `Agent::new` and so get their own.
     last_rendered_todo: tokio::sync::RwLock<Option<crate::tools::todo::TodoState>>,
+    /// The tool/skill/MCP picture the model was last shown, plus the conversation length at which
+    /// it was shown. `None` means "tell it everything": a fresh agent, or a compaction that may
+    /// have summarized the earlier rendering away. Same shape and reasoning as
+    /// [`Self::last_rendered_todo`].
+    ///
+    /// The length matters because the render lives in a single user message, and
+    /// [`truncate_messages_for_context`] sends only the most recent `context_messages` entries.
+    /// Once that message falls out of the window the model can no longer see the catalogue,
+    /// the skill list, or any MCP server's instructions, so the picture has to be restated.
+    /// Tracking where it landed means that costs a full render roughly once per window rather
+    /// than once per turn.
+    last_rendered_world: tokio::sync::RwLock<Option<(crate::context::WorldSnapshot, usize)>>,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
@@ -295,6 +307,7 @@ impl Agent {
             options,
             todo_list,
             last_rendered_todo: tokio::sync::RwLock::new(None),
+            last_rendered_world: tokio::sync::RwLock::new(None),
             shared_session_id,
             skills,
             frontend,
@@ -449,7 +462,7 @@ impl Agent {
     }
 
     /// Attach the MCP client manager so server-supplied `initialize` instructions can be injected
-    /// into each turn's system prompt.
+    /// into each turn's context block.
     pub fn set_mcp_manager(&mut self, manager: Arc<crate::mcp::McpClientManager>) {
         self.mcp_manager = Some(manager);
     }
@@ -561,12 +574,63 @@ impl Agent {
         let permission = self.shared_permission.get();
 
         let catalogue = self.tool_registry.tool_catalogue();
+        let skills = self.skills.current().await;
+        let mcp_instructions = self
+            .mcp_manager
+            .as_ref()
+            .map(|manager| manager.server_instructions())
+            .unwrap_or_default();
+
+        // Tools, skills, and MCP instructions all move mid-session, so they ride in the user
+        // message rather than the system prompt. Render only what changed since the model was last
+        // told; an unchanged session emits nothing here. Read before the block is built because the
+        // block carries it.
+        //
+        // `world_state_rollback` is the snapshot as it was before this turn claimed to have
+        // announced the change. A turn that fails early pops its user message (see the error arm at
+        // the end of this function), and that message is the only place the announcement lives, so
+        // the claim has to be withdrawn with it. Without this a server that connects during a turn
+        // that then fails is never mentioned again for the rest of the session.
+        //
+        // Skipped entirely for sub-agents. They run on a `system_prompt_override` that already
+        // lists their tools (`build_subagent_system_prompt`), and that prompt is built once at
+        // spawn for a fixed tool set and permission, so there is nothing here for them to
+        // learn and rendering it would bill every `spawn_agent` for a second copy of the
+        // catalogue.
+        let (world_state, world_state_rollback) = if self.options.system_prompt_override.is_some() {
+            (String::new(), None)
+        } else {
+            let current =
+                context::WorldSnapshot::new(&catalogue, skills.as_slice(), &mcp_instructions);
+            let mut last = self.last_rendered_world.write().await;
+            // Treat a render that has scrolled out of the API window as never having happened. The
+            // window keeps the last `context_messages` entries, so a render at index `i` is gone
+            // once the conversation grows past `i + limit`. Rendering in full then puts a fresh
+            // copy at the new tail, good for another window's worth of turns.
+            let still_visible = last.as_ref().filter(|(_, rendered_at)| {
+                world_state_still_visible(
+                    *rendered_at,
+                    messages.len(),
+                    self.options.context_messages,
+                )
+            });
+            let rendered = context::render_world_state(&current, still_visible.map(|(s, _)| s));
+            // This turn's user message is about to be appended, so that is where the render lands.
+            let previous = last.replace((current, messages.len()));
+            (rendered, previous)
+        };
+
         let augmented_input = {
             let todos = self.todo_list.read().await;
             let cwd_snapshot = cwd_snapshot(&self.cwd);
             let roots_snapshot = roots_snapshot(&self.roots);
-            let block =
-                context::build_turn_context(permission, &todos, &cwd_snapshot, &roots_snapshot);
+            let block = context::build_turn_context(
+                permission,
+                &todos,
+                &cwd_snapshot,
+                &roots_snapshot,
+                &world_state,
+            );
             format!("{}\n\n{}", block, user_input)
         };
         // Build the user message once (text preamble + any input images) and reuse it for both the
@@ -589,20 +653,11 @@ impl Agent {
                 false
             }
         };
-        let skills = self.skills.current().await;
-        let mcp_instructions = self
-            .mcp_manager
-            .as_ref()
-            .map(|manager| manager.server_instructions())
-            .unwrap_or_default();
         let system_prompt: Arc<str> = match &self.options.system_prompt_override {
             Some(prompt) => Arc::from(prompt.as_str()),
             None => Arc::from(context::build_system_prompt(
-                &catalogue,
                 self.options.sandboxed_shell,
-                skills.as_slice(),
                 self.options.user_instructions.as_deref(),
-                &mcp_instructions,
             )),
         };
 
@@ -1023,6 +1078,10 @@ impl Agent {
             }
             Err(error) if !matches!(error, MekaError::Interrupted) && !user_saved => {
                 messages.pop_unsaved();
+                // The popped message carried this turn's world-state announcement, so put the
+                // snapshot back to what the model has actually seen. The next turn then re-renders
+                // the change rather than assuming it was already delivered.
+                *self.last_rendered_world.write().await = world_state_rollback;
             }
             _ => {}
         }
@@ -1645,6 +1704,12 @@ impl Agent {
         // bounds its growth).
         self.tool_registry.clear_read_tracker().await;
 
+        // Same reasoning for the tool/skill/MCP picture: the turns that carried it are now behind
+        // the boundary and may have been summarized away, so forget what the model was told and let
+        // the next turn re-state it in full. Compaction re-caches the conversation anyway, so the
+        // extra tokens cost nothing that wasn't already spent.
+        *self.last_rendered_world.write().await = None;
+
         // Seed the live context gauge with an estimate of the compacted working set so `/status`
         // (and the prompt indicator) immediately reflect the smaller size; the next real turn
         // overwrites it with the exact provider-reported total.
@@ -1672,6 +1737,27 @@ impl Agent {
             &roots_snapshot(&self.roots),
         )
     }
+}
+
+/// Whether a world-state render made when the conversation held `rendered_at` messages is still
+/// inside the window [`truncate_messages_for_context`] will send.
+///
+/// The render lives in exactly one user message, at index `rendered_at`. The window keeps the last
+/// `context_messages` entries, so that message survives while `current_len - rendered_at` stays
+/// within the limit. Once it falls out, the model can no longer see the tool catalogue, the skill
+/// list, or any MCP server's instructions, and the picture has to be restated in full.
+///
+/// Deliberately one turn conservative (`<` rather than `<=`), for two reasons: `current_len` is
+/// read before this turn's own message is appended, and `truncate_messages_for_context` walks
+/// backward from the cut to land on a user-message boundary, which can only keep *more*. Restating
+/// a turn early costs tokens once per window; restating a turn late means a request with no
+/// catalogue in it at all.
+fn world_state_still_visible(
+    rendered_at: usize,
+    current_len: usize,
+    context_messages: Option<usize>,
+) -> bool {
+    context_messages.is_none_or(|limit| current_len.saturating_sub(rendered_at) < limit)
 }
 
 fn truncate_messages_for_context(
@@ -2552,6 +2638,38 @@ mod tests {
             &api_iter1[..base_len],
             "base stable after tool loop",
         );
+    }
+
+    /// Regression: the tool catalogue, skill list, and MCP instructions used to live in the system
+    /// prompt, which is sent unconditionally. They now live in one user message, which
+    /// `truncate_messages_for_context` will drop once the conversation outgrows
+    /// `context_messages` (200 by default). Without this check the snapshot would still claim the
+    /// model had been told, and a long session would run with no catalogue at all.
+    #[test]
+    fn test_world_state_is_restated_once_it_scrolls_out_of_the_window() {
+        // Rendered at index 0, window of 200.
+        assert!(
+            world_state_still_visible(0, 10, Some(200)),
+            "a fresh render is visible"
+        );
+        assert!(
+            world_state_still_visible(0, 199, Some(200)),
+            "still inside the window one message before the cut"
+        );
+        assert!(
+            !world_state_still_visible(0, 200, Some(200)),
+            "the render has reached the edge and must be restated"
+        );
+        assert!(
+            !world_state_still_visible(0, 5_000, Some(200)),
+            "a long session must not run on a render that scrolled away"
+        );
+
+        // A restatement lands at the current tail and buys another window.
+        assert!(world_state_still_visible(4_900, 5_000, Some(200)));
+
+        // No limit means nothing is ever dropped, so a single render lasts the session.
+        assert!(world_state_still_visible(0, 100_000, None));
     }
 
     #[test]

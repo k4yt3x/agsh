@@ -345,6 +345,73 @@ fn blocking_turn_returns_final_text_from_mock_provider() {
     assert_eq!(body["session_id"], id);
 }
 
+/// End-to-end shape of the per-turn context, through a real server and real turns rather than the
+/// renderer in isolation: the first turn carries the tool catalogue, the second carries none of it.
+///
+/// This is the observable form of the whole cache-prefix design. The catalogue used to live in the
+/// system prompt, where anything that changed re-cached the entire conversation; it now rides in
+/// the user's own message, which is appended. If it ever reappears on every turn, the change is
+/// costing tokens instead of saving them, and this fails.
+#[test]
+fn per_turn_context_states_the_catalogue_once_not_every_turn() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    for message in ["first question", "second question"] {
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .json(&serde_json::json!({"message": message, "stream": false}))
+            .send()
+            .expect("send");
+        assert_eq!(response.status(), 200);
+    }
+
+    let body: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", id),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let user_texts: Vec<String> = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"][0]["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        user_texts.len() >= 2,
+        "expected both user turns; got {:?}",
+        user_texts,
+    );
+
+    assert!(
+        user_texts[0].contains("[Available tools]") && user_texts[0].contains("**read_file**"),
+        "the first turn must state the catalogue; got: {}",
+        user_texts[0],
+    );
+    assert!(
+        !user_texts[1].contains("[Available tools]"),
+        "the second turn must not restate it: nothing changed, so it costs nothing; got: {}",
+        user_texts[1],
+    );
+    // Both still carry the cheap per-turn state, so this isn't passing because the block vanished.
+    for text in &user_texts[..2] {
+        assert!(text.contains("[Permission context]"), "got: {}", text);
+    }
+}
+
 #[test]
 fn fork_copies_the_conversation_into_a_new_session() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());

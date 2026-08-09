@@ -154,6 +154,8 @@ The top block reports what the session actually resolved to: the model, the acti
 
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
 
+`cache hit` is the share of input tokens served from the prompt cache rather than re-sent at full price. It should climb quickly and stay high: meka keeps everything that changes mid-session out of the cached prefix, so a steady session re-reads the cache instead of rewriting it. Expect it to drop once after a `/compact` (which rewrites the head of the conversation) and to recover on the following turns.
+
 `Redactions` reports any times the Claude provider had to drop oldest tool-result image blocks because the request body would have exceeded Anthropic's 32 MiB ceiling. A non-zero count indicates the cache prefix was invalidated for the redacted messages. See [`display.show_token_usage`](../configuration/config-file.md#displayshow_token_usage) for a per-turn variant of the same data.
 
 ### `/usage`

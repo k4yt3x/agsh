@@ -153,7 +153,17 @@ Only block 3 is marked for caching, matching the captured Claude Code CLI wire s
 
 ### Cache control
 
-The most recent message's last content block, the last tool definition, and the user system prompt all carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL matches Claude Code's `getCacheControl` for OAuth subscribers (`should1hCacheTTL` in `claude.ts:358-374`). Mid-session permission toggles never invalidate this cache; see [Permissions](../usage/permissions.md) for the reasoning.
+The most recent message's last content block, the last tool definition, and the user system prompt all carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL matches Claude Code's `getCacheControl` for OAuth subscribers (`should1hCacheTTL` in `claude.ts:358-374`).
+
+Caching is prefix-based: the system prompt precedes the tools array, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
+
+- **The system prompt is fixed for a session.** It carries only the role description, permission model, user instructions, guidelines, and OS/shell info, all resolved once at startup. The tool catalogue, skill list, and MCP server instructions live in the per-turn `<context>` block instead, because all three can change while a session runs.
+- **The tools array only grows at the tail.** `load_tool` appends a schema rather than reordering, so the earlier entries stay byte-identical.
+- **Permission toggles cost nothing.** See [Permissions](../usage/permissions.md).
+
+Two things do legitimately invalidate it, both by necessity rather than oversight: compaction, which rewrites the head of the conversation, and an MCP server withdrawing a tool via `tools/list_changed`, which has to be removed from the tools array. The latter is confined to the array, leaving the system prompt ahead of it intact.
+
+You can see the effect directly: `/status` reports the cache hit ratio, and reads should dominate from the second turn onward.
 
 ### Streaming
 

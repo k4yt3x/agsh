@@ -2216,10 +2216,9 @@ mod tests {
 
         let provider = test_provider();
 
-        // The agent fetches these once per turn. None of them take the current permission; that's
-        // the invariant we're testing.
-        let catalogue = registry.tool_catalogue();
-        let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+        // The agent builds these once per turn. Neither takes the current permission; that's the
+        // invariant we're testing.
+        let system = build_system_prompt(true, None);
         let tools = registry.definitions_active(&[]);
 
         let u1_text = {
@@ -2228,6 +2227,7 @@ mod tests {
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
                 &[],
+                "",
             );
             format!("{}\n\n{}", block, "list files under /tmp")
         };
@@ -2238,8 +2238,7 @@ mod tests {
         // via `SharedPermission::set`; here we just re-read the catalogue and rebuild everything to
         // prove the outputs don't depend on the live permission state.
 
-        let catalogue_t2 = registry.tool_catalogue();
-        let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
+        let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&[]);
 
         let u2_text = {
@@ -2248,6 +2247,7 @@ mod tests {
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
                 &[],
+                "",
             );
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
@@ -2338,8 +2338,7 @@ mod tests {
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
 
         let provider = test_provider();
-        let catalogue = registry.tool_catalogue();
-        let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+        let system = build_system_prompt(true, None);
 
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
@@ -2348,6 +2347,7 @@ mod tests {
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
                 &[],
+                "",
             );
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
@@ -2385,8 +2385,7 @@ mod tests {
         ];
         // System prompt is rebuilt the same way every turn; its content is a function of the
         // catalogue, not the messages, so it must not shift when load_tool is invoked.
-        let catalogue_t2 = registry.tool_catalogue();
-        let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
+        let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&messages_t2);
         let body_t2 = provider.build_request_body(&system_t2, &messages_t2, &tools_t2, true);
 
@@ -2421,6 +2420,110 @@ mod tests {
                 idx
             );
         }
+    }
+
+    /// An MCP server hot-swapping its tools (`tools/list_changed`) is the loudest mid-session
+    /// change there is. It legitimately rewrites part of the tools array, but it must not touch the
+    /// system prompt: that heads the cached prefix, so a byte moving there would re-cache the whole
+    /// conversation on top of the tools-array cost.
+    #[tokio::test]
+    async fn test_mcp_tool_swap_leaves_the_system_prompt_untouched() {
+        use std::path::Path;
+
+        use crate::{
+            context::build_system_prompt,
+            permission::{Permission, SharedPermission},
+            session::SessionManager,
+            tools::ToolRegistry,
+        };
+
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory session manager");
+        let shared_permission = SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            shared_permission,
+            true,
+            crate::sandbox::detect(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Missing {
+                reason: "test fixture".to_string(),
+            },
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::tools::todo::TodoState::default(),
+            )),
+            session_manager,
+            std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            crate::skills::SkillCache::for_root(None),
+            crate::tools::BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            crate::agent::test_roots(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
+        )
+        .expect("default web client config should build cleanly");
+        crate::tools::tests::register_deferred_fixture(&registry, "mcp__fs__old_tool");
+
+        let provider = test_provider();
+        let before_system = build_system_prompt(true, None);
+        let before_catalogue = registry.tool_catalogue();
+
+        // The server reconnects and advertises a different tool set.
+        registry.replace_server_tools("fs", vec![std::sync::Arc::new(
+            crate::tools::tests::FixtureDeferredTool {
+                name: "mcp__fs__new_tool".to_string(),
+            },
+        )]);
+
+        let after_system = build_system_prompt(true, None);
+        let after_catalogue = registry.tool_catalogue();
+
+        assert_eq!(
+            before_system, after_system,
+            "the system prompt must survive an MCP tool swap: it heads the cached prefix",
+        );
+        assert_ne!(
+            before_catalogue, after_catalogue,
+            "the swap must actually be visible somewhere, or this test proves nothing",
+        );
+
+        // ...and the change is announced in the block that gets appended instead.
+        let delta = crate::context::render_world_state(
+            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[]),
+            Some(&crate::context::WorldSnapshot::new(
+                &before_catalogue,
+                &[],
+                &[],
+            )),
+        );
+        assert!(
+            delta.contains("mcp__fs__new_tool"),
+            "the new tool must be announced; got: {}",
+            delta,
+        );
+        assert!(
+            delta.contains("No longer available, do not call: `mcp__fs__old_tool`"),
+            "the withdrawn tool must be retracted, or the model keeps calling it; got: {}",
+            delta,
+        );
+
+        // Both request bodies still agree on the cached head.
+        let body_before = provider.build_request_body(
+            &before_system,
+            &[Message::user("hi")],
+            &registry.definitions_active(&[]),
+            true,
+        );
+        let body_after = provider.build_request_body(
+            &after_system,
+            &[Message::user("hi")],
+            &registry.definitions_active(&[]),
+            true,
+        );
+        assert_eq!(body_before["system"], body_after["system"]);
     }
 
     /// Compaction must not silently drop the deferred-tool active set. Pre-compaction, the model
@@ -2494,7 +2597,7 @@ mod tests {
         });
 
         let pre_loaded = extract_loaded_tool_names_from_events(log.events());
-        assert!(pre_loaded.contains("fixture_deferred"));
+        assert!(pre_loaded.iter().any(|name| name == "fixture_deferred"));
         let pre_tools = registry.definitions_active_with_loaded(&pre_loaded);
         assert!(pre_tools.iter().any(|t| t.name == "fixture_deferred"));
 
@@ -2502,13 +2605,13 @@ mod tests {
         log.replace_for_compaction(
             Message::user("[summary]"),
             vec![Message::user("question 2")],
-            pre_loaded.clone(),
+            pre_loaded.iter().cloned().collect(),
         );
 
         // The materialized view shrank, but events are append-only.
         let post_loaded = extract_loaded_tool_names_from_events(log.events());
         assert!(
-            post_loaded.contains("fixture_deferred"),
+            post_loaded.iter().any(|name| name == "fixture_deferred"),
             "compaction must preserve the loaded-tools active set via the snapshot"
         );
 
@@ -2586,8 +2689,7 @@ mod tests {
         let mut bodies = Vec::with_capacity(levels.len());
         for &level in &levels {
             shared_permission.set_unchecked(level);
-            let catalogue = registry.tool_catalogue();
-            let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+            let system = build_system_prompt(true, None);
             let tools = registry.definitions_active(&[]);
             let messages = vec![Message::user("hello")];
             bodies.push(provider.build_request_body(&system, &messages, &tools, true));

@@ -314,9 +314,16 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
 /// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
 /// for those uses are still in the log on disk, but they're below the materialized view's "logical
 /// start" so the model can't act on them).
-pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> HashSet<String> {
+/// Returns names in **load order**, de-duplicated. The order is what makes the tools array a stable
+/// cache prefix: `load_tool` calls only ever append to the conversation, so appending each newly
+/// loaded tool to the tail means the array can only grow at the end. Returning an unordered set and
+/// letting the registry impose its own order would reinsert an earlier-registered tool ahead of a
+/// later-registered one that was loaded first, which is a mid-array edit and re-caches the whole
+/// conversation behind it.
+pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
     use std::collections::HashMap;
-    let mut loaded: HashSet<String> = HashSet::new();
+    let mut loaded: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut pending: HashMap<String, String> = HashMap::new();
 
     for event in events {
@@ -338,8 +345,9 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> HashSet<String
                         } => {
                             if let Some(loaded_name) = pending.remove(tool_use_id)
                                 && !is_error
+                                && seen.insert(loaded_name.clone())
                             {
-                                loaded.insert(loaded_name);
+                                loaded.push(loaded_name);
                             }
                         }
                         _ => {}
@@ -353,7 +361,17 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> HashSet<String
                 // Pending uses inside the summarized window are gone from the model's view; their
                 // would-be results are also gone. Drop them and absorb the snapshot.
                 pending.clear();
-                loaded.extend(loaded_tools_snapshot.iter().cloned());
+                // The snapshot is an unordered set, so sort it for a deterministic tail. Continuity
+                // with the pre-boundary order isn't needed: compaction rewrites the head of the
+                // conversation and re-caches everything anyway. What matters is that every turn
+                // *after* the boundary agrees on the order.
+                let mut absorbed: Vec<&String> = loaded_tools_snapshot.iter().collect();
+                absorbed.sort();
+                for name in absorbed {
+                    if seen.insert(name.clone()) {
+                        loaded.push(name.clone());
+                    }
+                }
             }
         }
     }
@@ -643,7 +661,27 @@ mod tests {
             load_tool_result("u1", false),
         ]);
         let loaded = extract_loaded_tool_names_from_events(log.events());
-        assert!(loaded.contains("scratchpad_read"));
+        assert!(loaded.iter().any(|name| name == "scratchpad_read"));
+    }
+
+    /// Load order, not registry order, is what makes the tools array append-only. A failed load
+    /// contributes nothing, and a repeat load must not move a name to the back.
+    #[test]
+    fn test_extract_loaded_tool_names_preserves_load_order() {
+        let log = Conversation::from_vec(vec![
+            load_tool_use("u1", "omega"),
+            load_tool_result("u1", false),
+            load_tool_use("u2", "alpha"),
+            load_tool_result("u2", false),
+            load_tool_use("u3", "broken"),
+            load_tool_result("u3", true),
+            load_tool_use("u4", "omega"),
+            load_tool_result("u4", false),
+        ]);
+        assert_eq!(extract_loaded_tool_names_from_events(log.events()), vec![
+            "omega".to_string(),
+            "alpha".to_string()
+        ]);
     }
 
     #[test]
@@ -658,7 +696,7 @@ mod tests {
         log.replace_for_compaction(Message::user("[summary]"), Vec::new(), snapshot);
 
         let loaded = extract_loaded_tool_names_from_events(log.events());
-        assert!(loaded.contains("scratchpad_read"));
+        assert!(loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
     #[test]
@@ -694,7 +732,9 @@ mod tests {
             extract_loaded_tool_names_from_events(log.events())
         );
         assert!(
-            extract_loaded_tool_names_from_events(log.events()).contains("scratchpad_read"),
+            extract_loaded_tool_names_from_events(log.events())
+                .iter()
+                .any(|name| name == "scratchpad_read"),
             "deferred tool must survive the prune"
         );
 
@@ -726,7 +766,7 @@ mod tests {
         );
 
         let loaded = extract_loaded_tool_names_from_events(log.events());
-        assert!(!loaded.contains("scratchpad_read"));
+        assert!(!loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
     #[test]

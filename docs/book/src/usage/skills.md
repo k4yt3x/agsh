@@ -8,7 +8,7 @@ Skills are user-defined knowledge packages that give the agent non-standard know
 - Each skill is a directory: `skills/<name>/SKILL.md`.
 - Any entry whose name begins with `.` is skipped at discovery. This covers VCS metadata (`.git`), editor/IDE state (`.vscode`, `.idea`), filesystem artifacts (`.DS_Store`, `.Trash`), and any other dotfile or dotdir that may sit alongside your skills.
 - `SKILL.md` starts with a YAML frontmatter block declaring the skill's metadata, followed by Markdown body content.
-- On every prompt, meka discovers all valid skills and lists them in the system prompt with their `description`.
+- On every prompt, meka discovers all valid skills and lists them in the per-turn context with their `description`.
 - The agent invokes a skill by calling the `skill` tool with the skill name. The tool returns the full body, which the agent follows.
 - Skills are available in **read**, **ask**, and **write** permission modes (not in **none**).
 
@@ -55,7 +55,7 @@ yt-dlp "https://example.com/video"
 
 | Field | Description |
 |-------|-------------|
-| `description` | Summary of what the skill does *and when to invoke it*. Shown in the system prompt. Fold the trigger condition into this one line. |
+| `description` | Summary of what the skill does *and when to invoke it*. Shown to the model in the per-turn context. Fold the trigger condition into this one line. |
 
 Skills missing `description` are skipped at discovery with a warning log. Unknown frontmatter keys are ignored, so a skill authored for Claude Code (which carries extra keys like `when_to_use` or `allowed-tools`) still loads.
 
@@ -84,14 +84,16 @@ The skill body may reference these variables, which are expanded when the skill 
 
 ## How the Agent Uses Skills
 
-When skills are available, the system prompt includes a `## Skills` section like:
+When skills are available, the per-turn context includes a `[Skills]` section like:
 
 ```
-## Skills
+[Skills]
 
 - **download-videos**: Download videos from various websites using yt-dlp. Use when the user wants a video off a URL.
 - **deploy-kubernetes**: Deploy services to a K8s cluster. Use when the user asks to deploy to Kubernetes.
 ```
+
+The list is sent once, not on every turn. Adding, editing, or removing a skill mid-session is picked up on the next prompt and announced as a short note naming just what changed, so a long session doesn't pay for the whole list repeatedly.
 
 The agent loads a skill by calling the `skill` tool:
 
@@ -164,7 +166,7 @@ Only the `SKILL.md` file is fetched. Helper scripts bundled alongside it in the 
 ## Tips
 
 - Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls.
-- Write `description` concisely, and fold the "use when..." trigger into it. It goes into every system prompt and consumes tokens.
+- Write `description` concisely, and fold the "use when..." trigger into it. It is sent to the model and consumes tokens.
 - Keep each skill focused on a single topic or procedure. Spawn multiple skills rather than one giant one.
 - Bundle supporting files in the skill directory and reference them with `${MEKA_SKILL_DIR}/file.ext`.
 - Skills are re-discovered on every prompt, so you can add, edit, or remove skills mid-session without restarting meka.

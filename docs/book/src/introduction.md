@@ -35,7 +35,7 @@ The same agent core is exposed through four front-ends:
 ## How It Works
 
 1. You give meka a goal in natural language, interactively, one-shot, over ACP, or over HTTP.
-2. meka sends it to the configured model along with the tool catalogue and a system prompt.
+2. meka sends it to the configured model along with a system prompt, the tool schemas, and a context block describing the current permission level, working directory, tools, and skills.
 3. The model decides which tools to call (if any) and returns text and/or tool calls.
 4. meka enforces the current permission level, executes the tool calls, and feeds the results back to the model.
 5. The loop repeats until the model is done; the final response is returned (streamed as Markdown in the terminal).

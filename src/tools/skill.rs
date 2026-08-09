@@ -31,7 +31,7 @@ impl Tool for SkillTool {
             description: "Load the full content of a named skill. Skills are knowledge \
                           files that document procedures, tools, and non-standard \
                           knowledge. Call this tool with the skill name (as listed in \
-                          the system prompt) to get its full instructions."
+                          the conversation context) to get its full instructions."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

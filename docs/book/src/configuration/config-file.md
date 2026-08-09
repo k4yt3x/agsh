@@ -563,6 +563,8 @@ Settings for injecting custom instructions into the system prompt. Use this to s
 
 A string of custom instructions that meka will include in every system prompt, under a `## User Instructions` section. The model is told to treat them as hard constraints unless they conflict with safety requirements.
 
+Resolved once at startup, so editing this value takes effect on the next `meka` launch rather than mid-session. That is deliberate: the system prompt heads the prompt-cache prefix, and rewriting it mid-session would re-cache the entire conversation.
+
 Suitable use cases:
 
 - System-specific policies: "Never install Python packages globally with pip; always use `uv` or a venv."
@@ -649,7 +651,7 @@ User-supplied config (1, 2, 4) always beats the server's self-classification; if
 
 **Stale config**: entries in `allowed_tools` / `disabled_tools` / `eager_load_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool. A name that appears in both `eager_load_tools` and `disabled_tools` also warns: the disabled filter wins, so eager-loading the disabled tool is a no-op.
 
-**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the system prompt with its required level noted inline, and a per-turn `[Permission context]` block names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
+**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
 
 #### Examples
 
@@ -714,7 +716,7 @@ disabled_tools = ["delete_file", "move_file"]
 
 MCP tools are registered with namespaced names in the format `servername__toolname` to prevent collisions with built-in tools or between servers.
 
-Tool and resource descriptions returned from MCP servers are truncated at 2048 characters to keep the system prompt bounded.
+Tool and resource descriptions returned from MCP servers are truncated at 2048 characters to keep the rendered catalogue bounded.
 
 ### Environment variable substitution
 
@@ -852,7 +854,7 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 - **Tool list refresh**: on `tools/list_changed`, meka re-discovers the server's tools and hot-swaps them in the registry; no restart needed.
 - **Progress notifications**: MCP tool calls attach a per-request `progressToken`; incoming `notifications/progress` render as a live status line under the tool invocation.
 - **Call identity**: `tools/call` carries two extra keys in `_meta` alongside the progress token. `meka/sessionId` is the UUID of the session the call came from, letting a server scope per-session state (a cache, a workspace, an audit trail) to one conversation; a sub-agent reports its own child session id. `meka/toolUseId` is the provider's tool-use id for the call. Both are absent for calls made outside a session, such as connection-time handshakes.
-- **Server instructions**: `InitializeResult.instructions` is captured once per connection and spliced into the system prompt (sanitised + truncated to 2048 chars) under `## MCP Server Instructions`.
+- **Server instructions**: `InitializeResult.instructions` is captured once per connection and delivered in the per-turn context (sanitised + truncated to 2048 chars) under `[MCP server instructions]`. A server that connects late, or reconnects with different instructions, is announced as a change rather than rewriting anything already sent.
 - **stdio server logs**: a stdio server's own stderr (many servers log there) is captured, not inherited, so it never corrupts the REPL display. Each line is re-emitted on meka's `tracing` stream at `debug` level tagged with the server name, so it stays silent at default verbosity and surfaces under `-v` / `RUST_LOG`.
 - **Auth-probe cache**: 401 responses are cached for 15 minutes so a restart after a failed auth flow skips the unauthenticated probe and goes straight to OAuth. Cleared by `meka mcp logout`.
 - `resources/list_changed`, `prompts/list_changed`, and `resources/updated` notifications are logged at `info`/`debug` level.

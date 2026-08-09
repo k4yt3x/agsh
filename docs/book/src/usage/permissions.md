@@ -68,18 +68,29 @@ When the agent attempts to use a tool, meka checks whether the current permissio
 
 ### Telling the agent the current level
 
-meka lists **every registered tool** in the system prompt with its required permission level inline (nothing is filtered out), and each user message carries a compact `[Permission context]` block:
+meka lists **every registered tool** in the per-turn `<context>` block with its required permission level inline (nothing is filtered out), and the same block carries a compact `[Permission context]` section:
 
 ```text
 <context>
 [Permission context]
 Current permission level: read
 Only read-only tools are executable.
+
+[Environment context]
+Working directory: /home/you/project
+
+[Available tools]
+- **read_file** (requires `read`)
+- **write_file** (requires `write`)
 ...
 </context>
 ```
 
-That two-line block is the only permission-dependent content in the request. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
+That two-line permission section is the only permission-dependent content in the request. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache; the entire conversation stays warm.
+
+The same reasoning is why the tool catalogue itself lives here rather than in the system prompt. Prompt caching is prefix-based, and the system prompt heads that prefix, so anything cached there that later changes (an MCP server connecting late or hot-swapping its tools, a skill being installed) would re-cache the entire conversation behind it. The `<context>` block rides inside your own message instead, so changes are appended rather than rewritten.
+
+Only what actually changed is re-sent. The first turn of a session carries the full catalogue, skill list, and any MCP server instructions; a turn where nothing moved carries none of it, and a turn where something moved carries a short note naming just that change.
 
 ### MCP tool permissions
 

@@ -119,11 +119,13 @@ context_messages = 100
 
 The full history remains in SQLite for resumption. Only the API payload is truncated. The truncation preserves tool call chains (it never splits a tool use from its result).
 
+The tool catalogue and skill list travel in the conversation rather than the system prompt, so they are subject to this window too. meka tracks where it last stated them and restates them in full once that message scrolls out, which works out to roughly once per window. Setting `context_messages` very low therefore makes those restatements more frequent.
+
 ### Compacting a Session
 
 If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace older messages with a structured summary. A token-budgeted tail of the most recent messages is preserved verbatim (snapped to a clean user-turn boundary so tool calls aren't split). The structured summary captures the primary task and current state, key files and decisions, errors and fixes, every distinct user request, the next step (quoted verbatim to avoid drift), and any security-relevant constraints the user stated (preserved verbatim so they keep applying after compaction).
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. The summary message ends with a directive to resume the work directly rather than narrate the summary. Tools that the model loaded via `load_tool` before compaction stay loaded after; the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used. If a detail was dropped, the model can `recall` / `recall_read` the full pre-compaction history, which stays on disk.
+Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. The tool catalogue, skill list, and MCP server instructions are restated in full on the next turn too, since the messages that carried them may have been summarized away. The summary message ends with a directive to resume the work directly rather than narrate the summary. Tools that the model loaded via `load_tool` before compaction stay loaded after; the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used. If a detail was dropped, the model can `recall` / `recall_read` the full pre-compaction history, which stays on disk.
 
 Internally, compaction does not delete pre-compaction rows from the database. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only.
 

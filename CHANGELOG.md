@@ -17,8 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ACP multi-root workspaces: extra folders are searched and named, not silently dropped.
 - Fork a session into an independent copy from the CLI, REPL, HTTP, or ACP.
 
+### Changed
+
+- Tools, skills, and MCP instructions moved from the system prompt into the per-turn context.
+
 ### Fixed
 
+- Loading a deferred tool no longer reorders the tools array, which invalidated the prompt cache.
+- A new skill or a reconnecting MCP server no longer re-caches the whole conversation.
 - ACP clients now see images a tool looked at, instead of an `[image]` placeholder.
 - `meka session import` no longer leaves a restored session for retention GC to delete.
 - Session export/import no longer drops a session's additional workspace roots.

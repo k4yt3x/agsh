@@ -29,10 +29,10 @@ impl Tool for LoadToolTool {
         ToolDefinition {
             name: LOAD_TOOL_NAME.to_string(),
             description: "Load the full schema for a deferred tool listed under \
-                          `## Tool Discovery` in the system prompt. After a successful \
-                          call, the tool's full schema becomes available on your next \
-                          turn. Invoke the tool by name as usual. Pass the exact tool \
-                          name (e.g. `mcp__notion__fetch`)."
+                          `[Tool discovery]` in the conversation context. After a \
+                          successful call, the tool's full schema becomes available on \
+                          your next turn. Invoke the tool by name as usual. Pass the \
+                          exact tool name (e.g. `mcp__notion__fetch`)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -80,7 +80,7 @@ impl Tool for LoadToolTool {
             return Ok(ToolOutput::text(
                 format!(
                     "Error: tool '{}' is not registered. Check the names listed under \
-                     `## Tool Discovery` in the system prompt.",
+                     `[Tool discovery]` in the conversation context.",
                     name
                 ),
                 true,
@@ -200,7 +200,7 @@ mod tests {
         assert!(result.is_error);
         let text = ContentBlock::tool_result_text_content(&result.content);
         assert!(text.contains("not registered"));
-        assert!(text.contains("Tool Discovery"));
+        assert!(text.contains("[Tool discovery]"));
     }
 
     #[tokio::test]

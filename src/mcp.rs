@@ -629,7 +629,7 @@ impl McpClientManager {
     /// Returns `(server_name, instructions)` pairs for every connected server that advertised an
     /// `InitializeResult.instructions` string during the handshake. Already sanitised and truncated
     /// to [`MAX_MCP_DESCRIPTION_LENGTH`]. Used by the agent loop to splice MCP server instructions
-    /// into the system prompt.
+    /// into the per-turn context.
     pub fn server_instructions(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {

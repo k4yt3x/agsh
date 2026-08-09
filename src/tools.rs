@@ -366,9 +366,9 @@ impl ToolRegistry {
 
     /// Mark a tool as deferred. Deferred tools live in the registry but are hidden from the
     /// per-turn tools array until the model explicitly loads them via the `load_tool` meta-tool.
-    /// Discoverability is preserved by the `## Tool Discovery` section of the system prompt (built
-    /// from `tool_catalogue()`), and the active set is recomputed per turn from the conversation,
-    /// not from registry state.
+    /// Discoverability is preserved by the `[Tool discovery]` section of the per-turn `<context>`
+    /// block (built from `tool_catalogue()`), and the active set is recomputed per turn from the
+    /// conversation, not from registry state.
     pub fn mark_deferred(&self, name: &str) {
         self.deferred
             .write()
@@ -427,7 +427,10 @@ impl ToolRegistry {
     /// scan loses the snapshot.
     #[cfg(test)]
     pub fn definitions_active(&self, messages: &[Message]) -> Vec<ToolDefinition> {
-        let loaded = extract_loaded_tool_names(messages);
+        // Sorted so the slice-only path is deterministic; the events-aware path preserves real load
+        // order, which is what the append-only cache prefix depends on.
+        let mut loaded: Vec<String> = extract_loaded_tool_names(messages).into_iter().collect();
+        loaded.sort();
         self.definitions_active_with_loaded(&loaded)
     }
 
@@ -440,25 +443,57 @@ impl ToolRegistry {
     /// Blocked calls are rejected at dispatch; keeping the tools array permission-independent is
     /// what preserves the prompt cache prefix across `/permission` toggles (breakpoint 3 in the
     /// Claude provider's cache layout).
-    pub fn definitions_active_with_loaded(&self, loaded: &HashSet<String>) -> Vec<ToolDefinition> {
+    /// `loaded` must be in load order (see
+    /// [`crate::conversation::extract_loaded_tool_names_from_events`]).
+    ///
+    /// Emits always-active tools first in registration order, then loaded-deferred tools in the
+    /// order they were loaded. Both halves grow only at the tail as a session proceeds, which is
+    /// what keeps this array a stable cache prefix: `load_tool` only ever appends to the
+    /// conversation, so the second half only ever gains entries.
+    ///
+    /// Filtering the registration-ordered list in place would *not* be append-only. With tools
+    /// registered `[a, b]`, loading `b` then `a` yields `[b]` and then `[a, b]`, inserting `a`
+    /// ahead of `b`. The array precedes every message, so that edit re-caches the whole
+    /// conversation.
+    ///
+    /// The one thing that does disturb the first half is [`Self::replace_server_tools`], which
+    /// removes an MCP server's tools and re-appends the new set at the tail. That genuinely
+    /// rewrites part of the array and cannot be avoided when a server withdraws a tool, but it is
+    /// confined here: the system prompt ahead of the array is unaffected, so the blast radius is
+    /// the array rather than the whole conversation.
+    pub fn definitions_active_with_loaded(&self, loaded: &[String]) -> Vec<ToolDefinition> {
         let deferred = self
             .deferred
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.tools
+        let tools = self
+            .tools
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut definitions: Vec<ToolDefinition> = tools
             .iter()
-            .filter(|tool| {
-                let name = tool.definition().name;
-                !deferred.contains(&name) || loaded.contains(&name)
-            })
+            .filter(|tool| !deferred.contains(&tool.definition().name))
             .map(|tool| tool.definition())
-            .collect()
+            .collect();
+
+        for name in loaded {
+            // Names that aren't deferred are already in the active half; a name with no registry
+            // entry was loaded and later removed (an MCP `tools/list_changed` swap) and simply
+            // drops out.
+            if !deferred.contains(name) {
+                continue;
+            }
+            if let Some(tool) = tools.iter().find(|tool| &tool.definition().name == name) {
+                definitions.push(tool.definition());
+            }
+        }
+
+        definitions
     }
 
     /// Returns (name, description, required_permission, is_deferred) for every registered tool.
-    /// Drives the permission-independent system-prompt tool catalogue plus the per-turn
+    /// Drives the permission-independent `[Available tools]` catalogue plus the per-turn
     /// `[Permission context]` block that names currently-blocked tools. Sorted by (name) for
     /// deterministic output.
     pub fn tool_catalogue(&self) -> Vec<(String, String, Permission, bool)> {
@@ -1107,6 +1142,49 @@ pub(crate) mod tests {
         assert!(active.iter().any(|t| t.name == "scratchpad_delete"));
     }
 
+    /// The tools array precedes every message in the request, so it must only ever grow at the
+    /// tail: a mid-array insertion re-caches the entire conversation behind it.
+    ///
+    /// Loading in reverse registration order is the case that breaks a naive implementation.
+    /// Filtering the registration-ordered list in place puts `alpha` in front of `omega` once both
+    /// are loaded, even though `omega` was loaded first.
+    #[tokio::test]
+    async fn test_definitions_active_grows_only_at_the_tail() {
+        let registry = test_registry().await;
+        register_deferred_fixture(&registry, "alpha_fixture");
+        register_deferred_fixture(&registry, "omega_fixture");
+
+        let names = |loaded: &[String]| -> Vec<String> {
+            registry
+                .definitions_active_with_loaded(loaded)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect()
+        };
+
+        // Reverse registration order: `omega_fixture` was registered second but loads first.
+        let none = names(&[]);
+        let one = names(&["omega_fixture".to_string()]);
+        let two = names(&["omega_fixture".to_string(), "alpha_fixture".to_string()]);
+
+        assert_eq!(
+            one[..none.len()],
+            none[..],
+            "loading a tool must not disturb the tools already in the array"
+        );
+        assert_eq!(
+            two[..one.len()],
+            one[..],
+            "loading a second tool must not reorder the first: got {:?} after {:?}",
+            two,
+            one,
+        );
+        assert_eq!(two[none.len()..], [
+            "omega_fixture".to_string(),
+            "alpha_fixture".to_string()
+        ]);
+    }
+
     #[tokio::test]
     async fn test_definitions_active_stable_across_permissions() {
         let registry = test_registry().await;
@@ -1392,7 +1470,7 @@ pub(crate) mod tests {
             registry.required_permission_for("write_file"),
             Some(Permission::Write)
         );
-        // Catalogue must reflect the override too (the system prompt reads from it).
+        // Catalogue must reflect the override too (the world-state block reads from it).
         let catalogue = registry.tool_catalogue();
         let read_file_required = catalogue
             .iter()

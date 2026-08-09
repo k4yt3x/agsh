@@ -4220,6 +4220,7 @@ mod tests {
             &crate::tools::todo::TodoState::default(),
             std::path::Path::new("."),
             &[],
+            "",
         );
         format!("{}\n\n{}", block, user_input)
     }

@@ -50,7 +50,7 @@ Any built-in can be allow-listed, blocked, or have its required permission overr
 
 ## MCP Tools
 
-When [MCP servers](../configuration/config-file.md#mcp-servers-mcp) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the system prompt catalogue alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
+When [MCP servers](../configuration/config-file.md#mcp-servers-mcp) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalogue alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
 
 meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; call `load_tool` with the exact name to make the schema available on the next turn:
 
@@ -107,7 +107,7 @@ Multiple `spawn_agent` calls in one assistant turn run in parallel; useful when 
 
 ## `skill`
 
-Loads a named skill's instructions. Skills are user-defined knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`. The system prompt lists available skills with their description and when-to-use hint; the agent calls `skill({"name": "<skill-name>"})` to load the full body. See [Skills](../usage/skills.md) for how to author skills.
+Loads a named skill's instructions. Skills are user-defined knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`. The per-turn context lists available skills with their description and when-to-use hint; the agent calls `skill({"name": "<skill-name>"})` to load the full body. See [Skills](../usage/skills.md) for how to author skills.
 
 ## `render_image`
 
