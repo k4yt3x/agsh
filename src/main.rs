@@ -140,6 +140,20 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
+    // `-c` used to take an optional session id, so `meka -c <uuid>` was the documented way to
+    // resume one. It is now a boolean, which would silently read that id as the prompt and continue
+    // the *most recent* session instead of the named one. Catch the old spelling rather than
+    // quietly doing the wrong thing.
+    if cli.continue_last
+        && let Some(prompt) = cli.prompt.as_deref()
+        && looks_like_session_id(prompt)
+    {
+        return Err(anyhow::anyhow!(
+            "`-c` no longer takes a session id; use `-r {prompt}` to resume that session, \
+             or `-c` alone to continue the most recent one"
+        ));
+    }
+
     // If --skill is set, validate and render the body upfront so an invalid name fails fast
     // before any session/MCP setup. The combined string (extra + body, mirroring the REPL's `/skill
     // <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
@@ -783,7 +797,7 @@ async fn run_oneshot(
     ));
     let agent = create_agent_from_config(
         &config,
-        session_manager,
+        session_manager.clone(),
         shared_permission,
         token_store,
         credential,
@@ -794,8 +808,11 @@ async fn run_oneshot(
     )
     .await?;
 
-    let mut session_id = None;
-    let mut messages = conversation::Conversation::new();
+    // `--continue` / `--resume` apply here just as they do interactively: run one turn against an
+    // existing conversation and exit. The lock is bound rather than dropped so it is held for the
+    // duration of the turn.
+    let (mut session_id, mut messages, _session_lock) =
+        resolve_session_resume(&session_manager, &config).await?;
 
     match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt).await {
         Ok(()) => {}
@@ -1527,12 +1544,12 @@ async fn import_session(session_manager: &SessionManager, input: &str) -> anyhow
     // other one-shot CLI messages; `render_hint`'s dark-grey styling is for the REPL.
     if count > 1 {
         eprintln!(
-            "Imported session with {} sub-agent(s). Resume with: meka -c {}",
+            "Imported session with {} sub-agent(s). Resume with: meka -r {}",
             count - 1,
             root_new_id
         );
     } else {
-        eprintln!("Imported session. Resume with: meka -c {}", root_new_id);
+        eprintln!("Imported session. Resume with: meka -r {}", root_new_id);
     }
     println!("{}", root_new_id);
     Ok(())
@@ -1599,7 +1616,7 @@ async fn fork_session_command(
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
     tracing::info!("forked session {} into {}", session_id, forked.id);
-    eprintln!("Forked session. Resume with: meka -c {}", forked.id);
+    eprintln!("Forked session. Resume with: meka -r {}", forked.id);
     println!("{}", forked.id);
     Ok(())
 }
@@ -2481,36 +2498,40 @@ async fn resolve_session_resume(
     conversation::Conversation,
     Option<session::SessionLock>,
 )> {
-    let Some(value) = &config.continue_session else {
+    let resolved = match &config.session_resume {
+        None => return Ok((None, conversation::Conversation::new(), None)),
+        // `--continue` on a store with no sessions yet is not an error: there is simply nothing to
+        // pick up, so the run starts fresh.
+        Some(crate::config::SessionResume::Last) => session_manager.last_session_id().await?,
+        Some(crate::config::SessionResume::Id(value)) => {
+            Some(resolve_session_id(session_manager, value).await?)
+        }
+    };
+    let Some(id) = resolved else {
         return Ok((None, conversation::Conversation::new(), None));
     };
 
-    if value == "last" {
-        match session_manager.last_session_id().await? {
-            Some(id) => {
-                let lock = session_manager.lock_session(id)?;
-                render::render_session_id("Continuing session", &id.to_string());
-                if config.newline_after_prompt {
-                    eprintln!();
-                }
-                let messages = load_session_messages(session_manager, id).await?;
-                Ok((Some(id), messages, Some(lock)))
-            }
-            None => Ok((None, conversation::Conversation::new(), None)),
-        }
-    } else {
-        let id = resolve_session_id(session_manager, value).await?;
-        let lock = session_manager.lock_session(id)?;
-        render::render_session_id("Continuing session", &id.to_string());
-        if config.newline_after_prompt {
-            eprintln!();
-        }
-        let messages = load_session_messages(session_manager, id).await?;
-        Ok((Some(id), messages, Some(lock)))
+    let lock = session_manager.lock_session(id)?;
+    render::render_session_id("Continuing session", &id.to_string());
+    if config.newline_after_prompt {
+        eprintln!();
     }
+    let messages = load_session_messages(session_manager, id).await?;
+    Ok((Some(id), messages, Some(lock)))
 }
 
-/// Resolve `meka -c <value>` (where `value` is not "last") to a single session UUID. Tries a
+/// Whether a string is plausibly a session id rather than a prompt: hex digits and hyphens only,
+/// and long enough to be a useful UUID prefix.
+///
+/// Only used to catch the old `meka -c <uuid>` spelling and point at `-r`. Deliberately
+/// conservative: an English prompt of eight-plus characters with no spaces that happens to be pure
+/// hex (`deadbeef`) would be caught, but that is a far better trade than silently continuing the
+/// wrong session for someone following older docs.
+fn looks_like_session_id(value: &str) -> bool {
+    value.len() >= 8 && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Resolve `meka -r <value>` to a single session UUID. Tries a
 /// full-UUID parse first; if that fails, falls back to a prefix lookup so users can type just the
 /// leading hex chars.
 ///
@@ -2609,6 +2630,23 @@ mod tests {
             ("b".to_string(), Some("a".to_string())),
         ];
         assert!(parents_first_order(&nodes).is_err());
+    }
+
+    /// `meka -c <uuid>` was the documented way to resume a specific session before `-c` became a
+    /// boolean. It now parses as "continue the most recent session, with this id as the prompt",
+    /// which is silently the wrong session, so the old spelling has to be caught rather than run.
+    #[test]
+    fn test_looks_like_session_id_catches_the_old_spelling() {
+        assert!(looks_like_session_id(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(looks_like_session_id("550e8400"));
+        // Real prompts are not mistaken for ids.
+        assert!(!looks_like_session_id("fix the bug"));
+        assert!(!looks_like_session_id("explain"));
+        assert!(!looks_like_session_id("why?"));
+        // Too short to be a useful prefix, so treated as a prompt.
+        assert!(!looks_like_session_id("550e"));
     }
 
     #[test]

@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Tools, skills, and MCP instructions moved from the system prompt into the per-turn context.
+- **Breaking:** `-c` takes no session id; use `-r`/`--resume <SESSION>` to resume a specific one.
 
 ### Fixed
 
+- `--oneshot` now honours `-c`/`-r` instead of silently starting a new session.
 - Loading a deferred tool no longer reorders the tools array, which invalidated the prompt cache.
 - A new skill or a reconnecting MCP server no longer re-caches the whole conversation.
 - ACP clients now see images a tool looked at, instead of an `[image]` placeholder.

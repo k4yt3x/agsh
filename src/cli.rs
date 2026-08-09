@@ -115,7 +115,7 @@ pub enum SessionAction {
     /// Import a session from a JSON export
     ///
     /// Recreates the session and any sub-agent children under fresh IDs so it
-    /// can be resumed with `meka -c <new-id>`. Prints the new root session ID.
+    /// can be resumed with `meka -r <new-id>`. Prints the new root session ID.
     Import {
         /// Export file to read (`-` for stdin)
         input: String,
@@ -498,9 +498,13 @@ pub struct Cli {
     /// Run a one-shot prompt and exit
     pub prompt: Option<String>,
 
-    /// Resume a session (`-c` for last, `-c <UUID-PREFIX>` for specific)
-    #[arg(short = 'c', long = "continue", num_args = 0..=1, default_missing_value = "last")]
-    pub continue_session: Option<String>,
+    /// Continue the most recent session
+    #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
+    pub continue_last: bool,
+
+    /// Resume a session by UUID or leading prefix
+    #[arg(short = 'r', long = "resume", value_name = "SESSION")]
+    pub resume: Option<String>,
 
     /// Initial permission mode (none, read, ask, write)
     #[arg(long = "permission", value_parser = parse_permission)]
@@ -580,7 +584,8 @@ mod tests {
         let cli = Cli::parse_from(["meka"]);
         assert!(cli.command.is_none());
         assert!(cli.prompt.is_none());
-        assert!(cli.continue_session.is_none());
+        assert!(!cli.continue_last);
+        assert!(cli.resume.is_none());
         assert!(cli.permission.is_none());
         assert!(cli.provider.is_none());
         assert!(cli.model.is_none());
@@ -638,16 +643,39 @@ mod tests {
     #[test]
     fn test_cli_continue_last() {
         let cli = Cli::parse_from(["meka", "-c"]);
-        assert_eq!(cli.continue_session.as_deref(), Some("last"));
+        assert!(cli.continue_last);
+        assert!(cli.resume.is_none());
     }
 
     #[test]
-    fn test_cli_continue_specific_session() {
-        let cli = Cli::parse_from(["meka", "-c", "550e8400-e29b-41d4-a716-446655440000"]);
+    fn test_cli_resume_specific_session() {
+        let cli = Cli::parse_from(["meka", "-r", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
-            cli.continue_session.as_deref(),
+            cli.resume.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
+        assert!(!cli.continue_last);
+    }
+
+    /// The reason `-c` stopped taking an optional value: it was the only root flag that could
+    /// swallow the next argument, so a prompt after it was read as a session prefix.
+    #[test]
+    fn test_cli_continue_does_not_consume_the_prompt() {
+        let cli = Cli::parse_from(["meka", "-c", "fix the bug"]);
+        assert!(cli.continue_last);
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn test_cli_resume_takes_the_id_and_leaves_the_prompt() {
+        let cli = Cli::parse_from(["meka", "-r", "550e8400", "fix the bug"]);
+        assert_eq!(cli.resume.as_deref(), Some("550e8400"));
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    #[test]
+    fn test_cli_continue_and_resume_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["meka", "-c", "-r", "550e8400"]).is_err());
     }
 
     #[test]
@@ -665,7 +693,7 @@ mod tests {
         assert_eq!(cli.provider.as_deref(), Some("openai-api"));
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.no_stream);
-        assert_eq!(cli.continue_session.as_deref(), Some("last"));
+        assert!(cli.continue_last);
         assert_eq!(cli.verbosity, 2);
     }
 
@@ -678,14 +706,14 @@ mod tests {
     #[test]
     fn test_cli_continue_long_form() {
         let cli = Cli::parse_from(["meka", "--continue"]);
-        assert_eq!(cli.continue_session.as_deref(), Some("last"));
+        assert!(cli.continue_last);
     }
 
     #[test]
-    fn test_cli_continue_long_form_with_id() {
-        let cli = Cli::parse_from(["meka", "--continue", "550e8400-e29b-41d4-a716-446655440000"]);
+    fn test_cli_resume_long_form() {
+        let cli = Cli::parse_from(["meka", "--resume", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
-            cli.continue_session.as_deref(),
+            cli.resume.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
     }

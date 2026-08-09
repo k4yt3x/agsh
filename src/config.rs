@@ -496,6 +496,35 @@ pub struct ProviderProfile {
     pub redact_thinking: Option<bool>,
 }
 
+/// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
+/// `--resume` flags.
+///
+/// A real type rather than the `Option<String>` with a `"last"` sentinel this replaces: the
+/// sentinel meant `-c` had to take an optional value, which made it the only flag on the root
+/// command that could swallow the following argument. `meka -c "fix the bug"` read the prompt as a
+/// session prefix and failed with either a confusing lookup error or, under `--oneshot`, a claim
+/// that no prompt was given. Splitting the two intents into a boolean and a value-taking flag puts
+/// both in line with every other root flag and removes the ambiguity at the parser rather than
+/// guessing at it afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionResume {
+    /// `--continue`: the most recently updated session.
+    Last,
+    /// `--resume <SESSION>`: a specific UUID, or a leading prefix of one.
+    Id(String),
+}
+
+impl SessionResume {
+    /// `None` when neither flag was given. Clap enforces that they are mutually exclusive, so the
+    /// order of these checks is not load-bearing.
+    fn from_cli(cli: &crate::cli::Cli) -> Option<Self> {
+        if let Some(id) = &cli.resume {
+            return Some(Self::Id(id.clone()));
+        }
+        cli.continue_last.then_some(Self::Last)
+    }
+}
+
 /// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
 /// rest of the binary reads; `ConfigFile` is for deserialization only. Resolution lives in
 /// `resolve_config` (Linux) and the non-Linux variant below it.
@@ -516,7 +545,7 @@ pub struct ResolvedConfig {
     pub permission: Permission,
     pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
-    pub continue_session: Option<String>,
+    pub session_resume: Option<SessionResume>,
     pub prompt: Option<String>,
     pub oneshot: bool,
     pub newline_before_prompt: bool,
@@ -1453,7 +1482,7 @@ impl ResolvedConfig {
             permission,
             enabled_permissions,
             streaming: !cli.no_stream,
-            continue_session: cli.continue_session.clone(),
+            session_resume: SessionResume::from_cli(cli),
             prompt: cli.prompt.clone(),
             oneshot: cli.oneshot,
             newline_before_prompt: file_display.newline_before_prompt.unwrap_or(true),
@@ -2785,6 +2814,30 @@ Rule 2.
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_session_resume_from_cli() {
+        use clap::Parser as _;
+
+        let parse = |args: &[&str]| SessionResume::from_cli(&crate::cli::Cli::parse_from(args));
+
+        assert_eq!(parse(&["meka"]), None);
+        assert_eq!(parse(&["meka", "-c"]), Some(SessionResume::Last));
+        assert_eq!(
+            parse(&["meka", "-r", "550e8400"]),
+            Some(SessionResume::Id("550e8400".to_string())),
+        );
+        // A prompt alongside either flag is a prompt, not a session; that ambiguity is exactly what
+        // splitting the old optional-value `-c` removed.
+        assert_eq!(
+            parse(&["meka", "-c", "fix the bug"]),
+            Some(SessionResume::Last)
+        );
+        assert_eq!(
+            parse(&["meka", "-r", "550e8400", "fix the bug"]),
+            Some(SessionResume::Id("550e8400".to_string())),
+        );
     }
 
     #[test]

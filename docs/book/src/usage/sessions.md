@@ -17,23 +17,23 @@ Sessions persist your conversation so you can resume later. Each session is iden
 meka -c
 ```
 
-This resumes the most recently updated session.
+This resumes the most recently updated session. `-c` takes no value, so you can follow it with an opening prompt: `meka -c "and now add tests"`.
 
 ### By UUID
 
 ```bash
-meka -c 550e8400-e29b-41d4-a716-446655440000
+meka -r 550e8400-e29b-41d4-a716-446655440000
 ```
 
 The agent loads the previous conversation and continues from where you left off.
 
 ### By UUID Prefix
 
-If the value isn't a valid UUID, meka treats it as a leading prefix and looks up sessions whose ID starts with it. This avoids having to copy the entire UUID:
+If the value passed to `-r` isn't a valid UUID, meka treats it as a leading prefix and looks up sessions whose ID starts with it. This avoids having to copy the entire UUID:
 
 ```bash
-meka -c 550e            # works if exactly one session starts with `550e`
-meka -c 5               # likely ambiguous; meka lists matching IDs and exits
+meka -r 550e            # works if exactly one session starts with `550e`
+meka -r 5               # likely ambiguous; meka lists matching IDs and exits
 ```
 
 When a prefix matches multiple sessions, meka prints the matching IDs (most-recent first) so you can disambiguate. Type a few more characters until the prefix is unique.
@@ -204,7 +204,7 @@ meka session import session-550e8400-e29b-41d4-a716-446655440000.json
 meka assigns the imported session (and any sub-agent children) **new** UUIDs so they can't collide with existing sessions, then prints the new root session ID. Resume it like any other session:
 
 ```bash
-meka -c <new-id>
+meka -r <new-id>
 ```
 
 Read from stdin with `-`:
@@ -228,7 +228,7 @@ meka session fork 550e8400-e29b-41d4-a716-446655440000
 The copy starts with the original's full conversation and continues from there under a new UUID, which is printed on stdout so it can be captured:
 
 ```bash
-meka -c "$(meka session fork 550e8400-e29b-41d4-a716-446655440000)"
+meka -r "$(meka session fork 550e8400-e29b-41d4-a716-446655440000)"
 ```
 
 Use it to try a different direction from a known-good point, to run a throwaway question against a large accumulated context, or to keep a conversation you're about to compact.

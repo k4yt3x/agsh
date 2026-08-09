@@ -60,17 +60,36 @@ When omitted, meka starts the REPL with no initial input.
 
 ## Options
 
-### `-c`, `--continue [SESSION_ID]`
+### `-c`, `--continue`
 
-Resume a session. Without a session ID, resumes the most recently updated session. With a session ID, resumes that specific session. It accepts either the full UUID or any unique leading prefix (most-recent-first if the prefix matches more than one).
+Continue the most recently updated session. Takes no value.
 
 ```bash
-meka -c                                          # resume last session
-meka -c 550e8400-e29b-41d4-a716-446655440000     # full UUID
-meka -c 550e                                     # prefix; works if unique
+meka -c                     # pick up where you left off
+meka -c "and now add tests" # …with an opening prompt
+```
+
+Starting fresh when there is no session yet is not an error; meka just begins a new one.
+
+### `-r`, `--resume <SESSION>`
+
+Resume a specific session. Accepts either the full UUID or any unique leading prefix.
+
+```bash
+meka -r 550e8400-e29b-41d4-a716-446655440000     # full UUID
+meka -r 550e                                     # prefix; works if unique
+meka -r 550e "and now add tests"                 # …with an opening prompt
 ```
 
 Errors if the session does not exist, the prefix matches multiple sessions (with the matching IDs listed for disambiguation), or the session is locked by another meka instance.
+
+`-c` and `-r` are mutually exclusive. Both work with `--oneshot`, which runs a single turn against the session and exits:
+
+```bash
+meka --oneshot -r 550e "summarise what we decided"
+```
+
+> **Breaking change.** `-c` used to take an optional session ID (`meka -c 550e8400`); that spelling now belongs to `-r`. Because `-c` was the only flag that could swallow the following argument, `meka -c "fix the bug"` read the prompt as a session ID and failed with a confusing error. Passing an ID to `-c` now tells you to use `-r`.
 
 ### `--permission <MODE>`
 

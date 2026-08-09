@@ -37,11 +37,16 @@ meka --permission write "run 'cargo test' and summarize the results"
 
 # Disable streaming
 meka --no-stream "read README.md and summarize it"
+
+# Run one turn against an existing session
+meka --oneshot -r 550e8400 "summarise what we decided"
 ```
 
 ## Session Behavior
 
-One-shot mode creates a new session for each invocation. The session UUID is printed to stderr when the run completes:
+One-shot mode creates a new session for each invocation, unless you point it at an existing one with `-c` (most recent) or `-r <SESSION>` (specific). Those run a single turn against that conversation and exit, which is the usual shape for scripting against a session built up earlier.
+
+The session UUID is printed to stderr when the run completes:
 
 ```text
 Session: 550e8400-e29b-41d4-a716-446655440000

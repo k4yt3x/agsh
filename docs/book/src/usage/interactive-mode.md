@@ -180,7 +180,7 @@ After compacting, the session continues with the summary as context. The pre-com
 
 `/fork` copies the current session and switches you into the copy, printing its ID. Your conversation carries over untouched, so the branch happens exactly where you are; the original stops there and keeps everything up to that point.
 
-Use it before trying a direction you might want to back out of, or before `/compact` if you'd rather keep the uncompacted conversation around. To go back, exit and resume the original with `meka -c <old-id>`.
+Use it before trying a direction you might want to back out of, or before `/compact` if you'd rather keep the uncompacted conversation around. To go back, exit and resume the original with `meka -r <old-id>`.
 
 The copy is a fully independent session with no link back to its source. See [Forking a Session](./sessions.md#forking-a-session) for exactly what it carries.
 
