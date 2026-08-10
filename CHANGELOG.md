@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-08-10
+
 ### Added
 
 - `POST /v1/sessions/{id}/turn` accepts inline `images`, so a remote client can send a picture.
@@ -1244,7 +1246,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.36.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.37.0...HEAD
+[0.37.0]: https://github.com/k4yt3x/meka/compare/0.36.0...0.37.0
 [0.36.0]: https://github.com/k4yt3x/meka/compare/0.35.0...0.36.0
 [0.35.0]: https://github.com/k4yt3x/meka/compare/0.34.0...0.35.0
 [0.34.0]: https://github.com/k4yt3x/meka/compare/0.33.1...0.34.0
