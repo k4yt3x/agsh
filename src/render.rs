@@ -2525,6 +2525,27 @@ mod tests {
         output
     }
 
+    /// The agent substitutes a bracketed stand-in when a turn produces no content (see
+    /// `agent::empty_turn_notice`) and streams it as ordinary assistant text, so it lands in the
+    /// markdown renderer like any other prose. A leading `[` opens a link in CommonMark, and these
+    /// notices are the user's only signal that the turn happened at all, so a parser that swallowed
+    /// the brackets - or the line - would turn a reported failure back into a silent one.
+    #[test]
+    fn termimad_preserves_bracketed_empty_turn_notices() {
+        for notice in [
+            "[The model returned an empty response.]",
+            "[The model returned an empty response (stop reason: pause_turn).]",
+            "[The model declined to respond to this request.]",
+            "[The model reached its output limit before producing a response.]",
+        ] {
+            assert_eq!(
+                termimad_stream(notice, 4096).trim_end(),
+                notice,
+                "the stand-in notice must render verbatim"
+            );
+        }
+    }
+
     /// Documents that between them cover every branch of the termimad flush: prose, headings,
     /// lists, tables, fences (closed, unterminated, containing blank lines), and the adjacencies
     /// between them. Tokens are short and unique so wrapping can't split one.

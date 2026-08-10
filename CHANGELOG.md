@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI-compatible streaming dropped a tool call or text that shared a chunk with `finish_reason`.
+- REPL text streamed before an interrupt or error no longer leaks into the next turn's output.
+
 ## [0.37.0] - 2026-08-10
 
 ### Added

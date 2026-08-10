@@ -449,97 +449,17 @@ impl Provider for OpenAiProvider {
                                 }
                             };
 
-                            if let Some(usage) = data.get("usage") {
-                                let token_usage = TokenUsage {
-                                    input_tokens: usage
-                                        .get("prompt_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0),
-                                    output_tokens: usage
-                                        .get("completion_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0),
-                                    ..TokenUsage::default()
-                                };
-                                if event_sender
-                                    .send(StreamEvent::Usage(token_usage))
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::trace!("stream event receiver dropped");
-                                    break;
-                                }
-                            }
-
-                            let Some(choice) = data.get("choices").and_then(|choices| choices.get(0)) else {
-                                continue;
-                            };
-
-                            if let Some(finish_reason) = choice.get("finish_reason").and_then(|reason| reason.as_str()) {
-                                // Record the stop reason but keep reading: with
-                                // `stream_options.include_usage` the usage arrives in a trailing
-                                // chunk AFTER this one (and before `[DONE]`). Finalisation and the
-                                // single MessageEnd happen once the stream ends, below the loop.
-                                final_stop = Some(parse_openai_stop_reason(finish_reason));
-                                continue;
-                            }
-
-                            let Some(delta) = choice.get("delta") else {
-                                continue;
-                            };
-
-                            if let Some(text) = delta.get("content").and_then(|content| content.as_str())
-                                && !text.is_empty()
-                                    && event_sender.send(StreamEvent::TextDelta(text.to_string())).await.is_err() {
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-
-                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|tool_calls| tool_calls.as_array()) {
-                                for tool_call in tool_calls {
-                                    let index = tool_call.get("index").and_then(|index| index.as_i64()).unwrap_or(0);
-
-                                    let name = tool_call
-                                        .get("function")
-                                        .and_then(|function| function.get("name"))
-                                        .and_then(|name| name.as_str())
-                                        .or_else(|| tool_call.get("name").and_then(|name| name.as_str()));
-
-                                    if let Some(id) = tool_call.get("id").and_then(|id| id.as_str()) {
-                                        let accumulator = tool_call_accumulators
-                                            .entry(index)
-                                            .or_insert_with(|| ToolCallAccumulator {
-                                                id: id.to_string(),
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            });
-                                        if let Some(name) = name
-                                            && accumulator.name.is_empty()
-                                        {
-                                            accumulator.name = name.to_string();
-                                        }
-                                    } else if let Some(name) = name
-                                        && let Some(accumulator) = tool_call_accumulators.get_mut(&index)
-                                        && accumulator.name.is_empty()
-                                    {
-                                        accumulator.name = name.to_string();
-                                    }
-
-                                    if let Some(args) = tool_call
-                                        .get("function")
-                                        .and_then(|function| function.get("arguments"))
-                                        .and_then(|arguments| arguments.as_str())
-                                        .or_else(|| tool_call.get("arguments").and_then(|arguments| arguments.as_str()))
-                                        && !args.is_empty() {
-                                            if let Some(accumulator) = tool_call_accumulators.get_mut(&index) {
-                                                accumulator.arguments.push_str(args);
-                                            }
-                                            if event_sender.send(StreamEvent::ToolInputDelta(args.to_string())).await.is_err() {
-                                                tracing::trace!("stream event receiver dropped");
-                                                break;
-                                            }
-                                        }
-                                }
+                            if matches!(
+                                handle_stream_chunk(
+                                    &data,
+                                    &mut tool_call_accumulators,
+                                    &mut final_stop,
+                                    &event_sender,
+                                )
+                                .await,
+                                ChunkOutcome::Stop
+                            ) {
+                                break;
                             }
                         }
                         Err(error) => {
@@ -586,6 +506,149 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// Whether the caller should keep reading the stream after a chunk. `Stop` means the event receiver
+/// has been dropped, so there is nobody left to stream to.
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkOutcome {
+    Continue,
+    Stop,
+}
+
+/// Folds one Chat Completions streaming chunk into the in-progress response: forwards usage and
+/// text, accumulates tool-call fragments by index, and records the stop reason.
+///
+/// Extracted from the read loop so the chunk shapes real endpoints emit can be tested without an
+/// HTTP server.
+async fn handle_stream_chunk(
+    data: &serde_json::Value,
+    accumulators: &mut std::collections::HashMap<i64, ToolCallAccumulator>,
+    final_stop: &mut Option<StopReason>,
+    event_sender: &mpsc::Sender<StreamEvent>,
+) -> ChunkOutcome {
+    if let Some(usage) = data.get("usage") {
+        let token_usage = TokenUsage {
+            input_tokens: usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            ..TokenUsage::default()
+        };
+        if event_sender
+            .send(StreamEvent::Usage(token_usage))
+            .await
+            .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+            return ChunkOutcome::Stop;
+        }
+    }
+
+    let Some(choice) = data.get("choices").and_then(|choices| choices.get(0)) else {
+        return ChunkOutcome::Continue;
+    };
+
+    if let Some(finish_reason) = choice
+        .get("finish_reason")
+        .and_then(|reason| reason.as_str())
+    {
+        // Record the stop reason but keep reading: with `stream_options.include_usage` the usage
+        // arrives in a trailing chunk AFTER this one (and before `[DONE]`). Finalisation and the
+        // single MessageEnd happen once the stream ends, back in the caller.
+        //
+        // Fall through to the delta below rather than returning here: OpenAI itself sends
+        // `finish_reason` alone with an empty delta, but vLLM-backed endpoints coalesce the final
+        // content or tool_calls delta into this same chunk whenever generation ends before the
+        // stream flushes it separately. Skipping the delta dropped it, which for a tool call left
+        // `finish_reason: "tool_calls"` with no tool-use block at all - a silently empty turn.
+        *final_stop = Some(parse_openai_stop_reason(finish_reason));
+    }
+
+    let Some(delta) = choice.get("delta") else {
+        return ChunkOutcome::Continue;
+    };
+
+    if let Some(text) = delta.get("content").and_then(|content| content.as_str())
+        && !text.is_empty()
+        && event_sender
+            .send(StreamEvent::TextDelta(text.to_string()))
+            .await
+            .is_err()
+    {
+        tracing::trace!("stream event receiver dropped");
+        return ChunkOutcome::Stop;
+    }
+
+    let Some(tool_calls) = delta
+        .get("tool_calls")
+        .and_then(|tool_calls| tool_calls.as_array())
+    else {
+        return ChunkOutcome::Continue;
+    };
+
+    for tool_call in tool_calls {
+        let index = tool_call
+            .get("index")
+            .and_then(|index| index.as_i64())
+            .unwrap_or(0);
+
+        let name = tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|name| name.as_str())
+            .or_else(|| tool_call.get("name").and_then(|name| name.as_str()));
+
+        if let Some(id) = tool_call.get("id").and_then(|id| id.as_str()) {
+            let accumulator = accumulators
+                .entry(index)
+                .or_insert_with(|| ToolCallAccumulator {
+                    id: id.to_string(),
+                    name: String::new(),
+                    arguments: String::new(),
+                });
+            if let Some(name) = name
+                && accumulator.name.is_empty()
+            {
+                accumulator.name = name.to_string();
+            }
+        } else if let Some(name) = name
+            && let Some(accumulator) = accumulators.get_mut(&index)
+            && accumulator.name.is_empty()
+        {
+            accumulator.name = name.to_string();
+        }
+
+        if let Some(args) = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(|arguments| arguments.as_str())
+            .or_else(|| {
+                tool_call
+                    .get("arguments")
+                    .and_then(|arguments| arguments.as_str())
+            })
+            && !args.is_empty()
+        {
+            if let Some(accumulator) = accumulators.get_mut(&index) {
+                accumulator.arguments.push_str(args);
+            }
+            if event_sender
+                .send(StreamEvent::ToolInputDelta(args.to_string()))
+                .await
+                .is_err()
+            {
+                tracing::trace!("stream event receiver dropped");
+                return ChunkOutcome::Stop;
+            }
+        }
+    }
+
+    ChunkOutcome::Continue
+}
+
 fn parse_openai_stop_reason(reason: &str) -> StopReason {
     match reason {
         "stop" => StopReason::EndTurn,
@@ -604,6 +667,140 @@ fn parse_openai_stop_reason(reason: &str) -> StopReason {
 mod tests {
     use super::*;
     use crate::provider::ToolResultContent;
+
+    /// Drives [`handle_stream_chunk`] over a sequence of chunks and returns everything it produced,
+    /// mirroring what the read loop in `stream_completion` does with a live SSE stream.
+    async fn drive_chunks(
+        chunks: &[serde_json::Value],
+    ) -> (
+        Vec<StreamEvent>,
+        std::collections::HashMap<i64, ToolCallAccumulator>,
+        Option<StopReason>,
+    ) {
+        let (sender, mut receiver) = mpsc::channel::<StreamEvent>(64);
+        let mut accumulators = std::collections::HashMap::new();
+        let mut final_stop = None;
+
+        for chunk in chunks {
+            handle_stream_chunk(chunk, &mut accumulators, &mut final_stop, &sender).await;
+        }
+        drop(sender);
+
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        (events, accumulators, final_stop)
+    }
+
+    /// vLLM-backed endpoints coalesce the final tool-call delta into the same chunk as
+    /// `finish_reason`, rather than sending `finish_reason` alone with an empty delta the way
+    /// OpenAI does. The chunk below is a real capture. Skipping the delta on a chunk that carries a
+    /// `finish_reason` used to drop the tool call outright, leaving `StopReason::ToolUse` with no
+    /// tool-use block, which the agent surfaced as "the model returned an empty response".
+    #[tokio::test]
+    async fn test_stream_chunk_keeps_tool_call_coalesced_with_finish_reason() {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "chatcmpl-tool-a445012e51c3a83d",
+                        "type": "function",
+                        "index": 0,
+                        "function": {
+                            "name": "mcp__exa__web_search_exa",
+                            "arguments": "{\"numResults\": 8, \"query\": \"top global news\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let (_, accumulators, final_stop) = drive_chunks(&[chunk]).await;
+
+        assert_eq!(final_stop, Some(StopReason::ToolUse));
+        let accumulator = accumulators
+            .get(&0)
+            .expect("tool call in a finish_reason chunk must still be accumulated");
+        assert_eq!(accumulator.id, "chatcmpl-tool-a445012e51c3a83d");
+        assert_eq!(accumulator.name, "mcp__exa__web_search_exa");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&accumulator.arguments)
+                .expect("arguments parse")["query"],
+            "top global news"
+        );
+    }
+
+    /// The same coalescing applies to plain text: the tail of a response must not be swallowed
+    /// because it shared a chunk with `finish_reason: "stop"`.
+    #[tokio::test]
+    async fn test_stream_chunk_keeps_text_coalesced_with_finish_reason() {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": " final words"},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let (events, _, final_stop) = drive_chunks(&[chunk]).await;
+
+        assert_eq!(final_stop, Some(StopReason::EndTurn));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, StreamEvent::TextDelta(text) if text == " final words")
+            ),
+            "text sharing a chunk with finish_reason must still stream, got {events:?}"
+        );
+    }
+
+    /// The canonical OpenAI shape - tool call streamed across chunks, then `finish_reason` alone
+    /// with an empty delta - must keep working. The same endpoint emits this shape too; which of
+    /// the two arrives is a timing race.
+    #[tokio::test]
+    async fn test_stream_chunk_handles_finish_reason_in_its_own_chunk() {
+        let chunks = [
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "index": 0,
+                            "function": {"name": "execute_command", "arguments": "{\"command\":"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": " \"pwd\"}"}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ];
+
+        let (_, accumulators, final_stop) = drive_chunks(&chunks).await;
+
+        assert_eq!(final_stop, Some(StopReason::ToolUse));
+        let accumulator = accumulators.get(&0).expect("accumulated tool call");
+        assert_eq!(accumulator.id, "call_abc");
+        assert_eq!(accumulator.name, "execute_command");
+        assert_eq!(accumulator.arguments, "{\"command\": \"pwd\"}");
+    }
 
     #[test]
     fn test_openai_request_body_simple() {

@@ -1308,6 +1308,13 @@ impl Frontend for ReplFrontend {
                 }
             }
             FrontendEvent::TurnStarted => {
+                // A text run left open here belongs to a previous turn that ended without
+                // `TurnFinished`, which the agent loop only emits when the turn succeeded: an
+                // interrupt or a provider error leaves the renderer holding whatever streamed
+                // before it. Flushing here keeps that text from being glued to the front of this
+                // turn's response. The ACP frontend sweeps its own per-turn state on `TurnStarted`
+                // for exactly this reason.
+                Self::close_text_run(&mut state);
                 if self.config.newline_after_prompt {
                     eprintln!();
                     state.spacing.after_prompt();
@@ -1455,6 +1462,80 @@ impl Frontend for ReplFrontend {
         receiver
             .await
             .unwrap_or(crate::mcp::elicitation::ElicitationResponse::Decline)
+    }
+}
+
+#[cfg(test)]
+mod frontend_tests {
+    use super::*;
+    use crate::frontend::{Frontend, FrontendEvent};
+
+    fn frontend() -> ReplFrontend {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        ReplFrontend::new(ReplFrontendConfig {
+            render_mode: RenderMode::Termimad,
+            newline_before_prompt: false,
+            newline_after_prompt: false,
+            show_session_id_on_create: false,
+            show_token_usage: false,
+            thinking_show_content: false,
+            agent_event_sender: sender,
+        })
+    }
+
+    /// `Agent::run_turn` emits `TurnFinished` only when the turn succeeded, so an interrupt or a
+    /// provider error leaves the streaming renderer holding whatever text arrived first. Starting
+    /// the next turn has to clear it; reusing the open renderer prepended the abandoned partial to
+    /// the next response.
+    #[tokio::test]
+    async fn turn_started_closes_a_text_run_left_open_by_a_failed_turn() {
+        let frontend = frontend();
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta(
+                "abandoned partial".into(),
+            ))
+            .await;
+        assert!(
+            frontend
+                .state
+                .lock()
+                .expect("frontend state")
+                .renderer
+                .is_some(),
+            "a text delta opens a renderer"
+        );
+
+        frontend.emit(FrontendEvent::TurnStarted).await;
+
+        assert!(
+            frontend
+                .state
+                .lock()
+                .expect("frontend state")
+                .renderer
+                .is_none(),
+            "the next turn must not inherit the previous turn's open renderer"
+        );
+    }
+
+    /// The happy path still closes on `TurnFinished`, so a completed turn doesn't hold its last
+    /// paragraph until the following prompt.
+    #[tokio::test]
+    async fn turn_finished_closes_the_text_run() {
+        let frontend = frontend();
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta("done".into()))
+            .await;
+        frontend.emit(FrontendEvent::TurnFinished).await;
+
+        assert!(
+            frontend
+                .state
+                .lock()
+                .expect("frontend state")
+                .renderer
+                .is_none()
+        );
     }
 }
 

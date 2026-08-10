@@ -673,6 +673,49 @@ fn acp_prompt_response_carries_token_usage() {
     assert!(usage["thoughtTokens"].is_null(), "usage: {}", usage);
 }
 
+/// A turn that reports `tool_use` but carries no tool-call block leaves the agent with nothing to
+/// run and nothing to show. It happens for real: an OpenAI-compatible endpoint that coalesces its
+/// final delta into the `finish_reason` chunk used to have that delta dropped, so the tool call
+/// vanished and only the stop reason survived. The client must still get a visible message and a
+/// terminal stop reason rather than a silent turn it waits on forever.
+#[test]
+fn acp_turn_with_tool_use_stop_but_no_tool_call_still_reports_to_the_client() {
+    let script = serde_json::json!([[
+        { "kind": "message_end", "stop_reason": "tool_use" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "search the web");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    let chunk = updates
+        .iter()
+        .find(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .unwrap_or_else(|| {
+            panic!("expected an agent_message_chunk standing in for the empty turn; updates: {updates:?}")
+        });
+    let text = chunk["params"]["update"]["content"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("empty response"),
+        "the stand-in notice must reach the client verbatim; got {text:?}"
+    );
+
+    // No tool call was made, so the turn ends normally. A client that saw `tool_use` with no
+    // `tool_call` update and no terminal stop reason would sit waiting on a call that never came.
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "full response: {response}"
+    );
+    assert!(
+        !updates
+            .iter()
+            .any(|value| value["params"]["update"]["sessionUpdate"] == "tool_call"),
+        "no tool call was made, so none must be announced; updates: {updates:?}"
+    );
+}
+
 /// Outcome the test wants the synthetic ACP client to send back when the agent issues
 /// `session/request_permission`.
 #[derive(Debug, Clone, Copy)]
