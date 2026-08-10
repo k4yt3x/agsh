@@ -32,9 +32,8 @@ pub(super) struct ExecuteCommandTool {
     pub shared_permission: crate::permission::SharedPermission,
     pub sandbox_enabled: bool,
     pub cwd: crate::agent::SharedCwd,
-    /// Non-`Read` modes delegate to the editor's hosted terminal (ACP `terminal/*`) when the
-    /// client advertises support. `Read` mode bypasses delegation to keep the local Landlock /
-    /// bwrap / sandbox-exec / Low-Integrity jail.
+    /// Sink for [`crate::frontend::FrontendEvent::ToolCallOutputDelta`], so a frontend can show
+    /// output as the command produces it rather than only once it exits.
     pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -132,28 +131,6 @@ impl Tool for ExecuteCommandTool {
             }
         }
 
-        // Delegate to the editor's hosted terminal when offered. `Read` mode skips delegation to
-        // preserve the local sandbox jail; the editor's terminal has no equivalent.
-        if !matches!(permission, Permission::Read) {
-            let (program, args) = shell_invocation(&command);
-            let spec = crate::frontend::DelegatedExecSpec {
-                command: program,
-                args,
-                env: Vec::new(),
-                cwd: Some(crate::agent::cwd_snapshot(&self.cwd)),
-                timeout: Some(std::time::Duration::from_millis(timeout_ms)),
-                output_byte_limit: Some(2_000_000),
-                cancellation: cancellation.clone(),
-            };
-            if let Some(result) = self.frontend.delegate_execute(spec).await {
-                let output = result.map_err(|error| MekaError::ToolExecution {
-                    tool_name: "execute_command".to_string(),
-                    message: format!("delegated execute failed: {}", error),
-                })?;
-                return Ok(assemble_delegated_output(output));
-            }
-        }
-
         // Windows + sandboxed: spawn directly via CreateProcessAsUserW with a Low-integrity token.
         // This path can't go through tokio::process because the stdlib gives no hook for injecting
         // a custom token.
@@ -164,7 +141,8 @@ impl Tool for ExecuteCommandTool {
                 crate::sandbox::SandboxCapability::LowIntegrity
             )
         {
-            return run_windows_low_integrity(&command, timeout_ms, cancellation).await;
+            let relay = OutputRelay::for_current_call(&self.frontend);
+            return run_windows_low_integrity(&command, timeout_ms, cancellation, relay).await;
         }
 
         #[cfg(windows)]
@@ -323,8 +301,15 @@ impl Tool for ExecuteCommandTool {
         // write ends close and the drains hit EOF.
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(async move { read_to_string_best_effort(stdout).await });
-        let stderr_task = tokio::spawn(async move { read_to_string_best_effort(stderr).await });
+        let relay = OutputRelay::for_current_call(&self.frontend);
+        let stdout_task = tokio::spawn({
+            let relay = relay.clone();
+            async move { read_to_string_best_effort(stdout, relay).await }
+        });
+        let stderr_task = tokio::spawn({
+            let relay = relay.clone();
+            async move { read_to_string_best_effort(stderr, relay).await }
+        });
 
         // wait_with_output() consumes the child, so use wait() + manual stdout/stderr reading
         // instead to allow kill on cancellation.
@@ -339,10 +324,13 @@ impl Tool for ExecuteCommandTool {
                 kill_child_tree(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
+                // Timed out means we killed it, so report the kill rather than inventing an exit
+                // code; a frontend rendering a terminal shows "terminated" instead of "exit 0".
                 Ok(ToolOutput::text(
                     format!("Command timed out after {}ms", timeout_ms),
                     true,
-                ))
+                )
+                .with_metadata(timed_out_exit_metadata()))
             }
             status = child.wait() => {
                 let status = status.map_err(|error| MekaError::ToolExecution {
@@ -367,7 +355,7 @@ impl Tool for ExecuteCommandTool {
                 if stdout_timed_out || stderr_timed_out {
                     append_drain_truncation_note(&mut output, stdout_timed_out, stderr_timed_out);
                 }
-                Ok(output)
+                Ok(output.with_metadata(command_exit_metadata(&status)))
             }
         }
     }
@@ -418,18 +406,136 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
 /// than block the tool call we cap the drain, abort it, and attach a truncation note.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn read_to_string_best_effort<R>(reader: Option<R>) -> String
+/// Forwards a running command's output to the frontend as it is produced. Cloned into both drain
+/// tasks so stdout and stderr land in one stream in arrival order, which is what a terminal shows.
+///
+/// `None` when there is no tool call to correlate against (direct tool construction in tests), in
+/// which case draining behaves exactly as it did before deltas existed.
+#[derive(Clone)]
+struct OutputRelay {
+    frontend: Arc<dyn crate::frontend::Frontend>,
+    tool_call_id: String,
+}
+
+impl OutputRelay {
+    /// The id has to be captured here rather than inside the drain task: it lives in a task-local
+    /// scoped by `Agent::resolve_and_execute_tool`, and `tokio::spawn` does not inherit
+    /// task-locals.
+    fn for_current_call(frontend: &Arc<dyn crate::frontend::Frontend>) -> Option<Self> {
+        crate::tools::current_tool_call_id().map(|tool_call_id| Self {
+            frontend: Arc::clone(frontend),
+            tool_call_id,
+        })
+    }
+
+    async fn send(&self, chunk: String) {
+        self.frontend
+            .emit(crate::frontend::FrontendEvent::ToolCallOutputDelta {
+                id: self.tool_call_id.clone(),
+                chunk,
+            })
+            .await;
+    }
+}
+
+/// Read a child pipe to EOF, relaying each chunk as it arrives.
+///
+/// Reads bytes rather than `read_to_string` because a chunk boundary can fall inside a multi-byte
+/// character: the trailing incomplete sequence is carried over to the next read instead of being
+/// relayed as replacement characters. The returned string still covers the whole stream, so the
+/// model-facing result is unaffected by how the reads happened to split.
+async fn read_to_string_best_effort<R>(reader: Option<R>, relay: Option<OutputRelay>) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    let mut content = String::new();
-    if let Some(mut reader) = reader
-        && let Err(error) = reader.read_to_string(&mut content).await
-    {
-        tracing::debug!("failed to read child output: {}", error);
+    let Some(mut reader) = reader else {
+        return String::new();
+    };
+    let mut content: Vec<u8> = Vec::new();
+    let mut relayed = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                content.extend_from_slice(&buffer[..read]);
+                if let Some(relay) = &relay {
+                    // Relay only the prefix that is complete UTF-8; whatever trails an incomplete
+                    // sequence stays behind for the next read to finish.
+                    let pending = &content[relayed..];
+                    let valid = match std::str::from_utf8(pending) {
+                        Ok(text) => text.len(),
+                        Err(error) => error.valid_up_to(),
+                    };
+                    if valid > 0 {
+                        // `valid` is the length of a verified-UTF-8 prefix, so the lossy decode
+                        // never actually substitutes anything; it is just the panic-free spelling.
+                        let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        relayed += valid;
+                        relay.send(chunk).await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!("failed to read child output: {}", error);
+                break;
+            }
+        }
     }
-    content
+    // Lossy rather than a hard error: a command that emits a stray non-UTF-8 byte (a progress bar
+    // in a foreign encoding, a binary blob on stderr) should still hand the model everything else
+    // it printed.
+    String::from_utf8_lossy(&content).into_owned()
+}
+
+/// Structured exit status for frontends that render a terminal. `ExitStatus::code()` is `None`
+/// exactly when a signal ended the process, so the two are read as alternatives rather than both
+/// being guessed from the same number.
+fn command_exit_metadata(status: &std::process::ExitStatus) -> crate::frontend::ToolOutputMetadata {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(signal_name)
+    };
+    #[cfg(not(unix))]
+    let signal = None;
+    crate::frontend::ToolOutputMetadata::CommandExit {
+        exit_code: status.code(),
+        signal,
+    }
+}
+
+/// Symbolic name for the signals a command realistically dies from. The number alone would render
+/// as `SIG9` in a client's terminal UI next to a `SIGKILL` we report elsewhere for the same kill,
+/// so the two paths have to agree. Numbers outside this set are stable enough nowhere to name.
+#[cfg(unix)]
+fn signal_name(number: i32) -> String {
+    match number {
+        libc::SIGHUP => "SIGHUP".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGQUIT => "SIGQUIT".to_string(),
+        libc::SIGABRT => "SIGABRT".to_string(),
+        libc::SIGKILL => "SIGKILL".to_string(),
+        libc::SIGSEGV => "SIGSEGV".to_string(),
+        libc::SIGPIPE => "SIGPIPE".to_string(),
+        libc::SIGTERM => "SIGTERM".to_string(),
+        other => format!("SIG{}", other),
+    }
+}
+
+/// Exit status for a command meka killed for exceeding its timeout. The child is torn down without
+/// its status being reaped, so there is nothing to read it from. On Unix the kill really is a
+/// signal ([`kill_child_tree`]); Windows has no signals, and claiming one there would put a name in
+/// the client's terminal that never existed on that platform.
+fn timed_out_exit_metadata() -> crate::frontend::ToolOutputMetadata {
+    crate::frontend::ToolOutputMetadata::CommandExit {
+        exit_code: None,
+        #[cfg(unix)]
+        signal: Some("SIGKILL".to_string()),
+        #[cfg(not(unix))]
+        signal: None,
+    }
 }
 
 fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOutput {
@@ -481,6 +587,7 @@ async fn run_windows_low_integrity(
     command: &str,
     timeout_ms: u64,
     cancellation: CancellationToken,
+    relay: Option<OutputRelay>,
 ) -> Result<ToolOutput> {
     use std::{sync::Arc, time::Duration};
 
@@ -502,8 +609,11 @@ async fn run_windows_low_integrity(
     let child = Arc::new(sandboxed);
     let timeout_duration = Duration::from_millis(timeout_ms);
 
-    let stdout_task = tokio::spawn(async move { read_to_string_best_effort(stdout).await });
-    let stderr_task = tokio::spawn(async move { read_to_string_best_effort(stderr).await });
+    let stdout_task = tokio::spawn({
+        let relay = relay.clone();
+        async move { read_to_string_best_effort(stdout, relay).await }
+    });
+    let stderr_task = tokio::spawn(async move { read_to_string_best_effort(stderr, relay).await });
 
     let wait_child = Arc::clone(&child);
     // `tokio::select!` requires the future passed to the happy-path branch (`join = ...`) to be
@@ -533,7 +643,8 @@ async fn run_windows_low_integrity(
             Ok(ToolOutput::text(
                 format!("Command timed out after {}ms", timeout_ms),
                 true,
-            ))
+            )
+            .with_metadata(timed_out_exit_metadata()))
         }
         join = &mut wait_handle => {
             let status = join
@@ -567,7 +678,7 @@ async fn run_windows_low_integrity(
                     stderr_timed_out,
                 );
             }
-            Ok(output)
+            Ok(output.with_metadata(command_exit_metadata(&status)))
         }
     }
 }
@@ -630,60 +741,6 @@ fn append_drain_truncation_note(
     }
 }
 
-/// Build the `(program, args)` pair an ACP `terminal/create` should run for the user-supplied shell
-/// command. Mirrors the platform choices the local spawn makes (`sh -c …` on Unix, PowerShell with
-/// the UTF-8 prelude on Windows) so a delegated command behaves like the local one.
-fn shell_invocation(command: &str) -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        let wrapped = crate::sandbox::wrap_command_with_utf8_output(command);
-        ("powershell.exe".to_string(), vec![
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            wrapped,
-        ])
-    }
-    #[cfg(not(windows))]
-    {
-        ("sh".to_string(), vec![
-            "-c".to_string(),
-            command.to_string(),
-        ])
-    }
-}
-
-/// Assemble a [`ToolOutput`] from a [`crate::frontend::DelegatedExecOutput`]. Matches the local
-/// execute_command's final-string shape so the model can't tell whether the command ran locally or
-/// in the editor's terminal: stdout (combined output here, since ACP returns one stream) + an "Exit
-/// code: N" trailer for non-zero exits + a truncation note when the editor dropped output.
-fn assemble_delegated_output(output: crate::frontend::DelegatedExecOutput) -> ToolOutput {
-    let mut text = output.output.clone();
-    let exit_code = output.exit_code.unwrap_or(0);
-    let is_error = exit_code != 0 || output.signal.is_some();
-    if let Some(signal) = output.signal.as_deref() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("Terminated by signal: {}", signal));
-    } else if exit_code != 0 {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("Exit code: {}", exit_code));
-    }
-    if output.truncated {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(
-            "(output truncated by the editor's terminal-buffer cap; rerun with a narrower \
-             scope or pipe to a file for the full output)",
-        );
-    }
-    ToolOutput::text(text, is_error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +771,140 @@ mod tests {
             sandbox_enabled,
             cwd: crate::agent::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
+        }
+    }
+
+    /// A real signal kill and meka's own timeout kill must spell the same signal the same way; a
+    /// client's terminal shows this string, and `SIG9` next to `SIGKILL` for the same event reads
+    /// as two different failures.
+    #[cfg(unix)]
+    #[test]
+    fn test_signal_naming_is_consistent_between_a_real_kill_and_a_timeout() {
+        assert_eq!(signal_name(libc::SIGKILL), "SIGKILL");
+        assert_eq!(signal_name(libc::SIGTERM), "SIGTERM");
+        assert_eq!(
+            signal_name(4242),
+            "SIG4242",
+            "unknown signals stay unambiguous"
+        );
+
+        let crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal } =
+            timed_out_exit_metadata()
+        else {
+            panic!("timeout must report a command exit");
+        };
+        assert_eq!(
+            exit_code, None,
+            "a killed command never produced an exit code"
+        );
+        assert_eq!(
+            signal.as_deref(),
+            Some(signal_name(libc::SIGKILL).as_str()),
+            "the timeout path must name the signal the same way the reaped-status path does",
+        );
+    }
+
+    /// `execute_command` reports its exit status structurally, not only inside the prose the model
+    /// reads, so a frontend rendering a terminal can show the real code instead of guessing from
+    /// the error flag.
+    #[tokio::test]
+    async fn test_execute_command_reports_its_exit_code_as_metadata() {
+        let tool = test_tool(test_shared_permission(), false);
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "exit 42"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("tool runs");
+        assert!(result.is_error, "a non-zero exit is a failed call");
+        let Some(crate::frontend::ToolOutputMetadata::CommandExit { exit_code, signal }) =
+            result.frontend_metadata
+        else {
+            panic!(
+                "expected CommandExit metadata; got {:?}",
+                result.frontend_metadata
+            );
+        };
+        assert_eq!(exit_code, Some(42));
+        assert_eq!(signal, None, "a clean exit carries no signal");
+    }
+
+    /// A read can end partway through a multi-byte character. Relaying the raw bytes would show
+    /// the client replacement characters that were never in the output, so the incomplete tail has
+    /// to wait for the read that completes it. Feeds the reader one byte at a time to force the
+    /// split on every character.
+    #[tokio::test]
+    async fn test_reader_relays_chunks_without_splitting_characters() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl crate::frontend::Frontend for ChunkRecorder {
+            async fn emit(&self, event: crate::frontend::FrontendEvent) {
+                if let crate::frontend::FrontendEvent::ToolCallOutputDelta { chunk, .. } = event
+                    && let Ok(mut chunks) = self.chunks.lock()
+                {
+                    chunks.push(chunk);
+                }
+            }
+
+            async fn request_permission(
+                &self,
+                _request: crate::frontend::PermissionRequest,
+            ) -> crate::frontend::PermissionOutcome {
+                crate::frontend::PermissionOutcome::Deny
+            }
+        }
+
+        let recorder = Arc::new(ChunkRecorder::default());
+        let frontend: Arc<dyn crate::frontend::Frontend> = recorder.clone();
+        let relay = Some(OutputRelay {
+            frontend,
+            tool_call_id: "call_1".to_string(),
+        });
+
+        let source = "ünïcödé ✓ done\n";
+        // `tokio::io::AsyncRead` over a byte slice yields whatever the caller's buffer allows, so
+        // cap reads at one byte to guarantee every multi-byte character straddles a read.
+        let reader = tokio::io::AsyncReadExt::take(source.as_bytes(), u64::MAX);
+        let collected = read_to_string_best_effort(Some(OneByteAtATime(reader)), relay).await;
+
+        assert_eq!(collected, source, "the full stream must survive intact");
+        let chunks = recorder.chunks.lock().expect("lock").clone();
+        assert_eq!(
+            chunks.concat(),
+            source,
+            "the relayed chunks must reassemble to the same bytes",
+        );
+        assert!(
+            !chunks.iter().any(|chunk| chunk.contains('\u{fffd}')),
+            "no chunk may contain a replacement character; got {chunks:?}",
+        );
+    }
+
+    /// Reader that hands out at most one byte per `poll_read`, so every multi-byte character in
+    /// the source is guaranteed to span a read boundary.
+    struct OneByteAtATime<R>(R);
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for OneByteAtATime<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut single = [0u8; 1];
+            let mut limited = tokio::io::ReadBuf::new(&mut single);
+            match std::pin::Pin::new(&mut self.0).poll_read(context, &mut limited) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let filled = limited.filled().to_vec();
+                    buffer.put_slice(&filled);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
         }
     }
 

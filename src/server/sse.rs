@@ -150,9 +150,14 @@ pub fn translate(
         // `SubAgentActivity` is a progressive rewrite of one tool call's display, which only makes
         // sense against a stateful view like ACP's; the SSE stream already carries the sub-agent's
         // `spawn_agent` tool result when it lands.
+        // `ToolCallOutputDelta` is left out for the same reason as `SubAgentActivity`: both are
+        // progressive rewrites of one tool call's display, and the SSE stream carries the tool
+        // result once, when it lands. Surfacing partial output here would add a wire event whose
+        // consumers have to reassemble it, for a stream that already delivers the whole thing.
         FrontendEvent::TodoListUpdated { .. }
         | FrontendEvent::TokenUsage(_)
         | FrontendEvent::SubAgentActivity { .. }
+        | FrontendEvent::ToolCallOutputDelta { .. }
         | FrontendEvent::McpProgress(_) => return None,
         FrontendEvent::Notice(notice) => (SseEventType::Notice, notice_view(notice)),
         FrontendEvent::SessionStarted { .. } => return None,

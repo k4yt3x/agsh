@@ -7,7 +7,7 @@
 //! `MEKA_ACP_MOCK_PROVIDER=1` so a scripted [`crate::provider::mock::MockProvider`] drives
 //! deterministic `session/prompt` round-trips. Tests verify the tool-call lifecycle, permission
 //! round-trip, session lifecycle (load / resume / list / close), slash-skill invocation, set_mode
-//! flow, and the `fs/*` + `terminal/*` delegation paths.
+//! flow, and the `fs/*` delegation path.
 //!
 //! # Test shape
 //!
@@ -2139,12 +2139,104 @@ enabled = ["read", "write"]
     assert_eq!(written, content_to_write);
 }
 
-/// when the client advertises `terminal: true` and the session is in a non-`read` mode,
-/// `execute_command` flows through the `terminal/*` calls instead of spawning a local shell.
+/// The capabilities Zed advertises, in the shape that matters here: `terminal` says it implements
+/// `terminal/*` requests, and the separate `_meta.terminal_output` key says it renders agent-owned
+/// terminals from meka's `_meta` frames. Only the latter gates the terminal rendering.
+fn zed_shaped_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "terminal": true,
+        "_meta": { "terminal_output": true },
+    })
+}
+
+/// `execute_command` always runs in meka's own (sandboxed) child process, never in the client's
+/// terminal, whatever the permission mode and whatever the client advertises. `write` is the mode
+/// that used to delegate, and `ask` is the mode where delegating was a sandbox bypass: meka treats
+/// `ask` as sandboxed (it hard-errors when no sandbox backend is available) yet handed the command
+/// to an unsandboxed editor terminal anyway. Guards both by asserting no `terminal/*` traffic and
+/// that the output is the local shell's, not the client's.
 #[test]
-fn acp_execute_command_is_delegated_when_terminal_capability_offered() {
-    // Force the agent into `write` mode so the sandbox carve-out doesn't kick in.
-    let config_toml = r#"
+fn acp_execute_command_never_leaves_meka() {
+    for mode in ["write", "ask"] {
+        let config_toml = format!(
+            r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "{mode}"
+enabled = ["read", "ask", "write"]
+"#
+        );
+        let script = serde_json::json!([
+            [
+                { "kind": "text", "text": "running..." },
+                { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+                { "kind": "tool_use_end", "input": { "command": "echo ran-inside-meka" } },
+                { "kind": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "kind": "text", "text": "done" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]);
+        let mut harness = AcpTestHarness::spawn_with_capabilities(
+            &config_toml,
+            Some(script),
+            zed_shaped_capabilities(),
+        );
+        let sid = harness.new_session();
+        let id = harness.prompt(&sid, "run it");
+
+        let mut terminal_methods: Vec<String> = Vec::new();
+        let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |value| {
+            if let Some(method) = value["method"].as_str()
+                && method.starts_with("terminal/")
+            {
+                terminal_methods.push(method.to_string());
+            }
+            // Approve anything `ask` mode prompts for, so the tool actually runs.
+            if value["method"] == "session/request_permission" {
+                return Some(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": value["id"].clone(),
+                    "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+                }));
+            }
+            None
+        });
+
+        assert!(
+            terminal_methods.is_empty(),
+            "{mode} mode must run execute_command inside meka; saw {terminal_methods:?}",
+        );
+        assert!(
+            updates.iter().any(|u| {
+                u["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                    && u["params"]["update"]["status"] == "completed"
+            }),
+            "{mode}: expected a completed tool_call_update",
+        );
+        // The client advertised `terminal`, so the output rides the agent-owned terminal channel
+        // rather than a text block. Either way it must be meka's local shell that produced it.
+        let streamed: String = updates
+            .iter()
+            .filter_map(|u| {
+                u["params"]["update"]["_meta"]["terminal_output"]["data"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            streamed.contains("ran-inside-meka"),
+            "{mode}: expected the local shell's output; got {streamed:?}",
+        );
+    }
+}
+
+/// Write mode, so `execute_command` isn't subject to the sandbox's availability on the test host.
+const ACP_WRITE_MODE_CONFIG: &str = r#"
 [providers.mock]
 type = "claude-api"
 model = "claude-sonnet-4-5"
@@ -2153,11 +2245,22 @@ model = "claude-sonnet-4-5"
 default = "write"
 enabled = ["read", "write"]
 "#;
+
+/// A command's output reaches the client while it is still running, not only when it exits. The
+/// scripted command prints, sleeps past the throttle interval, then prints again, so a correct
+/// implementation emits at least one `tool_call_update` carrying `first` but not yet `second`.
+/// Before live output existed, the only update for a tool call was the one at completion, and a
+/// long build showed a bare spinner for its whole duration.
+#[test]
+fn acp_execute_command_streams_output_while_running() {
     let script = serde_json::json!([
         [
             { "kind": "text", "text": "running..." },
             { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": { "command": "echo hi" } },
+            {
+                "kind": "tool_use_end",
+                "input": { "command": "echo first; sleep 0.5; echo second" }
+            },
             { "kind": "message_end", "stop_reason": "tool_use" }
         ],
         [
@@ -2165,86 +2268,59 @@ enabled = ["read", "write"]
             { "kind": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        config_toml,
-        Some(script),
-        serde_json::json!({ "terminal": true }),
-    );
+    let mut harness = AcpTestHarness::spawn(ACP_WRITE_MODE_CONFIG, Some(script));
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "run it");
+    let (updates, response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
 
-    let mut saw_create = false;
-    let mut saw_wait = false;
-    let mut saw_output = false;
-    let mut saw_release = false;
-    let _ = harness.await_response_with_dispatch(id, |value| match value["method"].as_str() {
-        Some("terminal/create") => {
-            saw_create = true;
-            Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": { "terminalId": "term-1" }
-            }))
-        }
-        Some("terminal/wait_for_exit") => {
-            saw_wait = true;
-            Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": { "exitCode": 0 }
-            }))
-        }
-        Some("terminal/output") => {
-            saw_output = true;
-            Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": {
-                    "output": "hi from editor terminal\n",
-                    "truncated": false,
-                    "exitStatus": { "exitCode": 0 }
-                }
-            }))
-        }
-        Some("terminal/release") => {
-            saw_release = true;
-            Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": {}
-            }))
-        }
-        _ => None,
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let exec_updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|u| &u["params"]["update"])
+        .filter(|u| u["sessionUpdate"] == "tool_call_update" && u["toolCallId"] == "call_exec")
+        .collect();
+
+    let partial = exec_updates.iter().find(|u| {
+        let rendered = u["content"].to_string();
+        rendered.contains("first") && !rendered.contains("second")
     });
-
     assert!(
-        saw_create && saw_wait && saw_output && saw_release,
-        "expected the full terminal/* dance (create={}, wait={}, output={}, release={})",
-        saw_create,
-        saw_wait,
-        saw_output,
-        saw_release,
+        partial.is_some(),
+        "expected an in-progress update carrying only the first line; got: {exec_updates:#?}",
+    );
+    assert!(
+        partial.expect("checked above")["status"].is_null(),
+        "a live-output update must not claim the call finished",
+    );
+
+    let completed = exec_updates
+        .iter()
+        .find(|u| u["status"] == "completed")
+        .unwrap_or_else(|| panic!("expected a completed update; got: {exec_updates:#?}"));
+    let rendered = completed["content"].to_string();
+    assert!(
+        rendered.contains("first") && rendered.contains("second"),
+        "the final update must carry the whole output; got {rendered}",
     );
 }
 
-/// `read` permission mode keeps the local sandboxed shell even when the client advertises
-/// `terminal: true`. No `terminal/create` request should appear.
+/// A terminal-capable client gets the agent-owned terminal channel: the call announces a terminal
+/// so the client can register it, each update carries only the *new* bytes (the client owns the
+/// scrollback, so re-sending would duplicate), and the call ends with a real exit status.
+///
+/// This is what makes output visible in Zed. A `kind: execute` tool call whose content is a text
+/// block renders with no expansion affordance at all, so the output is sent but never shown.
 #[test]
-fn acp_read_mode_keeps_local_sandbox_for_execute_command() {
-    let config_toml = r#"
-[providers.mock]
-type = "claude-api"
-model = "claude-sonnet-4-5"
-
-[permissions]
-default = "read"
-enabled = ["read", "write"]
-"#;
+fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
     let script = serde_json::json!([
         [
             { "kind": "text", "text": "running..." },
             { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": { "command": "echo sandboxed" } },
+            {
+                "kind": "tool_use_end",
+                "input": { "command": "echo alpha; sleep 0.4; echo beta; exit 7" }
+            },
             { "kind": "message_end", "stop_reason": "tool_use" }
         ],
         [
@@ -2253,25 +2329,176 @@ enabled = ["read", "write"]
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
-        config_toml,
+        ACP_WRITE_MODE_CONFIG,
         Some(script),
+        zed_shaped_capabilities(),
+    );
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "run it");
+    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+
+    let for_call = |kind: &str| -> Vec<serde_json::Value> {
+        updates
+            .iter()
+            .map(|u| &u["params"]["update"])
+            .filter(|u| u["toolCallId"] == "call_exec")
+            .filter(|u| !u["_meta"][kind].is_null())
+            .cloned()
+            .collect()
+    };
+
+    // The terminal has to be announced before anything references it; without a matching create,
+    // clients park the output against an id they were never told about and show an empty terminal.
+    let announced = for_call("terminal_info");
+    assert_eq!(
+        announced.len(),
+        1,
+        "expected exactly one terminal_info; got {announced:#?}",
+    );
+    assert_eq!(announced[0]["sessionUpdate"], "tool_call");
+    assert_eq!(announced[0]["content"][0]["type"], "terminal");
+    assert_eq!(announced[0]["content"][0]["terminalId"], "call_exec");
+
+    // Output is appended, so no chunk may repeat what an earlier one already delivered.
+    let output_frames = for_call("terminal_output");
+    let chunks: Vec<&str> = output_frames
+        .iter()
+        .filter_map(|u| u["_meta"]["terminal_output"]["data"].as_str())
+        .collect();
+    assert!(
+        chunks.len() >= 2,
+        "expected the output to arrive in pieces while the command ran; got {chunks:?}",
+    );
+    assert_eq!(
+        chunks.concat(),
+        "alpha\nbeta\n",
+        "appended chunks must reassemble to the command's output exactly once",
+    );
+    assert!(
+        chunks.iter().all(|chunk| !chunk.is_empty()),
+        "an empty append is a wasted notification; got {chunks:?}",
+    );
+
+    // The real exit code, not a synthesised 1: a terminal shows the status, and 7 is only
+    // available because the shell tool reports it structurally.
+    let exits = for_call("terminal_exit");
+    assert_eq!(exits.len(), 1, "expected exactly one terminal_exit");
+    assert_eq!(exits[0]["_meta"]["terminal_exit"]["exit_code"], 7);
+    assert_eq!(exits[0]["status"], "failed");
+    assert_eq!(
+        exits[0]["content"][0]["type"], "terminal",
+        "the completed call must keep the terminal, not swap in a flattened copy",
+    );
+}
+
+/// `terminal: true` alone must not trigger terminal rendering. That capability means "I implement
+/// `terminal/*` requests", which is about running commands *in the client*; a client can offer it
+/// and have no idea what meka's `_meta` terminal frames mean. Sending a terminal content block to
+/// such a client resolves to nothing and displays no output at all, which is the exact failure the
+/// terminal path exists to fix. Only `_meta.terminal_output` licenses it.
+#[test]
+fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": { "command": "echo capability-check" } },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_WRITE_MODE_CONFIG,
+        Some(script),
+        // `terminal/*` implemented, agent-owned terminal frames not understood.
         serde_json::json!({ "terminal": true }),
     );
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "run it");
+    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
 
-    let mut saw_create = false;
-    let _ = harness.await_response_with_dispatch(id, |value| {
-        if value["method"] == "terminal/create" {
-            saw_create = true;
-        }
-        None
-    });
-
+    let call_updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|u| &u["params"]["update"])
+        .filter(|u| u["toolCallId"] == "call_exec")
+        .collect();
     assert!(
-        !saw_create,
-        "read mode must not delegate execute_command; sandbox jail would be bypassed"
+        call_updates
+            .iter()
+            .all(|u| u["content"][0]["type"] != "terminal"),
+        "a terminal block here would render as nothing; got {call_updates:#?}",
     );
+    assert!(
+        call_updates.iter().any(|u| {
+            u["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("capability-check"))
+        }),
+        "expected the console text fallback; got {call_updates:#?}",
+    );
+}
+
+/// A client that never advertised `terminal` keeps the text rendering, because a terminal block it
+/// cannot resolve renders as nothing at all.
+#[test]
+fn acp_client_without_terminal_capability_gets_console_text() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": { "command": "echo plain-text-path" } },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn_with_capabilities(
+        ACP_WRITE_MODE_CONFIG,
+        Some(script),
+        serde_json::json!({ "terminal": false }),
+    );
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "run it");
+    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+
+    let call_updates: Vec<&serde_json::Value> = updates
+        .iter()
+        .map(|u| &u["params"]["update"])
+        .filter(|u| u["toolCallId"] == "call_exec")
+        .collect();
+    assert!(
+        call_updates.iter().all(|u| u["_meta"].is_null()),
+        "no terminal _meta may be sent to a client that can't resolve a terminal; got \
+         {call_updates:#?}",
+    );
+    assert!(
+        call_updates
+            .iter()
+            .all(|u| u["content"][0]["type"] != "terminal"),
+        "no terminal content block either; got {call_updates:#?}",
+    );
+    let completed = call_updates
+        .iter()
+        .find(|u| u["status"] == "completed")
+        .unwrap_or_else(|| panic!("expected a completed update; got {call_updates:#?}"));
+    assert!(
+        completed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("plain-text-path")),
+        "expected a console text block carrying the output; got {completed:#?}",
+    );
+}
+
+/// Build a JSON-RPC error response for a request the dispatch closure wants to fail.
+fn jsonrpc_error(id: serde_json::Value, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32603, "message": message }
+    })
 }
 
 /// Spec: `session/cancel` MUST resolve the in-flight prompt with `stopReason: "cancelled"`. The
@@ -4259,416 +4486,6 @@ enabled = ["read", "ask", "write"]
         response["result"]["stopReason"], "cancelled",
         "permission-Err must mark disconnect → next loop iter short-circuits; got: {}",
         response,
-    );
-}
-
-// === terminal/* delegation failure paths ============================
-//
-// `run_delegated_execute` has four error arms (`terminal/create` failure, `terminal/wait_for_exit`
-// failure, `terminal/output` failure with release-anyway, and cancel-mid-wait kill-then-read).
-// Previously only the happy-path test
-// `acp_execute_command_is_delegated_when_terminal_capability_offered` was covered; these tests fill
-// in the failure modes.
-
-const ACP_TERMINAL_CONFIG: &str = r#"
-[providers.mock]
-type = "claude-api"
-model = "claude-sonnet-4-5"
-
-[permissions]
-default = "write"
-enabled = ["read", "write"]
-"#;
-
-fn terminal_exec_script() -> serde_json::Value {
-    // Two rounds: round 1 issues the execute_command tool call, round 2 emits a closing text "done"
-    // so the agent loop continues past the tool failure.
-    serde_json::json!([
-        [
-            { "kind": "text", "text": "running..." },
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": { "command": "echo hi" } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
-        ],
-        [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
-        ]
-    ])
-}
-
-fn jsonrpc_error(id: serde_json::Value, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": -32603, "message": message }
-    })
-}
-
-/// `terminal/create` failure: the dispatch closure returns a JSON-RPC error response. The tool
-/// result must be marked `failed`; the agent continues to the next round and produces `end_turn`.
-#[test]
-fn acp_terminal_create_failure_surfaces_to_tool_output() {
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_TERMINAL_CONFIG,
-        Some(terminal_exec_script()),
-        serde_json::json!({ "terminal": true }),
-    );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
-            Some("terminal/create") => Some(jsonrpc_error(value["id"].clone(), "denied")),
-            _ => None,
-        });
-
-    assert_eq!(response["result"]["stopReason"], "end_turn");
-    let failed_update = updates
-        .iter()
-        .find(|u| {
-            u["params"]["update"]["sessionUpdate"] == "tool_call_update"
-                && u["params"]["update"]["status"] == "failed"
-        })
-        .unwrap_or_else(|| panic!("expected a failed tool_call_update; got: {:?}", updates));
-    let _ = failed_update;
-}
-
-/// `terminal/wait_for_exit` failure: `terminal/create` succeeds, but the wait returns an error.
-/// Tool result is `failed`.
-#[test]
-fn acp_terminal_wait_for_exit_failure_surfaces() {
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_TERMINAL_CONFIG,
-        Some(terminal_exec_script()),
-        serde_json::json!({ "terminal": true }),
-    );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
-            Some("terminal/create") => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": { "terminalId": "term-1" }
-            })),
-            Some("terminal/wait_for_exit") => {
-                Some(jsonrpc_error(value["id"].clone(), "wait failed"))
-            }
-            _ => None,
-        });
-
-    assert_eq!(response["result"]["stopReason"], "end_turn");
-    assert!(
-        updates.iter().any(|u| {
-            u["params"]["update"]["sessionUpdate"] == "tool_call_update"
-                && u["params"]["update"]["status"] == "failed"
-        }),
-        "tool_call_update with status=failed expected; updates: {:?}",
-        updates,
-    );
-}
-
-/// `terminal/output` failure: `create` + `wait_for_exit` succeed, `output` errors. The agent still
-/// attempts `terminal/release` (best-effort cleanup at `src/acp.rs:817-823`) and the tool surfaces
-/// a failure.
-#[test]
-fn acp_terminal_output_failure_still_releases() {
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_TERMINAL_CONFIG,
-        Some(terminal_exec_script()),
-        serde_json::json!({ "terminal": true }),
-    );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let mut saw_release = false;
-    let (updates, response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
-            Some("terminal/create") => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": { "terminalId": "term-1" }
-            })),
-            Some("terminal/wait_for_exit") => Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": value["id"].clone(),
-                "result": { "exitCode": 0 }
-            })),
-            Some("terminal/output") => Some(jsonrpc_error(value["id"].clone(), "output failed")),
-            Some("terminal/release") => {
-                saw_release = true;
-                Some(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": value["id"].clone(),
-                    "result": {}
-                }))
-            }
-            _ => None,
-        });
-
-    assert_eq!(response["result"]["stopReason"], "end_turn");
-    assert!(
-        saw_release,
-        "meka must release the terminal even when output fails; updates: {:?}",
-        updates,
-    );
-    assert!(
-        updates.iter().any(|u| {
-            u["params"]["update"]["sessionUpdate"] == "tool_call_update"
-                && u["params"]["update"]["status"] == "failed"
-        }),
-        "tool_call_update with status=failed expected after output failure; updates: {:?}",
-        updates,
-    );
-}
-
-/// Cancel-mid-wait: `terminal/create` succeeds, the test holds `wait_for_exit` open (no response),
-/// then fires `session/cancel`. The agent must send `terminal/kill` and *then* `terminal/output` to
-/// drain whatever buffered output exists, even after a cancel. The prompt response resolves as
-/// `cancelled`.
-#[test]
-fn acp_terminal_cancel_mid_wait_kills_then_reads_output() {
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_TERMINAL_CONFIG,
-        Some(terminal_exec_script()),
-        serde_json::json!({ "terminal": true }),
-    );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-
-    // Loop until create has been dispatched and the agent is parked inside wait_for_exit. Then fire
-    // cancel. The expected sequence: create → (wait stalled) → kill → output → release → prompt
-    // response (cancelled).
-    let mut saw_create = false;
-    let mut saw_kill = false;
-    let mut saw_output = false;
-    let mut saw_release = false;
-    let mut cancel_fired = false;
-    let sid_clone = sid.clone();
-    let needle = format!("\"id\":{}", id);
-    let mut response: Option<serde_json::Value> = None;
-    let mut transcript = String::new();
-    while Instant::now() < harness.deadline {
-        let mut line = String::new();
-        match harness.reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        transcript.push_str(&line);
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if let Some(method) = value["method"].as_str()
-            && value.get("id").is_some()
-        {
-            let reply = match method {
-                "terminal/create" => {
-                    saw_create = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": { "terminalId": "term-1" }
-                    }))
-                }
-                // `wait_for_exit` is intentionally never answered; the agent races it against the
-                // cancel token. When cancel fires, the agent proceeds to kill + output regardless
-                // of wait still being pending.
-                "terminal/wait_for_exit" => None,
-                "terminal/kill" => {
-                    saw_kill = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {}
-                    }))
-                }
-                "terminal/output" => {
-                    saw_output = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {
-                            "output": "partial output before cancel\n",
-                            "truncated": false
-                        }
-                    }))
-                }
-                "terminal/release" => {
-                    saw_release = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {}
-                    }))
-                }
-                _ => None,
-            };
-            if let Some(r) = reply {
-                let _ = writeln!(harness.stdin, "{}", r);
-            }
-        }
-        // Fire cancel as soon as create has been dispatched; by then the agent is inside
-        // `tokio::select!` waiting on the wait_for_exit request.
-        if saw_create && !cancel_fired {
-            let cancel_notif = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": { "sessionId": sid_clone.clone() }
-            });
-            let _ = writeln!(harness.stdin, "{}", cancel_notif);
-            cancel_fired = true;
-        }
-        if line.contains(&needle) && response_matches(&line, &needle) {
-            response = Some(value);
-            break;
-        }
-    }
-
-    let response = response.unwrap_or_else(|| {
-        panic!(
-            "no prompt response; saw_create={} saw_kill={} saw_output={} saw_release={}; transcript:\n{}",
-            saw_create, saw_kill, saw_output, saw_release, transcript,
-        );
-    });
-    assert_eq!(
-        response["result"]["stopReason"], "cancelled",
-        "expected cancelled stop reason; transcript:\n{}",
-        transcript,
-    );
-    assert!(
-        saw_create && saw_kill && saw_output,
-        "expected create → kill → output sequence (got create={}, kill={}, output={})",
-        saw_create,
-        saw_kill,
-        saw_output,
-    );
-}
-
-/// Timeout-arm sibling of `acp_terminal_cancel_mid_wait_kills_then_reads_output`. The agent passes
-/// `timeout_ms` from the tool input into [`DelegatedExecSpec::timeout`]; when neither cancel nor
-/// exit arrives within that window, the third `tokio::select!` arm at `src/acp.rs:798` fires,
-/// `killed = true`, and the kill → output → release sequence runs the same way the cancel path
-/// runs. Unlike the cancel path, no `session/cancel` is sent, so the prompt completes normally
-/// (`end_turn`) rather than `cancelled`. This is the only place in the codebase that exercises the
-/// timeout arm distinct from the cancel arm.
-#[test]
-fn acp_terminal_timeout_kills_then_reads_output_and_continues() {
-    // Script execute_command with a 100ms timeout; we won't answer wait_for_exit, so the timeout
-    // will fire and the agent will proceed to kill+output+release. Round 2 then closes the turn.
-    let script = serde_json::json!([
-        [
-            { "kind": "text", "text": "running..." },
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            {
-                "kind": "tool_use_end",
-                "input": { "command": "sleep 9999", "timeout_ms": 100 }
-            },
-            { "kind": "message_end", "stop_reason": "tool_use" }
-        ],
-        [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
-        ]
-    ]);
-    let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_TERMINAL_CONFIG,
-        Some(script),
-        serde_json::json!({ "terminal": true }),
-    );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-
-    let mut saw_create = false;
-    let mut saw_kill = false;
-    let mut saw_output = false;
-    let mut saw_release = false;
-    let needle = format!("\"id\":{}", id);
-    let mut response: Option<serde_json::Value> = None;
-    let mut transcript = String::new();
-    while Instant::now() < harness.deadline {
-        let mut line = String::new();
-        match harness.reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        transcript.push_str(&line);
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if let Some(method) = value["method"].as_str()
-            && value.get("id").is_some()
-        {
-            let reply = match method {
-                "terminal/create" => {
-                    saw_create = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": { "terminalId": "term-1" }
-                    }))
-                }
-                // Intentionally never answered: the 100ms timeout races wait_for_exit and wins.
-                "terminal/wait_for_exit" => None,
-                "terminal/kill" => {
-                    saw_kill = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {}
-                    }))
-                }
-                "terminal/output" => {
-                    saw_output = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {
-                            "output": "partial before timeout\n",
-                            "truncated": false
-                        }
-                    }))
-                }
-                "terminal/release" => {
-                    saw_release = true;
-                    Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": value["id"].clone(),
-                        "result": {}
-                    }))
-                }
-                _ => None,
-            };
-            if let Some(reply) = reply {
-                let _ = writeln!(harness.stdin, "{}", reply);
-            }
-        }
-        if line.contains(&needle) && response_matches(&line, &needle) {
-            response = Some(value);
-            break;
-        }
-    }
-
-    let response = response.unwrap_or_else(|| {
-        panic!(
-            "no prompt response; saw_create={} saw_kill={} saw_output={} saw_release={}; transcript:\n{}",
-            saw_create, saw_kill, saw_output, saw_release, transcript,
-        );
-    });
-    // Timeout is not cancel; the turn completes normally and proceeds to round 2 (`done` text +
-    // `end_turn`).
-    assert_eq!(
-        response["result"]["stopReason"], "end_turn",
-        "timeout must not surface as cancelled; transcript:\n{}",
-        transcript,
-    );
-    assert!(
-        saw_create && saw_kill && saw_output,
-        "timeout arm must produce create → kill → output (got create={}, kill={}, output={}); transcript:\n{}",
-        saw_create,
-        saw_kill,
-        saw_output,
-        transcript,
     );
 }
 

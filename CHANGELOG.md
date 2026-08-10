@@ -16,11 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP `tools/call` now carries `meka/sessionId` in `_meta` so servers can scope session state.
 - ACP multi-root workspaces: extra folders are searched and named, not silently dropped.
 - Fork a session into an independent copy from the CLI, REPL, HTTP, or ACP.
+- ACP clients now see `execute_command` output as it is produced, not only when the command exits.
+- Editors that render agent-owned terminals now show shell output live, in a real terminal.
 
 ### Changed
 
 - Tools, skills, and MCP instructions moved from the system prompt into the per-turn context.
 - **Breaking:** `-c` takes no session id; use `-r`/`--resume <SESSION>` to resume a specific one.
+- **Breaking:** `execute_command` no longer runs in the ACP client's terminal; meka always owns it.
 
 ### Fixed
 
@@ -33,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-attaching a session over HTTP now drops orphaned tool calls that broke its next turn.
 - An MCP server that fails its initial connect is now retried in the background until it comes up.
 - MCP `tools/call` now actually sends `meka/toolUseId`; it was never populated at the call site.
+- A command printing a non-UTF-8 byte had its whole output dropped; it is now decoded lossily.
+
+### Security
+
+- ACP `ask` mode delegated shell commands to the client's terminal, bypassing meka's sandbox.
 
 ## [0.36.0] - 2026-08-01
 

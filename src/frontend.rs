@@ -14,20 +14,14 @@
 //! The event-based shape mirrors ACP's `session/update` notification: one channel for every kind
 //! of agent-emitted output, discriminated by the [`FrontendEvent`] variant.
 
-// `Mutex` is consumed only by the `#[cfg(test)] mod testing` block below; gating its import
-// keeps non-test builds warning-clean now that `ReplFrontend` (the production user of
+// `Mutex` and `PathBuf` are consumed only by the `#[cfg(test)] mod testing` block below; gating
+// their imports keeps non-test builds warning-clean now that `ReplFrontend` (the production user of
 // `std::sync::Mutex`) has moved into `crate::repl`.
+use std::{collections::VecDeque, path::Path, sync::Arc};
 #[cfg(test)]
-use std::sync::Mutex;
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Mutex};
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{provider::TokenUsage, tools::todo::TodoItem};
@@ -79,15 +73,6 @@ pub trait Frontend: Send + Sync {
         None
     }
 
-    /// Delegate a shell command to the frontend's hosted terminal (e.g. ACP `terminal/*`). Same
-    /// `None` / `Some(Err)` / `Some(Ok)` semantics as [`Self::delegate_fs_read`].
-    async fn delegate_execute(
-        &self,
-        _spec: DelegatedExecSpec,
-    ) -> Option<Result<DelegatedExecOutput, FrontendError>> {
-        None
-    }
-
     /// Returns `true` if the frontend has observed that its client is no longer reachable (e.g. an
     /// ACP client has closed its stdio connection, so every `session/update` notification returns
     /// an error). The agent loop checks this at every loop iteration and short-circuits with
@@ -136,9 +121,9 @@ pub enum DelegateFailure {
 }
 
 /// Error from a frontend-delegated operation ([`Frontend::delegate_fs_read`],
-/// [`Frontend::delegate_fs_write`], [`Frontend::delegate_execute`]). Carries the underlying
-/// transport's message in a stringly form so tools can splice it into their `ToolOutput` text
-/// without depending on the transport crate, plus the [`DelegateFailure`] the routing rule needs.
+/// [`Frontend::delegate_fs_write`]). Carries the underlying transport's message in a stringly form
+/// so tools can splice it into their `ToolOutput` text without depending on the transport crate,
+/// plus the [`DelegateFailure`] the routing rule needs.
 #[derive(Debug, Clone)]
 pub struct FrontendError {
     message: String,
@@ -178,49 +163,6 @@ impl std::fmt::Display for FrontendError {
 }
 
 impl std::error::Error for FrontendError {}
-
-/// Description of the command a delegated `execute_command` should run. The frontend is responsible
-/// for spawning the process (via ACP `terminal/create`, an MCP equivalent, etc.) and returning the
-/// assembled output via [`DelegatedExecOutput`].
-#[derive(Debug, Clone)]
-pub struct DelegatedExecSpec {
-    /// The executable to run. meka always picks a shell (e.g. `sh` / `powershell.exe`) and passes
-    /// the user-supplied command as an argument, so the frontend doesn't need to do its own shell-
-    /// quoting.
-    pub command: String,
-    pub args: Vec<String>,
-    /// Process environment to set in addition to whatever the frontend supplies as its baseline.
-    /// meka forwards a filtered subset of the agent's env so things like `PATH` / `LANG` are
-    /// preserved.
-    pub env: Vec<(String, String)>,
-    /// Working directory for the spawned process. Almost always `Some(_)`: meka's per-session cwd
-    /// snapshot at the call site.
-    pub cwd: Option<PathBuf>,
-    /// Hard timeout. The frontend should attempt to kill the process and return whatever output
-    /// accumulated. `None` defers to the frontend's own default.
-    pub timeout: Option<Duration>,
-    /// Maximum bytes of output the frontend should retain. The frontend signals truncation via
-    /// [`DelegatedExecOutput::truncated`].
-    pub output_byte_limit: Option<u64>,
-    /// Cancellation token from the agent loop. The frontend may use this to short-circuit
-    /// `wait_for_exit` and issue a kill.
-    pub cancellation: CancellationToken,
-}
-
-/// Output of a delegated execute_command. ACP's `terminal/*` returns one combined output stream; we
-/// flatten any stdout/stderr separation into the single [`Self::output`] field. meka's local
-/// execute_command renders the same way (stderr is appended to stdout with a separator), so this
-/// matches.
-#[derive(Debug, Clone)]
-pub struct DelegatedExecOutput {
-    pub output: String,
-    pub exit_code: Option<i32>,
-    /// Signal name (e.g. `"SIGTERM"`) when the process was killed. Mutually exclusive with
-    /// [`Self::exit_code`] in practice.
-    pub signal: Option<String>,
-    /// True iff the frontend dropped bytes past [`DelegatedExecSpec::output_byte_limit`].
-    pub truncated: bool,
-}
 
 /// One-way UI event emitted by the agent loop.
 #[derive(Debug, Clone)]
@@ -273,6 +215,19 @@ pub enum FrontendEvent {
         /// render its apply-diff UI). `None` for tools that have nothing extra.
         metadata: Option<ToolOutputMetadata>,
     },
+    /// Output a still-running tool has produced so far, as it arrives. `id` matches the
+    /// [`Self::ToolCallStarted`] `id`. Only `execute_command` emits these today: a build or a test
+    /// run is silent for its whole duration otherwise, since [`Self::ToolCallCompleted`] can't fire
+    /// until the process exits.
+    ///
+    /// A delta, not a snapshot, so the emitter doesn't have to hold the whole output. Frontends
+    /// that render a replace-the-content protocol (ACP `tool_call_update`) accumulate it
+    /// themselves, which is also where throttling belongs -- the emitter fires per read syscall
+    /// and has no idea what a given transport costs.
+    ///
+    /// stdout and stderr arrive interleaved in production order, the way a terminal shows them.
+    /// The model-facing result assembled at completion still separates the two streams.
+    ToolCallOutputDelta { id: String, chunk: String },
     /// The shared todo list changed via the `todo` tool. Emitted by the agent loop after the tool
     /// succeeds and only when the rendered state actually changed; the REPL renders the list and
     /// the agent's per-turn `OutputSpacing` is advanced. `title` is the heading the agent set
@@ -317,6 +272,14 @@ pub enum ToolOutputMetadata {
         path: std::path::PathBuf,
         old_text: Option<String>,
         new_text: String,
+    },
+    /// How an `execute_command` child ended. The exit code is already spelled out in the tool text
+    /// for the model, but a frontend rendering a terminal needs it as a number, and parsing it back
+    /// out of the prose would be a guess. `exit_code == None` with a `signal` means the process was
+    /// killed; both `None` means it never got far enough to have either (timeout, spawn failure).
+    CommandExit {
+        exit_code: Option<i32>,
+        signal: Option<String>,
     },
 }
 
@@ -440,6 +403,11 @@ impl Frontend for PermissionForwardingFrontend {
             FrontendEvent::SubAgentActivity { .. } => {}
             // Everything else (text deltas, thinking, tool results, todos, token usage, session
             // lifecycle) is sub-agent chrome the user shouldn't see.
+            //
+            // [`FrontendEvent::ToolCallOutputDelta`] must stay in here rather than being forwarded.
+            // It is keyed by the sub-agent's own `tool_use_id`, which names no tool call the client
+            // has been told about, so a frontend that buffers deltas per call would accumulate an
+            // entry that nothing ever completes and frees.
             _ => {}
         }
     }
@@ -470,13 +438,6 @@ impl Frontend for PermissionForwardingFrontend {
         content: &str,
     ) -> Option<Result<(), FrontendError>> {
         self.delegate.delegate_fs_write(path, content).await
-    }
-
-    async fn delegate_execute(
-        &self,
-        spec: DelegatedExecSpec,
-    ) -> Option<Result<DelegatedExecOutput, FrontendError>> {
-        self.delegate.delegate_execute(spec).await
     }
 
     /// Forwarded for the same reason as [`Self::request_permission`]: an MCP server called from a
@@ -833,20 +794,6 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(
-            frontend
-                .delegate_execute(DelegatedExecSpec {
-                    command: "true".to_string(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                    cwd: None,
-                    timeout: None,
-                    output_byte_limit: None,
-                    cancellation: tokio_util::sync::CancellationToken::new(),
-                })
-                .await
-                .is_none()
-        );
     }
 
     /// Test fixture that records what arguments each delegate method was called with, and lets the
@@ -854,10 +801,8 @@ mod tests {
     pub(super) struct DelegatingRecorder {
         pub fs_reads: Mutex<Vec<PathBuf>>,
         pub fs_writes: Mutex<Vec<(PathBuf, String)>>,
-        pub execs: Mutex<Vec<DelegatedExecSpec>>,
         pub fs_read_response: Mutex<Option<Result<String, FrontendError>>>,
         pub fs_write_response: Mutex<Option<Result<(), FrontendError>>>,
-        pub exec_response: Mutex<Option<Result<DelegatedExecOutput, FrontendError>>>,
     }
 
     impl DelegatingRecorder {
@@ -865,15 +810,8 @@ mod tests {
             Self {
                 fs_reads: Mutex::new(Vec::new()),
                 fs_writes: Mutex::new(Vec::new()),
-                execs: Mutex::new(Vec::new()),
                 fs_read_response: Mutex::new(Some(Ok("from-delegate".to_string()))),
                 fs_write_response: Mutex::new(Some(Ok(()))),
-                exec_response: Mutex::new(Some(Ok(DelegatedExecOutput {
-                    output: "delegate-out".to_string(),
-                    exit_code: Some(0),
-                    signal: None,
-                    truncated: false,
-                }))),
             }
         }
     }
@@ -907,14 +845,6 @@ mod tests {
                 .push((path.to_path_buf(), content.to_string()));
             self.fs_write_response.lock().unwrap().take()
         }
-
-        async fn delegate_execute(
-            &self,
-            spec: DelegatedExecSpec,
-        ) -> Option<Result<DelegatedExecOutput, FrontendError>> {
-            self.execs.lock().unwrap().push(spec);
-            self.exec_response.lock().unwrap().take()
-        }
     }
 
     #[tokio::test]
@@ -947,28 +877,5 @@ mod tests {
             PathBuf::from("/tmp/sub.txt"),
             "hi from sub-agent".to_string()
         )]);
-    }
-
-    #[tokio::test]
-    async fn test_permission_forwarding_frontend_forwards_execute() {
-        let recorder = Arc::new(DelegatingRecorder::new());
-        let delegate: Arc<dyn Frontend> = recorder.clone();
-        let forwarder = PermissionForwardingFrontend::new(delegate, None);
-        let spec = DelegatedExecSpec {
-            command: "ls".to_string(),
-            args: vec!["-la".to_string()],
-            env: Vec::new(),
-            cwd: Some(PathBuf::from("/tmp")),
-            timeout: None,
-            output_byte_limit: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        };
-        let outcome = forwarder
-            .delegate_execute(spec)
-            .await
-            .expect("delegate result")
-            .expect("ok");
-        assert_eq!(outcome.output, "delegate-out");
-        assert_eq!(recorder.execs.lock().unwrap().len(), 1);
     }
 }

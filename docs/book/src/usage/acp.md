@@ -45,10 +45,31 @@ The client advertises these in `InitializeRequest.clientCapabilities`; meka stas
 
 - **`fs.readTextFile: true`**: `read_file` issues `fs/read_text_file { sessionId, path, line?, limit? }` so the client serves the *in-buffer* view of the file. Image and regex `read_file` modes have no `fs/*` analogue and stay local.
 - **`fs.writeTextFile: true`**: `write_file` and `edit_file`'s apply step issue `fs/write_text_file { sessionId, path, content }`. meka still attaches diff metadata to the `tool_call_update` so clients with an apply-diff UI can render it.
-- **`terminal: true`**: `execute_command` runs the four-call dance: `terminal/create` → `terminal/wait_for_exit` → `terminal/output` → `terminal/release`. On `session/cancel` or a per-call timeout, meka issues `terminal/kill` and still reads accumulated output. **Exception**: in `read` permission mode meka keeps the local sandboxed shell (Landlock / bwrap / sandbox-exec / Low-Integrity) rather than delegating, so the sandbox isn't bypassed by the client's terminal.
+- **`terminal`**: not consumed. It means "I implement `terminal/*`", i.e. the agent may run commands *in the client*, which meka never does. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
+- **`_meta.terminal_output: true`**: the client renders agent-owned terminals, so `execute_command` output is streamed into a real terminal instead of a code block. A *rendering* choice only: meka still spawns and sandboxes the process either way. Advertised by Zed; independent of the `terminal` capability above.
 - **`elicitation.form` / `elicitation.url`**: when an MCP server asks the user for input mid-tool-call, meka issues `elicitation/create` so the prompt renders in the editor. The two modes are advertised independently and checked separately — a server asking for a form when only `url` is advertised is declined rather than sent. Without the capability meka declines every elicitation, which is what it did unconditionally before. Elicitations raised inside a sub-agent forward to the parent session, like permission prompts.
 
 If the client omits a capability, the matching tool falls back to local syscalls; the user-visible behaviour is the same as `meka` in the REPL.
+
+## Shell commands stay inside meka
+
+`execute_command` never runs in the client's terminal, whatever the client advertises and whatever the permission mode. meka spawns the process itself so everything it wraps a command in keeps applying: the read-mode sandbox (Landlock / bwrap / sandbox-exec / Low-Integrity), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
+
+meka used to delegate in any mode other than `read`, which made `ask` mode a sandbox bypass: meka treats `ask` as sandboxed and refuses to run at all when no sandbox backend is available, yet handed the command to an unsandboxed editor terminal anyway. Delegation is gone rather than narrowed to `write`.
+
+### Live output
+
+Because meka owns the process, it streams the output: while a command runs, what it has printed so far is pushed into the open tool call, so an editor shows a build or a test run progressing instead of a spinner. Updates are coalesced to at most one per 150 ms. stdout and stderr are interleaved in the live view, the way a terminal shows them, while the result the model sees keeps them separated.
+
+How that output is drawn depends on the client:
+
+**Clients advertising `_meta.terminal_output`** get an *agent-owned terminal*. meka announces one on the tool call, appends each chunk to it as it arrives, and closes it with the command's real exit code and signal. The client renders a genuine terminal: ANSI colour, selection, full scrollback, and an expandable view in the tool call. meka still spawns and sandboxes the process; the client only draws the bytes it is handed. Nothing is executed on the client side, and no `terminal/*` request is ever sent.
+
+**Everything else** gets a `console` code block, replaced on each update with a trailing window of the output. The complete output arrives in the final update when the command exits.
+
+The terminal path uses an extension rather than ACP proper: `_meta.terminal_info` to announce the terminal (on the opening `tool_call`, which is where clients read it), `_meta.terminal_output` to append, `_meta.terminal_exit` to close it with the command's real exit code. The convention comes from codex-acp, claude-agent-acp emits the same shape, and Zed consumes it, advertising `_meta.terminal_output: true` to say so. Gating on that key rather than on `terminal` matters: a client that implements `terminal/*` but not these frames cannot resolve the terminal, and would render nothing at all for it.
+
+This is deliberately temporary. ACP v2 standardises agent-owned terminals as `terminal_update` / `terminal_output_chunk`, and meka should move to those once a client implements them; v2 is still a draft schema (`v2.0.0-alpha.N`, behind an off-by-default feature flag) that nothing speaks yet.
 
 ### When the client won't serve a path
 
@@ -148,7 +169,7 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 
 ## Sub-agents
 
-`spawn_agent` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts, fs delegates, and terminal delegates all forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
+`spawn_agent` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts and fs delegates forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
 
 ACP has no sub-agent primitive — no nested sessions, no nested tool calls — so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `spawn_agent` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as a `spawn_agent` line in its parent's list, and two writers on one tool call's content would overwrite each other.
 
@@ -185,7 +206,7 @@ This method is marked **unstable** in the protocol: it is not part of the spec y
 ## Known limitations
 
 - **Tool-call diff metadata isn't persisted.** A session reopened with `session/load` replays `tool_call_update`s as plain text rather than diffs. The on-disk content is unaffected.
-- **`read` mode + `terminal` capability**: meka runs the local sandboxed shell instead of delegating, to preserve the read-only jail. The shell appears in meka's own output rather than the client's terminal pane until you switch to `ask` or `write`.
+- **No terminal pane for shell commands**: `execute_command` output streams into the tool call itself rather than the client's terminal, because meka owns the process. See [Shell commands stay inside meka](#shell-commands-stay-inside-meka).
 - **Image and regex `read_file`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.
 - **`audio` prompts**: not supported; `audio` content blocks produce `InvalidParams`.
 - **No client-side model gate for images**: when `vision` is on, meka forwards images to whatever model the profile names; a non-vision model returns a provider error rather than meka rejecting up front. Set `vision = false` for text-only endpoints.

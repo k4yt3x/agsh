@@ -1358,6 +1358,12 @@ impl Frontend for ReplFrontend {
             // (the next assistant turn). No additional UI is needed at completion time; the
             // model's response that follows already summarizes what happened.
             FrontendEvent::ToolCallCompleted { .. } => {}
+            // Same reasoning as `ToolCallCompleted`: the REPL deliberately doesn't show tool output
+            // at all, so streaming a command's output here would be the only tool output it ever
+            // printed. That's a change to the interactive UX rather than a fix, and it wants its
+            // own `show_*` config knob to go with it. ACP has no such convention to respect -- an
+            // editor's tool-call view is the only place a command's output can appear.
+            FrontendEvent::ToolCallOutputDelta { .. } => {}
             FrontendEvent::TodoListUpdated { title, items } => {
                 Self::close_text_run(&mut state);
                 // Only advance spacing when the list actually rendered. An empty list prints

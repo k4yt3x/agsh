@@ -11,25 +11,28 @@
 //!   `tool_call` + `tool_call_update` lifecycle (with diff content blocks from
 //!   [`crate::frontend::ToolOutputMetadata::Diff`]), and ends with `end_turn` / `cancelled` stop
 //!   reasons. `session/request_permission` handles `ask`-mode tool approvals; per-session sticky
-//!   always/never sets short-circuit subsequent requests.
+//!   always/never sets short-circuit subsequent requests. A running `execute_command` pushes its
+//!   output into the open tool call as it arrives, throttled by [`LIVE_OUTPUT_INTERVAL`].
 //! - **Commands + modes**: built-in local commands (`/status`, `/mcp`) and installed skills surface
 //!   as `available_commands_update` palette entries. Local commands render text and end the turn
 //!   with no model call; skills resolve `/<skill-name> [extra]` prompts to the rendered skill body
 //!   before the turn. `Permission` levels map 1:1 to ACP `SessionMode` ids, advertised on every
 //!   session-creation response and mutated live via `session/set_mode`.
-//! - **Delegation**: `read_file` / `write_file` / `edit_file` / `execute_command` route through the
-//!   client's `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` when the matching
-//!   capability is offered, falling back to local syscalls otherwise. `read` permission mode
-//!   bypasses `execute_command` delegation so the local Landlock / bwrap / sandbox-exec /
-//!   Low-Integrity jail stays in place.
+//! - **Delegation**: `read_file` / `write_file` / `edit_file` route through the client's
+//!   `fs/read_text_file` and `fs/write_text_file` when the matching capability is offered, falling
+//!   back to local syscalls otherwise. `execute_command` is deliberately never delegated: meka owns
+//!   the process so its Landlock / bwrap / sandbox-exec / Low-Integrity jail, env scrub, cwd
+//!   resolution, and process-group kill apply in every permission mode. The client's `terminal/*`
+//!   has no equivalent, and routing through it once made `ask` mode -- a mode meka treats as
+//!   sandboxed -- run commands unsandboxed.
 //!
 //! Multi-session: any number of sessions can coexist in one `meka acp` process. Each session has
 //! its own cwd, permission cell, conversation, cancellation token, and per-session `Agent` +
 //! `AcpFrontend`. Sessions share process-wide dependencies (provider, MCP manager, session DB,
 //! skill cache) via `Arc`. Two sessions can run `session/prompt` calls in parallel; there is no
 //! global mutex serialising turns. Sub-agents reach the parent's client through
-//! [`crate::frontend::PermissionForwardingFrontend`], so their permission prompts, fs delegates,
-//! and terminal delegates all flow through the parent session's editor UI.
+//! [`crate::frontend::PermissionForwardingFrontend`], so their permission prompts and fs delegates
+//! flow through the parent session's editor UI.
 
 mod elicitation;
 
@@ -45,22 +48,20 @@ use agent_client_protocol::{
     schema::v1::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
-        ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
-        EmbeddedResource, EmbeddedResourceResource, EnvVariable, ForkSessionRequest,
-        ForkSessionResponse, ImageContent, Implementation, InitializeRequest, InitializeResponse,
-        KillTerminalRequest, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-        LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-        PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-        ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+        ContentBlock, ContentChunk, CurrentModeUpdate, Diff, EmbeddedResource,
+        EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, ImageContent,
+        Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+        PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+        ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
         ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
         SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities, SessionId,
         SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId,
         SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionModeRequest, SetSessionModeResponse, StopReason, TerminalOutputRequest, ToolCall,
-        ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-        ToolKind, UnstructuredCommandInput, Usage, UsageUpdate, WaitForTerminalExitRequest,
-        WriteTextFileRequest,
+        SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallContent,
+        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        UnstructuredCommandInput, Usage, UsageUpdate, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -77,8 +78,8 @@ use crate::{
     conversation::Conversation,
     error::MekaError,
     frontend::{
-        DelegatedExecOutput, DelegatedExecSpec, Frontend, FrontendError, FrontendEvent,
-        PermissionOutcome, PermissionRequest, ToolOutputMetadata,
+        Frontend, FrontendError, FrontendEvent, PermissionOutcome, PermissionRequest,
+        ToolOutputMetadata,
     },
     mcp,
     permission::{Permission, SharedPermission},
@@ -152,6 +153,20 @@ impl SharedClientState {
             .clone()
     }
 
+    /// Whether the client renders agent-owned terminals from meka's `_meta` frames.
+    ///
+    /// Deliberately not the typed `terminal` capability: that one says the client implements
+    /// `terminal/*` so an agent can run commands *in the client*, which meka never does. A client
+    /// can offer that and still have no idea what [`META_TERMINAL_INFO`] means.
+    fn renders_agent_terminals(&self) -> bool {
+        self.capabilities()
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(CAP_TERMINAL_OUTPUT))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     #[cfg(test)]
     fn client_info(&self) -> Option<Implementation> {
         self.inner
@@ -204,6 +219,138 @@ pub struct AcpFrontend {
     /// which suppresses the update).
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
     context_window: std::sync::atomic::AtomicU64,
+    /// Accumulated live output per in-flight tool call, keyed by `tool_use_id`. ACP replaces a
+    /// tool call's whole `content` array on each update rather than appending to it, so the
+    /// running total has to be kept somewhere; the emitter sends deltas, and this is where
+    /// they are added up. Entries are dropped when the call completes.
+    live_output: std::sync::Mutex<std::collections::HashMap<String, LiveOutput>>,
+}
+
+/// How a running command's output is shown to this client.
+///
+/// The two modes are not cosmetic variants of each other. In [`Self::Terminal`] the client owns a
+/// scrollback buffer that meka appends to, so the whole output is available and rendered as a real
+/// terminal (ANSI colours, selection, its own scrolling). In [`Self::Text`] the only lever is
+/// replacing the tool call's `content`, so meka has to keep the running text itself and can only
+/// afford to re-send a window of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveOutputMode {
+    /// Client advertised `terminal`, so it understands the agent-owned terminal `_meta` channel.
+    Terminal,
+    /// Fallback: a `console` code block, replaced on each update.
+    Text,
+}
+
+/// Per-tool-call state for relaying a running command's output.
+struct LiveOutput {
+    mode: LiveOutputMode,
+    /// Text still to show. In [`LiveOutputMode::Text`] this is the whole (tail-capped) output,
+    /// re-sent every tick. In [`LiveOutputMode::Terminal`] it is only the bytes not yet appended,
+    /// and it is drained on each send, because the client keeps the scrollback.
+    text: String,
+    /// `None` until the first update goes out, so the first chunk is never delayed.
+    last_sent: Option<std::time::Instant>,
+}
+
+/// Shortest gap between two `tool_call_update`s for the same tool call. A chatty build writes
+/// thousands of small chunks a second, and one notification per read syscall would spend more time
+/// on the wire than on the build. Coalescing is why both modes need a buffer at all.
+const LIVE_OUTPUT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How much of the tail to keep visible while a command runs, in [`LiveOutputMode::Text`] only.
+/// That mode re-sends its whole buffer on every tick, so an uncapped buffer would make a chatty
+/// command cost quadratic in its own output. The terminal mode appends and needs no cap.
+const LIVE_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
+
+impl LiveOutput {
+    fn new(mode: LiveOutputMode) -> Self {
+        Self {
+            mode,
+            text: String::new(),
+            last_sent: None,
+        }
+    }
+
+    /// Append a delta and return what to send now, or `None` while throttled.
+    fn push(&mut self, chunk: &str, now: std::time::Instant) -> Option<String> {
+        self.text.push_str(chunk);
+        if self.mode == LiveOutputMode::Text && self.text.len() > LIVE_OUTPUT_TAIL_BYTES {
+            let mut cut = self.text.len() - LIVE_OUTPUT_TAIL_BYTES;
+            // A byte count can land inside a multi-byte character, and both slicing and draining
+            // there panic. Advance to a boundary before either.
+            while cut < self.text.len() && !self.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            // Prefer opening the view at a line start rather than mid-line.
+            if let Some(offset) = self.text[cut..].find('\n') {
+                cut += offset + 1;
+            }
+            self.text.drain(..cut);
+        }
+        if let Some(last) = self.last_sent
+            && now.duration_since(last) < LIVE_OUTPUT_INTERVAL
+        {
+            return None;
+        }
+        self.last_sent = Some(now);
+        match self.mode {
+            // Appending: hand over what has accumulated and start empty again, so the same bytes
+            // are never sent twice.
+            LiveOutputMode::Terminal => {
+                if self.text.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.text))
+                }
+            }
+            LiveOutputMode::Text => Some(self.text.clone()),
+        }
+    }
+
+    /// Whatever is still buffered, for the final flush before a call completes. The throttle can
+    /// swallow the last chunk of a command that exits right after printing, and in terminal mode
+    /// those bytes exist nowhere else.
+    fn take_pending(&mut self) -> Option<String> {
+        match self.mode {
+            LiveOutputMode::Terminal if !self.text.is_empty() => {
+                Some(std::mem::take(&mut self.text))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `clientCapabilities._meta` key a client sets to say it renders agent-owned terminals from the
+/// `_meta` frames below. Distinct from the typed `terminal` capability, which means "I implement
+/// `terminal/*` requests" -- a client can do that without understanding these frames at all. Zed
+/// advertises both; gating on the wrong one would send terminal content blocks to a client that
+/// resolves them to nothing and so displays no output, which is the failure this whole path exists
+/// to fix.
+const CAP_TERMINAL_OUTPUT: &str = "terminal_output";
+
+/// `_meta` key naming an agent-owned terminal so the client registers it. Without this the client
+/// has nothing to attach output to and buffers it against an id it was never told about (Zed parks
+/// it in `pending_terminal_output`, drained only on a matching create), leaving an empty terminal.
+///
+/// Must ride on the `tool_call` that opens the call, not a later `tool_call_update`: the client
+/// reads it only off the former.
+const META_TERMINAL_INFO: &str = "terminal_info";
+/// `_meta` key carrying a chunk of output to append to an agent-owned terminal.
+const META_TERMINAL_OUTPUT: &str = "terminal_output";
+/// `_meta` key marking an agent-owned terminal as finished, with its exit status.
+const META_TERMINAL_EXIT: &str = "terminal_exit";
+
+/// Build the `_meta` map for one agent-owned-terminal frame.
+///
+/// This is an extension, not ACP proper: it originates in codex-acp, claude-agent-acp emits the
+/// same shape, and Zed consumes it. ACP v2 standardises the idea as `terminal_update` /
+/// `terminal_output_chunk`, which is what this should become once a client speaks v2. `_meta` is
+/// specified as ignorable (every `_meta` field deserialises with `DefaultOnError`), so a client
+/// that doesn't know these keys drops them rather than failing.
+fn terminal_meta(key: &str, payload: serde_json::Value) -> agent_client_protocol::schema::v1::Meta {
+    let mut meta = agent_client_protocol::schema::v1::Meta::new();
+    meta.insert(key.to_string(), payload);
+    meta
 }
 
 impl AcpFrontend {
@@ -225,6 +372,7 @@ impl AcpFrontend {
             transport_dead,
             context_tokens,
             context_window: std::sync::atomic::AtomicU64::new(0),
+            live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -241,6 +389,55 @@ impl AcpFrontend {
     fn mark_transport_dead(&self) {
         self.transport_dead
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Push one `session/update` to the client, latching the transport as dead if it fails.
+    ///
+    /// `send_notification` is synchronous, which is what lets the live-output path hold its buffer
+    /// lock across a send to keep chunks ordered.
+    fn send_update(&self, update: SessionUpdate) {
+        if let Err(error) = self
+            .connection
+            .send_notification(SessionNotification::new(self.session_id.clone(), update))
+        {
+            tracing::debug!("AcpFrontend send_notification failed: {}", error);
+            self.mark_transport_dead();
+        }
+    }
+
+    /// Recover from a poisoned lock rather than propagating it. A panic under this lock would
+    /// otherwise disable live output *and* the tool-call completion update for the rest of the
+    /// session, leaving the client on a spinner that never resolves; the buffer is display state,
+    /// so continuing with whatever it holds is strictly better than going silent.
+    fn live_output(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, LiveOutput>> {
+        self.live_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Open a live-output view for a starting tool call and return how it will be rendered, or
+    /// `None` for calls that produce no streamed output.
+    ///
+    /// Only `execute_command` qualifies: it is the one tool whose result can be minutes away, and
+    /// the terminal frames below would be nonsense for anything that isn't a command. The mode is
+    /// decided once, here, so the client can't be told about a terminal it never registered.
+    fn begin_live_output(&self, id: &str, tool_name: &str) -> Option<LiveOutputMode> {
+        if tool_name != "execute_command" {
+            return None;
+        }
+        let mode = if self.client_state.renders_agent_terminals() {
+            LiveOutputMode::Terminal
+        } else {
+            LiveOutputMode::Text
+        };
+        // The single most useful line when a user reports "I see the command but not its output":
+        // it says whether the client asked for terminal rendering, which is the whole branch point.
+        tracing::debug!("execute_command {} live output: {:?}", id, mode);
+        self.live_output()
+            .insert(id.to_string(), LiveOutput::new(mode));
+        Some(mode)
     }
 
     fn is_always_allowed(&self, tool_name: &str) -> bool {
@@ -273,9 +470,6 @@ impl AcpFrontend {
 #[async_trait]
 impl Frontend for AcpFrontend {
     async fn emit(&self, event: FrontendEvent) {
-        let connection = self.connection.clone();
-        let session_id = self.session_id.clone();
-
         let update = match event {
             FrontendEvent::AssistantTextDelta(text) => {
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
@@ -299,12 +493,53 @@ impl Frontend for AcpFrontend {
                 // a bare tool name; `raw_input` still carries the full argument object.
                 let locations = tool_locations(&name, &input, &self.cwd);
                 let title = tool_call_title(&name, display_summary.as_deref());
-                let call = ToolCall::new(id, title)
+                let mut call = ToolCall::new(id.clone(), title)
                     .kind(tool_kind_for(&name))
                     .status(ToolCallStatus::InProgress)
                     .locations(locations)
                     .raw_input(input);
+                // Claim the rendering mode for this call up front, because the terminal has to be
+                // announced before any output references it. The tool call's own id doubles as the
+                // terminal id: it is unique per call and is what the client already correlates on.
+                if self.begin_live_output(&id, &name) == Some(LiveOutputMode::Terminal) {
+                    // `cwd` is optional in the frame but worth sending: the client labels the
+                    // terminal with it, and meka's per-session cwd (which `/cd` moves) is not
+                    // something the client could otherwise know.
+                    let cwd = crate::agent::cwd_snapshot(&self.cwd);
+                    call = call
+                        .content(vec![ToolCallContent::Terminal(
+                            agent_client_protocol::schema::v1::Terminal::new(id.clone()),
+                        )])
+                        .meta(terminal_meta(
+                            META_TERMINAL_INFO,
+                            serde_json::json!({ "terminal_id": id, "cwd": cwd }),
+                        ));
+                }
                 SessionUpdate::ToolCall(call)
+            }
+            FrontendEvent::ToolCallOutputDelta { id, chunk } => {
+                // stdout and stderr drain on separate tasks, so two deltas for the same call can
+                // be in flight on two threads at once. Terminal mode appends whatever it is handed,
+                // so draining the buffer and sending it have to be one atomic step: release the
+                // lock in between and the two tasks can swap order, interleaving the terminal's
+                // contents. Safe to hold across the send because `send_notification` is
+                // synchronous -- nothing is awaited under the lock.
+                let mut buffers = self.live_output();
+                // Absent means the call never opened a live view (not `execute_command`, or it
+                // already completed), so there is nothing to attach this to.
+                let Some(entry) = buffers.get_mut(&id) else {
+                    return;
+                };
+                let mode = entry.mode;
+                // `None` means this tick is throttled away; the buffer keeps the bytes and the next
+                // tick that clears the interval sends them.
+                let Some(text) = entry.push(&chunk, std::time::Instant::now()) else {
+                    return;
+                };
+                self.send_update(SessionUpdate::ToolCallUpdate(live_output_update(
+                    &id, mode, &text,
+                )));
+                return;
             }
             FrontendEvent::ToolCallCompleted {
                 id,
@@ -313,21 +548,60 @@ impl Frontend for AcpFrontend {
                 content,
                 metadata,
             } => {
+                let live = {
+                    // The completion update carries the authoritative output, so the live view has
+                    // done its job either way; take the mode and any bytes the throttle swallowed.
+                    self.live_output()
+                        .remove(&id)
+                        .map(|mut entry| (entry.mode, entry.take_pending()))
+                };
+                // A command that exits immediately after printing can have its last chunk still
+                // inside the throttle window. In terminal mode those bytes live nowhere else -- the
+                // client's scrollback is the only copy -- so flush them before marking the call
+                // done.
+                if let Some((LiveOutputMode::Terminal, Some(pending))) = &live {
+                    self.send_update(SessionUpdate::ToolCallUpdate(live_output_update(
+                        &id,
+                        LiveOutputMode::Terminal,
+                        pending,
+                    )));
+                }
                 let status = if is_error {
                     ToolCallStatus::Failed
                 } else {
                     ToolCallStatus::Completed
                 };
-                let acp_content = build_completion_content(&name, &content, metadata);
-                let mut fields = ToolCallUpdateFields::new()
-                    .status(status)
-                    .content(acp_content);
+                let mut fields = ToolCallUpdateFields::new().status(status);
+                let mut update_meta = None;
+                if let Some((LiveOutputMode::Terminal, _)) = live {
+                    // Keep the terminal as the call's content: it already holds the full
+                    // scrollback, and replacing it with a text block here would
+                    // swap a live, scrollable, colour-rendered view for a
+                    // flattened copy at the moment the command finishes.
+                    fields = fields.content(vec![ToolCallContent::Terminal(
+                        agent_client_protocol::schema::v1::Terminal::new(id.clone()),
+                    )]);
+                    update_meta = Some(terminal_meta(
+                        META_TERMINAL_EXIT,
+                        serde_json::json!({
+                            "terminal_id": id,
+                            "exit_code": command_exit_code(&metadata, is_error),
+                            "signal": command_signal(&metadata),
+                        }),
+                    ));
+                } else {
+                    fields = fields.content(build_completion_content(&name, &content, metadata));
+                }
                 // Surface the structured tool output too, so clients (e.g. Zed's tool-call detail
                 // view) can introspect the result beyond the rendered `content` blocks.
                 if let Ok(raw) = serde_json::to_value(&content) {
                     fields = fields.raw_output(raw);
                 }
-                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
+                let mut update = ToolCallUpdate::new(id, fields);
+                if let Some(meta) = update_meta {
+                    update = update.meta(meta);
+                }
+                SessionUpdate::ToolCallUpdate(update)
             }
             FrontendEvent::SubAgentActivity {
                 tool_call_id,
@@ -395,16 +669,21 @@ impl Frontend for AcpFrontend {
                 }
                 SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
             }
+            FrontendEvent::TurnStarted => {
+                // Tool calls begin and end inside a turn, so anything still open here belongs to a
+                // previous one that never delivered its completion (a cancelled turn, or a stream
+                // retried after announcing a tool call). Those entries would otherwise accumulate
+                // for the life of the session. `TurnFinished` is not a substitute: the agent loop
+                // only emits it when the turn succeeded, which is exactly when there is nothing to
+                // clean up.
+                self.live_output().clear();
+                return;
+            }
             // REPL-specific signage (lifecycle, diffs).
             _ => return,
         };
 
-        if let Err(error) =
-            connection.send_notification(SessionNotification::new(session_id, update))
-        {
-            tracing::debug!("AcpFrontend send_notification failed: {}", error);
-            self.mark_transport_dead();
-        }
+        self.send_update(update);
     }
 
     fn client_disconnected(&self) -> bool {
@@ -470,9 +749,9 @@ impl Frontend for AcpFrontend {
                     // outcome, so an `Err` here is almost certainly transport-level. Mark the
                     // connection dropped so the agent loop short-circuits on the next pre-iteration
                     // check instead of running a tool, emitting a denied result, and only then
-                    // discovering the client is gone via the next emit. The FS / execute delegates
+                    // discovering the client is gone via the next emit. The FS delegates
                     // intentionally don't do this: those paths legitimately receive JSON-RPC error
-                    // responses (e.g. terminal/create denied), which would produce false-positive
+                    // responses (a path the client won't serve), which would produce false-positive
                     // disconnects.
                     self.mark_transport_dead();
                     return PermissionOutcome::Deny;
@@ -532,19 +811,6 @@ impl Frontend for AcpFrontend {
             Ok(_) => Ok(()),
             Err(error) => Err(classify_fs_error("fs/write_text_file", &error)),
         })
-    }
-
-    async fn delegate_execute(
-        &self,
-        spec: DelegatedExecSpec,
-    ) -> Option<Result<DelegatedExecOutput, FrontendError>> {
-        let caps = self.client_state.capabilities();
-        if !caps.terminal {
-            return None;
-        }
-        let connection = self.connection.clone();
-        let session_id = self.session_id.clone();
-        Some(run_delegated_execute(connection, session_id, spec).await)
     }
 
     async fn handle_elicitation(
@@ -844,6 +1110,52 @@ fn text_content_block(text: impl Into<String>) -> ToolCallContent {
     ))
 }
 
+/// Build the `tool_call_update` that carries a running command's output, in whichever shape the
+/// client understands. Terminal mode appends `text` to the client's scrollback and repeats the
+/// content block so the terminal stays attached; text mode replaces the content with the window
+/// meka is holding.
+fn live_output_update(id: &str, mode: LiveOutputMode, text: &str) -> ToolCallUpdate {
+    match mode {
+        LiveOutputMode::Terminal => {
+            let fields = ToolCallUpdateFields::new().content(vec![ToolCallContent::Terminal(
+                agent_client_protocol::schema::v1::Terminal::new(id.to_string()),
+            )]);
+            ToolCallUpdate::new(id.to_string(), fields).meta(terminal_meta(
+                META_TERMINAL_OUTPUT,
+                serde_json::json!({ "terminal_id": id, "data": text }),
+            ))
+        }
+        LiveOutputMode::Text => {
+            let fields = ToolCallUpdateFields::new().content(vec![console_content_block(text)]);
+            ToolCallUpdate::new(id.to_string(), fields)
+        }
+    }
+}
+
+/// Exit code for a finished command's terminal frame. Falls back to the coarse "did it fail" bit
+/// when the tool didn't report a code (a signal kill, or a tool error raised before the spawn).
+fn command_exit_code(metadata: &Option<ToolOutputMetadata>, is_error: bool) -> Option<i32> {
+    match metadata {
+        Some(ToolOutputMetadata::CommandExit { exit_code, .. }) => *exit_code,
+        _ => Some(i32::from(is_error)),
+    }
+}
+
+/// Signal name for a finished command's terminal frame, when it was killed rather than exiting.
+fn command_signal(metadata: &Option<ToolOutputMetadata>) -> Option<String> {
+    match metadata {
+        Some(ToolOutputMetadata::CommandExit { signal, .. }) => signal.clone(),
+        _ => None,
+    }
+}
+
+/// Wrap shell output in a `console` code block so editors render it monospaced (mirrors
+/// claude-agent-acp's no-terminal fallback). Shared by the live view a command streams while it
+/// runs and the final one emitted when it exits, so output doesn't reflow when the call completes.
+fn console_content_block(output: &str) -> ToolCallContent {
+    text_content_block(format!("```console\n{}\n```", output.trim_end()))
+}
+
 /// Build the `content` array of a `tool_call_update` from meka's tool output. A populated `Diff`
 /// metadata wins (so clients like Zed get the structured diff for apply-UI). `execute_command`
 /// output is wrapped in a `console` code block so editors render it monospaced (mirrors
@@ -872,11 +1184,10 @@ fn build_completion_content(
         // Reuse the canonical text-flattening; `execute_command` output is text-only, so the
         // `[Image]` marker `tool_result_text_content` would emit for images never appears here.
         let combined = MekaContentBlock::tool_result_text_content(content);
-        let trimmed = combined.trim_end();
-        if trimmed.is_empty() {
+        if combined.trim_end().is_empty() {
             return Vec::new();
         }
-        return vec![text_content_block(format!("```console\n{trimmed}\n```"))];
+        return vec![console_content_block(&combined)];
     }
 
     content
@@ -1068,7 +1379,10 @@ fn send_session_update(
     if let Err(error) =
         connection.send_notification(SessionNotification::new(session_id.clone(), update))
     {
-        tracing::debug!("session/load replay send_notification failed: {}", error);
+        // Every `session/update` goes out through here, not just `session/load` replay, so name the
+        // notification rather than one caller: this is the line to look at when a client reports
+        // that updates aren't arriving.
+        tracing::debug!("session/update send_notification failed: {}", error);
     }
 }
 
@@ -1117,144 +1431,6 @@ fn maybe_emit_session_title(
         session_id,
         SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
     );
-}
-
-/// Drive the ACP `terminal/*` four-call dance for a delegated execute:
-/// `terminal/create` → wait for exit (raced against the agent's
-/// cancellation token + the spec's timeout) → `terminal/output` →
-/// `terminal/release`. On cancel or timeout we send `terminal/kill`
-/// first and then still read whatever output the editor buffered.
-async fn run_delegated_execute(
-    connection: ConnectionTo<Client>,
-    session_id: SessionId,
-    spec: DelegatedExecSpec,
-) -> Result<DelegatedExecOutput, FrontendError> {
-    // Build CreateTerminalRequest. Empty `args` / `env` / unset `cwd` / unset `output_byte_limit`
-    // are all fine; the builder leaves them at defaults.
-    let mut create = CreateTerminalRequest::new(session_id.clone(), spec.command.clone());
-    if !spec.args.is_empty() {
-        create = create.args(spec.args.clone());
-    }
-    if !spec.env.is_empty() {
-        let env_vars: Vec<EnvVariable> = spec
-            .env
-            .iter()
-            .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
-            .collect();
-        create = create.env(env_vars);
-    }
-    if let Some(cwd) = spec.cwd.clone() {
-        create = create.cwd(cwd);
-    }
-    if let Some(limit) = spec.output_byte_limit {
-        create = create.output_byte_limit(limit);
-    }
-
-    let terminal_id = match connection.send_request(create).block_task().await {
-        Ok(response) => response.terminal_id,
-        Err(error) => {
-            return Err(FrontendError::new(format!(
-                "terminal/create failed: {}",
-                error
-            )));
-        }
-    };
-
-    // Wait for exit, racing the agent's cancellation token + the spec's timeout. On race-loss we
-    // kill the terminal first; the follow-up `terminal/output` still returns whatever was buffered.
-    //
-    // Default cap of 15 minutes when the caller didn't supply one; interactive tools can override
-    // per-call. The agent's cancel token is still the primary escape hatch; the timeout is just the
-    // worst-case bound if both the cancel path and the underlying process get wedged.
-    let timeout = spec
-        .timeout
-        .unwrap_or_else(|| std::time::Duration::from_secs(60 * 15));
-    let wait_request = WaitForTerminalExitRequest::new(session_id.clone(), terminal_id.clone());
-    let killed = tokio::select! {
-        result = connection.send_request(wait_request).block_task() => {
-            match result {
-                Ok(_response) => false,
-                Err(error) => {
-                    return Err(FrontendError::new(format!(
-                        "terminal/wait_for_exit failed: {}",
-                        error
-                    )));
-                }
-            }
-        }
-        _ = spec.cancellation.cancelled() => true,
-        _ = tokio::time::sleep(timeout) => true,
-    };
-    if killed
-        && let Err(error) = connection
-            .send_request(KillTerminalRequest::new(
-                session_id.clone(),
-                terminal_id.clone(),
-            ))
-            .block_task()
-            .await
-    {
-        tracing::debug!("terminal/kill failed: {}", error);
-    }
-
-    // Fetch the final output regardless of which arm won.
-    let output_request = TerminalOutputRequest::new(session_id.clone(), terminal_id.clone());
-    let output_response = match connection.send_request(output_request).block_task().await {
-        Ok(response) => response,
-        Err(error) => {
-            // Try to release before bubbling the error so we don't leak the terminal handle on the
-            // client side.
-            if let Err(release_error) = connection
-                .send_request(ReleaseTerminalRequest::new(
-                    session_id.clone(),
-                    terminal_id.clone(),
-                ))
-                .block_task()
-                .await
-            {
-                tracing::debug!(
-                    "terminal/release after output failure also failed: {}",
-                    release_error,
-                );
-            }
-            return Err(FrontendError::new(format!(
-                "terminal/output failed: {}",
-                error
-            )));
-        }
-    };
-
-    // Best-effort release; errors are non-fatal (the editor cleans up on disconnect anyway). Log at
-    // debug for diagnostics.
-    if let Err(error) = connection
-        .send_request(ReleaseTerminalRequest::new(session_id, terminal_id))
-        .block_task()
-        .await
-    {
-        tracing::debug!("terminal/release failed: {}", error);
-    }
-
-    let (exit_code, signal) = match output_response.exit_status {
-        Some(status) => (
-            // ACP wire protocol uses u32 exit codes; meka's `DelegatedExecOutput.exit_code` is
-            // i32. Real exit codes are 0-255, so `try_from` always succeeds; the
-            // explicit fallback to -1 documents the choice instead of doing a lossy
-            // `as`-cast.
-            status
-                .exit_code
-                .map(|code| i32::try_from(code).unwrap_or(-1)),
-            status.signal.clone(),
-        ),
-        None if killed => (None, Some("SIGTERM".to_string())),
-        None => (None, None),
-    };
-
-    Ok(DelegatedExecOutput {
-        output: output_response.output,
-        exit_code,
-        signal,
-        truncated: output_response.truncated,
-    })
 }
 
 /// Map a meka [`Permission`] to its ACP [`SessionModeId`] string. The mapping is the lowercase
@@ -3382,6 +3558,150 @@ mod tests {
             text: "   \n".to_string(),
         }];
         assert!(build_completion_content("execute_command", &content, None).is_empty());
+    }
+
+    fn empty_live_output() -> LiveOutput {
+        LiveOutput::new(LiveOutputMode::Text)
+    }
+
+    /// The first chunk goes out immediately (a command that prints one line and exits must still
+    /// show it), and chunks inside the interval accumulate silently rather than being dropped.
+    #[test]
+    fn test_live_output_throttles_but_keeps_every_byte() {
+        let start = std::time::Instant::now();
+        let mut live = empty_live_output();
+
+        assert_eq!(live.push("first\n", start).as_deref(), Some("first\n"));
+        assert_eq!(
+            live.push("swallowed\n", start + LIVE_OUTPUT_INTERVAL / 2),
+            None,
+            "a second chunk inside the interval must not produce an update",
+        );
+        assert_eq!(
+            live.push("later\n", start + LIVE_OUTPUT_INTERVAL * 2)
+                .as_deref(),
+            Some("first\nswallowed\nlater\n"),
+            "the throttled chunk must reappear in the next update, not be lost",
+        );
+    }
+
+    /// The live view is capped, so a command that dumps far more than the cap doesn't make every
+    /// subsequent update carry the whole history. Cutting must land on a line boundary and must
+    /// never split a multi-byte character (slicing off one panics).
+    #[test]
+    fn test_live_output_trims_to_a_tail_on_a_line_boundary() {
+        let start = std::time::Instant::now();
+        let mut live = empty_live_output();
+        // Multi-byte content so a naive byte-offset cut would panic rather than merely look wrong.
+        let line = "ünïcödé filler line to push past the cap\n";
+        let mut now = start;
+        for _ in 0..(LIVE_OUTPUT_TAIL_BYTES / line.len() + 10) {
+            now += LIVE_OUTPUT_INTERVAL * 2;
+            live.push(line, now);
+        }
+        let tail = live
+            .push("final\n", now + LIVE_OUTPUT_INTERVAL * 2)
+            .expect("update");
+        assert!(
+            tail.len() <= LIVE_OUTPUT_TAIL_BYTES + line.len(),
+            "tail should stay near the cap; got {} bytes",
+            tail.len(),
+        );
+        assert!(tail.ends_with("final\n"), "the newest output must survive");
+        assert!(
+            tail.starts_with(line),
+            "the cut must land at a line start; got {:?}",
+            &tail[..line.len().min(tail.len())],
+        );
+    }
+
+    /// Terminal mode appends into a buffer the client owns, so each send must carry only what has
+    /// arrived since the last one. Re-sending the running total (which is what text mode does)
+    /// would make the terminal show every line duplicated more times the longer the command ran.
+    #[test]
+    fn test_live_output_terminal_mode_sends_each_byte_once() {
+        let start = std::time::Instant::now();
+        let mut live = LiveOutput::new(LiveOutputMode::Terminal);
+
+        assert_eq!(live.push("alpha\n", start).as_deref(), Some("alpha\n"));
+        assert_eq!(
+            live.push("beta\n", start + LIVE_OUTPUT_INTERVAL * 2)
+                .as_deref(),
+            Some("beta\n"),
+            "the second send must not repeat the first chunk",
+        );
+        // Throttled chunks coalesce into the next send rather than being dropped or re-sent.
+        assert_eq!(live.push("gamma\n", start + LIVE_OUTPUT_INTERVAL * 2), None);
+        assert_eq!(
+            live.push("delta\n", start + LIVE_OUTPUT_INTERVAL * 4)
+                .as_deref(),
+            Some("gamma\ndelta\n"),
+        );
+    }
+
+    /// The throttle can swallow the final chunk of a command that exits right after printing. In
+    /// terminal mode the client's scrollback is the only copy of those bytes, so completion has to
+    /// flush them; in text mode the completion update re-sends everything anyway.
+    #[test]
+    fn test_live_output_terminal_mode_flushes_what_the_throttle_held_back() {
+        let start = std::time::Instant::now();
+        let mut live = LiveOutput::new(LiveOutputMode::Terminal);
+        live.push("first\n", start).expect("first send");
+        assert_eq!(live.push("last gasp\n", start), None, "inside the interval");
+        assert_eq!(live.take_pending().as_deref(), Some("last gasp\n"));
+        assert_eq!(live.take_pending(), None, "flushing twice would duplicate");
+
+        let mut text_mode = LiveOutput::new(LiveOutputMode::Text);
+        text_mode.push("buffered\n", start);
+        assert_eq!(
+            text_mode.take_pending(),
+            None,
+            "text mode's completion update carries the whole output already",
+        );
+    }
+
+    /// The tail cap exists only because text mode re-sends its buffer every tick. Applying it to
+    /// terminal mode would silently drop output the client can no longer recover.
+    #[test]
+    fn test_live_output_terminal_mode_never_drops_output_to_the_tail_cap() {
+        let start = std::time::Instant::now();
+        let mut live = LiveOutput::new(LiveOutputMode::Terminal);
+        let line = "x".repeat(1024) + "\n";
+        let mut now = start;
+        let mut delivered = String::new();
+        let rounds = (LIVE_OUTPUT_TAIL_BYTES / line.len()) + 8;
+        for _ in 0..rounds {
+            now += LIVE_OUTPUT_INTERVAL * 2;
+            if let Some(chunk) = live.push(&line, now) {
+                delivered.push_str(&chunk);
+            }
+        }
+        assert_eq!(
+            delivered.len(),
+            line.len() * rounds,
+            "every byte must reach the client exactly once, past the text-mode cap",
+        );
+    }
+
+    /// A live update reports content only. Setting a status would tell the client the call had
+    /// finished while the command is still running.
+    #[test]
+    fn test_live_output_update_carries_no_status() {
+        let mut live = empty_live_output();
+        let text = live
+            .push("building...\n", std::time::Instant::now())
+            .expect("first push always emits");
+        let fields = ToolCallUpdateFields::new().content(vec![console_content_block(&text)]);
+        let update = ToolCallUpdate::new("call_1", fields);
+        let wire = serde_json::to_value(&update).expect("serialize");
+        assert!(
+            wire["status"].is_null(),
+            "live updates must not carry a status; got {wire}",
+        );
+        assert_eq!(
+            wire["content"][0]["content"]["text"], "```console\nbuilding...\n```",
+            "the live view must render the same way the completed one does",
+        );
     }
 
     #[test]
