@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `termimad` render mode is now coloured from the same theme as `syntect` instead of greyscale.
+- `termimad` no longer centres a top-level heading, which read as a formatting glitch.
 - Tools, skills, and MCP instructions moved from the system prompt into the per-turn context.
 - **Breaking:** `-c` takes no session id; use `-r`/`--resume <SESSION>` to resume a specific one.
 - **Breaking:** `execute_command` no longer runs in the ACP client's terminal; meka always owns it.
@@ -37,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An MCP server that fails its initial connect is now retried in the background until it comes up.
 - MCP `tools/call` now actually sends `meka/toolUseId`; it was never populated at the call site.
 - A command printing a non-UTF-8 byte had its whole output dropped; it is now decoded lossily.
+- `syntect` and `raw` dropped a reply's trailing table or unclosed code fence instead of showing it.
+- `termimad` mode parses real CommonMark: `-`/`+` bullets, `__bold__`, `_italic_`, and links.
+- `termimad` mode reflows multi-line paragraphs to the terminal width instead of per line.
+- `termimad` mode no longer splits a fenced code block that contains a blank line.
+- A `#` or `|` line inside a fenced code block no longer gets blank lines inserted into it.
 
 ### Security
 

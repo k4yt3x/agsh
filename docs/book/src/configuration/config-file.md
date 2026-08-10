@@ -255,8 +255,8 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 
 | Value | Description |
 |-------|-------------|
-| `syntect` | Syntax-highlighted markdown via `syntect`, incl. per-language code blocks (default) |
-| `termimad` | Terminal formatting via termimad (box-drawn code blocks, reflowed paragraphs). Alias: `rich` |
+| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed (default) |
+| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colours as `syntect`, and code blocks are highlighted by it. Alias: `rich` |
 | `raw` | Raw markdown printed verbatim with aligned tables |
 
 Default: `syntect`

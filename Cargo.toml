@@ -31,6 +31,7 @@ infer = { version = "0.19", default-features = false }
 nu-ansi-term = "0.50"
 open = "5"
 percent-encoding = "2"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10"
 reedline = { git = "https://github.com/wtfbbqhax/reedline", rev = "3a457ff1dab28c9021db116f2575eed5116bed88", features = ["external_printer"] }
 regex = "1"

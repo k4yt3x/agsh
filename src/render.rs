@@ -7,15 +7,17 @@ use std::{
     sync::{LazyLock, OnceLock},
 };
 
-use crossterm::style::{Color, Stylize};
+mod markdown;
+
+use crossterm::style::{Attribute, Color, Stylize};
 use regex::Regex;
 use syntect::{
     easy::HighlightLines,
-    highlighting::{Theme, ThemeSet},
-    parsing::{SyntaxReference, SyntaxSet},
+    highlighting::{FontStyle, Theme, ThemeSet},
+    parsing::{Scope, SyntaxReference, SyntaxSet},
     util::{LinesWithEndings, as_24_bit_terminal_escaped},
 };
-use termimad::MadSkin;
+use termimad::{Alignment, MadSkin};
 
 /// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended` (MIT).
 const MONOKAI_EXTENDED_TMTHEME: &[u8] = include_bytes!("../assets/themes/Monokai Extended.tmTheme");
@@ -124,18 +126,37 @@ pub struct StreamingRenderer {
     pub(crate) started: bool,
     raw_table_lines: Vec<String>,
     code_block_lines: Vec<String>,
+    /// Fixed render width for the termimad path. `None` in production, where the real terminal
+    /// width is the right answer; tests set it so their expected output doesn't depend on the
+    /// terminal the suite happens to run under.
+    width: Option<usize>,
 }
 
 impl StreamingRenderer {
     pub fn new(mode: RenderMode) -> Self {
         Self {
             buffer: String::new(),
-            skin: MadSkin::default_dark(),
+            // Only the termimad path renders through the skin, and building it forces the ~1 MB
+            // syntax-set load. `Raw` and `Silent` otherwise never touch syntect at all, and
+            // `Silent` is what sub-agents run under.
+            skin: match mode {
+                RenderMode::Termimad => markdown_skin().clone(),
+                _ => MadSkin::default(),
+            },
             mode,
             started: false,
             raw_table_lines: Vec::new(),
             code_block_lines: Vec::new(),
+            width: None,
         }
+    }
+
+    /// Pin the render width instead of reading the terminal's. Test-only: production always wants
+    /// the live width.
+    #[cfg(test)]
+    fn with_width(mut self, width: usize) -> Self {
+        self.width = Some(width);
+        self
     }
 
     pub fn push_delta(&mut self, delta: &str) -> io::Result<()> {
@@ -172,7 +193,7 @@ impl StreamingRenderer {
         }
         match self.mode {
             RenderMode::Syntect => {
-                if !self.buffer.is_empty() {
+                {
                     let remaining = std::mem::take(&mut self.buffer);
                     let trimmed = remaining.trim_end_matches('\n');
                     let mut needs_newline = false;
@@ -202,6 +223,10 @@ impl StreamingRenderer {
                             needs_newline = true;
                         }
                     }
+                    // Deliberately not gated on a non-empty buffer. A turn whose last delta ended
+                    // in a newline leaves the buffer empty while a table or an unterminated fence
+                    // is still pending, and skipping these drains discarded it: a reply ending in a
+                    // markdown table lost the table entirely.
                     self.flush_syntect_code_block()?;
                     self.flush_syntect_table()?;
                     if needs_newline {
@@ -210,28 +235,31 @@ impl StreamingRenderer {
                 }
             }
             RenderMode::Termimad => {
-                if !self.buffer.is_empty() {
-                    let remaining = std::mem::take(&mut self.buffer);
-                    let trimmed = remaining.trim_end_matches('\n');
-                    if !trimmed.is_empty() {
-                        print!("{}", self.skin.term_text(trimmed));
-                    }
+                // Not gated on a non-empty buffer: an unterminated fence whose lines have all been
+                // consumed leaves the buffer empty and the block pending, and skipping the drain
+                // here would discard it.
+                let remaining = std::mem::take(&mut self.buffer);
+                let trimmed = remaining.trim_end_matches('\n');
+                let output = self.finish_termimad_output(trimmed);
+                if !output.is_empty() {
+                    print!("{}", output);
                 }
             }
             RenderMode::Raw => {
-                if !self.buffer.is_empty() {
-                    let remaining = std::mem::take(&mut self.buffer);
-                    let trimmed = remaining.trim_end_matches('\n');
-                    for line in trimmed.lines() {
-                        if is_table_line(line) {
-                            self.raw_table_lines.push(line.to_string());
-                        } else {
-                            self.flush_raw_table()?;
-                            println!("{}", line);
-                        }
+                // Same reason the other arms aren't gated on a non-empty buffer: a reply ending in
+                // a table leaves the rows pending with nothing left in the buffer, and skipping the
+                // drain printed no table at all.
+                let remaining = std::mem::take(&mut self.buffer);
+                let trimmed = remaining.trim_end_matches('\n');
+                for line in trimmed.lines() {
+                    if is_table_line(line) {
+                        self.raw_table_lines.push(line.to_string());
+                    } else {
+                        self.flush_raw_table()?;
+                        println!("{}", line);
                     }
-                    self.flush_raw_table()?;
                 }
+                self.flush_raw_table()?;
             }
             // Already short-circuited above; included for exhaustiveness.
             RenderMode::Silent => {}
@@ -240,7 +268,7 @@ impl StreamingRenderer {
     }
 
     fn flush_syntect(&mut self) -> io::Result<()> {
-        self.buffer = normalize_spacing(&self.buffer);
+        self.buffer = normalize_spacing(&self.buffer, !self.code_block_lines.is_empty());
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos].to_string();
@@ -303,34 +331,213 @@ impl StreamingRenderer {
         io::stdout().flush()
     }
 
-    fn flush_termimad(&mut self) -> io::Result<()> {
-        self.buffer = normalize_spacing(&self.buffer);
+    /// Render markdown prose through termimad.
+    ///
+    /// Split out from the flush path so tests can assert on the rendered string; `term_text` reads
+    /// the real terminal width, so the tests pass an explicit one to stay deterministic.
+    fn termimad_to_string(&self, markdown: &str) -> String {
+        // Parsed by meka, not by minimad: see `render::markdown`. termimad still lays the result
+        // out and applies the skin, but the text it receives carries no markup, so nothing depends
+        // on minimad's dialect matching what the model wrote.
+        let document = markdown::MarkdownDoc::parse(markdown);
+        let width = self
+            .width
+            .or_else(|| Some(termimad::terminal_size().0 as usize));
+        format!(
+            "{}",
+            termimad::FmtText::from_text(&self.skin, document.to_minimad(), width)
+        )
+    }
 
-        while let Some(boundary) = self.buffer.find("\n\n") {
-            let complete = self.buffer[..boundary + 2].to_string();
-            self.buffer = self.buffer[boundary + 2..].to_string();
-            print!("{}", self.skin.term_text(&complete));
+    /// Flush the termimad path, keeping fenced code blocks away from termimad.
+    ///
+    /// Code blocks are pulled out and rendered by [`render_code_block_to_string`], the same
+    /// syntect-backed renderer the `syntect` mode uses, because termimad paints a block in one flat
+    /// colour with no regard for its language. Segmenting on fences also fixes a bug the previous
+    /// paragraph-splitting loop had: it broke on every `\n\n` with no fence guard, so a code block
+    /// containing a blank line was cut in half and each half handed to termimad separately, which
+    /// left the fence unbalanced.
+    fn flush_termimad(&mut self) -> io::Result<()> {
+        let output = self.take_termimad_output();
+        if !output.is_empty() {
+            print!("{}", output);
             io::stdout().flush()?;
         }
+        Ok(())
+    }
 
-        if !self.in_code_block() && !self.in_table() {
-            while let Some(newline_pos) = self.buffer.find('\n') {
-                if newline_pos + 1 < self.buffer.len() || !self.buffer.ends_with('\n') {
-                    let line = self.buffer[..newline_pos + 1].to_string();
+    /// Consume whatever of the buffer is renderable and return it, leaving anything still being
+    /// streamed behind. Separated from the printing so tests can assert on real output instead of
+    /// smoke-testing that a render didn't panic.
+    fn take_termimad_output(&mut self) -> String {
+        let mut output = String::new();
+        self.buffer = normalize_spacing(&self.buffer, !self.code_block_lines.is_empty());
+
+        // Every iteration below either stops or strictly consumes from the buffer, so the loop
+        // terminates. This tracks that invariant rather than trusting it: the cost of getting it
+        // wrong is a frozen REPL, and it has been wrong once already (a partial-looking table row
+        // ahead of a fence was handed back to the buffer, leaving the loop where it started).
+        // Stopping early is harmless, since `finish` drains whatever is left.
+        let mut buffered_before = usize::MAX;
+
+        loop {
+            if self.buffer.len() >= buffered_before {
+                tracing::debug!(
+                    "termimad flush made no progress on {} buffered bytes; deferring to finish",
+                    self.buffer.len()
+                );
+                break;
+            }
+            buffered_before = self.buffer.len();
+
+            // Inside a block: accumulate whole lines until the closing fence arrives.
+            if !self.code_block_lines.is_empty() {
+                let Some(newline_pos) = self.buffer.find('\n') else {
+                    break;
+                };
+                let line = self.buffer[..newline_pos].to_string();
+                self.buffer = self.buffer[newline_pos + 1..].to_string();
+                let closes = is_code_fence(&line);
+                self.code_block_lines.push(line);
+                if closes {
+                    output.push_str(&self.take_code_block());
+                }
+                continue;
+            }
+
+            // Outside a block: hand everything up to the next opening fence to termimad, then take
+            // the fence itself. A fence only counts once its line is complete, otherwise a partial
+            // "``" at the buffer's end would be mistaken for prose.
+            match self.next_fence_offset() {
+                Some(offset) => {
+                    if offset > 0 {
+                        let prose = self.buffer[..offset].to_string();
+                        self.buffer = self.buffer[offset..].to_string();
+                        // Complete: a fence follows, so nothing more can be appended to this
+                        // segment and none of it may be held back. Holding any of it would also
+                        // put it straight back into the buffer ahead of the fence, leaving the
+                        // loop in the state it started in and spinning forever.
+                        output.push_str(&self.take_prose_output(&prose, true));
+                        continue;
+                    }
+                    let Some(newline_pos) = self.buffer.find('\n') else {
+                        break;
+                    };
+                    let fence = self.buffer[..newline_pos].to_string();
                     self.buffer = self.buffer[newline_pos + 1..].to_string();
-                    print!("{}", self.skin.term_text(&line));
-                    io::stdout().flush()?;
-                } else {
+                    self.code_block_lines.push(fence);
+                }
+                None => {
+                    // Not complete: the turn may still stream more text onto the end of this, so a
+                    // partial table or a partial line goes back into the buffer to be finished.
+                    let prose = std::mem::take(&mut self.buffer);
+                    output.push_str(&self.take_prose_output(&prose, false));
                     break;
                 }
             }
         }
 
-        Ok(())
+        output
+    }
+
+    /// Byte offset of the next line that opens a code fence, or `None` when the buffer holds no
+    /// complete fence line. Only complete lines count, so a fence still being streamed stays in the
+    /// buffer rather than being flushed as prose.
+    fn next_fence_offset(&self) -> Option<usize> {
+        let mut offset = 0;
+        for line in self.buffer.split_inclusive('\n') {
+            if !line.ends_with('\n') {
+                return None;
+            }
+            if is_code_fence(line) {
+                return Some(offset);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// Render prose, holding back anything whose meaning later text could still change.
+    ///
+    /// Markdown is retroactive: `Title` is a paragraph until a following `===` makes it a heading,
+    /// `| a | b |` is a paragraph until a following `|---|` makes it a table header, and a list
+    /// keeps absorbing lines until a non-list one arrives. So a line cannot be rendered the moment
+    /// it completes; it can only be rendered once no later text can reinterpret it.
+    ///
+    /// A blank line is that point. No block construct spans one -- a setext underline and a table
+    /// delimiter must both follow immediately -- so everything before the last blank line is
+    /// settled, and everything after it is still open. Flushing at blank lines therefore renders
+    /// whole blocks, which is also what lets a paragraph reflow to the terminal width instead of
+    /// keeping whatever line breaks the model wrote.
+    ///
+    /// `segment_is_complete` overrides this: when the caller has already found the fence that ends
+    /// the segment, nothing can be appended to it, so all of it renders. Returning any of it would
+    /// also put it back in front of that fence and leave the flush loop where it started.
+    fn take_prose_output(&mut self, prose: &str, segment_is_complete: bool) -> String {
+        if prose.is_empty() {
+            return String::new();
+        }
+        if segment_is_complete {
+            return self.termimad_to_string(prose);
+        }
+        match prose.rfind("\n\n") {
+            Some(boundary) => {
+                let (settled, open) = prose.split_at(boundary + 2);
+                self.buffer.insert_str(0, open);
+                self.termimad_to_string(settled)
+            }
+            None => {
+                self.buffer.insert_str(0, prose);
+                String::new()
+            }
+        }
+    }
+
+    /// Drain the tail at end-of-turn. A fence still open here (a truncated response, an
+    /// interrupted stream) has its remaining lines rendered as code rather than dropped.
+    ///
+    /// Prose is accumulated and rendered in one go rather than line by line, for the same reason
+    /// the streaming path flushes whole blocks: a table handed to the renderer a row at a time
+    /// becomes a separate single-row table per line, with misaligned columns and no wrapping. A
+    /// reply that ends with a table lands here, because a trailing table is held back for the
+    /// stream to finish.
+    fn finish_termimad_output(&mut self, trimmed: &str) -> String {
+        let mut output = String::new();
+        let mut prose = String::new();
+        for line in trimmed.lines() {
+            if !self.code_block_lines.is_empty() {
+                let closes = is_code_fence(line);
+                self.code_block_lines.push(line.to_string());
+                if closes {
+                    output.push_str(&self.take_code_block());
+                }
+            } else if is_code_fence(line) {
+                if !prose.is_empty() {
+                    output.push_str(&self.termimad_to_string(&std::mem::take(&mut prose)));
+                }
+                self.code_block_lines.push(line.to_string());
+            } else {
+                prose.push_str(line);
+                prose.push('\n');
+            }
+        }
+        if !prose.is_empty() {
+            output.push_str(&self.termimad_to_string(&prose));
+        }
+        output.push_str(&self.take_code_block());
+        output
+    }
+
+    fn take_code_block(&mut self) -> String {
+        if self.code_block_lines.is_empty() {
+            return String::new();
+        }
+        let lines = std::mem::take(&mut self.code_block_lines);
+        render_code_block_to_string(&lines)
     }
 
     fn flush_raw(&mut self) -> io::Result<()> {
-        self.buffer = normalize_spacing(&self.buffer);
+        self.buffer = normalize_spacing(&self.buffer, false);
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos].to_string();
@@ -359,23 +566,18 @@ impl StreamingRenderer {
         }
         io::stdout().flush()
     }
-
-    fn in_code_block(&self) -> bool {
-        let fence_count = self.buffer.matches("```").count();
-        !fence_count.is_multiple_of(2)
-    }
-
-    fn in_table(&self) -> bool {
-        self.buffer.trim_start().starts_with('|')
-    }
 }
 
 /// Ensure blank lines after markdown headers and tables when followed by non-empty content. Skips
 /// content inside code fences.
-fn normalize_spacing(text: &str) -> String {
+fn normalize_spacing(text: &str, starts_inside_fence: bool) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
-    let mut in_fence = false;
+    // The caller may already have consumed an opening fence out of the buffer, in which case these
+    // lines are a code-block body even though nothing here says so. Assuming otherwise rewrites the
+    // user's code: a `# comment` line reads as a markdown header and gets a blank line inserted
+    // after it, inside their snippet.
+    let mut in_fence = starts_inside_fence;
 
     for (index, line) in lines.iter().enumerate() {
         if line.trim_start().starts_with("```") {
@@ -443,6 +645,122 @@ fn highlighter() -> &'static Highlighter {
         let theme =
             ThemeSet::load_from_reader(&mut cursor).expect("embedded Monokai Extended theme loads");
         Highlighter { syntax_set, theme }
+    })
+}
+
+/// The termimad skin, derived from the same theme the syntect path highlights with.
+///
+/// Cached because [`syntect::highlighting::Highlighter::style_for_stack`] documents itself as
+/// "convenient but expensive", and a skin is otherwise rebuilt per renderer (one per turn, plus one
+/// per message when reprinting history).
+static MARKDOWN_SKIN: OnceLock<MadSkin> = OnceLock::new();
+
+/// The context scope a markdown document is highlighted under. Several of the theme's markdown
+/// rules are nested selectors (`text.html.markdown markup.raw.inline`), which only match when this
+/// sits below the element scope on the stack; looking the element up alone silently falls through
+/// to the default foreground.
+const MARKDOWN_CONTEXT_SCOPE: &str = "text.html.markdown";
+
+/// Resolve a TextMate scope stack against the embedded theme.
+///
+/// Returns `None` for a scope the theme doesn't style or that fails to parse, so a caller falls
+/// back to termimad's own default for that element rather than to an invented colour.
+fn theme_style(scope: &str) -> Option<(Option<Color>, FontStyle)> {
+    let theme = &highlighter().theme;
+    let highlighter = syntect::highlighting::Highlighter::new(theme);
+    let stack = [
+        Scope::new(MARKDOWN_CONTEXT_SCOPE).ok()?,
+        Scope::new(scope).ok()?,
+    ];
+    let style = highlighter.style_for_stack(&stack);
+    let foreground = style.foreground;
+    // syntect hands back the enclosing context's foreground for an unmatched scope. Passing that
+    // through would paint every element the same colour, i.e. exactly the flat problem this
+    // replaces, so treat "same as the context" as "unstyled" and leave termimad's default in place.
+    let default_foreground = highlighter
+        .style_for_stack(&[Scope::new(MARKDOWN_CONTEXT_SCOPE).ok()?])
+        .foreground;
+    let color = (foreground != default_foreground).then_some(Color::Rgb {
+        r: foreground.r,
+        g: foreground.g,
+        b: foreground.b,
+    });
+    Some((color, style.font_style))
+}
+
+/// Apply a scope's colour and font style to one `CompoundStyle`, keeping whatever termimad already
+/// set for anything the theme is silent about.
+fn apply_scope(style: &mut termimad::CompoundStyle, scope: &str) {
+    let Some((color, font_style)) = theme_style(scope) else {
+        return;
+    };
+    if let Some(color) = color {
+        style.set_fg(color);
+    }
+    if font_style.contains(FontStyle::BOLD) {
+        style.add_attr(Attribute::Bold);
+    }
+    if font_style.contains(FontStyle::ITALIC) {
+        style.add_attr(Attribute::Italic);
+    }
+    if font_style.contains(FontStyle::UNDERLINE) {
+        style.add_attr(Attribute::Underlined);
+    }
+}
+
+/// Foreground colour for a scope, for the fields that are a styled character rather than a span.
+fn scope_color(scope: &str) -> Option<Color> {
+    theme_style(scope).and_then(|(color, _)| color)
+}
+
+/// Build the markdown skin from the embedded theme.
+///
+/// termimad's `default_dark()` is defined entirely in `gray(n)`, so out of the box every element
+/// renders in the same four greyscale tones and the mode is unreadable. The theme meka already
+/// ships for syntect defines all of these elements (`markup.heading`, `markup.bold`, …), so reading
+/// them from there gives termimad the same visual language as the syntect mode *and* keeps the two
+/// in sync automatically if the theme is ever swapped.
+fn markdown_skin() -> &'static MadSkin {
+    MARKDOWN_SKIN.get_or_init(|| {
+        let mut skin = MadSkin::default_dark();
+
+        apply_scope(&mut skin.bold, "markup.bold");
+        apply_scope(&mut skin.italic, "markup.italic");
+        apply_scope(&mut skin.strikeout, "markup.strike");
+        apply_scope(&mut skin.inline_code, "markup.raw.inline");
+        apply_scope(&mut skin.code_block.compound_style, "markup.raw.block");
+
+        if let Some(color) = scope_color("markup.heading") {
+            skin.set_headers_fg(color);
+        }
+        for header in &mut skin.headers {
+            // `MadSkin::default()` centres the first header. Centring a heading mid-transcript
+            // reads as a formatting glitch rather than structure.
+            header.align = Alignment::Left;
+        }
+
+        if let Some(color) = scope_color("punctuation.definition.list_item.markdown") {
+            skin.bullet.set_fg(color);
+        }
+        if let Some(color) = scope_color("markup.quote") {
+            skin.quote_mark.set_fg(color);
+        }
+        // Borders and rules are structure, not content. `markup.table` in this theme is a saturated
+        // red that competes with the cells it frames, so the comment colour (the theme's own
+        // "recede into the background" tone) is the better fit.
+        if let Some(color) = scope_color("comment") {
+            skin.table.compound_style.set_fg(color);
+            skin.horizontal_rule.set_fg(color);
+            skin.ellipsis.set_fg(color);
+        }
+
+        // Foreground only, matching the syntect path, which renders with
+        // `as_24_bit_terminal_escaped(.., false)` and so never emits a background. A hardcoded dark
+        // background would fight any terminal not already using one.
+        skin.inline_code.object_style.background_color = None;
+        skin.code_block.compound_style.object_style.background_color = None;
+
+        skin
     })
 }
 
@@ -1687,17 +2005,25 @@ mod tests {
         );
     }
 
-    /// Count distinct 24-bit foreground colors (`ESC[38;2;R;G;B`) in ANSI-escaped output.
-    fn distinct_fg_colors(ansi: &str) -> usize {
+    /// The distinct 24-bit foreground colors (`ESC[38;2;R;G;B`) in ANSI-escaped output.
+    fn fg_color_set(ansi: &str) -> std::collections::BTreeSet<String> {
         let mut colors = std::collections::BTreeSet::new();
         let mut rest = ansi;
         while let Some(pos) = rest.find("\x1b[38;2;") {
             rest = &rest[pos + 7..];
             if let Some(end) = rest.find('m') {
                 colors.insert(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            } else {
+                break;
             }
         }
-        colors.len()
+        colors
+    }
+
+    /// Count distinct 24-bit foreground colors in ANSI-escaped output.
+    fn distinct_fg_colors(ansi: &str) -> usize {
+        fg_color_set(ansi).len()
     }
 
     fn strip_ansi_escapes(input: &str) -> String {
@@ -1964,6 +2290,495 @@ mod tests {
         renderer.finish().unwrap();
     }
 
+    fn termimad_render(markdown: &str) -> String {
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
+        renderer.started = true;
+        renderer.buffer = markdown.to_string();
+        let mut output = renderer.take_termimad_output();
+        let tail = std::mem::take(&mut renderer.buffer);
+        output.push_str(&renderer.finish_termimad_output(tail.trim_end_matches('\n')));
+        output
+    }
+
+    /// termimad's own `default_dark()` is defined entirely in `gray(n)`, which is what made this
+    /// mode unreadable: every element rendered in the same handful of greyscale tones. Each element
+    /// must now carry a distinct colour from the theme.
+    #[test]
+    fn test_markdown_skin_is_not_greyscale() {
+        let rendered = termimad_render(
+            "# Title\n\nText with **bold**, *italic*, and `code`.\n\n> quoted\n\n* item\n",
+        );
+        let colors = fg_color_set(&rendered);
+        assert!(
+            colors.len() >= 5,
+            "expected a distinct colour per element; got {colors:?}",
+        );
+        // A greyscale colour has r == g == b; a skin that regressed to the default would be all of
+        // them, so assert the palette actually carries hue.
+        let has_hue = colors.iter().any(|color| {
+            let parts: Vec<&str> = color.split(';').collect();
+            parts.len() == 3 && !(parts[0] == parts[1] && parts[1] == parts[2])
+        });
+        assert!(has_hue, "every colour was greyscale: {colors:?}");
+    }
+
+    /// The theme's markdown rules are nested selectors (`text.html.markdown markup.raw.inline`),
+    /// so resolving an element scope on its own silently yields the default foreground. Inline code
+    /// is the one that exposes this, and it regressed exactly this way during development.
+    #[test]
+    fn test_inline_code_resolves_through_the_markdown_context() {
+        let rendered = termimad_render("uses `inline_code` here\n");
+        assert!(
+            fg_color_set(&rendered).contains("236;53;51"),
+            "inline code should take the theme's markup.raw.inline colour; got {:?}",
+            fg_color_set(&rendered),
+        );
+    }
+
+    /// minimad only understands `* ` as a list marker, and models write `-`, so without rewriting
+    /// them every list rendered as literal dashes with no bullet and no indentation.
+    #[test]
+    fn test_dash_and_plus_lists_render_as_bullets() {
+        let rendered = termimad_render("- alpha\n+ beta\n");
+        assert_eq!(
+            rendered.matches('\u{2022}').count(),
+            2,
+            "both markers should become bullets; got {rendered:?}",
+        );
+    }
+
+    /// Every CommonMark bullet marker has to render as a list, and the things that merely look
+    /// like one must not. These were the cases the old text-rewriting approach had to special-case
+    /// by hand; the parser gets them from the spec.
+    #[test]
+    fn test_bullet_markers_and_their_lookalikes() {
+        let bullets =
+            strip_ansi_escapes(&termimad_stream("- alpha\n+ beta\n* gamma\n", usize::MAX));
+        assert_eq!(
+            bullets.matches('\u{2022}').count(),
+            3,
+            "all three markers are bullets in CommonMark; got {bullets:?}",
+        );
+
+        let rule = strip_ansi_escapes(&termimad_stream("above\n\n---\n\nbelow\n", usize::MAX));
+        assert!(
+            !rule.contains('\u{2022}') && rule.contains("above") && rule.contains("below"),
+            "`---` is a horizontal rule, not a bullet; got {rule:?}",
+        );
+
+        let code = strip_ansi_escapes(&termimad_stream("```sh\n- not a bullet\n```\n", usize::MAX));
+        assert!(
+            code.contains("- not a bullet"),
+            "a dash inside a fence is code, not a list; got {code:?}",
+        );
+    }
+
+    /// Nesting comes from the parser's list depth rather than from counting leading spaces, so both
+    /// of the conventional indent widths land on the same level.
+    #[test]
+    fn test_nested_lists_indent_by_depth() {
+        for document in ["- top\n  - nested\n", "- top\n    - nested\n"] {
+            let rendered = strip_ansi_escapes(&termimad_stream(document, usize::MAX));
+            let lines: Vec<&str> = rendered
+                .lines()
+                .filter(|l| l.contains('\u{2022}'))
+                .collect();
+            assert_eq!(lines.len(), 2, "expected two items from {document:?}");
+            let indent = |line: &str| line.len() - line.trim_start().len();
+            assert!(
+                indent(lines[1]) > indent(lines[0]),
+                "the nested item must be indented further; got {lines:?} from {document:?}",
+            );
+        }
+    }
+
+    /// The reason the old rewrite was dangerous in a coding agent: underscores are identifiers far
+    /// more often than emphasis, and CommonMark says an intraword underscore is literal.
+    #[test]
+    fn test_underscore_emphasis_follows_commonmark() {
+        let emphasised = strip_ansi_escapes(&termimad_stream(
+            "__bold text__ and _italic text_ here\n",
+            usize::MAX,
+        ));
+        assert!(
+            !emphasised.contains('_'),
+            "underscore emphasis markers must be consumed, not shown; got {emphasised:?}",
+        );
+        assert!(
+            emphasised.contains("bold text") && emphasised.contains("italic text"),
+            "the emphasised words must survive; got {emphasised:?}",
+        );
+
+        let identifiers = strip_ansi_escapes(&termimad_stream(
+            "call snake_case_name and foo_bar here\n",
+            usize::MAX,
+        ));
+        assert!(
+            identifiers.contains("snake_case_name") && identifiers.contains("foo_bar"),
+            "intraword underscores are literal; got {identifiers:?}",
+        );
+    }
+
+    /// termimad paints a fenced block in one flat colour regardless of language. Routing blocks
+    /// through the syntect renderer the other mode already uses is the whole point of the change.
+    #[test]
+    fn test_fenced_code_block_is_syntax_highlighted() {
+        let rendered = termimad_render("```rust\nfn main() { let x = 42; }\n```\n");
+        assert!(
+            fg_color_set(&rendered).len() >= 4,
+            "a highlighted block has several colours, not one flat run; got {:?}",
+            fg_color_set(&rendered),
+        );
+    }
+
+    /// Regression guard: the previous flush split the buffer on every `\n\n` with no fence guard,
+    /// so a code block containing a blank line was cut in half and each half rendered separately,
+    /// leaving the fence unbalanced.
+    #[test]
+    fn test_code_block_containing_a_blank_line_survives() {
+        let rendered = termimad_render("```rust\nfn a() {}\n\nfn b() {}\n```\n\nafter\n");
+        let plain = strip_ansi_escapes(&rendered);
+        assert!(
+            plain.contains("fn a() {}") && plain.contains("fn b() {}"),
+            "both halves of the block must render; got {plain:?}",
+        );
+        assert!(
+            plain.contains("after"),
+            "content after the block must still render; got {plain:?}",
+        );
+    }
+
+    /// An interrupted or truncated response can leave a fence open. Its lines are still content.
+    #[test]
+    fn test_unterminated_code_block_still_renders() {
+        let rendered = termimad_render("```rust\nfn main() {}\n");
+        assert!(
+            strip_ansi_escapes(&rendered).contains("fn main() {}"),
+            "an unclosed block must not swallow its body; got {rendered:?}",
+        );
+    }
+
+    /// Wrapping wide tables is the reason to pick this mode over syntect, so it has to survive the
+    /// restructuring.
+    #[test]
+    fn test_wide_table_still_wraps() {
+        let rendered = termimad_render(
+            "| Col | Description |\n|---|---|\n| a | one two three four five six seven eight \
+             nine ten eleven twelve thirteen |\n\n",
+        );
+        let plain = strip_ansi_escapes(&rendered);
+        assert!(
+            plain.lines().count() >= 4,
+            "a long cell should wrap onto extra rows; got {plain:?}",
+        );
+        assert!(
+            plain.lines().all(|line| line.chars().count() <= 80),
+            "no rendered line may exceed the render width; got {plain:?}",
+        );
+    }
+
+    /// A turn whose final delta ends in a newline leaves the buffer empty while a table or an
+    /// unterminated fence is still pending. `finish` used to skip its drains in that case, so a
+    /// reply ending in a markdown table lost the table completely. Asserts on the renderer's own
+    /// state because the drain itself writes to stdout.
+    ///
+    /// The cases are listed per mode because the two buffer differently: syntect collects table
+    /// rows in `raw_table_lines`, while termimad hands tables to minimad and holds partial ones in
+    /// `buffer`.
+    #[test]
+    fn test_finish_drains_pending_state_when_the_buffer_is_empty() {
+        let cases = [
+            (RenderMode::Syntect, "| a | b |\n"),
+            (RenderMode::Syntect, "```rust\nfn main() {}\n"),
+            (RenderMode::Termimad, "```rust\nfn main() {}\n"),
+        ];
+        for (mode, input) in cases {
+            let mut renderer = StreamingRenderer::new(mode);
+            renderer.push_delta(input).unwrap();
+            assert!(
+                renderer.buffer.is_empty()
+                    && (!renderer.raw_table_lines.is_empty()
+                        || !renderer.code_block_lines.is_empty()),
+                "{mode} / {input:?}: precondition is an empty buffer with content still pending",
+            );
+            renderer.finish().unwrap();
+            assert!(
+                renderer.raw_table_lines.is_empty() && renderer.code_block_lines.is_empty(),
+                "{mode} / {input:?}: finish must render pending content, not drop it",
+            );
+        }
+    }
+
+    /// Drive the termimad path the way `push_delta`/`finish` do, but returning the output so it
+    /// can be asserted on. `chunk_chars` splits the input the way a stream would.
+    fn termimad_stream(markdown: &str, chunk_chars: usize) -> String {
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
+        renderer.started = true;
+        let mut output = String::new();
+        let chars: Vec<char> = markdown.chars().collect();
+        for chunk in chars.chunks(chunk_chars.max(1)) {
+            renderer.buffer.push_str(&chunk.iter().collect::<String>());
+            output.push_str(&renderer.take_termimad_output());
+        }
+        let tail = std::mem::take(&mut renderer.buffer);
+        output.push_str(&renderer.finish_termimad_output(tail.trim_end_matches('\n')));
+        output
+    }
+
+    /// Documents that between them cover every branch of the termimad flush: prose, headings,
+    /// lists, tables, fences (closed, unterminated, containing blank lines), and the adjacencies
+    /// between them. Tokens are short and unique so wrapping can't split one.
+    const STREAMING_CORPUS: &[&str] = &[
+        "t01 t02 t03\n\nt04 t05\n",
+        "## t06\n\nt07 **t08** *t09* `t10`\n",
+        "- t11\n- t12\n  - t13\n    - t14\n",
+        "| t15 | t16 |\n|---|---|\n| t17 | t18 |\n\nt19\n",
+        "```rust\nlet t20 = 1;\n\nlet t21 = 2;\n```\n\nt22\n",
+        "```\nt23\n",
+        // A line that starts with `|` but doesn't end with one sits between prose and a fence:
+        // this is the shape that used to spin the flush loop forever.
+        "| t24\n```rust\nlet t25 = 3;\n```\n",
+        "```rust\nlet t26 = 4;\n```\n| t27 | t28 |\n|---|---|\n| t29 | t30 |\n\n",
+        "> t31\n\n---\n\nt32\n",
+        "t33\n\n### t34\n\n- t35\n\n```sh\necho t36\n```\n\nt37\n",
+        // Ends on a table row with no trailing blank line, so the rows are still pending when the
+        // turn finishes. This is the shape that rendered as one broken single-row table per line.
+        "t38\n\n| t39 | t40 |\n|---|---|\n| t41 | t42 |\n",
+        // A code block whose body would be mistaken for markdown if the fence state were lost.
+        "```sh\n# t43\nls t44\n```\n",
+    ];
+
+    /// Every byte pushed has to come out exactly once, whatever offsets the stream is chopped at.
+    /// Chunking at one character per delta puts a split inside every fence, table row, and marker.
+    #[test]
+    fn test_termimad_streaming_preserves_content_at_every_chunk_boundary() {
+        for document in STREAMING_CORPUS {
+            let tokens: Vec<&str> = document
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| word.len() == 3 && word.starts_with('t'))
+                .collect();
+            assert!(
+                !tokens.is_empty(),
+                "corpus entry has no tokens: {document:?}"
+            );
+
+            for chunk in [1, 2, 3, 5, 11, usize::MAX] {
+                let rendered = strip_ansi_escapes(&termimad_stream(document, chunk));
+                for token in &tokens {
+                    assert_eq!(
+                        rendered.matches(token).count(),
+                        1,
+                        "{token} should appear exactly once for chunk size {chunk} of \
+                         {document:?}; got {rendered:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// After one pass, everything the flush could legally render must be gone from the buffer.
+    ///
+    /// Two things qualify. Prose is settled once a blank line follows it, so no blank line may
+    /// remain. A complete fenced block is self-delimiting and is taken the moment its opening
+    /// fence line is whole, so no complete fence line may remain either. What is allowed to stay
+    /// is the final open block: a trailing table, an unfinished paragraph, a partial line.
+    ///
+    /// Stopping earlier than that is the failure this guards. It is how the flush loop used to
+    /// hang, and even with the loop's progress check it would silently defer the rest of the turn
+    /// to `finish`, so output arrives in one burst at the end instead of streaming.
+    #[test]
+    fn test_flush_consumes_everything_it_can_in_one_pass() {
+        for document in STREAMING_CORPUS {
+            let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
+            renderer.started = true;
+            renderer.buffer = document.to_string();
+            renderer.take_termimad_output();
+            let left = renderer.buffer.clone();
+            assert!(
+                !left.contains("\n\n"),
+                "settled prose left unrendered in {left:?} from {document:?}",
+            );
+            assert!(
+                !left
+                    .lines()
+                    .any(|line| is_code_fence(line) && left.contains(&format!("{line}\n"))),
+                "a complete fence line left unconsumed in {left:?} from {document:?}",
+            );
+        }
+    }
+
+    /// Whatever the mode and however the stream is chopped, a finished turn must leave nothing
+    /// buffered: anything still held after `finish` is content that was never shown. This is the
+    /// invariant the old `finish` broke, dropping a table when the last delta ended in a newline.
+    /// Runs every mode, including `Raw` and `Silent`, which share the same buffers.
+    #[test]
+    fn test_finish_leaves_nothing_buffered_in_any_mode() {
+        let modes = [
+            RenderMode::Syntect,
+            RenderMode::Termimad,
+            RenderMode::Raw,
+            RenderMode::Silent,
+        ];
+        for document in STREAMING_CORPUS {
+            for mode in modes {
+                for chunk in [1, 3, 17, usize::MAX] {
+                    let mut renderer = StreamingRenderer::new(mode);
+                    let chars: Vec<char> = document.chars().collect();
+                    for piece in chars.chunks(chunk.max(1)) {
+                        renderer
+                            .push_delta(&piece.iter().collect::<String>())
+                            .expect("push_delta");
+                    }
+                    renderer.finish().expect("finish");
+                    assert!(
+                        renderer.buffer.is_empty()
+                            && renderer.raw_table_lines.is_empty()
+                            && renderer.code_block_lines.is_empty(),
+                        "{mode} left content buffered after finish for chunk {chunk} of \
+                         {document:?}: buffer={:?} table={:?} code={:?}",
+                        renderer.buffer,
+                        renderer.raw_table_lines,
+                        renderer.code_block_lines,
+                    );
+                }
+            }
+        }
+    }
+
+    /// minimad sizes table columns per document, so a table handed to it one row at a time becomes
+    /// a series of single-row tables: columns don't line up, the separator row renders as its own
+    /// empty box, and nothing wraps. A reply ending in a table hits this, because a trailing table
+    /// is deliberately held back for the stream to finish.
+    #[test]
+    fn test_table_at_end_of_reply_renders_as_one_table() {
+        let rendered = strip_ansi_escapes(&termimad_stream(
+            "Comparison:\n\n| Option | Notes |\n|---|---|\n| fast | skips validation entirely |\n\
+             | safe | revalidates everything first |\n",
+            usize::MAX,
+        ));
+        // One table means one separator row, and every row the same width.
+        assert_eq!(
+            rendered.matches('\u{251c}').count(),
+            1,
+            "expected a single separator row; got {rendered:?}",
+        );
+        let widths: std::collections::BTreeSet<usize> = rendered
+            .lines()
+            .filter(|line| line.contains('\u{2502}'))
+            .map(|line| line.chars().count())
+            .collect();
+        assert_eq!(
+            widths.len(),
+            1,
+            "every row of one table is the same width; got {widths:?} from {rendered:?}",
+        );
+    }
+
+    /// `normalize_spacing` re-derives fence state from the buffer, but the flush consumes the
+    /// opening fence into `code_block_lines` first, so the buffer alone looks like top-level
+    /// markdown. Without being told, it treats a `#` line in a shell snippet as a heading and
+    /// inserts a blank line into the user's code.
+    #[test]
+    fn test_code_block_body_is_not_reflowed_as_markdown() {
+        for mode in [RenderMode::Termimad, RenderMode::Syntect] {
+            let mut renderer = StreamingRenderer::new(mode);
+            renderer.push_delta("```sh\n").expect("fence");
+            renderer.push_delta("# comment\nls -la\n").expect("body");
+            assert_eq!(
+                renderer.code_block_lines,
+                vec!["```sh", "# comment", "ls -la"],
+                "{mode} injected markdown spacing into a code block body",
+            );
+        }
+    }
+
+    /// Blocks have to be separated by a blank line. minimad renders a flat list of lines with no
+    /// concept of a block, so without an explicit empty line a whole reply renders as one slab.
+    #[test]
+    fn test_blocks_are_separated_by_blank_lines() {
+        let rendered = strip_ansi_escapes(&termimad_stream(
+            "## Title\n\nA paragraph.\n\n- an item\n\nAnother paragraph.\n",
+            usize::MAX,
+        ));
+        let blanks = rendered
+            .lines()
+            .filter(|line| line.trim().is_empty())
+            .count();
+        assert!(
+            blanks >= 3,
+            "expected a blank line between each pair of blocks; got {rendered:?}",
+        );
+        assert!(
+            !rendered.ends_with("\n\n"),
+            "the last block must not trail a separator; got {rendered:?}",
+        );
+    }
+
+    /// A paragraph written across several source lines is one paragraph, so it reflows to the
+    /// terminal width rather than keeping the model's line breaks. Line-at-a-time rendering could
+    /// not do this.
+    #[test]
+    fn test_multi_line_paragraph_reflows() {
+        let source = "alpha bravo charlie\ndelta echo foxtrot\ngolf hotel india\n\n";
+        let rendered = strip_ansi_escapes(&termimad_stream(source, usize::MAX));
+        let body: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(
+            body.len(),
+            1,
+            "three short source lines are one paragraph at width 76; got {body:?}",
+        );
+        assert!(body[0].contains("alpha") && body[0].contains("india"));
+    }
+
+    /// Ordered lists have no minimad equivalent. Rendering them as bullets would discard the
+    /// numbering, which is the whole content of a numbered instruction.
+    #[test]
+    fn test_ordered_lists_keep_their_numbers() {
+        let rendered = strip_ansi_escapes(&termimad_stream("1. first\n2. second\n\n", usize::MAX));
+        assert!(
+            rendered.contains("1. first") && rendered.contains("2. second"),
+            "numbering must survive; got {rendered:?}",
+        );
+        assert!(
+            !rendered.contains('\u{2022}'),
+            "an ordered item is not a bullet; got {rendered:?}",
+        );
+    }
+
+    /// A terminal can't follow a link, so the destination is shown next to the text instead of the
+    /// raw `[text](url)` minimad would have printed verbatim.
+    #[test]
+    fn test_links_render_text_and_destination() {
+        let rendered = strip_ansi_escapes(&termimad_stream(
+            "see [the docs](https://example.com) now\n\n",
+            usize::MAX,
+        ));
+        assert!(
+            rendered.contains("the docs") && rendered.contains("https://example.com"),
+            "both the text and the target should show; got {rendered:?}",
+        );
+        assert!(
+            !rendered.contains("]("),
+            "the markdown syntax itself must not survive; got {rendered:?}",
+        );
+    }
+
+    /// Emphasis nests, and the inner span closing must not end the outer one.
+    #[test]
+    fn test_nested_emphasis_survives() {
+        let rendered = strip_ansi_escapes(&termimad_stream(
+            "**bold with *inner* tail**\n\n",
+            usize::MAX,
+        ));
+        assert!(
+            rendered.contains("bold with inner tail"),
+            "markers consumed, text intact; got {rendered:?}",
+        );
+    }
+
     #[test]
     fn test_render_mode_default() {
         assert_eq!(RenderMode::default(), RenderMode::Syntect);
@@ -2214,77 +3029,77 @@ mod tests {
     #[test]
     fn test_normalize_spacing_adds_blank_line() {
         let input = "## Title\nBody text";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "## Title\n\nBody text");
     }
 
     #[test]
     fn test_normalize_spacing_already_has_blank_line() {
         let input = "## Title\n\nBody text";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "## Title\n\nBody text");
     }
 
     #[test]
     fn test_normalize_spacing_header_at_end() {
         let input = "## Title";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "## Title");
     }
 
     #[test]
     fn test_normalize_spacing_inside_code_fence() {
         let input = "```\n## Not a header\ncode\n```";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "```\n## Not a header\ncode\n```");
     }
 
     #[test]
     fn test_normalize_spacing_multiple_levels() {
         let input = "# H1\ntext\n### H3\nmore text";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "# H1\n\ntext\n### H3\n\nmore text");
     }
 
     #[test]
     fn test_normalize_spacing_preserves_trailing_newline() {
         let input = "## Title\nBody\n";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "## Title\n\nBody\n");
     }
 
     #[test]
     fn test_normalize_spacing_no_space_after_hash_is_not_header() {
         let input = "##not a header\ntext";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "##not a header\ntext");
     }
 
     #[test]
     fn test_normalize_spacing_table_then_text() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |\n> blockquote";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
     }
 
     #[test]
     fn test_normalize_spacing_table_already_has_blank_line() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
     }
 
     #[test]
     fn test_normalize_spacing_table_inside_code_fence() {
         let input = "```\n| A | B |\n| 1 | 2 |\ncode\n```";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "```\n| A | B |\n| 1 | 2 |\ncode\n```");
     }
 
     #[test]
     fn test_normalize_spacing_table_at_end() {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |";
-        let output = normalize_spacing(input);
+        let output = normalize_spacing(input, false);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
     }
 
