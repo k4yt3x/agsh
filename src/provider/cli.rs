@@ -346,21 +346,21 @@ fn write_profile(
 ) -> anyhow::Result<()> {
     let (path, mut document) = open_document()?;
     upsert_profile_document(&mut document, name, backend, model, base_url)?;
-    config::write_config_atomic(&path, &document.to_string())?;
+    config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
 
 fn set_default_provider(name: &str) -> anyhow::Result<()> {
     let (path, mut document) = open_document()?;
     document["default_provider"] = toml_edit::value(name);
-    config::write_config_atomic(&path, &document.to_string())?;
+    config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
 
 fn remove_profile(name: &str) -> anyhow::Result<()> {
     let (path, mut document) = open_document()?;
     remove_profile_document(&mut document, name);
-    config::write_config_atomic(&path, &document.to_string())?;
+    config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
 

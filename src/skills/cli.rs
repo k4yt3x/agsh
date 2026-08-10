@@ -357,7 +357,7 @@ async fn fetch_and_replace_skill(skill: &skills::Skill) -> Result<UpdateOutcome>
         return Ok(UpdateOutcome::Unchanged);
     }
 
-    crate::config::write_config_atomic(&skill.body_path, &fetched).map_err(|error| {
+    crate::config::write_file_atomic(&skill.body_path, &fetched).map_err(|error| {
         MekaError::Config(format!(
             "failed to write {}: {}",
             skill.body_path.display(),

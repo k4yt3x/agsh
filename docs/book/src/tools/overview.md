@@ -22,6 +22,10 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
 | [`skill`](./overview.md#skill) | Read | Load a named skill's instructions |
+| [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
+| [`memory_read`](../usage/memory.md) | Read | Load one saved memory in full |
+| [`memory_search`](../usage/memory.md) | Read | Regex over the full text of every memory |
+| [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
 | [`recall`](./overview.md#recall) | Read | Search the full conversation history, including compacted turns |
 | [`recall_read`](./overview.md#recall) | Read | Read conversation turns by index |
@@ -36,6 +40,8 @@ Tools are grouped by the minimum permission level required:
 - `todo`, `spawn_agent`, `skill`, `render_image`
 - `recall`, `recall_read`
 - All scratchpad tools
+- All memory tools. Writing a memory needs only read permission: the store is meka's own, under
+  its config directory, not your working tree
 
 **Write permission** (only available in write mode):
 - `edit_file`, `write_file`, `execute_command` (unsandboxed)

@@ -18,6 +18,7 @@
 //! The last group is diffed rather than re-sent: an unchanged turn renders nothing at all.
 
 use crate::{
+    memory::Memory,
     permission::Permission,
     session::ToolOutputSummary,
     skills::Skill,
@@ -55,24 +56,73 @@ const MCP_RESOURCE_TOOLS: &[&str] = &[
 /// conversation the first time it moves; rendering it into the per-turn `<context>` block costs an
 /// append instead.
 ///
-/// Every field is a `BTreeMap`, so a snapshot has one canonical form and equality is a real "did
-/// the model's picture change" test rather than an ordering accident.
+/// Tools, skills, and MCP instructions are `BTreeMap`s, so a snapshot has one canonical form and
+/// equality is a real "did the model's picture change" test rather than an ordering accident.
+/// Memories are a `Vec` because their order is meaningful (see [`WorldSnapshot::memories`]) and
+/// already canonical when it arrives.
+/// One memory's line in the `[Memory]` index. Carries `mtime` rather than a rendered age so the
+/// snapshot compares equal across a midnight boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryIndexEntry {
+    name: String,
+    description: String,
+    priority: u8,
+    mtime: std::time::SystemTime,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldSnapshot {
     /// Tool name → `(required permission, deferred, one-line summary)`.
     tools: std::collections::BTreeMap<String, (Permission, bool, String)>,
     /// Skill name → description.
     skills: std::collections::BTreeMap<String, String>,
+    /// Memory name → index entry, in the order [`crate::memory::sort_for_index`] produced.
+    ///
+    /// A `Vec`, not a map, because the order *is* the ranking and the budget cuts from the end.
+    /// The entry holds `mtime` rather than a rendered age so snapshot equality is stable across
+    /// days: rendering "14 days ago" into the snapshot would make every midnight look like a
+    /// world change and force a full re-render.
+    memories: Vec<MemoryIndexEntry>,
     /// MCP server name → its `initialize` instructions.
     mcp_instructions: std::collections::BTreeMap<String, String>,
 }
 
+/// The tool each store's index exists to drive. An index is a menu: without the tool that opens an
+/// entry, listing the entries is a promise the model cannot act on.
+const SKILL_INDEX_TOOL: &str = "skill";
+const MEMORY_INDEX_TOOL: &str = "memory_read";
+
+/// Whether `name` is registered, deferred or not. A deferred tool still counts: its schema is
+/// withheld until `load_tool` fetches it, but the model can reach it.
+fn catalogue_has(catalogue: &[ToolCatalogueEntry], name: &str) -> bool {
+    catalogue.iter().any(|(entry, ..)| entry == name)
+}
+
 impl WorldSnapshot {
+    /// Build the picture the model will be shown.
+    ///
+    /// Each store's index is dropped when the tool that opens it is not registered. That happens
+    /// through `[skills] enabled` / `[memory] enabled`, which also empty the caches, but equally
+    /// through `[tools] disabled_tools = ["skill"]`, which does not - and without this filter the
+    /// section would keep instructing the model to call a tool that no longer exists. Gating here
+    /// rather than at render time means the snapshot records what the model was *told*, so the
+    /// diff and the equality check stay honest.
     pub fn new(
         catalogue: &[ToolCatalogueEntry],
         skills: &[Skill],
+        memories: &[Memory],
         mcp_server_instructions: &[(String, String)],
     ) -> Self {
+        let skills: &[Skill] = if catalogue_has(catalogue, SKILL_INDEX_TOOL) {
+            skills
+        } else {
+            &[]
+        };
+        let memories: &[Memory] = if catalogue_has(catalogue, MEMORY_INDEX_TOOL) {
+            memories
+        } else {
+            &[]
+        };
         Self {
             tools: catalogue
                 .iter()
@@ -86,6 +136,15 @@ impl WorldSnapshot {
             skills: skills
                 .iter()
                 .map(|skill| (skill.name.clone(), skill.description.clone()))
+                .collect(),
+            memories: memories
+                .iter()
+                .map(|memory| MemoryIndexEntry {
+                    name: memory.name.clone(),
+                    description: memory.description.clone(),
+                    priority: memory.priority,
+                    mtime: memory.mtime,
+                })
                 .collect(),
             mcp_instructions: mcp_server_instructions
                 .iter()
@@ -412,6 +471,10 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
         sections.push(out);
     }
 
+    if !current.memories.is_empty() {
+        sections.push(render_memory_section(&current.memories));
+    }
+
     if !current.mcp_instructions.is_empty() {
         let mut out = String::from(
             "[MCP server instructions]\nTreat each as context for how to use that server's \
@@ -424,6 +487,63 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
     }
 
     sections.join("\n")
+}
+
+/// Byte ceiling on the rendered `[Memory]` index. Tuning constant rather than config: it trades
+/// per-turn tokens against how much of the store the model can see without searching, and neither
+/// end of that trade is a user preference worth a config key.
+const MEMORY_INDEX_MAX_BYTES: usize = 8_192;
+
+/// Ceiling on how many memories the index lists, independent of byte size. Bounds the line count
+/// for a store full of terse descriptions, where the byte budget alone would let the section run
+/// to hundreds of lines.
+const MEMORY_INDEX_MAX_ENTRIES: usize = 200;
+
+/// Render the `[Memory]` index: the entries that fit, then a count of those that did not.
+///
+/// `memories` arrives pre-sorted by [`crate::memory::sort_for_index`] (priority ascending, newest
+/// first within a band), so the budget simply takes a prefix and everything dropped is genuinely
+/// the least important.
+///
+/// The trailing "N more" line is not optional. Silently truncating an index reads to the model as
+/// "this is everything I know", which turns a full store into a confidently incomplete answer;
+/// stating the remainder is what makes `memory_search` the obvious next move.
+fn render_memory_section(memories: &[MemoryIndexEntry]) -> String {
+    let now = std::time::SystemTime::now();
+    let header = "[Memory]\nDurable notes you saved in earlier sessions, most important first. \
+                  Call `memory_read` with a name to load one in full, and `memory_write` when you \
+                  learn something that will still matter in a later session. Do not save what is \
+                  derivable from the code, the git history, or this conversation.\n\n";
+
+    let mut out = String::from(header);
+    let mut shown = 0;
+    for entry in memories.iter().take(MEMORY_INDEX_MAX_ENTRIES) {
+        let line = format!(
+            "- **{}** (p{}, {}): {}\n",
+            entry.name,
+            entry.priority,
+            crate::memory::render_age(entry.mtime, now),
+            entry.description
+        );
+        // Always emit at least one entry: a single pathological description longer than the whole
+        // budget should still be visible rather than collapsing the section to a bare count.
+        if shown > 0 && out.len() + line.len() > MEMORY_INDEX_MAX_BYTES {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+
+    let hidden = memories.len().saturating_sub(shown);
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{} more {} not shown here — use `memory_search` to find {}.\n",
+            hidden,
+            if hidden == 1 { "memory" } else { "memories" },
+            if hidden == 1 { "it" } else { "them" },
+        ));
+    }
+    out
 }
 
 /// Only what moved since the model was last told, phrased so the new text supersedes the old.
@@ -512,6 +632,59 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         lines.push(format!(
             "- Skills no longer available: {}",
             join_names(removed_skills.into_iter())
+        ));
+    }
+
+    // Memories move whenever the agent writes one, which is often, so the diff carries the delta
+    // rather than re-listing the index. Priority is included because it decides where the entry
+    // will sit when the index is next stated in full.
+    let previous_memories: std::collections::HashMap<&str, &MemoryIndexEntry> = previous
+        .memories
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
+    let changed_memories: Vec<String> = current
+        .memories
+        .iter()
+        .filter(|entry| {
+            // Compare only what the model was told - priority and description - not `mtime`.
+            // Rewriting a memory with identical content moves its mtime, and re-announcing "saved
+            // or updated" for a note that reads exactly as before is noise. The mtime still rides
+            // in the snapshot, because it decides ordering the next time the index renders in full.
+            previous_memories
+                .get(entry.name.as_str())
+                .is_none_or(|before| {
+                    before.priority != entry.priority || before.description != entry.description
+                })
+        })
+        .map(|entry| {
+            format!(
+                "{} (p{}: {})",
+                entry.name, entry.priority, entry.description
+            )
+        })
+        .collect();
+    let removed_memories: Vec<&String> = previous
+        .memories
+        .iter()
+        .filter(|entry| {
+            !current
+                .memories
+                .iter()
+                .any(|candidate| candidate.name == entry.name)
+        })
+        .map(|entry| &entry.name)
+        .collect();
+    if !changed_memories.is_empty() {
+        lines.push(format!(
+            "- Memories saved or updated: {}",
+            changed_memories.join("; ")
+        ));
+    }
+    if !removed_memories.is_empty() {
+        lines.push(format!(
+            "- Memories deleted: {}",
+            join_names(removed_memories.into_iter())
         ));
     }
 
@@ -715,6 +888,243 @@ pub fn build_post_compact_context(
 mod tests {
     use super::*;
 
+    fn sample_memory(name: &str, priority: u8, description: &str, age_days: u64) -> Memory {
+        Memory {
+            name: name.to_string(),
+            description: description.to_string(),
+            priority,
+            path: std::path::PathBuf::from("/tmp").join(format!("{}.md", name)),
+            mtime: std::time::SystemTime::now() - std::time::Duration::from_secs(age_days * 86_400),
+        }
+    }
+
+    /// A memory index that fits the budget lists everything and adds no "N more" line.
+    #[test]
+    fn test_memory_section_lists_everything_under_budget() {
+        let memories = [
+            sample_memory("standing-rule", 1, "Always reply in kind", 0),
+            sample_memory("a-fact", 5, "The NAS is at nas.lan", 14),
+        ];
+        let rendered = world_state_for_memories(&memories);
+
+        assert!(rendered.contains("[Memory]"), "{rendered}");
+        assert!(
+            rendered.contains("**standing-rule** (p1, today)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("**a-fact** (p5, 14 days ago)"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("more memories"),
+            "nothing was dropped, so no truncation notice belongs here: {rendered}"
+        );
+    }
+
+    /// Truncation must always announce itself. A silently shortened index reads to the model as
+    /// "this is everything I know", which turns a full store into a confidently incomplete answer.
+    #[test]
+    fn test_memory_section_always_announces_truncation() {
+        // Long descriptions so the byte budget bites well before the entry cap.
+        let filler = "x".repeat(400);
+        let memories: Vec<Memory> = (0..100)
+            .map(|index| sample_memory(&format!("memory-{index:03}"), 5, &filler, index))
+            .collect();
+        let rendered = world_state_for_memories(&memories);
+
+        assert!(
+            rendered.len() < 12_000,
+            "budget must bite: {}",
+            rendered.len()
+        );
+        let notice = rendered
+            .lines()
+            .find(|line| line.contains("more memories not shown"))
+            .unwrap_or_else(|| panic!("truncation must be announced; got:\n{rendered}"));
+        assert!(notice.contains("memory_search"), "{notice}");
+
+        // The count has to be right, or the model can't tell how much it is missing.
+        let listed = memory_lines(&rendered);
+        assert!(
+            notice.contains(&(100 - listed).to_string()),
+            "notice must name the number withheld ({} listed): {notice}",
+            listed
+        );
+    }
+
+    /// The entry cap bounds line count independently of the byte cap, for a store full of terse
+    /// descriptions that would otherwise run to hundreds of lines inside the byte budget.
+    #[test]
+    fn test_memory_section_caps_entry_count() {
+        let memories: Vec<Memory> = (0..MEMORY_INDEX_MAX_ENTRIES + 50)
+            .map(|index| sample_memory(&format!("m{index:04}"), 5, "x", index as u64))
+            .collect();
+        let rendered = world_state_for_memories(&memories);
+        let listed = memory_lines(&rendered);
+        assert!(listed <= MEMORY_INDEX_MAX_ENTRIES, "listed {listed}");
+        assert!(rendered.contains("more memories not shown"), "{rendered}");
+    }
+
+    /// Snapshot equality must not depend on the wall clock. The index renders ages as "14 days
+    /// ago", but the snapshot stores `mtime`, so crossing midnight cannot masquerade as a world
+    /// change and force a full re-render every day.
+    #[test]
+    fn test_memory_snapshot_equality_ignores_elapsed_time() {
+        let memory = sample_memory("stable", 5, "unchanged", 3);
+        let catalogue = catalogue_with(MEMORY_INDEX_TOOL);
+        let before = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[]);
+        let after = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[]);
+        assert_eq!(before, after);
+        assert_eq!(
+            render_world_state(&after, Some(&before)),
+            "",
+            "an unchanged world must render nothing at all"
+        );
+    }
+
+    /// A newly saved memory reaches the model through the diff, without re-listing the whole index.
+    #[test]
+    fn test_memory_diff_reports_saves_and_deletions() {
+        let catalogue = catalogue_with(MEMORY_INDEX_TOOL);
+        let before = WorldSnapshot::new(
+            &catalogue,
+            &[],
+            &[sample_memory("kept", 5, "still true", 1)],
+            &[],
+        );
+        let after = WorldSnapshot::new(
+            &catalogue,
+            &[],
+            &[
+                sample_memory("kept", 5, "still true", 1),
+                sample_memory("fresh", 2, "just learned", 0),
+            ],
+            &[],
+        );
+
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("fresh (p2: just learned)"), "{diff}");
+        assert!(
+            !diff.contains("kept"),
+            "unchanged entries must stay quiet: {diff}"
+        );
+
+        let removed = render_world_state(&before, Some(&after));
+        assert!(removed.contains("Memories deleted: `fresh`"), "{removed}");
+    }
+
+    /// The feature's load-bearing claim is that memory survives compaction. Two pieces make that
+    /// true: `Agent::compact_session` drops `last_rendered_world`, and a `None` previous renders
+    /// the world in full. This pins the second - an index already shown is restated verbatim, not
+    /// diffed into silence - so a change to the diff path can't quietly make a post-compaction
+    /// turn forget what the agent knows.
+    #[test]
+    fn test_full_render_restates_the_memory_index_after_compaction() {
+        let memories = [
+            sample_memory("standing-rule", 1, "Always reply in kind", 0),
+            sample_memory("a-fact", 5, "The NAS is at nas.lan", 14),
+        ];
+        let snapshot = WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[]);
+
+        // Mid-session, an unchanged world says nothing.
+        assert_eq!(render_world_state(&snapshot, Some(&snapshot)), "");
+
+        // Post-compaction the previous render is forgotten, and the same snapshot renders whole.
+        let restated = render_world_state(&snapshot, None);
+        assert!(restated.contains("[Memory]"), "{restated}");
+        assert!(restated.contains("standing-rule"), "{restated}");
+        assert!(restated.contains("a-fact"), "{restated}");
+    }
+
+    /// An index whose opening tool is gone is a menu with no kitchen: the model would be told to
+    /// call `skill` / `memory_read` and get an unknown-tool error. `[tools] disabled_tools` can
+    /// reach that state without going through the `enabled` switches, so the filter lives in
+    /// `WorldSnapshot::new` rather than beside them.
+    #[test]
+    fn test_index_is_dropped_when_its_opening_tool_is_unregistered() {
+        let skills = [sample_skill("setup-server")];
+        let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
+
+        // Only `read_file` registered: neither index has a way to be opened.
+        let catalogue = catalogue_with("read_file");
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&catalogue, &skills, &memories, &[]),
+            None,
+        );
+        assert!(!rendered.contains("[Skills]"), "{rendered}");
+        assert!(!rendered.contains("setup-server"), "{rendered}");
+        assert!(!rendered.contains("[Memory]"), "{rendered}");
+        assert!(!rendered.contains("a-note"), "{rendered}");
+
+        // Each appears exactly when its own tool does, and not because of the other's.
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&catalogue_with(SKILL_INDEX_TOOL), &skills, &memories, &[]),
+            None,
+        );
+        assert!(rendered.contains("setup-server"), "{rendered}");
+        assert!(!rendered.contains("[Memory]"), "{rendered}");
+
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &skills, &memories, &[]),
+            None,
+        );
+        assert!(rendered.contains("a-note"), "{rendered}");
+        assert!(!rendered.contains("[Skills]"), "{rendered}");
+    }
+
+    /// A deferred tool still counts. Its schema is withheld until `load_tool` fetches it, but the
+    /// model can reach it, so the index it opens is still actionable.
+    #[test]
+    fn test_deferred_opening_tool_still_renders_the_index() {
+        let deferred = vec![(
+            MEMORY_INDEX_TOOL.to_string(),
+            "Load a saved memory".to_string(),
+            Permission::Read,
+            true,
+        )];
+        let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
+        let rendered =
+            render_world_state(&WorldSnapshot::new(&deferred, &[], &memories, &[]), None);
+        assert!(rendered.contains("[Memory]"), "{rendered}");
+        assert!(rendered.contains("a-note"), "{rendered}");
+    }
+
+    /// Losing the opening tool mid-session has to reach the model as a deletion, not silence: the
+    /// entries it was told about earlier are no longer usable.
+    #[test]
+    fn test_losing_the_opening_tool_reports_the_index_as_gone() {
+        let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
+        let before = WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[]);
+        let after = WorldSnapshot::new(&catalogue_with("read_file"), &[], &memories, &[]);
+
+        let diff = render_world_state(&after, Some(&before));
+        assert!(diff.contains("Memories deleted: `a-note`"), "{diff}");
+    }
+
+    /// The `[Memory]` section alone. Counting index lines across the whole render would also
+    /// catch `[Available tools]` entries, which share the `- **name**` shape.
+    fn memory_section_of(rendered: &str) -> &str {
+        let start = rendered
+            .find("[Memory]")
+            .unwrap_or_else(|| panic!("no [Memory] section in:\n{rendered}"));
+        &rendered[start..]
+    }
+
+    fn memory_lines(rendered: &str) -> usize {
+        memory_section_of(rendered)
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .count()
+    }
+
+    fn world_state_for_memories(memories: &[Memory]) -> String {
+        render_world_state(
+            &WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], memories, &[]),
+            None,
+        )
+    }
+
     fn sample_skill(name: &str) -> Skill {
         Skill {
             name: name.to_string(),
@@ -768,7 +1178,31 @@ mod tests {
                 Permission::Read,
                 true,
             ),
+            // `WorldSnapshot::new` drops each store's index unless the tool that opens it is
+            // registered, so a catalogue meant to render those sections has to carry both.
+            (
+                SKILL_INDEX_TOOL.to_string(),
+                "Load a skill's instructions".to_string(),
+                Permission::Read,
+                false,
+            ),
+            (
+                MEMORY_INDEX_TOOL.to_string(),
+                "Load a saved memory".to_string(),
+                Permission::Read,
+                false,
+            ),
         ]
+    }
+
+    /// The smallest catalogue that lets `name`'s index render.
+    fn catalogue_with(name: &str) -> Vec<ToolCatalogueEntry> {
+        vec![(
+            name.to_string(),
+            "opens the index".to_string(),
+            Permission::Read,
+            false,
+        )]
     }
 
     /// Full world-state render, as a first turn or a post-compaction turn sees it.
@@ -778,7 +1212,7 @@ mod tests {
         mcp_server_instructions: &[(String, String)],
     ) -> String {
         render_world_state(
-            &WorldSnapshot::new(catalogue, skills, mcp_server_instructions),
+            &WorldSnapshot::new(catalogue, skills, &[], mcp_server_instructions),
             None,
         )
     }
@@ -1075,14 +1509,14 @@ mod tests {
         let mut last: Option<WorldSnapshot> = None;
 
         // Turn 1: nothing has been said yet, so the model gets the whole picture.
-        let current = WorldSnapshot::new(&catalogue, &[], &[]);
+        let current = WorldSnapshot::new(&catalogue, &[], &[], &[]);
         let turn1 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert!(turn1.contains("[Available tools]"), "got: {}", turn1);
         assert!(turn1.contains("**read_file**"));
 
         // Turn 2: nothing changed. This is the steady state and must cost nothing.
-        let current = WorldSnapshot::new(&catalogue, &[], &[]);
+        let current = WorldSnapshot::new(&catalogue, &[], &[], &[]);
         let turn2 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert_eq!(turn2, "", "an unchanged turn must render nothing");
@@ -1096,7 +1530,7 @@ mod tests {
             true,
         ));
         let instructions = vec![("fs".to_string(), "Read before write.".to_string())];
-        let current = WorldSnapshot::new(&grown, &[], &instructions);
+        let current = WorldSnapshot::new(&grown, &[], &[], &instructions);
         let turn3 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert!(turn3.contains("`mcp__fs__read`"), "got: {}", turn3);
@@ -1109,7 +1543,7 @@ mod tests {
         );
 
         // Turn 4: quiet again.
-        let current = WorldSnapshot::new(&grown, &[], &instructions);
+        let current = WorldSnapshot::new(&grown, &[], &[], &instructions);
         assert_eq!(render_world_state(&current, last.as_ref()), "");
 
         // Turn 5: compaction forgets what the model was told (`compact_session` clears the stored
@@ -1138,8 +1572,8 @@ mod tests {
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         }];
         let instructions = [("fs".to_string(), "Read before write.".to_string())];
-        let before = WorldSnapshot::new(&catalogue, &skills, &instructions);
-        let after = WorldSnapshot::new(&catalogue, &skills, &instructions);
+        let before = WorldSnapshot::new(&catalogue, &skills, &[], &instructions);
+        let after = WorldSnapshot::new(&catalogue, &skills, &[], &instructions);
         assert_eq!(render_world_state(&after, Some(&before)), "");
     }
 
@@ -1154,6 +1588,7 @@ mod tests {
             )],
             &[],
             &[],
+            &[],
         );
         let after = WorldSnapshot::new(
             &[(
@@ -1162,6 +1597,7 @@ mod tests {
                 Permission::Write,
                 false,
             )],
+            &[],
             &[],
             &[],
         );
@@ -1188,7 +1624,7 @@ mod tests {
     #[test]
     fn test_world_state_renders_in_full_when_previous_is_forgotten() {
         let catalogue = sample_catalogue();
-        let snapshot = WorldSnapshot::new(&catalogue, &[], &[]);
+        let snapshot = WorldSnapshot::new(&catalogue, &[], &[], &[]);
         let full = render_world_state(&snapshot, None);
 
         assert!(full.contains("[Available tools]"));
@@ -1235,15 +1671,15 @@ mod tests {
             ("empty", WorldSnapshot::default()),
             (
                 "one tool",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[]),
             ),
             (
                 "same tool, deferred",
-                WorldSnapshot::new(&[tool("a", "does a", true)], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a", true)], &[], &[], &[]),
             ),
             (
                 "same tool, reworded",
-                WorldSnapshot::new(&[tool("a", "does a differently", false)], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a differently", false)], &[], &[], &[]),
             ),
             (
                 "two tools",
@@ -1251,11 +1687,17 @@ mod tests {
                     &[tool("a", "does a", false), tool("b", "does b", false)],
                     &[],
                     &[],
+                    &[],
                 ),
             ),
             (
                 "one tool and a skill",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[skill("s", "ships")], &[]),
+                WorldSnapshot::new(
+                    &[tool("a", "does a", false)],
+                    &[skill("s", "ships")],
+                    &[],
+                    &[],
+                ),
             ),
             (
                 "one tool and a reworded skill",
@@ -1263,18 +1705,19 @@ mod tests {
                     &[tool("a", "does a", false)],
                     &[skill("s", "ships fast")],
                     &[],
+                    &[],
                 ),
             ),
             (
                 "one tool and a server",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[(
+                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[(
                     "fs".to_string(),
                     "guidance".to_string(),
                 )]),
             ),
             (
                 "one tool and a rewritten server",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[(
+                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[(
                     "fs".to_string(),
                     "new guidance".to_string(),
                 )]),
@@ -1317,8 +1760,8 @@ mod tests {
                 false,
             )]
         };
-        let before = WorldSnapshot::new(&entry("Reads a file."), &[], &[]);
-        let after = WorldSnapshot::new(&entry("Reads a file, following symlinks."), &[], &[]);
+        let before = WorldSnapshot::new(&entry("Reads a file."), &[], &[], &[]);
+        let after = WorldSnapshot::new(&entry("Reads a file, following symlinks."), &[], &[], &[]);
         assert_ne!(before, after, "the fixture must actually differ");
 
         let diff = render_world_state(&after, Some(&before));
@@ -1331,12 +1774,14 @@ mod tests {
 
     #[test]
     fn test_world_state_diff_reports_mcp_instruction_changes() {
-        let before = WorldSnapshot::new(&[], &[], &[
+        let before = WorldSnapshot::new(&[], &[], &[], &[
             ("fs".to_string(), "Old guidance.".to_string()),
             ("db".to_string(), "Read only.".to_string()),
         ]);
-        let after =
-            WorldSnapshot::new(&[], &[], &[("fs".to_string(), "New guidance.".to_string())]);
+        let after = WorldSnapshot::new(&[], &[], &[], &[(
+            "fs".to_string(),
+            "New guidance.".to_string(),
+        )]);
         let diff = render_world_state(&after, Some(&before));
 
         assert!(diff.contains("New guidance."), "got: {}", diff);
@@ -1361,7 +1806,7 @@ mod tests {
     #[test]
     fn test_world_state_lists_skills() {
         let skills = vec![sample_skill("setup-server"), sample_skill("deploy-app")];
-        let prompt = world_state_for(&[], &skills, &[]);
+        let prompt = world_state_for(&catalogue_with(SKILL_INDEX_TOOL), &skills, &[]);
         assert!(prompt.contains("[Skills]"));
         assert!(prompt.contains("**setup-server**"));
         assert!(prompt.contains("setup-server description"));

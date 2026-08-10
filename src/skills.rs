@@ -15,6 +15,8 @@ use std::{
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::store::{split_frontmatter, validate_entry_name, yaml_scalar};
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -142,6 +144,14 @@ pub struct SkillCache {
     /// Resolved skills root. `None` when [`skills_dir`] returns `None` or when constructed via
     /// `SkillCache::for_root(None)` for test scaffolding / subcommands that don't read skills.
     root: Option<PathBuf>,
+    /// Whether the subsystem is switched on at all, from `[skills] enabled`.
+    ///
+    /// Deliberately separate from `root`: a cache with no root is an *empty* store (nothing on
+    /// disk, or test scaffolding), and its `skill` tool still belong in the registry. A disabled
+    /// cache means the feature is off, so they are not registered and the `[Skills]` section
+    /// never renders. Conflating the two made `meka tools list` hide tools that a real session
+    /// would have had.
+    enabled: bool,
     state: Mutex<CacheState>,
 }
 
@@ -168,11 +178,30 @@ impl SkillCache {
         };
         Arc::new(Self {
             root,
+            enabled: true,
             state: Mutex::new(CacheState {
                 skills: Arc::new(skills),
                 snapshot,
             }),
         })
+    }
+
+    /// A cache for a switched-off subsystem: empty, rootless, and reporting
+    /// [`SkillCache::enabled`] as `false` so the registration sites skip its tools.
+    pub fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            root: None,
+            enabled: false,
+            state: Mutex::new(CacheState {
+                skills: Arc::new(Vec::new()),
+                snapshot: BTreeMap::new(),
+            }),
+        })
+    }
+
+    /// Whether the subsystem is switched on. See the field docs on [`SkillCache::enabled`].
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Return the current skill list, re-discovering first if the on-disk snapshot has changed
@@ -254,23 +283,6 @@ pub fn parse_skill_definition(
     })
 }
 
-/// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
-/// valid frontmatter block is present.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
-    let rest = content
-        .strip_prefix("---\n")
-        .or_else(|| content.strip_prefix("---\r\n"))?;
-
-    for (marker, offset) in [("\n---\n", 5), ("\n---\r\n", 6)] {
-        if let Some(end) = rest.find(marker) {
-            let frontmatter = &rest[..end];
-            let body = &rest[end + offset..];
-            return Some((frontmatter, body));
-        }
-    }
-    None
-}
-
 /// Load the body (post-frontmatter) of a skill, perform variable substitution, and prepend the
 /// [`skill_context_header`] so every consumer (the `skill` tool, `--skill`, `/skill`,
 /// `spawn_agent`'s skill delegation, and `meka skill show`) sees the skill's base directory.
@@ -308,44 +320,11 @@ fn substitute_variables(text: &str, skill: &Skill, session_id: Option<&str>) -> 
     result
 }
 
-/// Maximum length of a skill name. Kept small so the system-prompt `## Skills` listing stays
-/// readable and per-line bounded.
-pub const MAX_SKILL_NAME_LEN: usize = 64;
-
-/// Validate that `name` is a safe filesystem-and-prompt-embeddable skill identifier. Accepts
-/// `[A-Za-z0-9][A-Za-z0-9_-]*`, max [`MAX_SKILL_NAME_LEN`] characters. Rejects anything that could
-/// escape the skills directory (path components, hidden files) or break parsing of the
-/// slash-command grammar (whitespace, `:`).
+/// Validate that `name` is a safe filesystem-and-prompt-embeddable skill identifier. See
+/// [`validate_entry_name`] for the rules; rejecting the character class outright is what keeps a
+/// name from escaping the skills directory or breaking the slash-command grammar.
 pub fn validate_skill_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("skill name cannot be empty".to_string());
-    }
-    if name.len() > MAX_SKILL_NAME_LEN {
-        return Err(format!(
-            "skill name '{}' exceeds {} characters",
-            name, MAX_SKILL_NAME_LEN
-        ));
-    }
-    let mut chars = name.chars();
-    // `name.is_empty()` was checked at the top of this function (and returned an error), so
-    // `chars.next()` always yields `Some` here. The `expect` documents the invariant.
-    #[allow(clippy::expect_used)]
-    let first = chars.next().expect("non-empty checked above");
-    if !first.is_ascii_alphanumeric() {
-        return Err(format!(
-            "skill name '{}' must start with a letter or digit",
-            name
-        ));
-    }
-    for ch in chars {
-        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
-            return Err(format!(
-                "skill name '{}' contains invalid character '{}'; only [A-Za-z0-9_-] are allowed",
-                name, ch
-            ));
-        }
-    }
-    Ok(())
+    validate_entry_name(name, "skill")
 }
 
 /// Resolve `~/.config/meka/skills/<name>` for a given skill name. Returns `None` if the meka config
@@ -388,25 +367,6 @@ pub fn render_template(
     out
 }
 
-/// YAML-quote a scalar when it contains characters that would otherwise require structural
-/// interpretation. Plain ASCII text without leading punctuation, colons, or hash marks passes
-/// through unquoted.
-fn yaml_scalar(text: &str) -> String {
-    let needs_quotes = text.is_empty()
-        || text.starts_with([
-            '-', '?', ':', '!', '&', '*', '#', '|', '>', '%', '@', '`', '"', '\'',
-        ])
-        || text.contains(':')
-        || text.contains('#')
-        || text.contains('\n');
-    if needs_quotes {
-        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{}\"", escaped)
-    } else {
-        text.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,27 +375,6 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("create skill dir");
         std::fs::write(dir.join("SKILL.md"), skill_md).expect("write SKILL.md");
-    }
-
-    #[test]
-    fn test_split_frontmatter_simple() {
-        let content = "---\ndescription: hi\n---\nbody here\n";
-        let (fm, body) = split_frontmatter(content).expect("should split");
-        assert_eq!(fm, "description: hi");
-        assert_eq!(body, "body here\n");
-    }
-
-    #[test]
-    fn test_split_frontmatter_crlf() {
-        let content = "---\r\ndescription: hi\r\n---\r\nbody\r\n";
-        let split = split_frontmatter(content);
-        assert!(split.is_some());
-    }
-
-    #[test]
-    fn test_split_frontmatter_no_fence() {
-        let content = "no frontmatter here\n";
-        assert!(split_frontmatter(content).is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod find;
 mod grep;
 mod load_tool;
 pub(crate) mod mcp_resources;
+mod memory;
 mod recall;
 mod render_image;
 pub(crate) mod scratchpad;
@@ -127,6 +128,10 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "fetch_url",
     "find_files",
     "load_tool",
+    "memory_delete",
+    "memory_read",
+    "memory_search",
+    "memory_write",
     "read_file",
     "render_image",
     "scratchpad_delete",
@@ -612,6 +617,7 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         todo_list: todo::SharedTodoList,
         skills: Arc<crate::skills::SkillCache>,
+        memories: Arc<crate::memory::MemoryCache>,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
@@ -620,10 +626,27 @@ impl ToolRegistry {
             tools: Arc::downgrade(&self.tools),
             deferred: Arc::downgrade(&self.deferred),
         }));
-        self.register_builtin(Arc::new(skill::SkillTool {
-            session_id: shared_session_id.clone(),
-            skills,
-        }));
+        // Both stores register their tools only when the subsystem is switched on. Skipping is
+        // the whole point of the config switch: a disabled subsystem must keep its schemas out of
+        // every request, not ship tools that can only ever fail.
+        if skills.enabled() {
+            self.register_builtin(Arc::new(skill::SkillTool {
+                session_id: shared_session_id.clone(),
+                skills,
+            }));
+        }
+        if memories.enabled() {
+            self.register_builtin(Arc::new(memory::MemoryWriteTool {
+                memories: memories.clone(),
+            }));
+            self.register_builtin(Arc::new(memory::MemoryReadTool {
+                memories: memories.clone(),
+            }));
+            self.register_builtin(Arc::new(memory::MemorySearchTool {
+                memories: memories.clone(),
+            }));
+            self.register_builtin(Arc::new(memory::MemoryDeleteTool { memories }));
+        }
         self.register_builtin(Arc::new(render_image::RenderImageTool {
             session_id: shared_session_id.clone(),
             session_manager: session_manager.clone(),
@@ -702,6 +725,7 @@ impl ToolRegistry {
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
+        memories: Arc<crate::memory::MemoryCache>,
         builtin_filter: BuiltinToolFilter,
         cwd: crate::agent::SharedCwd,
         roots: crate::agent::SharedRoots,
@@ -724,6 +748,7 @@ impl ToolRegistry {
             shared_session_id,
             todo_list,
             skills,
+            memories,
             None,
             Vec::new(),
             cwd,
@@ -752,6 +777,7 @@ impl ToolRegistry {
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
+        memories: Arc<crate::memory::MemoryCache>,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
@@ -775,6 +801,7 @@ impl ToolRegistry {
             shared_session_id,
             todo_list,
             skills,
+            memories,
             parent_session_id,
             inherited_scratchpad_names,
             cwd,
@@ -828,6 +855,7 @@ pub(crate) mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             filter,
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
@@ -1102,9 +1130,64 @@ pub(crate) mod tests {
         assert!(registry.get("scratchpad_list").is_some());
         assert!(registry.get("scratchpad_delete").is_some());
         assert!(registry.get("skill").is_some());
+        assert!(registry.get("memory_write").is_some());
+        assert!(registry.get("memory_read").is_some());
+        assert!(registry.get("memory_search").is_some());
+        assert!(registry.get("memory_delete").is_some());
         assert!(registry.get("render_image").is_some());
         assert!(registry.get("load_tool").is_some());
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    /// A store with no root is an *empty* store, not a disabled one: its tools still register, so
+    /// the agent can write the first memory into a directory that doesn't exist yet. Conflating
+    /// the two is what made `meka tools list` hide tools a real session would have had.
+    #[tokio::test]
+    async fn test_empty_store_still_registers_its_tools() {
+        let registry = test_registry().await;
+        assert!(registry.get("skill").is_some());
+        assert!(registry.get("memory_write").is_some());
+    }
+
+    /// Disabling a subsystem keeps its schemas out of the request entirely, which is the whole
+    /// point of the config switch.
+    #[tokio::test]
+    async fn test_disabled_stores_register_no_tools() {
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("failed to open in-memory database");
+        let sandbox_capability = crate::sandbox::detect();
+        let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            test_shared_permission(),
+            true,
+            sandbox_capability,
+            crate::config::SandboxBackend::Landlock,
+            backend_probe,
+            test_todo_list(),
+            session_manager,
+            Arc::new(RwLock::new(None)),
+            crate::skills::SkillCache::disabled(),
+            crate::memory::MemoryCache::disabled(),
+            BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            crate::agent::test_roots(),
+            Arc::new(crate::frontend::SilentFrontend),
+        )
+        .expect("default web client config should build cleanly");
+
+        assert!(registry.get("skill").is_none());
+        for name in [
+            "memory_write",
+            "memory_read",
+            "memory_search",
+            "memory_delete",
+        ] {
+            assert!(registry.get(name).is_none(), "{name} must not register");
+        }
+        // Unrelated built-ins are untouched.
+        assert!(registry.get("read_file").is_some());
     }
 
     #[tokio::test]
@@ -1520,6 +1603,7 @@ pub(crate) mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             None,
             Vec::new(),
             crate::agent::test_cwd(),

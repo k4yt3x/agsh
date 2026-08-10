@@ -11,6 +11,7 @@ Skills are user-defined knowledge packages that give the agent non-standard know
 - On every prompt, meka discovers all valid skills and lists them in the per-turn context with their `description`.
 - The agent invokes a skill by calling the `skill` tool with the skill name. The tool returns the full body, which the agent follows.
 - Skills are available in **read**, **ask**, and **write** permission modes (not in **none**).
+- The whole subsystem can be switched off with `[skills] enabled = false`, which keeps the `skill` tool's schema out of every request and stops the skills section from rendering.
 
 ## File Format
 

@@ -38,6 +38,9 @@ pub struct ToolBuilderParams {
     /// Shared skill cache. Sub-agents read from the same cache as the parent so their system
     /// prompts stay consistent and pick up the same auto-reloads.
     pub skills: Arc<crate::skills::SkillCache>,
+    /// Shared memory cache. Sub-agents read and write the parent's memory store: memory is scoped
+    /// to the meka instance, and a note a sub-agent learns is worth just as much to the parent.
+    pub memories: Arc<crate::memory::MemoryCache>,
     /// Parent's MCP client manager, if any servers are configured. When `Some`, every
     /// `spawn_agent` invocation calls [`crate::mcp::McpClientManager::install_tools_on`] on
     /// the freshly-built sub-agent registry so sub-agents see the same MCP resource meta-tools
@@ -352,6 +355,7 @@ impl Tool for SpawnAgentTool {
             self.tool_builder_params.session_manager.clone(),
             sub_shared_session_id.clone(),
             self.tool_builder_params.skills.clone(),
+            self.tool_builder_params.memories.clone(),
             if inherited_scratchpad.is_empty() {
                 None
             } else {
@@ -459,6 +463,7 @@ impl Tool for SpawnAgentTool {
             sub_todo_list,
             sub_shared_session_id,
             self.tool_builder_params.skills.clone(),
+            self.tool_builder_params.memories.clone(),
             &self.tool_builder_params.parent_cwd,
             &self.tool_builder_params.parent_roots,
             sub_frontend,
@@ -834,6 +839,7 @@ mod tests {
             test_session_manager().await,
             Arc::new(tokio::sync::RwLock::new(None)),
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             None,
             Vec::new(),
             crate::agent::test_cwd(),

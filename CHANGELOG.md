@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Agent memory: durable Markdown notes in `~/.config/meka/memory/`, surviving compaction.
+- `memory_write` / `memory_read` / `memory_search` / `memory_delete` tools, all at read permission.
+- `meka memory` subcommands and `/memory` to list, inspect, and curate saved memories.
+- `[memory] enabled` config (default true) to drop the memory tools and index entirely.
+- `[skills] enabled` config (default true) to drop the `skill` tool and skills index entirely.
+- `/memory <name>` prints one memory's body, matching `meka memory show`.
+
 ### Fixed
 
 - OpenAI-compatible streaming dropped a tool call or text that shared a chunk with `finish_reason`.
 - REPL text streamed before an interrupt or error no longer leaks into the next turn's output.
+- The skills and memory indexes no longer render when the tool that opens them is disabled.
 
 ## [0.37.0] - 2026-08-10
 

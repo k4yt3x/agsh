@@ -43,6 +43,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Manage the agent's saved memories
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Show OAuth account info (usage, identity) for scripting
     Account {
         #[command(subcommand)]
@@ -262,6 +267,50 @@ pub enum SkillAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Inspect and curate the agent's durable notes. The agent maintains these itself through the
+/// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
+#[derive(clap::Subcommand, Debug)]
+pub enum MemoryAction {
+    /// List saved memories and the priority distribution
+    List,
+    /// Print one memory's frontmatter and on-disk facts
+    Get { name: String },
+    /// Print a memory's body
+    Show { name: String },
+    /// Write a memory by hand
+    ///
+    /// Examples:
+    ///   meka memory add tz --description "K4YT3X is in UTC+8"
+    ///   meka memory add rules --description "House rules" --priority 1
+    #[command(verbatim_doc_comment)]
+    Add {
+        /// Unique name (alphanumerics, `-`, `_` only)
+        name: String,
+
+        /// Fact shown in every session's memory index
+        #[arg(long)]
+        description: String,
+
+        /// 0 is most important, 9 least; defaults to 5
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+        priority: Option<u8>,
+
+        /// Detail loaded only on memory_read
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Read the body from this file, not --body
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<std::path::PathBuf>,
+
+        /// Overwrite the memory if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete a memory permanently
+    Remove { name: String },
 }
 
 /// Read-only account introspection, for scripting (e.g. an i3blocks status bar). Both subcommands

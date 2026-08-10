@@ -950,8 +950,8 @@ fn tool_kind_for(name: &str) -> ToolKind {
         "execute_command" => ToolKind::Execute,
         "fetch_url" | "web_search" => ToolKind::Fetch,
         "spawn_agent" => ToolKind::Think,
-        // skill, scratchpad_*, render_image, load_tool, mcp__*, and any future
-        // built-ins.
+        // skill, memory_*, scratchpad_*, render_image, load_tool, mcp__*, and any
+        // future built-ins.
         _ => ToolKind::Other,
     }
 }

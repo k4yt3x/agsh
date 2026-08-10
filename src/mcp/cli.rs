@@ -486,7 +486,7 @@ fn persist_auth_block_for(name: &str) -> Result<()> {
     };
 
     if mutated {
-        crate::config::write_config_atomic(&path, &document.to_string())
+        crate::config::write_file_atomic(&path, &document.to_string())
             .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
     }
     Ok(())
@@ -634,7 +634,7 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     let table = build_server_table(&resolved);
     servers_array.push(table);
 
-    crate::config::write_config_atomic(&path, &document.to_string())
+    crate::config::write_file_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
     tracing::info!("added '{}' to {}", resolved.name, path.display());
 
@@ -1329,7 +1329,7 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
         return Err(config_err(format!("no server named '{}' in config", name)));
     }
 
-    crate::config::write_config_atomic(&path, &document.to_string())
+    crate::config::write_file_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
 
     // Best-effort OAuth token revocation per RFC 7009 before we drop the local credentials. If the
@@ -1359,7 +1359,7 @@ pub async fn run_remove(name: &str, token_store: &TokenStore) -> Result<()> {
 
 /// Set `disabled = <value>` on a server entry in config.toml, preserving other fields and
 /// formatting. Backs `meka mcp disable|enable`. Writes atomically via
-/// [`crate::config::write_config_atomic`].
+/// [`crate::config::write_file_atomic`].
 async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
@@ -1389,7 +1389,7 @@ async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::Pa
         entry.remove("disabled");
     }
 
-    crate::config::write_config_atomic(&path, &document.to_string())
+    crate::config::write_file_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
     Ok(path)
 }

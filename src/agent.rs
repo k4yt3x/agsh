@@ -153,6 +153,7 @@ use crate::{
     conversation::Conversation,
     error::{MekaError, Result},
     frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
+    memory::MemoryCache,
     permission::SharedPermission,
     provider::{
         ContentBlock, ImageSource, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition,
@@ -246,6 +247,9 @@ pub struct Agent {
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
     /// invocation regardless of cache state.
     skills: Arc<SkillCache>,
+    /// Shared memory cache, same contract as `skills`: re-checked at the top of each turn so a
+    /// memory the agent writes mid-turn appears in the very next turn's index.
+    memories: Arc<MemoryCache>,
     /// Where streaming output, todo-list renders, token-usage summaries,
     /// and tool-approval requests flow. Concrete impls today:
     /// [`crate::repl::ReplFrontend`], [`crate::acp::AcpFrontend`],
@@ -294,6 +298,7 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
+        memories: Arc<MemoryCache>,
         frontend: Arc<dyn Frontend>,
         cwd: SharedCwd,
         roots: SharedRoots,
@@ -310,6 +315,7 @@ impl Agent {
             last_rendered_world: tokio::sync::RwLock::new(None),
             shared_session_id,
             skills,
+            memories,
             frontend,
             cwd,
             roots,
@@ -369,6 +375,7 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
+        memories: Arc<MemoryCache>,
         parent_cwd: &SharedCwd,
         parent_roots: &SharedRoots,
         frontend: Arc<dyn Frontend>,
@@ -405,6 +412,7 @@ impl Agent {
             todo_list,
             shared_session_id,
             skills,
+            memories,
             frontend,
             sub_cwd,
             Arc::clone(parent_roots),
@@ -575,6 +583,7 @@ impl Agent {
 
         let catalogue = self.tool_registry.tool_catalogue();
         let skills = self.skills.current().await;
+        let memories = self.memories.current().await;
         let mcp_instructions = self
             .mcp_manager
             .as_ref()
@@ -600,8 +609,12 @@ impl Agent {
         let (world_state, world_state_rollback) = if self.options.system_prompt_override.is_some() {
             (String::new(), None)
         } else {
-            let current =
-                context::WorldSnapshot::new(&catalogue, skills.as_slice(), &mcp_instructions);
+            let current = context::WorldSnapshot::new(
+                &catalogue,
+                skills.as_slice(),
+                memories.as_slice(),
+                &mcp_instructions,
+            );
             let mut last = self.last_rendered_world.write().await;
             // Treat a render that has scrolled out of the API window as never having happened. The
             // window keeps the last `context_messages` entries, so a render at index `i` is gone

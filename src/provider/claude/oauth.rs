@@ -2207,6 +2207,7 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
@@ -2326,6 +2327,7 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
@@ -2459,6 +2461,7 @@ mod tests {
             session_manager,
             std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
@@ -2492,9 +2495,10 @@ mod tests {
 
         // ...and the change is announced in the block that gets appended instead.
         let delta = crate::context::render_world_state(
-            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[]),
+            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[], &[]),
             Some(&crate::context::WorldSnapshot::new(
                 &before_catalogue,
+                &[],
                 &[],
                 &[],
             )),
@@ -2566,6 +2570,7 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
@@ -2671,6 +2676,7 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
             crate::agent::test_roots(),

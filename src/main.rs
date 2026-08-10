@@ -23,6 +23,7 @@ mod frontend;
 mod history;
 mod image;
 mod mcp;
+mod memory;
 mod permission;
 mod provider;
 mod relay;
@@ -33,6 +34,7 @@ mod server;
 mod session;
 mod skills;
 mod stats;
+mod store;
 mod tokens;
 mod tools;
 
@@ -123,6 +125,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
+                cli::Command::Memory { action } => run_memory_subcommand(action).await,
                 cli::Command::Account { action } => {
                     run_account_subcommand(&session_manager, action).await
                 }
@@ -328,6 +331,7 @@ pub struct SharedDeps {
     pub mcp_manager: Option<Arc<mcp::McpClientManager>>,
     pub mcp_context: Arc<mcp::McpClientContext>,
     pub skills: Arc<skills::SkillCache>,
+    pub memories: Arc<memory::MemoryCache>,
     pub builtin_filter: crate::tools::BuiltinToolFilter,
     pub sandbox_capability: crate::sandbox::SandboxCapability,
     pub sandboxed_shell: bool,
@@ -388,7 +392,19 @@ pub async fn build_shared_deps(
             crate::sandbox::SandboxCapability::Unavailable
         );
 
-    let skills = crate::skills::SkillCache::discover();
+    // Both stores are instance-scoped, so one cache each serves every session this process runs.
+    // `disabled()` is distinct from an empty store: it keeps the subsystem's tools out of the
+    // registry entirely, which is the point of the config switch.
+    let skills = if config.skills_enabled {
+        crate::skills::SkillCache::discover()
+    } else {
+        crate::skills::SkillCache::disabled()
+    };
+    let memories = if config.memory_enabled {
+        crate::memory::MemoryCache::discover()
+    } else {
+        crate::memory::MemoryCache::disabled()
+    };
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
         config.builtin_disabled_tools.clone(),
@@ -431,6 +447,7 @@ pub async fn build_shared_deps(
         mcp_manager,
         mcp_context,
         skills,
+        memories,
         builtin_filter,
         sandbox_capability,
         sandboxed_shell,
@@ -453,6 +470,7 @@ struct AgentAssembly<'a> {
     provider: Arc<dyn provider::Provider>,
     mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
     skills: Arc<skills::SkillCache>,
+    memories: Arc<memory::MemoryCache>,
     builtin_filter: crate::tools::BuiltinToolFilter,
     agent_options: AgentOptions,
     session_stats: Arc<stats::SessionStats>,
@@ -494,6 +512,7 @@ async fn assemble_agent(
         bundle.session_manager.clone(),
         shared_session_id.clone(),
         bundle.skills.clone(),
+        bundle.memories.clone(),
         bundle.builtin_filter.clone(),
         cwd.clone(),
         Arc::clone(&roots),
@@ -514,6 +533,7 @@ async fn assemble_agent(
                 backend_probe: bundle.backend_probe.clone(),
                 builtin_filter: bundle.builtin_filter.clone(),
                 skills: bundle.skills.clone(),
+                memories: bundle.memories.clone(),
                 mcp_manager: bundle.mcp_manager.map(Arc::downgrade),
                 session_manager: bundle.session_manager.clone(),
                 parent_shared_session_id: shared_session_id.clone(),
@@ -549,6 +569,7 @@ async fn assemble_agent(
         todo_list,
         shared_session_id,
         bundle.skills.clone(),
+        bundle.memories.clone(),
         frontend,
         cwd,
         roots,
@@ -586,6 +607,7 @@ pub async fn build_session_agent(
         provider: Arc::clone(&shared.provider),
         mcp_manager: shared.mcp_manager.as_ref(),
         skills: shared.skills.clone(),
+        memories: shared.memories.clone(),
         builtin_filter: shared.builtin_filter.clone(),
         agent_options: shared.agent_options.clone(),
         session_stats: Arc::clone(&shared.session_stats),
@@ -649,12 +671,24 @@ async fn create_agent_from_config(
             crate::sandbox::SandboxCapability::Unavailable
         );
 
-    // Discover skills once at startup. Any malformed `SKILL.md` emits its `tracing::warn!` here
+    // Discover both stores once at startup. Any malformed entry emits its `tracing::warn!` here
     // (tracing is already initialized), so the user sees parse errors above the first prompt rather
-    // than interleaved with their first turn's output. The cache also drives mid-session auto-
-    // reload; `SkillCache::current()` re-snapshots on each turn and re-discovers only when the
-    // on-disk state changes.
-    let skills = crate::skills::SkillCache::discover();
+    // than interleaved with their first turn's output. The caches also drive mid-session auto-
+    // reload; `current()` re-snapshots on each turn and re-discovers only when the on-disk state
+    // changes.
+    //
+    // `disabled()` is distinct from an empty store: it keeps the subsystem's tools out of the
+    // registry entirely, which is the point of the config switch.
+    let skills = if config.skills_enabled {
+        crate::skills::SkillCache::discover()
+    } else {
+        crate::skills::SkillCache::disabled()
+    };
+    let memories = if config.memory_enabled {
+        crate::memory::MemoryCache::discover()
+    } else {
+        crate::memory::MemoryCache::disabled()
+    };
 
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
@@ -699,6 +733,7 @@ async fn create_agent_from_config(
         provider: Arc::clone(&provider),
         mcp_manager,
         skills: skills.clone(),
+        memories: memories.clone(),
         builtin_filter: builtin_filter.clone(),
         agent_options: agent_options.clone(),
         session_stats: Arc::clone(&session_stats),
@@ -1234,6 +1269,16 @@ async fn run_interactive(
                             eprintln!("no MCP servers configured");
                         }
                     },
+                    repl::SlashCommand::MemoryList => {
+                        if let Err(error) = memory::cli::run_list().await {
+                            render::render_error(&error);
+                        }
+                    }
+                    repl::SlashCommand::MemoryShow { name } => {
+                        if let Err(error) = memory::cli::run_show(&name).await {
+                            render::render_error(&error);
+                        }
+                    }
                     repl::SlashCommand::SkillList => {
                         if let Err(error) = skills::cli::run_list().await {
                             render::render_error(&error);
@@ -1856,9 +1901,19 @@ async fn run_tools_subcommand(
                 todo_list,
                 session_manager,
                 shared_session_id,
-                // `meka tools list` only prints the tool catalogue; skill metadata isn't read, so
-                // skip the filesystem walk.
-                crate::skills::SkillCache::for_root(None),
+                // `meka tools list` only prints the catalogue, so neither store's metadata is read
+                // and the filesystem walk is skipped. The switches still have to be honoured:
+                // this listing exists to show what a real session would have.
+                if config.skills_enabled {
+                    crate::skills::SkillCache::for_root(None)
+                } else {
+                    crate::skills::SkillCache::disabled()
+                },
+                if config.memory_enabled {
+                    crate::memory::MemoryCache::for_root(None)
+                } else {
+                    crate::memory::MemoryCache::disabled()
+                },
                 crate::tools::BuiltinToolFilter::default(),
                 std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -1901,6 +1956,34 @@ async fn run_tools_subcommand(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+async fn run_memory_subcommand(action: &cli::MemoryAction) -> anyhow::Result<()> {
+    match action {
+        cli::MemoryAction::List => memory::cli::run_list().await?,
+        cli::MemoryAction::Get { name } => memory::cli::run_get(name).await?,
+        cli::MemoryAction::Show { name } => memory::cli::run_show(name).await?,
+        cli::MemoryAction::Add {
+            name,
+            description,
+            priority,
+            body,
+            from_file,
+            force,
+        } => {
+            memory::cli::run_add(memory::cli::AddArgs {
+                name,
+                description,
+                priority: *priority,
+                body: body.as_deref(),
+                from_file: from_file.as_deref(),
+                force: *force,
+            })
+            .await?
+        }
+        cli::MemoryAction::Remove { name } => memory::cli::run_remove(name).await?,
     }
     Ok(())
 }

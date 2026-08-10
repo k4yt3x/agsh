@@ -34,8 +34,32 @@ pub struct ConfigFile {
     pub mcp: Option<McpConfig>,
     pub prompt: Option<PromptConfig>,
     pub tools: Option<ToolsConfig>,
+    pub skills: Option<SkillsConfig>,
+    pub memory: Option<MemoryConfig>,
     pub permissions: Option<PermissionsConfig>,
     pub serve: Option<ServeConfig>,
+}
+
+/// `[skills]` table: the user-authored skill store ([`crate::skills`]).
+///
+/// Same shape and rationale as [`MemoryConfig`]: config-only, no env var, no CLI flag. Turning it
+/// off keeps the `skill` tool's schema out of every request and stops the `[Skills]` section from
+/// rendering, for an installation that never uses skills.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    pub enabled: Option<bool>,
+}
+
+/// `[memory]` table: the agent's durable note store ([`crate::memory`]).
+///
+/// Config-only, with no env var and no CLI flag: whether an agent keeps memories is a property of
+/// the installation, not something to vary per run. Turning it off keeps the four `memory_*` tool
+/// schemas out of every request, which is the point for someone running lean coding sessions.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub enabled: Option<bool>,
 }
 
 /// `[serve]` table: HTTP server config for `meka serve`. All fields optional with sensible
@@ -605,6 +629,12 @@ pub struct ResolvedConfig {
     /// `[mcp]` default configured"; resolution falls through to the hardcoded Write.
     pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
+    /// Whether the `skill` tool is registered and the `[Skills]` index rendered. Defaults to
+    /// `true`; see [`SkillsConfig`].
+    pub skills_enabled: bool,
+    /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
+    /// `true`; see [`MemoryConfig`].
+    pub memory_enabled: bool,
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
@@ -928,7 +958,11 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
 /// Unix) and chmods the final file to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
 /// world-readable regardless of the user's umask.
-pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+///
+/// Not config-specific despite living here: the same durability and permission guarantees are what
+/// the Markdown stores under the config dir want, so `meka skill` bodies and [`crate::memory`]
+/// entries go through it too.
+pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
@@ -969,10 +1003,7 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     }
 
     let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no file name",
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
     let mut tmp_name = file_name.to_os_string();
     tmp_name.push(".tmp");
@@ -1326,6 +1357,16 @@ impl ResolvedConfig {
         let file_thinking = config_file.thinking.unwrap_or_default();
         let file_prompt = config_file.prompt.unwrap_or_default();
         let file_tools = config_file.tools.unwrap_or_default();
+        let skills_enabled = config_file
+            .skills
+            .unwrap_or_default()
+            .enabled
+            .unwrap_or(true);
+        let memory_enabled = config_file
+            .memory
+            .unwrap_or_default()
+            .enabled
+            .unwrap_or(true);
         // Destructure the [mcp] table into its two independent fields so we don't have to re-open
         // the config file later for resolution.
         let (
@@ -1543,6 +1584,8 @@ impl ResolvedConfig {
             mcp_servers,
             mcp_default_permission,
             user_instructions,
+            skills_enabled,
+            memory_enabled,
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
@@ -1634,7 +1677,7 @@ fn validate_max_output_tokens(
 mod device_id {
     use std::path::Path;
 
-    use super::{config_file_path, write_config_atomic};
+    use super::{config_file_path, write_file_atomic};
 
     /// Lookup order: configured → Claude Code's `~/.claude.json` userID → freshly generated. The
     /// claude.json fallback lets meka and Claude Code on the same machine share a device identity.
@@ -1725,7 +1768,7 @@ mod device_id {
         };
         table.insert("device_id", toml_edit::value(id));
 
-        write_config_atomic(path, &doc.to_string())
+        write_file_atomic(path, &doc.to_string())
     }
 }
 
@@ -2412,6 +2455,61 @@ model = "gpt-5.5"
     }
 
     #[test]
+    fn test_memory_and_skills_config_deserialization() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[memory]
+enabled = false
+
+[skills]
+enabled = true
+"#,
+        )
+        .expect("failed to parse toml");
+        assert_eq!(
+            config.memory.expect("memory table present").enabled,
+            Some(false)
+        );
+        assert_eq!(
+            config.skills.expect("skills table present").enabled,
+            Some(true)
+        );
+    }
+
+    /// Absent tables must stay absent rather than deserialising to something opinionated; the
+    /// default-on decision lives in `from_cli`'s `unwrap_or(true)`, not in the parsed shape.
+    #[test]
+    fn test_memory_and_skills_absent_by_default() {
+        let config: ConfigFile = toml::from_str("").expect("empty config parses");
+        assert!(config.memory.is_none());
+        assert!(config.skills.is_none());
+        assert!(MemoryConfig::default().enabled.is_none());
+        assert!(SkillsConfig::default().enabled.is_none());
+    }
+
+    /// Both tables are `deny_unknown_fields`, so a typo is a startup error rather than a setting
+    /// that silently does nothing.
+    #[test]
+    fn test_memory_and_skills_reject_unknown_keys() {
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[memory]
+enabeld = false
+"
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[skills]
+path = \"/tmp\"
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_session_config_deserialization() {
         let toml_str = r#"
 [session]
@@ -2967,10 +3065,10 @@ Rule 2.
     }
 
     #[test]
-    fn test_write_config_atomic_writes_content_and_no_tmp_left() {
+    fn test_write_file_atomic_writes_content_and_no_tmp_left() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("sub").join("config.toml");
-        write_config_atomic(&path, "[x]\nk = 1\n").expect("atomic write");
+        write_file_atomic(&path, "[x]\nk = 1\n").expect("atomic write");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read back"),
             "[x]\nk = 1\n"
@@ -2981,22 +3079,22 @@ Rule 2.
     }
 
     #[test]
-    fn test_write_config_atomic_overwrites_existing() {
+    fn test_write_file_atomic_overwrites_existing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "old contents that are LONGER than the new ones").expect("seed file");
-        write_config_atomic(&path, "new\n").expect("atomic overwrite");
+        write_file_atomic(&path, "new\n").expect("atomic overwrite");
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new\n");
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_write_config_atomic_sets_unix_permissions() {
+    fn test_write_file_atomic_sets_unix_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let parent = dir.path().join("meka");
         let path = parent.join("config.toml");
-        write_config_atomic(&path, "x = 1\n").expect("atomic write");
+        write_file_atomic(&path, "x = 1\n").expect("atomic write");
 
         let file_mode = std::fs::metadata(&path)
             .expect("stat file")

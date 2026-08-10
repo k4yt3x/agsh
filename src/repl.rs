@@ -100,6 +100,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "[name] [extra...]",
     },
     CommandSpec {
+        name: "memory",
+        aliases: &[],
+        help: "List saved memories, or show one by name",
+        arg_hint: "[name]",
+    },
+    CommandSpec {
         name: "mcp",
         aliases: &[],
         help: "Manage MCP servers and prompts",
@@ -511,6 +517,13 @@ pub enum SlashCommand {
     McpLogout {
         server: String,
     },
+    /// `/memory` (no argument): list saved memories, most important first.
+    MemoryList,
+    /// `/memory <name>`: print one memory's body, the in-session equivalent of
+    /// `meka memory show`.
+    MemoryShow {
+        name: String,
+    },
     /// `/skill` (no argument): list installed skills.
     SkillList,
     /// `/skill <name> [extra...]`: invoke a user-invocable skill directly. Anything the user types
@@ -575,6 +588,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "help" | "?" => Some(SlashCommand::Help),
         "clear" => Some(SlashCommand::Clear),
         "session" => Some(SlashCommand::Session),
+        "memory" => Some(parse_memory_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
         "export" => Some(SlashCommand::Export),
@@ -590,6 +604,23 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
                 .and_then(|s| s.trim().parse::<usize>().ok()),
         )),
         _ => None,
+    }
+}
+
+/// Parse the argument to `/memory …`.
+///
+/// - Empty argument (bare `/memory`) → list saved memories.
+/// - Otherwise the whole argument is a memory name to display. Unlike `/skill` there is no
+///   free-form trailer: showing a memory is a read, not a turn, so there is nothing to prepend it
+///   to. Extra tokens would be silently dropped, so they make the name invalid instead and the
+///   lookup reports it.
+fn parse_memory_slash(rest: &str) -> SlashCommand {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return SlashCommand::MemoryList;
+    }
+    SlashCommand::MemoryShow {
+        name: rest.to_string(),
     }
 }
 
@@ -870,6 +901,8 @@ pub fn run_repl(
                             | SlashCommand::McpReconnect { .. }
                             | SlashCommand::McpLogin { .. }
                             | SlashCommand::McpLogout { .. }
+                            | SlashCommand::MemoryList
+                            | SlashCommand::MemoryShow { .. }
                             | SlashCommand::SkillList
                             | SlashCommand::SkillInvoke { .. }
                             | SlashCommand::Status
@@ -2122,6 +2155,39 @@ mod tests {
         }
     }
 
+    /// Bare `/memory` lists. Mirrors `/skill`'s empty-argument behaviour.
+    #[test]
+    fn test_parse_memory_slash_empty_is_list() {
+        assert!(matches!(
+            parse_slash_command("/memory"),
+            Some(SlashCommand::MemoryList)
+        ));
+        assert!(matches!(
+            parse_slash_command("/memory   "),
+            Some(SlashCommand::MemoryList)
+        ));
+    }
+
+    /// `/memory <name>` shows that memory. It used to fall through to the bare-list arm, silently
+    /// discarding the name and listing everything instead.
+    #[test]
+    fn test_parse_memory_slash_shows_named_memory() {
+        match parse_slash_command("/memory alice-timezone") {
+            Some(SlashCommand::MemoryShow { name }) => assert_eq!(name, "alice-timezone"),
+            other => panic!("expected MemoryShow, got {:?}", option_label(&other)),
+        }
+    }
+
+    /// There is no `list` keyword, for the same reason `/skill` has none: it would shadow a
+    /// legitimately-named entry.
+    #[test]
+    fn test_parse_memory_slash_no_list_keyword() {
+        match parse_slash_command("/memory list") {
+            Some(SlashCommand::MemoryShow { name }) => assert_eq!(name, "list"),
+            other => panic!("expected MemoryShow, got {:?}", option_label(&other)),
+        }
+    }
+
     #[test]
     fn test_parse_skill_slash_empty_is_list() {
         assert!(matches!(
@@ -2206,6 +2272,8 @@ mod tests {
             Some(SlashCommand::McpLogin { .. }) => "McpLogin",
             Some(SlashCommand::McpLogout { .. }) => "McpLogout",
             Some(SlashCommand::McpPrompt { .. }) => "McpPrompt",
+            Some(SlashCommand::MemoryList) => "MemoryList",
+            Some(SlashCommand::MemoryShow { .. }) => "MemoryShow",
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",

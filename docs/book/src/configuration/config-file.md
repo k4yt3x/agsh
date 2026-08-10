@@ -1032,6 +1032,38 @@ disabled_tools = ["web_search", "fetch_url"]
 
 Sub-agents spawned via `spawn_agent` inherit the same filter; a disabled built-in is disabled everywhere. Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
 
+## `[skills]`
+
+Controls the user-authored skill store. See the [Skills](../usage/skills.md) guide.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Register the `skill` tool and render the skills index |
+
+```toml
+[skills]
+enabled = false
+```
+
+Setting `enabled = false` keeps the `skill` tool's schema out of every request and renders no skills section. Files already in `~/.config/meka/skills/` are left untouched.
+
+## `[memory]`
+
+Controls the agent's durable note store. See the [Memory](../usage/memory.md) guide.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Register the `memory_*` tools and render the memory index |
+
+```toml
+[memory]
+enabled = false
+```
+
+Setting `enabled = false` keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing for lean sessions that will never use it. Files already in `~/.config/meka/memory/` are left untouched.
+
+There is deliberately no environment variable and no CLI flag here: whether an agent keeps memories is a property of the installation, not something to vary per run.
+
 ## `[serve]`
 
 Configuration for `meka serve`, the HTTP API server. See the [HTTP API](../usage/http-api.md) usage guide for a full walkthrough.
