@@ -15,12 +15,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[memory] enabled` config (default true) to drop the memory tools and index entirely.
 - `[skills] enabled` config (default true) to drop the `skill` tool and skills index entirely.
 - `/memory <name>` prints one memory's body, matching `meka memory show`.
+- `[[mcp.servers]].required` and `meka mcp add --required` gate a turn on one server, not all.
+- `meka session delete --older-than-days <DAYS>` prunes old sessions on demand.
+
+### Changed
+
+- **Breaking:** `[mcp] strict` defaults to false; a server gates a turn only if `required = true`.
+- **Breaking:** `[session] retention_days` has no default; unset now keeps every session forever.
+- `[session] retention_days = 0` is now rejected; it would have deleted everything each startup.
+- A configured retention sweep now reports deletions at `warn` instead of `info`.
+- `GET /v1/health/ready` ignores failed *optional* MCP servers; only `required` ones mean 503.
+- **Breaking:** an unparseable `config.toml` is a startup error, not a silent fall back to defaults.
+
+### Removed
+
+- **Breaking:** `[session] max_storage_bytes` is gone; delete the key or meka won't start.
 
 ### Fixed
 
 - OpenAI-compatible streaming dropped a tool call or text that shared a chunk with `finish_reason`.
 - REPL text streamed before an interrupt or error no longer leaks into the next turn's output.
 - The skills and memory indexes no longer render when the tool that opens them is disabled.
+- Calling a tool from an unconnected MCP server said "Unknown tool" instead of naming the cause.
+- An unreachable MCP server logged its failure on every background retry, forever; now once.
+- `meka provider add <existing>` could overwrite a profile when `config.toml` failed to parse.
+- `meka provider remove` truncated `config.toml` to nothing when the file couldn't be read.
+- An absurdly large `retention_days` panicked the retention sweep instead of keeping everything.
 
 ## [0.37.0] - 2026-08-10
 

@@ -93,18 +93,26 @@ Scratchpad entries are scoped to a session. Two sessions can have entries with t
 
 ## History Retention
 
-meka automatically manages session storage on startup with sensible defaults:
+**meka never deletes sessions unless you ask it to.** Conversation history isn't reproducible, so there is no default cleanup by age and none at all by size.
 
-- **`retention_days`** (default: `90`): deletes sessions whose `updated_at` is older than this many days.
-- **`max_storage_bytes`** (default: `52428800` / 50 MB): when total message content exceeds this limit, the oldest sessions are deleted until the total is under the limit.
-
-You can override these defaults in the config file under `[session]`:
+If you do want a time window, set it explicitly:
 
 ```toml
 [session]
-retention_days = 30          # delete sessions not used in 30 days
-max_storage_bytes = 10485760 # cap total storage at ~10 MB
+retention_days = 30   # delete sessions not updated in 30 days, at startup
 ```
+
+With that set, meka deletes matching sessions when the agent starts and says so at `warn` level, so a deletion you configured is still a deletion you see. Unset (the default) keeps everything forever.
+
+To prune on demand instead, delete on your own schedule:
+
+```bash
+meka session delete --older-than-days 90   # same window, run when you choose
+meka session delete <id> [<id>…]           # specific sessions
+meka session delete --all                  # everything
+```
+
+Deleting a session also removes its messages, scratchpad entries, and any sub-agent children.
 
 See [Config File](../configuration/config-file.md#session) for details.
 
@@ -215,7 +223,7 @@ cat session.json | meka session import -
 
 The import preserves the full conversation, per-message timestamps, cumulative stats, and scratchpad entries. Because the provider and model are chosen at run time (not stored per session), a resumed import uses your currently-active provider.
 
-`updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than your `retention_days` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
+`updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than a configured `retention_days` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
 
 ## Forking a Session
 
@@ -258,6 +266,14 @@ Delete multiple sessions at once:
 ```bash
 meka session delete 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
+
+Delete every session not updated in the last N days:
+
+```bash
+meka session delete --older-than-days 90
+```
+
+This is the manual counterpart to [`retention_days`](#history-retention). It can't be combined with UUIDs or `--all`, and `0` is refused: it would match everything.
 
 Delete all sessions:
 

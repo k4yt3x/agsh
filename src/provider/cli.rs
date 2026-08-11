@@ -68,7 +68,13 @@ async fn run_add(
     if name.trim().is_empty() {
         anyhow::bail!("profile name cannot be empty");
     }
-    if config::load_config_file().providers.contains_key(name) {
+    // Hard-fails on an unparseable config rather than warning: this guard is the only thing
+    // standing between `provider add <existing>` and `upsert_profile_document` replacing the
+    // profile's table, and an empty parsed map defeats it.
+    if config::load_config_file_or_err()?
+        .providers
+        .contains_key(name)
+    {
         anyhow::bail!(
             "a profile named '{}' already exists. Use `meka provider login {}` to re-authenticate, \
              or `meka provider remove {}` first.",
@@ -124,7 +130,7 @@ async fn run_add(
 }
 
 async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
-    let config_file = config::load_config_file();
+    let config_file = config::load_config_file_or_err()?;
     let Some(profile) = config_file.providers.get(name) else {
         anyhow::bail!(
             "no provider profile named '{}'. Run `meka provider add {}` to create it.",
@@ -151,7 +157,7 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
 }
 
 fn run_use(name: &str) -> anyhow::Result<()> {
-    let config_file = config::load_config_file();
+    let config_file = config::load_config_file_or_err()?;
     if !config_file.providers.contains_key(name) {
         anyhow::bail!(
             "no provider profile named '{}' (configured: {})",
@@ -165,7 +171,7 @@ fn run_use(name: &str) -> anyhow::Result<()> {
 }
 
 async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
-    let config_file = config::load_config_file();
+    let config_file = config::load_config_file_or_err()?;
     if config_file.providers.is_empty() {
         println!("(no provider profiles configured)");
         return Ok(());
@@ -265,9 +271,19 @@ async fn acquire_credential(
 fn open_document() -> anyhow::Result<(std::path::PathBuf, toml_edit::DocumentMut)> {
     let path = config::config_file_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
-    let document = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .parse::<toml_edit::DocumentMut>()?;
+    // Only a genuinely absent file starts from empty. Treating *any* read failure as "" turns
+    // "I couldn't read your config" into "your config is blank", and the caller writes that blank
+    // document straight back over the real file: one non-UTF-8 byte or a mode-000 file, and
+    // `provider remove` truncates config.toml to nothing, profiles and MCP servers included. The
+    // `meka mcp` editors already tolerate `NotFound` only; this matches them.
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            anyhow::bail!("failed to read config at {}: {}", path.display(), error);
+        }
+    };
+    let document = contents.parse::<toml_edit::DocumentMut>()?;
     Ok((path, document))
 }
 
@@ -866,6 +882,46 @@ fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config meka can't read must never be treated as a config that is empty: `open_document`
+    /// hands its result to `write_file_atomic`, so "" here truncates the user's real file. This
+    /// wiped 159 bytes of profiles and MCP servers off a single non-UTF-8 byte in a comment, while
+    /// printing `ok:` and exiting 0.
+    #[test]
+    fn open_document_refuses_an_unreadable_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), b"# caf\xe9\n").expect("write");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every test
+        // that touches it, and the guard is held across the whole set → read → clear cycle.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = open_document();
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(_) => panic!("an unreadable config must not parse as empty"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("failed to read config"),
+            "{error}"
+        );
+    }
+
+    /// An absent file is the one case that legitimately starts from empty: `provider add` on a
+    /// fresh install has no config.toml to read yet.
+    #[test]
+    fn open_document_starts_empty_when_there_is_no_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = open_document();
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let (_, document) = result.expect("a missing config is not an error");
+        assert!(document.as_table().is_empty());
+    }
 
     #[test]
     fn test_generate_pkce_pair_challenge_is_sha256_of_verifier() {

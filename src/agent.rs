@@ -197,11 +197,9 @@ pub struct AgentOptions {
     /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
     /// `--instructions` overrides the config-file value.
     pub user_instructions: Option<String>,
-    /// Pre-turn MCP readiness gate. When true, a turn is rejected with `MekaError::McpTurnGated`
-    /// if any enabled server isn't `Connected` after [`Self::mcp_grace`].
-    pub mcp_strict: bool,
-    /// Max time to wait for still-`Pending` MCP servers to reach `Connected` before applying the
-    /// strict check.
+    /// Max time to wait for still-`Pending` MCP servers to settle before the readiness gate
+    /// decides. Which servers actually gate is per-server (`[[mcp.servers]].required`), so there
+    /// is no strictness flag here.
     pub mcp_grace: std::time::Duration,
     /// When `Some`, `run_turn` uses this string verbatim instead of invoking
     /// [`crate::context::build_system_prompt`]. Sub-agents set this to their stripped-down prompt
@@ -363,7 +361,9 @@ impl Agent {
     ///
     /// Doesn't call `set_mcp_manager`. MCP tool dispatch from the sub-agent's registry works
     /// without an attached manager because the adapters delegate through `Arc<ServerEntry>`
-    /// directly.
+    /// directly, and the paths that do need the manager (`load_tool`, the unknown-tool
+    /// explanation) reach it through the registry, which
+    /// [`crate::mcp::McpClientManager::install_tools_on`] wires up.
     #[allow(clippy::too_many_arguments)]
     pub fn new_subagent(
         provider: Arc<dyn Provider>,
@@ -390,7 +390,6 @@ impl Agent {
             streaming: false,
             auto_compact: false,
             context_window: 0,
-            mcp_strict: false,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
@@ -477,10 +476,9 @@ impl Agent {
 
     /// Per-turn MCP readiness gate. Applies to every turn (not just the
     /// first) so mid-session reconnects also gate cleanly. Awaits
-    /// `grace` for Pending servers to finish connecting; then:
-    /// - all enabled servers `Connected` → `Ok(())`.
-    /// - some still not Connected + `strict` → `Err(McpTurnGated)`.
-    /// - some still not Connected + `!strict` → `Ok(())` with a warn.
+    /// `grace` for Pending servers to finish connecting, then hands whatever is still not
+    /// `Connected` to [`gate_on_required_servers`], which rejects the turn only if one of them is
+    /// `required`.
     ///
     /// No-op when no MCP manager is attached (e.g. sub-agents).
     async fn await_mcp_ready(&self) -> Result<()> {
@@ -506,25 +504,8 @@ impl Agent {
         self.handle_mcp_not_ready(not_ready)
     }
 
-    fn handle_mcp_not_ready(
-        &self,
-        not_ready: Vec<(String, crate::mcp::ServerState)>,
-    ) -> Result<()> {
-        if self.options.mcp_strict {
-            let summary: Vec<(String, String)> = not_ready
-                .iter()
-                .map(|(name, state)| (name.clone(), state.label().to_string()))
-                .collect();
-            Err(MekaError::McpTurnGated { servers: summary })
-        } else {
-            let names: Vec<&str> = not_ready.iter().map(|(n, _)| n.as_str()).collect();
-            tracing::warn!(
-                "mcp: proceeding without {} server(s): {:?} (set [mcp].strict = true to gate)",
-                names.len(),
-                names
-            );
-            Ok(())
-        }
+    fn handle_mcp_not_ready(&self, not_ready: Vec<crate::mcp::NotConnected>) -> Result<()> {
+        gate_on_required_servers(not_ready)
     }
 
     pub async fn run_turn(
@@ -1484,6 +1465,17 @@ impl Agent {
         }
 
         let Some(tool) = self.tool_registry.get(name) else {
+            // A tool from a server that never connected was never registered, so it lands here.
+            // Saying "unknown" would be false - it exists and is unreachable - and would teach the
+            // agent to stop asking for a capability that may be seconds from returning.
+            //
+            // Asks the registry rather than `self.mcp_manager`: a sub-agent has no manager of its
+            // own (see `new_subagent`) but its registry does, and it deserves the same answer.
+            if let Some(manager) = self.tool_registry.mcp_manager()
+                && let Some(reason) = manager.unavailable_tool_reason(name).await
+            {
+                return crate::tools::ToolOutput::text(reason, true);
+            }
             return crate::tools::ToolOutput::text(format!("Unknown tool: '{}'", name), true);
         };
 
@@ -1886,6 +1878,55 @@ fn compute_compaction_split(view: &[Message], keep_budget: u64) -> (Vec<Message>
     }
 }
 
+/// Split the unavailable MCP servers into the ones that stop the turn and the ones that don't.
+///
+/// Only `required` servers gate. Whether a missing server should halt work is a property of that
+/// server, not of the installation - the same config runs on a workstation that has the binary and
+/// in a container that doesn't - so a single installation-wide switch could only ever be right for
+/// one of them. `[mcp].strict` survives as the default each server inherits.
+///
+/// A free function rather than a method because it reads nothing from the agent, which also makes
+/// the gating decision directly testable.
+fn gate_on_required_servers(not_ready: Vec<crate::mcp::NotConnected>) -> Result<()> {
+    let (required, optional): (Vec<_>, Vec<_>) =
+        not_ready.into_iter().partition(|server| server.required);
+
+    if !optional.is_empty() {
+        let names: Vec<&str> = optional.iter().map(|s| s.name.as_str()).collect();
+        // `debug!`, not `warn!`: this runs on *every* turn, and a server that is down stays down,
+        // so at warn level a single unreachable server would print a line before every reply for
+        // the life of the session. The connector already reports the failure once, and `/mcp list`
+        // in the REPL shows live state on demand; repeating it per turn is noise.
+        tracing::debug!(
+            "mcp: proceeding without {} optional server(s): {:?}",
+            names.len(),
+            names
+        );
+    }
+
+    if required.is_empty() {
+        return Ok(());
+    }
+    Err(MekaError::McpTurnGated {
+        servers: required
+            .iter()
+            .map(|server| {
+                // Carry the cause, not just the label. This message is the only thing the user gets
+                // when a required server blocks every turn, and the connector's warn fires once at
+                // startup and then stays quiet, so "ida (failed)" on its own leaves them with
+                // nothing to act on. The cause replaces the label rather than joining it: every
+                // one of them already describes a failure ("failed to spawn process: …"), so
+                // prefixing would render as "failed: failed to …".
+                let detail = match &server.state {
+                    crate::mcp::ServerState::Failed { error, .. } => error.clone(),
+                    other => other.label().to_string(),
+                };
+                (server.name.clone(), detail)
+            })
+            .collect(),
+    })
+}
+
 /// Whether an assistant turn produced any user-visible text: a `Text` block with non-whitespace
 /// content. `Thinking`, `ToolUse`, `ToolResult`, and `Image` blocks are not user-visible prose, so
 /// a thinking-only turn returns `false` here.
@@ -2126,6 +2167,78 @@ mod tests {
                 text: "answer".to_string(),
             },
         ]));
+    }
+
+    fn not_connected(name: &str, required: bool) -> crate::mcp::NotConnected {
+        crate::mcp::NotConnected {
+            name: name.to_string(),
+            required,
+            state: crate::mcp::ServerState::Failed {
+                error: "boom".to_string(),
+                at: std::time::Instant::now(),
+            },
+        }
+    }
+
+    /// The point of the change: an optional server that is down must not stop the session. A
+    /// container without `ida-mcp` should still run every turn that doesn't need IDA.
+    #[test]
+    fn test_optional_servers_do_not_gate_the_turn() {
+        assert!(gate_on_required_servers(vec![]).is_ok());
+        assert!(
+            gate_on_required_servers(vec![
+                not_connected("ida", false),
+                not_connected("exa", false)
+            ])
+            .is_ok()
+        );
+    }
+
+    /// The rejection must name the cause, not just "failed": it is the only thing the user sees
+    /// when a required server blocks every turn, and the connector's warn fires once and stops.
+    #[test]
+    fn test_required_server_gates_the_turn() {
+        let error = gate_on_required_servers(vec![not_connected("bridge", true)])
+            .expect_err("a required server must gate");
+        match error {
+            MekaError::McpTurnGated { servers } => {
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].0, "bridge");
+                // The cause, not the "failed" label: every cause already reads as a failure, so
+                // the label would only produce "failed: failed to ...".
+                assert_eq!(servers[0].1, "boom");
+            }
+            other => panic!("expected McpTurnGated, got {other:?}"),
+        }
+        assert!(
+            gate_on_required_servers(vec![crate::mcp::NotConnected {
+                name: "slow".to_string(),
+                required: true,
+                state: crate::mcp::ServerState::Pending,
+            }])
+            .expect_err("pending required server still gates")
+            .to_string()
+            .contains("pending")
+        );
+    }
+
+    /// A mixed fleet gates on the required one and names only it: listing the optional servers
+    /// would imply they are the problem.
+    #[test]
+    fn test_gate_names_only_the_required_servers() {
+        let error = gate_on_required_servers(vec![
+            not_connected("ida", false),
+            not_connected("bridge", true),
+            not_connected("exa", false),
+        ])
+        .expect_err("a required server must gate even alongside optional ones");
+        match error {
+            MekaError::McpTurnGated { servers } => {
+                let names: Vec<&str> = servers.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, vec!["bridge"]);
+            }
+            other => panic!("expected McpTurnGated, got {other:?}"),
+        }
     }
 
     #[test]

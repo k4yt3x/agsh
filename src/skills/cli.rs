@@ -393,22 +393,34 @@ fn truncate(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the global `MEKA_CONFIG_DIR` env var. Without this, tokio's
-    /// parallel test runner causes one test's tempdir to be observed by another test's
-    /// `discover_skills()`. `tokio::sync::Mutex` (rather than `std::sync::Mutex`) so the guard is
-    /// awaitable; tests must hold it across `.await` calls.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Holds the env-lock and clears `MEKA_CONFIG_DIR` when dropped, so the var never outlives the
+    /// tempdir it points at. The `config.rs` users of the same lock unset it symmetrically; leaving
+    /// it set here would mean two modules sharing one lock while disagreeing on what state they
+    /// hand back to each other.
+    struct ConfigDirGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under the lock; the guard field is dropped after this.
+            unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        }
+    }
 
     /// Acquire the env-lock and point `MEKA_CONFIG_DIR` at `temp`. The returned guard must be held
-    /// by the caller for the lifetime of the test; dropping it releases the lock so the next test
-    /// can run.
-    async fn isolate_config_dir(temp: &tempfile::TempDir) -> tokio::sync::MutexGuard<'static, ()> {
-        let guard = ENV_LOCK.lock().await;
+    /// by the caller for the lifetime of the test; dropping it clears the var and releases the lock
+    /// so the next test can run.
+    ///
+    /// Uses the crate-wide [`crate::config::CONFIG_DIR_ENV_LOCK`] rather than a lock private to
+    /// this module: the var is process-global, so a per-module lock leaves these tests racing the
+    /// ones in `config.rs`, and losing that race points `run_add` at the developer's real config
+    /// directory.
+    async fn isolate_config_dir(temp: &tempfile::TempDir) -> ConfigDirGuard {
+        let guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         // SAFETY: the mutex makes this access exclusive across tests in this process; no other code
         // reads the var while the lock is held. Matches the env-var override at
         // `src/config.rs:462-467`.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", temp.path()) };
-        guard
+        ConfigDirGuard(guard)
     }
 
     fn add_args<'a>(name: &'a str, description: &'a str) -> AddArgs<'a> {

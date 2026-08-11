@@ -30,6 +30,7 @@ Manage stored sessions: list them, export one as Markdown, or delete them.
 meka session list [-n <LIMIT>]          # default limit: 20
 meka session export <SESSION_ID> [-o <PATH>]   # -o - prints to stdout
 meka session delete <SESSION_ID>...
+meka session delete --older-than-days <DAYS>
 meka session delete --all
 ```
 

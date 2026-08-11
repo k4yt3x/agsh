@@ -72,6 +72,16 @@ pub async fn run_list(
             };
             let perm_label = config.permission.as_deref().unwrap_or("read");
 
+            // `required` is settled during config resolution, so `None` only shows up for a
+            // config assembled outside that path; it means the same thing as false. A disabled
+            // server is never started and so never gates, whatever `required` says, and this view
+            // has no State column to reveal that on its own.
+            let required_label = match (config.required.unwrap_or(false), config.disabled) {
+                (_, true) => "n/a (disabled)",
+                (true, false) => "yes",
+                (false, false) => "no",
+            };
+
             let mut row = vec![config.name.clone(), transport_label.to_string()];
             if with_state {
                 let state_label = states
@@ -80,6 +90,7 @@ pub async fn run_list(
                     .unwrap_or("(unknown)");
                 row.push(state_label.to_string());
             }
+            row.push(required_label.to_string());
             row.push(perm_label.to_string());
             row.push(target);
             row
@@ -87,9 +98,16 @@ pub async fn run_list(
         .collect();
 
     let headers: &[&str] = if with_state {
-        &["Name", "Transport", "State", "Permission", "Target"]
+        &[
+            "Name",
+            "Transport",
+            "State",
+            "Required",
+            "Permission",
+            "Target",
+        ]
     } else {
-        &["Name", "Transport", "Permission", "Target"]
+        &["Name", "Transport", "Required", "Permission", "Target"]
     };
     print!("{}", crate::render::format_columns(headers, &rows));
     Ok(())
@@ -106,6 +124,22 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
         McpTransport::Stdio => "stdio",
         McpTransport::Http => "http",
     });
+    // Same order as the `meka mcp list` columns. A disabled server is never started, so it never
+    // reaches the turn gate no matter what `required` says; claiming it "gates the turn" would be
+    // a flat falsehood, and `strict = true` seeds `required` on disabled servers too.
+    if config.disabled {
+        println!("required:    n/a (server is disabled)");
+        println!("disabled:    yes (skipped at startup)");
+    } else {
+        println!(
+            "required:    {}",
+            if config.required.unwrap_or(false) {
+                "yes (gates the turn)"
+            } else {
+                "no"
+            }
+        );
+    }
     println!(
         "permission:  {}",
         config.permission.as_deref().unwrap_or("read")
@@ -525,6 +559,10 @@ pub struct AddArgs {
     pub eager_load_tool: Vec<String>,
     /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
     pub tool_permission: Vec<String>,
+    /// Persist with `required = true` so an unavailable server gates the turn instead of being
+    /// skipped over. Omitted from the written table when false, which leaves the server inheriting
+    /// `[mcp].strict`.
+    pub required: bool,
     /// Persist with `disabled = true` so the server is skipped at startup until the user runs
     /// `meka mcp enable <name>`.
     pub disabled: bool,
@@ -556,6 +594,7 @@ struct ResolvedAddArgs {
     tool_permissions: Option<std::collections::HashMap<String, String>>,
     no_login: bool,
     disabled: bool,
+    required: bool,
 }
 
 /// Run `meka mcp add …`.
@@ -801,6 +840,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         eager_load_tool,
         tool_permission,
         disabled,
+        required,
     } = args;
 
     let looks_like_url = location
@@ -921,6 +961,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 tool_permissions,
                 no_login,
                 disabled,
+                required,
             })
         }
         McpTransport::Http => {
@@ -966,6 +1007,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 tool_permissions,
                 no_login,
                 disabled,
+                required,
             })
         }
     }
@@ -1126,6 +1168,7 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         eager_load_tools: resolved.eager_load_tools.clone(),
         tool_permissions: resolved.tool_permissions.clone(),
         disabled: resolved.disabled,
+        required: resolved.required.then_some(true),
     }
 }
 
@@ -1184,6 +1227,9 @@ fn build_server_table(resolved: &ResolvedAddArgs) -> toml_edit::Table {
     }
     if resolved.disabled {
         table.insert("disabled", toml_edit::value(true));
+    }
+    if resolved.required {
+        table.insert("required", toml_edit::value(true));
     }
     if let Some(auth) = &resolved.auth {
         table.insert("auth", toml_edit::Item::Table(auth_to_toml(auth)));
@@ -1436,6 +1482,7 @@ mod tests {
             eager_load_tool: Vec::new(),
             tool_permission: Vec::new(),
             disabled: false,
+            required: false,
         }
     }
 
@@ -1610,6 +1657,35 @@ mod tests {
             Some(crate::config::McpAuthConfig::OAuth { redirect_port: Some(8400), scopes: Some(s), .. })
             if s == &vec!["read".to_string(), "write".to_string()]
         ));
+    }
+
+    /// `--required` is written by exactly one `if` in `build_server_table`, and nothing else
+    /// asserts it. Without this, dropping that branch leaves `meka mcp add --required` silently
+    /// producing an optional server with the whole suite still green.
+    #[test]
+    fn build_server_table_persists_required_only_when_set() {
+        let round_trip = |required: bool| {
+            let mut args = bare_add("bridge", Some("http://127.0.0.1:9100/mcp"));
+            args.required = required;
+            let resolved = resolve_add_args(args).expect("resolve");
+            let mut doc = toml_edit::DocumentMut::new();
+            let mut servers = toml_edit::ArrayOfTables::new();
+            servers.push(build_server_table(&resolved));
+            doc.insert(
+                "mcp",
+                toml_edit::Item::Table({
+                    let mut table = toml_edit::Table::new();
+                    table.insert("servers", toml_edit::Item::ArrayOfTables(servers));
+                    table
+                }),
+            );
+            let parsed: crate::config::ConfigFile =
+                toml::from_str(&doc.to_string()).expect("valid config");
+            parsed.mcp.expect("mcp").servers.expect("servers")[0].required
+        };
+        assert_eq!(round_trip(true), Some(true));
+        // Left out entirely when false, so the server keeps inheriting `[mcp].strict`.
+        assert_eq!(round_trip(false), None);
     }
 
     #[test]

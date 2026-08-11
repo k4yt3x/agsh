@@ -172,6 +172,21 @@ pub enum ServerState {
 }
 
 impl ServerState {
+    /// Why this server can't serve a tool call right now, or `None` when it can.
+    ///
+    /// Deliberately terse and free of instructions: it states the condition and leaves the agent
+    /// to decide what to do. "Still connecting" and "failed" are kept distinct because they call
+    /// for opposite behaviour, and collapsing them produces an agent that either gives up too
+    /// early or retries forever.
+    pub fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            ServerState::Connected { .. } => None,
+            ServerState::Pending => Some("is still connecting".to_string()),
+            ServerState::Failed { error, .. } => Some(format!("is unavailable: {}", error)),
+            ServerState::Disabled => Some("is disabled in config".to_string()),
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             ServerState::Disabled => "disabled",
@@ -180,6 +195,16 @@ impl ServerState {
             ServerState::Failed { .. } => "failed",
         }
     }
+}
+
+/// One enabled server that isn't `Connected`, as reported by
+/// [`McpClientManager::enabled_not_connected`].
+#[derive(Clone)]
+pub struct NotConnected {
+    pub name: String,
+    /// Whether this server gates the turn. See [`crate::config::McpServerConfig::required`].
+    pub required: bool,
+    pub state: ServerState,
 }
 
 /// Holds the lifecycle state of a single MCP server plus reconnection machinery. Wrapped in an
@@ -226,21 +251,18 @@ impl ServerEntry {
     /// describing the current lifecycle state. Every tool dispatch / list-call path funnels through
     /// this so the "MCP X not ready" error surfaces at one site.
     pub(crate) async fn require_connected(&self) -> Result<Peer<RoleClient>> {
-        match &*self.state.read().await {
-            ServerState::Connected { service } => Ok(service.peer().clone()),
-            ServerState::Pending => Err(MekaError::McpConnection {
-                server_name: self.server_name.clone(),
-                message: "server is still connecting; try again".to_string(),
-            }),
-            ServerState::Failed { error, .. } => Err(MekaError::McpConnection {
-                server_name: self.server_name.clone(),
-                message: format!("server failed to connect: {}", error),
-            }),
-            ServerState::Disabled => Err(MekaError::McpConnection {
-                server_name: self.server_name.clone(),
-                message: "server is disabled in config".to_string(),
-            }),
+        let state = self.state.read().await;
+        if let ServerState::Connected { service } = &*state {
+            return Ok(service.peer().clone());
         }
+        // Same wording the unregistered-tool path uses, so one condition reads one way however the
+        // agent reached it.
+        Err(MekaError::McpConnection {
+            server_name: self.server_name.clone(),
+            message: state
+                .unavailable_reason()
+                .unwrap_or_else(|| "is unavailable".to_string()),
+        })
     }
 
     /// Transport-close check used by [`Self::reconnect`]. Returns false if the server isn't
@@ -531,7 +553,11 @@ impl McpClientManager {
     /// Sessions call this at `session/new` (after building their per-session
     /// [`crate::tools::ToolRegistry`]) and pair it with [`Self::detach_registry`] at
     /// `session/close`.
-    pub async fn attach_registry(&self, registry: crate::tools::ToolRegistry) {
+    /// Takes `&Arc<Self>` rather than `&self` so the registry can be handed a `Weak` back to the
+    /// manager. `load_tool` needs it to explain that a name it can't find belongs to a server that
+    /// isn't connected, rather than reporting it as unknown.
+    pub async fn attach_registry(self: &Arc<Self>, registry: crate::tools::ToolRegistry) {
+        registry.set_mcp_manager(Arc::downgrade(self));
         self.attached_registries
             .write()
             .await
@@ -604,18 +630,52 @@ impl McpClientManager {
     }
 
     /// Snapshot of enabled servers that are not currently `Connected` (still `Pending` or
-    /// `Failed`). Used by the per-turn strict gate to compose the rejection message.
-    pub async fn enabled_not_connected(&self) -> Vec<(String, ServerState)> {
+    /// `Failed`), each paired with whether it is `required`. [`crate::agent`]'s turn gate stops
+    /// only for the required ones; the rest are logged at `debug` and the session runs without
+    /// them. Deliberately not `warn`: this is consulted on every turn, and a server that is down
+    /// stays down, so warning here would print a line before every reply for the life of the
+    /// session.
+    pub async fn enabled_not_connected(&self) -> Vec<NotConnected> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {
             let state = entry.state().await;
             match state {
                 ServerState::Connected { .. } | ServerState::Disabled => {}
-                other => out.push((name.clone(), other)),
+                other => out.push(NotConnected {
+                    name: name.clone(),
+                    // `required` is settled in `ResolvedConfig::from_cli`, so `None` here can only
+                    // mean a config built outside that path (tests, `meka mcp add`); treat it as
+                    // optional, matching the default.
+                    required: entry.config.required.unwrap_or(false),
+                    state: other,
+                }),
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Why a `mcp__<server>__<tool>` name isn't callable, when the reason is the server rather
+    /// than the tool. `None` means this is not an MCP name, or names a server meka has never heard
+    /// of - both genuinely "unknown tool".
+    ///
+    /// Exists because a server that never connected registers no tools, so its names fall through
+    /// to the agent's unknown-tool arm and the model is told the tool does not exist. It does
+    /// exist; it is unreachable. An agent told "unknown" reasonably stops asking, which is the
+    /// wrong lesson when the server is still connecting or is one `meka mcp reconnect` away. The
+    /// prompt-level instructions, a skill, or a resumed conversation can all name a tool whose
+    /// server is currently down.
+    pub async fn unavailable_tool_reason(&self, tool_name: &str) -> Option<String> {
+        let rest = tool_name.strip_prefix("mcp__")?;
+        // Server names cannot contain `__` (`sanitize::normalize_server_name`), so the first
+        // occurrence splits server from tool.
+        let (server_name, _tool) = rest.split_once("__")?;
+        let entry = self.servers.get(server_name)?;
+        Some(format!(
+            "MCP server '{}' {}",
+            server_name,
+            entry.state().await.unavailable_reason()?
+        ))
     }
 
     pub fn server_entry(&self, server_name: &str) -> Option<Arc<ServerEntry>> {
@@ -763,6 +823,11 @@ impl McpClientManager {
     pub async fn install_tools_on(self: &Arc<Self>, registry: &crate::tools::ToolRegistry) {
         use crate::tools::Tool as _;
 
+        // Sub-agent registries come through here rather than `attach_registry`, so this is where
+        // they pick up the back-reference `load_tool` needs to explain an unconnected server. A
+        // sub-agent that reaches for a dead server's tool should get the same answer the parent
+        // would, not a bare "not registered".
+        registry.set_mcp_manager(Arc::downgrade(self));
         crate::tools::mcp_resources::register_all(registry, Arc::clone(self));
         for name in self.server_names() {
             let adapters = match self.discover_tools_for_server(&name).await {
@@ -1349,6 +1414,7 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             disabled: false,
+            required: None,
         }
     }
 
@@ -1660,6 +1726,179 @@ mod tests {
         })
     }
 
+    /// A server that never connected registers no tools, so its names reach the agent's
+    /// unknown-tool arm. Answering "unknown" would be false and would teach the agent the
+    /// capability is gone; this reports the server's state instead.
+    #[tokio::test]
+    async fn unavailable_tool_reason_names_the_server_state() {
+        let manager = McpClientManager::prepare(
+            &[bare_server_config("ida")],
+            None,
+            None,
+            McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+
+        let reason = manager
+            .unavailable_tool_reason("mcp__ida__decompile")
+            .await
+            .expect("a configured server must explain itself");
+        assert!(reason.contains("ida"), "{reason}");
+        assert!(reason.contains("still connecting"), "{reason}");
+
+        // Failed reads differently from Pending: the two call for opposite behaviour, and
+        // collapsing them yields an agent that either gives up early or retries forever.
+        *manager
+            .server_entry("ida")
+            .expect("entry")
+            .state
+            .write()
+            .await = ServerState::Failed {
+            error: "'ida-mcp' not found".to_string(),
+            at: std::time::Instant::now(),
+        };
+        let reason = manager
+            .unavailable_tool_reason("mcp__ida__decompile")
+            .await
+            .expect("failed server must explain itself");
+        assert!(reason.contains("unavailable"), "{reason}");
+        assert!(reason.contains("'ida-mcp' not found"), "{reason}");
+    }
+
+    /// Sub-agent registries come through `install_tools_on`, not `attach_registry`, so they need
+    /// the manager back-reference wired there too - otherwise a sub-agent reaching for a dead
+    /// server's tool gets a bare "not registered" while the parent gets the reason.
+    #[tokio::test]
+    async fn subagent_registry_also_explains_an_unconnected_server() {
+        use crate::tools::ToolRegistry;
+
+        let manager = McpClientManager::prepare(
+            &[bare_server_config("ida")],
+            None,
+            None,
+            McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+
+        let registry = ToolRegistry::new();
+        registry.register_load_tool_for_test();
+        manager.install_tools_on(&registry).await;
+
+        let load_tool = registry.get("load_tool").expect("load_tool registered");
+        let output = load_tool
+            .execute(
+                serde_json::json!({"name": "mcp__ida__decompile"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("load_tool returns Ok with an error payload");
+        let text = format!("{:?}", output.content);
+        assert!(text.contains("ida"), "{text}");
+        assert!(!text.contains("not registered"), "{text}");
+
+        // The same back-reference is what `Agent::resolve_and_execute_tool` reads when the model
+        // calls the tool outright instead of loading it: a sub-agent has no `mcp_manager` of its
+        // own, so the registry is the only route to the reason.
+        let from_registry = registry
+            .mcp_manager()
+            .expect("install_tools_on must record the manager")
+            .unavailable_tool_reason("mcp__ida__decompile")
+            .await;
+        assert!(from_registry.is_some_and(|reason| reason.contains("ida")));
+    }
+
+    /// `load_tool` is the path a model actually takes: the tool is absent from its catalogue, so
+    /// it reaches for the documented way to load a deferred tool first. Found by watching a real
+    /// model do exactly that and get "not registered" back.
+    #[tokio::test]
+    async fn load_tool_explains_an_unconnected_server() {
+        use crate::tools::ToolRegistry;
+
+        let manager = McpClientManager::prepare(
+            &[bare_server_config("ida")],
+            None,
+            None,
+            McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+
+        let registry = ToolRegistry::new();
+        registry.register_load_tool_for_test();
+        manager.attach_registry(registry.clone()).await;
+
+        let load_tool = registry.get("load_tool").expect("load_tool registered");
+        let output = load_tool
+            .execute(
+                serde_json::json!({"name": "mcp__ida__decompile"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("load_tool returns Ok with an error payload");
+
+        assert!(output.is_error);
+        let text = format!("{:?}", output.content);
+        assert!(text.contains("ida"), "{text}");
+        assert!(text.contains("still connecting"), "{text}");
+        assert!(!text.contains("not registered"), "{text}");
+    }
+
+    /// Genuinely unknown names must stay unknown, or the agent loses the signal that it invented
+    /// a tool.
+    #[tokio::test]
+    async fn unavailable_tool_reason_ignores_non_mcp_and_unconfigured_names() {
+        let manager = McpClientManager::prepare(
+            &[bare_server_config("ida")],
+            None,
+            None,
+            McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+
+        for name in [
+            "read_file",
+            "memory_write",
+            "mcp__nosuch__tool",
+            "mcp__malformed",
+            "mcp__",
+        ] {
+            assert!(
+                manager.unavailable_tool_reason(name).await.is_none(),
+                "'{name}' must fall through to unknown-tool"
+            );
+        }
+    }
+
+    /// The gate needs to know which unavailable servers actually stop a turn.
+    #[tokio::test]
+    async fn enabled_not_connected_reports_required() {
+        let mut optional = bare_server_config("ida");
+        optional.required = Some(false);
+        let mut gating = bare_server_config("bridge");
+        gating.required = Some(true);
+
+        let manager =
+            McpClientManager::prepare(&[optional, gating], None, None, McpClientContext::new())
+                .await
+                .expect("prepare");
+
+        let not_ready = manager.enabled_not_connected().await;
+        assert_eq!(not_ready.len(), 2);
+        let bridge = not_ready
+            .iter()
+            .find(|s| s.name == "bridge")
+            .expect("bridge listed");
+        assert!(bridge.required);
+        let ida = not_ready
+            .iter()
+            .find(|s| s.name == "ida")
+            .expect("ida listed");
+        assert!(!ida.required);
+    }
+
     #[tokio::test]
     async fn require_connected_errors_for_pending() {
         let entry = pending_entry("pending-srv", McpTransport::Http);
@@ -1744,7 +1983,7 @@ mod tests {
         );
         let not_ready = manager.enabled_not_connected().await;
         assert_eq!(not_ready.len(), 1);
-        assert_eq!(not_ready[0].0, "waiting");
+        assert_eq!(not_ready[0].name, "waiting");
     }
 
     #[test]

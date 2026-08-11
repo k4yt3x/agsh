@@ -157,11 +157,16 @@ pub struct McpConfig {
     /// unset the hardcoded fallback is `Write`, i.e. strict.
     pub default_permission: Option<String>,
     pub servers: Option<Vec<McpServerConfig>>,
-    /// When true (default), every turn is gated on all enabled MCP servers being `Connected`. If
-    /// any are not, the turn is rejected with a shell-style error instead of sending the request.
+    /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
+    /// gates the turn; when false (the default) only servers that opt in with `required = true`
+    /// do. A gated turn is rejected outright rather than sent to the model.
+    ///
+    /// Defaults to false because whether a missing server should stop the turn is a property of
+    /// that server, not of the installation: one that is essential on a workstation may be
+    /// irrelevant inside a container that lacks its binary.
     pub strict: Option<bool>,
-    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before applying
-    /// the strict check. Default: 3.
+    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before the
+    /// readiness gate decides. Default: 3.
     pub grace_seconds: Option<u64>,
     /// Per-server wrap around connect + `initialize` + `list_tools`. A hung stdio spawn or slow
     /// HTTPS handshake can't stall the whole fleet past this bound. Default: 30.
@@ -208,6 +213,13 @@ pub struct McpServerConfig {
     /// entry.
     #[serde(default)]
     pub disabled: bool,
+    /// Whether a turn may proceed while this server is unavailable. `None` inherits
+    /// [`McpConfig::strict`] (false by default), so a server is optional unless it says otherwise.
+    ///
+    /// The other half of the availability pair with [`Self::disabled`]: `disabled` says "don't
+    /// even try", `required` says "if trying failed, stop the turn". Resolved once in
+    /// [`ResolvedConfig::from_cli`], so every later consumer reads a plain `bool`.
+    pub required: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -412,10 +424,6 @@ pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x
 
 /// Max conversation messages kept in the per-turn API window by default.
 const DEFAULT_CONTEXT_MESSAGES: usize = 200;
-/// Default session-retention window, in days.
-const DEFAULT_RETENTION_DAYS: u64 = 90;
-/// Default cap on total session storage, in bytes (50 MiB).
-const DEFAULT_MAX_STORAGE_BYTES: u64 = 50 * 1024 * 1024;
 /// Default extended-thinking token budget.
 const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
@@ -477,8 +485,9 @@ impl std::str::FromStr for SandboxBackend {
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     pub context_messages: Option<usize>,
+    /// Delete sessions whose `updated_at` is older than this, at agent startup. Unset means keep
+    /// everything: conversation history is not reproducible, so meka never discards it unasked.
     pub retention_days: Option<u64>,
-    pub max_storage_bytes: Option<u64>,
     pub auto_compact: Option<bool>,
     pub context_window: Option<u64>,
     pub subagent_max_depth: Option<usize>,
@@ -562,6 +571,9 @@ pub struct ResolvedConfig {
     /// Set when profile selection failed (no profiles, ambiguous, or an unknown name); surfaced by
     /// [`Self::validate`] with guidance to run `meka provider add` / `use`.
     pub provider_error: Option<String>,
+    /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
+    /// since every other field is a default that silently ignores what the user wrote.
+    pub config_error: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub client_id: Option<String>,
@@ -595,8 +607,8 @@ pub struct ResolvedConfig {
     pub backend_probe: crate::sandbox::BackendProbe,
     pub render_mode: RenderMode,
     pub context_messages: Option<usize>,
+    /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
     pub retention_days: Option<u64>,
-    pub max_storage_bytes: Option<u64>,
     pub thinking_enabled: bool,
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
@@ -639,9 +651,6 @@ pub struct ResolvedConfig {
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
     pub input_style: nu_ansi_term::Style,
-    /// Per-turn MCP readiness gate. When true, a turn is rejected if any enabled server isn't
-    /// `Connected` after `mcp_grace`.
-    pub mcp_strict: bool,
     /// First-turn await cap for still-connecting MCP servers.
     pub mcp_grace: std::time::Duration,
     /// Per-server connect+initialize timeout.
@@ -1028,24 +1037,60 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     })
 }
 
-pub(crate) fn load_config_file() -> ConfigFile {
+/// Load `config.toml`, returning the parsed file and any error that stopped it from parsing.
+///
+/// A malformed config used to warn and fall back to `ConfigFile::default()`, which is the worst of
+/// the options: one mistyped key silently reconfigured the whole agent, running it with no provider
+/// profiles, no MCP servers and default permissions, off a single line the user could easily scroll
+/// past. The error is carried instead and raised by [`ResolvedConfig::validate`], alongside the
+/// profile-selection failures, so `from_cli` can stay infallible.
+///
+/// The line between failing and continuing is whether a command *consults* the parsed config. One
+/// that does can only answer from empty defaults, which reads as fact: `meka provider list`
+/// printing "(no provider profiles configured)" over a file full of them. Those callers use
+/// [`load_config_file_or_err`] / [`ResolvedConfig::require_readable_config`].
+///
+/// Commands that instead edit the raw document through `toml_edit` are unaffected by an unknown key
+/// and are how a broken config gets fixed from the CLI, so they run anyway: `meka mcp add` /
+/// `remove` / `enable` / `disable` note the failure via
+/// [`ResolvedConfig::warn_if_config_unreadable`], and `meka provider remove` never loads the parsed
+/// config at all. Each re-reads the file itself, and each must fail on a *read* error rather than
+/// substitute an empty document, or the write-back truncates what it couldn't read.
+pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
     let Some(path) = config_file_path() else {
-        return ConfigFile::default();
+        return (ConfigFile::default(), None);
     };
 
     match std::fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str(&contents) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!("failed to parse config file {}: {}", path.display(), error);
-                ConfigFile::default()
-            }
+            Ok(config) => (config, None),
+            Err(error) => (
+                ConfigFile::default(),
+                Some(format!("failed to parse {}: {}", path.display(), error)),
+            ),
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
-        Err(error) => {
-            tracing::warn!("failed to read config file {}: {}", path.display(), error);
-            ConfigFile::default()
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (ConfigFile::default(), None),
+        Err(error) => (
+            ConfigFile::default(),
+            Some(format!("failed to read {}: {}", path.display(), error)),
+        ),
+    }
+}
+
+/// [`load_config_file`] for callers that read profiles but have no `validate()` to route the error
+/// through: the `meka provider` and `meka account` subcommands.
+///
+/// Fails rather than falling back to an empty `ConfigFile`, because for these callers "empty" is
+/// indistinguishable from "your profiles are gone". `meka provider add <existing>` is the sharp
+/// edge: its duplicate guard is the parsed map, so an empty one lets the add through to
+/// `upsert_profile_document`, which replaces the profile's table wholesale and drops every field
+/// the flags didn't set. An unparseable config used to route the user straight into that ("no
+/// provider profile named 'work'. Run `meka provider add work` to create it.").
+pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
+    let (config_file, error) = load_config_file();
+    match error {
+        Some(error) => Err(crate::error::MekaError::Config(error)),
+        None => Ok(config_file),
     }
 }
 
@@ -1338,7 +1383,7 @@ pub(crate) fn select_active_profile(
 
 impl ResolvedConfig {
     pub fn from_cli(cli: &Cli) -> Self {
-        let config_file = load_config_file();
+        let (config_file, config_error) = load_config_file();
         let providers = config_file.providers;
         // Select the active profile: `--provider` flag, else `default_provider`, else the sole
         // profile. Absence / ambiguity / unknown name becomes a deferred error surfaced by
@@ -1379,19 +1424,26 @@ impl ResolvedConfig {
             Some(mcp) => (
                 mcp.default_permission,
                 mcp.servers.unwrap_or_default(),
-                mcp.strict.unwrap_or(true),
+                mcp.strict.unwrap_or(false),
                 std::time::Duration::from_secs(mcp.grace_seconds.unwrap_or(3)),
                 std::time::Duration::from_secs(mcp.connect_timeout_seconds.unwrap_or(30)),
             ),
             None => (
                 None,
                 Vec::new(),
-                true,
+                false,
                 std::time::Duration::from_secs(3),
                 std::time::Duration::from_secs(30),
             ),
         };
         apply_cli_eager_load_overrides(&cli.eager_load_tool, &mut mcp_servers);
+        // Settle `required` here so no later consumer has to remember that `None` means "inherit
+        // strict". Everything downstream reads a plain `Some(bool)`, and `strict` deliberately
+        // isn't carried on `ResolvedConfig`: a second copy of the same answer is one a future
+        // reader could gate on, believing it still decides turns on its own. It doesn't.
+        for server in &mut mcp_servers {
+            server.required = Some(server.required.unwrap_or(mcp_strict));
+        }
         let mcp_default_permission = match mcp_default_permission_str.as_deref() {
             Some(raw) => match raw.parse::<Permission>() {
                 Ok(permission) => Some(permission),
@@ -1516,6 +1568,7 @@ impl ResolvedConfig {
             provider_name,
             active_profile,
             provider_error,
+            config_error,
             model,
             base_url,
             client_id: active.and_then(|profile| profile.client_id.clone()),
@@ -1551,10 +1604,7 @@ impl ResolvedConfig {
             context_messages: file_session
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
-            retention_days: file_session.retention_days.or(Some(DEFAULT_RETENTION_DAYS)),
-            max_storage_bytes: file_session
-                .max_storage_bytes
-                .or(Some(DEFAULT_MAX_STORAGE_BYTES)),
+            retention_days: file_session.retention_days,
             thinking_enabled: cli
                 .thinking
                 .unwrap_or_else(|| file_thinking.enabled.unwrap_or(true)),
@@ -1594,7 +1644,6 @@ impl ResolvedConfig {
                 .as_deref()
                 .map(parse_input_style)
                 .unwrap_or_else(default_input_style),
-            mcp_strict,
             mcp_grace,
             mcp_connect_timeout,
             serve: config_file.serve,
@@ -1602,11 +1651,49 @@ impl ResolvedConfig {
         }
     }
 
+    /// Refuse to answer from empty defaults when `config.toml` didn't parse.
+    ///
+    /// For the subcommands that never reach [`Self::validate`] but do read the parsed config:
+    /// `meka mcp list` over a config full of servers would otherwise print "(no MCP servers
+    /// configured)", and `meka mcp get <name>` would say the server doesn't exist. Both are
+    /// indistinguishable from the truthful answer, which is what makes them worth failing on.
+    pub fn require_readable_config(&self) -> crate::error::Result<()> {
+        match &self.config_error {
+            Some(error) => Err(crate::error::MekaError::Config(error.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Note an unreadable `config.toml` without failing, for the commands that edit the raw
+    /// document through `toml_edit` and so work fine on one meka can't parse. They are how the file
+    /// gets repaired from the CLI, so they must run; the warning is there because their view of the
+    /// config is empty and any message they print about it would otherwise mislead.
+    pub fn warn_if_config_unreadable(&self) {
+        if let Some(error) = &self.config_error {
+            tracing::warn!("ignoring config file: {}", error);
+        }
+    }
+
     pub fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
         // specific guidance.
+        // Ahead of the provider check: with an unparsed config there are no profiles at all, and
+        // "no provider configured" would send the user chasing the wrong problem.
+        if let Some(error) = &self.config_error {
+            return Err(crate::error::MekaError::Config(error.clone()));
+        }
         if let Some(error) = &self.provider_error {
             return Err(crate::error::MekaError::Config(error.clone()));
+        }
+        // `retention_days = 0` means "delete anything not updated in the last zero days", i.e.
+        // every session, on every startup. Nobody means that, and the cost of guessing wrong is
+        // unrecoverable, so refuse rather than run it once and find out.
+        if self.retention_days == Some(0) {
+            return Err(crate::error::MekaError::Config(
+                "[session].retention_days = 0 would delete every session on each startup. \
+                 Remove the key to keep sessions forever, or use `meka session delete --all`."
+                    .to_string(),
+            ));
         }
         match self.provider_name.as_deref() {
             None => {
@@ -1772,6 +1859,16 @@ mod device_id {
     }
 }
 
+/// The one lock serialising every test in this crate that mutates `MEKA_CONFIG_DIR`.
+///
+/// The var is process-global and unit tests share a process, so a per-module lock only serialises a
+/// module against itself. Two of them are worse than none: while `src/skills/cli.rs` held its own
+/// lock, a config test's `remove_var` could land mid-test and send `skills::cli::run_add` at the
+/// developer's real `~/.config/meka`. A `tokio::sync::Mutex` because the skills tests are async and
+/// hold the guard across `.await`; the synchronous tests here take it with `blocking_lock`.
+#[cfg(test)]
+pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1794,6 +1891,7 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             disabled: false,
+            required: None,
         }
     }
 
@@ -2454,6 +2552,36 @@ model = "gpt-5.5"
         assert_eq!(profile.max_output_tokens, None);
     }
 
+    /// Deserialization only: `required` reaches the per-server config, and an omitted one stays
+    /// `None` so resolution can seed it from `strict`. What that resolution then produces is
+    /// covered by `test_strict_seeds_required_and_per_server_wins`.
+    #[test]
+    fn test_mcp_required_deserialization() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[mcp]
+strict = true
+
+[[mcp.servers]]
+name = "ida"
+transport = "stdio"
+command = "ida-mcp"
+required = false
+
+[[mcp.servers]]
+name = "bridge"
+transport = "http"
+url = "http://127.0.0.1:9100/mcp"
+"#,
+        )
+        .expect("parse");
+        let mcp = config.mcp.expect("mcp table");
+        assert_eq!(mcp.strict, Some(true));
+        let servers = mcp.servers.expect("servers");
+        assert_eq!(servers[0].required, Some(false), "explicit opt-out");
+        assert_eq!(servers[1].required, None, "inherits strict at resolve time");
+    }
+
     #[test]
     fn test_memory_and_skills_config_deserialization() {
         let config: ConfigFile = toml::from_str(
@@ -2515,13 +2643,154 @@ path = \"/tmp\"
 [session]
 context_messages = 100
 retention_days = 90
-max_storage_bytes = 52428800
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let session = config.session.expect("session should be present");
         assert_eq!(session.context_messages, Some(100));
         assert_eq!(session.retention_days, Some(90));
-        assert_eq!(session.max_storage_bytes, Some(52428800));
+    }
+
+    /// Builds a `ResolvedConfig` from a real config file, so the resolution steps in `from_cli`
+    /// are exercised rather than re-implemented in the test.
+    fn resolve_with_config(body: &str) -> ResolvedConfig {
+        use clap::Parser;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), body).expect("write config");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every test
+        // that touches it, and the guard is held across the whole set → resolve → clear
+        // cycle.
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let resolved = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        resolved
+    }
+
+    /// `strict` is only a default for `required`; every consumer downstream reads the per-server
+    /// flag, so if this resolution stopped happening `strict = true` would silently stop gating.
+    #[test]
+    fn test_strict_seeds_required_and_per_server_wins() {
+        let resolved = resolve_with_config(
+            r#"
+[mcp]
+strict = true
+
+[[mcp.servers]]
+name = "gates"
+transport = "http"
+url = "http://localhost/mcp"
+
+[[mcp.servers]]
+name = "optout"
+transport = "http"
+url = "http://localhost/mcp"
+required = false
+"#,
+        );
+        let by_name = |n: &str| {
+            resolved
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap_or_else(|| panic!("{n} present"))
+                .required
+        };
+        assert_eq!(by_name("gates"), Some(true), "inherits strict");
+        assert_eq!(by_name("optout"), Some(false), "explicit opt-out wins");
+    }
+
+    /// The default is off: an unavailable server degrades the session instead of stopping it.
+    #[test]
+    fn test_servers_are_optional_without_strict() {
+        let resolved = resolve_with_config(
+            r#"
+[[mcp.servers]]
+name = "ida"
+transport = "stdio"
+command = "ida-mcp"
+"#,
+        );
+        assert_eq!(resolved.mcp_servers[0].required, Some(false));
+        assert!(resolved.retention_days.is_none(), "no cleanup by default");
+    }
+
+    /// Zero is "delete everything, every startup". Refuse rather than discover it after the fact.
+    #[test]
+    fn test_retention_days_zero_is_rejected() {
+        // Needs a usable provider: `validate` reports a missing one first, and rightly so - it
+        // blocks the run outright, where retention only bites at the next startup sweep.
+        let resolved = resolve_with_config(
+            r#"
+default_provider = "p"
+
+[providers.p]
+type = "openai-api"
+model = "m"
+
+[session]
+retention_days = 0
+"#,
+        );
+        assert_eq!(
+            resolved.retention_days,
+            Some(0),
+            "fixture must actually set it"
+        );
+        let error = resolved
+            .validate()
+            .expect_err("retention_days = 0 must not be accepted");
+        assert!(error.to_string().contains("retention_days"), "{error}");
+    }
+
+    /// A config that doesn't parse must stop meka, not be swapped for defaults. The old fallback
+    /// meant one mistyped key silently ran the agent with no provider profiles, no MCP servers and
+    /// default permissions, off one warn line among the rest of startup.
+    #[test]
+    fn test_unparseable_config_is_reported_not_ignored() {
+        // `load_config_file` carries the parse failure; `validate` is what turns it into an exit.
+        let (file, error) = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("config.toml"), "[session]\nnot_a_key = 1\n")
+                .expect("write config");
+            // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every
+            // test that touches it, and the guard is held across the whole set → read →
+            // clear cycle.
+            let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+            unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+            let loaded = load_config_file();
+            unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+            loaded
+        };
+        assert!(
+            file.session.is_none(),
+            "a failed parse yields defaults, not partial config"
+        );
+        let error = error.expect("the parse failure must be reported");
+        assert!(error.contains("not_a_key"), "{error}");
+    }
+
+    /// Carrying the parse failure is only half of it: `validate` is what turns it into an exit.
+    /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
+    /// back to silently running the agent on defaults.
+    #[test]
+    fn test_validate_rejects_an_unparseable_config() {
+        let resolved = resolve_with_config("[session]\nnot_a_key = 1\n");
+        let error = resolved
+            .validate()
+            .expect_err("an unparseable config must not start the agent");
+        assert!(error.to_string().contains("not_a_key"), "{error}");
+        // Ahead of the provider check: this fixture has no profiles either, and "no provider
+        // configured" would send the user chasing the wrong problem.
+        assert!(resolved.provider_error.is_some(), "fixture has no profiles");
+    }
+
+    /// Size-based cleanup is gone, not merely defaulted off. The key must be rejected outright so
+    /// a config that still sets it fails loudly rather than silently no-longer-pruning.
+    #[test]
+    fn test_max_storage_bytes_is_rejected() {
+        let error = toml::from_str::<ConfigFile>("[session]\nmax_storage_bytes = 52428800\n")
+            .expect_err("the key must no longer parse");
+        assert!(error.to_string().contains("max_storage_bytes"), "{error}");
     }
 
     #[test]
@@ -2534,21 +2803,18 @@ context_messages = 50
         let session = config.session.expect("session should be present");
         assert_eq!(session.context_messages, Some(50));
         assert!(session.retention_days.is_none());
-        assert!(session.max_storage_bytes.is_none());
     }
 
     #[test]
     fn test_session_defaults_applied() {
         let file_session = SessionConfig::default();
         let context_messages = file_session.context_messages.or(Some(200));
-        let retention_days = file_session.retention_days.or(Some(90));
-        let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(context_messages, Some(200));
-        assert_eq!(retention_days, Some(90));
-        assert_eq!(max_storage_bytes, Some(52_428_800));
         assert_eq!(subagent_max_depth, 3);
+        // Retention has no default: unset means keep every session forever.
+        assert!(file_session.retention_days.is_none());
     }
 
     #[test]
@@ -2601,19 +2867,15 @@ permission = "write"
 [session]
 context_messages = 50
 retention_days = 30
-max_storage_bytes = 10485760
 subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let file_session = config.session.unwrap_or_default();
         let context_messages = file_session.context_messages.or(Some(200));
-        let retention_days = file_session.retention_days.or(Some(90));
-        let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(context_messages, Some(50));
-        assert_eq!(retention_days, Some(30));
-        assert_eq!(max_storage_bytes, Some(10_485_760));
+        assert_eq!(file_session.retention_days, Some(30));
         assert_eq!(subagent_max_depth, 5);
     }
 
@@ -2982,15 +3244,12 @@ Rule 2.
     /// tempdir-backed config to catch any regression where the env-var read silently no-ops.
     ///
     /// Touches process env, so it serializes against any other env-var test in this file via
-    /// `ENV_LOCK`.
+    /// [`CONFIG_DIR_ENV_LOCK`].
     #[test]
     fn test_env_var_overrides_config_file_instructions() {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        // The module-level lock, not a private one: a function-local static only serialises the
+        // test against itself, which let concurrent tests clobber each other's MEKA_CONFIG_DIR.
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -2999,7 +3258,7 @@ Rule 2.
         )
         .expect("write config.toml");
 
-        // SAFETY: ENV_LOCK serializes this with any other env-var test.
+        // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with any other env-var test.
         unsafe {
             std::env::set_var("MEKA_CONFIG_DIR", dir.path());
             std::env::set_var("MEKA_INSTRUCTIONS", "FROM ENV VAR");
@@ -3009,7 +3268,8 @@ Rule 2.
         let cli = crate::cli::Cli::parse_from(["meka"]);
         let resolved = ResolvedConfig::from_cli(&cli);
 
-        // SAFETY: same as above, ENV_LOCK held for the full set→read→clear cycle.
+        // SAFETY: same as above, the `CONFIG_DIR_ENV_LOCK` guard is held for the full
+        // set→read→clear cycle.
         unsafe {
             std::env::remove_var("MEKA_CONFIG_DIR");
             std::env::remove_var("MEKA_INSTRUCTIONS");

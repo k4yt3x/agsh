@@ -852,6 +852,7 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             disabled: false,
+            required: None,
         };
         let context = McpClientContext::new();
         let manager = McpClientManager::prepare(&[server_config], None, None, context)

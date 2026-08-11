@@ -110,12 +110,28 @@ pub enum SessionAction {
         format: SessionExportFormat,
     },
     /// Delete one or more sessions
+    ///
+    /// Examples:
+    ///   meka session delete 0e5f… 7a21…
+    ///   meka session delete --older-than-days 90
+    ///   meka session delete --all
+    #[command(verbatim_doc_comment)]
     Delete {
         /// Session UUIDs to delete
         session_ids: Vec<uuid::Uuid>,
         /// Delete all sessions
-        #[arg(long)]
+        #[arg(long, conflicts_with = "older_than_days")]
         all: bool,
+        /// Delete sessions not updated in this many days
+        ///
+        /// Conflicts with explicit IDs rather than ignoring them: a listed session younger than
+        /// the window would otherwise be silently spared.
+        #[arg(
+            long = "older-than-days",
+            value_name = "DAYS",
+            conflicts_with = "session_ids"
+        )]
+        older_than_days: Option<u64>,
     },
     /// Import a session from a JSON export
     ///
@@ -494,6 +510,10 @@ pub enum McpAction {
         /// Persist with disabled=true; re-enable via `meka mcp enable`
         #[arg(long = "disabled")]
         disabled: bool,
+
+        /// Gate turns on this server: reject the turn if it is not connected
+        #[arg(long = "required")]
+        required: bool,
     },
     /// Remove a server from config.toml and clear stored creds
     Remove { name: String },
@@ -805,12 +825,60 @@ mod tests {
         let cli = Cli::parse_from(["meka", "session", "delete", id, "--all"]);
         match cli.command {
             Some(Command::Session {
-                action: SessionAction::Delete { session_ids, all },
+                action:
+                    SessionAction::Delete {
+                        session_ids, all, ..
+                    },
             }) => {
                 assert_eq!(session_ids.len(), 1);
                 assert!(all);
             }
             other => panic!("expected session delete, got {:?}", other),
+        }
+    }
+
+    /// The manual replacement for size-based auto-cleanup, so it has to actually parse.
+    #[test]
+    fn test_cli_session_delete_older_than_days() {
+        let cli = Cli::parse_from(["meka", "session", "delete", "--older-than-days", "90"]);
+        match cli.command {
+            Some(Command::Session {
+                action:
+                    SessionAction::Delete {
+                        session_ids,
+                        all,
+                        older_than_days,
+                    },
+            }) => {
+                assert!(session_ids.is_empty());
+                assert!(!all);
+                assert_eq!(older_than_days, Some(90));
+            }
+            other => panic!("expected session delete, got {:?}", other),
+        }
+    }
+
+    /// Both other selectors must be refused alongside it. `--all` because the two windows
+    /// disagree, and explicit IDs because a listed session younger than the window would be
+    /// silently spared while the user watched a different count come back.
+    #[test]
+    fn test_cli_session_delete_older_than_days_conflicts() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        for args in [
+            vec![
+                "meka",
+                "session",
+                "delete",
+                "--older-than-days",
+                "90",
+                "--all",
+            ],
+            vec!["meka", "session", "delete", "--older-than-days", "90", id],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} must be rejected"
+            );
         }
     }
 

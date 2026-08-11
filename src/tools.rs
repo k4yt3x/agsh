@@ -284,6 +284,13 @@ pub struct ToolRegistry {
     /// Files read this session, shared with the file tools so `edit_file` can require a prior
     /// read. Cleared on conversation compaction.
     read_tracker: ReadTracker,
+    /// Back-reference to the MCP manager, filled in by
+    /// [`crate::mcp::McpClientManager::attach_registry`] for session registries and
+    /// [`crate::mcp::McpClientManager::install_tools_on`] for sub-agent ones. Both `load_tool` and
+    /// `Agent::resolve_and_execute_tool` read it to distinguish "no such tool" from "that tool's
+    /// server isn't connected". `Weak` because the manager owns the registry list, not the other
+    /// way round.
+    mcp_manager: Arc<std::sync::OnceLock<std::sync::Weak<crate::mcp::McpClientManager>>>,
 }
 
 impl ToolRegistry {
@@ -303,6 +310,7 @@ impl ToolRegistry {
             deferred: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_overrides: Arc::new(overrides),
             builtin_filter: Arc::new(filter),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
             read_tracker: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -367,6 +375,34 @@ impl ToolRegistry {
                 deferred.remove(name);
             }
         }
+    }
+
+    /// Register just `load_tool`, for tests that exercise its unfindable-name path against a real
+    /// registry + manager pair without building the whole builtin set.
+    #[cfg(test)]
+    pub(crate) fn register_load_tool_for_test(&self) {
+        self.register_builtin(Arc::new(load_tool::LoadToolTool {
+            tools: Arc::downgrade(&self.tools),
+            deferred: Arc::downgrade(&self.deferred),
+            mcp_manager: Arc::downgrade(&self.mcp_manager),
+        }));
+    }
+
+    /// Record the manager whose servers back this registry's MCP tools. Called by
+    /// [`crate::mcp::McpClientManager::attach_registry`] (session registries) and
+    /// [`crate::mcp::McpClientManager::install_tools_on`] (sub-agent registries); a second call is
+    /// ignored, since a registry is only ever wired to one manager.
+    pub(crate) fn set_mcp_manager(&self, manager: std::sync::Weak<crate::mcp::McpClientManager>) {
+        // `set` fails only when the slot is already filled, which is the documented no-op.
+        let _already_set = self.mcp_manager.set(manager);
+    }
+
+    /// The manager recorded by [`Self::set_mcp_manager`], if it is still alive.
+    ///
+    /// The registry is the right place to ask "which manager owns these tools": a sub-agent's
+    /// [`crate::agent::Agent`] has no `mcp_manager` of its own, but its registry does.
+    pub(crate) fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpClientManager>> {
+        self.mcp_manager.get()?.upgrade()
     }
 
     /// Mark a tool as deferred. Deferred tools live in the registry but are hidden from the
@@ -625,6 +661,7 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
             deferred: Arc::downgrade(&self.deferred),
+            mcp_manager: Arc::downgrade(&self.mcp_manager),
         }));
         // Both stores register their tools only when the subsystem is switched on. Skipping is
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
@@ -757,9 +794,14 @@ impl ToolRegistry {
     }
 
     /// Build a tool registry for sub-agents. Sub-agents get the same session-scoped tools as the
-    /// parent (load_tool, skill, render_image, todo_*, scratchpad_*) scoped to their own ephemeral
-    /// child session. `spawn_agent` remains absent; sub-agents cannot recursively spawn further
-    /// sub-agents.
+    /// parent (load_tool, skill, memory_*, render_image, todo, scratchpad_*) scoped to their own
+    /// ephemeral child session.
+    ///
+    /// `spawn_agent` is deliberately not registered here, but sub-agents *can* nest: the caller
+    /// adds it afterwards when the recursion budget allows (`SpawnAgentTool::execute`), because
+    /// the child's depth counters aren't known until the parent's `max_depth` override has been
+    /// resolved. Registering it outside this builder mirrors the root's own registration in
+    /// `assemble_agent`.
     ///
     /// `parent_session_id` + `inherited_scratchpad_names` enable read-only scratchpad inheritance:
     /// `scratchpad_read` falls back to the parent for allowlisted names, and `scratchpad_list`

@@ -95,7 +95,7 @@ pub(super) async fn run_connector(
     // ever transitions out of `Failed`: `require_connected` rejects, `needs_reconnect` ignores any
     // state but `Connected`, and `meka mcp reconnect` builds a throwaway manager rather than
     // healing this one. A server that was thirty seconds slow to boot would stay dead for the life
-    // of the process, and under `[mcp].strict` (the default) take every turn down with it.
+    // of the process, and take every turn down with it if it is `required`.
     for entry in all_entries {
         if matches!(entry.state().await, ServerState::Failed { .. }) {
             tokio::spawn(retry_until_connected(
@@ -187,6 +187,40 @@ async fn retry_until_connected(
     }
 }
 
+/// Whether `cause` is the same failure the entry is already sitting on, and so not worth
+/// repeating. A *changed* cause is new information (a server that went from "not found" to
+/// "connection refused" is a different problem) and is announced.
+fn is_repeat_failure(state: &ServerState, cause: &str) -> bool {
+    matches!(state, ServerState::Failed { error, .. } if error == cause)
+}
+
+/// Record a failed connect on `entry`, announcing it only when it tells the user something new.
+///
+/// A server that is down stays down, and [`retry_until_connected`] keeps trying every five minutes
+/// for the life of the process. Logging each attempt at `warn!` meant a missing binary or an
+/// unreachable endpoint printed forever, on top of an idle REPL prompt, long after the user had
+/// read the message the first time. The first failure - and any *change* of cause - is worth
+/// saying; a repeat of the same one is not.
+async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cause: String) {
+    let repeat = {
+        let state = entry.state.read().await;
+        is_repeat_failure(&state, &cause)
+    };
+    if repeat {
+        tracing::debug!("MCP server '{}' still unavailable: {}", server_name, cause);
+    } else {
+        tracing::warn!(
+            "failed to connect to MCP server '{}': {} (retrying in the background)",
+            server_name,
+            cause
+        );
+    }
+    *entry.state.write().await = ServerState::Failed {
+        error: cause,
+        at: std::time::Instant::now(),
+    };
+}
+
 /// Connect a single `Pending` server: wrap the existing `connect_server` in a per-server timeout,
 /// capture instructions, discover + register tools into the registry, and flip the entry's state to
 /// `Connected` on success or `Failed` on error. Never panics; errors are logged and reflected in
@@ -223,40 +257,26 @@ async fn connect_one(
 
     let connected = match connect_task.await {
         Ok(Ok(Ok(service))) => service,
+        // Store the bare cause. `MekaError::McpConnection` renders as
+        // "MCP connection error: <server>: <message>", and every consumer of this string
+        // (`meka mcp list`, the turn-gate summary, the agent-facing tool error) already names the
+        // server, so keeping the prefix would say it twice.
         Ok(Ok(Err(error))) => {
-            tracing::warn!(
-                "failed to connect to MCP server '{}': {}",
-                server_name,
-                error
-            );
-            *entry.state.write().await = ServerState::Failed {
-                error: error.to_string(),
-                at: std::time::Instant::now(),
+            let cause = match &error {
+                MekaError::McpConnection { message, .. } => message.clone(),
+                other => other.to_string(),
             };
+            record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
         Ok(Err(_elapsed)) => {
-            tracing::warn!(
-                "MCP server '{}' connect timed out after {:?}",
-                server_name,
-                connect_timeout
-            );
-            *entry.state.write().await = ServerState::Failed {
-                error: format!("connect timed out after {:?}", connect_timeout),
-                at: std::time::Instant::now(),
-            };
+            let cause = format!("connect timed out after {:?}", connect_timeout);
+            record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
         Err(join_error) => {
-            tracing::warn!(
-                "MCP server '{}' connect task panicked: {}",
-                server_name,
-                join_error
-            );
-            *entry.state.write().await = ServerState::Failed {
-                error: format!("connect task join error: {}", join_error),
-                at: std::time::Instant::now(),
-            };
+            let cause = format!("connect task join error: {}", join_error);
+            record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
     };
@@ -518,7 +538,13 @@ pub(super) async fn connect_server(
                 .spawn()
                 .map_err(|error| MekaError::McpConnection {
                     server_name: server_name.to_string(),
-                    message: format!("failed to spawn process: {}", error),
+                    // `NotFound` from spawn means the program isn't on PATH, which reads as a
+                    // bare "No such file or directory" without saying which file. Name it.
+                    message: if error.kind() == std::io::ErrorKind::NotFound {
+                        format!("failed to spawn process: '{}' not found", command_str)
+                    } else {
+                        format!("failed to spawn process: {}", error)
+                    },
                 })?;
             if let Some(stderr) = stderr {
                 forward_child_stderr(server_name.to_string(), stderr);
@@ -604,6 +630,56 @@ mod tests {
     use super::*;
     use crate::config::{McpServerConfig, McpTransport};
 
+    /// A dead server is retried every five minutes for the life of the process. Announcing each
+    /// attempt buried an idle REPL prompt in identical warnings long after the user had read the
+    /// first one, so only a new or changed cause is worth saying out loud.
+    #[test]
+    fn repeat_failure_is_recognised_and_a_changed_cause_is_not() {
+        let same = ServerState::Failed {
+            error: "'ida-mcp' not found".to_string(),
+            at: std::time::Instant::now(),
+        };
+        assert!(is_repeat_failure(&same, "'ida-mcp' not found"));
+        assert!(
+            !is_repeat_failure(&same, "connection refused"),
+            "a different cause is new information and must be announced"
+        );
+        // The first failure of all, from Pending, is never a repeat.
+        assert!(!is_repeat_failure(
+            &ServerState::Pending,
+            "'ida-mcp' not found"
+        ));
+        assert!(!is_repeat_failure(&ServerState::Disabled, "anything"));
+    }
+
+    #[tokio::test]
+    async fn record_connect_failure_stores_the_bare_cause() {
+        let entry = bare_entry("ida");
+        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string()).await;
+        match &*entry.state.read().await {
+            ServerState::Failed { error, .. } => assert_eq!(error, "'ida-mcp' not found"),
+            other => panic!("expected Failed, got {}", other.label()),
+        }
+        // A second identical failure keeps the state and stays quiet.
+        record_connect_failure(&entry, "ida", "'ida-mcp' not found".to_string()).await;
+        assert!(matches!(
+            &*entry.state.read().await,
+            ServerState::Failed { .. }
+        ));
+    }
+
+    fn bare_entry(name: &str) -> Arc<ServerEntry> {
+        Arc::new(ServerEntry {
+            server_name: name.to_string(),
+            config: bare_server_config(name),
+            token_store: None,
+            client_context: McpClientContext::new(),
+            state: RwLock::new(ServerState::Pending),
+            reconnect_lock: Mutex::new(()),
+            instructions: std::sync::OnceLock::new(),
+        })
+    }
+
     fn bare_server_config(name: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -622,6 +698,50 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             disabled: false,
+            required: None,
+        }
+    }
+
+    /// The container case: the configured command simply isn't installed. A bare "No such file or
+    /// directory" doesn't say *which* file, and that is the whole diagnosis.
+    ///
+    /// Unix-only: on Windows a shim command (`npx`, `*.cmd`) is launched through `cmd /c`, which
+    /// spawns successfully and fails later in the handshake, so the spawn-time name is not
+    /// available to report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_stdio_binary_names_the_command() {
+        let mut config = bare_server_config("ida");
+        config.transport = McpTransport::Stdio;
+        config.command = Some("meka-no-such-binary-xyz".to_string());
+        config.url = None;
+
+        let entry = Arc::new(ServerEntry {
+            server_name: "ida".to_string(),
+            config,
+            token_store: None,
+            client_context: McpClientContext::new(),
+            state: RwLock::new(ServerState::Pending),
+            reconnect_lock: Mutex::new(()),
+            instructions: std::sync::OnceLock::new(),
+        });
+        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
+            .await
+            .expect("empty manager");
+        connect_one(
+            Arc::clone(&entry),
+            manager,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        match &*entry.state.read().await {
+            ServerState::Failed { error, .. } => {
+                assert!(error.contains("meka-no-such-binary-xyz"), "{error}");
+                assert!(error.contains("not found"), "{error}");
+            }
+            other => panic!("expected Failed, got {}", other.label()),
         }
     }
 

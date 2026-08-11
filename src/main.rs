@@ -202,14 +202,20 @@ async fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
 /// When the user sets `RUST_LOG`, we honour it verbatim; no hidden
 /// overrides. Debugging with `RUST_LOG=rmcp=debug` works as expected.
 /// Otherwise we start from `log_level` (derived from `-v` / `-vv`) and
-/// add a single directive that downgrades rmcp's SSE-reconnect warning
-/// to `error`:
+/// add directives that quiet two rmcp log sites which fire on every retry:
 ///
-/// MCP servers behind a CDN / edge (Cloudflare, Fastly, …) close idle HTTP streams after ~100 s,
-/// which trips `rmcp::transport::common::client_side_sse`'s `warn!("sse stream error: …")` before
-/// rmcp transparently reconnects via `Last-Event-ID`. The warn fires on every expected reconnect;
-/// the real failure mode (`"max retry times reached"`) is emitted at `error!` from the same module,
-/// so an `=error` floor keeps the useful signal and drops the noise. Verified against rmcp 1.5.
+/// 1. MCP servers behind a CDN / edge (Cloudflare, Fastly, …) close idle HTTP streams after ~100 s,
+///    which trips `rmcp::transport::common::client_side_sse`'s `warn!("sse stream error: …")`
+///    before rmcp transparently reconnects via `Last-Event-ID`. The warn fires on every expected
+///    reconnect; the real failure mode (`"max retry times reached"`) is emitted at `error!` from
+///    the same module, so an `=error` floor keeps the useful signal and drops the noise.
+/// 2. `rmcp::transport::worker` emits `error!("worker quit with fatal: …")` each time a transport
+///    fails to come up. A configured-but-unreachable server is retried in the background for the
+///    life of the process, so that lands on the user's prompt every few minutes, at `error` level,
+///    saying nothing meka hasn't already reported once itself through `record_connect_failure`.
+///    Silenced outright rather than floored, because the noise *is* the error level.
+///
+/// Verified against rmcp 2.1. `RUST_LOG` short-circuits both, so nothing is permanently hidden.
 fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     if let Some(value) = rust_log
@@ -220,10 +226,16 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
     // The directive string is a compile-time literal in a known-good shape; `.parse()` failing
     // would mean we shipped a malformed directive, caught on first test.
     #[allow(clippy::expect_used)]
-    let directive = "rmcp::transport::common::client_side_sse=error"
+    let sse = "rmcp::transport::common::client_side_sse=error"
         .parse()
         .expect("valid tracing directive");
-    EnvFilter::new(log_level).add_directive(directive)
+    #[allow(clippy::expect_used)]
+    let worker = "rmcp::transport::worker=off"
+        .parse()
+        .expect("valid tracing directive");
+    EnvFilter::new(log_level)
+        .add_directive(sse)
+        .add_directive(worker)
 }
 
 async fn async_main(
@@ -247,24 +259,21 @@ async fn async_main(
     let session_manager = SessionManager::open(None).await?;
     let token_store = session_manager.token_store();
 
+    // Opt-in only, and never by size. Conversation history is not reproducible, and a byte budget
+    // is unpredictable in a way a time window is not: which sessions it takes depends on the total
+    // corpus, so one long conversation today can silently destroy an unrelated one from months
+    // ago. `warn!` rather than `info!` because a deletion the user configured is still a deletion
+    // they should see at the default log level.
     if let Some(retention_days) = config.retention_days {
         let deleted = session_manager
             .delete_expired_sessions(retention_days)
             .await?;
         if deleted > 0 {
-            tracing::info!("deleted {} expired sessions", deleted);
-        }
-    }
-
-    if let Some(max_bytes) = config.max_storage_bytes {
-        // Startup eviction: no sessions are opened yet, so the active set is empty. The signature
-        // is still required for mid-run callers that want to protect live sessions.
-        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let deleted = session_manager
-            .enforce_storage_limit(max_bytes, &active)
-            .await?;
-        if deleted > 0 {
-            tracing::info!("deleted {} sessions to enforce storage limit", deleted);
+            tracing::warn!(
+                "deleted {} session(s) older than {} days ([session].retention_days)",
+                deleted,
+                retention_days
+            );
         }
     }
 
@@ -427,7 +436,6 @@ pub async fn build_shared_deps(
         auto_compact: config.auto_compact,
         context_window,
         user_instructions: config.user_instructions.clone(),
-        mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
         system_prompt_override: None,
     };
@@ -715,7 +723,6 @@ async fn create_agent_from_config(
         auto_compact: config.auto_compact,
         context_window,
         user_instructions: config.user_instructions.clone(),
-        mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
         // Parent builds its system prompt dynamically per-turn via context::build_system_prompt.
         // Sub-agents override.
@@ -1782,6 +1789,21 @@ async fn run_mcp_subcommand(
     cli_args: &cli::Cli,
 ) -> anyhow::Result<()> {
     let config = ResolvedConfig::from_cli(cli_args);
+    // `validate()` never runs here, so an unparseable config has to be handled per action. The four
+    // that edit `config.toml` through `toml_edit` never read `config.mcp_servers` and are how the
+    // file gets repaired, so they run on a broken one; the rest would answer out of an empty server
+    // list and state it as fact ("(no MCP servers configured)", "no MCP server named 'x'").
+    if matches!(
+        action,
+        cli::McpAction::Add { .. }
+            | cli::McpAction::Remove { .. }
+            | cli::McpAction::Enable { .. }
+            | cli::McpAction::Disable { .. }
+    ) {
+        config.warn_if_config_unreadable();
+    } else {
+        config.require_readable_config()?;
+    }
     let token_store = session_manager.token_store();
     match action {
         cli::McpAction::List => mcp::cli::run_list(&config.mcp_servers, None).await?,
@@ -1826,6 +1848,7 @@ async fn run_mcp_subcommand(
             eager_load_tool,
             tool_permission,
             disabled,
+            required,
         } => {
             mcp::cli::run_add(
                 mcp::cli::AddArgs {
@@ -1850,6 +1873,7 @@ async fn run_mcp_subcommand(
                     eager_load_tool: eager_load_tool.clone(),
                     tool_permission: tool_permission.clone(),
                     disabled: *disabled,
+                    required: *required,
                 },
                 &token_store,
             )
@@ -1870,6 +1894,9 @@ async fn run_tools_subcommand(
     match action {
         cli::ToolsAction::List => {
             let config = ResolvedConfig::from_cli(cli_args);
+            // The table's permission and status columns come from config, so rendering it off
+            // defaults would misreport every tool the user has overridden.
+            config.require_readable_config()?;
             let filter = crate::tools::BuiltinToolFilter::from_config(
                 config.builtin_allowed_tools.clone(),
                 config.builtin_disabled_tools.clone(),
@@ -2086,7 +2113,7 @@ async fn run_account_subcommand(
     };
 
     let token_store = session_manager.token_store();
-    let config_file = config::load_config_file();
+    let config_file = config::load_config_file_or_err()?;
     let requested = profile_arg.or_else(|| config_file.default_provider.clone());
     let (name, error) = config::select_active_profile(requested, &config_file.providers);
     let name = name.ok_or_else(|| {
@@ -2284,9 +2311,11 @@ async fn run_session_subcommand(
             output,
             format,
         } => export_session(session_manager, *session_id, output.as_deref(), *format).await,
-        cli::SessionAction::Delete { session_ids, all } => {
-            delete_sessions(session_manager, session_ids, *all).await
-        }
+        cli::SessionAction::Delete {
+            session_ids,
+            all,
+            older_than_days,
+        } => delete_sessions(session_manager, session_ids, *all, *older_than_days).await,
         cli::SessionAction::Import { input } => import_session(session_manager, input).await,
         cli::SessionAction::Fork { session_id } => {
             fork_session_command(session_manager, *session_id).await
@@ -2357,6 +2386,7 @@ async fn delete_sessions(
     session_manager: &SessionManager,
     session_ids: &[uuid::Uuid],
     all: bool,
+    older_than_days: Option<u64>,
 ) -> anyhow::Result<()> {
     if all {
         let deleted = session_manager.delete_all_sessions().await?;
@@ -2364,8 +2394,28 @@ async fn delete_sessions(
         return Ok(());
     }
 
+    // The manual counterpart to `[session].retention_days`, now that nothing prunes on its own.
+    // Reports the count through `info!` like the `--all` and by-id branches below: the user ran
+    // this to delete, not to obtain a number, and the exit code already carries success.
+    if let Some(days) = older_than_days {
+        // Zero would sweep everything, which is `--all` by another name and far too easy to type
+        // by accident when you meant "today's".
+        if days == 0 {
+            anyhow::bail!(
+                "--older-than-days 0 would delete every session; use --all if you mean that"
+            );
+        }
+        let deleted = session_manager.delete_expired_sessions(days).await?;
+        tracing::info!(
+            "deleted {} session(s) not updated in {} days",
+            deleted,
+            days
+        );
+        return Ok(());
+    }
+
     if session_ids.is_empty() {
-        anyhow::bail!("specify one or more session IDs, or use --all to delete all sessions");
+        anyhow::bail!("specify one or more session IDs, --older-than-days <DAYS>, or --all");
     }
 
     let mut deleted = 0u64;
@@ -2684,6 +2734,76 @@ async fn load_session_messages(
 mod tests {
     use super::*;
 
+    /// Zero days means "not updated since this instant", i.e. everything. Easy to type when you
+    /// meant "today's", and unrecoverable, so it is refused rather than run.
+    #[tokio::test]
+    async fn test_delete_older_than_zero_days_is_refused() {
+        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("in-memory db");
+        let error = delete_sessions(&manager, &[], false, Some(0))
+            .await
+            .expect_err("zero must be refused");
+        assert!(error.to_string().contains("--all"), "{error}");
+    }
+
+    /// The flag has to reach `delete_expired_sessions(days)` and nothing else: routing it to
+    /// `delete_all_sessions` would pass every error-path test in this file while wiping the DB.
+    #[tokio::test]
+    async fn test_delete_older_than_days_deletes_only_the_old() {
+        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("in-memory db");
+        let old = manager.create_session(None).await.expect("create old");
+        let recent = manager.create_session(None).await.expect("create recent");
+        let backdated = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        manager
+            .set_session_updated_at_for_test(old, &backdated)
+            .await
+            .expect("backdate");
+
+        delete_sessions(&manager, &[], false, Some(30))
+            .await
+            .expect("sweep");
+
+        assert!(!manager.session_exists(old).await.expect("exists"));
+        assert!(manager.session_exists(recent).await.expect("exists"));
+    }
+
+    /// No selector at all should say what the options are, not silently do nothing.
+    #[tokio::test]
+    async fn test_delete_with_no_selector_explains_itself() {
+        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("in-memory db");
+        let error = delete_sessions(&manager, &[], false, None)
+            .await
+            .expect_err("no selector must be an error");
+        let text = error.to_string();
+        assert!(text.contains("--older-than-days"), "{text}");
+        assert!(text.contains("--all"), "{text}");
+    }
+
+    /// Both directives exist to stop a retried MCP connect from repeating itself on the user's
+    /// prompt. `RUST_LOG` must still win outright, or there is no way to see them when debugging.
+    #[test]
+    fn test_log_filter_quiets_rmcp_retry_noise() {
+        let filter = build_log_filter(None, "warn").to_string();
+        assert!(
+            filter.contains("rmcp::transport::worker=off"),
+            "the per-attempt transport error must be silenced: {filter}"
+        );
+        assert!(
+            filter.contains("rmcp::transport::common::client_side_sse=error"),
+            "the per-reconnect sse warning must be floored: {filter}"
+        );
+
+        let overridden = build_log_filter(Some("rmcp=debug"), "warn").to_string();
+        assert!(
+            !overridden.contains("rmcp::transport::worker=off"),
+            "RUST_LOG must replace the defaults wholesale: {overridden}"
+        );
+    }
     #[test]
     fn test_parents_first_order_orders_parents_before_children() {
         // Given out of order (child, root, middle), each node must land after its parent.
@@ -3011,7 +3131,7 @@ mod tests {
     }
 
     /// Regression: import restored the export's `updated_at`, and retention GC deletes by that
-    /// column at every agent startup, so restoring an archive older than `retention_days` was
+    /// column when `[session].retention_days` is set, so restoring an archive older than that was
     /// undone by the next launch before anyone could resume it.
     #[tokio::test]
     async fn test_import_survives_retention_gc() {

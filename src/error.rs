@@ -76,9 +76,11 @@ pub enum MekaError {
         message: String,
     },
 
-    /// Strict MCP gate rejected the turn: at least one enabled server wasn't `Connected` within the
-    /// configured grace period. Turn contents haven't been sent to the provider. The REPL catches
-    /// this and loops back to the prompt; one-shot mode propagates to a non-zero process exit.
+    /// MCP readiness gate rejected the turn: at least one server marked
+    /// [`crate::config::McpServerConfig::required`] wasn't `Connected` within the configured grace
+    /// period. Servers that aren't required never appear here. Turn contents haven't been sent to
+    /// the provider. The REPL catches this and loops back to the prompt; one-shot mode propagates
+    /// to a non-zero process exit.
     #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{} ({})", n, s)).collect::<Vec<_>>().join(", "))]
     McpTurnGated { servers: Vec<(String, String)> },
 }

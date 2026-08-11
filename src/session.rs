@@ -1115,10 +1115,10 @@ impl SessionManager {
     /// All-or-nothing: any failure rolls back the whole import, leaving no partial tree.
     ///
     /// `updated_at` is stamped to the import time rather than restored from the export. Retention
-    /// GC deletes by `updated_at` ([`Self::delete_expired_sessions`], run at every agent startup),
-    /// so restoring the original value meant an archive older than `retention_days` was swept on
-    /// the next launch, before anyone could resume it. `created_at` still carries the original for
-    /// provenance.
+    /// GC deletes by `updated_at` ([`Self::delete_expired_sessions`], run at startup when
+    /// `[session].retention_days` is set), so restoring the original value meant an archive older
+    /// than the window was swept on the next launch, before anyone could resume it. `created_at`
+    /// still carries the original for provenance.
     pub async fn import_sessions(&self, records: Vec<ImportSessionRecord>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -1786,15 +1786,54 @@ impl SessionManager {
             .map_err(|error| MekaError::Database(format!("WAL checkpoint failed: {}", error)))
     }
 
+    /// Backdate a session's `updated_at`, for tests that need one to look old to the retention
+    /// sweep. Lives here because `connection` is private to this module, so tests in other modules
+    /// have no other way to age a row.
+    #[cfg(test)]
+    pub(crate) async fn set_session_updated_at_for_test(
+        &self,
+        session_id: uuid::Uuid,
+        updated_at: &str,
+    ) -> Result<()> {
+        let updated_at = updated_at.to_string();
+        let rows = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![updated_at, session_id.to_string()],
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to backdate session: {}", error))
+            })?;
+        // A typo'd id would otherwise backdate nothing and leave the test asserting against a
+        // session that was never aged, which reads as the sweep failing to match.
+        if rows != 1 {
+            return Err(MekaError::Database(format!(
+                "expected to backdate 1 session, updated {rows}"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
-        // `TimeDelta::days` panics on out-of-range input, so route through `try_days`: an absurdly
-        // large `retention_days` falls back to a ~100-year window, which deletes nothing: the
-        // intended "retain everything" outcome.
-        let retention = i64::try_from(retention_days)
+        // Both steps can blow up on an absurd `retention_days`, and this takes user input straight
+        // from `--older-than-days`, so a run of digits must not panic. `TimeDelta` overflows around
+        // 10^11 days; subtracting from `Utc::now()` overflows far sooner, around 96.4 million. Both
+        // fall back to a ~100-year window, which matches nothing and so keeps every session: the
+        // sane reading of "delete anything older than forever".
+        let now = chrono::Utc::now();
+        #[allow(clippy::expect_used)]
+        let fallback = now
+            .checked_sub_signed(chrono::TimeDelta::days(36_500))
+            .expect("100 years before now is representable");
+        let cutoff = i64::try_from(retention_days)
             .ok()
             .and_then(chrono::TimeDelta::try_days)
-            .unwrap_or_else(|| chrono::TimeDelta::days(36_500));
-        let cutoff = chrono::Utc::now() - retention;
+            .and_then(|retention| now.checked_sub_signed(retention))
+            .unwrap_or(fallback);
         let cutoff_str = cutoff.to_rfc3339();
 
         let deleted = self
@@ -2200,82 +2239,6 @@ impl SessionManager {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to load tool outputs: {}", error)))
-    }
-
-    /// Delete the oldest sessions until total `messages.content` size is at or below `max_bytes`.
-    /// `active_ids` is the set of session ids the caller knows to be currently in use; they are
-    /// excluded from the eviction sweep so the caller's in-flight `save_event` calls don't trip on
-    /// foreign-key violations after a deletion. Pass an empty set when there are no live sessions
-    /// (typical at startup, when this is called before any session is opened).
-    pub async fn enforce_storage_limit(
-        &self,
-        max_bytes: u64,
-        active_ids: &std::collections::HashSet<String>,
-    ) -> Result<u64> {
-        // Take the caller's snapshot once and move it into the blocking task so the SQL closure can
-        // match against it without re-locking anything.
-        let active: Vec<String> = active_ids.iter().cloned().collect();
-        let deleted = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let mut deleted: u64 = 0;
-
-                loop {
-                    let total_bytes: i64 = connection.query_row(
-                        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages",
-                        [],
-                        |row| row.get(0),
-                    )?;
-
-                    if u64::try_from(total_bytes).unwrap_or(0) <= max_bytes {
-                        break;
-                    }
-
-                    // Build the `NOT IN (?, ?, ...)` placeholder list dynamically. SQLite's
-                    // parameter index uses 1-based values; we feed each id positionally below.
-                    let placeholders = (1..=active.len())
-                        .map(|index| format!("?{}", index))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let query = if placeholders.is_empty() {
-                        "SELECT id FROM sessions ORDER BY updated_at ASC LIMIT 1".to_string()
-                    } else {
-                        format!(
-                            "SELECT id FROM sessions WHERE id NOT IN ({}) \
-                             ORDER BY updated_at ASC LIMIT 1",
-                            placeholders
-                        )
-                    };
-                    let params = rusqlite::params_from_iter(active.iter());
-                    let oldest_id: std::result::Result<String, _> =
-                        connection.query_row(&query, params, |row| row.get(0));
-
-                    match oldest_id {
-                        Ok(session_id) => {
-                            // FK CASCADE sweeps the session's messages and tool_outputs along with
-                            // the session row.
-                            connection.execute(
-                                "DELETE FROM sessions WHERE id = ?1",
-                                rusqlite::params![session_id],
-                            )?;
-                            deleted += 1;
-                        }
-                        // No eligible row left: either the DB is empty, or every remaining session
-                        // is in the active set. Either way, we can't reclaim more without touching
-                        // live state.
-                        Err(rusqlite::Error::QueryReturnedNoRows) => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-
-                Ok(deleted)
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to enforce storage limit: {}", error))
-            })?;
-        self.prune_orphan_lock_files().await;
-        Ok(deleted)
     }
 }
 
@@ -4074,47 +4037,26 @@ mod tests {
         assert!(manager.session_exists(new_session).await.expect("failed"));
     }
 
+    /// `--older-than-days` puts a raw number in the user's hands, so a mistyped run of digits must
+    /// not panic. `TimeDelta` overflows near 10^11 days and `Utc::now() - delta` near 96.4 million,
+    /// so both bounds need covering; either way nothing is old enough to match.
     #[tokio::test]
-    async fn test_enforce_storage_limit() {
+    async fn test_delete_expired_sessions_survives_absurd_windows() {
         let manager = test_manager().await;
-        let session1 = manager.create_session(None).await.expect("failed");
-
-        // Add enough content to exceed a small limit
-        let large_content = "x".repeat(1000);
+        let session_id = manager.create_session(None).await.expect("create");
         manager
-            .save_message(session1, "user", &large_content)
+            .save_message(session_id, "user", "hello")
             .await
-            .expect("failed");
+            .expect("save");
 
-        // Backdate session1 so it's the oldest
-        let old_date = (chrono::Utc::now() - chrono::TimeDelta::days(10)).to_rfc3339();
-        manager
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-                    rusqlite::params![old_date, session1.to_string()],
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("failed to backdate");
-
-        let session2 = manager.create_session(None).await.expect("failed");
-        manager
-            .save_message(session2, "user", "small")
-            .await
-            .expect("failed");
-
-        // Set a limit smaller than the total, but larger than session2 alone
-        let no_active: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let deleted = manager
-            .enforce_storage_limit(500, &no_active)
-            .await
-            .expect("failed to enforce");
-        assert_eq!(deleted, 1);
-        assert!(!manager.session_exists(session1).await.expect("failed"));
-        assert!(manager.session_exists(session2).await.expect("failed"));
+        for days in [96_500_000, u64::MAX] {
+            let deleted = manager
+                .delete_expired_sessions(days)
+                .await
+                .expect("must not panic or error");
+            assert_eq!(deleted, 0, "{days} days should match nothing");
+        }
+        assert!(manager.session_exists(session_id).await.expect("exists"));
     }
 
     #[tokio::test]
@@ -4481,70 +4423,6 @@ mod tests {
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
         assert_eq!(summary.preview, "legacy prompt without any wrapper");
-    }
-
-    #[tokio::test]
-    async fn test_enforce_storage_limit_no_deletion_needed() {
-        let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("failed");
-        manager
-            .save_message(session_id, "user", "small")
-            .await
-            .expect("failed");
-
-        let no_active: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let deleted = manager
-            .enforce_storage_limit(1_000_000, &no_active)
-            .await
-            .expect("failed to enforce");
-        assert_eq!(deleted, 0);
-        assert!(manager.session_exists(session_id).await.expect("failed"));
-    }
-
-    /// Active sessions must survive eviction even when they're the oldest by `updated_at`. The
-    /// eviction loop should walk through younger eligible rows and only stop when the budget is met
-    /// or no inactive sessions remain.
-    #[tokio::test]
-    async fn test_enforce_storage_limit_skips_active_sessions() {
-        let manager = test_manager().await;
-        let oldest = manager.create_session(None).await.expect("create oldest");
-        let large = "x".repeat(1000);
-        manager
-            .save_message(oldest, "user", &large)
-            .await
-            .expect("save oldest");
-
-        // Bump a younger session to also push the budget over.
-        let younger = manager.create_session(None).await.expect("create younger");
-        manager
-            .save_message(younger, "user", &large)
-            .await
-            .expect("save younger");
-
-        // Mark the oldest as active; it must be skipped even though it would otherwise be the
-        // natural eviction target.
-        let mut active = std::collections::HashSet::new();
-        active.insert(oldest.to_string());
-
-        let deleted = manager
-            .enforce_storage_limit(500, &active)
-            .await
-            .expect("enforce");
-        assert_eq!(deleted, 1);
-        assert!(
-            manager
-                .session_exists(oldest)
-                .await
-                .expect("session_exists"),
-            "active session must not be evicted",
-        );
-        assert!(
-            !manager
-                .session_exists(younger)
-                .await
-                .expect("session_exists"),
-            "inactive younger session should have been evicted",
-        );
     }
 
     // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id column, FKs without ON

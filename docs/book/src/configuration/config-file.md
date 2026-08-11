@@ -12,6 +12,10 @@ The config file is optional. If it does not exist, meka silently skips it.
 
 meka rejects unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
 
+The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable` and `meka provider remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "(no MCP servers configured)" over a file full of them is indistinguishable from the truth.
+
+Those editors only reach the keys they own, so a bad key anywhere else (`[session]`, `[permissions]`, a top-level typo, a raw syntax error) has to be fixed in an editor. The error names the file, line, column, and offending key.
+
 Set the `MEKA_CONFIG_DIR` environment variable to override the default location entirely. The value points at the `meka` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
 
 ## Providers
@@ -473,24 +477,13 @@ context_messages = 100
 
 ### `session.retention_days`
 
-Automatically delete sessions older than this many days on startup. Uses the session's `updated_at` timestamp, so actively-resumed sessions are preserved even if originally created long ago.
+Delete sessions older than this many days, at agent startup. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
-Default: `90`
+**Default: unset, meaning nothing is deleted.** Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
 
 ```toml
 [session]
 retention_days = 30
-```
-
-### `session.max_storage_bytes`
-
-Maximum total byte size of all stored message content across all sessions. When exceeded on startup, the oldest sessions are deleted until the total is under the limit.
-
-Default: `52428800` (50 MB)
-
-```toml
-[session]
-max_storage_bytes = 10485760  # 10 MB
 ```
 
 ### `session.auto_compact`
@@ -616,14 +609,15 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Defaults to `false`. |
+| `required` | No | When `true`, a turn is rejected while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). When `false`, the session runs without it and its tools are simply absent. Defaults to `[mcp].strict` (itself `false`), so servers are optional unless they opt in. |
 
 ### `[mcp]` top-level table
 
 | Field | Purpose |
 |-------|---------|
 | `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"ask"`, or `"write"`. If unset the hardcoded fallback is `"write"` (strict). |
-| `strict` | When `true` (default), every turn is gated on all enabled MCP servers being `Connected`. If any are not, the turn is rejected with a shell-style error instead of sending the request to the model. Set to `false` to proceed with whichever servers are ready (a warn log names the missing ones). |
-| `grace_seconds` | Per-turn cap on how long to wait for still-`Pending` servers to connect before applying the strict check. Default `3`. Set to `0` to skip waiting (useful for scripts that want to fail fast). |
+| `strict` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` in the REPL or probed with `meka mcp reconnect <name>`. |
+| `grace_seconds` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. Default `3`. Set to `0` to skip waiting (useful for scripts that want to fail fast). |
 | `connect_timeout_seconds` | Per-server timeout for connect + `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. Default `30`. |
 
 ### Startup concurrency
@@ -771,6 +765,8 @@ Manage configured servers without editing `config.toml` by hand:
 | `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
 | `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`ask`/`write`. |
+| `--required` | Persist `required = true`, so a turn is rejected while this server isn't connected. Omitted, the server inherits `[mcp].strict` and is optional by default. |
+| `--disabled` | Persist `disabled = true`, so the server is skipped entirely at startup. Re-enable with `meka mcp enable <name>`. |
 
 #### Example: Notion
 
@@ -847,8 +843,8 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 ### Connection lifecycle
 
 - **Reconnection** is automatic for all transports (stdio, plain HTTP, OAuth-authenticated HTTP) when the transport closes mid-session. HTTP transports use exponential backoff (1s, 2s, 4s, 8s, 16s, capped 30s, max 5 attempts); stdio gets one immediate retry. The reconnect runs on a blocking thread to work around an upstream rmcp bug where the auth future is `!Send`.
-- **Failed initial connect** is retried in the background with its own backoff (5s doubling to a 5 minute ceiling) until the server comes up, and the server's tools are registered into every live session when it does. A server that is slow to boot, or that starts after meka, therefore recovers on its own rather than staying `failed` for the life of the process. This matters most with `[mcp].strict = true` (the default), where a failed server rejects every turn.
-- **Session-expired recovery**: rmcp 1.5 transparently re-initialises HTTP sessions on 404 / JSON-RPC `-32001`. meka relies on this; no per-call handling is required.
+- **Failed initial connect** is retried in the background with its own backoff (5s doubling to a 5 minute ceiling) until the server comes up, and the server's tools are registered into every live session when it does. A server that is slow to boot, or that starts after meka, therefore recovers on its own rather than staying `failed` for the life of the process. This matters most for a `required` server, where every turn is rejected until it connects.
+- **Session-expired recovery**: rmcp transparently re-initialises HTTP sessions on 404 / JSON-RPC `-32001`. meka relies on this; no per-call handling is required.
 - **Cancellation**: when the agent cancels a tool call (e.g. Ctrl-C), meka sends `notifications/cancelled` to the server with the in-flight request id so the server can stop work.
 - **Timeouts**: tool calls default to 600 s; override with `MEKA_MCP_TOOL_TIMEOUT` in ms.
 - **Tool list refresh**: on `tools/list_changed`, meka re-discovers the server's tools and hot-swaps them in the registry; no restart needed.

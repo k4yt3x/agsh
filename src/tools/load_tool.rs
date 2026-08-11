@@ -21,6 +21,20 @@ use crate::{error::Result, permission::Permission, provider::ToolDefinition};
 pub(super) struct LoadToolTool {
     pub(super) tools: Weak<RwLock<Vec<std::sync::Arc<dyn Tool>>>>,
     pub(super) deferred: Weak<RwLock<HashSet<String>>>,
+    /// Filled once the registry is attached to an MCP manager. Lets an unfindable name be
+    /// explained by its server's state instead of reported as unknown; a server that never
+    /// connected registers no tools, so `load_tool` is the first place the agent hears about it.
+    pub(super) mcp_manager: Weak<std::sync::OnceLock<Weak<crate::mcp::McpClientManager>>>,
+}
+
+impl LoadToolTool {
+    /// The state of the MCP server behind `name`, when the name is unfindable *because* its
+    /// server isn't connected. `None` for every other reason, leaving the generic message.
+    async fn unavailable_server_reason(&self, name: &str) -> Option<String> {
+        let slot = self.mcp_manager.upgrade()?;
+        let manager = slot.get()?.upgrade()?;
+        manager.unavailable_tool_reason(name).await
+    }
 }
 
 #[async_trait]
@@ -77,6 +91,9 @@ impl Tool for LoadToolTool {
         };
 
         let Some(definition) = definition else {
+            if let Some(reason) = self.unavailable_server_reason(&name).await {
+                return Ok(ToolOutput::text(reason, true));
+            }
             return Ok(ToolOutput::text(
                 format!(
                     "Error: tool '{}' is not registered. Check the names listed under \
@@ -178,6 +195,9 @@ mod tests {
         let load_tool = LoadToolTool {
             tools: Arc::downgrade(&tools),
             deferred: Arc::downgrade(&deferred),
+            // No manager attached: these fixtures exercise the plain registry paths, so an
+            // unfindable name must still produce the generic "not registered" message.
+            mcp_manager: std::sync::Weak::new(),
         };
         Fixture {
             tools: Some(tools),

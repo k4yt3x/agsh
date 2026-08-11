@@ -462,7 +462,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
-| `GET /v1/health/ready` | None | Readiness probe: 200 if provider, DB, and MCP servers are healthy. Returns `status`, `session_db`, `provider_configured`, and `mcp_servers_healthy` (boolean, no server names). |
+| `GET /v1/health/ready` | None | Readiness probe: 200 if the provider and DB are healthy and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `provider_configured`, and `mcp_servers_healthy` (boolean, no server names). |
 | `GET /v1/info` | Any read scope | Server version, model, capabilities. `vision` reports whether `POST /turn` accepts [image attachments](#image-attachments) |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
