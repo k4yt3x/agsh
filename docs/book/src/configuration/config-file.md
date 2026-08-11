@@ -548,40 +548,19 @@ budget_tokens = 20000
 show_content = true
 ```
 
-## `[prompt]`
+## Instructions
 
-Settings for injecting custom instructions into the system prompt. Use this to set installation-specific rules that should apply to every session: things the agent needs to know about your system, preferred tools, or policies.
+Standing instructions are **not** a config key. They live at a conventional path beside `config.toml`, because prose long enough to be worth writing is miserable to maintain inside a TOML string:
 
-### `prompt.instructions`
-
-A string of custom instructions that meka will include in every system prompt, under a `## User Instructions` section. The model is told to treat them as hard constraints unless they conflict with safety requirements.
-
-Resolved once at startup, so editing this value takes effect on the next `meka` launch rather than mid-session. That is deliberate: the system prompt heads the prompt-cache prefix, and rewriting it mid-session would re-cache the entire conversation.
-
-Suitable use cases:
-
-- System-specific policies: "Never install Python packages globally with pip; always use `uv` or a venv."
-- Installed tooling the agent should know about: "Poppler is available on this system; use `pdftotext` for PDFs."
-- Workflow preferences: "Prefer ripgrep over grep; it's installed and faster."
-- Signing / compliance rules: "Git commits on this system must use gpg signing."
-
-Default: unset (no custom instructions).
-
-```toml
-[prompt]
-instructions = """
-Never install Python packages globally with pip. Always use `uv` or a venv.
-Poppler is available on this system, use `pdftotext` for PDFs.
-Prefer ripgrep over grep.
-"""
+```
+~/.config/meka/
+├── config.toml
+├── instructions.md      # or instructions/*.md
+├── memory/
+└── skills/
 ```
 
-Notes:
-
-- Empty or whitespace-only strings are treated as unset.
-- Instructions apply to sub-agents spawned via `spawn_agent` too.
-- Instructions are included at all permission levels (including `none`) because they are authored by you.
-- Per-run override: [`--instructions`](./cli-options.md#instructions-string) (or `MEKA_INSTRUCTIONS`) replaces this value for a single invocation.
+See [Instructions](../usage/instructions.md) for the full picture. In short: write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## User Instructions` section of the system prompt. To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
 
 ## `[mcp]`
 

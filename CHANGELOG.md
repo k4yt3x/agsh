@@ -7,32 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-08-11
+
 ### Added
 
 - Agent memory: durable Markdown notes in `~/.config/meka/memory/`, surviving compaction.
 - `memory_write` / `memory_read` / `memory_search` / `memory_delete` tools, all at read permission.
-- `meka memory` subcommands and `/memory` to list, inspect, and curate saved memories.
+- `meka memory` subcommands and `/memory [name]` to list, inspect, and curate saved memories.
 - `[memory] enabled` config (default true) to drop the memory tools and index entirely.
 - `[skills] enabled` config (default true) to drop the `skill` tool and skills index entirely.
-- `/memory <name>` prints one memory's body, matching `meka memory show`.
-- `[[mcp.servers]].required` and `meka mcp add --required` gate a turn on one server, not all.
-- `meka session delete --older-than-days <DAYS>` prunes old sessions on demand.
 - Scheduled wakeups: the agent can schedule its own future turns with `schedule_create`.
 - `schedule_list` / `schedule_cancel` tools, `meka schedule list|cancel`, and `/schedule`.
 - Job gates: a shell command decides whether a due job spends a model turn, so polling is cheap.
 - `[schedule]` config for the poll interval, missed-job grace, gate timeout, and per-session cap.
 - Scheduled jobs fire under `meka serve`, the REPL, and ACP; `serve` is the durable host.
-- A provider rejecting content meka just added now degrades it and retries, telling the model why.
+- Instructions live in `instructions.md`, or split across `instructions/*.md`, in the config dir.
+- `MEKA_INSTRUCTIONS_FILE` reads instructions from a path, for mounted ConfigMaps and secrets.
+- `meka instructions show` / `path` report the resolved text and where it came from.
 - `/rewind [N]` and `meka session rewind` drop recent turns, so a stuck session is recoverable.
+- `[[mcp.servers]].required` and `meka mcp add --required` gate a turn on one server, not all.
+- `meka session delete --older-than-days <DAYS>` prunes old sessions on demand.
 
 ### Changed
 
+- **Breaking:** an unparseable `config.toml` is a startup error, not a silent fall back to defaults.
+- **Breaking:** `[prompt].instructions` is gone; move the text to `instructions.md` to start.
 - **Breaking:** `[mcp] strict` defaults to false; a server gates a turn only if `required = true`.
 - **Breaking:** `[session] retention_days` has no default; unset now keeps every session forever.
+- `--instructions` and `MEKA_INSTRUCTIONS` are unaffected; only the config-file key moved.
 - `[session] retention_days = 0` is now rejected; it would have deleted everything each startup.
 - A configured retention sweep now reports deletions at `warn` instead of `info`.
 - `GET /v1/health/ready` ignores failed *optional* MCP servers; only `required` ones mean 503.
-- **Breaking:** an unparseable `config.toml` is a startup error, not a silent fall back to defaults.
 - reedline moved from a personal fork to upstream `main`.
 
 ### Removed
@@ -42,18 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- One provider-rejected message killed a session for good; meka now drops the content and retries.
+- The model is told what the provider refused, so it can adapt instead of losing the turn.
+- Images were labelled from the filename, `Content-Type`, or MCP `mime_type` instead of the bytes.
+- A session already holding a mislabelled image is repaired on resume, with no provider call.
+- MCP images above the size providers accept were forwarded anyway, only to be rejected.
 - OpenAI-compatible streaming dropped a tool call or text that shared a chunk with `finish_reason`.
 - REPL text streamed before an interrupt or error no longer leaks into the next turn's output.
-- The skills and memory indexes no longer render when the tool that opens them is disabled.
 - Calling a tool from an unconnected MCP server said "Unknown tool" instead of naming the cause.
 - An unreachable MCP server logged its failure on every background retry, forever; now once.
 - `meka provider add <existing>` could overwrite a profile when `config.toml` failed to parse.
 - `meka provider remove` truncated `config.toml` to nothing when the file couldn't be read.
 - An absurdly large `retention_days` panicked the retention sweep instead of keeping everything.
-- Images were labelled from the filename, `Content-Type`, or MCP `mime_type` instead of the bytes.
-- A single provider-rejected message killed a session permanently; it now repairs and continues.
-- A session already holding a mislabelled image is repaired on resume, with no provider call.
-- MCP images above the size providers accept were forwarded anyway, only to be rejected.
+- The skills and memory indexes no longer render when the tool that opens them is disabled.
 
 ## [0.37.0] - 2026-08-10
 
@@ -1294,7 +1300,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.37.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.38.0...HEAD
+[0.38.0]: https://github.com/k4yt3x/meka/compare/0.37.0...0.38.0
 [0.37.0]: https://github.com/k4yt3x/meka/compare/0.36.0...0.37.0
 [0.36.0]: https://github.com/k4yt3x/meka/compare/0.35.0...0.36.0
 [0.35.0]: https://github.com/k4yt3x/meka/compare/0.34.0...0.35.0

@@ -48,6 +48,11 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Show the standing instructions the agent is given
+    Instructions {
+        #[command(subcommand)]
+        action: InstructionsAction,
+    },
     /// Inspect and cancel scheduled jobs
     Schedule {
         #[command(subcommand)]
@@ -326,6 +331,20 @@ pub enum ScheduleAction {
 
 /// Inspect and curate the agent's durable notes. The agent maintains these itself through the
 /// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
+#[derive(clap::Subcommand, Debug)]
+pub enum InstructionsAction {
+    /// Print the resolved instructions and where they came from
+    ///
+    /// Resolution order is `--instructions`, `MEKA_INSTRUCTIONS`,
+    /// `MEKA_INSTRUCTIONS_FILE`, then `instructions.md` (or `instructions/`)
+    /// in the config directory. The text goes to stdout and the source to
+    /// stderr, so `meka instructions show 2>/dev/null` pipes cleanly.
+    #[command(verbatim_doc_comment)]
+    Show,
+    /// Print the paths checked for instructions, and whether each exists
+    Path,
+}
+
 #[derive(clap::Subcommand, Debug)]
 pub enum MemoryAction {
     /// List saved memories and the priority distribution

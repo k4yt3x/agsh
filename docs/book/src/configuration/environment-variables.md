@@ -11,7 +11,8 @@ These operational variables override config file values but are overridden by CL
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `MEKA_PERMISSION` | Default permission mode | `none`, `read`, `write` |
-| `MEKA_INSTRUCTIONS` | Replace `[prompt].instructions` for this run. Equivalent to `--instructions`. Used by the `mekabox` container wrapper to tell the agent it can install packages freely. | `Be terse.` |
+| `MEKA_INSTRUCTIONS` | Standing instructions as a string, overriding the `instructions.md` file. Equivalent to `--instructions`. Used by the `mekabox` container wrapper, which mounts the config directory read-only and so cannot supply a file. | `Be terse.` |
+| `MEKA_INSTRUCTIONS_FILE` | Standing instructions read from this path (a file, or a directory of `*.md`). For a file you did not choose the location of, such as a Kubernetes ConfigMap. Conflicts with `MEKA_INSTRUCTIONS`. | `/run/secrets/meka-instructions` |
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. | `/tmp/meka-test/meka` |
 | `MEKA_DATA_DIR` | Override the default data directory (where `meka.db` lives). Same cross-platform escape hatch: `dirs::data_dir()` ignores `$XDG_DATA_HOME` on macOS/Windows. Useful for tests, portable installs, and per-project session isolation. | `/tmp/meka-test/data/meka` |
 | `MEKA_SANDBOX_BACKEND` | Override `[shell].sandbox_backend` (Linux only). Pinning a value also suppresses the "install Bubblewrap" auto-resolve warning. Used by the `mekabox` wrapper to pin Landlock in the container without editing the read-only host config. | `landlock`, `bubblewrap` |

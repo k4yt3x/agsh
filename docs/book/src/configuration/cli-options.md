@@ -172,7 +172,7 @@ meka --thinking-budget 20000
 
 ### `--instructions <STRING>`
 
-Override [`prompt.instructions`](./config-file.md#promptinstructions) for this run, replacing whatever is in the config file. Also reads from `MEKA_INSTRUCTIONS` if the flag is not given.
+Standing [instructions](../usage/instructions.md) for this run, replacing the `instructions.md` file and both `MEKA_INSTRUCTIONS*` environment variables. Takes the text itself, not a path; use `"$(cat file.md)"` to read one.
 
 ```bash
 meka --instructions "Be terse. No code fences in answers."

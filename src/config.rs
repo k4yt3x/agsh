@@ -32,7 +32,6 @@ pub struct ConfigFile {
     pub session: Option<SessionConfig>,
     pub thinking: Option<ThinkingConfig>,
     pub mcp: Option<McpConfig>,
-    pub prompt: Option<PromptConfig>,
     pub tools: Option<ToolsConfig>,
     pub skills: Option<SkillsConfig>,
     pub memory: Option<MemoryConfig>,
@@ -202,12 +201,6 @@ pub struct ToolsConfig {
     pub allowed_tools: Option<Vec<String>>,
     pub disabled_tools: Option<Vec<String>>,
     pub tool_permissions: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct PromptConfig {
-    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -643,6 +636,11 @@ pub struct ResolvedConfig {
     /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
     /// since every other field is a default that silently ignores what the user wrote.
     pub config_error: Option<String>,
+    /// The instructions the user explicitly named could not be loaded, or the two environment
+    /// variables that carry them contradict each other. Deferred like the two above so `from_cli`
+    /// stays infallible, and raised rather than shrugged off because running without guidance the
+    /// user believes they supplied is worse than not starting.
+    pub instructions_error: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub client_id: Option<String>,
@@ -1033,6 +1031,66 @@ pub fn meka_config_dir() -> Option<PathBuf> {
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
     meka_config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Resolve the user's standing instructions across the tiers that can carry them, most specific
+/// first: `--instructions`, then `MEKA_INSTRUCTIONS`, then `MEKA_INSTRUCTIONS_FILE`, then the
+/// conventional path under the config directory.
+///
+/// Inline and file are two *transports* for one setting rather than two ways of saying the same
+/// thing, which is why both survive. Which is natural follows from the channel: a filesystem
+/// channel (the config directory) points at content, while a string channel (argv, environment)
+/// carries it. Demanding a file from the latter can be impossible, not merely inconvenient: the
+/// `mekabox` wrapper mounts the host config directory read-only and then overrides the instructions
+/// for the container, which it can do with one `-e` and could not do at all if a path were the only
+/// accepted form.
+///
+/// Setting both environment variables is refused rather than silently resolved. There is no reading
+/// under which someone meant both, so picking one would just hide the mistake until the agent
+/// behaved unexpectedly.
+/// [`resolve_instructions`] over the persistent tiers only, for `meka instructions show`. A
+/// per-run `--instructions` isn't part of what a standalone query is asking about.
+pub(crate) fn resolve_instructions_for_display()
+-> crate::error::Result<Option<crate::instructions::Instructions>> {
+    resolve_instructions(None)
+}
+
+fn resolve_instructions(
+    flag: Option<&str>,
+) -> crate::error::Result<Option<crate::instructions::Instructions>> {
+    if let Some(text) = flag {
+        let text = text.trim();
+        return Ok(
+            (!text.is_empty()).then(|| crate::instructions::Instructions {
+                text: text.to_string(),
+                source: crate::instructions::InstructionsSource::Flag,
+            }),
+        );
+    }
+
+    let inline = std::env::var("MEKA_INSTRUCTIONS").ok();
+    let from_file = std::env::var("MEKA_INSTRUCTIONS_FILE").ok();
+    if inline.is_some() && from_file.is_some() {
+        return Err(crate::error::MekaError::Config(
+            "MEKA_INSTRUCTIONS and MEKA_INSTRUCTIONS_FILE are both set; keep one. The first \
+             carries the text itself, the second a path to it."
+                .to_string(),
+        ));
+    }
+
+    if let Some(text) = inline {
+        let text = text.trim();
+        return Ok(
+            (!text.is_empty()).then(|| crate::instructions::Instructions {
+                text: text.to_string(),
+                source: crate::instructions::InstructionsSource::Env,
+            }),
+        );
+    }
+    if let Some(path) = from_file {
+        return crate::instructions::read_explicit(Path::new(&path)).map(Some);
+    }
+    Ok(crate::instructions::discover())
 }
 
 /// Write `content` to `path` atomically: serialise to `<path>.tmp` in the same directory,
@@ -1472,7 +1530,6 @@ impl ResolvedConfig {
         let file_shell = config_file.shell.unwrap_or_default();
         let file_session = config_file.session.unwrap_or_default();
         let file_thinking = config_file.thinking.unwrap_or_default();
-        let file_prompt = config_file.prompt.unwrap_or_default();
         let file_tools = config_file.tools.unwrap_or_default();
         let skills_enabled = config_file
             .skills
@@ -1532,13 +1589,16 @@ impl ResolvedConfig {
             None => None,
         };
 
-        let user_instructions = cli
-            .instructions
-            .clone()
-            .or_else(|| std::env::var("MEKA_INSTRUCTIONS").ok())
-            .or(file_prompt.instructions)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let (instructions, instructions_error) =
+            match resolve_instructions(cli.instructions.as_deref()) {
+                Ok(found) => (found, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        if let Some(found) = &instructions {
+            crate::instructions::warn_if_large(found);
+            tracing::info!("instructions loaded from {}", found.source);
+        }
+        let user_instructions = instructions.map(|found| found.text);
 
         let builtin_allowed_tools = file_tools
             .allowed_tools
@@ -1642,6 +1702,7 @@ impl ResolvedConfig {
             active_profile,
             provider_error,
             config_error,
+            instructions_error,
             model,
             base_url,
             client_id: active.and_then(|profile| profile.client_id.clone()),
@@ -1757,6 +1818,9 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         if let Some(error) = &self.provider_error {
+            return Err(crate::error::MekaError::Config(error.clone()));
+        }
+        if let Some(error) = &self.instructions_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         // `retention_days = 0` means "delete anything not updated in the last zero days", i.e.
@@ -3326,51 +3390,6 @@ read_file = "ask"
     }
 
     #[test]
-    fn test_prompt_config_deserialization() {
-        let toml_str = r#"
-[prompt]
-instructions = "Never use pip."
-"#;
-        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let prompt = config.prompt.expect("prompt should be present");
-        assert_eq!(prompt.instructions.as_deref(), Some("Never use pip."));
-    }
-
-    #[test]
-    fn test_prompt_config_missing() {
-        let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
-        assert!(config.prompt.is_none());
-    }
-
-    #[test]
-    fn test_prompt_config_multiline() {
-        let toml_str = r#"
-[prompt]
-instructions = """
-Rule 1.
-Rule 2.
-"""
-"#;
-        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let prompt = config.prompt.expect("prompt should be present");
-        let instructions = prompt.instructions.expect("instructions should be set");
-        assert!(instructions.contains("Rule 1."));
-        assert!(instructions.contains("Rule 2."));
-    }
-
-    #[test]
-    fn test_user_instructions_whitespace_only_is_none() {
-        let file_prompt = PromptConfig {
-            instructions: Some("   \n\t  ".to_string()),
-        };
-        let resolved = file_prompt
-            .instructions
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        assert!(resolved.is_none());
-    }
-
-    #[test]
     fn test_session_resume_from_cli() {
         use clap::Parser as _;
 
@@ -3394,48 +3413,134 @@ Rule 2.
         );
     }
 
+    /// The conventional path is the tier with no configuration at all, so a regression here is
+    /// invisible: instructions simply stop applying and nothing says so.
     #[test]
-    fn test_user_instructions_trimmed() {
-        let file_prompt = PromptConfig {
-            instructions: Some("  hello  \n".to_string()),
-        };
-        let resolved = file_prompt
-            .instructions
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        assert_eq!(resolved.as_deref(), Some("hello"));
+    fn test_instructions_resolve_from_the_conventional_file() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instructions.md"), "  from the file  \n")
+            .expect("write instructions.md");
+
+        // SAFETY: `CONFIG_DIR_ENV_LOCK` serialises this with every other env-var test.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let resolved = resolve_instructions(None);
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let found = resolved.expect("ok").expect("some");
+        assert_eq!(found.text, "from the file", "trimmed");
+        assert!(matches!(
+            found.source,
+            crate::instructions::InstructionsSource::Files(_)
+        ));
+    }
+
+    /// Splitting a grown `instructions.md` into a directory should be a rename, so the directory
+    /// has to win rather than the two silently concatenating or the file shadowing it.
+    #[test]
+    fn test_instructions_directory_wins_over_the_single_file() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instructions.md"), "single file").expect("write file");
+        std::fs::create_dir(dir.path().join("instructions")).expect("mkdir");
+        std::fs::write(dir.path().join("instructions/10-a.md"), "split one").expect("write a");
+        std::fs::write(dir.path().join("instructions/20-b.md"), "split two").expect("write b");
+
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let resolved = resolve_instructions(None);
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        assert_eq!(
+            resolved.expect("ok").expect("some").text,
+            "split one\n\nsplit two"
+        );
+    }
+
+    /// The `mekabox` case: the config directory is mounted read-only, so the container's own
+    /// instructions can only arrive as a string. If the env tier ever stopped beating the
+    /// conventional file, that wrapper would silently run with the host's instructions instead.
+    #[test]
+    fn test_inline_env_beats_the_conventional_file() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("instructions.md"), "FROM THE FILE").expect("write");
+
+        // SAFETY: guarded above.
+        unsafe {
+            std::env::set_var("MEKA_CONFIG_DIR", dir.path());
+            std::env::set_var("MEKA_INSTRUCTIONS", "FROM THE ENV");
+        }
+        let resolved = resolve_instructions(None);
+        unsafe {
+            std::env::remove_var("MEKA_CONFIG_DIR");
+            std::env::remove_var("MEKA_INSTRUCTIONS");
+        }
+
+        let found = resolved.expect("ok").expect("some");
+        assert_eq!(found.text, "FROM THE ENV");
+        assert_eq!(found.source, crate::instructions::InstructionsSource::Env);
     }
 
     #[test]
-    fn test_user_instructions_cli_overrides_config() {
-        // Replicates the merge chain in `from_cli`: CLI value wins over config.
-        let cli: Option<String> = Some("from cli".to_string());
-        let env: Option<String> = None;
-        let file: Option<String> = Some("from config".to_string());
-        let resolved = cli
-            .or(env)
-            .or(file)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        assert_eq!(resolved.as_deref(), Some("from cli"));
+    fn test_instructions_file_env_reads_the_named_path() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("elsewhere.md");
+        std::fs::write(&path, "from the named path").expect("write");
+
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_INSTRUCTIONS_FILE", &path) };
+        let resolved = resolve_instructions(None);
+        unsafe { std::env::remove_var("MEKA_INSTRUCTIONS_FILE") };
+
+        assert_eq!(
+            resolved.expect("ok").expect("some").text,
+            "from the named path"
+        );
+    }
+
+    /// No reading of "both set" means both, so resolving one silently would hide the mistake until
+    /// the agent behaved unexpectedly.
+    #[test]
+    fn test_both_instruction_env_vars_is_an_error() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        // SAFETY: guarded above.
+        unsafe {
+            std::env::set_var("MEKA_INSTRUCTIONS", "inline");
+            std::env::set_var("MEKA_INSTRUCTIONS_FILE", "/nonexistent.md");
+        }
+        let resolved = resolve_instructions(None);
+        unsafe {
+            std::env::remove_var("MEKA_INSTRUCTIONS");
+            std::env::remove_var("MEKA_INSTRUCTIONS_FILE");
+        }
+
+        let error = resolved.expect_err("must refuse").to_string();
+        assert!(error.contains("MEKA_INSTRUCTIONS"), "{error}");
+        assert!(error.contains("MEKA_INSTRUCTIONS_FILE"), "{error}");
     }
 
     #[test]
-    fn test_user_instructions_falls_through_to_config_when_cli_unset() {
-        let cli: Option<String> = None;
-        let env: Option<String> = None;
-        let file: Option<String> = Some("from config".to_string());
-        let resolved = cli
-            .or(env)
-            .or(file)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        assert_eq!(resolved.as_deref(), Some("from config"));
+    fn test_flag_beats_every_env_tier_and_trims() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        // SAFETY: guarded above.
+        unsafe { std::env::set_var("MEKA_INSTRUCTIONS", "from the env") };
+        let resolved = resolve_instructions(Some("  from the flag  "));
+        let blank = resolve_instructions(Some("   \n\t "));
+        unsafe { std::env::remove_var("MEKA_INSTRUCTIONS") };
+
+        assert_eq!(resolved.expect("ok").expect("some").text, "from the flag");
+        assert!(
+            blank.expect("ok").is_none(),
+            "an all-whitespace flag is no instructions, not empty ones"
+        );
     }
 
-    /// End-to-end check that MEKA_INSTRUCTIONS overrides `[prompt].instructions` when
-    /// `--instructions` is not on the CLI. Drives the actual `from_cli` path against a
-    /// tempdir-backed config to catch any regression where the env-var read silently no-ops.
+    /// End-to-end check that `MEKA_INSTRUCTIONS` reaches `user_instructions` when
+    /// `--instructions` is not on the CLI. Drives the actual `from_cli` path rather than
+    /// `resolve_instructions` directly, to catch a regression where the resolved value never makes
+    /// it onto `ResolvedConfig`.
     ///
     /// Touches process env, so it serializes against any other env-var test in this file via
     /// [`CONFIG_DIR_ENV_LOCK`].
@@ -3446,11 +3551,8 @@ Rule 2.
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
 
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "[prompt]\ninstructions = \"FROM CONFIG FILE\"\n",
-        )
-        .expect("write config.toml");
+        std::fs::write(dir.path().join("instructions.md"), "FROM THE FILE")
+            .expect("write instructions.md");
 
         // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with any other env-var test.
         unsafe {
@@ -3472,7 +3574,7 @@ Rule 2.
         assert_eq!(
             resolved.user_instructions.as_deref(),
             Some("FROM ENV VAR"),
-            "MEKA_INSTRUCTIONS should override [prompt].instructions in the config file",
+            "MEKA_INSTRUCTIONS should override the conventional instructions file",
         );
     }
 

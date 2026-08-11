@@ -22,6 +22,7 @@
 - [HTTP API](./usage/http-api.md)
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
+- [Instructions](./usage/instructions.md)
 - [Skills](./usage/skills.md)
 - [Memory](./usage/memory.md)
 - [Scheduling](./usage/scheduling.md)

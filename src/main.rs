@@ -22,6 +22,7 @@ mod error;
 mod frontend;
 mod history;
 mod image;
+mod instructions;
 mod mcp;
 mod memory;
 mod permission;
@@ -127,6 +128,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
                 cli::Command::Memory { action } => run_memory_subcommand(action).await,
+                cli::Command::Instructions { action } => run_instructions_subcommand(action),
                 cli::Command::Schedule { action } => {
                     crate::schedule::cli::run(&session_manager, action).await
                 }
@@ -2201,6 +2203,52 @@ async fn run_tools_subcommand(
         }
     }
     Ok(())
+}
+
+/// `meka instructions`: answer "what is the model actually being told, and why".
+///
+/// With four tiers feeding one value and a conventional path that appears in no config file, that
+/// question is otherwise only answerable by reading the source. Not async: every tier is either a
+/// process environment read or a small synchronous file read.
+fn run_instructions_subcommand(action: &cli::InstructionsAction) -> anyhow::Result<()> {
+    match action {
+        cli::InstructionsAction::Show => {
+            // `--instructions` belongs to a run, not to this query, so it is deliberately not
+            // consulted here; `None` resolves the persistent tiers only.
+            match config::resolve_instructions_for_display()? {
+                Some(found) => {
+                    // Source to stderr, text to stdout: the text is the data you asked for, so
+                    // `2>/dev/null` leaves something pipeable.
+                    eprintln!("Source: {}", found.source);
+                    eprintln!();
+                    println!("{}", found.text);
+                }
+                None => eprintln!(
+                    "No instructions configured. Write them to {} (or split them across {}).",
+                    display_path(instructions::instructions_file()),
+                    display_path(instructions::instructions_dir()),
+                ),
+            }
+        }
+        cli::InstructionsAction::Path => {
+            for path in [
+                instructions::instructions_dir(),
+                instructions::instructions_file(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let state = if path.exists() { "present" } else { "absent" };
+                println!("{}\t{}", path.display(), state);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_path(path: Option<std::path::PathBuf>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<no config directory>".to_string())
 }
 
 async fn run_memory_subcommand(action: &cli::MemoryAction) -> anyhow::Result<()> {
