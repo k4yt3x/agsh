@@ -30,9 +30,13 @@ use crate::{
 /// [`crate::tools::ToolRegistry::tool_catalogue`].
 pub type ToolCatalogueEntry = (String, String, Permission, bool);
 
-/// Per-entry cap for a deferred tool's one-line summary. Keeps the rendered catalogue bounded when
-/// MCP servers advertise 2 KB descriptions.
-const TOOL_SUMMARY_MAX_CHARS: usize = 160;
+/// Per-entry cap for a deferred tool's summary. Keeps the rendered catalogue bounded when MCP
+/// servers advertise 2 KB descriptions.
+///
+/// Generous because this text is the *only* thing the model knows about a tool until `load_tool`
+/// fetches its schema, and the world-state block is re-rendered on change rather than every turn
+/// (see [`WorldSnapshot`]), so the extra characters are paid roughly once per session.
+const TOOL_SUMMARY_MAX_CHARS: usize = 250;
 
 /// Names of the seven built-in MCP-resource helper tools (defined in `src/tools/mcp_resources.rs`).
 /// They share no common simple prefix, so they're enumerated explicitly. Used to group deferred
@@ -192,14 +196,41 @@ impl WorldSnapshot {
     }
 }
 
-/// Shorten `text` to `limit` characters, cutting on a character boundary.
+/// Shorten `text` to `limit` characters, cutting on a word boundary.
 fn elide(text: &str, limit: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= limit {
         return collapsed;
     }
-    let truncated: String = collapsed.chars().take(limit).collect();
-    format!("{}…", truncated.trim_end())
+    clip_at_word_boundary(&collapsed, limit)
+}
+
+/// Clip `text` to at most `limit` characters and append `…`.
+///
+/// Cuts at the last whitespace inside the budget so a word is never split, and drops a trailing
+/// token carrying an unclosed backtick: a summary ending ``Set `as_`` reads like a complete thought
+/// while inviting the model to guess at a parameter name it cannot actually see.
+fn clip_at_word_boundary(text: &str, limit: usize) -> String {
+    let mut end = text.len();
+    let mut cut_mid_word = false;
+    if text.chars().count() > limit
+        && let Some((byte_idx, next)) = text.char_indices().nth(limit)
+    {
+        end = byte_idx;
+        cut_mid_word = !next.is_whitespace();
+    }
+
+    let mut clipped = &text[..end];
+    if cut_mid_word && let Some(space) = clipped.rfind(char::is_whitespace) {
+        clipped = &clipped[..space];
+    }
+    // An odd backtick count means the clip landed inside an inline-code span.
+    if clipped.matches('`').count() % 2 == 1
+        && let Some(tick) = clipped.rfind('`')
+    {
+        clipped = &clipped[..tick];
+    }
+    format!("{}…", clipped.trim_end())
 }
 
 /// Bucket deferred catalogue entries by source for the `[Tool discovery]`
@@ -252,8 +283,15 @@ fn group_deferred_entries<'a>(
     groups
 }
 
-/// Collapse whitespace, keep the first sentence, clamp to [`TOOL_SUMMARY_MAX_CHARS`], append `…` if
-/// clipped.
+/// Collapse whitespace and fit `description` into [`TOOL_SUMMARY_MAX_CHARS`], appending `…` if and
+/// only if something was dropped.
+///
+/// Packs as many whole sentences as the budget allows rather than stopping at the first one. The
+/// sentence documenting a tool's most consequential optional parameter is rarely the opening one,
+/// so a first-sentence rule silently hid mekabridge's `as_photo` behind a summary that read as
+/// complete, and the model spent a session's worth of work rediscovering it from the server's
+/// source. For the same reason the `…` is load-bearing: it is the only signal that `load_tool` has
+/// more to say.
 fn short_description(description: &str) -> String {
     let collapsed: String = {
         let mut out = String::with_capacity(description.len());
@@ -272,48 +310,58 @@ fn short_description(description: &str) -> String {
         out.trim_end().to_string()
     };
 
-    if collapsed.is_empty() {
+    if collapsed.chars().count() <= TOOL_SUMMARY_MAX_CHARS {
         return collapsed;
     }
 
-    // Find the first sentence terminator followed by whitespace or EOS. Walks by char to avoid
-    // slicing a multi-byte UTF-8 scalar, and recognises CJK fullwidth punctuation (。！？)
-    // alongside ASCII so descriptions in non-Western scripts get the same treatment.
-    let mut sentence_end_byte: Option<usize> = None;
-    let mut prev_term: Option<(char, usize)> = None;
-    for (byte_idx, ch) in collapsed.char_indices() {
-        if let Some((_, term_end)) = prev_term {
-            if ch.is_whitespace() {
-                sentence_end_byte = Some(term_end);
-                break;
-            }
-            prev_term = None;
+    match longest_sentence_prefix(&collapsed, TOOL_SUMMARY_MAX_CHARS) {
+        Some(prefix) => format!("{}…", prefix),
+        // Not even one sentence fits; fall back to a word-boundary clip.
+        None => clip_at_word_boundary(&collapsed, TOOL_SUMMARY_MAX_CHARS),
+    }
+}
+
+/// Byte offsets one past every sentence terminator that is followed by whitespace, plus one for a
+/// terminator that ends the string. Ascending.
+///
+/// Walks by char to avoid slicing a multi-byte UTF-8 scalar, and recognises CJK fullwidth
+/// punctuation (。！？) alongside ASCII so descriptions in non-Western scripts get the same
+/// treatment.
+fn sentence_ends(text: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut pending: Option<usize> = None;
+    for (byte_idx, ch) in text.char_indices() {
+        // Cleared whether or not it turned out to be a boundary: a terminator followed by anything
+        // other than whitespace is an abbreviation or a decimal point, not the end of a sentence.
+        if let Some(term_end) = pending.take()
+            && ch.is_whitespace()
+        {
+            ends.push(term_end);
         }
         if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
-            prev_term = Some((ch, byte_idx + ch.len_utf8()));
+            pending = Some(byte_idx + ch.len_utf8());
         }
     }
-    // Terminator at end-of-string counts as a sentence boundary.
-    if sentence_end_byte.is_none()
-        && let Some((_, term_end)) = prev_term
-        && term_end == collapsed.len()
+    if let Some(term_end) = pending
+        && term_end == text.len()
     {
-        sentence_end_byte = Some(term_end);
+        ends.push(term_end);
     }
+    ends
+}
 
-    let candidate = match sentence_end_byte {
-        Some(end) => collapsed[..end].to_string(),
-        None => collapsed.clone(),
-    };
-
-    if candidate.chars().count() <= TOOL_SUMMARY_MAX_CHARS {
-        return candidate;
+/// The longest prefix of `text` ending on a sentence boundary that stays within `limit` characters,
+/// or `None` when even the first sentence overruns it.
+fn longest_sentence_prefix(text: &str, limit: usize) -> Option<&str> {
+    let mut best = None;
+    for end in sentence_ends(text) {
+        let candidate = &text[..end];
+        if candidate.chars().count() > limit {
+            break;
+        }
+        best = Some(candidate);
     }
-
-    // Char-cap fallback. Walking by char preserves UTF-8 boundaries without relying on the unstable
-    // `floor_char_boundary`.
-    let clipped: String = candidate.chars().take(TOOL_SUMMARY_MAX_CHARS).collect();
-    format!("{}…", clipped.trim_end())
+    best
 }
 
 /// OS description for the system prompt's environment block, detected once. Probing the OS is
@@ -488,9 +536,11 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
 
     if !deferred.is_empty() {
         let mut out = String::from(
-            "[Tool discovery]\nThese are registered but not yet callable: their schemas are \
-             withheld to keep the request small. Call `load_tool` with a tool's exact `name` to \
-             fetch its schema, then call it directly.\n",
+            "[Tool discovery]\nThese are registered, but their schemas are withheld to keep the \
+             request small, so the summaries below are all you have and a trailing `…` means one \
+             was cut short. Call `load_tool` with a tool's exact `name` (or a list of names) to \
+             fetch the full schemas. Calling one of these directly does work, but you will be \
+             guessing at its optional parameters and silently taking their defaults.\n",
         );
         for (heading, group) in group_deferred_entries(&deferred) {
             out.push_str(&format!("\n{}\n", heading));
@@ -932,10 +982,17 @@ pub fn build_turn_context(
     cwd: &std::path::Path,
     roots: &[std::path::PathBuf],
     world_state: &str,
+    budget: Option<ContextBudget>,
 ) -> String {
     let mut sections = Vec::new();
 
     sections.push(build_permission_context(permission));
+
+    if let Some(budget) = budget
+        && let Some(rendered) = budget.render()
+    {
+        sections.push(rendered);
+    }
 
     if !todos.items.is_empty() {
         sections.push(todo::format_todo_state(todos));
@@ -951,6 +1008,62 @@ pub fn build_turn_context(
     }
 
     format!("<context>\n{}</context>", sections.join("\n"))
+}
+
+/// How much of the context window the conversation is occupying, as the model is told it.
+///
+/// The harness has always known this: it drives auto-compaction and the REPL's live gauge. The
+/// model never saw it, which left it deciding how much of a file to read, whether to summarise
+/// before a long stretch of work, and whether a task fits at all, entirely by feel. Rendered into
+/// the per-turn `<context>` block rather than the system prompt because it moves every turn and the
+/// system prompt is the cached prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextBudget {
+    /// Input tokens behind the most recent request, provider-reported where possible.
+    pub used: u64,
+    /// The model's total window. Zero when meka has no metadata for the model, which suppresses
+    /// the section: a percentage of an unknown denominator is worse than silence.
+    pub window: u64,
+    /// Occupancy at which auto-compaction fires, or `None` when it is switched off.
+    pub compact_at_percent: Option<u64>,
+}
+
+impl ContextBudget {
+    /// The `[Context budget]` section, or `None` when there is nothing trustworthy to report.
+    fn render(&self) -> Option<String> {
+        // `used` is zero until the first response lands, and on that turn a "0%" would describe a
+        // request that has not been measured rather than an empty conversation.
+        if self.window == 0 || self.used == 0 {
+            return None;
+        }
+        let percent = self.used.saturating_mul(100) / self.window;
+        let policy = match self.compact_at_percent {
+            Some(threshold) => format!(
+                "The conversation is summarised automatically at {}%, which loses detail, so \
+                 prefer to finish or checkpoint work before then.",
+                threshold
+            ),
+            None => {
+                "Auto-compaction is off, so a request past the window fails the turn.".to_string()
+            }
+        };
+        Some(format!(
+            "[Context budget]\nUsing ~{} of {} tokens ({}%). {}\n",
+            round_tokens(self.used),
+            round_tokens(self.window),
+            percent,
+            policy,
+        ))
+    }
+}
+
+/// `48213` → `"48k"`. Exact digits invite the model to do arithmetic on a figure that is itself an
+/// approximation of the next request's size.
+fn round_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    format!("{}k", tokens / 1_000)
 }
 
 /// Build the post-compaction context block summarizing live session state (environment, todos,
@@ -1617,16 +1730,37 @@ mod tests {
         assert!(!notion_section.contains("mcp__github__"));
     }
 
+    /// The regression that sent an agent to read the server's source: a parameter documented in the
+    /// third sentence must survive into the summary, because until `load_tool` runs this text is
+    /// all the model has.
     #[test]
-    fn test_short_description_first_sentence() {
-        let s = "Read a scratchpad entry. Extra info follows that we drop.";
-        assert_eq!(short_description(s), "Read a scratchpad entry.");
+    fn test_short_description_keeps_later_sentences() {
+        let s = "Send a file from the local filesystem to a conversation. Use this to deliver \
+                 something you produced, such as a report, an archive, or a rendered chart. Set \
+                 `as_photo` for images you want shown inline rather than offered as a download.";
+        let out = short_description(s);
+        assert!(out.contains("as_photo"), "{out}");
+        assert!(!out.ends_with('…'), "nothing was dropped: {out}");
     }
 
     #[test]
     fn test_short_description_passes_through_short_text() {
         let s = "Read a scratchpad entry.";
         assert_eq!(short_description(s), "Read a scratchpad entry.");
+    }
+
+    /// Over budget, the cut lands on a sentence boundary and says so.
+    #[test]
+    fn test_short_description_packs_whole_sentences_then_marks_the_cut() {
+        let s = format!(
+            "First sentence. {} Trailing sentence.",
+            "Filler word. ".repeat(30)
+        );
+        let out = short_description(&s);
+        assert!(out.starts_with("First sentence."), "{out}");
+        assert!(out.ends_with(".…"), "cut on a sentence boundary: {out}");
+        assert!(out.chars().count() <= TOOL_SUMMARY_MAX_CHARS + 1);
+        assert!(!out.contains("Trailing sentence"), "{out}");
     }
 
     #[test]
@@ -1640,7 +1774,26 @@ mod tests {
     #[test]
     fn test_short_description_collapses_whitespace() {
         let s = "Line one.\n\n  Line   two.  ";
-        assert_eq!(short_description(s), "Line one.");
+        assert_eq!(short_description(s), "Line one. Line two.");
+    }
+
+    /// A clip must never strand the model with half a parameter name inside an unclosed code span.
+    #[test]
+    fn test_clip_at_word_boundary_drops_a_partial_code_span() {
+        let text = format!("{} Set `as_photo` for images.", "padding word ".repeat(30));
+        let out = clip_at_word_boundary(&text, TOOL_SUMMARY_MAX_CHARS);
+        assert_eq!(
+            out.matches('`').count() % 2,
+            0,
+            "unbalanced backticks: {out}"
+        );
+        assert!(!out.contains("`as_"), "{out}");
+    }
+
+    #[test]
+    fn test_clip_at_word_boundary_does_not_split_a_word() {
+        let out = clip_at_word_boundary("alpha beta gamma delta", 12);
+        assert_eq!(out, "alpha beta…");
     }
 
     #[test]
@@ -2197,10 +2350,82 @@ mod tests {
             std::path::Path::new("."),
             &[],
             "",
+            None,
         );
         assert!(context.starts_with("<context>\n"));
         assert!(context.ends_with("</context>"));
         assert!(context.contains("[Permission context]"));
+    }
+
+    #[test]
+    fn test_context_budget_reports_occupancy_and_the_compaction_threshold() {
+        let rendered = ContextBudget {
+            used: 84_000,
+            window: 200_000,
+            compact_at_percent: Some(80),
+        }
+        .render()
+        .expect("a measured turn reports");
+
+        assert!(rendered.contains("[Context budget]"));
+        assert!(rendered.contains("~84k of 200k tokens (42%)"), "{rendered}");
+        assert!(
+            rendered.contains("summarised automatically at 80%"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_context_budget_says_when_compaction_is_off() {
+        let rendered = ContextBudget {
+            used: 10_000,
+            window: 100_000,
+            compact_at_percent: None,
+        }
+        .render()
+        .expect("some");
+        assert!(rendered.contains("Auto-compaction is off"), "{rendered}");
+    }
+
+    /// An unknown window has no denominator, and an unmeasured first turn has no numerator. Either
+    /// way a percentage would be a fabrication.
+    #[test]
+    fn test_context_budget_is_silent_without_a_real_measurement() {
+        assert!(
+            ContextBudget {
+                used: 5_000,
+                window: 0,
+                compact_at_percent: Some(80),
+            }
+            .render()
+            .is_none()
+        );
+        assert!(
+            ContextBudget {
+                used: 0,
+                window: 200_000,
+                compact_at_percent: Some(80),
+            }
+            .render()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_turn_context_includes_the_budget() {
+        let context = build_turn_context(
+            Permission::Read,
+            &TodoState::default(),
+            std::path::Path::new("."),
+            &[],
+            "",
+            Some(ContextBudget {
+                used: 42_000,
+                window: 200_000,
+                compact_at_percent: Some(80),
+            }),
+        );
+        assert!(context.contains("[Context budget]"), "{context}");
     }
 
     #[test]
@@ -2211,6 +2436,7 @@ mod tests {
             std::path::Path::new("."),
             &[],
             "",
+            None,
         );
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
@@ -2222,8 +2448,14 @@ mod tests {
             items: vec![sample_todo("write tests", todo::TodoStatus::InProgress)],
             ..Default::default()
         };
-        let context =
-            build_turn_context(Permission::Read, &todos, std::path::Path::new("."), &[], "");
+        let context = build_turn_context(
+            Permission::Read,
+            &todos,
+            std::path::Path::new("."),
+            &[],
+            "",
+            None,
+        );
         assert!(context.contains("write tests"));
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("[Permission context]"));
@@ -2235,8 +2467,14 @@ mod tests {
             items: vec![sample_todo("do a thing", todo::TodoStatus::Pending)],
             ..Default::default()
         };
-        let context =
-            build_turn_context(Permission::None, &todos, std::path::Path::new("."), &[], "");
+        let context = build_turn_context(
+            Permission::None,
+            &todos,
+            std::path::Path::new("."),
+            &[],
+            "",
+            None,
+        );
         assert!(context.contains("do a thing"));
         assert!(context.contains("[Permission context]"));
         assert!(!context.contains("[Environment context]"));

@@ -70,6 +70,27 @@ meka also exposes seven built-in **MCP meta-tools** for browsing server-side res
 | `unsubscribe_mcp_resource` | Read | Stop receiving change notifications |
 | `list_mcp_resource_updates` | Read | Inspect pending resource-change notifications |
 
+## Deferred Tools
+
+Most MCP tools are **deferred**: they are registered and listed under `[Tool discovery]` in the per-turn context, but their JSON schemas are withheld from the request until the agent calls `load_tool`. A large server can advertise fifty tools with multi-kilobyte schemas, and shipping all of them on every turn costs more than it returns.
+
+The trade-off is that until a tool is loaded, the agent sees only its name and a summary clipped to 250 characters. **Anything past that clip is invisible**, including optional parameters, and a summary that was clipped ends in `…`.
+
+Two behaviours exist so this never turns into a silent wrong answer:
+
+- Calling a deferred tool without loading it **works**. The agent may be confident about the required arguments, and forcing a round trip it doesn't need is worse than allowing it.
+- But when it does that and the tool has documented parameters it didn't pass, meka appends a note to the tool result naming them, with their types, defaults, and descriptions. A wrong default stops being invisible. The note is emitted once per tool per run.
+
+`load_tool` takes one name or an array of up to ten, so a task needing several tools off one server costs one round trip:
+
+```text
+load_tool({"name": ["mcp__notion__search", "mcp__notion__fetch"]})
+```
+
+Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#mcp-servers) skip all of this: their schemas ship from turn 1. Use it for tools whose optional parameters matter and that the agent reaches for constantly.
+
+**When writing a tool description for a server meka will consume**, put whatever a caller must know to use the tool correctly in the first two sentences. That may be all anyone ever sees.
+
 ## Scratchpad Parameter
 
 All tools support an optional `scratchpad` string parameter. When provided, the tool's output is saved to the scratchpad under that name instead of being returned inline. This lets the agent store large outputs for later processing without consuming conversation context.

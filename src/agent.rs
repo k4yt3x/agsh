@@ -279,6 +279,10 @@ pub struct Agent {
     /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
     /// Cleared between turns by `persist_oversized_results`.
     scratchpad_hints: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Tools that have already been the subject of a [`Self::schema_advisory`]. Never cleared: the
+    /// advisory lives on in the conversation, so a second copy teaches nothing and costs context
+    /// on every later call.
+    schema_advisories_sent: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Optional MCP client manager; used to read server-supplied `InitializeResult.instructions`
     /// for inclusion in the system prompt.
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
@@ -345,6 +349,9 @@ impl Agent {
             roots,
             last_context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            schema_advisories_sent: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             mcp_manager: None,
             session_stats,
             persist_session_stats: true,
@@ -687,6 +694,16 @@ impl Agent {
                 &cwd_snapshot,
                 &roots_snapshot,
                 &world_state,
+                Some(context::ContextBudget {
+                    used: self
+                        .last_context_tokens
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    window: self.options.context_window,
+                    compact_at_percent: self
+                        .options
+                        .auto_compact
+                        .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
+                }),
             );
             format!("{}\n\n{}", block, user_input)
         };
@@ -1126,7 +1143,7 @@ impl Agent {
                     }
 
                     let mut tool_results = self
-                        .execute_tool_calls(&assistant_message, cancellation.clone())
+                        .execute_tool_calls(&assistant_message, &loaded, cancellation.clone())
                         .await;
 
                     if let Err(error) = crate::tools::scratchpad::save_explicit_scratchpad_results(
@@ -1513,9 +1530,12 @@ impl Agent {
         Ok((message, stop_reason, token_usage))
     }
 
+    /// `loaded` is the turn's active-tool set, used only to tell a call made against a schema the
+    /// model has actually seen from one made blind; see [`Self::schema_advisory`].
     async fn execute_tool_calls(
         &self,
         assistant_message: &Message,
+        loaded: &[String],
         cancellation: CancellationToken,
     ) -> Vec<ContentBlock> {
         // Emit tool-call indicators in source order. The streaming path already emitted these as
@@ -1547,7 +1567,13 @@ impl Agent {
         // Dispatch concurrently. `join_all` preserves input ordering so the i-th output corresponds
         // to the i-th planned call.
         let futures = planned.iter().map(|(id, name, input)| {
-            self.resolve_and_execute_tool(id.as_str(), name.as_str(), input, cancellation.clone())
+            self.resolve_and_execute_tool(
+                id.as_str(),
+                name.as_str(),
+                input,
+                loaded,
+                cancellation.clone(),
+            )
         });
         let outputs = futures::future::join_all(futures).await;
 
@@ -1613,6 +1639,7 @@ impl Agent {
         tool_call_id: &str,
         name: &str,
         input: &serde_json::Value,
+        loaded: &[String],
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
         // If the stream layer couldn't parse this tool call's JSON arguments, it marked the input
@@ -1637,7 +1664,15 @@ impl Agent {
             {
                 return crate::tools::ToolOutput::text(reason, true);
             }
-            return crate::tools::ToolOutput::text(format!("Unknown tool: '{}'", name), true);
+            // Namespaced MCP names are long and easy to mangle, and the commonest slip is dropping
+            // the `mcp__<server>__` prefix entirely, which no amount of re-reading the catalogue
+            // fixes if the reply is a bare "unknown".
+            let registered = self.tool_registry.registered_tool_names();
+            let hint = crate::tools::did_you_mean_hint(name, registered.iter().map(String::as_str));
+            return crate::tools::ToolOutput::text(
+                format!("Unknown tool: '{}'.{}", name, hint),
+                true,
+            );
         };
 
         // Read the current permission once, at the enforcement site, so a permission cycle via
@@ -1668,6 +1703,7 @@ impl Agent {
         // conversation it came from. `run_turn` populates `shared_session_id` before the tool loop,
         // so this is only `None` on paths that never established a session.
         let session_id = *self.shared_session_id.read().await;
+        let schema = tool.definition().parameters;
         let dispatch = crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
             if permission == crate::permission::Permission::Ask {
                 return self
@@ -1677,10 +1713,53 @@ impl Agent {
 
             Self::run_tool(&*tool, input, cancellation, &self.frontend).await
         });
-        match session_id {
+        let mut output = match session_id {
             Some(id) => crate::mcp::with_session_id(id, dispatch).await,
             None => dispatch.await,
+        };
+        if let Some(advisory) = self.schema_advisory(name, input, &schema, loaded, !output.is_error)
+        {
+            output.append_notice(&advisory);
         }
+        output
+    }
+
+    /// The advisory to append to this call's result when the arguments and the tool's advertised
+    /// schema disagree, or `None`.
+    ///
+    /// Deferred tools are dispatchable whether or not the model loaded them (see
+    /// [`Self::resolve_and_execute_tool`]), and a model that never loaded one has only ever seen
+    /// the truncated one-line summary from `[Tool discovery]`. That is how a `send_file` call
+    /// landed every image as a download attachment for want of an `as_photo` flag nothing had
+    /// mentioned: the call succeeded, so there was no error to read, and the wrong default was
+    /// invisible.
+    ///
+    /// Emitted at most once per tool per process. The result stays in the conversation, so
+    /// repeating it buys nothing and costs context on every subsequent call.
+    ///
+    /// `ran` gates only the *bookkeeping*: a call that never executed (an interactive permission
+    /// denial, say) still gets the advisory, but must not spend the tool's one slot, or the retry
+    /// after the user grants permission would be the silent call this exists to prevent.
+    fn schema_advisory(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        schema: &serde_json::Value,
+        loaded: &[String],
+        ran: bool,
+    ) -> Option<String> {
+        let blind =
+            self.tool_registry.is_deferred(name) && !loaded.iter().any(|entry| entry == name);
+        let advisory = crate::tools::schema_disagreement(name, input, schema, blind)?;
+        if !ran {
+            return Some(advisory);
+        }
+        let first_time = self
+            .schema_advisories_sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_string());
+        first_time.then_some(advisory)
     }
 
     async fn execute_with_approval(
@@ -2287,6 +2366,13 @@ mod tests {
     /// Minimal in-memory agent driving `provider`: no tools, no skills, no memories, silent
     /// frontend. Enough to exercise `run_turn`'s recovery arms, which touch none of that.
     async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
+        test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
+    }
+
+    async fn test_agent_with_registry(
+        provider: Arc<dyn Provider>,
+        registry: crate::tools::ToolRegistry,
+    ) -> (Agent, SessionManager) {
         let session_manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
             .await
             .expect("in-memory db");
@@ -2302,7 +2388,7 @@ mod tests {
         };
         let agent = Agent::new(
             provider,
-            crate::tools::ToolRegistry::new(),
+            registry,
             session_manager.clone(),
             SharedPermission::new(
                 crate::permission::Permission::Read,
@@ -2501,6 +2587,210 @@ mod tests {
                 .flat_map(|message| message.content.iter())
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
             "the refused image should have been degraded away"
+        );
+    }
+
+    /// A deferred tool with a documented optional parameter, standing in for mekabridge's
+    /// `send_file`.
+    struct SendFileFixture;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SendFileFixture {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "mcp__bridge__send_file".to_string(),
+                description: "Send a file to a conversation.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to the file"},
+                        "as_photo": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Send as a viewable photo rather than a document.",
+                        },
+                    },
+                    "required": ["path"]
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text(
+                "Sent (message id 1)".to_string(),
+                false,
+            ))
+        }
+    }
+
+    fn send_file_registry() -> crate::tools::ToolRegistry {
+        let registry = crate::tools::ToolRegistry::new();
+        registry.register_load_tool_for_test();
+        registry
+            .register(Arc::new(SendFileFixture))
+            .expect("register fixture");
+        registry.mark_deferred("mcp__bridge__send_file");
+        registry
+    }
+
+    fn send_file_round(input: serde_json::Value) -> Vec<crate::provider::mock::MockEvent> {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "mcp__bridge__send_file".to_string(),
+            },
+            MockEvent::ToolUseEnd { input },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    /// The whole incident, end to end: a deferred tool is callable without `load_tool`, so a model
+    /// working from the truncated `[Tool discovery]` summary takes a silently wrong default. The
+    /// result has to say so, because the call itself succeeds and there is no error to read.
+    #[tokio::test]
+    async fn test_blind_deferred_call_is_told_what_it_omitted() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            send_file_round(serde_json::json!({"path": "/tmp/a.png"})),
+            vec![
+                MockEvent::Text {
+                    text: "sent".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, _session_manager) =
+            test_agent_with_registry(provider, send_file_registry()).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "send the picture".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(results.contains("Sent (message id 1)"), "{results}");
+        assert!(results.contains("as_photo"), "the omitted flag: {results}");
+        assert!(results.contains("load_tool"), "{results}");
+    }
+
+    /// A call that never executed must not spend the tool's one advisory. Otherwise a permission
+    /// denial swallows the hint, and the retry after the user grants permission is exactly the
+    /// silent call this machinery exists to prevent.
+    #[tokio::test]
+    async fn test_a_call_that_did_not_run_keeps_its_advisory_slot() {
+        use crate::provider::mock::MockProvider;
+
+        let (agent, _session_manager) = test_agent_with_registry(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            send_file_registry(),
+        )
+        .await;
+        let name = "mcp__bridge__send_file";
+        let schema = crate::tools::Tool::definition(&SendFileFixture).parameters;
+        let input = serde_json::json!({"path": "/tmp/a.png"});
+
+        let denied = agent.schema_advisory(name, &input, &schema, &[], false);
+        assert!(denied.is_some(), "a denied call is still told");
+
+        let retried = agent.schema_advisory(name, &input, &schema, &[], true);
+        assert!(retried.is_some(), "the denial must not have spent the slot");
+
+        let third = agent.schema_advisory(name, &input, &schema, &[], true);
+        assert!(third.is_none(), "but a call that ran spends it");
+    }
+
+    /// Once the model has loaded the schema, the same call is its own business.
+    #[tokio::test]
+    async fn test_loaded_tool_call_gets_no_advisory() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let registry = send_file_registry();
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "load-1".to_string(),
+                    name: crate::tools::LOAD_TOOL_NAME.to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "mcp__bridge__send_file"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            send_file_round(serde_json::json!({"path": "/tmp/a.png"})),
+            vec![
+                MockEvent::Text {
+                    text: "sent".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, _session_manager) = test_agent_with_registry(provider, registry).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "send the picture".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(results.contains("Sent (message id 1)"), "{results}");
+        assert!(
+            !results.contains("[meka]"),
+            "the schema was loaded; nothing to advise: {results}"
         );
     }
 

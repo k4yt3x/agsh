@@ -43,6 +43,230 @@ use crate::{
     session::SessionManager,
 };
 
+/// Most unused parameters one advisory will name before it starts costing more context than the
+/// discovery is worth.
+const MAX_ADVISED_PARAMETERS: usize = 5;
+
+/// The universal output-redirection parameter every tool accepts, handled by the agent loop rather
+/// than by the tool itself. See [`crate::tools::scratchpad::save_explicit_scratchpad_results`].
+const SCRATCHPAD_PARAMETER: &str = "scratchpad";
+
+/// An advisory appended to a `tool_result` when the call and the tool's advertised schema disagree,
+/// or `None` when they don't.
+///
+/// Two disagreements are worth reporting, and they are mirror images:
+///
+/// - **Parameters the schema documents that the call omitted.** Only raised for a deferred tool the
+///   model never loaded, because that is the case where it was working from a truncated one-line
+///   summary and could not have known. This is the `send_file(as_photo)` failure: the call
+///   succeeds, the default is silently wrong, and nothing anywhere says a knob existed.
+/// - **Arguments the schema doesn't declare.** Servers almost universally ignore unknown keys, so
+///   without this the model concludes the parameter "didn't work" rather than "was never
+///   delivered", which is what a server binary older than its own source looks like from the
+///   outside.
+pub fn schema_disagreement(
+    tool_name: &str,
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+    report_unused: bool,
+) -> Option<String> {
+    let properties = schema.get("properties")?.as_object()?;
+    // A schema that declares no properties at all describes nothing to disagree with. Servers do
+    // ship these for tools that genuinely take arguments, so treating every key as undeclared would
+    // be noise rather than a finding.
+    if properties.is_empty() {
+        return None;
+    }
+    let passed: std::collections::BTreeSet<&str> = input
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let mut lines: Vec<String> = Vec::new();
+
+    let undeclared: Vec<&str> = passed
+        .iter()
+        .copied()
+        .filter(|key| !properties.contains_key(*key))
+        // `scratchpad` is meka's own, accepted on every tool and consumed by
+        // `save_explicit_scratchpad_results` rather than by the tool. An MCP server's schema has no
+        // reason to declare it, so flagging it would fire on a documented feature.
+        .filter(|key| *key != SCRATCHPAD_PARAMETER)
+        .collect();
+    // An explicit `additionalProperties: true` means the server documented that it takes more than
+    // it lists, so an undeclared key there is intentional rather than a mistake.
+    let open = schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !undeclared.is_empty() && !open {
+        lines.push(format!(
+            "Sent but not declared in this tool's schema, so it was most likely ignored: {}.",
+            undeclared.join(", "),
+        ));
+    }
+
+    if report_unused {
+        let mut unused: Vec<String> = properties
+            .iter()
+            .filter(|(key, _)| !passed.contains(key.as_str()))
+            .filter_map(|(key, spec)| {
+                let description = spec
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)?;
+                let default = spec
+                    .get("default")
+                    .map(|value| format!(", default {}", value))
+                    .unwrap_or_default();
+                let kind = spec
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("any");
+                Some(format!("{} ({}{}): {}", key, kind, default, description))
+            })
+            .collect();
+        if !unused.is_empty() {
+            let dropped = unused.len().saturating_sub(MAX_ADVISED_PARAMETERS);
+            unused.truncate(MAX_ADVISED_PARAMETERS);
+            let tail = if dropped > 0 {
+                format!("\n  (+{} more)", dropped)
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "Called without loading its schema, so these documented parameters took their \
+                 defaults:\n  {}{}",
+                unused.join("\n  "),
+                tail,
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    // Only point at `load_tool` when the schema is genuinely still hidden; telling a model to load
+    // something it already loaded reads as noise and trains it to skim these.
+    if report_unused {
+        lines.push(format!(
+            "Call `load_tool` with \"{}\" for the full contract.",
+            tool_name,
+        ));
+    }
+    Some(format!("\n\n[meka] {}", lines.join("\n")))
+}
+
+/// `" Did you mean `a` or `b`?"` for a tool name that isn't registered, or `""` when nothing is
+/// close. The leading space lets it slot into a sentence unconditionally.
+///
+/// Plain edit distance is a poor fit for this namespace: omitting the `mcp__<server>__` prefix is
+/// the likeliest mistake by far and puts the right answer seventeen edits away. So an exact match
+/// on the final `__` segment is tried first and wins outright; distance is only the fallback for
+/// genuine typos.
+pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a str>) -> String {
+    const MAX_SUGGESTIONS: usize = 3;
+    let needle = target.to_ascii_lowercase();
+    let needle_tail = needle.rsplit("__").next().unwrap_or(needle.as_str());
+    let threshold = (needle.chars().count() / 3).clamp(1, 5);
+
+    let mut by_segment: Vec<&str> = Vec::new();
+    let mut by_distance: Vec<(usize, &str)> = Vec::new();
+    for candidate in candidates {
+        let lowered = candidate.to_ascii_lowercase();
+        if lowered == needle
+            || lowered.rsplit("__").next() == Some(needle.as_str())
+            || lowered == needle_tail
+        {
+            by_segment.push(candidate);
+            continue;
+        }
+        let distance = edit_distance(&needle, &lowered);
+        if distance <= threshold {
+            by_distance.push((distance, candidate));
+        }
+    }
+
+    let mut suggestions: Vec<&str> = if by_segment.is_empty() {
+        by_distance.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        by_distance.into_iter().map(|(_, name)| name).collect()
+    } else {
+        by_segment.sort_unstable();
+        by_segment
+    };
+    suggestions.truncate(MAX_SUGGESTIONS);
+
+    if suggestions.is_empty() {
+        return String::new();
+    }
+    let rendered: Vec<String> = suggestions
+        .iter()
+        .map(|name| format!("`{}`", name))
+        .collect();
+    format!(" Did you mean {}?", rendered.join(" or "))
+}
+
+/// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
+/// over the registry is not worth optimising away.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current: Vec<usize> = vec![0; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = usize::from(left_char != right_char);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+/// Most tools one `load_tool` call will render. A batch past this is more likely a model loading a
+/// whole server speculatively than a task that genuinely needs them all, and each schema is
+/// unbounded in size.
+pub const MAX_LOAD_TOOL_BATCH: usize = 10;
+
+/// The tool names one `load_tool` call refers to, in order, deduplicated, and capped at
+/// [`MAX_LOAD_TOOL_BATCH`].
+///
+/// Accepts a bare string or an array of strings: a task needing three tools off one server should
+/// cost one round trip, not three. Shared with [`extract_loaded_tool_names`] so the active set is
+/// derived from exactly the names the tool acted on, cap included. A name dropped by the cap must
+/// not become active, since its schema was never rendered.
+pub fn load_tool_names(input: &serde_json::Value) -> Vec<String> {
+    let mut names = requested_tool_names(input);
+    names.truncate(MAX_LOAD_TOOL_BATCH);
+    names
+}
+
+/// Every distinct name the call asked for, before [`MAX_LOAD_TOOL_BATCH`] is applied. `load_tool`
+/// compares this against [`load_tool_names`] so an over-long batch is reported rather than quietly
+/// half-honoured, which is the same class of silent shortfall this whole advisory machinery exists
+/// to eliminate.
+pub fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = match input.get("name") {
+        Some(serde_json::Value::String(name)) => vec![name.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
+    names
+}
+
 /// Walk the conversation and collect the names of tools that have been loaded via successful
 /// `load_tool` calls. A `load_tool` `tool_use` block counts only when paired with a non-error
 /// `tool_result` whose `tool_use_id` matches; this excludes errored loads (unknown name, malformed
@@ -51,15 +275,20 @@ use crate::{
 /// The active set is a pure function of the message slice, so the tools array sent to the Claude
 /// API is deterministic given the conversation state. Resumed sessions reconstruct the exact active
 /// set their suspend time had, with no out-of-band state.
+///
+/// A batch that resolved some names and not others returns a non-error result, so every name it
+/// carried is recorded here. Harmless: a name with no registry entry matches nothing when the
+/// active set is assembled (see [`ToolRegistry::definitions_active_with_loaded`]).
 pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
-    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut pending: HashMap<String, Vec<String>> = HashMap::new();
     let mut loaded: HashSet<String> = HashSet::new();
     for message in messages {
         for block in &message.content {
             match block {
                 ContentBlock::ToolUse { id, name, input } if name == LOAD_TOOL_NAME => {
-                    if let Some(loaded_name) = input.get("name").and_then(|v| v.as_str()) {
-                        pending.insert(id.clone(), loaded_name.to_string());
+                    let names = load_tool_names(input);
+                    if !names.is_empty() {
+                        pending.insert(id.clone(), names);
                     }
                 }
                 ContentBlock::ToolResult {
@@ -67,10 +296,10 @@ pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
                     is_error,
                     ..
                 } => {
-                    if let Some(loaded_name) = pending.remove(tool_use_id)
+                    if let Some(loaded_names) = pending.remove(tool_use_id)
                         && !is_error
                     {
-                        loaded.insert(loaded_name);
+                        loaded.extend(loaded_names);
                     }
                 }
                 _ => {}
@@ -217,6 +446,18 @@ impl ToolOutput {
     pub fn with_metadata(mut self, metadata: crate::frontend::ToolOutputMetadata) -> Self {
         self.frontend_metadata = Some(metadata);
         self
+    }
+
+    /// Append harness-authored text to the model-visible result, extending the trailing text block
+    /// rather than adding one. An MCP result can be a mix of text and images, and a bare text block
+    /// tacked onto the end of that is easy to read as part of the tool's own output.
+    pub fn append_notice(&mut self, notice: &str) {
+        match self.content.last_mut() {
+            Some(ToolResultContent::Text { text }) => text.push_str(notice),
+            _ => self.content.push(ToolResultContent::Text {
+                text: notice.trim_start().to_string(),
+            }),
+        }
     }
 }
 
@@ -416,6 +657,26 @@ impl ToolRegistry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(name.to_string());
+    }
+
+    /// Every registered tool name. Unlike [`Self::tool_catalogue`] this clones no descriptions and
+    /// imposes no order, which is all a "did you mean" lookup needs.
+    pub fn registered_tool_names(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect()
+    }
+
+    /// Whether `name` is deferred, i.e. whether the model has to have loaded it to have ever seen
+    /// its schema.
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(name)
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -1008,6 +1269,226 @@ pub(crate) mod tests {
         let loaded = extract_loaded_tool_names(&messages);
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains("scratchpad_read"));
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_from_a_batch() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: LOAD_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"name": ["alpha", "beta"]}),
+                }],
+            },
+            tool_result("u1", "loaded", false),
+        ];
+        let loaded = extract_loaded_tool_names(&messages);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains("alpha") && loaded.contains("beta"));
+    }
+
+    #[test]
+    fn test_load_tool_names_dedups_and_caps() {
+        let input = serde_json::json!({"name": ["a", "a", "b"]});
+        assert_eq!(load_tool_names(&input), vec![
+            "a".to_string(),
+            "b".to_string()
+        ]);
+
+        let many: Vec<String> = (0..MAX_LOAD_TOOL_BATCH + 5)
+            .map(|index| format!("tool_{index}"))
+            .collect();
+        let input = serde_json::json!({"name": many});
+        assert_eq!(load_tool_names(&input).len(), MAX_LOAD_TOOL_BATCH);
+    }
+
+    #[test]
+    fn test_load_tool_names_rejects_a_non_string_name() {
+        assert!(load_tool_names(&serde_json::json!({})).is_empty());
+        assert!(load_tool_names(&serde_json::json!({"name": 7})).is_empty());
+        assert!(load_tool_names(&serde_json::json!({"name": [7, false]})).is_empty());
+    }
+
+    /// The `send_file` schema, as mekabridge advertises it.
+    fn send_file_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "conversation": {"type": "string", "description": "Target conversation"},
+                "path": {"type": "string", "description": "Path to the file"},
+                "caption": {"type": ["string", "null"], "description": "Optional caption"},
+                "as_photo": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Send as a viewable photo rather than a downloadable document.",
+                },
+            },
+            "required": ["conversation", "path"]
+        })
+    }
+
+    /// The regression in full: a call that succeeds, takes a silently wrong default, and until now
+    /// said nothing about the flag that would have fixed it.
+    #[test]
+    fn test_schema_disagreement_names_the_unused_parameter() {
+        let input = serde_json::json!({"conversation": "telegram:1", "path": "/tmp/a.png"});
+        let advisory = schema_disagreement(
+            "mcp__mekabridge__send_file",
+            &input,
+            &send_file_schema(),
+            true,
+        )
+        .expect("blind call omitting as_photo must be advised");
+
+        assert!(
+            advisory.contains("as_photo (boolean, default false)"),
+            "{advisory}"
+        );
+        assert!(advisory.contains("viewable photo"), "{advisory}");
+        assert!(advisory.contains("caption"), "{advisory}");
+        assert!(advisory.contains("load_tool"), "{advisory}");
+        // Parameters the call did supply are not worth repeating back.
+        assert!(!advisory.contains("\n  path ("), "{advisory}");
+    }
+
+    /// The same call, once the model has actually seen the schema, is not worth a word.
+    #[test]
+    fn test_schema_disagreement_is_silent_for_a_loaded_tool() {
+        let input = serde_json::json!({"conversation": "telegram:1", "path": "/tmp/a.png"});
+        assert!(
+            schema_disagreement(
+                "mcp__mekabridge__send_file",
+                &input,
+                &send_file_schema(),
+                false
+            )
+            .is_none()
+        );
+    }
+
+    /// What a server binary older than its own source looks like from the caller's side.
+    #[test]
+    fn test_schema_disagreement_flags_an_undeclared_argument() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Path"}},
+        });
+        let input = serde_json::json!({"path": "/tmp/a.png", "as_photo": true});
+        let advisory = schema_disagreement("send_file", &input, &schema, false).expect("advised");
+
+        assert!(
+            advisory.contains("not declared in this tool's schema"),
+            "{advisory}"
+        );
+        assert!(advisory.contains("as_photo"), "{advisory}");
+        // Nothing to load: this tool's schema is already in hand.
+        assert!(!advisory.contains("load_tool"), "{advisory}");
+    }
+
+    /// `scratchpad` works on every tool and is consumed by the agent loop, so an MCP schema that
+    /// doesn't mention it is not a disagreement.
+    #[test]
+    fn test_schema_disagreement_ignores_the_scratchpad_parameter() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Path"}},
+        });
+        let input = serde_json::json!({"path": "/tmp/a.png", "scratchpad": "out"});
+        assert!(schema_disagreement("mcp__x__read", &input, &schema, false).is_none());
+    }
+
+    #[test]
+    fn test_schema_disagreement_respects_additional_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Path"}},
+            "additionalProperties": true,
+        });
+        let input = serde_json::json!({"path": "/tmp/a.png", "extra": 1});
+        assert!(schema_disagreement("open", &input, &schema, false).is_none());
+    }
+
+    #[test]
+    fn test_schema_disagreement_ignores_schemas_with_nothing_to_say() {
+        let input = serde_json::json!({"anything": 1});
+        assert!(schema_disagreement("x", &input, &serde_json::json!({}), true).is_none());
+        assert!(
+            schema_disagreement(
+                "x",
+                &input,
+                &serde_json::json!({"type": "object", "properties": {}}),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_schema_disagreement_caps_the_list() {
+        let mut properties = serde_json::Map::new();
+        for index in 0..MAX_ADVISED_PARAMETERS + 3 {
+            properties.insert(
+                format!("option_{index}"),
+                serde_json::json!({"type": "string", "description": "An option"}),
+            );
+        }
+        let schema = serde_json::json!({"type": "object", "properties": properties});
+        let advisory =
+            schema_disagreement("x", &serde_json::json!({}), &schema, true).expect("some");
+        assert!(advisory.contains("(+3 more)"), "{advisory}");
+    }
+
+    /// Undocumented parameters are skipped: naming a knob without saying what it does is not enough
+    /// to act on, and the schema is one `load_tool` away.
+    #[test]
+    fn test_schema_disagreement_skips_undocumented_parameters() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path"},
+                "mystery": {"type": "string"},
+            },
+        });
+        assert!(
+            schema_disagreement("x", &serde_json::json!({"path": "/a"}), &schema, true).is_none()
+        );
+    }
+
+    /// The commonest slip: naming the tool without its `mcp__<server>__` prefix. Edit distance
+    /// alone puts the answer seventeen operations away, so the segment match has to carry it.
+    #[test]
+    fn test_did_you_mean_matches_on_the_final_segment() {
+        let registered = ["mcp__mekabridge__send_file", "read_file"];
+        let hint = did_you_mean_hint("send_file", registered.into_iter());
+        assert_eq!(hint, " Did you mean `mcp__mekabridge__send_file`?");
+    }
+
+    #[test]
+    fn test_did_you_mean_catches_a_typo() {
+        let registered = ["read_file", "write_file"];
+        let hint = did_you_mean_hint("raed_file", registered.into_iter());
+        assert_eq!(hint, " Did you mean `read_file`?");
+    }
+
+    #[test]
+    fn test_did_you_mean_is_silent_when_nothing_is_close() {
+        let registered = ["read_file", "run_shell"];
+        assert_eq!(
+            did_you_mean_hint("frobnicate_widget", registered.into_iter()),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_did_you_mean_lists_every_server_offering_the_segment() {
+        let registered = ["mcp__a__send_file", "mcp__b__send_file"];
+        let hint = did_you_mean_hint("send_file", registered.into_iter());
+        assert_eq!(
+            hint,
+            " Did you mean `mcp__a__send_file` or `mcp__b__send_file`?"
+        );
     }
 
     #[test]

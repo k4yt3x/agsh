@@ -4593,6 +4593,13 @@ mod tests {
             std::path::Path::new("."),
             &[],
             "",
+            // A populated budget, matching the real call site: the section lands inside the
+            // `<context>` block, so `strip_context_tags` must carry it away with everything else.
+            Some(crate::context::ContextBudget {
+                used: 42_000,
+                window: 200_000,
+                compact_at_percent: Some(80),
+            }),
         );
         format!("{}\n\n{}", block, user_input)
     }

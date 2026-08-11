@@ -504,10 +504,10 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
     use std::collections::HashMap;
     let mut loaded: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut pending: HashMap<String, Vec<String>> = HashMap::new();
 
     let absorb = |message: &Message,
-                  pending: &mut HashMap<String, String>,
+                  pending: &mut HashMap<String, Vec<String>>,
                   seen: &mut HashSet<String>,
                   loaded: &mut Vec<String>| {
         for block in &message.content {
@@ -515,8 +515,9 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
                 ContentBlock::ToolUse { id, name, input }
                     if name == crate::tools::LOAD_TOOL_NAME =>
                 {
-                    if let Some(loaded_name) = input.get("name").and_then(|v| v.as_str()) {
-                        pending.insert(id.clone(), loaded_name.to_string());
+                    let names = crate::tools::load_tool_names(input);
+                    if !names.is_empty() {
+                        pending.insert(id.clone(), names);
                     }
                 }
                 ContentBlock::ToolResult {
@@ -524,11 +525,16 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
                     is_error,
                     ..
                 } => {
-                    if let Some(loaded_name) = pending.remove(tool_use_id)
+                    if let Some(loaded_names) = pending.remove(tool_use_id)
                         && !is_error
-                        && seen.insert(loaded_name.clone())
                     {
-                        loaded.push(loaded_name);
+                        // A batch load appends its names in call order, keeping the tools array's
+                        // growth append-only exactly as a sequence of single loads would.
+                        for loaded_name in loaded_names {
+                            if seen.insert(loaded_name.clone()) {
+                                loaded.push(loaded_name);
+                            }
+                        }
                     }
                 }
                 _ => {}

@@ -2230,6 +2230,7 @@ mod tests {
                 std::path::Path::new("."),
                 &[],
                 "",
+                None,
             );
             format!("{}\n\n{}", block, "list files under /tmp")
         };
@@ -2250,6 +2251,7 @@ mod tests {
                 std::path::Path::new("."),
                 &[],
                 "",
+                None,
             );
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
@@ -2352,6 +2354,7 @@ mod tests {
                 std::path::Path::new("."),
                 &[],
                 "",
+                None,
             );
             format!("{}\n\n{}", block, "investigate scratchpad")
         };

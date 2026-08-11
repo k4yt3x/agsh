@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Calling a deferred tool without its schema now reports the parameters it left defaulted.
+- Arguments a tool's schema doesn't declare are reported instead of being silently dropped.
+- `load_tool` accepts an array of names, so several tools off one server cost one round trip.
+- An unknown tool name suggests the closest match, allowing for a missing `mcp__` prefix.
+- `[Context budget]` tells the agent its context occupancy and when auto-compaction will fire.
+
+### Fixed
+
+- Deferred tool summaries kept only the first sentence, hiding parameters documented later.
+- Tool summaries clip on a sentence or word boundary, never mid-token, and are marked with `…`.
+- `[Tool discovery]` claimed deferred tools were "not yet callable" when calling one works.
+
 ## [0.38.0] - 2026-08-11
 
 ### Added

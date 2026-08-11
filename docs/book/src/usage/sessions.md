@@ -147,6 +147,20 @@ auto_compact = true
 context_window = 200000  # optional override
 ```
 
+### What the Agent Sees
+
+Once a turn has been measured, the per-turn context block carries a `[Context budget]` line reporting occupancy and the threshold compaction fires at:
+
+```text
+[Context budget]
+Using ~84k of 200k tokens (42%). The conversation is summarised automatically at
+80%, which loses detail, so prefer to finish or checkpoint work before then.
+```
+
+The agent is expected to budget its own reading and to decide when a task will fit, so it needs the same number the harness uses. Without it, those are guesses. The line is suppressed when the window is unknown, and on the first turn of a session, when there is no measurement yet rather than a genuine zero.
+
+It rides the per-turn context block rather than the system prompt because it changes every turn and the system prompt is the cached prefix.
+
 ## Listing Sessions
 
 To see past sessions:
