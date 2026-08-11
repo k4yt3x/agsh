@@ -77,11 +77,11 @@ pub async fn run_get(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `meka skill show <name>`: print the rendered body with `${MEKA_SKILL_DIR}` substituted.
-/// `${MEKA_SESSION_ID}` stays literal because there's no active session in the CLI context.
+/// `meka skill show <name>`: print the body as the agent receives it, i.e. the base-directory
+/// header followed by the body verbatim.
 pub async fn run_show(name: &str) -> Result<()> {
     let skill = require_skill(name)?;
-    let body = skills::load_skill_body(&skill, None)
+    let body = skills::load_skill_body(&skill)
         .await
         .map_err(|error| MekaError::Config(format!("failed to load skill body: {}", error)))?;
     print!("{}", body);
@@ -647,23 +647,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_show_substitutes_skill_dir() {
+    async fn test_run_show_renders_header_and_verbatim_body() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
         run_add(add_args("subst", "desc")).await.expect("add");
 
-        // Inject a marker into the skill body that references the dir.
         let dir = skills::skill_dir_for("subst").expect("dir resolves");
-        let body = "---\ndescription: x\n---\nDir is ${MEKA_SKILL_DIR}\n";
+        let body = "---\ndescription: x\n---\nRun scripts/helper.sh\nLiteral ${MEKA_SKILL_DIR}\n";
         std::fs::write(dir.join("SKILL.md"), body).expect("rewrite");
 
-        // run_show prints to stdout; we exercise the loader directly to assert the substitution
-        // since capturing stdout in tests is brittle.
+        // run_show prints to stdout; exercise the loader directly, since capturing stdout in tests
+        // is brittle.
         let skill = require_skill("subst").expect("found");
-        let rendered = skills::load_skill_body(&skill, None).await.expect("load");
+        let rendered = skills::load_skill_body(&skill).await.expect("load");
+        // The header names the base directory; the body itself is untouched.
         assert!(rendered.contains(&dir.display().to_string()));
-        assert!(!rendered.contains("${MEKA_SKILL_DIR}"));
+        assert!(rendered.contains("Run scripts/helper.sh"));
+        assert!(rendered.contains("Literal ${MEKA_SKILL_DIR}"));
     }
 
     #[test]

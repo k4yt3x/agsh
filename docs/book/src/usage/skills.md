@@ -68,12 +68,11 @@ Skills missing `description` are skipped at discovery with a warning log. Unknow
 | `author` | none | Attribution, conventionally `Name <email>` (e.g. `John Doe <john.doe@example.com>`). Informational only. |
 | `source_url` | none | An `https://` URL the skill's `SKILL.md` can be re-fetched from. Enables [`meka skill update`](#updating-skills). |
 
-### Variable Substitution
+### Referencing Bundled Files
 
-The skill body may reference these variables, which are expanded when the skill is loaded:
+Refer to files bundled alongside `SKILL.md` by relative path (e.g. `scripts/helper.sh`). Every skill body is prefixed with a header naming the skill's directory (see [How the Agent Uses Skills](#how-the-agent-uses-skills)), so relative paths resolve against the skill rather than against the session's working directory.
 
-- `${MEKA_SKILL_DIR}`: the absolute path to the skill's directory. Use this to reference bundled helper files (e.g. `${MEKA_SKILL_DIR}/helper.sh`).
-- `${MEKA_SESSION_ID}`: the current session UUID.
+The body is passed to the model verbatim; meka does not rewrite anything inside it. Keeping skills free of host-specific placeholders is what lets the same `SKILL.md` run under meka and other Agent Skills hosts unchanged.
 
 ## Storage Location
 
@@ -102,7 +101,7 @@ The agent loads a skill by calling the `skill` tool:
 skill(name: "download-videos")
 ```
 
-The tool returns the full body of `SKILL.md` (with variables expanded) as its output. The agent then follows the instructions.
+The tool returns the full body of `SKILL.md` as its output. The agent then follows the instructions.
 
 Whenever a skill body is loaded (by the `skill` tool, `--skill`, `/skill`, `spawn_agent`, or `meka skill show`), it is prefixed with a one-line header naming the skill's directory:
 
@@ -110,7 +109,7 @@ Whenever a skill body is loaded (by the `skill` tool, `--skill`, `/skill`, `spaw
 Base directory for this skill and its bundled files: /home/user/.config/meka/skills/download-videos
 ```
 
-This lets the agent locate files bundled alongside `SKILL.md` even when the body refers to them by bare name (e.g. `helper.sh`) rather than via `${MEKA_SKILL_DIR}`.
+This is what lets the agent locate files bundled alongside `SKILL.md` when the body refers to them by relative path (e.g. `scripts/helper.sh`).
 
 ## Running a Skill in a Sub-Agent
 
@@ -169,5 +168,5 @@ Only the `SKILL.md` file is fetched. Helper scripts bundled alongside it in the 
 - Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls.
 - Write `description` concisely, and fold the "use when..." trigger into it. It is sent to the model and consumes tokens.
 - Keep each skill focused on a single topic or procedure. Spawn multiple skills rather than one giant one.
-- Bundle supporting files in the skill directory and reference them with `${MEKA_SKILL_DIR}/file.ext`.
+- Bundle supporting files in the skill directory and reference them by relative path (`scripts/file.ext`).
 - Skills are re-discovered on every prompt, so you can add, edit, or remove skills mid-session without restarting meka.

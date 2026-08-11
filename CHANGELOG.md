@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **Breaking:** `[session] max_storage_bytes` is gone; delete the key or meka won't start.
+- **Breaking:** `${MEKA_SKILL_DIR}` / `${MEKA_SESSION_ID}` in skills; use relative paths instead.
 
 ### Fixed
 

@@ -163,7 +163,7 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 
 - A built-in local command (`/status`, `/mcp`): handled agent-side, output streamed back, turn ends with no model call. Checked first, so a skill can't shadow a built-in (a skill named `status`/`mcp` is dropped from the palette).
 - Plain text (no leading slash): passes through to the model unchanged.
-- `/<skill-name>` matching an installed skill: loads the skill body via the same path as the REPL's `/skill` command (substituting `${MEKA_SKILL_DIR}` and `${MEKA_SESSION_ID}`) and prepends any extra context the user typed.
+- `/<skill-name>` matching an installed skill: loads the skill body via the same path as the REPL's `/skill` command and prepends any extra context the user typed.
 - Slash with a syntactically valid but unknown skill name (`/nonexistent`): JSON-RPC error.
 - Slash with content that isn't a valid skill identifier (`/etc/hosts`, `//comment`): passes through to the model unchanged, so pasted paths and code comments don't get intercepted.
 

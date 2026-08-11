@@ -1,12 +1,10 @@
-//! `skill` tool: loads a named skill body (with `${MEKA_SKILL_DIR}` and `${MEKA_SESSION_ID}`
-//! substitution) so its instructions become available to the agent on demand.
+//! `skill` tool: loads a named skill body, prefixed with its base directory, so the skill's
+//! instructions become available to the agent on demand.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{Tool, ToolOutput, util::require_str};
 use crate::{
@@ -17,7 +15,6 @@ use crate::{
 };
 
 pub(super) struct SkillTool {
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
     /// Shared skill cache with the agent. Dispatch reads through `current().await` so the tool
     /// sees any auto-reloads that happened during the turn.
     pub skills: Arc<SkillCache>,
@@ -75,14 +72,13 @@ impl Tool for SkillTool {
             }
         };
 
-        let session_id = self.session_id.read().await.map(|id| id.to_string());
-
-        let body = skills::load_skill_body(skill, session_id.as_deref())
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "skill".to_string(),
-                message: error,
-            })?;
+        let body =
+            skills::load_skill_body(skill)
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "skill".to_string(),
+                    message: error,
+                })?;
 
         Ok(ToolOutput::text(body, false))
     }
@@ -107,7 +103,6 @@ mod tests {
     #[tokio::test]
     async fn test_skill_tool_unknown_skill() {
         let tool = SkillTool {
-            session_id: Arc::new(RwLock::new(None)),
             skills: SkillCache::for_root(None),
         };
         let result = tool
@@ -126,7 +121,6 @@ mod tests {
     #[tokio::test]
     async fn test_skill_tool_missing_name() {
         let tool = SkillTool {
-            session_id: Arc::new(RwLock::new(None)),
             skills: SkillCache::for_root(None),
         };
         let result = tool
@@ -144,7 +138,6 @@ mod tests {
             "---\ndescription: x\n---\nRun helper.py to do the thing.\n",
         );
         let tool = SkillTool {
-            session_id: Arc::new(RwLock::new(None)),
             skills: SkillCache::for_root(Some(temp.path().to_path_buf())),
         };
         let result = tool

@@ -283,10 +283,17 @@ pub fn parse_skill_definition(
     })
 }
 
-/// Load the body (post-frontmatter) of a skill, perform variable substitution, and prepend the
-/// [`skill_context_header`] so every consumer (the `skill` tool, `--skill`, `/skill`,
-/// `spawn_agent`'s skill delegation, and `meka skill show`) sees the skill's base directory.
-pub async fn load_skill_body(skill: &Skill, session_id: Option<&str>) -> Result<String, String> {
+/// Load the body (post-frontmatter) of a skill and prepend the [`skill_context_header`] so every
+/// consumer (the `skill` tool, `--skill`, `/skill`, `spawn_agent`'s skill delegation, and
+/// `meka skill show`) sees the skill's base directory.
+///
+/// The body is passed through verbatim. meka used to expand `${MEKA_SKILL_DIR}` and
+/// `${MEKA_SESSION_ID}` here, which made every skill that used them meka-specific: the same file
+/// would not run under another Agent Skills host, and an imported skill had to have its own host's
+/// spelling rewritten. Nothing in meka needs the expansion either, because meka never executes a
+/// skill body; the text is only ever read by a model that has just been told the base directory by
+/// the header above it.
+pub async fn load_skill_body(skill: &Skill) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&skill.body_path)
         .await
         .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
@@ -295,29 +302,20 @@ pub async fn load_skill_body(skill: &Skill, session_id: Option<&str>) -> Result<
         .map(|(_, body)| body.to_string())
         .unwrap_or(content);
 
-    Ok(format!(
-        "{}\n\n{}",
-        skill_context_header(skill),
-        substitute_variables(&body, skill, session_id)
-    ))
+    Ok(format!("{}\n\n{}", skill_context_header(skill), body))
 }
 
 /// Build the one-line context header prepended to a skill body by [`load_skill_body`]. Points the
-/// agent at the skill's directory so bare filenames in the body (bundled scripts, data files)
-/// resolve correctly without the author having to spell out `${MEKA_SKILL_DIR}` on every reference.
+/// agent at the skill's directory so relative references in the body (bundled scripts, data files)
+/// resolve against the skill rather than against the session's working directory.
+///
+/// This is the only thing that makes `scripts/helper.sh` in a skill body mean what its author
+/// intended, so it is prepended unconditionally.
 fn skill_context_header(skill: &Skill) -> String {
     format!(
         "Base directory for this skill and its bundled files: {}",
         skill.source_dir.display()
     )
-}
-
-fn substitute_variables(text: &str, skill: &Skill, session_id: Option<&str>) -> String {
-    let mut result = text.replace("${MEKA_SKILL_DIR}", &skill.source_dir.display().to_string());
-    if let Some(id) = session_id {
-        result = result.replace("${MEKA_SESSION_ID}", id);
-    }
-    result
 }
 
 /// Validate that `name` is a safe filesystem-and-prompt-embeddable skill identifier. See
@@ -361,8 +359,8 @@ pub fn render_template(
     let _ = writeln!(out, "# {}", name);
     out.push('\n');
     out.push_str(
-        "Skill body. Use `${MEKA_SKILL_DIR}` to reference files bundled in this skill's\n\
-         directory, or `${MEKA_SESSION_ID}` for the active session UUID.\n",
+        "Skill body. Reference files bundled in this skill's directory by relative path\n\
+         (e.g. `scripts/helper.sh`); they resolve against the directory this file is in.\n",
     );
     out
 }
@@ -490,8 +488,13 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The body reaches the model byte-for-byte, with only the base-directory header in front.
+    ///
+    /// The `${...}` assertions are the point: meka used to expand `${MEKA_SKILL_DIR}` and
+    /// `${MEKA_SESSION_ID}`, which is what tied a skill to meka. Asserting that they survive
+    /// untouched is what stops the substitution being quietly reintroduced.
     #[tokio::test]
-    async fn test_load_skill_body_with_substitution() {
+    async fn test_load_skill_body_passes_the_body_through_verbatim() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -499,38 +502,26 @@ mod tests {
             "---\n\
              description: X\n\
              ---\n\
-             Path: ${MEKA_SKILL_DIR}\nSession: ${MEKA_SESSION_ID}\n",
+             Run scripts/helper.sh\n\
+             Path: ${MEKA_SKILL_DIR}\nSession: ${MEKA_SESSION_ID}\nOther: ${CLAUDE_SKILL_DIR}\n",
         );
 
         let skill_path = temp.path().join("var-skill");
         let skill = load_skill_definition("var-skill", &skill_path, &skill_path.join("SKILL.md"))
             .expect("load");
 
-        let body = load_skill_body(&skill, Some("abc-123"))
-            .await
-            .expect("body");
-        assert!(body.contains(&skill_path.display().to_string()));
-        assert!(body.contains("Session: abc-123"));
-    }
+        let body = load_skill_body(&skill).await.expect("body");
 
-    #[tokio::test]
-    async fn test_load_skill_body_without_session_id() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        write_skill(
-            temp.path(),
-            "var-skill",
-            "---\n\
-             description: X\n\
-             ---\n\
-             Session: ${MEKA_SESSION_ID}\n",
-        );
-
-        let skill_path = temp.path().join("var-skill");
-        let skill = load_skill_definition("var-skill", &skill_path, &skill_path.join("SKILL.md"))
-            .expect("load");
-
-        let body = load_skill_body(&skill, None).await.expect("body");
+        // The header names the directory relative references resolve against.
+        assert!(body.starts_with(&format!(
+            "Base directory for this skill and its bundled files: {}",
+            skill_path.display()
+        )));
+        assert!(body.contains("Run scripts/helper.sh"));
+        // Nothing below the header is rewritten, whoever's spelling it uses.
+        assert!(body.contains("Path: ${MEKA_SKILL_DIR}"));
         assert!(body.contains("Session: ${MEKA_SESSION_ID}"));
+        assert!(body.contains("Other: ${CLAUDE_SKILL_DIR}"));
     }
 
     fn valid_frontmatter(description: &str) -> String {

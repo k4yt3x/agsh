@@ -301,8 +301,7 @@ pub async fn submit_turn(
                     format!("unknown skill `{}`", skill_name),
                 )
             })?;
-        let session_id_str = session_id.to_string();
-        let skill_body = crate::skills::load_skill_body(skill, Some(&session_id_str))
+        let skill_body = crate::skills::load_skill_body(skill)
             .await
             .map_err(|error| {
                 ProblemDetail::new(

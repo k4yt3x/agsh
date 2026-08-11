@@ -1683,8 +1683,8 @@ fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 /// - Slash followed by a name that isn't a syntactically valid skill identifier (e.g. a pasted path
 ///   like `/etc/hosts` or a `//` comment): returned unchanged so the model can see it.
 /// - `/<skill-name>` matching an installed skill: returns `extra\n\n{body}` where `body` is
-///   [`crate::skills::load_skill_body`]'s output (with `${MEKA_SKILL_DIR}` / `${MEKA_SESSION_ID}`
-///   substituted). Empty `extra` collapses to just `body`. Same composition the REPL uses at
+///   [`crate::skills::load_skill_body`]'s output (the skill's base-directory header followed by its
+///   body verbatim). Empty `extra` collapses to just `body`. Same composition the REPL uses at
 ///   `main.rs:1004`.
 /// - `/<name>` with a syntactically valid skill name but no installed skill of that name: error.
 ///   The shape is too deliberate to be a paste, so a typo deserves a clear "unknown skill" rather
@@ -1692,7 +1692,6 @@ fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 async fn slash_to_prompt_text(
     prompt_text: String,
     skills: &Arc<SkillCache>,
-    session_id: &str,
 ) -> Result<String, SlashInvocationError> {
     let Some((name, extra)) = split_acp_slash(&prompt_text) else {
         return Ok(prompt_text);
@@ -1706,7 +1705,7 @@ async fn slash_to_prompt_text(
     let Some(skill) = snapshot.iter().find(|skill| skill.name == name) else {
         return Err(SlashInvocationError::SkillNotFound(name));
     };
-    let body = crate::skills::load_skill_body(skill, Some(session_id))
+    let body = crate::skills::load_skill_body(skill)
         .await
         .map_err(|source| SlashInvocationError::SkillLoadFailed {
             name: name.clone(),
@@ -2433,13 +2432,7 @@ async fn run_prompt_turn(
     }
 
     let original_prompt_text = prompt_text.clone();
-    let prompt_text = match slash_to_prompt_text(
-        prompt_text,
-        &state.shared.skills,
-        session_id_str.as_str(),
-    )
-    .await
-    {
+    let prompt_text = match slash_to_prompt_text(prompt_text, &state.shared.skills).await {
         Ok(text) => text,
         Err(SlashInvocationError::SkillNotFound(name)) => {
             // `slash_to_prompt_text` only returns `SkillNotFound` for strings whose first token is
@@ -3915,7 +3908,7 @@ mod tests {
     #[tokio::test]
     async fn test_slash_to_prompt_text_passes_through_non_slash() {
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("just a normal prompt".to_string(), &cache, "sid")
+        let out = slash_to_prompt_text("just a normal prompt".to_string(), &cache)
             .await
             .expect("ok");
         assert_eq!(out, "just a normal prompt");
@@ -3926,7 +3919,7 @@ mod tests {
         // A pasted path like `/etc/hosts is a config file` has an invalid skill-name first token
         // (slash inside the name), so the helper must NOT touch it.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("/etc/hosts is the config file".to_string(), &cache, "sid")
+        let out = slash_to_prompt_text("/etc/hosts is the config file".to_string(), &cache)
             .await
             .expect("pass-through");
         assert_eq!(out, "/etc/hosts is the config file");
@@ -3936,7 +3929,7 @@ mod tests {
     async fn test_slash_to_prompt_text_passes_through_double_slash_comment() {
         // `//foo` parses as name="/foo", which is invalid; pass through.
         let cache = SkillCache::for_root(None);
-        let out = slash_to_prompt_text("//comment line".to_string(), &cache, "sid")
+        let out = slash_to_prompt_text("//comment line".to_string(), &cache)
             .await
             .expect("pass-through");
         assert_eq!(out, "//comment line");
@@ -3947,7 +3940,7 @@ mod tests {
         // A clean `/<name>` shape with a syntactically valid skill name that isn't installed:
         // error, since the only realistic source of this shape is a typo'd palette pick.
         let cache = SkillCache::for_root(None);
-        let err = slash_to_prompt_text("/nonexistent".to_string(), &cache, "sid")
+        let err = slash_to_prompt_text("/nonexistent".to_string(), &cache)
             .await
             .expect_err("should error");
         assert!(
@@ -3963,12 +3956,12 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\ndescription: demo skill\n---\nrun ls in ${MEKA_SKILL_DIR}\n",
+            "---\ndescription: demo skill\n---\nrun ls in scripts/\n",
         )
         .expect("write SKILL.md");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/demo only fetch UK news".to_string(), &cache, "sid-xyz")
+        let out = slash_to_prompt_text("/demo only fetch UK news".to_string(), &cache)
             .await
             .expect("ok");
         assert!(
@@ -3977,8 +3970,8 @@ mod tests {
             out
         );
         assert!(
-            out.contains("run ls in ") && out.contains("demo"),
-            "body must include the substituted skill dir: {}",
+            out.contains("run ls in scripts/"),
+            "body must be passed through verbatim: {}",
             out
         );
         assert!(
@@ -4000,7 +3993,7 @@ mod tests {
         .expect("write");
 
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
-        let out = slash_to_prompt_text("/ping".to_string(), &cache, "sid")
+        let out = slash_to_prompt_text("/ping".to_string(), &cache)
             .await
             .expect("ok");
         // No `extra\n\n` prefix when the user passed only the skill name; the body stands alone.

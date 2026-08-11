@@ -667,10 +667,7 @@ impl ToolRegistry {
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
         // every request, not ship tools that can only ever fail.
         if skills.enabled() {
-            self.register_builtin(Arc::new(skill::SkillTool {
-                session_id: shared_session_id.clone(),
-                skills,
-            }));
+            self.register_builtin(Arc::new(skill::SkillTool { skills }));
         }
         if memories.enabled() {
             self.register_builtin(Arc::new(memory::MemoryWriteTool {

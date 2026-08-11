@@ -184,10 +184,7 @@ async fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let skill = skills::cli::require_skill(name)?;
-    // Pass `None` for session_id: the session is created lazily on the first turn, so
-    // `${MEKA_SESSION_ID}` would be unresolvable here. This matches the REPL's first-turn `/skill`
-    // behaviour, where session_id is also None until run_turn populates it.
-    let body = skills::load_skill_body(&skill, None)
+    let body = skills::load_skill_body(&skill)
         .await
         .map_err(|error| anyhow::anyhow!("failed to load skill '{}': {}", name, error))?;
     let combined = match cli.prompt.as_deref() {
@@ -1306,18 +1303,16 @@ async fn run_interactive(
                             ));
                             break 'invoke;
                         };
-                        let session_str = session_id.map(|id| id.to_string());
-                        let body =
-                            match skills::load_skill_body(skill, session_str.as_deref()).await {
-                                Ok(body) => body,
-                                Err(error) => {
-                                    render::render_error(&format!(
-                                        "failed to load skill '{}': {}",
-                                        name, error
-                                    ));
-                                    break 'invoke;
-                                }
-                            };
+                        let body = match skills::load_skill_body(skill).await {
+                            Ok(body) => body,
+                            Err(error) => {
+                                render::render_error(&format!(
+                                    "failed to load skill '{}': {}",
+                                    name, error
+                                ));
+                                break 'invoke;
+                            }
+                        };
                         // Prepend the user's free-form directive to the skill body when present.
                         // The blank-line separator gives the model a visual cue that the first
                         // paragraph is the user's "do this skill, but with this twist" and the rest

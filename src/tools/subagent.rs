@@ -304,18 +304,18 @@ impl Tool for SpawnAgentTool {
             sub_session_id
         );
 
-        // Render the skill body now that the sub-agent's session ID exists, so `${MEKA_SESSION_ID}`
-        // resolves to the sub-agent's own session. `load_skill_body` also prepends the
-        // base-directory header so bundled-file references resolve.
+        // `load_skill_body` prepends the base-directory header so the skill's relative references
+        // resolve against the skill rather than the sub-agent's working directory.
         let skill_body = match &skill {
-            Some(skill) => Some(
-                crate::skills::load_skill_body(skill, Some(&sub_session_id.to_string()))
+            Some(skill) => {
+                let body = crate::skills::load_skill_body(skill)
                     .await
                     .map_err(|error| MekaError::ToolExecution {
                         tool_name: "spawn_agent".to_string(),
                         message: format!("failed to load skill: {}", error),
-                    })?,
-            ),
+                    })?;
+                Some(body)
+            }
             None => None,
         };
 
