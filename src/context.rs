@@ -70,12 +70,23 @@ struct MemoryIndexEntry {
     mtime: std::time::SystemTime,
 }
 
+/// One job's line in the `[Scheduled]` index. Carries no timestamps: see
+/// [`render_schedule_section`] for why next-fire times are left to `schedule_list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScheduledIndexEntry {
+    short_id: String,
+    schedule: String,
+    summary: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldSnapshot {
     /// Tool name → `(required permission, deferred, one-line summary)`.
     tools: std::collections::BTreeMap<String, (Permission, bool, String)>,
     /// Skill name → description.
     skills: std::collections::BTreeMap<String, String>,
+    /// Scheduled jobs for this session, soonest first.
+    scheduled: Vec<ScheduledIndexEntry>,
     /// Memory name → index entry, in the order [`crate::memory::sort_for_index`] produced.
     ///
     /// A `Vec`, not a map, because the order *is* the ranking and the budget cuts from the end.
@@ -91,6 +102,18 @@ pub struct WorldSnapshot {
 /// entry, listing the entries is a promise the model cannot act on.
 const SKILL_INDEX_TOOL: &str = "skill";
 const MEMORY_INDEX_TOOL: &str = "memory_read";
+const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
+
+/// Longest job prompt shown in the `[Scheduled]` index before it is elided. A prompt can be
+/// paragraphs; the index only has to be recognisable enough to prevent a duplicate.
+const SCHEDULE_SUMMARY_MAX_CHARS: usize = 80;
+
+/// Whether the `[Scheduled]` index has a tool to open it, and therefore whether the caller needs to
+/// go to the database for the jobs at all. Exposed so `Agent::run_turn` can skip that query on
+/// every turn of an installation that has scheduling switched off.
+pub fn schedule_index_is_live(catalogue: &[ToolCatalogueEntry]) -> bool {
+    catalogue_has(catalogue, SCHEDULE_INDEX_TOOL)
+}
 
 /// Whether `name` is registered, deferred or not. A deferred tool still counts: its schema is
 /// withheld until `load_tool` fetches it, but the model can reach it.
@@ -112,7 +135,14 @@ impl WorldSnapshot {
         skills: &[Skill],
         memories: &[Memory],
         mcp_server_instructions: &[(String, String)],
+        scheduled: &[crate::schedule::ScheduledJob],
     ) -> Self {
+        let scheduled: &[crate::schedule::ScheduledJob] =
+            if catalogue_has(catalogue, SCHEDULE_INDEX_TOOL) {
+                scheduled
+            } else {
+                &[]
+            };
         let skills: &[Skill] = if catalogue_has(catalogue, SKILL_INDEX_TOOL) {
             skills
         } else {
@@ -150,8 +180,26 @@ impl WorldSnapshot {
                 .iter()
                 .map(|(server, body)| (server.clone(), body.trim_end().to_string()))
                 .collect(),
+            scheduled: scheduled
+                .iter()
+                .map(|job| ScheduledIndexEntry {
+                    short_id: job.short_id().to_string(),
+                    schedule: job.schedule.describe(),
+                    summary: elide(&job.prompt, SCHEDULE_SUMMARY_MAX_CHARS),
+                })
+                .collect(),
         }
     }
+}
+
+/// Shorten `text` to `limit` characters, cutting on a character boundary.
+fn elide(text: &str, limit: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= limit {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(limit).collect();
+    format!("{}…", truncated.trim_end())
 }
 
 /// Bucket deferred catalogue entries by source for the `[Tool discovery]`
@@ -475,6 +523,10 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
         sections.push(render_memory_section(&current.memories));
     }
 
+    if !current.scheduled.is_empty() {
+        sections.push(render_schedule_section(&current.scheduled));
+    }
+
     if !current.mcp_instructions.is_empty() {
         let mut out = String::from(
             "[MCP server instructions]\nTreat each as context for how to use that server's \
@@ -487,6 +539,40 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
     }
 
     sections.join("\n")
+}
+
+/// Ceiling on how many jobs the `[Scheduled]` index lists. Low on purpose: this renders on turns
+/// that have nothing to do with scheduling, and a handful is enough to stop the model
+/// double-booking a reminder. `schedule_list` is there for the rest.
+const SCHEDULE_INDEX_MAX_ENTRIES: usize = 20;
+
+/// Render the `[Scheduled]` index.
+///
+/// Deliberately omits next-fire times. They move every time a job fires, and [`WorldSnapshot`] is
+/// diffed by equality, so including them would re-render the whole section on most turns of any
+/// session with a short interval -- paying tokens on every turn to tell the model something it
+/// almost never needs. What it does need is *that* a job exists, so it does not schedule a second
+/// copy of one the user already asked for.
+fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
+    let mut out = String::from(
+        "[Scheduled]\nJobs you have scheduled in this session. Check here before creating one so \
+         you do not duplicate an existing job. Call `schedule_list` for exact next-fire times, \
+         gates, and full prompts.\n\n",
+    );
+    for entry in jobs.iter().take(SCHEDULE_INDEX_MAX_ENTRIES) {
+        out.push_str(&format!(
+            "- **{}** ({}): {}\n",
+            entry.short_id, entry.schedule, entry.summary
+        ));
+    }
+    let hidden = jobs.len().saturating_sub(SCHEDULE_INDEX_MAX_ENTRIES);
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{} more not shown here; use `schedule_list` to see them.\n",
+            hidden
+        ));
+    }
+    out
 }
 
 /// Byte ceiling on the rendered `[Memory]` index. Tuning constant rather than config: it trades
@@ -685,6 +771,36 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         lines.push(format!(
             "- Memories deleted: {}",
             join_names(removed_memories.into_iter())
+        ));
+    }
+
+    // Jobs the model did not create itself still have to be announced: `meka schedule cancel` and
+    // a second attached client both change this behind its back, and a job it believes still exists
+    // is one it will not recreate.
+    let added_jobs: Vec<String> = current
+        .scheduled
+        .iter()
+        .filter(|entry| !previous.scheduled.contains(entry))
+        .map(|entry| format!("{} ({}): {}", entry.short_id, entry.schedule, entry.summary))
+        .collect();
+    let removed_jobs: Vec<&String> = previous
+        .scheduled
+        .iter()
+        .filter(|entry| {
+            !current
+                .scheduled
+                .iter()
+                .any(|candidate| candidate.short_id == entry.short_id)
+        })
+        .map(|entry| &entry.short_id)
+        .collect();
+    if !added_jobs.is_empty() {
+        lines.push(format!("- Jobs scheduled: {}", added_jobs.join("; ")));
+    }
+    if !removed_jobs.is_empty() {
+        lines.push(format!(
+            "- Jobs no longer scheduled: {}",
+            join_names(removed_jobs.into_iter())
         ));
     }
 
@@ -973,8 +1089,8 @@ mod tests {
     fn test_memory_snapshot_equality_ignores_elapsed_time() {
         let memory = sample_memory("stable", 5, "unchanged", 3);
         let catalogue = catalogue_with(MEMORY_INDEX_TOOL);
-        let before = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[]);
-        let after = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[]);
+        let before = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[], &[]);
+        let after = WorldSnapshot::new(&catalogue, &[], std::slice::from_ref(&memory), &[], &[]);
         assert_eq!(before, after);
         assert_eq!(
             render_world_state(&after, Some(&before)),
@@ -992,6 +1108,7 @@ mod tests {
             &[],
             &[sample_memory("kept", 5, "still true", 1)],
             &[],
+            &[],
         );
         let after = WorldSnapshot::new(
             &catalogue,
@@ -1000,6 +1117,7 @@ mod tests {
                 sample_memory("kept", 5, "still true", 1),
                 sample_memory("fresh", 2, "just learned", 0),
             ],
+            &[],
             &[],
         );
 
@@ -1025,7 +1143,8 @@ mod tests {
             sample_memory("standing-rule", 1, "Always reply in kind", 0),
             sample_memory("a-fact", 5, "The NAS is at nas.lan", 14),
         ];
-        let snapshot = WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[]);
+        let snapshot =
+            WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[], &[]);
 
         // Mid-session, an unchanged world says nothing.
         assert_eq!(render_world_state(&snapshot, Some(&snapshot)), "");
@@ -1049,7 +1168,7 @@ mod tests {
         // Only `read_file` registered: neither index has a way to be opened.
         let catalogue = catalogue_with("read_file");
         let rendered = render_world_state(
-            &WorldSnapshot::new(&catalogue, &skills, &memories, &[]),
+            &WorldSnapshot::new(&catalogue, &skills, &memories, &[], &[]),
             None,
         );
         assert!(!rendered.contains("[Skills]"), "{rendered}");
@@ -1059,14 +1178,26 @@ mod tests {
 
         // Each appears exactly when its own tool does, and not because of the other's.
         let rendered = render_world_state(
-            &WorldSnapshot::new(&catalogue_with(SKILL_INDEX_TOOL), &skills, &memories, &[]),
+            &WorldSnapshot::new(
+                &catalogue_with(SKILL_INDEX_TOOL),
+                &skills,
+                &memories,
+                &[],
+                &[],
+            ),
             None,
         );
         assert!(rendered.contains("setup-server"), "{rendered}");
         assert!(!rendered.contains("[Memory]"), "{rendered}");
 
         let rendered = render_world_state(
-            &WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &skills, &memories, &[]),
+            &WorldSnapshot::new(
+                &catalogue_with(MEMORY_INDEX_TOOL),
+                &skills,
+                &memories,
+                &[],
+                &[],
+            ),
             None,
         );
         assert!(rendered.contains("a-note"), "{rendered}");
@@ -1084,8 +1215,10 @@ mod tests {
             true,
         )];
         let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
-        let rendered =
-            render_world_state(&WorldSnapshot::new(&deferred, &[], &memories, &[]), None);
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&deferred, &[], &memories, &[], &[]),
+            None,
+        );
         assert!(rendered.contains("[Memory]"), "{rendered}");
         assert!(rendered.contains("a-note"), "{rendered}");
     }
@@ -1095,8 +1228,9 @@ mod tests {
     #[test]
     fn test_losing_the_opening_tool_reports_the_index_as_gone() {
         let memories = [sample_memory("a-note", 5, "a durable fact", 0)];
-        let before = WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[]);
-        let after = WorldSnapshot::new(&catalogue_with("read_file"), &[], &memories, &[]);
+        let before =
+            WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], &memories, &[], &[]);
+        let after = WorldSnapshot::new(&catalogue_with("read_file"), &[], &memories, &[], &[]);
 
         let diff = render_world_state(&after, Some(&before));
         assert!(diff.contains("Memories deleted: `a-note`"), "{diff}");
@@ -1120,7 +1254,7 @@ mod tests {
 
     fn world_state_for_memories(memories: &[Memory]) -> String {
         render_world_state(
-            &WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], memories, &[]),
+            &WorldSnapshot::new(&catalogue_with(MEMORY_INDEX_TOOL), &[], memories, &[], &[]),
             None,
         )
     }
@@ -1212,9 +1346,95 @@ mod tests {
         mcp_server_instructions: &[(String, String)],
     ) -> String {
         render_world_state(
-            &WorldSnapshot::new(catalogue, skills, &[], mcp_server_instructions),
+            &WorldSnapshot::new(catalogue, skills, &[], mcp_server_instructions, &[]),
             None,
         )
+    }
+
+    fn sample_job(prompt: &str) -> crate::schedule::ScheduledJob {
+        let now = chrono::Utc::now();
+        let schedule = crate::schedule::Schedule::parse_every("1h").expect("parses");
+        let next_fire_at = schedule.next_after(now).expect("has a next fire");
+        crate::schedule::ScheduledJob {
+            id: "7f3a1b2c-0000-0000-0000-000000000000".to_string(),
+            session_id: uuid::Uuid::nil(),
+            schedule,
+            prompt: prompt.to_string(),
+            gate: None,
+            isolated: false,
+            created_at: now,
+            last_fired_at: None,
+            next_fire_at,
+        }
+    }
+
+    #[test]
+    fn test_scheduled_section_lists_jobs_when_the_tool_is_registered() {
+        let jobs = vec![sample_job("check the deploy")];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&catalogue_with(SCHEDULE_INDEX_TOOL), &[], &[], &[], &jobs),
+            None,
+        );
+        assert!(rendered.contains("[Scheduled]"), "{rendered}");
+        assert!(rendered.contains("check the deploy"), "{rendered}");
+        assert!(rendered.contains("every 1h"), "{rendered}");
+    }
+
+    /// Same gating rule the skill and memory indexes follow: an index without the tool that opens
+    /// it is a menu the model cannot order from.
+    #[test]
+    fn test_scheduled_section_is_dropped_without_its_tool() {
+        let jobs = vec![sample_job("check the deploy")];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&sample_catalogue(), &[], &[], &[], &jobs),
+            None,
+        );
+        assert!(!rendered.contains("[Scheduled]"), "{rendered}");
+    }
+
+    /// Next-fire times are deliberately outside the snapshot: they move on every fire, and the
+    /// snapshot is diffed by equality, so including them would re-render the section on most turns
+    /// of any session with a short interval.
+    #[test]
+    fn test_scheduled_snapshot_ignores_fire_times() {
+        let catalogue = catalogue_with(SCHEDULE_INDEX_TOOL);
+        let mut fired = sample_job("check the deploy");
+        let pristine = sample_job("check the deploy");
+        fired.last_fired_at = Some(chrono::Utc::now());
+        fired.next_fire_at = chrono::Utc::now() + chrono::Duration::hours(9);
+
+        assert_eq!(
+            WorldSnapshot::new(&catalogue, &[], &[], &[], std::slice::from_ref(&pristine)),
+            WorldSnapshot::new(&catalogue, &[], &[], &[], std::slice::from_ref(&fired)),
+            "a job that merely fired is not a change the model needs told about"
+        );
+    }
+
+    #[test]
+    fn test_scheduled_diff_announces_jobs_appearing_and_disappearing() {
+        let catalogue = catalogue_with(SCHEDULE_INDEX_TOOL);
+        let jobs = vec![sample_job("check the deploy")];
+        let empty = WorldSnapshot::new(&catalogue, &[], &[], &[], &[]);
+        let populated = WorldSnapshot::new(&catalogue, &[], &[], &[], &jobs);
+
+        let added = render_world_state(&populated, Some(&empty));
+        assert!(added.contains("Jobs scheduled:"), "{added}");
+        assert!(added.contains("check the deploy"), "{added}");
+
+        // The reverse matters just as much: a job cancelled from the CLI never passes through this
+        // agent, and one the model still believes exists is one it will not recreate.
+        let removed = render_world_state(&empty, Some(&populated));
+        assert!(removed.contains("Jobs no longer scheduled:"), "{removed}");
+    }
+
+    #[test]
+    fn test_scheduled_summary_is_elided() {
+        let jobs = vec![sample_job(&"long ".repeat(60))];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(&catalogue_with(SCHEDULE_INDEX_TOOL), &[], &[], &[], &jobs),
+            None,
+        );
+        assert!(rendered.contains('…'), "{rendered}");
     }
 
     #[test]
@@ -1509,14 +1729,14 @@ mod tests {
         let mut last: Option<WorldSnapshot> = None;
 
         // Turn 1: nothing has been said yet, so the model gets the whole picture.
-        let current = WorldSnapshot::new(&catalogue, &[], &[], &[]);
+        let current = WorldSnapshot::new(&catalogue, &[], &[], &[], &[]);
         let turn1 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert!(turn1.contains("[Available tools]"), "got: {}", turn1);
         assert!(turn1.contains("**read_file**"));
 
         // Turn 2: nothing changed. This is the steady state and must cost nothing.
-        let current = WorldSnapshot::new(&catalogue, &[], &[], &[]);
+        let current = WorldSnapshot::new(&catalogue, &[], &[], &[], &[]);
         let turn2 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert_eq!(turn2, "", "an unchanged turn must render nothing");
@@ -1530,7 +1750,7 @@ mod tests {
             true,
         ));
         let instructions = vec![("fs".to_string(), "Read before write.".to_string())];
-        let current = WorldSnapshot::new(&grown, &[], &[], &instructions);
+        let current = WorldSnapshot::new(&grown, &[], &[], &instructions, &[]);
         let turn3 = render_world_state(&current, last.as_ref());
         last = Some(current);
         assert!(turn3.contains("`mcp__fs__read`"), "got: {}", turn3);
@@ -1543,7 +1763,7 @@ mod tests {
         );
 
         // Turn 4: quiet again.
-        let current = WorldSnapshot::new(&grown, &[], &[], &instructions);
+        let current = WorldSnapshot::new(&grown, &[], &[], &instructions, &[]);
         assert_eq!(render_world_state(&current, last.as_ref()), "");
 
         // Turn 5: compaction forgets what the model was told (`compact_session` clears the stored
@@ -1572,8 +1792,8 @@ mod tests {
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         }];
         let instructions = [("fs".to_string(), "Read before write.".to_string())];
-        let before = WorldSnapshot::new(&catalogue, &skills, &[], &instructions);
-        let after = WorldSnapshot::new(&catalogue, &skills, &[], &instructions);
+        let before = WorldSnapshot::new(&catalogue, &skills, &[], &instructions, &[]);
+        let after = WorldSnapshot::new(&catalogue, &skills, &[], &instructions, &[]);
         assert_eq!(render_world_state(&after, Some(&before)), "");
     }
 
@@ -1589,6 +1809,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         let after = WorldSnapshot::new(
             &[(
@@ -1597,6 +1818,7 @@ mod tests {
                 Permission::Write,
                 false,
             )],
+            &[],
             &[],
             &[],
             &[],
@@ -1624,7 +1846,7 @@ mod tests {
     #[test]
     fn test_world_state_renders_in_full_when_previous_is_forgotten() {
         let catalogue = sample_catalogue();
-        let snapshot = WorldSnapshot::new(&catalogue, &[], &[], &[]);
+        let snapshot = WorldSnapshot::new(&catalogue, &[], &[], &[], &[]);
         let full = render_world_state(&snapshot, None);
 
         assert!(full.contains("[Available tools]"));
@@ -1671,20 +1893,22 @@ mod tests {
             ("empty", WorldSnapshot::default()),
             (
                 "one tool",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[], &[]),
             ),
             (
                 "same tool, deferred",
-                WorldSnapshot::new(&[tool("a", "does a", true)], &[], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a", true)], &[], &[], &[], &[]),
             ),
             (
                 "same tool, reworded",
-                WorldSnapshot::new(&[tool("a", "does a differently", false)], &[], &[], &[]),
+                WorldSnapshot::new(&[tool("a", "does a differently", false)], &[], &[], &[], &[
+                ]),
             ),
             (
                 "two tools",
                 WorldSnapshot::new(
                     &[tool("a", "does a", false), tool("b", "does b", false)],
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -1697,6 +1921,7 @@ mod tests {
                     &[skill("s", "ships")],
                     &[],
                     &[],
+                    &[],
                 ),
             ),
             (
@@ -1706,21 +1931,28 @@ mod tests {
                     &[skill("s", "ships fast")],
                     &[],
                     &[],
+                    &[],
                 ),
             ),
             (
                 "one tool and a server",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[(
-                    "fs".to_string(),
-                    "guidance".to_string(),
-                )]),
+                WorldSnapshot::new(
+                    &[tool("a", "does a", false)],
+                    &[],
+                    &[],
+                    &[("fs".to_string(), "guidance".to_string())],
+                    &[],
+                ),
             ),
             (
                 "one tool and a rewritten server",
-                WorldSnapshot::new(&[tool("a", "does a", false)], &[], &[], &[(
-                    "fs".to_string(),
-                    "new guidance".to_string(),
-                )]),
+                WorldSnapshot::new(
+                    &[tool("a", "does a", false)],
+                    &[],
+                    &[],
+                    &[("fs".to_string(), "new guidance".to_string())],
+                    &[],
+                ),
             ),
         ];
 
@@ -1760,8 +1992,14 @@ mod tests {
                 false,
             )]
         };
-        let before = WorldSnapshot::new(&entry("Reads a file."), &[], &[], &[]);
-        let after = WorldSnapshot::new(&entry("Reads a file, following symlinks."), &[], &[], &[]);
+        let before = WorldSnapshot::new(&entry("Reads a file."), &[], &[], &[], &[]);
+        let after = WorldSnapshot::new(
+            &entry("Reads a file, following symlinks."),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         assert_ne!(before, after, "the fixture must actually differ");
 
         let diff = render_world_state(&after, Some(&before));
@@ -1774,14 +2012,23 @@ mod tests {
 
     #[test]
     fn test_world_state_diff_reports_mcp_instruction_changes() {
-        let before = WorldSnapshot::new(&[], &[], &[], &[
-            ("fs".to_string(), "Old guidance.".to_string()),
-            ("db".to_string(), "Read only.".to_string()),
-        ]);
-        let after = WorldSnapshot::new(&[], &[], &[], &[(
-            "fs".to_string(),
-            "New guidance.".to_string(),
-        )]);
+        let before = WorldSnapshot::new(
+            &[],
+            &[],
+            &[],
+            &[
+                ("fs".to_string(), "Old guidance.".to_string()),
+                ("db".to_string(), "Read only.".to_string()),
+            ],
+            &[],
+        );
+        let after = WorldSnapshot::new(
+            &[],
+            &[],
+            &[],
+            &[("fs".to_string(), "New guidance.".to_string())],
+            &[],
+        );
         let diff = render_world_state(&after, Some(&before));
 
         assert!(diff.contains("New guidance."), "got: {}", diff);

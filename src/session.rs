@@ -712,6 +712,37 @@ impl SessionManager {
                     )?;
                 }
 
+                // Scheduled wakeups (see `crate::schedule`). Created last, after the cascade-FK
+                // rebuild above, for the same reason the column migrations are: the rebuild does
+                // `DROP TABLE sessions` with enforcement off, and a table declared before it would
+                // have its FK target pulled out from under it mid-migration.
+                //
+                // `next_fire_at` is denormalised from `schedule` + `last_fired_at ?? created_at` so
+                // the due-job query is an index seek rather than a full scan plus a parse per row.
+                // `crate::schedule` owns keeping it consistent.
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                        id                TEXT PRIMARY KEY,
+                        session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        kind              TEXT NOT NULL,
+                        spec              TEXT NOT NULL,
+                        prompt            TEXT NOT NULL,
+                        gate_command      TEXT,
+                        gate_fire         TEXT,
+                        gate_last_output  TEXT,
+                        isolated          INTEGER NOT NULL DEFAULT 0,
+                        created_at        TEXT NOT NULL,
+                        last_fired_at     TEXT,
+                        next_fire_at      TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_fire
+                        ON scheduled_jobs(next_fire_at);
+
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_session
+                        ON scheduled_jobs(session_id);",
+                )?;
+
                 Ok(())
             })
             .await
@@ -2239,6 +2270,380 @@ impl SessionManager {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to load tool outputs: {}", error)))
+    }
+
+    /// Persist a new scheduled job. The caller owns computing `next_fire_at` from the job's anchor
+    /// (see [`crate::schedule::ScheduledJob::anchor`]).
+    pub async fn create_scheduled_job(&self, job: &crate::schedule::ScheduledJob) -> Result<()> {
+        let id = job.id.clone();
+        let session_id = job.session_id.to_string();
+        let kind = job.schedule.kind_str().to_string();
+        let spec = job.schedule.spec();
+        let prompt = job.prompt.clone();
+        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
+        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
+        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
+        let isolated = i64::from(job.isolated);
+        let created_at = job.created_at.to_rfc3339();
+        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
+        let next_fire_at = job.next_fire_at.to_rfc3339();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_command, \
+                     gate_fire, gate_last_output, isolated, created_at, last_fired_at, next_fire_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        id,
+                        session_id,
+                        kind,
+                        spec,
+                        prompt,
+                        gate_command,
+                        gate_fire,
+                        gate_last_output,
+                        isolated,
+                        created_at,
+                        last_fired_at,
+                        next_fire_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to create scheduled job: {}", error))
+            })
+    }
+
+    /// Every job belonging to one session, soonest first.
+    pub async fn list_scheduled_jobs(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs WHERE session_id = ?1 ORDER BY next_fire_at ASC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// Every job in the database, soonest first. Backs `meka schedule list` and `meka schedule
+    /// cancel`, which work from a job id and so cannot ask the caller which session to look in.
+    pub async fn list_all_scheduled_jobs(&self) -> Result<Vec<crate::schedule::ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs ORDER BY next_fire_at ASC",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Every job across all sessions whose `next_fire_at` has passed, soonest first. The
+    /// scheduler's per-tick query; served by `idx_scheduled_jobs_next_fire`.
+    pub async fn list_due_scheduled_jobs(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs WHERE next_fire_at <= ?1 ORDER BY next_fire_at ASC",
+            vec![now.to_rfc3339()],
+        )
+        .await
+    }
+
+    /// Shared row decoder. A row that fails to decode (hand-edited spec, a `kind` from a future
+    /// version) is skipped with a warning rather than failing the whole query: one bad row must not
+    /// stop every other job in the database from firing.
+    async fn query_scheduled_jobs(
+        &self,
+        sql: &'static str,
+        params: Vec<String>,
+    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
+        let rows: Vec<ScheduledJobRow> = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok(ScheduledJobRow {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            kind: row.get(2)?,
+                            spec: row.get(3)?,
+                            prompt: row.get(4)?,
+                            gate_command: row.get(5)?,
+                            gate_fire: row.get(6)?,
+                            gate_last_output: row.get(7)?,
+                            isolated: row.get::<_, i64>(8)? != 0,
+                            created_at: row.get(9)?,
+                            last_fired_at: row.get(10)?,
+                            next_fire_at: row.get(11)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load scheduled jobs: {}", error))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row.id.clone();
+                row.decode()
+                    .inspect_err(|error| {
+                        tracing::warn!("skipping unreadable scheduled job {}: {}", id, error);
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+
+    /// Delete a job by full or unique-prefix id. Returns the id actually removed, or `None` when
+    /// nothing matched. An ambiguous prefix is an error rather than an arbitrary pick.
+    pub async fn cancel_scheduled_job(
+        &self,
+        session_id: Uuid,
+        id_prefix: &str,
+    ) -> Result<Option<String>> {
+        let jobs = self.list_scheduled_jobs(session_id).await?;
+        let matches: Vec<&crate::schedule::ScheduledJob> = jobs
+            .iter()
+            .filter(|job| job.id.starts_with(id_prefix))
+            .collect();
+        let id = match matches.as_slice() {
+            [] => return Ok(None),
+            [job] => job.id.clone(),
+            several => {
+                return Err(MekaError::Database(format!(
+                    "'{}' matches {} jobs; use a longer id",
+                    id_prefix,
+                    several.len()
+                )));
+            }
+        };
+
+        let id_for_db = id.clone();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM scheduled_jobs WHERE id = ?1",
+                    rusqlite::params![id_for_db],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to cancel scheduled job: {}", error))
+            })?;
+        Ok(Some(id))
+    }
+
+    /// Delete a job by exact id, without the prefix resolution [`Self::cancel_scheduled_job`] does.
+    /// Used by the scheduler to retire a fired one-shot.
+    pub async fn delete_scheduled_job(&self, id: &str) -> Result<()> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM scheduled_jobs WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to delete scheduled job: {}", error))
+            })
+    }
+
+    /// Record that a job fired and when it is next due.
+    ///
+    /// Written *before* the turn runs, not after: a prompt that reliably crashes or hangs the
+    /// process would otherwise re-fire on every restart, turning one bad job into a boot loop in
+    /// the daemon that is supposed to stay up. Stamping first costs one missed occurrence instead.
+    pub async fn stamp_scheduled_job_fired(
+        &self,
+        id: &str,
+        fired_at: chrono::DateTime<chrono::Utc>,
+        next_fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let fired_at = fired_at.to_rfc3339();
+        let next_fire_at = next_fire_at.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET last_fired_at = ?2, next_fire_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, fired_at, next_fire_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to stamp scheduled job: {}", error))
+            })
+    }
+
+    /// Move a job's next due time without claiming it fired.
+    ///
+    /// Separate from [`Self::stamp_scheduled_job_fired`] because a gated job that evaluates to "no
+    /// change" has been *considered* but not fired, and recording it as fired would both mislead
+    /// `schedule list` and, for an interval schedule, silently re-anchor the cadence on evaluations
+    /// rather than on fires.
+    pub async fn reschedule_scheduled_job(
+        &self,
+        id: &str,
+        next_fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let id = id.to_string();
+        let next_fire_at = next_fire_at.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET next_fire_at = ?2 WHERE id = ?1",
+                    rusqlite::params![id, next_fire_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to reschedule job: {}", error)))
+    }
+
+    /// Put a job back exactly as it was, for a host that turned out to be unable to run it after
+    /// the scheduler had already claimed the occurrence.
+    ///
+    /// An upsert of the whole row rather than an update of the columns that moved, because claiming
+    /// a job can *delete* it: a one-shot has no next occurrence, so it is retired the moment it
+    /// comes due, and an `UPDATE` would then match nothing while still reporting success -- losing
+    /// the reminder outright. Restoring every column also puts back `gate_last_output`, without
+    /// which a deferred `on-change` watcher would have already absorbed the very change it exists
+    /// to report.
+    pub async fn restore_scheduled_job(&self, job: &crate::schedule::ScheduledJob) -> Result<()> {
+        let id = job.id.clone();
+        let session_id = job.session_id.to_string();
+        let kind = job.schedule.kind_str().to_string();
+        let spec = job.schedule.spec();
+        let prompt = job.prompt.clone();
+        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
+        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
+        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
+        let isolated = i64::from(job.isolated);
+        let created_at = job.created_at.to_rfc3339();
+        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
+        let next_fire_at = job.next_fire_at.to_rfc3339();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT OR REPLACE INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
+                     gate_command, gate_fire, gate_last_output, isolated, created_at, \
+                     last_fired_at, next_fire_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        id,
+                        session_id,
+                        kind,
+                        spec,
+                        prompt,
+                        gate_command,
+                        gate_fire,
+                        gate_last_output,
+                        isolated,
+                        created_at,
+                        last_fired_at,
+                        next_fire_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to restore scheduled job: {}", error))
+            })
+    }
+
+    /// Persist the gate's latest stdout so the next `on-change` evaluation has something to compare
+    /// against.
+    pub async fn update_scheduled_job_gate_output(&self, id: &str, output: &str) -> Result<()> {
+        let id = id.to_string();
+        let output = output.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET gate_last_output = ?2 WHERE id = ?1",
+                    rusqlite::params![id, output],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to record gate output: {}", error))
+            })
+    }
+}
+
+/// Raw `scheduled_jobs` row, decoded into a [`crate::schedule::ScheduledJob`] outside the database
+/// closure so parse failures can be logged and skipped individually.
+struct ScheduledJobRow {
+    id: String,
+    session_id: String,
+    kind: String,
+    spec: String,
+    prompt: String,
+    gate_command: Option<String>,
+    gate_fire: Option<String>,
+    gate_last_output: Option<String>,
+    isolated: bool,
+    created_at: String,
+    last_fired_at: Option<String>,
+    next_fire_at: String,
+}
+
+impl ScheduledJobRow {
+    fn decode(self) -> std::result::Result<crate::schedule::ScheduledJob, String> {
+        let parse_time =
+            |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .map(|at| at.with_timezone(&chrono::Utc))
+                    .map_err(|error| format!("bad timestamp '{}': {}", text, error))
+            };
+
+        let gate = match (self.gate_command, self.gate_fire) {
+            (Some(command), Some(fire)) => Some(crate::schedule::Gate {
+                command,
+                fire: crate::schedule::GateFire::parse(&fire)?,
+                last_output: self.gate_last_output,
+            }),
+            // A half-written gate is a corrupt row, not a job without a gate: silently dropping the
+            // condition would turn a watcher into an unconditional timer.
+            (Some(_), None) | (None, Some(_)) => {
+                return Err("gate_command and gate_fire must both be set or both be null".into());
+            }
+            (None, None) => None,
+        };
+
+        Ok(crate::schedule::ScheduledJob {
+            id: self.id,
+            session_id: Uuid::parse_str(&self.session_id)
+                .map_err(|error| format!("bad session id '{}': {}", self.session_id, error))?,
+            schedule: crate::schedule::Schedule::from_stored(&self.kind, &self.spec)?,
+            prompt: self.prompt,
+            gate,
+            isolated: self.isolated,
+            created_at: parse_time(&self.created_at)?,
+            last_fired_at: self.last_fired_at.as_deref().map(parse_time).transpose()?,
+            next_fire_at: parse_time(&self.next_fire_at)?,
+        })
     }
 }
 
@@ -5147,5 +5552,273 @@ mod tests {
             .delete_provider_credential("work")
             .await
             .expect("delete missing is a no-op");
+    }
+
+    async fn job_fixture(
+        manager: &SessionManager,
+        session_id: Uuid,
+        schedule: crate::schedule::Schedule,
+        gate: Option<crate::schedule::Gate>,
+    ) -> crate::schedule::ScheduledJob {
+        let created_at = chrono::Utc::now();
+        let next_fire_at = schedule.next_after(created_at).expect("has a next fire");
+        let job = crate::schedule::ScheduledJob {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            schedule,
+            prompt: "check the deploy".to_string(),
+            gate,
+            isolated: false,
+            created_at,
+            last_fired_at: None,
+            next_fire_at,
+        };
+        manager
+            .create_scheduled_job(&job)
+            .await
+            .expect("create scheduled job");
+        job
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_job_round_trips_through_the_database() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        let written = job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            Some(crate::schedule::Gate {
+                command: "gh pr checks 123".to_string(),
+                fire: crate::schedule::GateFire::OnChange,
+                last_output: None,
+            }),
+        )
+        .await;
+
+        let jobs = manager
+            .list_scheduled_jobs(session_id)
+            .await
+            .expect("list jobs");
+        assert_eq!(jobs.len(), 1);
+        let read = &jobs[0];
+        assert_eq!(read.id, written.id);
+        assert_eq!(read.prompt, "check the deploy");
+        assert_eq!(read.schedule.spec(), written.schedule.spec());
+        let gate = read.gate.as_ref().expect("gate survived the round trip");
+        assert_eq!(gate.command, "gh pr checks 123");
+        assert_eq!(gate.fire, crate::schedule::GateFire::OnChange);
+    }
+
+    /// Jobs are keyed to the conversation that asked for them, so deleting the session must not
+    /// leave a scheduler entry that fires into nothing.
+    #[tokio::test]
+    async fn test_deleting_a_session_cascades_to_its_scheduled_jobs() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            None,
+        )
+        .await;
+
+        manager
+            .delete_session(session_id)
+            .await
+            .expect("delete session");
+
+        let due = manager
+            .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::days(365))
+            .await
+            .expect("list due");
+        assert!(due.is_empty(), "the job should have cascaded away");
+    }
+
+    /// `meka schedule list` and `cancel` work from a job id, so they need every job regardless of
+    /// when it is due. An earlier version approximated that with "due within the next century",
+    /// which left a job scheduled past that horizon invisible and therefore uncancellable.
+    #[tokio::test]
+    async fn test_list_all_includes_jobs_beyond_any_due_horizon() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        let far_future = chrono::Utc::now() + chrono::Duration::days(365 * 200);
+        job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::At(far_future),
+            None,
+        )
+        .await;
+
+        assert!(
+            manager
+                .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::days(365 * 100))
+                .await
+                .expect("list due")
+                .is_empty(),
+            "fixture must actually sit beyond the horizon the old query used"
+        );
+        assert_eq!(
+            manager
+                .list_all_scheduled_jobs()
+                .await
+                .expect("list all")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_due_selects_only_jobs_whose_time_has_come() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("1h").expect("parses"),
+            None,
+        )
+        .await;
+
+        let none_yet = manager
+            .list_due_scheduled_jobs(chrono::Utc::now())
+            .await
+            .expect("list due");
+        assert!(none_yet.is_empty(), "not due for another hour");
+
+        let later = manager
+            .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::hours(2))
+            .await
+            .expect("list due");
+        assert_eq!(later.len(), 1);
+    }
+
+    /// The anchoring rule at the storage layer: stamping a fire records both when it fired and when
+    /// it is next due, and a subsequent read reconstructs the same anchor the in-memory scheduler
+    /// held. Without the `last_fired_at` half, a restart would re-anchor on `created_at` and replay
+    /// every occurrence since.
+    #[tokio::test]
+    async fn test_stamping_a_fire_persists_the_anchor_for_the_next_process() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        let job = job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("1h").expect("parses"),
+            None,
+        )
+        .await;
+
+        let fired_at = chrono::Utc::now();
+        let next = job.schedule.next_after(fired_at).expect("has a next fire");
+        manager
+            .stamp_scheduled_job_fired(&job.id, fired_at, next)
+            .await
+            .expect("stamp fired");
+
+        let reloaded = manager
+            .list_scheduled_jobs(session_id)
+            .await
+            .expect("list jobs");
+        let reloaded = reloaded.first().expect("job still present");
+        assert!(reloaded.last_fired_at.is_some());
+        assert_eq!(
+            reloaded.anchor(),
+            reloaded.last_fired_at.unwrap_or_default()
+        );
+        // One hour on from the fire, not from creation.
+        assert_eq!(
+            (reloaded.next_fire_at - fired_at).num_seconds(),
+            chrono::Duration::hours(1).num_seconds()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_resolves_an_id_prefix_and_reports_ambiguity() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        let job = job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            None,
+        )
+        .await;
+
+        assert!(
+            manager
+                .cancel_scheduled_job(session_id, "nomatch")
+                .await
+                .expect("cancel runs")
+                .is_none()
+        );
+
+        let cancelled = manager
+            .cancel_scheduled_job(session_id, job.short_id())
+            .await
+            .expect("cancel runs")
+            .expect("prefix matched");
+        assert_eq!(cancelled, job.id);
+        assert!(
+            manager
+                .list_scheduled_jobs(session_id)
+                .await
+                .expect("list jobs")
+                .is_empty()
+        );
+    }
+
+    /// A half-written gate is corruption, not "no gate": treating it as an ungated job would
+    /// silently promote a watcher into an unconditional timer that fires every interval.
+    #[tokio::test]
+    async fn test_a_row_with_a_half_written_gate_is_skipped_not_downgraded() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+        let job = job_fixture(
+            &manager,
+            session_id,
+            crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            Some(crate::schedule::Gate {
+                command: "true".to_string(),
+                fire: crate::schedule::GateFire::OnSuccess,
+                last_output: None,
+            }),
+        )
+        .await;
+
+        // Prove the row is readable before the corruption, so an empty result afterwards can only
+        // be the decoder rejecting it.
+        assert_eq!(
+            manager
+                .list_scheduled_jobs(session_id)
+                .await
+                .expect("list jobs")
+                .len(),
+            1
+        );
+
+        let id = job.id.clone();
+        manager
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET gate_fire = NULL WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("corrupt the row");
+
+        assert!(
+            manager
+                .list_scheduled_jobs(session_id)
+                .await
+                .expect("list jobs")
+                .is_empty(),
+            "the corrupt row is skipped rather than read as ungated"
+        );
     }
 }

@@ -621,6 +621,12 @@ curl -sf -X DELETE "$BASE/v1/sessions/$SESSION" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+## Scheduled jobs
+
+`meka serve` is the durable host for [scheduled wakeups](./scheduling.md). It fires every job in the database, reviving evicted sessions on demand, so jobs keep running whether or not a client is connected and survive a restart of the server.
+
+An agent-initiated turn has no HTTP request to respond to, so its output is persisted to the session like any other turn. Read it back with `GET /v1/sessions/{id}/messages`.
+
 ## Reverse proxy setup
 
 For production deployments behind nginx:

@@ -48,6 +48,11 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Inspect and cancel scheduled jobs
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Show OAuth account info (usage, identity) for scripting
     Account {
         #[command(subcommand)]
@@ -282,6 +287,28 @@ pub enum SkillAction {
         /// Apply --all updates (without this, --all only lists)
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Inspect and cancel the wakeups the agent scheduled for itself through the `schedule_*` tools.
+/// Read-and-cancel only: creating a job needs a session to attach it to, which is the agent's job.
+#[derive(clap::Subcommand, Debug)]
+pub enum ScheduleAction {
+    /// List scheduled jobs
+    ///
+    /// Examples:
+    ///   meka schedule list
+    ///   meka schedule list --session 0b5c...
+    #[command(verbatim_doc_comment)]
+    List {
+        /// Only this session's jobs (default: every session)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Cancel a job by id or unique prefix
+    Cancel {
+        /// Job id, or any unique prefix of one
+        id: String,
     },
 }
 

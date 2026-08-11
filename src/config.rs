@@ -37,6 +37,7 @@ pub struct ConfigFile {
     pub skills: Option<SkillsConfig>,
     pub memory: Option<MemoryConfig>,
     pub permissions: Option<PermissionsConfig>,
+    pub schedule: Option<ScheduleConfig>,
     pub serve: Option<ServeConfig>,
 }
 
@@ -49,6 +50,74 @@ pub struct ConfigFile {
 #[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     pub enabled: Option<bool>,
+}
+
+/// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
+///
+/// Config-only, like `[skills]` and `[memory]`: whether an agent may schedule its own future turns
+/// is a property of the installation. Turning it off keeps the three `schedule_*` tool schemas out
+/// of every request, stops the `[Scheduled]` section rendering, and leaves the scheduler unstarted,
+/// so existing jobs stay on disk without firing.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleConfig {
+    pub enabled: Option<bool>,
+    /// How often the scheduler looks for due jobs. Accepts humantime strings like `"10s"`, `"1m"`.
+    /// Default `"10s"`. This is the real resolution floor: a job with a shorter interval fires
+    /// once per tick, not once per interval.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub poll_interval: Option<std::time::Duration>,
+    /// How late a *one-shot* job may be and still fire after downtime. Accepts humantime strings
+    /// like `"24h"`. Default `"24h"`.
+    ///
+    /// Recurring jobs need no equivalent: their occurrences are one period apart, so the most
+    /// recent missed one is always less than a period old, and the scheduler coalesces the rest.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub missed_grace: Option<std::time::Duration>,
+    /// Wall-clock budget for a gate command. Accepts humantime strings like `"30s"`. Default
+    /// `"30s"`. A gate that overruns is a failure, not a silent skip.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub gate_timeout: Option<std::time::Duration>,
+    /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
+    pub max_jobs: Option<usize>,
+}
+
+/// [`ScheduleConfig`] with every default filled in.
+#[derive(Debug, Clone)]
+pub struct ResolvedScheduleConfig {
+    pub enabled: bool,
+    pub poll_interval: std::time::Duration,
+    pub missed_grace: std::time::Duration,
+    pub gate_timeout: std::time::Duration,
+    pub max_jobs: usize,
+}
+
+impl ResolvedScheduleConfig {
+    const DEFAULT_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const DEFAULT_MAX_JOBS: usize = 50;
+    /// A day. Long enough that an overnight outage still delivers this morning's reminder, short
+    /// enough that a laptop closed for a week does not wake to a pile of stale ones.
+    const DEFAULT_MISSED_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    /// Ten seconds trades scheduling precision against wakeups: a minute-granularity cron never
+    /// needs better, and it keeps a `--oneshot` run from paying for a tick it will never use.
+    const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn resolve(raw: Option<ScheduleConfig>) -> Self {
+        let raw = raw.unwrap_or_default();
+        Self {
+            enabled: raw.enabled.unwrap_or(true),
+            poll_interval: raw.poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL),
+            missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
+            gate_timeout: raw.gate_timeout.unwrap_or(Self::DEFAULT_GATE_TIMEOUT),
+            max_jobs: raw.max_jobs.unwrap_or(Self::DEFAULT_MAX_JOBS),
+        }
+    }
+}
+
+impl Default for ResolvedScheduleConfig {
+    fn default() -> Self {
+        Self::resolve(None)
+    }
 }
 
 /// `[memory]` table: the agent's durable note store ([`crate::memory`]).
@@ -647,6 +716,9 @@ pub struct ResolvedConfig {
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
     pub memory_enabled: bool,
+    /// `[schedule]` with defaults filled. Resolved here rather than at the call site because both
+    /// the REPL and `meka serve` start a scheduler and would otherwise each re-derive it.
+    pub schedule: ResolvedScheduleConfig,
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
@@ -1412,6 +1484,7 @@ impl ResolvedConfig {
             .unwrap_or_default()
             .enabled
             .unwrap_or(true);
+        let schedule = ResolvedScheduleConfig::resolve(config_file.schedule);
         // Destructure the [mcp] table into its two independent fields so we don't have to re-open
         // the config file later for resolution.
         let (
@@ -1636,6 +1709,7 @@ impl ResolvedConfig {
             user_instructions,
             skills_enabled,
             memory_enabled,
+            schedule,
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
@@ -1692,6 +1766,31 @@ impl ResolvedConfig {
             return Err(crate::error::MekaError::Config(
                 "[session].retention_days = 0 would delete every session on each startup. \
                  Remove the key to keep sessions forever, or use `meka session delete --all`."
+                    .to_string(),
+            ));
+        }
+        // `tokio::time::interval` panics on a zero period, so this would be a config value taking
+        // the process down rather than a setting behaving oddly.
+        if self.schedule.poll_interval.is_zero() {
+            return Err(crate::error::MekaError::Config(
+                "[schedule].poll_interval = 0 is not a valid tick. Remove the key for the \
+                 default, or set an interval like \"10s\"."
+                    .to_string(),
+            ));
+        }
+        // A zero budget fails every gate before it can produce output, so every gated job would
+        // report a broken watcher forever.
+        if self.schedule.gate_timeout.is_zero() {
+            return Err(crate::error::MekaError::Config(
+                "[schedule].gate_timeout = 0 would time out every gate before it runs. Remove \
+                 the key for the default, or set a budget like \"30s\"."
+                    .to_string(),
+            ));
+        }
+        if self.schedule.max_jobs == 0 {
+            return Err(crate::error::MekaError::Config(
+                "[schedule].max_jobs = 0 would refuse every job. Set `[schedule] enabled = false` \
+                 to turn scheduling off instead."
                     .to_string(),
             ));
         }
@@ -2604,6 +2703,50 @@ enabled = true
         );
     }
 
+    #[test]
+    fn test_schedule_config_deserialization() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[schedule]
+enabled = true
+poll_interval = "5s"
+missed_grace = "2h"
+gate_timeout = "45s"
+max_jobs = 10
+"#,
+        )
+        .expect("failed to parse toml");
+        let schedule = ResolvedScheduleConfig::resolve(config.schedule);
+        assert!(schedule.enabled);
+        assert_eq!(schedule.poll_interval, std::time::Duration::from_secs(5));
+        assert_eq!(schedule.missed_grace, std::time::Duration::from_secs(7200));
+        assert_eq!(schedule.gate_timeout, std::time::Duration::from_secs(45));
+        assert_eq!(schedule.max_jobs, 10);
+    }
+
+    #[test]
+    fn test_schedule_config_defaults_are_filled_when_absent() {
+        let config: ConfigFile = toml::from_str("").expect("empty config parses");
+        assert!(config.schedule.is_none());
+        let schedule = ResolvedScheduleConfig::resolve(config.schedule);
+        assert!(schedule.enabled, "scheduling is on unless turned off");
+        assert!(!schedule.poll_interval.is_zero());
+        assert!(!schedule.gate_timeout.is_zero());
+        assert!(schedule.max_jobs > 0);
+    }
+
+    #[test]
+    fn test_schedule_config_rejects_unknown_keys() {
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[schedule]
+on_exit = \"make build\"
+"
+            )
+            .is_err()
+        );
+    }
+
     /// Absent tables must stay absent rather than deserialising to something opinionated; the
     /// default-on decision lives in `from_cli`'s `unwrap_or(true)`, not in the parsed shape.
     #[test]
@@ -2740,6 +2883,57 @@ retention_days = 0
             .validate()
             .expect_err("retention_days = 0 must not be accepted");
         assert!(error.to_string().contains("retention_days"), "{error}");
+    }
+
+    /// `tokio::time::interval` panics on a zero period, so without this check a config value takes
+    /// the whole process down at scheduler startup rather than merely behaving oddly.
+    #[test]
+    fn test_schedule_poll_interval_zero_is_rejected() {
+        let resolved = resolve_with_config(
+            r#"
+default_provider = "p"
+
+[providers.p]
+type = "openai-api"
+model = "m"
+
+[schedule]
+poll_interval = "0s"
+"#,
+        );
+        assert!(
+            resolved.schedule.poll_interval.is_zero(),
+            "fixture must actually set it"
+        );
+        let error = resolved
+            .validate()
+            .expect_err("a zero poll interval must not be accepted");
+        assert!(error.to_string().contains("poll_interval"), "{error}");
+    }
+
+    #[test]
+    fn test_schedule_gate_timeout_and_max_jobs_zero_are_rejected() {
+        for (key, value, needle) in [
+            ("gate_timeout", "\"0s\"", "gate_timeout"),
+            ("max_jobs", "0", "max_jobs"),
+        ] {
+            let resolved = resolve_with_config(&format!(
+                r#"
+default_provider = "p"
+
+[providers.p]
+type = "openai-api"
+model = "m"
+
+[schedule]
+{key} = {value}
+"#
+            ));
+            let error = resolved
+                .validate()
+                .expect_err("a zero value must not be accepted");
+            assert!(error.to_string().contains(needle), "{key}: {error}");
+        }
     }
 
     /// A config that doesn't parse must stop meka, not be swapped for defaults. The old fallback

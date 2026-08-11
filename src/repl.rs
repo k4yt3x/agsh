@@ -4,14 +4,14 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
-use crossterm::style::{Color, Stylize};
+use crossterm::style::Stylize;
 use reedline::{
-    ColumnarMenu, Completer, EditCommand, Emacs, ExternalPrinter, Highlighter, History, KeyCode,
-    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    ColumnarMenu, Completer, CompletionResult, EditCommand, Emacs, ExternalPrinter, Highlighter,
+    History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, default_emacs_keybindings,
 };
@@ -106,6 +106,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "[name]",
     },
     CommandSpec {
+        name: "schedule",
+        aliases: &[],
+        help: "List this session's scheduled jobs, or cancel one by id",
+        arg_hint: "[cancel <id>]",
+    },
+    CommandSpec {
         name: "mcp",
         aliases: &[],
         help: "Manage MCP servers and prompts",
@@ -191,7 +197,19 @@ const PERMISSION_LEVELS: [crate::permission::Permission; 4] = [
 ];
 
 impl Completer for SlashCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    /// Slash-command completion is computed synchronously from in-memory snapshots, so every result
+    /// is authoritative the moment it is produced. reedline's `Stale` / `Pending` variants exist
+    /// for completers that compute off-thread; this one never has a partial answer to hand
+    /// back.
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.suggestions(line, pos))
+    }
+}
+
+impl SlashCompleter {
+    /// The completion logic proper, returning a plain `Vec` so callers (and tests) work with the
+    /// suggestions directly instead of destructuring [`CompletionResult`].
+    fn suggestions(&self, line: &str, pos: usize) -> Vec<Suggestion> {
         let Some(after_slash) = line.strip_prefix('/') else {
             return Vec::new();
         };
@@ -406,8 +424,8 @@ impl Prompt for MekaPrompt {
         Cow::Owned(format!("{} > ", colored_indicator))
     }
 
-    fn get_prompt_color(&self) -> Color {
-        Color::White
+    fn get_prompt_color(&self) -> nu_ansi_term::Color {
+        nu_ansi_term::Color::White
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -428,8 +446,10 @@ impl Prompt for MekaPrompt {
         ))
     }
 
-    fn get_indicator_color(&self) -> Color {
-        Color::Reset
+    fn get_indicator_color(&self) -> nu_ansi_term::Color {
+        // `nu_ansi_term::Color` has no `Reset`; `Default` is its equivalent, leaving the
+        // indicator's own crossterm styling (set in `render_prompt_indicator`) untouched.
+        nu_ansi_term::Color::Default
     }
 }
 
@@ -438,6 +458,7 @@ fn build_reedline_editor(
     printer: ExternalPrinter<String>,
     history: Option<Box<dyn History>>,
     completer: SlashCompleter,
+    wake: Arc<AtomicBool>,
 ) -> Reedline {
     let mut keybindings = default_emacs_keybindings();
 
@@ -477,6 +498,9 @@ fn build_reedline_editor(
             ColumnarMenu::default().with_name(COMPLETION_MENU),
         )))
         .use_bracketed_paste(true)
+        // Lets the scheduler interrupt an idle prompt. reedline polls this inside `read_line` and
+        // returns `Signal::ExternalBreak` with the current buffer, resetting the flag itself.
+        .with_break_signal(wake)
         .with_external_printer(printer);
     if let Some(history) = history {
         editor = editor.with_history(history);
@@ -519,6 +543,10 @@ pub enum SlashCommand {
     },
     /// `/memory` (no argument): list saved memories, most important first.
     MemoryList,
+    ScheduleList,
+    ScheduleCancel {
+        id: String,
+    },
     /// `/memory <name>`: print one memory's body, the in-session equivalent of
     /// `meka memory show`.
     MemoryShow {
@@ -549,6 +577,10 @@ pub enum SlashCommand {
 pub enum ReplEvent {
     UserInput(String),
     Command(SlashCommand),
+    /// A scheduled job for this session came due. Carries no payload: the agent side re-reads the
+    /// due jobs itself, because between the scheduler noticing and this arriving the job could have
+    /// been cancelled, and firing a prompt the user just cancelled is worse than missing it.
+    ScheduledTurn,
     Exit,
 }
 
@@ -589,6 +621,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "clear" => Some(SlashCommand::Clear),
         "session" => Some(SlashCommand::Session),
         "memory" => Some(parse_memory_slash(argument.as_deref().unwrap_or(""))),
+        "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
         "export" => Some(SlashCommand::Export),
@@ -621,6 +654,19 @@ fn parse_memory_slash(rest: &str) -> SlashCommand {
     }
     SlashCommand::MemoryShow {
         name: rest.to_string(),
+    }
+}
+
+/// Parse the argument to `/schedule …`.
+///
+/// Bare `/schedule` lists; `/schedule cancel <id>` cancels. There is no `create`: a job's prompt is
+/// prose the agent writes for its own future self, and typing one at the REPL would be doing the
+/// agent's job badly.
+fn parse_schedule_slash(rest: &str) -> SlashCommand {
+    let rest = rest.trim();
+    match rest.strip_prefix("cancel").map(str::trim) {
+        Some(id) if !id.is_empty() => SlashCommand::ScheduleCancel { id: id.to_string() },
+        _ => SlashCommand::ScheduleList,
     }
 }
 
@@ -749,6 +795,10 @@ pub fn run_repl(
     cwd: crate::agent::SharedCwd,
     mcp_server_names: Vec<String>,
     history_db_path: Option<PathBuf>,
+    // `wake` is set by the scheduler watcher when one of this session's jobs is due. reedline
+    // polls it inside `read_line` and returns `Signal::ExternalBreak`, which is what lets a wakeup
+    // interrupt an idle prompt instead of waiting for the user to press Enter.
+    wake: Arc<AtomicBool>,
 ) {
     // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
     // `read_line()`. From this point on, log lines (including async MCP-connect warnings that fire
@@ -784,7 +834,7 @@ pub fn run_repl(
         cwd: cwd.clone(),
     };
 
-    let mut editor = build_reedline_editor(input_style, printer, history, completer);
+    let mut editor = build_reedline_editor(input_style, printer, history, completer, wake);
     let prompt = MekaPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
@@ -808,23 +858,42 @@ pub fn run_repl(
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
         match signal {
-            Ok(Signal::Success(buffer)) => {
-                if buffer == CYCLE_PERMISSION_SENTINEL {
-                    let new_permission = shared_permission.cycle();
-                    tracing::debug!("permission cycled to {}", new_permission);
-                    // Re-emit the "backend unavailable" warn at the moment the user enters read
-                    // mode, so a misconfigured sandbox surfaces immediately instead of waiting for
-                    // the first `execute_command` failure. The "stronger sandbox available" nudge
-                    // (Warn 2) intentionally doesn't fire here: startup-only, to avoid nagging.
-                    if new_permission == crate::permission::Permission::Read {
-                        crate::sandbox::warn_if_sandbox_issues(
-                            &sandbox_state,
-                            crate::sandbox::WarnContext::ReadModeEntry,
-                        );
-                    }
-                    continue;
+            // Shift+Tab is bound to `ReedlineEvent::ExecuteHostCommand`, which reedline returns
+            // here rather than as `Success`. It is not user input and never reaches the agent.
+            Ok(Signal::HostCommand(command)) if command == CYCLE_PERMISSION_SENTINEL => {
+                let new_permission = shared_permission.cycle();
+                tracing::debug!("permission cycled to {}", new_permission);
+                // Re-emit the "backend unavailable" warn at the moment the user enters read
+                // mode, so a misconfigured sandbox surfaces immediately instead of waiting for
+                // the first `execute_command` failure. The "stronger sandbox available" nudge
+                // (Warn 2) intentionally doesn't fire here: startup-only, to avoid nagging.
+                if new_permission == crate::permission::Permission::Read {
+                    crate::sandbox::warn_if_sandbox_issues(
+                        &sandbox_state,
+                        crate::sandbox::WarnContext::ReadModeEntry,
+                    );
                 }
-
+                continue;
+            }
+            // A scheduled job came due while the prompt sat idle. `read_line` has returned, so the
+            // terminal is back in cooked mode and the turn that follows is indistinguishable from
+            // one the user typed: it streams, Ctrl+C reaches it, and the absent prompt is what
+            // reads as "busy". The buffer is whatever the user had half-typed, restored below.
+            Ok(Signal::ExternalBreak(buffer)) => {
+                if input_sender.send(ReplEvent::ScheduledTurn).is_err() {
+                    break;
+                }
+                if !wait_for_agent(&agent_event_receiver) {
+                    break;
+                }
+                // Nothing to restore: reedline hands back a *copy* of the line editor's contents
+                // and leaves the editor itself untouched (its break handler only resets the undo
+                // stack, unlike `submit_buffer`, which clears). Re-inserting would give the user
+                // their half-typed line twice.
+                let _still_in_the_editor = buffer;
+                continue;
+            }
+            Ok(Signal::Success(buffer)) => {
                 let trimmed = buffer.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -903,6 +972,8 @@ pub fn run_repl(
                             | SlashCommand::McpLogout { .. }
                             | SlashCommand::MemoryList
                             | SlashCommand::MemoryShow { .. }
+                            | SlashCommand::ScheduleList
+                            | SlashCommand::ScheduleCancel { .. }
                             | SlashCommand::SkillList
                             | SlashCommand::SkillInvoke { .. }
                             | SlashCommand::Status
@@ -990,11 +1061,16 @@ pub fn run_repl(
                 }
                 break;
             }
-            // The pinned reedline fork (wtfbbqhax/reedline @ 3a457ff) has a slimmer `Signal` enum
-            // than upstream, no `ExternalBreak` variant, so this catch-all is currently
-            // unreachable. When we switch back to upstream after #1005 lands in a release, it'll
-            // fire on the unhandled `ExternalBreak`.
-            #[allow(unreachable_patterns)]
+            // A host command we have no handler for. Both bindings that produce one are ours
+            // (`ExecuteHostCommand` for Shift+Tab, handled above), so reaching here means someone
+            // added a third and forgot the arm. Ignore it rather than ending the session: dropping
+            // a keystroke is a smaller surprise than the REPL quitting under the user.
+            Ok(Signal::HostCommand(command)) => {
+                tracing::warn!("unhandled reedline host command: {}", command);
+                continue;
+            }
+            // `Signal` is `#[non_exhaustive]`, so this arm is mandatory rather than defensive: it
+            // exists for variants a future reedline adds, which by definition we cannot interpret.
             Ok(other) => {
                 tracing::warn!("unexpected reedline signal: {:?}", other);
                 if input_sender.send(ReplEvent::Exit).is_err() {
@@ -1677,58 +1753,58 @@ mod tests {
 
     #[test]
     fn test_slash_completer_prefix_matches_expected() {
-        let mut completer = empty_completer();
-        let suggestions = completer.complete("/comp", 5);
+        let completer = empty_completer();
+        let suggestions = completer.suggestions("/comp", 5);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "/compact");
     }
 
     #[test]
     fn test_slash_completer_bare_slash_returns_all() {
-        let mut completer = empty_completer();
-        let suggestions = completer.complete("/", 1);
+        let completer = empty_completer();
+        let suggestions = completer.suggestions("/", 1);
         assert_eq!(suggestions.len(), COMMANDS.len());
         assert!(suggestions.iter().all(|s| s.value.starts_with('/')));
     }
 
     #[test]
     fn test_slash_completer_non_slash_returns_empty() {
-        let mut completer = empty_completer();
-        assert!(completer.complete("hello", 5).is_empty());
-        assert!(completer.complete("", 0).is_empty());
+        let completer = empty_completer();
+        assert!(completer.suggestions("hello", 5).is_empty());
+        assert!(completer.suggestions("", 0).is_empty());
     }
 
     #[test]
     fn test_slash_completer_no_args_for_argless_commands() {
-        let mut completer = empty_completer();
+        let completer = empty_completer();
         // Commands without an argument completer return nothing once past the command word.
-        assert!(completer.complete("/compact ", 9).is_empty());
-        assert!(completer.complete("/status foo", 11).is_empty());
+        assert!(completer.suggestions("/compact ", 9).is_empty());
+        assert!(completer.suggestions("/status foo", 11).is_empty());
     }
 
     #[test]
     fn test_slash_completer_span_replaces_whole_token() {
-        let mut completer = empty_completer();
-        let suggestions = completer.complete("/comp", 5);
+        let completer = empty_completer();
+        let suggestions = completer.suggestions("/comp", 5);
         assert_eq!(suggestions[0].span.start, 0);
         assert_eq!(suggestions[0].span.end, 5);
     }
 
     #[test]
     fn test_slash_completer_append_whitespace_tracks_arguments() {
-        let mut completer = empty_completer();
-        assert!(completer.complete("/permission", 11)[0].append_whitespace);
-        assert!(completer.complete("/cd", 3)[0].append_whitespace);
-        assert!(!completer.complete("/compact", 8)[0].append_whitespace);
-        assert!(!completer.complete("/help", 5)[0].append_whitespace);
+        let completer = empty_completer();
+        assert!(completer.suggestions("/permission", 11)[0].append_whitespace);
+        assert!(completer.suggestions("/cd", 3)[0].append_whitespace);
+        assert!(!completer.suggestions("/compact", 8)[0].append_whitespace);
+        assert!(!completer.suggestions("/help", 5)[0].append_whitespace);
     }
 
     #[test]
     fn test_slash_completer_descriptions_present() {
-        let mut completer = empty_completer();
+        let completer = empty_completer();
         assert!(
             completer
-                .complete("/", 1)
+                .suggestions("/", 1)
                 .iter()
                 .all(|s| s.description.as_deref().is_some_and(|d| !d.is_empty()))
         );
@@ -1736,20 +1812,20 @@ mod tests {
 
     #[test]
     fn test_slash_completer_does_not_offer_aliases() {
-        let mut completer = empty_completer();
+        let completer = empty_completer();
         // `/q` matches the `quit` alias of `exit`, but aliases are never completed.
-        assert!(completer.complete("/q", 2).is_empty());
+        assert!(completer.suggestions("/q", 2).is_empty());
     }
 
     #[test]
     fn test_slash_completer_permission_arg_prefix() {
-        let mut completer = empty_completer();
-        let one = completer.complete("/permission w", 13);
+        let completer = empty_completer();
+        let one = completer.suggestions("/permission w", 13);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].value, "write");
         assert!(one[0].append_whitespace);
         let all: Vec<String> = completer
-            .complete("/permission ", 12)
+            .suggestions("/permission ", 12)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -1758,50 +1834,57 @@ mod tests {
 
     #[test]
     fn test_slash_completer_permission_no_complete_second_arg() {
-        let mut completer = empty_completer();
-        assert!(completer.complete("/permission write extra", 23).is_empty());
+        let completer = empty_completer();
+        assert!(
+            completer
+                .suggestions("/permission write extra", 23)
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_slash_completer_skill_arg_prefix() {
-        let mut completer = completer_at(crate::agent::test_cwd());
-        let suggestions = completer.complete("/skill sea", 10);
+        let completer = completer_at(crate::agent::test_cwd());
+        let suggestions = completer.suggestions("/skill sea", 10);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "search");
     }
 
     #[test]
     fn test_slash_completer_skill_no_complete_second_arg() {
-        let mut completer = completer_at(crate::agent::test_cwd());
-        assert!(completer.complete("/skill search foo", 17).is_empty());
+        let completer = completer_at(crate::agent::test_cwd());
+        assert!(completer.suggestions("/skill search foo", 17).is_empty());
     }
 
     #[test]
     fn test_slash_completer_mcp_arg1_keywords() {
-        let mut completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::agent::test_cwd());
         let all: Vec<String> = completer
-            .complete("/mcp ", 5)
+            .suggestions("/mcp ", 5)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
         assert_eq!(all, ["list", "reconnect", "login", "logout"]);
-        let rec = completer.complete("/mcp rec", 8);
+        let rec = completer.suggestions("/mcp rec", 8);
         assert_eq!(rec.len(), 1);
         assert_eq!(rec[0].value, "reconnect");
     }
 
     #[test]
     fn test_slash_completer_mcp_arg2_server_after_subcommand() {
-        let mut completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::agent::test_cwd());
         let servers: Vec<String> = completer
-            .complete("/mcp reconnect ", 15)
+            .suggestions("/mcp reconnect ", 15)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
         assert_eq!(servers, ["postgres", "github"]);
-        assert_eq!(completer.complete("/mcp login git", 14)[0].value, "github");
+        assert_eq!(
+            completer.suggestions("/mcp login git", 14)[0].value,
+            "github"
+        );
         // `list` takes no server argument, so its second token completes nothing.
-        assert!(completer.complete("/mcp list ", 10).is_empty());
+        assert!(completer.suggestions("/mcp list ", 10).is_empty());
     }
 
     #[test]
@@ -1814,10 +1897,10 @@ mod tests {
         std::fs::write(root.join("README"), b"x").expect("write file");
         std::fs::create_dir_all(root.join("src/tools")).expect("mkdir src/tools");
         let cwd = std::sync::Arc::new(std::sync::RwLock::new(root));
-        let mut completer = completer_at(cwd);
+        let completer = completer_at(cwd);
 
         let bare: Vec<String> = completer
-            .complete("/cd ", 4)
+            .suggestions("/cd ", 4)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -1828,12 +1911,12 @@ mod tests {
         assert!(!bare.contains(&".git/".to_string()));
 
         // A leading dot in the partial opts dotdirs back in.
-        let dot = completer.complete("/cd .gi", 7);
+        let dot = completer.suggestions("/cd .gi", 7);
         assert_eq!(dot.len(), 1);
         assert_eq!(dot[0].value, ".git/");
 
         // Relative drill-down keeps the parent portion intact.
-        let nested = completer.complete("/cd src/too", 11);
+        let nested = completer.suggestions("/cd src/too", 11);
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0].value, "src/tools/");
         assert!(!nested[0].append_whitespace);
@@ -1843,8 +1926,8 @@ mod tests {
 
     #[test]
     fn test_slash_completer_command_word_still_completes() {
-        let mut completer = completer_at(crate::agent::test_cwd());
-        let suggestions = completer.complete("/comp", 5);
+        let completer = completer_at(crate::agent::test_cwd());
+        let suggestions = completer.suggestions("/comp", 5);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "/compact");
         assert_eq!(suggestions[0].span.start, 0);
@@ -2274,6 +2357,8 @@ mod tests {
             Some(SlashCommand::McpPrompt { .. }) => "McpPrompt",
             Some(SlashCommand::MemoryList) => "MemoryList",
             Some(SlashCommand::MemoryShow { .. }) => "MemoryShow",
+            Some(SlashCommand::ScheduleList) => "ScheduleList",
+            Some(SlashCommand::ScheduleCancel { .. }) => "ScheduleCancel",
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",

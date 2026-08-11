@@ -30,6 +30,7 @@ mod relay;
 mod render;
 mod repl;
 mod sandbox;
+mod schedule;
 mod server;
 mod session;
 mod skills;
@@ -126,6 +127,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
                 cli::Command::Memory { action } => run_memory_subcommand(action).await,
+                cli::Command::Schedule { action } => {
+                    crate::schedule::cli::run(&session_manager, action).await
+                }
                 cli::Command::Account { action } => {
                     run_account_subcommand(&session_manager, action).await
                 }
@@ -481,6 +485,9 @@ struct AgentAssembly<'a> {
     session_stats: Arc<stats::SessionStats>,
     /// Seeds the root `SpawnAgentTool`'s recursion budget from `session.subagent_max_depth`.
     subagent_max_depth: usize,
+    /// Gates the `schedule_*` tools and supplies their ceilings. Sub-agent registries get `None`
+    /// instead; see `ToolRegistry::register_session_scoped_tools`.
+    schedule: crate::config::ResolvedScheduleConfig,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -522,6 +529,7 @@ async fn assemble_agent(
         cwd.clone(),
         Arc::clone(&roots),
         Arc::clone(&frontend),
+        bundle.schedule.clone(),
     )?;
 
     // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `spawn_agent`); `>= 1`
@@ -602,6 +610,7 @@ pub async fn build_session_agent(
     roots: crate::agent::SharedRoots,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let bundle = AgentAssembly {
+        schedule: shared.config.schedule.clone(),
         web_client: shared.config.web_client.clone(),
         sandbox_enabled: shared.config.sandbox,
         sandbox_capability: shared.sandbox_capability.clone(),
@@ -727,6 +736,7 @@ async fn create_agent_from_config(
     };
 
     let bundle = AgentAssembly {
+        schedule: config.schedule.clone(),
         web_client: config.web_client.clone(),
         sandbox_enabled: config.sandbox,
         sandbox_capability,
@@ -998,6 +1008,11 @@ async fn run_interactive(
         .show_context_in_prompt
         .then(|| (Arc::clone(&context_tokens), context_window));
 
+    // Shared with reedline: the scheduler watcher sets it, `read_line` polls it and returns
+    // `Signal::ExternalBreak` so a due job can interrupt an idle prompt.
+    let schedule_wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let repl_wake = Arc::clone(&schedule_wake);
+
     let repl_handle = tokio::task::spawn_blocking(move || {
         repl::run_repl(
             repl_permission,
@@ -1011,6 +1026,7 @@ async fn run_interactive(
             repl_cwd,
             repl_mcp_server_names,
             repl_history_db_path,
+            repl_wake,
         );
     });
 
@@ -1063,8 +1079,127 @@ async fn run_interactive(
     // prompt gauge tracks what the agent writes after each turn (and the resume seed above).
     agent.set_context_tokens(Arc::clone(&context_tokens));
 
+    // Mirrors the loop's `session_id` for the watcher below, which runs on another task and cannot
+    // borrow it. Written after every event, which is the only thing that can change it.
+    let repl_shared_session_id = Arc::new(std::sync::RwLock::new(session_id));
+
+    // Watcher, not a scheduler: it only nudges reedline awake. The agent loop below owns the
+    // conversation, so it has to be the thing that evaluates gates and runs the turn -- otherwise
+    // two tasks would be appending to `messages`.
+    let schedule_watcher = {
+        let session_manager = session_manager.clone();
+        let shared_session_id = Arc::clone(&repl_shared_session_id);
+        let poll_interval = config.schedule.poll_interval;
+        let enabled = config.schedule.enabled;
+        tokio::spawn(async move {
+            if !enabled {
+                return;
+            }
+            let mut ticker = tokio::time::interval(poll_interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(current) = shared_session_id
+                    .read()
+                    .map(|guard| *guard)
+                    .unwrap_or_else(|poisoned| *poisoned.into_inner())
+                else {
+                    continue;
+                };
+                match session_manager
+                    .list_due_scheduled_jobs(chrono::Utc::now())
+                    .await
+                {
+                    Ok(due) if due.iter().any(|job| job.session_id == current) => {
+                        schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!("scheduler watcher failed: {}", error),
+                }
+            }
+        })
+    };
+
     while let Some(event) = input_receiver.recv().await {
         match event {
+            ReplEvent::ScheduledTurn => {
+                let scope = match session_id {
+                    Some(id) => crate::schedule::SchedulerScope::OneSession(id),
+                    // Nothing can be due before the session exists; the watcher would not have
+                    // woken us, but the loop must not assume that.
+                    None => {
+                        if agent_event_sender
+                            .send(repl::AgentToReplEvent::Done)
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                // Collected first, then run: `run_due` takes an `Fn`, and the turn needs `&mut`
+                // access to `messages` and `session_id`, which belong to this loop alone. Gating
+                // and stamping have already happened by the time a wakeup lands here.
+                let fired = std::sync::Mutex::new(Vec::new());
+                if let Err(error) = crate::schedule::run_due(
+                    &session_manager,
+                    &config.schedule,
+                    scope,
+                    &|wakeup: crate::schedule::Wakeup| {
+                        if let Ok(mut collected) = fired.lock() {
+                            collected.push(wakeup);
+                        }
+                        // The REPL owns this session outright, so it never defers: the turn runs
+                        // below, on this same loop, before anything else is handled.
+                        std::future::ready(crate::schedule::FireOutcome::Ran)
+                    },
+                )
+                .await
+                {
+                    render::render_error(&error);
+                }
+                let fired = fired
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for wakeup in fired {
+                    // The REPL has one agent and one conversation, so an isolated job runs here
+                    // like any other. Said out loud rather than silently downgraded: the tool
+                    // offers the flag and `meka serve` honours it, so a job behaving differently
+                    // depending on which host happened to fire it is exactly the kind of thing
+                    // nobody would think to check.
+                    if wakeup.job.isolated {
+                        tracing::warn!(
+                            "job {} asked for an isolated session; the REPL runs it in this \
+                             conversation instead. Run `meka serve` for isolated jobs.",
+                            wakeup.job.short_id()
+                        );
+                    }
+                    let prompt = wakeup.render_prompt();
+                    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error::MekaError::Interrupted) => {
+                            eprintln!("\nInterrupted.");
+                            if config.newline_before_prompt {
+                                eprintln!();
+                            }
+                        }
+                        Err(error) => {
+                            render::render_error(&error);
+                            if config.newline_before_prompt {
+                                eprintln!();
+                            }
+                        }
+                    }
+                }
+                if agent_event_sender
+                    .send(repl::AgentToReplEvent::Done)
+                    .is_err()
+                {
+                    break;
+                }
+            }
             ReplEvent::UserInput(input) => {
                 match run_turn_interruptible(&agent, &mut session_id, &mut messages, input).await {
                     Ok(()) => {}
@@ -1283,6 +1418,37 @@ async fn run_interactive(
                             render::render_error(&error);
                         }
                     }
+                    // Scoped to the session in the REPL, unlike `meka schedule list`, which has no
+                    // conversation to be "this one" and so shows every session's jobs.
+                    repl::SlashCommand::ScheduleList => match session_id {
+                        Some(id) => {
+                            if let Err(error) =
+                                crate::schedule::cli::run_list_for_session(&session_manager, id)
+                                    .await
+                            {
+                                render::render_error(&error);
+                            }
+                        }
+                        None => eprintln!("No active session yet."),
+                    },
+                    repl::SlashCommand::ScheduleCancel { id } => match session_id {
+                        Some(session) => {
+                            match session_manager.cancel_scheduled_job(session, &id).await {
+                                Ok(Some(cancelled)) => {
+                                    tracing::info!("cancelled scheduled job {}", cancelled);
+                                    eprintln!(
+                                        "Cancelled job {}.",
+                                        &cancelled[..8.min(cancelled.len())]
+                                    );
+                                }
+                                Ok(None) => {
+                                    eprintln!("No scheduled job matching '{}'.", id);
+                                }
+                                Err(error) => render::render_error(&error),
+                            }
+                        }
+                        None => eprintln!("No active session yet."),
+                    },
                     repl::SlashCommand::SkillList => {
                         if let Err(error) = skills::cli::run_list().await {
                             render::render_error(&error);
@@ -1390,8 +1556,15 @@ async fn run_interactive(
                 break;
             }
         }
+        // The loop's own `session_id` is authoritative; the watcher reads this mirror. An event is
+        // the only thing that can create or replace a session, so syncing here is sufficient.
+        match repl_shared_session_id.write() {
+            Ok(mut cell) => *cell = session_id,
+            Err(poisoned) => *poisoned.into_inner() = session_id,
+        }
     }
 
+    schedule_watcher.abort();
     drop(agent_event_sender);
     repl_handle.await?;
 
@@ -1940,6 +2113,7 @@ async fn run_tools_subcommand(
                 std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
                 std::sync::Arc::new(crate::frontend::SilentFrontend),
+                config.schedule.clone(),
             )?;
 
             let catalogue = reference.tool_catalogue();

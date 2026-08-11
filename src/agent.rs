@@ -590,11 +590,30 @@ impl Agent {
         let (world_state, world_state_rollback) = if self.options.system_prompt_override.is_some() {
             (String::new(), None)
         } else {
+            // Read fresh rather than cached: a job can be added or cancelled by `meka schedule`,
+            // by another attached client, or by the scheduler retiring a fired one-shot, none of
+            // which pass through this agent.
+            // Skipped outright when the tool that opens the index is not registered: without this
+            // an installation with `[schedule] enabled = false` pays a database round trip on every
+            // single turn for a section that will be discarded.
+            let scheduled =
+                match (*session_id).filter(|_| context::schedule_index_is_live(&catalogue)) {
+                    Some(id) => self
+                        .session_manager
+                        .list_scheduled_jobs(id)
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!("failed to load scheduled jobs for context: {}", error);
+                            Vec::new()
+                        }),
+                    None => Vec::new(),
+                };
             let current = context::WorldSnapshot::new(
                 &catalogue,
                 skills.as_slice(),
                 memories.as_slice(),
                 &mcp_instructions,
+                &scheduled,
             );
             let mut last = self.last_rendered_world.write().await;
             // Treat a render that has scrolled out of the API window as never having happened. The

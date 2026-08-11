@@ -3609,3 +3609,93 @@ fn option_fields_are_absent_not_null_when_unset() {
         session["last_turn_at"],
     );
 }
+
+/// End-to-end proof that a scheduled job actually fires: the agent creates a one-shot job through
+/// `schedule_create`, and the scheduler running inside `meka serve` delivers its prompt as a turn
+/// with no HTTP request driving it.
+///
+/// This is the whole feature in one test. Everything else about scheduling is unit-tested, but
+/// nothing else proves the scheduler is wired into the server, that an agent-initiated turn reaches
+/// the model, or that its output is persisted where a client can read it back.
+#[test]
+fn scheduled_job_fires_without_a_client_request() {
+    let script = serde_json::json!([
+        // Turn 1: the agent schedules a one-shot two seconds out.
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "kind": "tool_use_end", "input": {
+                "prompt": "DELIVERED_PROMPT_MARKER",
+                "at": "2s"
+            }},
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "scheduled it" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        // Turn 2 is the fire. Nothing on the client side asks for this one.
+        [
+            { "kind": "text", "text": "SCHEDULED_REPLY_MARKER" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let scheduled = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "remind me in two seconds"}))
+        .send()
+        .expect("send");
+    assert_eq!(scheduled.status(), 200);
+
+    // Poll for the fired turn rather than sleeping a fixed span: the job is due in 2s and the
+    // scheduler ticks every 1s, so the turn lands somewhere in a window rather than at an instant.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut body = String::new();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        let messages = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/messages", id),
+            )
+            .send()
+            .expect("messages");
+        body = messages.text().expect("body");
+        if body.contains("SCHEDULED_REPLY_MARKER") {
+            break;
+        }
+    }
+
+    // Deliberately counted, not merely contained: the marker appears once in turn 1's
+    // `schedule_create` tool-call input, which is echoed back by `GET /messages` whether or not the
+    // job ever fires. Only a real delivery produces a second occurrence.
+    assert!(
+        body.matches("DELIVERED_PROMPT_MARKER").count() >= 2,
+        "the job's prompt must be delivered as a turn nobody requested, not just appear in the \
+         tool call that created it; messages were:\n{}",
+        body,
+    );
+    assert!(
+        body.contains("Scheduled job"),
+        "the delivered prompt must be marked as scheduled so the model knows no human is \
+         waiting; messages were:\n{}",
+        body,
+    );
+    assert!(
+        body.contains("SCHEDULED_REPLY_MARKER"),
+        "the agent's reply to the scheduled turn must be persisted for a client to read back; \
+         messages were:\n{}",
+        body,
+    );
+}

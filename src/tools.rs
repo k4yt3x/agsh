@@ -10,6 +10,7 @@ pub(crate) mod mcp_resources;
 mod memory;
 mod recall;
 mod render_image;
+mod schedule;
 pub(crate) mod scratchpad;
 mod shell;
 mod skill;
@@ -657,6 +658,13 @@ impl ToolRegistry {
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
+        // `None` for sub-agents. A sub-agent's session is ephemeral, so a job keyed to it would
+        // outlive the only conversation able to run it -- the same reason Claude Code refuses
+        // durable crons for its teammates.
+        schedule: Option<(
+            crate::config::ResolvedScheduleConfig,
+            crate::permission::SharedPermission,
+        )>,
     ) {
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
@@ -685,6 +693,18 @@ impl ToolRegistry {
             session_id: shared_session_id.clone(),
             session_manager: session_manager.clone(),
         }));
+        if let Some((schedule_config, shared_permission)) = schedule
+            && schedule_config.enabled
+        {
+            for tool in schedule::build(
+                session_manager.clone(),
+                shared_session_id.clone(),
+                schedule_config,
+                shared_permission,
+            ) {
+                self.register_builtin(tool);
+            }
+        }
         self.register_builtin(Arc::new(todo::TodoTool { todo_list }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
             session_manager: session_manager.clone(),
@@ -764,11 +784,12 @@ impl ToolRegistry {
         cwd: crate::agent::SharedCwd,
         roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
+        schedule: crate::config::ResolvedScheduleConfig,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
             &web_client_config,
-            shared_permission,
+            shared_permission.clone(),
             sandbox_enabled,
             sandbox_capability,
             sandbox_backend,
@@ -786,6 +807,7 @@ impl ToolRegistry {
             None,
             Vec::new(),
             cwd,
+            Some((schedule, shared_permission)),
         );
         Ok(registry)
     }
@@ -844,6 +866,7 @@ impl ToolRegistry {
             parent_session_id,
             inherited_scratchpad_names,
             cwd,
+            None,
         );
         Ok(registry)
     }
@@ -899,6 +922,7 @@ pub(crate) mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly")
     }
@@ -1213,6 +1237,7 @@ pub(crate) mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
 

@@ -15,6 +15,7 @@ pub(crate) mod idempotency;
 pub(crate) mod openapi;
 pub(crate) mod poisoned;
 pub(crate) mod reattach;
+pub(crate) mod schedule;
 pub(crate) mod sse;
 pub(crate) mod state;
 
@@ -138,6 +139,7 @@ pub async fn run_serve(
     let state = ServerState::new(shared, serve_arc, idempotency_cache.clone());
 
     let gc_handle = gc::spawn(state.clone());
+    let scheduler_handle = schedule::spawn(state.clone());
     let pruner_handle = idempotency_cache.spawn_pruner();
 
     let router = build_router(state.clone(), auth, max_body_bytes);
@@ -169,6 +171,7 @@ pub async fn run_serve(
 
     let drain_result = tokio::time::timeout(shutdown_drain_timeout, serve_handle).await;
     gc_handle.abort();
+    scheduler_handle.abort();
     pruner_handle.abort();
     // Flush the SQLite WAL before exit so a quick restart doesn't pay WAL-replay cost.
     // Best-effort, SQLite recovers from an unflushed WAL automatically.

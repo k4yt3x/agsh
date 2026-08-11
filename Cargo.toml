@@ -15,6 +15,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+croner = "3"
 crossterm = "0.29"
 dirs = "6"
 eventsource-stream = "0.2"
@@ -33,7 +34,7 @@ open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10"
-reedline = { git = "https://github.com/wtfbbqhax/reedline", rev = "3a457ff1dab28c9021db116f2575eed5116bed88", features = ["external_printer"] }
+reedline = { git = "https://github.com/nushell/reedline", rev = "e4fe8edfb28440614e58a8c9dba78d128783f70f", features = ["external_printer"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
 rmcp = { version = "2.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }

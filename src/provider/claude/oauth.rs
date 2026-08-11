@@ -2212,6 +2212,7 @@ mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
 
@@ -2332,6 +2333,7 @@ mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
         // Register a deferred fixture *after* `build_default` so it lands at the tail of the tools
@@ -2466,6 +2468,7 @@ mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "mcp__fs__old_tool");
@@ -2495,9 +2498,10 @@ mod tests {
 
         // ...and the change is announced in the block that gets appended instead.
         let delta = crate::context::render_world_state(
-            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[], &[]),
+            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[], &[], &[]),
             Some(&crate::context::WorldSnapshot::new(
                 &before_catalogue,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2575,6 +2579,7 @@ mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
@@ -2681,6 +2686,7 @@ mod tests {
             crate::agent::test_cwd(),
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
         )
         .expect("default web client config should build cleanly");
 

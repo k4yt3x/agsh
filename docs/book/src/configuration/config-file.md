@@ -1060,6 +1060,35 @@ Setting `enabled = false` keeps the four `memory_*` tool schemas out of every re
 
 There is deliberately no environment variable and no CLI flag here: whether an agent keeps memories is a property of the installation, not something to vary per run.
 
+## `[schedule]`
+
+Controls the wakeups the agent schedules for itself. See the [Scheduling](../usage/scheduling.md) guide.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Register the `schedule_*` tools and run the scheduler |
+| `poll_interval` | duration | `"10s"` | How often due jobs are checked |
+| `missed_grace` | duration | `"24h"` | How late a one-shot job may be and still fire after downtime |
+| `gate_timeout` | duration | `"30s"` | Wall-clock budget for a gate command |
+| `max_jobs` | int | `50` | Per-session ceiling, refused at `schedule_create` |
+
+```toml
+[schedule]
+enabled = true
+poll_interval = "10s"
+missed_grace = "24h"
+gate_timeout = "30s"
+max_jobs = 50
+```
+
+`poll_interval` is the real resolution floor: a job whose interval is shorter than the tick fires once per tick, not once per interval.
+
+`missed_grace` applies only to one-shot jobs. Recurring jobs need no equivalent, because their occurrences are one period apart, so the most recent missed one is always less than a period old; the scheduler coalesces the rest into a single catch-up fire.
+
+Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing jobs on disk without firing.
+
+As with `[skills]` and `[memory]`, there is no environment variable and no CLI flag: whether an agent may schedule its own turns is a property of the installation.
+
 ## `[serve]`
 
 Configuration for `meka serve`, the HTTP API server. See the [HTTP API](../usage/http-api.md) usage guide for a full walkthrough.
