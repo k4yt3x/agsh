@@ -1265,6 +1265,39 @@ async fn run_interactive(
                             }
                         }
                     }
+                    repl::SlashCommand::Rewind(turns) => {
+                        let turns = turns.unwrap_or(1);
+                        match (session_id, messages.rewind(turns)) {
+                            (Some(id), Some(event)) => {
+                                if let Err(error) = session_manager.save_event(id, &event).await {
+                                    // Put the turns back rather than leave memory and disk
+                                    // disagreeing, which would resurrect them on the next resume
+                                    // and make the rewind look like it silently un-did itself.
+                                    messages.pop_repair();
+                                    render::render_error(&error);
+                                } else {
+                                    agent.reset_conversation_markers().await;
+                                    render::render_hint(&format!(
+                                        "Rewound {} turn(s). The model no longer sees them; \
+                                         `meka session export` still does.",
+                                        turns,
+                                    ));
+                                }
+                            }
+                            // No session means nothing was ever persisted, so the in-memory rewind
+                            // (which did happen) is the whole story.
+                            (None, Some(_)) => {
+                                agent.reset_conversation_markers().await;
+                                render::render_hint(&format!("Rewound {} turn(s).", turns));
+                            }
+                            (_, None) => {
+                                eprintln!(
+                                    "Nothing to rewind: the conversation has fewer than {} turn(s).",
+                                    turns
+                                );
+                            }
+                        }
+                    }
                     repl::SlashCommand::Export => match &session_id {
                         Some(id) => {
                             if let Err(error) = export_session(
@@ -2503,7 +2536,49 @@ async fn run_session_subcommand(
         cli::SessionAction::Fork { session_id } => {
             fork_session_command(session_manager, *session_id).await
         }
+        cli::SessionAction::Rewind { session_id, turns } => {
+            rewind_session_command(session_manager, *session_id, *turns).await
+        }
     }
+}
+
+/// `meka session rewind`: drop the last `turns` turns from a session that isn't currently open.
+///
+/// The escape hatch for content `Agent::run_turn` can't repair itself, namely anything the provider
+/// refuses that was committed before the current turn. Appends an `Event::Repair` with an empty
+/// replacement, so nothing is deleted and `meka session export` still shows the dropped turns.
+async fn rewind_session_command(
+    session_manager: &SessionManager,
+    session_id: uuid::Uuid,
+    turns: usize,
+) -> anyhow::Result<()> {
+    // Held for the whole read-modify-write. A REPL, `meka serve`, or `meka acp` holding this
+    // session has its own in-memory conversation that would overwrite the rewind on its next turn.
+    if !session_manager.session_exists(session_id).await? {
+        anyhow::bail!("session not found: {}", session_id);
+    }
+    let _lock = session_manager.lock_session(session_id)?;
+
+    let events = session_manager.load_events(session_id).await?;
+    let mut conversation = conversation::Conversation::from_events(events);
+
+    let Some(event) = conversation.rewind(turns) else {
+        anyhow::bail!(
+            "nothing to rewind: session {} has fewer than {} turn(s)",
+            session_id,
+            turns
+        );
+    };
+    session_manager.save_event(session_id, &event).await?;
+
+    tracing::info!("rewound {} turn(s) from session {}", turns, session_id);
+    eprintln!(
+        "Rewound {} turn(s); {} message(s) remain. The full history is still in \
+         `meka session export`.",
+        turns,
+        conversation.len(),
+    );
+    Ok(())
 }
 
 async fn run_history_subcommand(
@@ -2650,6 +2725,32 @@ pub(crate) fn format_session_as_markdown(
                 )
                 .ok();
                 writeln!(output, "{}\n", summary.text_content()).ok();
+                writeln!(output, "</details>\n").ok();
+            }
+            // Same treatment as a boundary: mark what happened and render the replacement, leaving
+            // the superseded messages above it. An export is the record of the session, and a
+            // repair (or a rewind, which is a repair with nothing to put back) is the one place
+            // where what the model saw and what actually happened diverge.
+            conversation::Event::Repair {
+                replaced_count,
+                messages,
+            } => {
+                writeln!(output, "---\n").ok();
+                writeln!(output, "<details>").ok();
+                writeln!(
+                    output,
+                    "<summary>{} message(s) above replaced with {} (rejected by the provider, or rewound)</summary>\n",
+                    replaced_count,
+                    if messages.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        format!("{} message(s)", messages.len())
+                    },
+                )
+                .ok();
+                for message in messages {
+                    write_message_markdown(&mut output, message, tool_outputs);
+                }
                 writeln!(output, "</details>\n").ok();
             }
         }
@@ -2907,6 +3008,19 @@ async fn load_session_messages(
         tracing::warn!(
             "dropping assistant message with orphaned tool_use IDs: {:?}",
             tool_use_ids,
+        );
+    }
+
+    // Materializing the log also replaces images whose bytes contradict their declared media type.
+    // Providers sniff and reject those with a 400, and since the block is already in the log that
+    // 400 would repeat on every request, leaving the session unusable. Sessions written by a meka
+    // old enough to have trusted a filename extension or a `Content-Type` heal here, for free; all
+    // that is left to do is say so.
+    let replaced = log.invalid_images_replaced();
+    if replaced > 0 {
+        tracing::warn!(
+            "replaced {} image(s) whose bytes did not match their declared media type",
+            replaced,
         );
     }
 

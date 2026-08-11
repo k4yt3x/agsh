@@ -220,6 +220,21 @@ fn materialize_with_timestamps(events: &[(String, Event)]) -> (Vec<Message>, Vec
                 messages.push(summary.clone());
                 timestamps.push(ts.clone());
             }
+            Event::Repair {
+                replaced_count,
+                messages: replacements,
+            } => {
+                let truncate_to = messages.len().saturating_sub(*replaced_count);
+                messages.truncate(truncate_to);
+                timestamps.truncate(truncate_to);
+                // The repair row's own timestamp, not the replaced messages', because that is when
+                // this content came into being. Keeping the originals' would put the replacement
+                // ahead of messages that predate it in a client sorting by time.
+                for replacement in replacements {
+                    messages.push(replacement.clone());
+                    timestamps.push(ts.clone());
+                }
+            }
         }
     }
     (messages, timestamps)

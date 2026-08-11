@@ -154,6 +154,18 @@ pub enum SessionAction {
         /// Session UUID to fork
         session_id: uuid::Uuid,
     },
+    /// Drop the most recent turns from a session
+    ///
+    /// Cuts at a clean user boundary so no tool call is separated from its
+    /// result. The log is append-only, so `meka session export` still shows
+    /// what was dropped. Use this to recover a session the provider refuses.
+    Rewind {
+        /// Session UUID to rewind
+        session_id: uuid::Uuid,
+        /// Number of turns to drop
+        #[arg(short = 'n', long, default_value = "1")]
+        turns: usize,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

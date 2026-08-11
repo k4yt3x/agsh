@@ -140,10 +140,23 @@ pub(crate) fn downscale_to_dim_cap(
 /// 2000 px multi-image cap is enforced separately at the Claude provider layer in
 /// `src/provider/claude/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
 /// bytes)`.
+///
+/// `hint` is what the *source* claimed the format was (a filename extension, an HTTP
+/// `Content-Type`, an MCP server's `mime_type`, a client's declared MIME). It is only consulted
+/// when the bytes can't be identified, because every one of those labels is guessable-wrong and the
+/// providers sniff: Anthropic rejects a JPEG labelled `image/png` with a 400, and that rejection
+/// lands in a `tool_result` already committed to the session, where it fails every subsequent
+/// request. Deciding the media type from the bytes is what keeps a mislabel from becoming
+/// unrecoverable history.
 pub(crate) fn prepare_image_payload(
-    handling: ImageHandling,
+    hint: ImageHandling,
     bytes: &[u8],
 ) -> Result<(&'static str, Vec<u8>), String> {
+    let handling = match classify_bytes(bytes) {
+        ImageHandling::Unsupported => hint,
+        sniffed => sniffed,
+    };
+
     match handling {
         ImageHandling::PassThrough(format) => {
             if bytes.len() > MAX_IMAGE_RAW_BYTES {
@@ -174,10 +187,10 @@ pub(crate) fn prepare_image_payload(
 /// [`prepare_image_payload`]). Used for *input* images (e.g. an ACP client's @-mention or pasted
 /// screenshot), parallel to [`build_image_tool_output`] for tool results.
 pub(crate) fn prepare_image_source(
-    handling: ImageHandling,
+    hint: ImageHandling,
     bytes: &[u8],
 ) -> Result<ImageSource, String> {
-    let (media_type, payload) = prepare_image_payload(handling, bytes)?;
+    let (media_type, payload) = prepare_image_payload(hint, bytes)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
     Ok(ImageSource {
         source_type: "base64".to_string(),
@@ -187,13 +200,12 @@ pub(crate) fn prepare_image_source(
 }
 
 /// Decode a base64 image attachment supplied by a *client* into an [`ImageSource`]: base64-decode
-/// the payload, classify the format by the declared MIME type falling back to the magic bytes, then
-/// enforce the size cap and convert unsupported formats to PNG. Returns a human-readable message on
-/// failure, suitable for surfacing back to the caller as a validation error.
+/// the payload, classify it, then enforce the size cap and convert unsupported formats to PNG.
+/// Returns a human-readable message on failure, suitable for surfacing back to the caller as a
+/// validation error.
 ///
-/// The magic-byte fallback matters because the declared type is attacker-or-typo controlled: a
-/// client that labels a PNG `application/octet-stream` (or `image/png` for something that isn't)
-/// still gets classified off what the bytes actually are.
+/// `declared_mime` is only a hint; [`prepare_image_source`] decides from the bytes. That matters
+/// here more than anywhere else, since a client's declared type is attacker-or-typo controlled.
 ///
 /// Shared by the ACP `session/prompt` handler and the HTTP `POST /turn` handler so both frontends
 /// enforce identical limits on client-supplied images.
@@ -201,11 +213,33 @@ pub(crate) fn decode_base64_image(data: &str, declared_mime: &str) -> Result<Ima
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|error| format!("base64 decode failed: {}", error))?;
-    let handling = match classify_content_type(declared_mime) {
-        ImageHandling::Unsupported => classify_bytes(&bytes),
-        handling => handling,
-    };
-    prepare_image_source(handling, &bytes)
+    prepare_image_source(classify_content_type(declared_mime), &bytes)
+}
+
+/// Number of leading base64 characters that decode to enough bytes for [`image::guess_format`] to
+/// identify every format it recognises: 32 chars decode to 24, and the longest signature it matches
+/// is WebP's 12-byte `RIFF....WEBP`. Used where only a base64 string is on hand and decoding a
+/// multi-megabyte payload purely to sniff it would be wasteful.
+const SNIFF_PREFIX_CHARS: usize = 32;
+
+/// Classify a base64 payload by its magic bytes without decoding all of it.
+///
+/// Base64 decodes in independent 4-character groups, so a prefix truncated to a multiple of 4
+/// decodes on its own. Returns [`ImageHandling::Unsupported`] when the prefix isn't valid base64 or
+/// the bytes match no known format, which callers treat the same way as any other unusable image.
+pub(crate) fn classify_base64_prefix(data: &str) -> ImageHandling {
+    // Bytes rather than chars: a stray multi-byte character would make a char-count prefix unsafe
+    // to slice, and any non-alphabet byte fails the decode below anyway.
+    let prefix: Vec<u8> = data
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .take(SNIFF_PREFIX_CHARS)
+        .collect();
+    let aligned = &prefix[..prefix.len() - prefix.len() % 4];
+    match base64::engine::general_purpose::STANDARD.decode(aligned) {
+        Ok(bytes) => classify_bytes(&bytes),
+        Err(_) => ImageHandling::Unsupported,
+    }
 }
 
 /// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
@@ -254,6 +288,15 @@ mod tests {
         let img = RgbaImage::from_pixel(width, height, image::Rgba([128, 64, 200, 255]));
         let mut out = Vec::new();
         img.write_to(&mut Cursor::new(&mut out), format)
+            .expect("encode");
+        out
+    }
+
+    /// JPEG has no alpha channel, so it needs an RGB source rather than the RGBA one above.
+    fn synthesize_jpeg_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([128, 64, 200]));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), ImageFormat::Jpeg)
             .expect("encode");
         out
     }
@@ -445,6 +488,123 @@ mod tests {
         let error =
             prepare_image_payload(ImageHandling::Unsupported, b"anything").expect_err("should err");
         assert!(error.contains("unsupported"));
+    }
+
+    /// The regression this file exists to prevent: a JPEG behind a `.png` name (or a `Content-Type:
+    /// image/png`) must be labelled `image/jpeg`, because Anthropic sniffs and answers 400.
+    #[test]
+    fn test_prepare_media_type_comes_from_bytes_not_hint() {
+        let jpeg = synthesize_jpeg_bytes();
+        let (media_type, payload) =
+            prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &jpeg).expect("ok");
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(payload, jpeg);
+    }
+
+    /// A hint claiming a native format doesn't skip the transcode when the bytes need one.
+    #[test]
+    fn test_prepare_converts_when_bytes_need_it_despite_native_hint() {
+        let tiff = synthesize_image_bytes(ImageFormat::Tiff);
+        let (media_type, payload) =
+            prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &tiff).expect("ok");
+        assert_eq!(media_type, "image/png");
+        image::load_from_memory_with_format(&payload, ImageFormat::Png).expect("png");
+    }
+
+    #[test]
+    fn test_classify_base64_prefix_identifies_format() {
+        let png = base64::engine::general_purpose::STANDARD.encode(synthesize_image_bytes_sized(
+            ImageFormat::Png,
+            200,
+            200,
+        ));
+        assert!(
+            png.len() > SNIFF_PREFIX_CHARS,
+            "fixture must be longer than the sniffed prefix"
+        );
+        assert_eq!(
+            classify_base64_prefix(&png),
+            ImageHandling::PassThrough(ImageFormat::Png)
+        );
+    }
+
+    #[test]
+    fn test_classify_base64_prefix_tolerates_whitespace() {
+        let raw = base64::engine::general_purpose::STANDARD.encode(synthesize_jpeg_bytes());
+        let wrapped = raw
+            .as_bytes()
+            .chunks(8)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify_base64_prefix(&wrapped),
+            ImageHandling::PassThrough(ImageFormat::Jpeg)
+        );
+    }
+
+    /// Pins [`SNIFF_PREFIX_CHARS`] against whatever `image::guess_format` actually reads, rather
+    /// than against my reading of its signature table. Sniffing the truncated prefix has to give
+    /// the same answer as sniffing the whole payload for every format we forward; WebP is the one
+    /// that matters, since its `RIFF....WEBP` check reaches furthest into the file.
+    #[test]
+    fn test_classify_base64_prefix_matches_full_sniff_for_every_native_format() {
+        // Hand-built headers: `image` can't encode all of these, and only the magic bytes are
+        // under test.
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0u8; 4]);
+        webp.extend_from_slice(b"WEBPVP8 ");
+        webp.extend(std::iter::repeat_n(0u8, 64));
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend(std::iter::repeat_n(0u8, 64));
+
+        let payloads: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "png",
+                synthesize_image_bytes_sized(ImageFormat::Png, 64, 64),
+            ),
+            ("jpeg", synthesize_jpeg_bytes()),
+            ("bmp", synthesize_image_bytes(ImageFormat::Bmp)),
+            ("gif", gif),
+            ("webp", webp),
+        ];
+
+        for (name, bytes) in payloads {
+            let full = classify_bytes(&bytes);
+            assert_ne!(
+                full,
+                ImageHandling::Unsupported,
+                "{name} fixture must be recognisable at all"
+            );
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            assert!(
+                encoded.len() > SNIFF_PREFIX_CHARS,
+                "{name} fixture must exceed the sniffed prefix for this to prove anything"
+            );
+            assert_eq!(
+                classify_base64_prefix(&encoded),
+                full,
+                "{name}: sniffing the first {SNIFF_PREFIX_CHARS} base64 chars must match sniffing \
+                 the whole payload"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_base64_prefix_rejects_non_image_and_non_base64() {
+        assert_eq!(
+            classify_base64_prefix("BASE64DATA"),
+            ImageHandling::Unsupported
+        );
+        assert_eq!(classify_base64_prefix("%%%%"), ImageHandling::Unsupported);
+        assert_eq!(classify_base64_prefix(""), ImageHandling::Unsupported);
+    }
+
+    #[test]
+    fn test_decode_base64_image_prefers_bytes_over_declared_mime() {
+        let data = base64::engine::general_purpose::STANDARD.encode(synthesize_jpeg_bytes());
+        let source = decode_base64_image(&data, "image/png").expect("ok");
+        assert_eq!(source.media_type, "image/jpeg");
     }
 
     #[test]

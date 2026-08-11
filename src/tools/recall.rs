@@ -3,6 +3,10 @@
 //! context. Compaction never deletes (it appends a boundary, [`crate::conversation`]), so every
 //! turn is still on disk in the `messages` table; these tools give the model a way back to detail
 //! the summary may have dropped.
+//!
+//! A rewind is the one thing that does remove turns from this view. That is deliberate: `/rewind`
+//! exists to take a turn back, and a search that could hand it straight back to the model would
+//! defeat it. Those turns remain on disk and in `meka session export`.
 
 use std::sync::Arc;
 
@@ -41,13 +45,26 @@ fn role_label(role: &Role) -> &'static str {
 /// summary is already in the model's context, and skipping them keeps message indices stable across
 /// compactions (the log only ever grows).
 fn append_messages(events: &[Event]) -> Vec<&Message> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            Event::Append(message) => Some(message),
-            Event::CompactBoundary { .. } => None,
-        })
-        .collect()
+    let mut messages: Vec<&Message> = Vec::new();
+    for event in events {
+        match event {
+            Event::Append(message) => messages.push(message),
+            Event::CompactBoundary { .. } => {}
+            // Applied rather than skipped: a repaired message is what the model actually saw, so
+            // searching the superseded original would surface content that is no longer in the
+            // conversation. Unlike a boundary this can shift indices, but only across a repair,
+            // which is rare and confined to a single run of trailing messages.
+            Event::Repair {
+                replaced_count,
+                messages: replacements,
+            } => {
+                let truncate_to = messages.len().saturating_sub(*replaced_count);
+                messages.truncate(truncate_to);
+                messages.extend(replacements.iter());
+            }
+        }
+    }
+    messages
 }
 
 /// Flatten a message into searchable lines. Non-text blocks are prefixed so a match is

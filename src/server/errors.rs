@@ -211,11 +211,16 @@ impl From<&MekaError> for ProblemDetail {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 message.clone(),
             ),
-            MekaError::Provider(message) => ProblemDetail::new(
-                ErrorKind::Provider,
-                StatusCode::BAD_GATEWAY,
-                message.clone(),
-            ),
+            // Both are upstream refusals rather than anything the HTTP caller got wrong: by the
+            // time a request is malformed enough for the provider to reject it, the agent loop has
+            // already tried to repair it.
+            MekaError::Provider(message) | MekaError::InvalidRequest(message) => {
+                ProblemDetail::new(
+                    ErrorKind::Provider,
+                    StatusCode::BAD_GATEWAY,
+                    message.clone(),
+                )
+            }
             MekaError::Interrupted => ProblemDetail::new(
                 ErrorKind::TurnCancelled,
                 StatusCode::CONFLICT,
@@ -268,6 +273,17 @@ mod tests {
     #[test]
     fn meka_error_provider_maps_to_502() {
         let error = MekaError::Provider("upstream 529".into());
+        let problem = ProblemDetail::from(&error);
+        assert_eq!(problem.status, 502);
+        assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
+    }
+
+    /// A malformed-request rejection reaches the HTTP caller only after the agent loop has already
+    /// tried to repair it, so it is an upstream failure (502) rather than a complaint about the
+    /// caller's own body (4xx).
+    #[test]
+    fn meka_error_invalid_request_maps_to_502() {
+        let error = MekaError::InvalidRequest("400 invalid_request_error".into());
         let problem = ProblemDetail::from(&error);
         assert_eq!(problem.status, 502);
         assert_eq!(problem.type_uri, "https://meka.so/errors/provider");

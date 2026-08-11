@@ -253,6 +253,21 @@ The same operation is available from the REPL as `/fork`, which switches you int
 
 Both produce a runnable copy under a new ID. Reach for `fork` to branch a conversation you're working on, and for `export` + `import` to move a session between machines or keep an archive. Export/import also copies sub-agent transcripts and preserves `created_at`, because an archive should restore whole.
 
+## Rewinding a Session
+
+Drop the most recent turns from a session:
+
+```bash
+meka session rewind 550e8400-e29b-41d4-a716-446655440000
+meka session rewind 550e8400-e29b-41d4-a716-446655440000 -n 3
+```
+
+The cut lands on a turn boundary, so a tool call is never separated from its result, and nothing is deleted: the dropped turns stay in the event log and still appear in `meka session export`, marked at the point of the rewind. The model simply stops seeing them.
+
+The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP or the HTTP API there is no in-session equivalent, so close the session in the editor (or stop the server) and run this command.
+
+Its main use is recovering a session a provider has started refusing. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too. meka repairs a rejection caused by content it added during the current turn, and repairs a mislabelled image on resume, but anything older than that needs rewinding past.
+
 ## Deleting Sessions
 
 Delete specific sessions by UUID:

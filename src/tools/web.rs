@@ -309,28 +309,12 @@ impl Tool for FetchUrlTool {
             ));
         }
 
-        // If the response is a supported image, return a multimodal Image block directly rather
-        // than running the binary body through html2md.
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-
-        let handling = classify_content_type(&content_type);
-        if !matches!(handling, ImageHandling::Unsupported) {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| MekaError::ToolExecution {
-                    tool_name: "fetch_url".to_string(),
-                    message: format!("failed to read image bytes: {}", error),
-                })?;
-
-            let marker = format!("Image fetched from {}", url);
-            return Ok(build_image_tool_output(&marker, handling, &bytes));
-        }
 
         // Enforce a byte cap on the decompressed body so a small gzip/brotli payload can't expand
         // into gigabytes and exhaust host memory (a classic "zip bomb" vector now that reqwest is
@@ -373,6 +357,23 @@ impl Tool for FetchUrlTool {
             }
             body_bytes.extend_from_slice(&chunk);
         }
+
+        // A response the server labelled as an image becomes a multimodal Image block rather than
+        // going through html2md. `Content-Type` only gates whether to try: the media type comes
+        // from the bytes, and a body that isn't an image at all (an HTML error page served
+        // as `image/png`, which is common) falls through to the text path below instead of
+        // shipping a block the provider will reject.
+        if !matches!(
+            classify_content_type(&content_type),
+            ImageHandling::Unsupported
+        ) {
+            let sniffed = crate::image::classify_bytes(&body_bytes);
+            if !matches!(sniffed, ImageHandling::Unsupported) {
+                let marker = format!("Image fetched from {}", url);
+                return Ok(build_image_tool_output(&marker, sniffed, &body_bytes));
+            }
+        }
+
         let html = String::from_utf8_lossy(&body_bytes).into_owned();
 
         let raw = input["raw"].as_bool().unwrap_or(false);

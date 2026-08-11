@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Job gates: a shell command decides whether a due job spends a model turn, so polling is cheap.
 - `[schedule]` config for the poll interval, missed-job grace, gate timeout, and per-session cap.
 - Scheduled jobs fire under `meka serve`, the REPL, and ACP; `serve` is the durable host.
+- A provider rejecting content meka just added now degrades it and retries, telling the model why.
+- `/rewind [N]` and `meka session rewind` drop recent turns, so a stuck session is recoverable.
 
 ### Changed
 
@@ -48,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka provider add <existing>` could overwrite a profile when `config.toml` failed to parse.
 - `meka provider remove` truncated `config.toml` to nothing when the file couldn't be read.
 - An absurdly large `retention_days` panicked the retention sweep instead of keeping everything.
+- Images were labelled from the filename, `Content-Type`, or MCP `mime_type` instead of the bytes.
+- A single provider-rejected message killed a session permanently; it now repairs and continues.
+- A session already holding a mislabelled image is repaired on resume, with no provider call.
+- MCP images above the size providers accept were forwarded anyway, only to be rejected.
 
 ## [0.37.0] - 2026-08-10
 

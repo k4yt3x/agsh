@@ -3005,9 +3005,13 @@ const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
 /// migration, mirroring [`COMPACT_BOUNDARY_ROLE`].
 const USER_BLOCKS_ROLE: &str = "user_blocks";
 
+/// Pseudo-role for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_ROLE`]. The superseded
+/// messages keep their own rows, so `meka session export` still shows what was replaced.
+const REPAIR_ROLE: &str = "repair";
+
 /// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
-/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary` writes a JSON
-/// envelope under the [`COMPACT_BOUNDARY_ROLE`] pseudo-role.
+/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary` and
+/// `Event::Repair` write a JSON envelope under their pseudo-role.
 fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
@@ -3045,6 +3049,10 @@ fn encode_event_for_db(
         Event::CompactBoundary { .. } => {
             let content = serde_json::to_string(event)?;
             Ok((COMPACT_BOUNDARY_ROLE.to_string(), content))
+        }
+        Event::Repair { .. } => {
+            let content = serde_json::to_string(event)?;
+            Ok((REPAIR_ROLE.to_string(), content))
         }
     }
 }
@@ -3087,7 +3095,7 @@ fn decode_event_from_row(
                 Err(error) => Err(error),
             }
         }
-        role if role == COMPACT_BOUNDARY_ROLE => {
+        role if role == COMPACT_BOUNDARY_ROLE || role == REPAIR_ROLE => {
             let event: Event = serde_json::from_str(&row.content)?;
             Ok(Some(event))
         }
@@ -3863,17 +3871,23 @@ mod tests {
             loaded_tools_snapshot: snapshot,
         };
 
+        let repair_event = Event::Repair {
+            replaced_count: 2,
+            messages: vec![Message::assistant_text("[degraded]")],
+        };
+
         for event in [
             &user_event,
             &assistant_event,
             &tool_result_event,
             &boundary_event,
+            &repair_event,
         ] {
             manager.save_event(sid, event).await.expect("save event");
         }
 
         let loaded = manager.load_events(sid).await.expect("load events");
-        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.len(), 5);
 
         match &loaded[0] {
             Event::Append(m) => assert_eq!(m.text_content(), "hello"),
@@ -3908,6 +3922,17 @@ mod tests {
                 assert_eq!(summary.text_content(), "[summary]");
             }
             _ => panic!("expected CompactBoundary"),
+        }
+        match &loaded[4] {
+            Event::Repair {
+                replaced_count,
+                messages,
+            } => {
+                assert_eq!(*replaced_count, 2);
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].text_content(), "[degraded]");
+            }
+            _ => panic!("expected Repair"),
         }
     }
 

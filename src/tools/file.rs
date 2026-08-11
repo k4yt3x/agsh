@@ -334,37 +334,44 @@ impl Tool for ReadFileTool {
                         message: format!("failed to read '{}': {}", path, error),
                     })?;
 
-            let (media_type, payload) = match prepare_image_payload(handling, &data) {
-                Ok(pair) => pair,
-                Err(message) => {
-                    return Ok(ToolOutput::text(
-                        format!("Error: image '{}': {}", path, message),
-                        true,
-                    ));
-                }
-            };
+            // The extension only gates whether to *try* the image path; the bytes decide both the
+            // media type and whether this is an image at all. A `.png` holding something else
+            // falls through to the text read below instead of shipping a block the provider will
+            // reject, and a `.png` holding a JPEG is labelled `image/jpeg`.
+            let sniffed = crate::image::classify_bytes(&data);
+            if !matches!(sniffed, ImageHandling::Unsupported) {
+                let (media_type, payload) = match prepare_image_payload(sniffed, &data) {
+                    Ok(pair) => pair,
+                    Err(message) => {
+                        return Ok(ToolOutput::text(
+                            format!("Error: image '{}': {}", path, message),
+                            true,
+                        ));
+                    }
+                };
 
-            let base64_data = base64::engine::general_purpose::STANDARD.encode(&payload);
+                let base64_data = base64::engine::general_purpose::STANDARD.encode(&payload);
 
-            self.read_tracker.write().await.insert(canonical);
+                self.read_tracker.write().await.insert(canonical);
 
-            return Ok(ToolOutput {
-                content: vec![
-                    ToolResultContent::Text {
-                        text: format!("[Image: {}]", path),
-                    },
-                    ToolResultContent::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
-                            media_type: media_type.to_string(),
-                            data: base64_data,
+                return Ok(ToolOutput {
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: format!("[Image: {}]", path),
                         },
-                    },
-                ],
-                is_error: false,
-                scratchpad_hint: None,
-                frontend_metadata: None,
-            });
+                        ToolResultContent::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: media_type.to_string(),
+                                data: base64_data,
+                            },
+                        },
+                    ],
+                    is_error: false,
+                    scratchpad_hint: None,
+                    frontend_metadata: None,
+                });
+            }
         }
 
         const DEFAULT_LINE_LIMIT: usize = 2000;

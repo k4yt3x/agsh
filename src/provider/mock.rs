@@ -75,6 +75,14 @@ pub enum MockEvent {
         message: String,
         retry_after_secs: Option<u64>,
     },
+    /// Synthetic *malformed-request* failure. The stream returns
+    /// `Err(MekaError::InvalidRequest(message))` immediately, exercising `Agent::run_turn`'s
+    /// degrade-and-retry path. Each attempt consumes one round, so
+    /// `[FailInvalidRequest, ..success events..]` simulates "the provider refused the content meka
+    /// just appended, the retry without it succeeds".
+    FailInvalidRequest {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +211,9 @@ impl Provider for MockProvider {
                         retry_after: retry_after_secs.map(std::time::Duration::from_secs),
                     });
                 }
+                MockEvent::FailInvalidRequest { message } => {
+                    return Err(crate::error::MekaError::InvalidRequest(message));
+                }
                 MockEvent::Sleep { ms } => {
                     // Race the sleep against cancellation so a mid-turn `session/cancel` doesn't
                     // have to wait for the full delay to elapse.
@@ -229,7 +240,8 @@ impl Provider for MockProvider {
                         },
                         MockEvent::Sleep { .. }
                         | MockEvent::Fail { .. }
-                        | MockEvent::FailRetryable { .. } => {
+                        | MockEvent::FailRetryable { .. }
+                        | MockEvent::FailInvalidRequest { .. } => {
                             unreachable!("handled above")
                         }
                     };

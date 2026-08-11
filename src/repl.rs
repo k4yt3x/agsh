@@ -76,6 +76,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "",
     },
     CommandSpec {
+        name: "rewind",
+        aliases: &[],
+        help: "Drop the last N turns from the conversation (default 1)",
+        arg_hint: "[N]",
+    },
+    CommandSpec {
         name: "export",
         aliases: &[],
         help: "Export the current session as Markdown",
@@ -567,6 +573,13 @@ pub enum SlashCommand {
     Status,
     /// `/usage`: fetch and print the account's rate-limit usage from the active provider.
     Usage,
+    /// `/rewind [N]`: drop the last `N` turns (default 1) from the conversation, cutting at a
+    /// clean user boundary so no `tool_use` is separated from its `tool_result`. The event log is
+    /// append-only, so `meka session export` still shows what was dropped.
+    ///
+    /// The manual counterpart to `run_turn`'s automatic repair: it reaches content the automatic
+    /// path cannot, namely anything the provider refuses that was committed before this turn.
+    Rewind(Option<usize>),
     /// `/history [N]`: reprint past conversation in REPL style. Bare `/history` dumps every
     /// materialised message; `/history N` shows the last `N` turns (turn = user prompt + the agent
     /// work it triggered). Any non-numeric argument (e.g. `all`) falls back to the dump-everything
@@ -624,6 +637,11 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
+        "rewind" => Some(SlashCommand::Rewind(
+            argument
+                .as_deref()
+                .and_then(|value| value.trim().parse::<usize>().ok()),
+        )),
         "export" => Some(SlashCommand::Export),
         "fork" => Some(SlashCommand::Fork),
         "cd" => Some(SlashCommand::Cd(argument)),
@@ -967,6 +985,7 @@ pub fn run_repl(
                         Some(
                             command @ (SlashCommand::Session
                             | SlashCommand::Compact
+                            | SlashCommand::Rewind(_)
                             | SlashCommand::Export
                             | SlashCommand::Fork
                             | SlashCommand::McpPrompt { .. }
@@ -1999,6 +2018,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slash_command_rewind() {
+        assert!(matches!(
+            parse_slash_command("/rewind"),
+            Some(SlashCommand::Rewind(None))
+        ));
+        assert!(matches!(
+            parse_slash_command("/rewind 3"),
+            Some(SlashCommand::Rewind(Some(3)))
+        ));
+        // A non-numeric argument falls back to the default rather than erroring, matching
+        // `/history`.
+        assert!(matches!(
+            parse_slash_command("/rewind all"),
+            Some(SlashCommand::Rewind(None))
+        ));
+    }
+
+    #[test]
     fn test_parse_slash_command_unknown() {
         assert!(parse_slash_command("/unknown").is_none());
     }
@@ -2367,6 +2404,7 @@ mod tests {
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",
             Some(SlashCommand::Usage) => "Usage",
+            Some(SlashCommand::Rewind(_)) => "Rewind",
             Some(SlashCommand::History(_)) => "History",
         }
     }

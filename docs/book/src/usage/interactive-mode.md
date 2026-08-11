@@ -109,6 +109,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/session` | Show the current session ID |
 | `/permission [none\|read\|ask\|write]` | Show or set the permission level |
 | `/compact` | Summarize and compact the session history |
+| `/rewind [N]` | Drop the last `N` turns (default 1) from the conversation the model sees |
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
 | `/cd [path]` | Change working directory |
 | `/schedule` | List this session's scheduled jobs |
@@ -177,6 +178,20 @@ This is distinct from `/status`, which reports this session's own token counters
 The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
 After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
+
+### `/rewind`
+
+`/rewind` drops the most recent turn from the conversation, so the model no longer sees it or your prompt that started it. `/rewind N` drops the last `N`. The cut always lands on a turn boundary, so a tool call is never separated from its result.
+
+Like `/compact`, nothing is deleted: the dropped turns stay in the event log on disk, and `meka session export` still shows them with a marker where the rewind happened.
+
+Use it to take back a prompt that sent the agent down the wrong path without paying for a summary, or to recover a session the provider has started refusing. meka repairs a rejection it causes itself (see below), but content that entered the conversation earlier is out of its reach; rewinding past it is the way back. `meka session rewind <id>` does the same to a session you are not currently in.
+
+### Recovering from a rejected message
+
+Providers validate the whole conversation on every request, so one piece of content they refuse would otherwise fail every later turn as well, permanently. When that happens, meka strips the offending content from what it added this turn, retries once, and hands the model the provider's own complaint as a failed tool result so it can adapt rather than silently losing the data. If the retry is refused too, the original content goes back untouched and the turn reports the provider's error.
+
+A session that already holds such content from an older meka is repaired when you resume it, without a provider round trip. For anything further back, use `/rewind`.
 
 ### `/fork`
 

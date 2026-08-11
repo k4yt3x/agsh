@@ -156,7 +156,8 @@ use crate::{
     memory::MemoryCache,
     permission::SharedPermission,
     provider::{
-        ContentBlock, ImageSource, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition,
+        ContentBlock, ImageSource, Message, Provider, Role, StopReason, StreamEvent,
+        ToolDefinition, ToolResultContent,
     },
     session::SessionManager,
     skills::SkillCache,
@@ -171,6 +172,11 @@ const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
 /// overflows, looping won't help.
 const MAX_OVERFLOW_RETRIES: u32 = 1;
+
+/// How many times a single turn may degrade-and-retry after the provider rejects the request as
+/// malformed. One pass strips every non-text block meka added since the last accepted request, so a
+/// second pass would have nothing left to remove.
+const MAX_REQUEST_REPAIRS: u32 = 1;
 
 /// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from the
 /// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
@@ -283,7 +289,27 @@ pub struct Agent {
     /// the primary agent; false for sub-agents, which share the parent's `SessionStats` Arc but
     /// own a child session row (so only the primary writes the parent-inclusive totals).
     persist_session_stats: bool,
+    /// Conversation length at the time of the most recent request the provider *accepted*, or
+    /// [`LAST_ACCEPTED_UNKNOWN`] before the first one. Everything appended past it is what a
+    /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
+    /// good one by exactly those messages, which is how `run_turn` locates the offending content
+    /// without parsing the provider's error path (Anthropic's `messages.34.content.0…`), a shape
+    /// no other backend produces and none of them map cleanly back through context truncation.
+    ///
+    /// Carried across turns rather than reset per turn so a turn that failed *after* appending its
+    /// user message leaves that message a suspect on the retry; a fresh-per-turn floor would put
+    /// it out of reach and leave the session stuck. The cost is that it must be invalidated
+    /// whenever the conversation is rewritten under the agent, which
+    /// [`Self::reset_conversation_markers`] and `compact_session` are responsible for.
+    ///
+    /// Atomic rather than `&mut` because `run_turn` takes `&self`; never shared between agents
+    /// (sub-agents construct their own through [`Self::new`]).
+    last_accepted_len: std::sync::atomic::AtomicUsize,
 }
+
+/// Sentinel for [`Agent::last_accepted_len`] before any request has come back 2xx, and after a
+/// compaction rewrites the conversation and makes earlier lengths incomparable.
+const LAST_ACCEPTED_UNKNOWN: usize = usize::MAX;
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -322,6 +348,7 @@ impl Agent {
             mcp_manager: None,
             session_stats,
             persist_session_stats: true,
+            last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
         }
     }
 
@@ -453,6 +480,23 @@ impl Agent {
     /// `Ok(None)` when the provider has no per-account usage endpoint.
     pub async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {
         self.provider.fetch_usage().await
+    }
+
+    /// Tell the agent that the conversation it holds was rewritten out from under it, as `/rewind`
+    /// does. Both markers the agent keeps against message *positions* stop meaning anything and are
+    /// cleared: the accepted-prefix length a rejection is measured back from, and the index where
+    /// the world-state delta was last rendered.
+    ///
+    /// Leaving either stale is silently wrong rather than loud. A stale accepted-prefix makes the
+    /// degrade-and-retry recovery compute an empty suspect window and quietly not fire; a stale
+    /// world-state index makes `run_turn` believe it already told the model about a tool or MCP
+    /// server whose announcement the rewind just deleted, so it never mentions it again.
+    ///
+    /// `compact_session` clears the same two inline, since it rewrites the conversation itself.
+    pub async fn reset_conversation_markers(&self) {
+        self.last_accepted_len
+            .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
+        *self.last_rendered_world.write().await = None;
     }
 
     /// Point this agent's live context counter at an externally-owned atomic so the REPL prompt
@@ -649,6 +693,11 @@ impl Agent {
         // Build the user message once (text preamble + any input images) and reuse it for both the
         // in-memory append and every persist path below, so attached images survive resume.
         let user_message = Message::user_with_images(augmented_input, images);
+        // Where this turn's additions begin, captured before the append so the user message (which
+        // may carry the attached images) is inside the window a rejection can blame. Distinct from
+        // `turn_start_len` below, which marks the start of the *loop's* additions and so excludes
+        // it.
+        let mut suspect_floor = messages.len();
         messages.append(user_message.clone());
         // Persist the user message eagerly, before the first provider call.  A crash
         // during the provider roundtrip would otherwise lose it from disk.  On transient
@@ -709,6 +758,11 @@ impl Agent {
         // Bounds the emergency compact-and-retry on a `ContextOverflow` so a request that stays too
         // large after one compaction fails cleanly instead of looping.
         let mut overflow_retries = 0u32;
+        // Bounds the degrade-and-retry on a `MekaError::InvalidRequest`, in the same spirit.
+        let mut repairs_used = 0u32;
+        // A repair applied to the in-memory conversation but not yet proven good by a 2xx, so not
+        // yet persisted. Dropped back into the log on success, undone on a second rejection.
+        let mut pending_repair: Option<crate::conversation::Event> = None;
 
         let mut user_saved = user_eagerly_saved;
         // Set once we've nudged the model for a user-visible response this turn, so the recovery
@@ -730,6 +784,10 @@ impl Agent {
                 if self.frontend.client_disconnected() {
                     break 'turn Err(MekaError::Interrupted);
                 }
+
+                // Conversation length behind this request, stamped onto `last_accepted_len` when
+                // the provider takes it.
+                let sent_len = messages.len();
 
                 let api_messages: Arc<[Message]> = if messages.len() > turn_start_len {
                     let mut combined = base_messages.to_vec();
@@ -835,10 +893,81 @@ impl Agent {
                             self.options.context_messages,
                         ));
                         turn_start_len = messages.len();
+                        // Compaction rewrote everything before this point, so the old floor no
+                        // longer marks anything.
+                        suspect_floor = messages.len();
+                        continue;
+                    }
+                    // The retry after a repair was refused too, so the repair was not the fix.
+                    // Undo it and report what the provider actually said, leaving the conversation
+                    // byte-identical to before the attempt: the cost of guessing wrong has to be
+                    // one round trip, never a destroyed tool result.
+                    Err(MekaError::InvalidRequest(message)) if pending_repair.is_some() => {
+                        if messages.pop_repair() {
+                            tracing::warn!(
+                                "degrading this turn's content did not satisfy the provider; \
+                                 restored it unchanged"
+                            );
+                        }
+                        break 'turn Err(MekaError::InvalidRequest(message));
+                    }
+                    // The provider refused the request as malformed. Retrying it unchanged is
+                    // pointless (a 400 is deterministic on the body), and failing outright is worse
+                    // than it looks: the content is already committed to the session, so every
+                    // later request carries it and dies the same way, leaving the session
+                    // unusable. Strip the non-text content appended since the last accepted request
+                    // and try once more, telling the model what happened via the tool result it is
+                    // already equipped to read.
+                    Err(MekaError::InvalidRequest(message))
+                        if repairs_used < MAX_REQUEST_REPAIRS =>
+                    {
+                        let suspect_start = match self
+                            .last_accepted_len
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            LAST_ACCEPTED_UNKNOWN => suspect_floor,
+                            accepted => accepted.min(messages.len()),
+                        };
+                        let Some(degraded) = degrade_rejected_content(
+                            &messages.as_slice()[suspect_start..],
+                            &message,
+                        ) else {
+                            // Nothing to strip, so this is not a content problem: a `max_tokens`
+                            // over the model's ceiling, an unknown header, a bad `tool_choice`.
+                            break 'turn Err(MekaError::InvalidRequest(message));
+                        };
+                        repairs_used += 1;
+                        let replaced_count = messages.len() - suspect_start;
+                        tracing::warn!(
+                            "provider rejected the request; degrading {} message(s) appended since \
+                             the last accepted one and retrying ({})",
+                            replaced_count,
+                            message,
+                        );
+                        self.frontend
+                            .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
+                                format!(
+                                    "provider rejected content in this turn; retrying without it: \
+                                     {}",
+                                    elide_reason(&message)
+                                ),
+                            )))
+                            .await;
+                        pending_repair = Some(messages.replace_tail(replaced_count, degraded));
+                        base_messages = Arc::from(truncate_messages_for_context(
+                            messages.as_slice(),
+                            self.options.context_messages,
+                        ));
+                        turn_start_len = messages.len();
                         continue;
                     }
                     Err(error) => break 'turn Err(error),
                 };
+
+                // The provider accepted this body, so everything in it is known-good and only what
+                // comes after can be blamed for a later rejection.
+                self.last_accepted_len
+                    .store(sent_len, std::sync::atomic::Ordering::Relaxed);
 
                 // Total of all tiers including output = everything in context as of this exchange,
                 // which is what the next request re-sends (minus the new user prompt). Summing the
@@ -870,6 +999,19 @@ impl Agent {
                         break 'turn Err(error);
                     }
                     user_saved = true;
+                }
+
+                // Persist the repair this response just vindicated, after the user message is
+                // guaranteed on disk and before anything else is appended. `Event::Repair` replaces
+                // the *trailing* messages on replay, so any row written between the messages it
+                // repairs and the repair itself would be swallowed instead.
+                if let Some(event) = pending_repair.take()
+                    && let Err(error) = self.session_manager.save_event(sid, &event).await
+                {
+                    // The in-memory conversation is repaired either way, so this turn still
+                    // completes; the cost is that a resume re-reads the rejected content and pays
+                    // one more round trip to heal it again.
+                    tracing::warn!("failed to persist content repair: {}", error);
                 }
 
                 if cancellation.is_cancelled() {
@@ -1723,6 +1865,12 @@ impl Agent {
         // in-memory log doesn't grow unbounded across repeated compactions.
         messages.prune_compacted_events();
 
+        // Compaction rewrites the conversation, so a length recorded against the old one no longer
+        // identifies any particular message. Cleared here rather than at the call sites so
+        // `/compact` and both auto-compact paths are covered by construction.
+        self.last_accepted_len
+            .store(LAST_ACCEPTED_UNKNOWN, std::sync::atomic::Ordering::Relaxed);
+
         // The model's view of which files it has read is reset by the summary; drop the
         // read-tracker so `edit_file` re-reads rather than trusting a pre-compaction read (also
         // bounds its growth).
@@ -1821,6 +1969,90 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
     content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// How much of the provider's rejection text is carried into the conversation. Long enough to keep
+/// the specific complaint (Anthropic's runs to about 150 characters), short enough that a provider
+/// echoing the request body back can't flood the window.
+const REJECTION_REASON_LIMIT: usize = 600;
+
+/// Rewrite `messages` so nothing the provider can refuse on content grounds survives, replacing
+/// every non-text block with a note carrying `reason`. Returns `None` when there was nothing to
+/// rewrite, which the caller treats as "this rejection isn't about content, don't retry".
+///
+/// Structure is preserved rather than pruned. A `tool_use` whose result is dropped would be an
+/// orphan the provider rejects in a *new* way, and dropping the `tool_use` itself is worse still:
+/// the tool has already run, side effects and all, so erasing the record invites the model to run
+/// it again. Instead the `tool_result` keeps its `tool_use_id` and is marked `is_error`, which is
+/// exactly the shape meka already uses for a tool that failed outright, so the model needs no new
+/// concept to understand it and no frontend needs new rendering.
+fn degrade_rejected_content(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
+    let reason = elide_reason(reason);
+    let mut changed = false;
+    let degraded: Vec<Message> = messages
+        .iter()
+        .map(|message| {
+            let content = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } if content
+                        .iter()
+                        .any(|item| !matches!(item, ToolResultContent::Text { .. })) =>
+                    {
+                        changed = true;
+                        let mut kept: Vec<ToolResultContent> = content
+                            .iter()
+                            .filter(|item| matches!(item, ToolResultContent::Text { .. }))
+                            .cloned()
+                            .collect();
+                        kept.push(ToolResultContent::Text {
+                            text: format!(
+                                "[meka] The provider refused this tool result, so its non-text \
+                                 content was removed to keep the conversation usable: {}. Do not \
+                                 repeat this call unchanged.",
+                                reason
+                            ),
+                        });
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: kept,
+                            is_error: true,
+                        }
+                    }
+                    ContentBlock::Image { .. } => {
+                        changed = true;
+                        ContentBlock::Text {
+                            text: format!(
+                                "[meka] An image attached to this message was removed because the \
+                                 provider refused it: {}.",
+                                reason
+                            ),
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Message {
+                role: message.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    changed.then_some(degraded)
+}
+
+fn elide_reason(reason: &str) -> String {
+    if reason.chars().count() <= REJECTION_REASON_LIMIT {
+        return reason.to_string();
+    }
+    let kept: String = reason.chars().take(REJECTION_REASON_LIMIT).collect();
+    format!("{}…", kept)
 }
 
 /// Whether a failed provider call should be retried, and if so, after how long. Pure and
@@ -2052,11 +2284,394 @@ mod tests {
     use super::*;
     use crate::provider::ToolResultContent;
 
+    /// Minimal in-memory agent driving `provider`: no tools, no skills, no memories, silent
+    /// frontend. Enough to exercise `run_turn`'s recovery arms, which touch none of that.
+    async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
+        let session_manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("in-memory db");
+        let options = AgentOptions {
+            streaming: true,
+            sandboxed_shell: false,
+            context_messages: None,
+            auto_compact: false,
+            context_window: 0,
+            user_instructions: None,
+            mcp_grace: std::time::Duration::from_secs(0),
+            system_prompt_override: Some("test".to_string()),
+        };
+        let agent = Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(),
+            session_manager.clone(),
+            SharedPermission::new(
+                crate::permission::Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            options,
+            crate::tools::todo::SharedTodoList::default(),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            crate::skills::SkillCache::disabled(),
+            crate::memory::MemoryCache::disabled(),
+            Arc::new(crate::frontend::SilentFrontend),
+            Arc::new(RwLock::new(std::env::temp_dir())),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(crate::stats::SessionStats::default()),
+        );
+        (agent, session_manager)
+    }
+
+    fn image_source() -> ImageSource {
+        ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        }
+    }
+
+    const REJECTION: &str = "API returned status 400 Bad Request: the image was specified using \
+                             the image/png media type, but the image appears to be a image/jpeg \
+                             image";
+
+    /// The whole point of the feature: a rejection of content meka just appended must not end the
+    /// turn, and the repair must be persisted so a resume doesn't walk back into it.
+    #[tokio::test]
+    async fn test_run_turn_degrades_rejected_content_and_continues() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "I could not see that image.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn recovers instead of dying");
+        assert_eq!(outcome, TurnOutcome::EndTurn);
+
+        // The image is gone from the live conversation, replaced by an explanation.
+        let user = &messages.as_slice()[0];
+        assert!(
+            user.content
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the refused image must not survive in the conversation"
+        );
+        assert!(
+            user.text_content().contains("image/jpeg"),
+            "carries the reason"
+        );
+
+        // And it is gone on disk too, or the next resume would re-poison the session.
+        let sid = session_id.expect("session created");
+        let reloaded =
+            Conversation::from_events(session_manager.load_events(sid).await.expect("load events"));
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the repair must be persisted, not just applied in memory"
+        );
+    }
+
+    /// A rejection that degrading doesn't fix must cost one round trip and nothing else.
+    #[tokio::test]
+    async fn test_run_turn_restores_content_when_the_repair_does_not_help() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("both attempts were refused");
+        assert!(
+            matches!(&error, MekaError::InvalidRequest(message) if message.contains("image/jpeg")),
+            "the provider's own error surfaces, not one about the repair: {error}"
+        );
+
+        assert!(
+            messages.as_slice()[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "a repair that didn't help must leave the conversation untouched"
+        );
+        assert!(
+            !messages
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::conversation::Event::Repair { .. })),
+            "and must leave no repair behind in the log"
+        );
+    }
+
+    /// `/rewind` shortens the conversation behind a live agent, which invalidates the length the
+    /// recovery measures its suspect window back from. Left stale, that length lands at or past the
+    /// end of the shortened conversation, the window comes out empty, and the recovery silently
+    /// never fires again for the rest of the session.
+    #[tokio::test]
+    async fn test_recovery_still_fires_after_the_conversation_is_rewound() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let text_round = |text: &str| {
+            vec![
+                MockEvent::Text {
+                    text: text.to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("first answer"),
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            text_round("second answer, without the image"),
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "first".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first turn succeeds");
+
+        assert!(messages.rewind(1).is_some(), "the turn is rewound away");
+        agent.reset_conversation_markers().await;
+
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the recovery must still fire on a rewound conversation");
+        assert!(
+            messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the refused image should have been degraded away"
+        );
+    }
+
+    /// A 400 that isn't about content (`max_tokens` over the ceiling, a bad header) has nothing to
+    /// degrade, so it must fail immediately rather than spend a retry.
+    #[tokio::test]
+    async fn test_run_turn_does_not_retry_a_rejection_with_nothing_to_degrade() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: "max_tokens: 999999 > 8192, the maximum for this model".to_string(),
+            }],
+            // Reaching this round would mean a retry was spent on an unrepairable request.
+            vec![
+                MockEvent::Text {
+                    text: "should never run".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "plain text only".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing to repair, so the turn fails");
+        assert!(matches!(error, MekaError::InvalidRequest(_)), "{error}");
+    }
+
     fn retryable_error() -> MekaError {
         MekaError::RetryableProvider {
             message: "overloaded".to_string(),
             retry_after: None,
         }
+    }
+
+    fn tool_result_with_image(tool_use_id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![
+                    ToolResultContent::Text {
+                        text: "[Image: smoketest.png]".to_string(),
+                    },
+                    ToolResultContent::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: "QUJD".to_string(),
+                        },
+                    },
+                ],
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_degrade_rejected_content_replaces_the_image_and_keeps_the_pairing() {
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "smoketest.png"}),
+            }],
+        };
+        let degraded = degrade_rejected_content(
+            &[assistant, tool_result_with_image("call_1")],
+            "the image appears to be a image/jpeg image",
+        )
+        .expect("there was non-text content to degrade");
+
+        assert_eq!(degraded.len(), 2, "the message count must not change");
+        // The tool_use survives: the tool already ran, so erasing the record would invite a rerun.
+        assert!(matches!(
+            &degraded[0].content[0],
+            ContentBlock::ToolUse { id, .. } if id == "call_1"
+        ));
+        match &degraded[1].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call_1", "the pairing must survive");
+                assert!(is_error, "the model has to see this as a failed call");
+                assert!(
+                    content
+                        .iter()
+                        .all(|item| matches!(item, ToolResultContent::Text { .. })),
+                    "no non-text content may remain"
+                );
+                let text: String = content
+                    .iter()
+                    .map(|item| match item {
+                        ToolResultContent::Text { text } => text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                assert!(
+                    text.contains("[Image: smoketest.png]"),
+                    "keeps the text: {text}"
+                );
+                assert!(text.contains("image/jpeg"), "carries the reason: {text}");
+                assert!(
+                    text.contains("Do not repeat this call unchanged"),
+                    "tells the model not to loop: {text}"
+                );
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_degrade_rejected_content_replaces_a_user_input_image() {
+        let attached = Message::user_with_images("look at this".to_string(), vec![ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        }]);
+        let degraded = degrade_rejected_content(&[attached], "refused").expect("degraded");
+        assert!(
+            degraded[0]
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Text { .. }))
+        );
+    }
+
+    /// The signal that a rejection is *not* about content, which is what stops the loop from
+    /// spending a retry on a `max_tokens` or bad-header error.
+    #[test]
+    fn test_degrade_rejected_content_reports_nothing_to_do_for_text_only() {
+        let messages = vec![
+            Message::user("plain text"),
+            Message::assistant_text("also plain"),
+        ];
+        assert!(degrade_rejected_content(&messages, "refused").is_none());
+        assert!(degrade_rejected_content(&[], "refused").is_none());
+    }
+
+    #[test]
+    fn test_elide_reason_caps_a_provider_echoing_the_request_body() {
+        let long = "x".repeat(REJECTION_REASON_LIMIT * 2);
+        let elided = elide_reason(&long);
+        assert_eq!(elided.chars().count(), REJECTION_REASON_LIMIT + 1);
+        assert!(elided.ends_with('…'));
+        assert_eq!(elide_reason("short"), "short");
+    }
+
+    /// Multi-byte input must not be sliced mid-character.
+    #[test]
+    fn test_elide_reason_respects_char_boundaries() {
+        let long = "é".repeat(REJECTION_REASON_LIMIT + 10);
+        assert_eq!(
+            elide_reason(&long).chars().count(),
+            REJECTION_REASON_LIMIT + 1
+        );
     }
 
     #[test]

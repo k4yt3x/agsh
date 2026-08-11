@@ -593,36 +593,68 @@ fn convert_tool_result_content(
                 text_buf.push_str(&text_content.text);
             }
             rmcp::model::ContentBlock::Image(image) => {
-                let mime_ok = ALLOWED_IMAGE_MIME_TYPES
-                    .iter()
-                    .any(|allowed| image.mime_type.eq_ignore_ascii_case(allowed));
-                let size_ok = image.data.len() <= MAX_MCP_IMAGE_BYTES;
-                if !mime_ok {
-                    if !text_buf.is_empty() {
-                        text_buf.push('\n');
-                    }
-                    text_buf.push_str(&format!(
-                        "[image suppressed: mime type '{}' not in allow-list]",
-                        image.mime_type
-                    ));
-                } else if !size_ok {
-                    if !text_buf.is_empty() {
-                        text_buf.push('\n');
-                    }
-                    text_buf.push_str(&format!(
-                        "[image suppressed: {} base64 bytes exceeds {} byte limit]",
+                // The server's declared `mime_type` is a hint; what gets forwarded is decided by
+                // the bytes. Providers sniff and reject a mismatch with a 400, and that rejection
+                // lands inside a `tool_result` already committed to the session, where it fails
+                // every later request. Only the first few characters are decoded, so this costs
+                // nothing on a multi-megabyte payload.
+                let sniffed = match crate::image::classify_base64_prefix(&image.data) {
+                    crate::image::ImageHandling::PassThrough(format) => Some(format.to_mime_type()),
+                    // A format needing transcoding (TIFF, ICO, ...) would mean decoding and
+                    // re-encoding the whole payload, which is not worth it for a server that
+                    // mislabelled its own output.
+                    _ => None,
+                }
+                .filter(|mime| {
+                    ALLOWED_IMAGE_MIME_TYPES
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(mime))
+                });
+                // Two ceilings, and both matter. `MAX_MCP_IMAGE_BYTES` is meka's own memory and
+                // quota guard. The second is the providers' limit, which every other image
+                // producer gets for free by going through `prepare_image_payload`; this path
+                // builds its `ImageSource` directly, so without it an MCP image between the two
+                // ceilings is forwarded only for the provider to answer 400. Base64 carries 3
+                // bytes per 4 characters, which is exact enough to compare against a cap.
+                let decoded_len = image.data.len() / 4 * 3;
+                let oversize = if image.data.len() > MAX_MCP_IMAGE_BYTES {
+                    Some(format!(
+                        "{} base64 bytes exceeds {} byte limit",
                         image.data.len(),
                         MAX_MCP_IMAGE_BYTES
-                    ));
+                    ))
+                } else if decoded_len > crate::image::MAX_IMAGE_RAW_BYTES {
+                    Some(format!(
+                        "~{} decoded bytes exceeds the {} byte ceiling providers accept",
+                        decoded_len,
+                        crate::image::MAX_IMAGE_RAW_BYTES
+                    ))
                 } else {
+                    None
+                };
+                if let Some(reason) = oversize {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(&format!("[image suppressed: {}]", reason));
+                } else if let Some(media_type) = sniffed {
                     flush_text(&mut text_buf, &mut blocks);
                     blocks.push(ToolResultContent::Image {
                         source: ImageSource {
                             source_type: "base64".to_string(),
-                            media_type: image.mime_type.clone(),
+                            media_type: media_type.to_string(),
                             data: image.data.clone(),
                         },
                     });
+                } else {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(&format!(
+                        "[image suppressed: declared '{}', but the bytes are not an allowed image \
+                         format]",
+                        image.mime_type
+                    ));
                 }
             }
             rmcp::model::ContentBlock::Audio(audio) => {
@@ -687,7 +719,27 @@ fn convert_tool_result_content(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
+
+    /// Base64 of a real 4x4 image in `format`. The handler classifies from the bytes now, so a
+    /// placeholder string is no longer a usable fixture for the accept path.
+    fn base64_image(format: image::ImageFormat) -> String {
+        let mut bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        // JPEG has no alpha channel, so it needs an RGB source.
+        if format == image::ImageFormat::Jpeg {
+            image::RgbImage::from_pixel(4, 4, image::Rgb([128, 64, 200]))
+                .write_to(&mut cursor, format)
+                .expect("encode");
+        } else {
+            image::RgbaImage::from_pixel(4, 4, image::Rgba([128, 64, 200, 255]))
+                .write_to(&mut cursor, format)
+                .expect("encode");
+        }
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
 
     #[test]
     fn test_convert_tool_result_content_text_only() {
@@ -706,21 +758,59 @@ mod tests {
     #[test]
     fn test_convert_tool_result_content_image_passthrough() {
         use rmcp::model::ContentBlock;
-        let items = vec![ContentBlock::image("BASE64DATA", "image/png")];
+        let data = base64_image(image::ImageFormat::Png);
+        let items = vec![ContentBlock::image(data.clone(), "image/png")];
         let blocks = convert_tool_result_content(&items);
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             crate::provider::ToolResultContent::Image { source } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type, "image/png");
-                assert_eq!(source.data, "BASE64DATA");
+                assert_eq!(source.data, data);
             }
             other => panic!("expected Image, got {:?}", other),
         }
     }
 
+    /// The bug this whole path guards: a server that declares one format and sends another. The
+    /// declared type must not reach the provider, which sniffs and answers 400.
     #[test]
-    fn test_convert_tool_result_content_image_rejects_disallowed_mime() {
+    fn test_convert_tool_result_content_image_media_type_comes_from_bytes() {
+        use rmcp::model::ContentBlock;
+        let items = vec![ContentBlock::image(
+            base64_image(image::ImageFormat::Jpeg),
+            "image/png",
+        )];
+        let blocks = convert_tool_result_content(&items);
+        match &blocks[0] {
+            crate::provider::ToolResultContent::Image { source } => {
+                assert_eq!(source.media_type, "image/jpeg");
+            }
+            other => panic!("expected Image, got {:?}", other),
+        }
+    }
+
+    /// The allow-list applies to what the bytes actually are. BMP decodes fine but isn't a format
+    /// we forward, so a real BMP is suppressed no matter what the server called it.
+    #[test]
+    fn test_convert_tool_result_content_image_rejects_disallowed_format() {
+        use rmcp::model::ContentBlock;
+        let items = vec![ContentBlock::image(
+            base64_image(image::ImageFormat::Bmp),
+            "image/png",
+        )];
+        let blocks = convert_tool_result_content(&items);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            crate::provider::ToolResultContent::Text { text } => {
+                assert!(text.contains("image suppressed"), "{}", text);
+            }
+            other => panic!("expected Text placeholder, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_tool_result_content_image_rejects_non_image_bytes() {
         use rmcp::model::ContentBlock;
         let items = vec![ContentBlock::image("BASE64DATA", "image/svg+xml")];
         let blocks = convert_tool_result_content(&items);
@@ -750,12 +840,32 @@ mod tests {
         }
     }
 
+    /// Between meka's own memory guard and the ceiling providers accept there used to be a band
+    /// where an MCP image was forwarded purely so the provider could answer 400.
+    #[test]
+    fn test_convert_tool_result_content_image_rejects_over_the_provider_ceiling() {
+        use rmcp::model::ContentBlock;
+        // Comfortably over the provider ceiling, comfortably under meka's own cap.
+        let base64_len = crate::image::MAX_IMAGE_RAW_BYTES / 3 * 4 + 4096;
+        assert!(base64_len < MAX_MCP_IMAGE_BYTES, "must sit between the two");
+        let items = vec![ContentBlock::image("A".repeat(base64_len), "image/png")];
+        let blocks = convert_tool_result_content(&items);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            crate::provider::ToolResultContent::Text { text } => {
+                assert!(text.contains("image suppressed"), "{}", text);
+                assert!(text.contains("providers accept"), "{}", text);
+            }
+            other => panic!("expected Text placeholder, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_convert_tool_result_content_mixed_keeps_ordering() {
         use rmcp::model::ContentBlock;
         let items = vec![
             ContentBlock::text("before"),
-            ContentBlock::image("IMG", "image/png"),
+            ContentBlock::image(base64_image(image::ImageFormat::Png), "image/png"),
             ContentBlock::text("after"),
         ];
         let blocks = convert_tool_result_content(&items);

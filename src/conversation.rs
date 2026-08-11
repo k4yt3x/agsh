@@ -1,10 +1,12 @@
 //! [`Conversation`]: append-only-by-default newtype for the agent's conversation.
 //!
 //! Built on an event log: each mutation pushes one or more [`Event`]s, and the materialized
-//! `&[Message]` view consumed by providers and the scanner is derived from those events. The three
-//! legitimate destructive operations ([`Conversation::pop_unsaved`],
-//! [`Conversation::replace_for_compaction`], [`Conversation::sanitize_orphans`]) remain explicit,
-//! named methods; the compiler refuses casual mutation.
+//! `&[Message]` view consumed by providers and the scanner is derived from those events. Every
+//! destructive operation ([`Conversation::pop_unsaved`], [`Conversation::replace_for_compaction`],
+//! [`Conversation::replace_tail`], [`Conversation::pop_repair`], [`Conversation::rewind`],
+//! [`Conversation::sanitize_orphans`]) remains an explicit, named method; the compiler refuses
+//! casual mutation. The one exception is [`repair_invalid_images`], which runs on every
+//! materialization because a rebuild must not be able to reinstate content the provider refuses.
 //!
 //! On disk, events are stored row-per-event in the existing `messages` table (no schema migration);
 //! the encoding lives in `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers,
@@ -32,6 +34,18 @@ pub enum Event {
         replaced_count: usize,
         loaded_tools_snapshot: HashSet<String>,
     },
+    /// Replaces the last `replaced_count` materialized messages with `messages`. An empty
+    /// `messages` therefore means "drop them", which is what [`Conversation::rewind`] emits.
+    ///
+    /// Position-relative rather than index-addressed, deliberately: like
+    /// [`Self::CompactBoundary`] it replays correctly no matter what precedes it, so
+    /// [`Conversation::sanitize_orphans`] removing an earlier event can't silently retarget it.
+    /// The corollary is an invariant on producers: emit it only while the messages it replaces are
+    /// still the trailing materialized entries.
+    Repair {
+        replaced_count: usize,
+        messages: Vec<Message>,
+    },
 }
 
 /// Append-only conversation. Public API matches PR 1's `Vec<Message>`-backed implementation
@@ -39,9 +53,12 @@ pub enum Event {
 #[derive(Debug, Default, Clone)]
 pub struct Conversation {
     events: Vec<Event>,
-    /// Materialized view kept in lockstep with `events`. Rebuilt by `materialize_into` after every
-    /// mutation; reads are zero-cost.
+    /// Materialized view kept in lockstep with `events`. Rebuilt by `rebuild_materialized` after
+    /// every mutation; reads are zero-cost.
     materialized: Vec<Message>,
+    /// Images replaced since the last full rebuild, for
+    /// [`Conversation::invalid_images_replaced`].
+    invalid_images_replaced: usize,
 }
 
 impl Conversation {
@@ -54,7 +71,7 @@ impl Conversation {
     pub fn from_events(events: Vec<Event>) -> Self {
         let mut log = Self {
             events,
-            materialized: Vec::new(),
+            ..Self::default()
         };
         log.rebuild_materialized();
         log
@@ -77,6 +94,12 @@ impl Conversation {
     pub fn append(&mut self, message: Message) {
         self.materialized.push(message.clone());
         self.events.push(Event::Append(message));
+        // Pushed straight onto the view rather than going through `rebuild_materialized`, so the
+        // repair has to be applied to the new tail explicitly or an appended block would be the one
+        // thing materialization never checks.
+        if let Some(tail) = self.materialized.last_mut() {
+            self.invalid_images_replaced += repair_invalid_images(std::slice::from_mut(tail));
+        }
     }
 
     /// Read-only borrow of the materialized view. Providers and the scanner
@@ -166,6 +189,69 @@ impl Conversation {
         let _ = summary;
     }
 
+    /// Replace the trailing `replaced_count` materialized messages with `messages`, appending one
+    /// [`Event::Repair`]. Returns that event so the caller can persist it; the log is only ever
+    /// appended to, so the originals stay in memory and on disk for `meka session export`.
+    ///
+    /// Used by `Agent::run_turn` when the provider rejects content it has just appended, and by
+    /// [`Self::rewind`] with an empty `messages`. Callers must satisfy [`Event::Repair`]'s
+    /// invariant: the replaced messages have to be the current tail.
+    pub fn replace_tail(&mut self, replaced_count: usize, messages: Vec<Message>) -> Event {
+        let event = Event::Repair {
+            replaced_count,
+            messages,
+        };
+        self.events.push(event.clone());
+        self.rebuild_materialized();
+        event
+    }
+
+    /// Undo the most recent [`Self::replace_tail`], restoring the messages it replaced.
+    ///
+    /// The inverse of [`Self::pop_unsaved`] for repairs: `run_turn` degrades content, retries, and
+    /// calls this when the retry fails too, so a misdiagnosed rejection leaves the conversation
+    /// byte-identical instead of permanently losing a good tool result. Returns whether anything
+    /// was undone; a trailing event that isn't a `Repair` is left alone.
+    pub fn pop_repair(&mut self) -> bool {
+        if !matches!(self.events.last(), Some(Event::Repair { .. })) {
+            return false;
+        }
+        self.events.pop();
+        self.rebuild_materialized();
+        true
+    }
+
+    /// Drop the last `turns` user turns and everything after them, as one [`Event::Repair`] with an
+    /// empty replacement. Returns the event to persist, or `None` when there is nothing to drop.
+    ///
+    /// The cut snaps to a message that opens a turn (a `User` message carrying no `tool_result`),
+    /// the same boundary `compute_compaction_split` uses, so a `tool_use` is never separated from
+    /// its `tool_result`. A compaction summary is a plain `User` message and so counts as one such
+    /// boundary: rewinding far enough past a compaction discards the summary too, which is right
+    /// (it stands in for the turns before it) but means a big `turns` can empty a compacted session
+    /// faster than the turn count suggests.
+    pub fn rewind(&mut self, turns: usize) -> Option<Event> {
+        if turns == 0 {
+            return None;
+        }
+        let opens_turn = |message: &Message| {
+            message.role == Role::User
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        };
+        let cut = self
+            .materialized
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| opens_turn(message))
+            .map(|(index, _)| index)
+            .nth_back(turns - 1)?;
+        let replaced_count = self.materialized.len() - cut;
+        Some(self.replace_tail(replaced_count, Vec::new()))
+    }
+
     /// Drop every event preceding the most recent `CompactBoundary`.
     ///
     /// Those events are fully superseded: a `CompactBoundary` truncates all materialized messages
@@ -220,6 +306,15 @@ impl Conversation {
         dropped
     }
 
+    /// How many images have been replaced because their bytes disagreed with their declared
+    /// `media_type`: reset by each full rebuild, then added to by each [`Self::append`]. See
+    /// [`repair_invalid_images`] for why that is done at all; callers use this only to log it at
+    /// resume, where it is read straight after [`Self::from_events`] and so counts exactly the
+    /// images the stored log carried.
+    pub fn invalid_images_replaced(&self) -> usize {
+        self.invalid_images_replaced
+    }
+
     fn rebuild_materialized(&mut self) {
         self.materialized.clear();
         for event in &self.events {
@@ -234,9 +329,82 @@ impl Conversation {
                     self.materialized.truncate(truncate_to);
                     self.materialized.push(summary.clone());
                 }
+                Event::Repair {
+                    replaced_count,
+                    messages,
+                } => {
+                    let truncate_to = self.materialized.len().saturating_sub(*replaced_count);
+                    self.materialized.truncate(truncate_to);
+                    self.materialized.extend(messages.iter().cloned());
+                }
+            }
+        }
+        self.invalid_images_replaced = repair_invalid_images(&mut self.materialized);
+    }
+}
+
+/// Replace every image whose bytes disagree with its declared `media_type` with a text note,
+/// returning how many were replaced.
+///
+/// Providers sniff and answer 400 on a mismatch, and because the block is already committed to the
+/// session that 400 repeats on every later request, leaving it unusable. `Agent::run_turn` recovers
+/// from a rejection it causes itself, but not from one already on disk: by then the block is
+/// outside the window a rejection is allowed to blame. Handling it here heals such a session on the
+/// next resume with no provider round trip at all.
+///
+/// Applied to the materialized view during every rebuild rather than as a one-shot pass, so a later
+/// compaction or rewind can't quietly reinstate what it removed. Only the first few base64
+/// characters of each image are decoded, so the cost is a fixed handful of bytes per image.
+fn repair_invalid_images(messages: &mut [Message]) -> usize {
+    let mismatched = |source: &crate::provider::ImageSource| {
+        match crate::image::classify_base64_prefix(&source.data) {
+            // Undecodable bytes aren't evidence of a mismatch: an encoding this build can't read
+            // may still be one the provider accepts.
+            crate::image::ImageHandling::Unsupported => false,
+            crate::image::ImageHandling::PassThrough(format)
+            | crate::image::ImageHandling::Convert(format) => !format
+                .to_mime_type()
+                .eq_ignore_ascii_case(&source.media_type),
+        }
+    };
+    let note = |source: &crate::provider::ImageSource| {
+        format!(
+            "[meka] An image here was removed: it is declared {} but the bytes are something else, \
+             which the provider refuses.",
+            source.media_type
+        )
+    };
+
+    let mut replaced = 0usize;
+    for message in messages {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::Image { source } if mismatched(source) => {
+                    replaced += 1;
+                    *block = ContentBlock::Text { text: note(source) };
+                }
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let mut touched = false;
+                    for item in content.iter_mut() {
+                        if let crate::provider::ToolResultContent::Image { source } = item
+                            && mismatched(source)
+                        {
+                            replaced += 1;
+                            touched = true;
+                            *item = crate::provider::ToolResultContent::Text { text: note(source) };
+                        }
+                    }
+                    if touched {
+                        *is_error = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
+    replaced
 }
 
 impl<'a> IntoIterator for &'a Conversation {
@@ -257,22 +425,34 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
     // report orphan event indices, not just materialized indices. Skip the "previous Append is
     // gone" case (the event was truncated by a CompactBoundary) since the materialized view never
     // sees that orphan.
-    let mut pairs: Vec<(usize, &Message)> = Vec::new();
+    //
+    // The index is `None` for messages that don't come from an `Append` event (a repair's
+    // replacement). They still take part in the adjacency scan, since a `tool_result` inside one
+    // answers the `tool_use` before it, but they can't be removed.
+    let mut pairs: Vec<(Option<usize>, &Message)> = Vec::new();
     for (idx, event) in events.iter().enumerate() {
         match event {
-            Event::Append(message) => pairs.push((idx, message)),
+            Event::Append(message) => pairs.push((Some(idx), message)),
             Event::CompactBoundary { replaced_count, .. } => {
                 let truncate_to = pairs.len().saturating_sub(*replaced_count);
                 pairs.truncate(truncate_to);
-                // The synthetic summary is not a real Append event, so we don't push a (idx, …)
-                // pair for it; sanitization only removes Append events anyway.
+            }
+            Event::Repair {
+                replaced_count,
+                messages,
+            } => {
+                let truncate_to = pairs.len().saturating_sub(*replaced_count);
+                pairs.truncate(truncate_to);
+                pairs.extend(messages.iter().map(|message| (None, message)));
             }
         }
     }
 
     let mut orphan = Vec::new();
     for window_idx in 0..pairs.len() {
-        let (event_idx, message) = pairs[window_idx];
+        let (Some(event_idx), message) = pairs[window_idx] else {
+            continue;
+        };
         if message.role != Role::Assistant {
             continue;
         }
@@ -326,32 +506,47 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut pending: HashMap<String, String> = HashMap::new();
 
+    let absorb = |message: &Message,
+                  pending: &mut HashMap<String, String>,
+                  seen: &mut HashSet<String>,
+                  loaded: &mut Vec<String>| {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input }
+                    if name == crate::tools::LOAD_TOOL_NAME =>
+                {
+                    if let Some(loaded_name) = input.get("name").and_then(|v| v.as_str()) {
+                        pending.insert(id.clone(), loaded_name.to_string());
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(loaded_name) = pending.remove(tool_use_id)
+                        && !is_error
+                        && seen.insert(loaded_name.clone())
+                    {
+                        loaded.push(loaded_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
     for event in events {
         match event {
-            Event::Append(message) => {
-                for block in &message.content {
-                    match block {
-                        ContentBlock::ToolUse { id, name, input }
-                            if name == crate::tools::LOAD_TOOL_NAME =>
-                        {
-                            if let Some(loaded_name) = input.get("name").and_then(|v| v.as_str()) {
-                                pending.insert(id.clone(), loaded_name.to_string());
-                            }
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            is_error,
-                            ..
-                        } => {
-                            if let Some(loaded_name) = pending.remove(tool_use_id)
-                                && !is_error
-                                && seen.insert(loaded_name.clone())
-                            {
-                                loaded.push(loaded_name);
-                            }
-                        }
-                        _ => {}
-                    }
+            Event::Append(message) => absorb(message, &mut pending, &mut seen, &mut loaded),
+            // A repair never *un*-loads a tool: the array is a cache prefix that may only grow, and
+            // rewinding past a `load_tool` would drop an entry from its middle and re-cache the
+            // whole conversation behind it. Pending uses inside the replaced window are dropped the
+            // same way a boundary drops them, since their results are gone from the view.
+            Event::Repair { messages, .. } => {
+                pending.clear();
+                for message in messages {
+                    absorb(message, &mut pending, &mut seen, &mut loaded);
                 }
             }
             Event::CompactBoundary {
@@ -520,6 +715,257 @@ mod tests {
     fn test_message_log_pop_unsaved_on_empty() {
         let mut log = Conversation::new();
         assert!(log.pop_unsaved().is_none());
+    }
+
+    #[test]
+    fn test_replace_tail_swaps_the_trailing_messages() {
+        let mut log = Conversation::new();
+        log.append(Message::user("kept"));
+        log.append(assistant_with_tool_use("call_1"));
+        log.append(user_with_tool_result("call_1"));
+
+        log.replace_tail(2, vec![
+            Message::assistant_text("degraded assistant"),
+            Message::user("degraded result"),
+        ]);
+
+        let view = log.as_slice();
+        assert_eq!(view.len(), 3);
+        assert_eq!(view[0].text_content(), "kept");
+        assert_eq!(view[1].text_content(), "degraded assistant");
+        assert_eq!(view[2].text_content(), "degraded result");
+    }
+
+    /// A failed repair has to leave nothing behind, or a misdiagnosed rejection would permanently
+    /// cost a good tool result.
+    #[test]
+    fn test_pop_repair_restores_the_originals_exactly() {
+        let mut log = Conversation::new();
+        log.append(Message::user("kept"));
+        log.append(assistant_with_tool_use("call_1"));
+        log.append(user_with_tool_result("call_1"));
+        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+
+        log.replace_tail(2, vec![Message::assistant_text("degraded")]);
+        assert_eq!(log.len(), 2);
+
+        assert!(log.pop_repair());
+        let after: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        assert_eq!(before, after);
+        // And the event log is clean, not carrying a repair that cancels another repair.
+        assert_eq!(log.events().len(), 3);
+    }
+
+    #[test]
+    fn test_pop_repair_ignores_a_non_repair_tail() {
+        let mut log = Conversation::new();
+        log.append(Message::user("only"));
+        assert!(!log.pop_repair());
+        assert_eq!(log.len(), 1);
+    }
+
+    /// A repair is position-relative, so removing an earlier event must not retarget it.
+    #[test]
+    fn test_repair_survives_orphan_sanitization_of_an_earlier_event() {
+        let mut log = Conversation::new();
+        log.append(Message::user("first"));
+        // Orphaned: no tool_result follows.
+        log.append(assistant_with_tool_use("orphan"));
+        log.append(Message::user("second"));
+        log.append(Message::assistant_text("rejected"));
+        log.replace_tail(1, vec![Message::assistant_text("degraded")]);
+
+        let dropped = log.sanitize_orphans();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(log.len(), 3);
+        assert_eq!(log.as_slice()[0].text_content(), "first");
+        assert_eq!(log.as_slice()[1].text_content(), "second");
+        assert_eq!(log.as_slice()[2].text_content(), "degraded");
+    }
+
+    fn base64_of(format: image::ImageFormat) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut bytes);
+        if format == image::ImageFormat::Jpeg {
+            image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3]))
+                .write_to(&mut cursor, format)
+                .expect("encode");
+        } else {
+            image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+                .write_to(&mut cursor, format)
+                .expect("encode");
+        }
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    fn image_block(data: String, media_type: &str) -> ContentBlock {
+        ContentBlock::Image {
+            source: crate::provider::ImageSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.to_string(),
+                data,
+            },
+        }
+    }
+
+    #[test]
+    fn test_materialization_replaces_a_mislabelled_image() {
+        let mut log = Conversation::new();
+        log.append(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "look".to_string(),
+                },
+                image_block(base64_of(image::ImageFormat::Jpeg), "image/png"),
+            ],
+        });
+
+        assert_eq!(log.invalid_images_replaced(), 1);
+        let content = &log.as_slice()[0].content;
+        assert!(
+            matches!(content[0], ContentBlock::Text { .. }),
+            "text is kept"
+        );
+        match &content[1] {
+            ContentBlock::Text { text } => assert!(text.contains("image/png"), "{text}"),
+            other => panic!("expected the image to become text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_materialization_marks_a_repaired_tool_result_as_an_error() {
+        let mut log = Conversation::new();
+        log.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![crate::provider::ToolResultContent::Image {
+                    source: crate::provider::ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: base64_of(image::ImageFormat::Jpeg),
+                    },
+                }],
+                is_error: false,
+            }],
+        });
+
+        assert_eq!(log.invalid_images_replaced(), 1);
+        match &log.as_slice()[0].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(is_error);
+                assert!(matches!(
+                    content[0],
+                    crate::provider::ToolResultContent::Text { .. }
+                ));
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    /// A correctly-labelled image, and one whose bytes this build simply can't identify, both have
+    /// to survive: the second may be a format the provider accepts and we don't decode.
+    #[test]
+    fn test_materialization_leaves_valid_and_unidentifiable_images_alone() {
+        let mut log = Conversation::new();
+        log.append(Message {
+            role: Role::User,
+            content: vec![
+                image_block(base64_of(image::ImageFormat::Png), "image/png"),
+                image_block("BASE64DATA".to_string(), "image/png"),
+            ],
+        });
+
+        assert_eq!(log.invalid_images_replaced(), 0);
+        assert!(
+            log.as_slice()[0]
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Image { .. }))
+        );
+    }
+
+    /// The repair lives in materialization, not in a one-shot pass, precisely so a later rebuild
+    /// can't quietly put the refused bytes back.
+    #[test]
+    fn test_materialization_repair_survives_a_later_rebuild() {
+        let mut log = Conversation::new();
+        log.append(Message::user("turn one"));
+        log.append(Message::assistant_text("answer one"));
+        log.append(Message {
+            role: Role::User,
+            content: vec![image_block(
+                base64_of(image::ImageFormat::Jpeg),
+                "image/png",
+            )],
+        });
+        log.append(Message::assistant_text("answer two"));
+
+        // Any operation that re-derives the view from the event log.
+        assert!(log.rewind(1).is_some());
+
+        assert!(
+            log.iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the mislabelled image must not come back"
+        );
+    }
+
+    #[test]
+    fn test_rewind_drops_whole_turns_and_snaps_to_a_user_boundary() {
+        let mut log = Conversation::new();
+        log.append(Message::user("turn one"));
+        log.append(Message::assistant_text("answer one"));
+        log.append(Message::user("turn two"));
+        log.append(assistant_with_tool_use("call_1"));
+        log.append(user_with_tool_result("call_1"));
+        log.append(Message::assistant_text("answer two"));
+
+        assert!(log.rewind(1).is_some());
+
+        let view = log.as_slice();
+        assert_eq!(
+            view.len(),
+            2,
+            "the whole second turn goes, results included"
+        );
+        assert_eq!(view[0].text_content(), "turn one");
+        assert_eq!(view[1].text_content(), "answer one");
+        assert!(
+            orphan_event_indices(log.events()).is_empty(),
+            "the cut must not separate a tool_use from its tool_result"
+        );
+    }
+
+    #[test]
+    fn test_rewind_past_the_start_returns_none() {
+        let mut log = Conversation::new();
+        log.append(Message::user("only turn"));
+        log.append(Message::assistant_text("answer"));
+
+        assert!(log.rewind(2).is_none(), "only one turn exists");
+        assert!(log.rewind(0).is_none());
+        assert_eq!(log.len(), 2, "a refused rewind leaves the log alone");
+    }
+
+    #[test]
+    fn test_rewind_all_turns_empties_the_view() {
+        let mut log = Conversation::new();
+        log.append(Message::user("turn one"));
+        log.append(Message::assistant_text("answer one"));
+        log.append(Message::user("turn two"));
+        log.append(Message::assistant_text("answer two"));
+
+        assert!(log.rewind(2).is_some());
+        assert!(log.is_empty());
     }
 
     #[test]

@@ -26,6 +26,15 @@ pub enum MekaError {
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
 
+    /// The provider rejected the request as malformed (HTTP 400 / 422 that isn't an overflow).
+    /// Deterministic on the request body, so retrying it unchanged is pointless; distinct from
+    /// [`Self::Provider`] so the agent loop can instead degrade the content it most recently
+    /// appended and retry once (see `Agent::run_turn`). Without that path a single rejected block
+    /// is permanent: it is already committed to the session, so every later request carries it and
+    /// fails the same way.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// A transient provider failure (HTTP 429, any 5xx including Anthropic's 529 "overloaded", or a
     /// mid-stream `overloaded_error`/`rate_limit_error`/`api_error` SSE event) that is safe to
     /// retry with backoff. Distinct from [`Self::Provider`] so the agent loop can retry by type
@@ -90,11 +99,17 @@ pub type Result<T> = std::result::Result<T, MekaError>;
 /// Classify a provider HTTP failure response: map context-window overflows to
 /// [`MekaError::ContextOverflow`] (so the agent loop can compact-and-retry once), transient
 /// failures (429, any 5xx including Anthropic's 529 "overloaded") to
-/// [`MekaError::RetryableProvider`] (so the agent loop can retry with backoff), and everything else
-/// to [`MekaError::Provider`]. Anthropic returns HTTP 400 `invalid_request_error` with "prompt is
-/// too long"; OpenAI returns 400 `context_length_exceeded` (or 413). The overflow check is matched
-/// on the body (a bare 400 is shared with many unrelated errors) and takes priority over the status
-/// code so it can't be shadowed by an unrelated retryable status.
+/// [`MekaError::RetryableProvider`] (so the agent loop can retry with backoff), malformed requests
+/// (400 / 422) to [`MekaError::InvalidRequest`] (so the agent loop can degrade-and-retry once), and
+/// everything else to [`MekaError::Provider`]. Anthropic returns HTTP 400 `invalid_request_error`
+/// with "prompt is too long"; OpenAI returns 400 `context_length_exceeded` (or 413). The overflow
+/// check is matched on the body (a bare 400 is shared with many unrelated errors) and takes
+/// priority over the status code so it can't be shadowed by an unrelated retryable status.
+///
+/// The 400 / 422 bucket deliberately makes no attempt to tell a content problem from a parameter
+/// problem: a `max_tokens` above the model's ceiling, an unknown beta header and a mislabelled
+/// image all arrive in the same shape. The agent loop restores what it degraded when the retry also
+/// fails, so classifying too broadly here costs one round trip and destroys nothing.
 pub(crate) fn provider_http_error(
     status: reqwest::StatusCode,
     body: &str,
@@ -115,6 +130,10 @@ pub(crate) fn provider_http_error(
             message,
             retry_after,
         }
+    } else if status == reqwest::StatusCode::BAD_REQUEST
+        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    {
+        MekaError::InvalidRequest(message)
     } else {
         MekaError::Provider(message)
     }
@@ -189,6 +208,7 @@ mod tests {
 
     #[test]
     fn test_provider_http_error_maps_other_as_provider() {
+        // Nothing the agent loop can repair: the credentials or the endpoint are wrong.
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::UNAUTHORIZED,
@@ -197,14 +217,39 @@ mod tests {
             ),
             MekaError::Provider(_)
         ));
-        // 404 / 422 are permanent client errors, not retryable.
         assert!(matches!(
             provider_http_error(reqwest::StatusCode::NOT_FOUND, "not found", None),
             MekaError::Provider(_)
         ));
+    }
+
+    #[test]
+    fn test_provider_http_error_maps_malformed_request() {
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"type":"invalid_request_error","message":"messages.34.content.0.tool_result.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image"}}"#,
+                None,
+            ),
+            MekaError::InvalidRequest(_)
+        ));
         assert!(matches!(
             provider_http_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, "invalid", None),
-            MekaError::Provider(_)
+            MekaError::InvalidRequest(_)
+        ));
+    }
+
+    /// An overflow also arrives as a 400 `invalid_request_error`, and compacting is the right
+    /// response to it rather than degrading content.
+    #[test]
+    fn test_provider_http_error_overflow_takes_priority_over_invalid_request() {
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+                None,
+            ),
+            MekaError::ContextOverflow(_)
         ));
     }
 
