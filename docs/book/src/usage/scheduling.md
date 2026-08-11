@@ -76,17 +76,22 @@ rely on one:
 |------|-------|-------|
 | `meka serve` | Every job, always | Revives evicted sessions on demand. **The durable path.** |
 | REPL | Only jobs for the session it has open | Best-effort; a job goes dormant if you next start a different session |
-| ACP | **Never** | Can create jobs, but runs no scheduler of its own |
+| ACP | Only jobs for sessions the editor has open | The prompt appears in the transcript as the turn that triggered the reply |
 | `--oneshot` | Never | The process exits; jobs stay on disk for a later run |
 
 If you want a job to fire reliably whether or not you are sitting at a terminal, run `meka serve`.
 In the REPL, a job created in one session resumes only when that session does; `meka --continue`
 picks up where you left off.
 
-Jobs all live in the same database, so a host that does not fire a job has not lost it. A job
-created from an editor over ACP fires as soon as something that *does* run a scheduler picks it up,
-which in practice means a `meka serve` daemon pointed at the same data directory. Without one, an
-ACP-created job simply waits.
+Jobs all live in the same database, so a host that does not fire a job has not lost it. A job whose
+session nobody has open simply waits, and fires as soon as something that can run it picks it up:
+another host, or a `meka serve` daemon pointed at the same data directory. Two hosts sharing a
+session do not fight over its jobs either, because a host that cannot take one hands the occurrence
+back rather than spending it.
+
+Under ACP the editor is a live client, which changes one thing: `ask`-mode approvals genuinely
+round-trip, so a scheduled job can prompt you in the editor rather than being denied for want of
+anybody to ask. Stopping a scheduled turn works the same as stopping any other.
 
 When a job fires at an idle REPL prompt, the turn interrupts the prompt and runs exactly like one
 you typed: output streams, Ctrl+C interrupts it, and anything you had half-typed is handed back
@@ -114,16 +119,18 @@ recurring, because the creating conversation's history is not replayed on every 
 result does not appear in that conversation. Isolated runs are ordinary sessions, so
 `meka session list` and `meka session export` can see them.
 
-**Only `meka serve` honours `isolated`.** The REPL has one agent and one conversation, so a job that
-asked for isolation runs in the current conversation there instead, with a warning saying so.
+**Only `meka serve` honours `isolated`.** The REPL and ACP each drive one conversation per session,
+so a job that asked for isolation runs in that conversation instead, with a warning saying so.
 
 ## Unattended turns and permissions
 
-A scheduled turn has no human on the other end. In `ask` permission mode, every approval prompt
-therefore resolves to **deny**, and the job fails to do whatever needed approval. The denial appears
-in the session transcript rather than anywhere louder, so a job created in `ask` mode that seems to
-do nothing is worth checking there first. Jobs created in `read` or `write` mode run at that level
-as normal.
+Under `meka serve` a scheduled turn has no human on the other end, so in `ask` permission mode every
+approval resolves to **deny** and the job fails to do whatever needed approval. The denial appears in
+the session transcript rather than anywhere louder, so a job in `ask` mode that seems to do nothing
+is worth checking there first.
+
+The REPL and ACP both have someone attached, so approvals reach them normally. Jobs created in
+`read` or `write` mode run at that level everywhere.
 
 ## Inspecting jobs
 

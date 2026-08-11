@@ -35,6 +35,7 @@
 //! flow through the parent session's editor UI.
 
 mod elicitation;
+mod schedule;
 
 use std::{
     path::PathBuf,
@@ -389,6 +390,19 @@ impl AcpFrontend {
     fn mark_transport_dead(&self) {
         self.transport_dead
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Show a scheduled job's prompt in the transcript, before the turn that answers it runs.
+    ///
+    /// Goes out as a `UserMessageChunk` rather than a notice because that is what it is: the turn
+    /// has a prompt, it just came from a timer instead of a keystroke. Without it the editor shows
+    /// a reply with nothing above it explaining the question.
+    pub(crate) fn push_scheduled_prompt(&self, wakeup: &crate::schedule::Wakeup) {
+        send_session_update(
+            &self.connection,
+            &self.session_id,
+            super::acp::schedule::scheduled_prompt_update(wakeup),
+        );
     }
 
     /// Push one `session/update` to the client, latching the transport as dead if it fails.
@@ -1718,6 +1732,16 @@ async fn slash_to_prompt_text(
     })
 }
 
+/// Aborts a background task when the value is dropped. `run_acp` has several exit paths, and a
+/// scheduler that outlived them would keep running turns against a connection nobody is reading.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Process-wide ACP server state. The outer `sessions` `RwLock` is held only for map insert /
 /// lookup / remove; per-session mutable state lives behind each entry's inner `Mutex` so a
 /// long-running prompt on one session never blocks operations on another.
@@ -1759,6 +1783,18 @@ struct SessionEntry {
     /// session row. Without this, a second `meka` process could attach to the same id.
     #[allow(dead_code)]
     session_lock: Arc<crate::session::SessionLock>,
+}
+
+impl SessionEntry {
+    /// Install the cancellation token for a turn this session is about to run, so `session/cancel`
+    /// reaches it. Mirrors what the prompt handler does; a scheduled turn needs it for the same
+    /// reason, and without it the editor's stop button would do nothing.
+    fn publish_cancellation(&self, token: CancellationToken) {
+        match self.cancellation.write() {
+            Ok(mut slot) => *slot = token,
+            Err(poisoned) => *poisoned.into_inner() = token,
+        }
+    }
 }
 
 /// Per-session state held under `SessionEntry.runtime`. Held inside a `Mutex` because
@@ -1964,6 +2000,11 @@ pub async fn run_acp(
         transport_dead,
         vision,
     });
+
+    // Fires jobs for whichever sessions the editor currently has open; see `acp::schedule`. Aborted
+    // on the way out so a scheduled turn cannot outlive the connection it would report to.
+    let scheduler_handle = schedule::spawn(Arc::clone(&state));
+    let _scheduler_guard = AbortOnDrop(scheduler_handle);
 
     // Observe stdin EOF so the connection shuts down when the client disconnects (or the parent
     // dies). The connection future does not resolve on idle EOF by itself, so wrap the incoming

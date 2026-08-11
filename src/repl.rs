@@ -880,6 +880,10 @@ pub fn run_repl(
             // one the user typed: it streams, Ctrl+C reaches it, and the absent prompt is what
             // reads as "busy". The buffer is whatever the user had half-typed, restored below.
             Ok(Signal::ExternalBreak(buffer)) => {
+                // The prompt line is closed on the agent side, not here, because only that side
+                // knows whether a job actually fires: a wake can be spurious when another process
+                // claims the job first, and a blank line printed for a turn that never happens is
+                // a stray gap above the redrawn prompt. See `ReplEvent::ScheduledTurn` in `main`.
                 if input_sender.send(ReplEvent::ScheduledTurn).is_err() {
                     break;
                 }

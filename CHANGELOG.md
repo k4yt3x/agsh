@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `schedule_list` / `schedule_cancel` tools, `meka schedule list|cancel`, and `/schedule`.
 - Job gates: a shell command decides whether a due job spends a model turn, so polling is cheap.
 - `[schedule]` config for the poll interval, missed-job grace, gate timeout, and per-session cap.
+- Scheduled jobs fire under `meka serve`, the REPL, and ACP; `serve` is the durable host.
 
 ### Changed
 

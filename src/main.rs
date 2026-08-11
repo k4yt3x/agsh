@@ -1144,7 +1144,7 @@ async fn run_interactive(
                 if let Err(error) = crate::schedule::run_due(
                     &session_manager,
                     &config.schedule,
-                    scope,
+                    &scope,
                     &|wakeup: crate::schedule::Wakeup| {
                         if let Ok(mut collected) = fired.lock() {
                             collected.push(wakeup);
@@ -1161,6 +1161,20 @@ async fn run_interactive(
                 let fired = fired
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Close the prompt line, once, and only if something is actually going to run.
+                //
+                // reedline moves the cursor below the input area on its way out of `read_line`
+                // (`move_cursor_to_end`), but only when it is genuinely exiting: the guard is
+                // `suspended_state.is_none()`, and the break path sets `suspended_state` precisely
+                // because the host is expected to print and come back. So unlike a submitted line,
+                // a scheduled wake leaves the cursor parked at the end of the prompt, and the
+                // turn's own `newline_after_prompt` blank gets spent terminating that line instead
+                // of producing a gap. Emitting the terminator here starts the turn at column zero
+                // of a fresh line, which is where a typed turn starts, so both `[display]` spacing
+                // settings mean the same thing either way.
+                if !fired.is_empty() {
+                    eprintln!();
+                }
                 for wakeup in fired {
                     // The REPL has one agent and one conversation, so an isolated job runs here
                     // like any other. Said out loud rather than silently downgraded: the tool

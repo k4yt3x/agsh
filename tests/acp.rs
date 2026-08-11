@@ -279,6 +279,33 @@ impl AcpTestHarness {
         })
     }
 
+    /// Drain every `session/update` for `sid` that meka has already emitted, with no prompt
+    /// outstanding.
+    ///
+    /// Every other update helper is keyed to a pending `session/prompt`; a scheduled turn has none,
+    /// which is the property under test. Termination comes from a `session/list` sent afterwards:
+    /// stdio preserves order, so its response cannot arrive before the notifications queued ahead
+    /// of it, and waiting on a reply meka is guaranteed to send means a regression fails the
+    /// test instead of blocking the suite on a `read_line` that never returns.
+    fn drain_unsolicited_updates(&mut self, sid: &str) -> Vec<serde_json::Value> {
+        let id = self.send_request("session/list", serde_json::json!({}));
+        let needle = format!("\"id\":{}", id);
+        let sid_owned = sid.to_string();
+        let lines = read_until_with_dispatch(
+            &mut self.reader,
+            &mut self.stdin,
+            self.deadline,
+            |_| None,
+            |line| response_matches(line, &needle),
+        );
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["method"] == "session/update")
+            .filter(|value| value["params"]["sessionId"] == sid_owned)
+            .collect()
+    }
+
     /// Collect every `session/update` notification for `sid` plus the eventual response for `id`.
     /// Captures everything the agent emits during a prompt turn, which is the single most reused
     /// pattern in the existing test file. Side-channel meka-issued requests are silently ignored;
@@ -5401,5 +5428,94 @@ fn acp_session_fork_rejects_bad_input() {
         relative_root["error"]["code"], -32602,
         "expected invalid_params for a relative additional root; got: {}",
         relative_root,
+    );
+}
+
+const ACP_SCHEDULE_CONFIG: &str = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "write"
+enabled = ["read", "write"]
+
+[schedule]
+poll_interval = "1s"
+"#;
+
+/// A scheduled job fires in an ACP session and its turn reaches the editor unsolicited: no
+/// `session/prompt` is outstanding when the notifications arrive.
+///
+/// This is the property the whole ACP host rests on. Zed's `handle_session_notification` dispatches
+/// on session id with no in-flight-prompt check, so an agent-initiated turn renders; if that ever
+/// stopped being true the feature would run invisibly, and this test is what would notice.
+#[test]
+fn acp_scheduled_job_fires_without_a_prompt() {
+    let script = serde_json::json!([
+        // Turn 1: the agent schedules a one-shot two seconds out.
+        [
+            { "kind": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "kind": "tool_use_end", "input": {
+                "prompt": "ACP_DELIVERED_MARKER",
+                "at": "2s"
+            }},
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "scheduled" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        // Turn 2 is the fire. Nothing on the client side asks for it.
+        [
+            { "kind": "text", "text": "ACP_SCHEDULED_REPLY" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::builder()
+        .config(ACP_SCHEDULE_CONFIG)
+        .script(script)
+        .deadline(Duration::from_secs(45))
+        .build();
+
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&sid, id);
+
+    // Nothing is outstanding now: the prompt above has been answered. Anything that arrives from
+    // here is agent-initiated. The job is due in 2s and the scheduler ticks every 1s, so this waits
+    // past both before asking meka for anything.
+    std::thread::sleep(Duration::from_secs(6));
+    let updates = harness.drain_unsolicited_updates(&sid);
+
+    let text_of = |kind: &str| -> String {
+        updates
+            .iter()
+            .map(|update| &update["params"]["update"])
+            .filter(|update| update["sessionUpdate"] == kind)
+            .filter_map(|update| update["content"]["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    // The prompt is shown as a user message, so the transcript explains the reply rather than
+    // presenting an answer to a question the editor never saw asked.
+    let user_text = text_of("user_message_chunk");
+    assert!(
+        user_text.contains("ACP_DELIVERED_MARKER"),
+        "the job's prompt must be pushed as a user message; updates were:\n{:#?}",
+        updates,
+    );
+    assert!(
+        user_text.contains("Scheduled job"),
+        "and it must be marked as scheduled; updates were:\n{:#?}",
+        updates,
+    );
+
+    let agent_text = text_of("agent_message_chunk");
+    assert!(
+        agent_text.contains("ACP_SCHEDULED_REPLY"),
+        "the agent's reply to the scheduled turn must reach the client; updates were:\n{:#?}",
+        updates,
     );
 }

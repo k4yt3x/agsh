@@ -494,12 +494,29 @@ pub enum FireOutcome {
 /// The distinction is what makes `meka serve` the durable host and the REPL a best-effort one: the
 /// server can revive any session on demand and so owns every job, while a REPL can only run turns
 /// against the conversation it has open.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub enum SchedulerScope {
-    /// Every job in the database. `meka serve`.
+    /// Every job in the database. `meka serve`, which can revive any session on demand.
     AllSessions,
-    /// Only jobs belonging to this session. The REPL.
+    /// Only jobs belonging to this session. The REPL, which has exactly one conversation open.
     OneSession(uuid::Uuid),
+    /// Jobs the predicate accepts, re-asked every sweep. ACP, whose set of open sessions changes
+    /// as the editor sends `session/new` and `session/close`.
+    ///
+    /// Filtering here rather than letting the host decline afterwards is deliberate: `prepare`
+    /// evaluates a job's *gate* before the host sees it, so a scope that admitted everything would
+    /// run every gated job's shell command on every tick for sessions it could never serve.
+    Sessions(std::sync::Arc<dyn Fn(uuid::Uuid) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for SchedulerScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllSessions => formatter.write_str("AllSessions"),
+            Self::OneSession(id) => write!(formatter, "OneSession({})", id),
+            Self::Sessions(_) => formatter.write_str("Sessions(<predicate>)"),
+        }
+    }
 }
 
 impl SchedulerScope {
@@ -507,6 +524,7 @@ impl SchedulerScope {
         match self {
             Self::AllSessions => true,
             Self::OneSession(id) => job.session_id == *id,
+            Self::Sessions(predicate) => predicate(job.session_id),
         }
     }
 }
@@ -535,7 +553,7 @@ where
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(error) = run_due(&session_manager, &config, scope, &fire).await {
+            if let Err(error) = run_due(&session_manager, &config, &scope, &fire).await {
                 // A failed sweep must not end the loop: a transient database error would otherwise
                 // silently disable every scheduled job for the life of the process.
                 tracing::warn!("scheduler tick failed: {}", error);
@@ -552,7 +570,7 @@ where
 pub async fn run_due<Callback, Fired>(
     session_manager: &crate::session::SessionManager,
     config: &crate::config::ResolvedScheduleConfig,
-    scope: SchedulerScope,
+    scope: &SchedulerScope,
     fire: &Callback,
 ) -> crate::error::Result<()>
 where
@@ -983,7 +1001,7 @@ mod tests {
             run_due(
                 &self.manager,
                 &self.config,
-                SchedulerScope::AllSessions,
+                &SchedulerScope::AllSessions,
                 &move |wakeup: Wakeup| {
                     let fired = fired.clone();
                     async move {
@@ -1243,7 +1261,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            SchedulerScope::OneSession(uuid::Uuid::new_v4()),
+            &SchedulerScope::OneSession(uuid::Uuid::new_v4()),
             &move |wakeup: Wakeup| {
                 let fired = fired.clone();
                 async move {
@@ -1289,7 +1307,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            SchedulerScope::AllSessions,
+            &SchedulerScope::AllSessions,
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await
@@ -1333,7 +1351,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            SchedulerScope::AllSessions,
+            &SchedulerScope::AllSessions,
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await
@@ -1368,7 +1386,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            SchedulerScope::AllSessions,
+            &SchedulerScope::AllSessions,
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await

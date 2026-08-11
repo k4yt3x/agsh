@@ -111,6 +111,16 @@ async fn run_in_session(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunE
     // in turn, so this only ever delays the tick.
     let mut runtime = entry.runtime.lock().await;
 
+    // Publish the token so `POST /v1/sessions/{id}/cancel` reaches a scheduled turn. It reads
+    // `entry.cancellation` (`handlers::turn::cancel_turn`), so a turn that only held a shutdown
+    // child token could be stopped by killing the process and no other way.
+    let cancellation = state.shutdown.child_token();
+    {
+        let mut slot =
+            crate::server::poisoned::write(&entry.cancellation, "schedule::publish_cancellation");
+        *slot = cancellation.clone();
+    }
+
     let mut session_uuid = Some(runtime.session_uuid);
     let runtime_inner = &mut *runtime;
     let outcome = runtime_inner
@@ -120,7 +130,7 @@ async fn run_in_session(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunE
             &mut runtime_inner.messages,
             wakeup.render_prompt(),
             Vec::new(),
-            state.shutdown.child_token(),
+            cancellation,
         )
         .await;
     entry.touch();
