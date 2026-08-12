@@ -4953,6 +4953,9 @@ mod tests {
                 compact_at_percent: Some(80),
             }),
             &[],
+            // Likewise the resume notice: it heads the block, so it is the first thing
+            // `strip_context_tags` has to swallow rather than mistake for the user's prompt.
+            true,
         );
         format!("{}\n\n{}", block, user_input)
     }

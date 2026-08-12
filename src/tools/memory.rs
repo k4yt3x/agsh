@@ -62,8 +62,9 @@ impl Tool for MemoryWriteTool {
             description: "Save a durable note that outlives this session. Use when you learn \
                 something that will still matter in a later conversation: who someone is, how \
                 they want you to work, a standing decision, or where something external lives. \
-                Writing to a name that already exists replaces it, so this is also how you \
-                correct or refine an existing memory. Do not save what is derivable from the \
+                Writing to a name that already exists updates it, so this is also how you \
+                correct or refine an existing memory, or change just its priority: omit body and \
+                whatever the memory already said is kept. Do not save what is derivable from the \
                 code, git history, or the current conversation. The description is what you will \
                 see in every future session, so make it stand on its own."
                 .to_string(),
@@ -89,7 +90,9 @@ impl Tool for MemoryWriteTool {
                     },
                     "body": {
                         "type": "string",
-                        "description": "Optional detail, loaded only when memory_read is called"
+                        "description": "Optional detail, loaded only when memory_read is called. \
+                                        Omit it to leave an existing memory's body untouched; \
+                                        pass an empty string to clear it"
                     }
                 },
                 "required": ["name", "description"]
@@ -109,8 +112,19 @@ impl Tool for MemoryWriteTool {
     ) -> Result<ToolOutput> {
         let root = require_root(&self.memories, "memory_write")?;
         let name = require_str(&input, "name", "memory_write")?;
+        // Validated here as well as inside `write_memory`, because the existence check below joins
+        // the name onto the root and an unvalidated one would stat outside it. The same guard
+        // `memory_delete` applies, for the same reason.
+        memory::validate_memory_name(name).map_err(|message| MekaError::ToolExecution {
+            tool_name: "memory_write".to_string(),
+            message,
+        })?;
         let description = require_str(&input, "description", "memory_write")?;
-        let body = input["body"].as_str().unwrap_or("");
+        // An absent `body` means "leave it alone", not "make it empty". The schema has always
+        // marked the field optional, so the call that changes only a priority is one the tool
+        // invites -- and rendering the absence as `""` made that call silently delete everything
+        // the memory said. `Some("")` is still an explicit request to clear it.
+        let body = input.get("body").and_then(serde_json::Value::as_str);
         // Same clamp the frontmatter path uses, so a priority reaches the same value whether the
         // agent passed it here or a human typed it into the file. Reading it as `i64` matters:
         // `as_u64` would reject a negative outright, where the file path clamps it to 0.
@@ -125,6 +139,11 @@ impl Tool for MemoryWriteTool {
             }
         };
 
+        // Read before the write, since the write is what makes the file exist. Without this the
+        // confirmation would claim to have kept the body of a memory that had none, on the very
+        // call that created it.
+        let kept_existing_body = body.is_none() && memory::memory_file_in(&root, name).is_file();
+
         let path =
             memory::write_memory(&root, name, description, priority, body).map_err(|message| {
                 MekaError::ToolExecution {
@@ -136,9 +155,18 @@ impl Tool for MemoryWriteTool {
         tracing::info!("saved memory to {}", path.display());
         Ok(ToolOutput::text(
             format!(
-                "Saved memory '{}' (priority {}). It will appear in your memory index from the \
+                "Saved memory '{}' (priority {}){}. It will appear in your memory index from the \
                  next turn on.",
-                name, priority
+                name,
+                priority,
+                // Stated so the two calls are distinguishable from the result alone: a metadata
+                // update and a rewrite otherwise report identically, and the difference is the
+                // whole body of the note.
+                if kept_existing_body {
+                    ", keeping the existing body"
+                } else {
+                    ""
+                }
             ),
             false,
         ))
@@ -182,13 +210,24 @@ impl Tool for MemoryReadTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_read")?;
-        let memories = self.memories.current().await;
-        let entry = memories
+        let index = self.memories.current().await;
+        let entry = index
+            .memories
             .iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "memory_read".to_string(),
-                message: format!("no memory named '{}'", name),
+                // A name whose file exists but would not parse is reported as such. Answering "no
+                // memory named x" there sends the reader off to write the memory again, when what
+                // it needs to know is that its note is on disk, unread, and not in effect.
+                message: match index.skip_reason(name) {
+                    Some(reason) => format!(
+                        "memory '{}' is on disk but could not be read: {}. Until it is fixed it is \
+                         not in your index and nothing it says is in effect.",
+                        name, reason
+                    ),
+                    None => format!("no memory named '{}'", name),
+                },
             })?;
 
         let body =
@@ -256,11 +295,11 @@ impl Tool for MemorySearchTool {
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "memory_search")?;
         let regex = compile_user_regex(pattern, "memory_search")?;
-        let memories = self.memories.current().await;
+        let index = self.memories.current().await;
 
         let mut matches = Vec::new();
         let mut truncated = false;
-        for entry in memories.iter() {
+        for entry in index.memories.iter() {
             // Search the whole file, frontmatter included, so a hit on the description surfaces
             // even when the body says nothing.
             let content = match tokio::fs::read_to_string(&entry.path).await {
@@ -378,6 +417,148 @@ mod tests {
         MemoryCache::for_root(Some(root.to_path_buf()))
     }
 
+    fn output_text(output: &ToolOutput) -> String {
+        output
+            .content
+            .iter()
+            .map(|block| match block {
+                crate::provider::ToolResultContent::Text { text } => text.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// The reported failure, at the point it was felt: four files on disk and an agent told four
+    /// times that no memory by those names existed. "Not found" sends the reader off to write the
+    /// note again; what it needs to know is that its note is right there and unread.
+    #[tokio::test]
+    async fn test_read_explains_a_file_it_could_not_parse() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("mica-policy.md"), "no frontmatter here\n")
+            .expect("write broken memory");
+
+        let read = MemoryReadTool {
+            memories: cache_at(temp.path()),
+        };
+        let error = read
+            .execute(
+                serde_json::json!({"name": "mica-policy"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an unreadable memory must not read as absent");
+        let message = error.to_string();
+        assert!(message.contains("missing YAML frontmatter"), "{message}");
+        assert!(
+            message.contains("nothing it says is in effect"),
+            "{message}"
+        );
+
+        // A name with no file at all still gets the plain answer.
+        let error = read
+            .execute(
+                serde_json::json!({"name": "never-written"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("absent is still absent");
+        assert!(error.to_string().contains("no memory named"), "{error}");
+    }
+
+    /// `body` has always been optional, so a priority change is a call the schema invites. It used
+    /// to render the absence as an empty body and delete everything the memory said.
+    #[tokio::test]
+    async fn test_write_without_a_body_keeps_the_existing_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let memories = cache_at(temp.path());
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+
+        // Creating a memory without a body keeps nothing, and must not say it did.
+        let output = write
+            .execute(
+                serde_json::json!({"name": "bare", "description": "No body"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("create without a body");
+        assert!(
+            !output_text(&output).contains("keeping"),
+            "{}",
+            output_text(&output)
+        );
+
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "policy",
+                    "description": "How to reply",
+                    "body": "Always answer in kind."
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("initial write");
+
+        let output = write
+            .execute(
+                serde_json::json!({
+                    "name": "policy",
+                    "description": "How to reply",
+                    "priority": 0
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("metadata-only write");
+        // Said out loud, so the two calls are distinguishable from their results alone.
+        assert!(
+            output_text(&output).contains("keeping the existing body"),
+            "{}",
+            output_text(&output)
+        );
+
+        let read = MemoryReadTool { memories };
+        let output = read
+            .execute(
+                serde_json::json!({"name": "policy"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("read");
+        assert!(
+            output_text(&output).contains("Always answer in kind."),
+            "{}",
+            output_text(&output)
+        );
+
+        // Clearing is still possible; it just has to be asked for.
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "policy",
+                    "description": "How to reply",
+                    "body": ""
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("explicit clear");
+        let output = read
+            .execute(
+                serde_json::json!({"name": "policy"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("read");
+        assert!(
+            !output_text(&output).contains("Always answer in kind."),
+            "{}",
+            output_text(&output)
+        );
+    }
+
     #[tokio::test]
     async fn test_write_then_read_round_trip() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -444,6 +625,7 @@ mod tests {
         let found = memories.current().await;
         for (name, given, expected) in cases {
             let entry = found
+                .memories
                 .iter()
                 .find(|entry| entry.name == name)
                 .unwrap_or_else(|| panic!("'{name}' must have been written"));

@@ -38,6 +38,17 @@ meka -r 5               # likely ambiguous; meka lists matching IDs and exits
 
 When a prefix matches multiple sessions, meka prints the matching IDs (most-recent first) so you can disambiguate. Type a few more characters until the prefix is unique.
 
+### What a Resume Does Not Restore
+
+A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
+
+- **Which files have been read.** meka tracks reads in memory so `edit_file` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `read_file` first.
+- **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription — these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
+
+Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, todo list, tool catalogue), and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
+
+Because the second kind is unknowable from meka's side, the first turn after a resume carries a `[Session resumed]` note telling the agent to re-establish rather than assume. It appears once and is not repeated. There is nothing to configure.
+
 ## Session Locking
 
 Only one meka instance can be attached to a session at a time. This prevents race conditions from concurrent writes.

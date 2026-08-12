@@ -45,6 +45,53 @@ pub struct Memory {
     pub mtime: SystemTime,
 }
 
+/// A file in the memory root that discovery could not turn into a [`Memory`].
+///
+/// Recorded rather than only logged, because the log is not a channel the model can read. From
+/// inside a session a skipped file is indistinguishable from a memory nobody ever wrote: the index
+/// does not list it and `memory_read` reports it missing. That silence is the failure worth
+/// designing against, since it lets someone drop in a standing rule and believe it is in force for
+/// as long as it takes them to look at stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedMemory {
+    /// The file name as it appears on disk, e.g. `mica-policy.md`. A file name and not a memory
+    /// name: an unusable name is itself one of the reasons a file lands here, and in that case
+    /// there is no memory name to report.
+    pub file: String,
+    pub reason: String,
+}
+
+/// The outcome of one discovery pass: what parsed, and what did not.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryIndex {
+    /// Valid memories, in the order [`sort_for_index`] produced.
+    pub memories: Vec<Memory>,
+    /// Files that failed to parse, sorted by file name.
+    ///
+    /// Sorted because this reaches [`crate::context::WorldSnapshot`], which is compared by
+    /// equality to decide whether the model needs telling anything. `read_dir` yields in
+    /// filesystem order, so an unsorted list would re-announce the same skips at random.
+    pub skipped: Vec<SkippedMemory>,
+    /// How many valid memories the [`MAX_MEMORY_FILES`] cap dropped. Distinct from `skipped`:
+    /// these parsed fine and were discarded for volume.
+    pub ignored_over_cap: usize,
+}
+
+impl MemoryIndex {
+    /// Why the file a memory of this name would live in was rejected, if it was.
+    ///
+    /// Every lookup that is about to report a name as absent checks this first. "No such memory"
+    /// and "the file is right there and unreadable" call for opposite responses, and from the
+    /// outside the two are indistinguishable: both are simply a name that is not in the index.
+    pub fn skip_reason(&self, name: &str) -> Option<&str> {
+        let file = memory_file_name(name);
+        self.skipped
+            .iter()
+            .find(|skipped| skipped.file == file)
+            .map(|skipped| skipped.reason.as_str())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
     description: Option<String>,
@@ -67,11 +114,16 @@ pub fn memory_dir() -> Option<PathBuf> {
     crate::config::meka_config_dir().map(|dir| dir.join("memory"))
 }
 
-/// Resolve one memory's path inside `root`. The sole owner of the `<name>.md` layout convention,
-/// so changing it is a one-line edit rather than a grep. Performs no I/O and does not validate the
-/// name; callers pair it with [`validate_memory_name`].
+/// The file name one memory lives under. The sole owner of the `<name>.md` layout convention, so
+/// changing it is a one-line edit rather than a grep.
+fn memory_file_name(name: &str) -> String {
+    format!("{}.md", name)
+}
+
+/// Resolve one memory's path inside `root`. Performs no I/O and does not validate the name; callers
+/// pair it with [`validate_memory_name`].
 pub fn memory_file_in(root: &Path, name: &str) -> PathBuf {
-    root.join(format!("{}.md", name))
+    root.join(memory_file_name(name))
 }
 
 /// Validate that `name` is a safe filesystem-and-prompt-embeddable memory identifier. See
@@ -103,11 +155,11 @@ pub fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
     clamped as u8
 }
 
-/// Discover all valid memories in the user's memory directory. Returns an empty vec if the
+/// Discover all valid memories in the user's memory directory. Returns an empty index if the
 /// directory is missing or contains nothing valid.
-pub fn discover_memories() -> Vec<Memory> {
+pub fn discover_memories() -> MemoryIndex {
     let Some(root) = memory_dir() else {
-        return Vec::new();
+        return MemoryIndex::default();
     };
     discover_memories_in(&root)
 }
@@ -115,19 +167,24 @@ pub fn discover_memories() -> Vec<Memory> {
 /// Walk a memory root and parse every `*.md`. Emits `tracing::warn!` for each malformed entry and
 /// skips it, so one bad file never hides the rest of the store.
 ///
-/// Returned in index order: `priority` ascending (lower is more important), then newest first
-/// within a band, so a fresh note never outranks a standing rule merely for being recent.
-fn discover_memories_in(root: &Path) -> Vec<Memory> {
+/// Memories come back in index order: `priority` ascending (lower is more important), then newest
+/// first within a band, so a fresh note never outranks a standing rule merely for being recent.
+///
+/// Every skip is also *returned*, not just logged. See [`SkippedMemory`] for why the log alone was
+/// not enough.
+fn discover_memories_in(root: &Path) -> MemoryIndex {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MemoryIndex::default();
+        }
         Err(error) => {
             tracing::warn!("failed to read memory dir {}: {}", root.display(), error);
-            return Vec::new();
+            return MemoryIndex::default();
         }
     };
 
-    let mut memories = Vec::new();
+    let mut index = MemoryIndex::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -143,32 +200,46 @@ fn discover_memories_in(root: &Path) -> Vec<Memory> {
         let Some(name) = file_name.strip_suffix(".md") else {
             continue;
         };
-        if validate_memory_name(name).is_err() {
-            tracing::warn!("skipping memory file '{}': invalid name", file_name);
+        if let Err(reason) = validate_memory_name(name) {
+            tracing::warn!("skipping memory file '{}': {}", file_name, reason);
+            index.skipped.push(SkippedMemory {
+                file: file_name.to_string(),
+                reason,
+            });
             continue;
         }
 
         match load_memory_definition(name, &path) {
-            Ok(memory) => memories.push(memory),
-            Err(error) => tracing::warn!("skipping memory '{}': {}", name, error),
+            Ok(memory) => index.memories.push(memory),
+            Err(reason) => {
+                tracing::warn!("skipping memory '{}': {}", name, reason);
+                index.skipped.push(SkippedMemory {
+                    file: file_name.to_string(),
+                    reason,
+                });
+            }
         }
     }
 
     // Sort *before* applying the cap. `read_dir` yields in filesystem order, so truncating first
     // would keep an arbitrary subset - a priority-0 standing rule could be dropped while a
     // priority-9 note survived, which defeats the point of ranking them.
-    sort_for_index(&mut memories);
-    if memories.len() > MAX_MEMORY_FILES {
+    sort_for_index(&mut index.memories);
+    if index.memories.len() > MAX_MEMORY_FILES {
+        index.ignored_over_cap = index.memories.len() - MAX_MEMORY_FILES;
         tracing::warn!(
             "memory dir {} holds {} entries; keeping the {} highest-priority and ignoring {}",
             root.display(),
-            memories.len(),
+            index.memories.len(),
             MAX_MEMORY_FILES,
-            memories.len() - MAX_MEMORY_FILES
+            index.ignored_over_cap
         );
-        memories.truncate(MAX_MEMORY_FILES);
+        index.memories.truncate(MAX_MEMORY_FILES);
     }
-    memories
+    index
+        .skipped
+        .sort_by(|left, right| left.file.cmp(&right.file));
+    index
 }
 
 /// Order memories the way the context index presents them: priority ascending, then newest first,
@@ -264,7 +335,27 @@ pub fn render_memory(description: &str, priority: u8, body: &str) -> String {
     out
 }
 
+/// The body of an existing memory file, or `None` when there is nothing readable at `path`.
+///
+/// Falls back to the whole file when it carries no frontmatter, matching [`load_memory_body`]: such
+/// a file is a body somebody wrote without a header, and giving it one is a repair. Discarding the
+/// text instead would make a malformed memory worse the moment anyone tried to fix its metadata.
+fn existing_body(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(
+        split_frontmatter(&content)
+            .map(|(_, body)| body.to_string())
+            .unwrap_or(content),
+    )
+}
+
 /// Create or overwrite a memory. Returns the path written.
+///
+/// `body` of `None` means "leave whatever is there alone", which is what a metadata-only update is:
+/// a priority or description change should not cost the note its contents. Resolved here rather
+/// than at each call site so no writer can get it wrong, because getting it wrong is silent.
+/// `Some("")` is an explicit request to empty the body, and a `None` for a memory that does not
+/// exist yet writes an empty one.
 ///
 /// Validates the rendered file by parsing it back before it lands, so a description that would
 /// break the frontmatter (an unescaped colon, say) fails loudly at write time rather than silently
@@ -274,7 +365,7 @@ pub fn write_memory(
     name: &str,
     description: &str,
     priority: u8,
-    body: &str,
+    body: Option<&str>,
 ) -> Result<PathBuf, String> {
     validate_memory_name(name)?;
     if description.trim().is_empty() {
@@ -282,7 +373,11 @@ pub fn write_memory(
     }
 
     let path = memory_file_in(root, name);
-    let rendered = render_memory(description, priority, body);
+    let body = match body {
+        Some(body) => body.to_string(),
+        None => existing_body(&path).unwrap_or_default(),
+    };
+    let rendered = render_memory(description, priority, &body);
     parse_memory_definition(name, &path, SystemTime::now(), &rendered).map_err(|error| {
         format!("refusing to write a memory that would not parse back: {error}")
     })?;
@@ -365,7 +460,7 @@ pub struct MemoryCache {
 }
 
 struct CacheState {
-    memories: Arc<Vec<Memory>>,
+    index: Arc<MemoryIndex>,
     snapshot: BTreeMap<PathBuf, SystemTime>,
 }
 
@@ -377,18 +472,18 @@ impl MemoryCache {
 
     /// Construct a cache backed by a specific root. `None` produces a permanently-empty cache.
     pub fn for_root(root: Option<PathBuf>) -> Arc<Self> {
-        let (memories, snapshot) = match root.as_deref() {
+        let (index, snapshot) = match root.as_deref() {
             Some(root) => (
                 discover_memories_in(root),
                 disk_snapshot(root).unwrap_or_default(),
             ),
-            None => (Vec::new(), BTreeMap::new()),
+            None => (MemoryIndex::default(), BTreeMap::new()),
         };
         Arc::new(Self {
             root,
             enabled: true,
             state: Mutex::new(CacheState {
-                memories: Arc::new(memories),
+                index: Arc::new(index),
                 snapshot,
             }),
         })
@@ -401,7 +496,7 @@ impl MemoryCache {
             root: None,
             enabled: false,
             state: Mutex::new(CacheState {
-                memories: Arc::new(Vec::new()),
+                index: Arc::new(MemoryIndex::default()),
                 snapshot: BTreeMap::new(),
             }),
         })
@@ -412,11 +507,15 @@ impl MemoryCache {
         self.enabled
     }
 
-    /// Return the current memory list, re-discovering first if the on-disk snapshot changed since
-    /// the last call.
-    pub async fn current(&self) -> Arc<Vec<Memory>> {
+    /// Return the current index, re-discovering first if the on-disk snapshot changed since the
+    /// last call.
+    ///
+    /// One `Arc` covering both the memories and the skips, rather than a second accessor for the
+    /// latter: two lookups would each re-check the snapshot and could straddle a rediscovery,
+    /// leaving a caller reporting skips that no longer match the memories it listed.
+    pub async fn current(&self) -> Arc<MemoryIndex> {
         let Some(root) = self.root.clone() else {
-            return self.state.lock().await.memories.clone();
+            return self.state.lock().await.index.clone();
         };
         // Discovery touches the filesystem and runs on every prompt from the async agent loop, so
         // offload it to the blocking pool. Transient errors yield `None`; serve stale state rather
@@ -425,27 +524,27 @@ impl MemoryCache {
             let root = root.clone();
             match tokio::task::spawn_blocking(move || disk_snapshot(&root)).await {
                 Ok(Some(snapshot)) => snapshot,
-                _ => return self.state.lock().await.memories.clone(),
+                _ => return self.state.lock().await.index.clone(),
             }
         };
         if self.state.lock().await.snapshot == now {
-            return self.state.lock().await.memories.clone();
+            return self.state.lock().await.index.clone();
         }
         // Run discovery *without* holding the state lock so concurrent callers aren't blocked
         // behind the filesystem walk. A racing caller may discover in parallel; harmless, since
         // both results derive from disk and the last write wins.
         let discovered =
             match tokio::task::spawn_blocking(move || discover_memories_in(&root)).await {
-                Ok(memories) => memories,
+                Ok(index) => index,
                 Err(error) => {
                     tracing::warn!("memory discovery task failed: {}", error);
-                    return self.state.lock().await.memories.clone();
+                    return self.state.lock().await.index.clone();
                 }
             };
         let mut state = self.state.lock().await;
-        state.memories = Arc::new(discovered);
+        state.index = Arc::new(discovered);
         state.snapshot = now;
-        state.memories.clone()
+        state.index.clone()
     }
 
     /// The resolved root, for the tools and CLI that need to write into it.
@@ -482,11 +581,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         write_memory_file(temp.path(), "a-note", &frontmatter("A durable fact"));
 
-        let memories = discover_memories_in(temp.path());
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].name, "a-note");
-        assert_eq!(memories[0].description, "A durable fact");
-        assert_eq!(memories[0].priority, DEFAULT_PRIORITY);
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+        assert_eq!(index.memories[0].name, "a-note");
+        assert_eq!(index.memories[0].description, "A durable fact");
+        assert_eq!(index.memories[0].priority, DEFAULT_PRIORITY);
+        assert!(index.skipped.is_empty());
     }
 
     #[test]
@@ -496,9 +596,72 @@ mod tests {
         write_memory_file(temp.path(), "good", &frontmatter("fine"));
 
         // One malformed file must not hide the rest of the store.
-        let memories = discover_memories_in(temp.path());
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].name, "good");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+        assert_eq!(index.memories[0].name, "good");
+        assert_eq!(index.skipped.len(), 1);
+        assert_eq!(index.skipped[0].file, "bad.md");
+    }
+
+    /// The skip list is the whole point of recording rather than only logging: a file nobody can
+    /// read has to be nameable from inside a session, with the reason attached, or it is
+    /// indistinguishable from a memory that was never written.
+    #[test]
+    fn test_every_unreadable_file_is_named_with_its_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_memory_file(temp.path(), "no-frontmatter", "just prose, no header\n");
+        write_memory_file(
+            temp.path(),
+            "no-description",
+            "---\npriority: 1\n---\nBody\n",
+        );
+        write_memory_file(temp.path(), "bad-yaml", "---\ndescription: [\n---\n");
+        write_memory_file(temp.path(), "has space", &frontmatter("unusable name"));
+        write_memory_file(temp.path(), "fine", &frontmatter("ok"));
+
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+
+        // Sorted by file name, so the same store always renders the same section: `read_dir`
+        // order would otherwise re-announce these at random.
+        let files: Vec<&str> = index
+            .skipped
+            .iter()
+            .map(|skipped| skipped.file.as_str())
+            .collect();
+        assert_eq!(files, vec![
+            "bad-yaml.md",
+            "has space.md",
+            "no-description.md",
+            "no-frontmatter.md"
+        ]);
+
+        assert_eq!(
+            index.skip_reason("no-frontmatter"),
+            Some("missing YAML frontmatter")
+        );
+        assert_eq!(
+            index.skip_reason("no-description"),
+            Some("missing required field 'description'")
+        );
+        assert!(
+            index
+                .skip_reason("bad-yaml")
+                .is_some_and(|reason| reason.starts_with("invalid frontmatter")),
+            "{:?}",
+            index.skip_reason("bad-yaml")
+        );
+        // Disqualified by its name, so the reason has to come from name validation rather than
+        // from a parse that never ran.
+        assert!(
+            index
+                .skip_reason("has space")
+                .is_some_and(|reason| reason.contains("invalid character")),
+            "{:?}",
+            index.skip_reason("has space")
+        );
+        assert_eq!(index.skip_reason("fine"), None);
+        assert_eq!(index.skip_reason("never-existed"), None);
     }
 
     #[test]
@@ -508,9 +671,12 @@ mod tests {
         std::fs::write(temp.path().join("notes.txt"), "plain").expect("write txt");
         std::fs::write(temp.path().join(".hidden.md"), frontmatter("y")).expect("write dotfile");
 
-        let memories = discover_memories_in(temp.path());
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].name, "real");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+        assert_eq!(index.memories[0].name, "real");
+        // Neither is a memory that failed, so neither belongs in the skip list: reporting a
+        // `.DS_Store` as an unreadable memory would train the reader to ignore the section.
+        assert!(index.skipped.is_empty());
     }
 
     /// Without this check `memory_write` would be an arbitrary-file-write primitive, because the
@@ -569,6 +735,7 @@ mod tests {
         bump_mtime(&temp.path().join("new-default.md"));
 
         let names: Vec<String> = discover_memories_in(temp.path())
+            .memories
             .into_iter()
             .map(|memory| memory.name)
             .collect();
@@ -596,12 +763,15 @@ mod tests {
             );
         }
 
-        let memories = discover_memories_in(temp.path());
-        assert_eq!(memories.len(), MAX_MEMORY_FILES);
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), MAX_MEMORY_FILES);
         assert_eq!(
-            memories[0].name, "zzz-standing-rule",
+            index.memories[0].name, "zzz-standing-rule",
             "the highest-priority memory must survive the cap and lead the index"
         );
+        // Counted, not just logged: a store trimmed by the cap looks exactly like a store that
+        // small from inside a session.
+        assert_eq!(index.ignored_over_cap, 51);
     }
 
     /// A description is a single line by contract. Left to YAML, a newline would fold to a space
@@ -618,11 +788,11 @@ mod tests {
         // which would then be rendered mid-way through an index entry and break the one-line-per
         // -memory shape the `[Memory]` section and its budget both assume.
         let temp = tempfile::tempdir().expect("tempdir");
-        write_memory(temp.path(), "n", "para one\n\npara two", 5, "body").expect("write");
-        let memories = discover_memories_in(temp.path());
-        assert_eq!(memories[0].description, "para one para two");
+        write_memory(temp.path(), "n", "para one\n\npara two", 5, Some("body")).expect("write");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories[0].description, "para one para two");
         assert!(
-            !memories[0].description.contains('\n'),
+            !index.memories[0].description.contains('\n'),
             "a description must never carry a newline into the index"
         );
     }
@@ -652,9 +822,64 @@ mod tests {
     #[test]
     fn test_write_memory_rejects_bad_name_and_empty_description() {
         let temp = tempfile::tempdir().expect("tempdir");
-        assert!(write_memory(temp.path(), "../escape", "d", 5, "b").is_err());
-        assert!(write_memory(temp.path(), "ok", "   ", 5, "b").is_err());
-        assert!(write_memory(temp.path(), "ok", "d", 5, "b").is_ok());
+        assert!(write_memory(temp.path(), "../escape", "d", 5, Some("b")).is_err());
+        assert!(write_memory(temp.path(), "ok", "   ", 5, Some("b")).is_err());
+        assert!(write_memory(temp.path(), "ok", "d", 5, Some("b")).is_ok());
+    }
+
+    /// A metadata-only write must not cost the note its contents. `body` has always been optional,
+    /// so this is the call the API invites, and rendering the absence as an empty body made a
+    /// priority change silently delete everything the memory said.
+    #[test]
+    fn test_write_memory_keeps_an_omitted_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_memory(
+            temp.path(),
+            "note",
+            "first",
+            5,
+            Some("Detail worth keeping.\n"),
+        )
+        .expect("initial write");
+
+        write_memory(temp.path(), "note", "revised", 1, None).expect("metadata-only write");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories[0].description, "revised");
+        assert_eq!(index.memories[0].priority, 1);
+        let content =
+            std::fs::read_to_string(memory_file_in(temp.path(), "note")).expect("read back");
+        assert!(content.contains("Detail worth keeping."), "{content}");
+
+        // Clearing stays possible, just no longer the accident.
+        write_memory(temp.path(), "note", "revised", 1, Some("")).expect("explicit clear");
+        let content =
+            std::fs::read_to_string(memory_file_in(temp.path(), "note")).expect("read back");
+        assert!(!content.contains("Detail worth keeping."), "{content}");
+    }
+
+    /// An omitted body on a name with no file yet is a create, not a failure.
+    #[test]
+    fn test_write_memory_with_no_body_creates_an_empty_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_memory(temp.path(), "fresh", "d", 5, None).expect("write");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+        assert_eq!(index.memories[0].name, "fresh");
+    }
+
+    /// A file with no frontmatter is a body somebody wrote without a header. Giving it one repairs
+    /// it; discarding the text would make a broken memory worse the moment anyone tried to fix it.
+    #[test]
+    fn test_write_memory_adopts_a_frontmatterless_file_as_its_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_memory_file(temp.path(), "orphan", "Prose that never had a header.\n");
+
+        write_memory(temp.path(), "orphan", "now described", 5, None).expect("write");
+        let index = discover_memories_in(temp.path());
+        assert_eq!(index.memories.len(), 1);
+        assert!(index.skipped.is_empty(), "the repair must clear the skip");
+        let body = std::fs::read_to_string(memory_file_in(temp.path(), "orphan")).expect("read");
+        assert!(body.contains("Prose that never had a header."), "{body}");
     }
 
     #[test]
@@ -680,12 +905,12 @@ mod tests {
     async fn test_memory_cache_picks_up_new_memory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache = MemoryCache::for_root(Some(temp.path().to_path_buf()));
-        assert!(cache.current().await.is_empty());
+        assert!(cache.current().await.memories.is_empty());
 
         write_memory_file(temp.path(), "foo", &frontmatter("first"));
-        let memories = cache.current().await;
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].name, "foo");
+        let index = cache.current().await;
+        assert_eq!(index.memories.len(), 1);
+        assert_eq!(index.memories[0].name, "foo");
     }
 
     #[tokio::test]
@@ -693,13 +918,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         write_memory_file(temp.path(), "foo", &frontmatter("old"));
         let cache = MemoryCache::for_root(Some(temp.path().to_path_buf()));
-        assert_eq!(cache.current().await[0].description, "old");
+        assert_eq!(cache.current().await.memories[0].description, "old");
 
         let path = temp.path().join("foo.md");
         std::fs::write(&path, frontmatter("new")).expect("rewrite");
         bump_mtime(&path);
 
-        assert_eq!(cache.current().await[0].description, "new");
+        assert_eq!(cache.current().await.memories[0].description, "new");
+    }
+
+    /// A file that breaks after the cache was seeded has to reach the next reader. Discovery only
+    /// re-runs when the disk snapshot moves, so a skip recorded once and never revisited would go
+    /// unmentioned for the rest of the session.
+    #[tokio::test]
+    async fn test_memory_cache_picks_up_a_newly_broken_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_memory_file(temp.path(), "foo", &frontmatter("fine"));
+        let cache = MemoryCache::for_root(Some(temp.path().to_path_buf()));
+        assert!(cache.current().await.skipped.is_empty());
+
+        let path = temp.path().join("foo.md");
+        std::fs::write(&path, "someone deleted the frontmatter\n").expect("rewrite");
+        bump_mtime(&path);
+
+        let index = cache.current().await;
+        assert!(index.memories.is_empty());
+        assert_eq!(index.skip_reason("foo"), Some("missing YAML frontmatter"));
     }
 
     #[tokio::test]
@@ -707,10 +951,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         write_memory_file(temp.path(), "foo", &frontmatter("first"));
         let cache = MemoryCache::for_root(Some(temp.path().to_path_buf()));
-        assert_eq!(cache.current().await.len(), 1);
+        assert_eq!(cache.current().await.memories.len(), 1);
 
         std::fs::remove_file(temp.path().join("foo.md")).expect("rm");
-        assert!(cache.current().await.is_empty());
+        assert!(cache.current().await.memories.is_empty());
     }
 
     #[tokio::test]
@@ -728,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_cache_with_no_root_is_empty() {
         let cache = MemoryCache::for_root(None);
-        assert!(cache.current().await.is_empty());
+        assert!(cache.current().await.memories.is_empty());
         assert!(cache.root().is_none());
     }
 
@@ -740,8 +984,8 @@ mod tests {
             "foo",
             "---\ndescription: d\n---\nLine one\nLine two\n",
         );
-        let memories = discover_memories_in(temp.path());
-        let body = load_memory_body(&memories[0]).await.expect("body");
+        let index = discover_memories_in(temp.path());
+        let body = load_memory_body(&index.memories[0]).await.expect("body");
         assert_eq!(body, "Line one\nLine two\n");
     }
 }

@@ -39,6 +39,22 @@ chat replies, not to commit messages or documentation.
 
 Unknown keys are ignored, so extra metadata is harmless.
 
+### Files that cannot be read
+
+A file missing its frontmatter, missing `description`, or carrying a name outside `[A-Za-z0-9_-]` is not a memory, and discovery skips it. Skipped files are **named in the index**, with the reason:
+
+```
+2 files in your memory directory could not be read, so they are not in the
+index above and nothing they say is in effect:
+
+- **house-style.md**: missing YAML frontmatter
+- **tone.md**: missing required field 'description'
+```
+
+This is why the section renders even when nothing readable is saved. A store whose every file fails to parse would otherwise produce no `[Memory]` section at all, which reads as "memory is switched off" rather than "your notes are right there and unreadable" — and someone who drops a standing rule into the directory has no way to tell the two apart.
+
+`memory_read` on such a name says the same thing rather than reporting the memory as missing, as do `meka memory get` and `meka memory show`. `meka memory list` prints the skipped files after the table.
+
 ## Priority
 
 **Lower means more important** (the same direction as `nice`, the opposite of CSS `z-index`). Priority decides two things: where a memory sits in the index, and which memories survive when the index hits its size budget.
@@ -68,12 +84,14 @@ Nothing is lost: `memory_search` runs a regular expression over the full text of
 
 | Tool | Purpose |
 |---|---|
-| `memory_write` | Save a memory, or replace one by writing to the same name |
+| `memory_write` | Save a memory, or update one by writing to the same name |
 | `memory_read` | Load one memory's body in full |
 | `memory_search` | Regex over the full text of every memory |
 | `memory_delete` | Remove a memory permanently |
 
 `memory_read` states how old the memory is and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against.
+
+`memory_write`'s `body` is optional, and omitting it **keeps whatever the memory already said**. That makes a metadata-only update — a new priority, a reworded description — a single call that cannot cost the note its contents. To empty a body, pass `""` explicitly.
 
 ## What not to save
 

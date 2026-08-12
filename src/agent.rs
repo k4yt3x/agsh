@@ -715,7 +715,7 @@ impl Agent {
             let current = context::WorldSnapshot::new(
                 &catalogue,
                 skills.as_slice(),
-                memories.as_slice(),
+                &memories,
                 &mcp_instructions,
                 &scheduled,
             );
@@ -736,6 +736,11 @@ impl Agent {
             let previous = last.replace((current, messages.len()));
             (rendered, previous)
         };
+
+        // Taken before the block is built, since the block is where it lands. Sub-agents never see
+        // it: they run on a fresh conversation, so `from_events` never set it, and nothing in their
+        // history could be stale in the first place.
+        let resumed = messages.take_resumed_notice();
 
         let augmented_input = {
             let todos = self.todo_list.read().await;
@@ -758,6 +763,7 @@ impl Agent {
                         .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
                 }),
                 &background_tasks,
+                resumed,
             );
             format!("{}\n\n{}", block, user_input)
         };
@@ -1308,6 +1314,10 @@ impl Agent {
                 // snapshot back to what the model has actually seen. The next turn then re-renders
                 // the change rather than assuming it was already delivered.
                 *self.last_rendered_world.write().await = world_state_rollback;
+                // Same withdrawal for the resume notice, which rode that message and nothing else.
+                if resumed {
+                    messages.restore_resumed_notice();
+                }
             }
             _ => {}
         }
@@ -2769,6 +2779,174 @@ mod tests {
                 .flat_map(|message| message.content.iter())
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
             "the repair must be persisted, not just applied in memory"
+        );
+    }
+
+    /// A resumed conversation is told so, once. Its own history reads as proof that a tool call
+    /// happened, which is true, and as proof that the effect still holds, which a restart makes
+    /// false: the read tracker is gone and any MCP server has reconnected.
+    #[tokio::test]
+    async fn test_resumed_conversation_is_told_once() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let round = || {
+            vec![
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![round(), round(), round()]));
+        let (agent, session_manager) = test_agent(provider).await;
+
+        // A session with one real turn behind it, then reloaded the way a restart would.
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "first".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first turn");
+        assert!(
+            !messages.as_slice()[0]
+                .text_content()
+                .contains("[Session resumed]"),
+            "a session nobody resumed must not claim to have been"
+        );
+
+        let sid = session_id.expect("session created");
+        let mut resumed =
+            Conversation::from_events(session_manager.load_events(sid).await.expect("load events"));
+        let before = resumed.len();
+        agent
+            .run_turn(
+                &mut Some(sid),
+                &mut resumed,
+                "second".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn after resume");
+        assert!(
+            resumed.as_slice()[before]
+                .text_content()
+                .contains("[Session resumed]"),
+            "the first turn after a resume carries the notice"
+        );
+
+        let next = resumed.len();
+        agent
+            .run_turn(
+                &mut Some(sid),
+                &mut resumed,
+                "third".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("third turn");
+        assert!(
+            !resumed.as_slice()[next]
+                .text_content()
+                .contains("[Session resumed]"),
+            "and only that turn: repeating it every turn would make it scenery"
+        );
+    }
+
+    /// A first turn that fails still delivered the notice, because the user message carrying it is
+    /// persisted before the provider is called and so survives the failure. It must therefore not
+    /// be offered a second time on the retry. The withdrawal in the error arm is for the narrower
+    /// case where that save itself failed and the message is popped, which is exactly the pairing
+    /// `world_state_rollback` has beside it.
+    #[tokio::test]
+    async fn test_resume_notice_is_not_repeated_after_a_failed_turn() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            vec![MockEvent::FailInvalidRequest {
+                message: "nope".to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "first".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first turn");
+        let sid = session_id.expect("session created");
+
+        let mut resumed =
+            Conversation::from_events(session_manager.load_events(sid).await.expect("load events"));
+        assert!(
+            agent
+                .run_turn(
+                    &mut Some(sid),
+                    &mut resumed,
+                    "doomed".to_string(),
+                    Vec::new(),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "the fixture must actually fail"
+        );
+
+        assert!(
+            resumed
+                .iter()
+                .any(|message| message.text_content().contains("[Session resumed]")),
+            "the failed turn's user message is persisted, so the notice was delivered"
+        );
+
+        let before = resumed.len();
+        agent
+            .run_turn(
+                &mut Some(sid),
+                &mut resumed,
+                "retry".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("retry");
+        assert!(
+            !resumed.as_slice()[before]
+                .text_content()
+                .contains("[Session resumed]"),
+            "and having been delivered, it must not be said again"
         );
     }
 

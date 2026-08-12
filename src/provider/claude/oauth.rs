@@ -2236,6 +2236,7 @@ mod tests {
                 "",
                 None,
                 &[],
+                false,
             );
             format!("{}\n\n{}", block, "list files under /tmp")
         };
@@ -2258,6 +2259,7 @@ mod tests {
                 "",
                 None,
                 &[],
+                false,
             );
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
@@ -2366,6 +2368,7 @@ mod tests {
                 "",
                 None,
                 &[],
+                false,
             );
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
@@ -2515,12 +2518,13 @@ mod tests {
         );
 
         // ...and the change is announced in the block that gets appended instead.
+        let memories = crate::memory::MemoryIndex::default();
         let delta = crate::context::render_world_state(
-            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &[], &[], &[]),
+            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &memories, &[], &[]),
             Some(&crate::context::WorldSnapshot::new(
                 &before_catalogue,
                 &[],
-                &[],
+                &memories,
                 &[],
                 &[],
             )),

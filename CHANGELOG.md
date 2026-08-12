@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `[Memory]` index names memory files that could not be read, with the reason for each.
+- A resumed session tells the agent that state a tool held outside the conversation may be gone.
+
+### Fixed
+
+- `memory_write` without a `body` erased the memory's body; it now keeps what is there.
+- `memory_read` on a name whose file exists but will not parse reported it as never written.
+
 ## [0.39.0] - 2026-08-12
 
 ### Added

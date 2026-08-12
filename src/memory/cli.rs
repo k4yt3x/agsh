@@ -40,14 +40,19 @@ pub enum ListDetail {
 /// drift something you can see and rebalance rather than something you discover when the index
 /// stops being useful. That is a deliberate inspection, though, not what `/memory` is for.
 pub async fn run_list(detail: ListDetail) -> Result<()> {
-    let memories = memory::discover_memories();
-    if memories.is_empty() {
+    let index = memory::discover_memories();
+    if index.memories.is_empty() {
         println!("(no memories saved)");
+        // Deliberately after the "none saved" line rather than instead of it. A store whose files
+        // all fail to parse is exactly the case worth reporting, and an early return here would
+        // print "no memories saved" over the top of four unreadable ones.
+        report_unreadable(&index);
         return Ok(());
     }
 
     let now = std::time::SystemTime::now();
-    let rows: Vec<Vec<String>> = memories
+    let rows: Vec<Vec<String>> = index
+        .memories
         .iter()
         .map(|entry| {
             vec![
@@ -66,9 +71,10 @@ pub async fn run_list(detail: ListDetail) -> Result<()> {
 
     if detail == ListDetail::WithDistribution {
         println!();
-        println!("{} memories. Priority distribution:", memories.len());
+        println!("{} memories. Priority distribution:", index.memories.len());
         for priority in memory::MIN_PRIORITY..=memory::MAX_PRIORITY {
-            let count = memories
+            let count = index
+                .memories
                 .iter()
                 .filter(|entry| entry.priority == priority)
                 .count();
@@ -77,7 +83,42 @@ pub async fn run_list(detail: ListDetail) -> Result<()> {
             }
         }
     }
+
+    report_unreadable(&index);
     Ok(())
+}
+
+/// Name the files discovery could not read, after whatever listing preceded it.
+///
+/// The warnings for these already go out through `tracing`, but only at the moment discovery runs,
+/// which for a long-lived process is once. Someone asking what is in their store is asking exactly
+/// the question these answer.
+fn report_unreadable(index: &memory::MemoryIndex) {
+    if index.skipped.is_empty() && index.ignored_over_cap == 0 {
+        return;
+    }
+    if !index.skipped.is_empty() {
+        println!();
+        println!(
+            "{} file(s) in the memory directory could not be read:",
+            index.skipped.len()
+        );
+        for skipped in &index.skipped {
+            println!("  {}: {}", skipped.file, skipped.reason);
+        }
+        crate::render::render_hint(
+            "these are not in the index and the agent cannot read them; fix the frontmatter or \
+             remove the file",
+        );
+    }
+    if index.ignored_over_cap > 0 {
+        println!();
+        println!(
+            "{} further memories were ignored because the directory exceeds the discovery cap.",
+            index.ignored_over_cap
+        );
+        crate::render::render_hint("the lowest-priority entries are the ones dropped");
+    }
 }
 
 /// `meka memory get <name>`: frontmatter and on-disk facts as `key: value` lines.
@@ -143,7 +184,10 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
         )));
     }
 
-    let written = memory::write_memory(&root, args.name, args.description, priority, &body)
+    // `Some` even when no body was given: `add` reads as "write this memory", and `--force` on a
+    // name that already exists reads as replacing it. The tool's omit-to-keep semantics belong to
+    // an update, which is not what this command is.
+    let written = memory::write_memory(&root, args.name, args.description, priority, Some(&body))
         .map_err(MekaError::Config)?;
     tracing::info!("wrote memory to {}", written.display());
     Ok(())
@@ -164,7 +208,18 @@ pub async fn run_remove(name: &str) -> Result<()> {
 }
 
 fn require_memory(name: &str) -> Result<memory::Memory> {
-    memory::discover_memories()
+    let index = memory::discover_memories();
+    // A name whose file is present but unreadable is reported as such rather than as absent. The
+    // two need opposite responses -- write it, versus repair the file that is already there -- and
+    // "not found" points at the wrong one.
+    if let Some(reason) = index.skip_reason(name) {
+        return Err(MekaError::Config(format!(
+            "memory '{}' exists but could not be read: {}",
+            name, reason
+        )));
+    }
+    index
+        .memories
         .into_iter()
         .find(|entry| entry.name == name)
         .ok_or_else(|| MekaError::Config(format!("memory '{}' not found", name)))

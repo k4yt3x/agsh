@@ -59,6 +59,14 @@ pub struct Conversation {
     /// Images replaced since the last full rebuild, for
     /// [`Conversation::invalid_images_replaced`].
     invalid_images_replaced: usize,
+    /// Whether this log came off disk and the model has not been told yet.
+    ///
+    /// Set by [`Self::from_events`] and consumed once by [`Self::take_resumed_notice`]. Lives here
+    /// rather than on the agent because the conversation is the thing that was hydrated, and
+    /// hydration has four entry points (REPL resume, two ACP paths, serve reattach) that all reach
+    /// `from_events`. A flag set at those call sites instead would be a flag the fifth one
+    /// forgets.
+    resumed_undisclosed: bool,
 }
 
 impl Conversation {
@@ -74,6 +82,10 @@ impl Conversation {
             ..Self::default()
         };
         log.rebuild_materialized();
+        // Only when something was actually restored. Resuming a session that never got a turn
+        // leaves the model nothing to hold a stale belief about, and the notice would be a warning
+        // against trusting a history that does not exist.
+        log.resumed_undisclosed = !log.materialized.is_empty();
         log
     }
 
@@ -87,6 +99,26 @@ impl Conversation {
     /// Read the underlying event log (e.g. for persistence or scanning).
     pub fn events(&self) -> &[Event] {
         &self.events
+    }
+
+    /// Whether this turn is the first since the log was restored from disk, clearing the flag.
+    ///
+    /// Told once. The conversation the model reads back is a record of what happened, not proof
+    /// that any of it still holds: a tool that was holding something open across those turns has
+    /// been restarted along with the process, and nothing else in the context block says so
+    /// (permission, cwd, todos, and the tool catalogue are all restated every turn regardless).
+    pub fn take_resumed_notice(&mut self) -> bool {
+        std::mem::take(&mut self.resumed_undisclosed)
+    }
+
+    /// Put back a notice taken by a turn that then failed and had its user message popped.
+    ///
+    /// The notice rides that message and nothing else, so without this a resume whose first turn
+    /// errors is never told. Same withdrawal [`Agent::run_turn`] performs on the world snapshot.
+    ///
+    /// [`Agent::run_turn`]: crate::agent::Agent::run_turn
+    pub fn restore_resumed_notice(&mut self) {
+        self.resumed_undisclosed = true;
     }
 
     /// The only canonical mutation. Push a fully-formed message onto the log as a new
@@ -630,6 +662,29 @@ mod tests {
                 is_error,
             }],
         }
+    }
+
+    /// The flag tracks "came off disk with something in it", which is the only condition under
+    /// which the model can be holding a belief the restart invalidated.
+    #[test]
+    fn test_resumed_notice_is_set_only_by_hydration_and_taken_once() {
+        let mut hydrated = Conversation::from_events(vec![Event::Append(Message::user("earlier"))]);
+        assert!(hydrated.take_resumed_notice());
+        assert!(
+            !hydrated.take_resumed_notice(),
+            "saying it twice would make it scenery"
+        );
+
+        // Withdrawn by a turn that failed and popped its user message, and offered again after.
+        hydrated.restore_resumed_notice();
+        assert!(hydrated.take_resumed_notice());
+
+        // A session with no turns behind it has nothing to be stale about, and a log built up in
+        // this process was never restored at all.
+        assert!(!Conversation::from_events(Vec::new()).take_resumed_notice());
+        let mut fresh = Conversation::new();
+        fresh.append(Message::user("first"));
+        assert!(!fresh.take_resumed_notice());
     }
 
     #[test]
