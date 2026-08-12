@@ -14,6 +14,7 @@ use std::{
 };
 
 use fd_lock::{RwLock as FdRwLock, RwLockWriteGuard as FdRwLockWriteGuard};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio_rusqlite::Connection;
 use uuid::Uuid;
@@ -61,6 +62,9 @@ pub struct SessionMetaRow {
     /// Workspace roots beyond `cwd`. Empty for every non-ACP session and for rows written before
     /// the column existed, both of which were single-root.
     pub additional_roots: Vec<PathBuf>,
+    /// The terms a sub-agent was spawned under, as stored JSON. `None` on every top-level session
+    /// and on sub-agent rows written before the column existed.
+    pub subagent_spec_json: Option<String>,
 }
 
 /// Per-surface overrides applied to the copy produced by [`SessionManager::fork_session`]. Each
@@ -90,6 +94,10 @@ pub struct ImportSessionRecord {
     /// Workspace roots beyond `cwd`, carried across an export/import round trip. Defaults to empty
     /// for exports written before the field existed.
     pub additional_roots: Vec<PathBuf>,
+    /// A sub-agent's spawn terms, carried so an imported worker is still followable. `None` for
+    /// top-level sessions and for archives written before the field existed; an imported sub-agent
+    /// without it can be read and deleted but not resumed.
+    pub subagent_spec_json: Option<String>,
     pub stats: crate::stats::SessionStatsSnapshot,
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub events: Vec<(String, crate::conversation::Event)>,
@@ -396,7 +404,8 @@ impl SessionManager {
                         permission TEXT,
                         capabilities_json TEXT,
                         token_id TEXT,
-                        additional_roots_json TEXT
+                        additional_roots_json TEXT,
+                        subagent_spec_json TEXT
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
@@ -688,6 +697,30 @@ impl SessionManager {
                     )?;
                 }
 
+                // Migration: add `sessions.subagent_spec_json`, the terms a sub-agent was spawned
+                // under (see `crate::tools::subagent::SubagentSpec`). NULL on every non-sub-agent
+                // row and on sub-agent rows written before this column existed; `agent_followup`
+                // refuses those rather than guessing, because the alternative is rebuilding a
+                // worker from the parent's *current* permission and deny lists, which turns a
+                // follow-up into a privilege escalation.
+                //
+                // Placed after the cascade-FK rebuild, like the column migrations above: the
+                // rebuild's `sessions_new` lists only id/created_at/updated_at/parent_session_id/
+                // cwd and silently drops anything added before it.
+                let has_subagent_spec_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'subagent_spec_json'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_subagent_spec_col {
+                    connection.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN subagent_spec_json TEXT",
+                    )?;
+                }
+
                 // Migration: per-session cumulative stat columns (surfaced by `/status`) so the
                 // running totals survive resume instead of restarting at zero each process. Added as
                 // a set; the presence of `stat_turns` gates the whole batch.
@@ -829,13 +862,19 @@ impl SessionManager {
     }
 
     /// Create a session whose `parent_session_id` references an existing session, used by
-    /// `spawn_agent` so sub-agent conversations persist as children of the parent for auditing.
+    /// `agent_spawn` so sub-agent conversations persist as children of the parent for auditing.
     /// Cascades on parent delete (see [`Self::delete_session`]). The optional `cwd` is the parent's
     /// cwd snapshot at spawn time.
+    ///
+    /// `subagent_spec_json` records the terms the worker was spawned under so `agent_followup` can
+    /// rebuild it from them rather than from whatever the parent looks like at follow-up time. It
+    /// is written with the row rather than updated afterwards: a spawn that fails between the
+    /// two would otherwise leave a child that can be followed up on with no recorded terms.
     pub async fn create_child_session(
         &self,
         parent: Uuid,
         cwd: Option<std::path::PathBuf>,
+        subagent_spec_json: Option<String>,
     ) -> Result<Uuid> {
         let session_id = Uuid::new_v4();
         let now = chrono::Utc::now().to_rfc3339();
@@ -844,14 +883,16 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, parent_session_id, cwd)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO sessions
+                         (id, created_at, updated_at, parent_session_id, cwd, subagent_spec_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     rusqlite::params![
                         session_id.to_string(),
                         now,
                         now,
                         parent.to_string(),
                         cwd_string,
+                        subagent_spec_json,
                     ],
                 )?;
                 Ok(())
@@ -862,6 +903,26 @@ impl SessionManager {
             })?;
 
         Ok(session_id)
+    }
+
+    /// The recorded spawn terms for a sub-agent session, or `None` when the row has none (a
+    /// top-level session, or a sub-agent spawned before the column existed).
+    pub async fn load_subagent_spec(&self, session_id: Uuid) -> Result<Option<String>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection
+                    .query_row(
+                        "SELECT subagent_spec_json FROM sessions WHERE id = ?1",
+                        rusqlite::params![session_id.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map(Option::flatten)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load sub-agent spec: {}", error))
+            })
     }
 
     /// Copy `source`'s conversation into a brand-new top-level session and return it, or `Ok(None)`
@@ -884,6 +945,10 @@ impl SessionManager {
     ///   while the sub-agent's *result* already sits in the parent's own event log as a tool
     ///   result, so the copy is self-contained without them. This is the intended divergence from
     ///   [`Self::import_sessions`], which copies the tree because an archive should restore whole.
+    /// - **`subagent_spec_json`**, left NULL for the same reason as `parent_session_id`: a fork is
+    ///   top-level, and spawn terms on a session nothing spawned would describe a relationship that
+    ///   no longer exists. [`Self::import_sessions`] does carry it, because there the relationship
+    ///   is carried too.
     ///
     /// Copying in SQL rather than through the export/import structs is deliberate: routing a fork
     /// through that envelope is precisely how `additional_roots` came to be silently dropped. The
@@ -1189,6 +1254,7 @@ impl SessionManager {
             permission: Option<String>,
             capabilities_json: Option<String>,
             additional_roots_json: Option<String>,
+            subagent_spec_json: Option<String>,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String)>,
             tool_outputs: Vec<(String, String)>,
@@ -1211,6 +1277,7 @@ impl SessionManager {
                 permission: record.permission,
                 capabilities_json: record.capabilities_json,
                 additional_roots_json: encode_additional_roots(&record.additional_roots)?,
+                subagent_spec_json: record.subagent_spec_json,
                 stats: record.stats,
                 events,
                 tool_outputs: record.tool_outputs,
@@ -1223,11 +1290,11 @@ impl SessionManager {
                     txn.execute(
                         "INSERT INTO sessions (
                              id, created_at, updated_at, parent_session_id, cwd, permission,
-                             capabilities_json, additional_roots_json, stat_turns,
-                             stat_input_tokens, stat_output_tokens,
+                             capabilities_json, additional_roots_json, subagent_spec_json,
+                             stat_turns, stat_input_tokens, stat_output_tokens,
                              stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                              stat_redactions, stat_redacted_images, stat_redacted_bytes
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1237,6 +1304,7 @@ impl SessionManager {
                             session.permission,
                             session.capabilities_json,
                             session.additional_roots_json,
+                            session.subagent_spec_json,
                             session.stats.turns as i64,
                             session.stats.input_tokens as i64,
                             session.stats.output_tokens as i64,
@@ -1352,7 +1420,8 @@ impl SessionManager {
                          FROM sessions s JOIN tree ON s.parent_session_id = tree.id
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
-                            s.cwd, s.permission, s.capabilities_json, s.additional_roots_json
+                            s.cwd, s.permission, s.capabilities_json, s.additional_roots_json,
+                            s.subagent_spec_json
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -1377,6 +1446,7 @@ impl SessionManager {
                         additional_roots: decode_additional_roots(
                             row.get::<_, Option<String>>(7)?.as_deref(),
                         ),
+                        subagent_spec_json: row.get(8)?,
                     })
                 })?;
                 let mut out = Vec::new();
@@ -3683,7 +3753,7 @@ mod tests {
         let manager = test_manager().await;
         let source = seeded_session(&manager).await;
         manager
-            .create_child_session(source, None)
+            .create_child_session(source, None, None)
             .await
             .expect("child");
 
@@ -3931,6 +4001,8 @@ mod tests {
             "capabilities_json",
             "token_id",
             "additional_roots_json",
+            // Deliberately not copied by a fork; see `fork_session`'s doc comment.
+            "subagent_spec_json",
             "stat_turns",
             "stat_input_tokens",
             "stat_output_tokens",
@@ -5420,7 +5492,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("create parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("create child");
 
@@ -5439,7 +5511,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("create parent");
         let _child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("create child");
 
@@ -5590,7 +5662,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("create parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("create child");
 

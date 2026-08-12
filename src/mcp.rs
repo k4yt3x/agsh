@@ -818,7 +818,7 @@ impl McpClientManager {
     /// Mirrors the connector's deferred-mark step so a sub-agent sees the same eager-vs-deferred
     /// tool classification as the parent.
     ///
-    /// Idempotent and safe to call concurrently from separate `spawn_agent` invocations operating
+    /// Idempotent and safe to call concurrently from separate `agent_spawn` invocations operating
     /// on distinct sub-agent registries.
     pub async fn install_tools_on(self: &Arc<Self>, registry: &crate::tools::ToolRegistry) {
         use crate::tools::Tool as _;
@@ -830,6 +830,13 @@ impl McpClientManager {
         registry.set_mcp_manager(Arc::downgrade(self));
         crate::tools::mcp_resources::register_all(registry, Arc::clone(self));
         for name in self.server_names() {
+            // Skip the round trip entirely rather than discovering and then filtering: a denied
+            // server should not even be listed, and `list_all_tools` on a server the sub-agent
+            // cannot use is latency the spawn pays for nothing.
+            if registry.denials().denies_server(&name) {
+                tracing::info!("mcp: sub-agent registry denied server '{}'", name);
+                continue;
+            }
             let adapters = match self.discover_tools_for_server(&name).await {
                 Ok(adapters) => adapters,
                 Err(error) => {
@@ -1393,10 +1400,10 @@ pub async fn get_prompt(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn bare_server_config(name: &str) -> McpServerConfig {
+    pub(crate) fn bare_server_config(name: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
             transport: McpTransport::Http,

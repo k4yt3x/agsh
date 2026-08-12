@@ -169,9 +169,9 @@ When the user picks one from the palette, the client typically inserts `/<name> 
 
 ## Sub-agents
 
-`spawn_agent` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts and fs delegates forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
+`agent_spawn` and skill-based delegation produce a sub-agent that runs through `PermissionForwardingFrontend`. The sub-agent's own output isn't streamed to the client (its final report flows back through the parent's `tool_call_update`), but its permission prompts and fs delegates forward through the parent's connection, so the editor's apply-diff UI sees a sub-agent's writes the same as the main agent's.
 
-ACP has no sub-agent primitive — no nested sessions, no nested tool calls — so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `spawn_agent` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as a `spawn_agent` line in its parent's list, and two writers on one tool call's content would overwrite each other.
+ACP has no sub-agent primitive — no nested sessions, no nested tool calls — so a sub-agent is one tool call, and its progress is that call's content. While it runs, each tool call it starts is appended to a rolling list (the last 20) and pushed as a `tool_call_update` on the parent's `agent_spawn` call, so a long delegated task shows what it is currently doing instead of an opaque spinner. The whole list is resent on each update because clients replace a tool call's content rather than appending to it. A nested sub-agent's list is not forwarded further up: it already appears as a `agent_spawn` line in its parent's list, and two writers on one tool call's content would overwrite each other.
 
 ## Multi-root workspaces
 

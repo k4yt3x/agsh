@@ -18,7 +18,13 @@ use crossterm::style::Color;
 /// `Ord` follows the `#[repr(u8)]` discriminant and exists so a sub-agent's level can be clamped to
 /// its parent's as a ceiling (`min`); it is deliberately distinct from [`Permission::allows`], a
 /// capability predicate that treats `Ask` and `Write` as equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Serialises as the same lowercase word [`fmt::Display`] and [`FromStr`] use, so a persisted
+/// permission reads the way it is written in `config.toml`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 #[repr(u8)]
 pub enum Permission {
     None = 0,

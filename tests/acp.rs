@@ -3025,7 +3025,7 @@ enabled = ["read", "write"]
 }
 
 /// a sub-agent's permission prompt must forward through `PermissionForwardingFrontend` to the
-/// parent's ACP connection. The parent triggers `spawn_agent`; the sub-agent runs in `ask` mode
+/// parent's ACP connection. The parent triggers `agent_spawn`; the sub-agent runs in `ask` mode
 /// (inherited) and attempts `write_file`, which fires a `session/request_permission` on the
 /// *parent's* connection. Test answers `allow_once` and asserts the request was observed.
 #[test]
@@ -3050,7 +3050,7 @@ enabled = ["read", "ask", "write"]
                 // Parent round 1: spawn the sub-agent.
                 [
                     { "kind": "text", "text": "spawning sub-agent..." },
-                    { "kind": "tool_use_start", "id": "call_spawn", "name": "spawn_agent" },
+                    { "kind": "tool_use_start", "id": "call_spawn", "name": "agent_spawn" },
                     {
                         "kind": "tool_use_end",
                         "input": { "prompt": "write the file" }

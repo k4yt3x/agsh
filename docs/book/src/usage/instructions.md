@@ -71,7 +71,7 @@ This is the opposite of [skills](./skills.md) and [memory](./memory.md), which d
 ## Notes
 
 - Empty or whitespace-only instructions are treated as unset.
-- They apply to sub-agents spawned via `spawn_agent`.
+- Sub-agents do **not** receive them by default. Instructions describe the top-level agent, and a worker handed one task by one of its turns is not that agent; inheriting the persona is how a sub-agent ends up addressing the user as though it were the one they are talking to. The agent can pass `instructions: "inherit"` to [`agent_spawn`](../tools/overview.md#agent_spawn) when a task genuinely needs the project's standing rules, or pass a [skill](./skills.md) when the direction is reusable.
 - They apply at every permission level, including `none`, because you wrote them.
 - A set larger than roughly 8k tokens logs a warning at startup. It still works, and it is cached, but it occupies that much of every request's window and is usually a surprise rather than a decision.
 - An unreadable file in a directory is skipped with a warning rather than hiding the rest of it. A path you named explicitly via `MEKA_INSTRUCTIONS_FILE` is an error instead, since running without guidance you believe you supplied is worse than not starting.

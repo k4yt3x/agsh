@@ -284,7 +284,7 @@ pub fn parse_skill_definition(
 }
 
 /// Load the body (post-frontmatter) of a skill and prepend the [`skill_context_header`] so every
-/// consumer (the `skill` tool, `--skill`, `/skill`, `spawn_agent`'s skill delegation, and
+/// consumer (the `skill` tool, `--skill`, `/skill`, `agent_spawn`'s skill delegation, and
 /// `meka skill show`) sees the skill's base directory.
 ///
 /// The body is passed through verbatim. meka used to expand `${MEKA_SKILL_DIR}` and

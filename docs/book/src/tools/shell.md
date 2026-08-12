@@ -40,7 +40,7 @@ In **read mode**, commands run inside a sandbox that blocks writes to the user's
 | Filesystem reads | | ✓ |
 | Program execution | | ✓ |
 | Outbound network (TCP/UDP) | | ✓ |
-| dbus / systemd-user state mutations | Bubblewrap / macOS | Landlock / Windows |
+| dbus / systemd-user state mutations | Bubblewrap / macOS / Landlock on kernel 7.1+ | Landlock below kernel 7.1 / Windows |
 | Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |
 | Inheritance of sensitive parent env vars (API keys, OAuth tokens, …) | ✓ (all platforms) | |
@@ -66,7 +66,7 @@ Read-mode sandboxes still permit outbound network (the threat model intentionall
 Linux supports two backends, selected via `[shell].sandbox_backend` in `config.toml`:
 
 - **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/) (kernel 5.13+). Blocks filesystem writes via `landlock_restrict_self`. Does **not** block dbus / systemd-user IPC, so a sandboxed shell can still invoke state-mutating dbus methods.
+- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/) (kernel 5.13+). Blocks filesystem writes via `landlock_restrict_self`. On kernel 7.1+ (Landlock ABI v9) it also blocks `connect()` to every Unix socket on disk, which closes the dbus / systemd-user route out of the sandbox but likewise breaks socket-based clients such as `docker` and `psql` in read mode. **Below kernel 7.1 the kernel offers no such right**, so a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely. Prefer Bubblewrap, which removes those sockets on any kernel.
 
 `sandbox_backend` is unset unless you pin it yourself; `meka provider add` does not write it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch.
 

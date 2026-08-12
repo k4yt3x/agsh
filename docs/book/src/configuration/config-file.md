@@ -470,7 +470,7 @@ The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#sh
 Linux-only choice between `"landlock"` and `"bubblewrap"`:
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`"landlock"`) uses the Landlock LSM (kernel 5.13+) to block filesystem writes. Does **not** block dbus / systemd-user IPC; a sandboxed shell can still invoke state-mutating dbus methods. Kept as the lighter-weight fallback for hosts without Bubblewrap.
+- **Landlock** (`"landlock"`) uses the Landlock LSM (kernel 5.13+) to block filesystem writes. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Below kernel 7.1 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods. Kept as the lighter-weight fallback for hosts without Bubblewrap.
 
 When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. `meka provider add` does not write this field; leave it unset to keep auto-detection.
 
@@ -551,7 +551,7 @@ context_window = 200000
 
 ### `session.subagent_max_depth`
 
-Maximum recursion depth for sub-agents spawned via [`spawn_agent`](../tools/overview.md#spawn_agent). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `spawn_agent`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `spawn_agent` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
+Maximum recursion depth for sub-agents spawned via [`agent_spawn`](../tools/overview.md#agent_spawn). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `agent_spawn`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `agent_spawn` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
 
 Default: `3`
 
@@ -1050,7 +1050,38 @@ Disable web access entirely in a locked-down environment:
 disabled_tools = ["web_search", "fetch_url"]
 ```
 
-Sub-agents spawned via `spawn_agent` inherit the same filter; a disabled built-in is disabled everywhere. Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
+Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
+
+## `[subagents]`
+
+Capabilities a sub-agent may never hold. Where `[tools]` restricts everyone, this block restricts only workers.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `disabled_servers` | list | `[]` | MCP servers a sub-agent cannot see at all |
+| `disabled_tools` | list | `[]` | Individual tool names a sub-agent cannot see |
+
+```toml
+[subagents]
+disabled_servers = ["mekabridge"]
+disabled_tools = ["mcp__notion__create_page"]
+```
+
+**`disabled_servers` is the one that matters.** Naming a server removes everything it offers from every sub-agent: its tools, its resources, and its prompts. Reach for it when a server exists to talk to *you* or to act on your behalf. The motivating case is a server that can message the user: without this, a worker three levels down can send a message the user has no way to distinguish from the one they are actually talking to.
+
+`disabled_tools` takes names as they appear in the tool list, so built-ins (`write_file`) and namespaced MCP tools (`mcp__notion__create_page`) share one namespace. For a whole server, prefer `disabled_servers`: it covers the resource and prompt surfaces that a tool-name list cannot reach.
+
+An entry matching nothing emits a `warn!` at startup, the same way `[tools]` does. A typo here denies nothing while reading as a restriction, which is worse than writing no config at all.
+
+These are floors. An orchestrator can restrict a particular worker further with `agent_spawn`'s `deny_servers` / `deny_tools` parameters, and each level of nesting inherits everything above it, but nothing can grant back what this block took away. There is deliberately no call-site allow-list for that reason.
+
+### Why memory and instructions are not configured here
+
+Two things a sub-agent might inherit are deliberately absent: the memory store and the [instructions file](../usage/instructions.md). Both are granted per call by [`agent_spawn`](../tools/overview.md#agent_spawn) and default to nothing.
+
+The distinction is what config can actually enforce. A *capability* can be withheld: a tool the registry never registered cannot be reached, however the parent phrases the task. *Context* cannot. An agent holding the instructions has them verbatim in its own system prompt, and one with `memory_read` can read any memory — so either can be copied into a worker's prompt whatever config says. A `[subagents].memory = "none"` key would look like a boundary while stopping only the worker's own browsing, not the content reaching it, and a control that reads as a guarantee but isn't one is worse than none.
+
+The other half of the argument is that the config guardrail existed for a failure mode that no longer applies. It was there because the parent might *forget* — which only matters for things that are on by default. Both of these now default to off, so forgetting produces a clean worker.
 
 ## `[skills]`
 

@@ -15,7 +15,10 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`web_search`](./web.md#web_search) | Read | Search the web |
 | [`execute_command`](./shell.md#execute_command) | Read/Write | Run a shell command |
 | [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
-| [`spawn_agent`](./overview.md#spawn_agent) | Read | Delegate tasks to a sub-agent |
+| [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
+| [`agent_list`](./overview.md#agent_list--agent_followup--agent_delete) | Read | List the sub-agents this session spawned |
+| [`agent_followup`](./overview.md#agent_list--agent_followup--agent_delete) | Read | Ask a sub-agent another question |
+| [`agent_delete`](./overview.md#agent_list--agent_followup--agent_delete) | Read | Discard a sub-agent and its records |
 | [`scratchpad_write`](./scratchpad.md#scratchpad_write) | Read | Store content in the scratchpad |
 | [`scratchpad_read`](./scratchpad.md#scratchpad_read) | Read | Read a scratchpad entry |
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
@@ -44,7 +47,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available in read, ask, and write modes):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo`, `spawn_agent`, `skill`, `render_image`
+- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `skill`, `render_image`
 - `recall`, `recall_read`
 - All scratchpad tools
 - All memory tools. Writing a memory needs only read permission: the store is meka's own, under
@@ -143,15 +146,42 @@ Inputs (all optional):
 
 Task statuses are `pending`, `in_progress`, `completed`, and `cancelled`. Calling `todo` with no arguments simply reads the current list.
 
-## `spawn_agent`
+## `agent_spawn`
 
 Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent gets its own private todo list (`todo` operates on the sub-agent's own state), runs silently (its tool calls are not surfaced to the terminal), and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
 
-Multiple `spawn_agent` calls in one assistant turn run in parallel; useful when independent investigations can proceed concurrently.
+Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when independent investigations can proceed concurrently.
 
-**Recursion.** Sub-agents may themselves spawn further sub-agents, so an agent can orchestrate a team. Nesting is bounded by [`session.subagent_max_depth`](../configuration/config-file.md#sessionsubagent_max_depth) (default 3; `1` reproduces the old "sub-agents can't spawn" behavior, `0` disables `spawn_agent` entirely). Pass the optional `max_depth` parameter to tune how deep a given subtree may recurse; a built-in absolute cap always bounds real nesting so recursion can't run away.
+**Recursion.** Sub-agents may themselves spawn further sub-agents, so an agent can orchestrate a team. Nesting is bounded by [`session.subagent_max_depth`](../configuration/config-file.md#sessionsubagent_max_depth) (default 3; `1` reproduces the old "sub-agents can't spawn" behavior, `0` disables `agent_spawn` entirely). Pass the optional `max_depth` parameter to tune how deep a given subtree may recurse; a built-in absolute cap always bounds real nesting so recursion can't run away.
 
 **Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `ask` / `write`) to run it at a *more restricted* level: the value is clamped to the parent's level as a ceiling, so a sub-agent can never be escalated above its parent. This lets a write-mode orchestrator hand untrusted or risky work to a read-only sub-agent.
+
+**Tools.** Pass `deny_servers` to withhold whole MCP servers from the sub-agent (its tools, its resources, and its prompts) or `deny_tools` to withhold individual tools by name. Both union with whatever [`[subagents]`](../configuration/config-file.md#subagents) already denies; there is no way to grant something back, so a nested `agent_spawn` can only ever narrow further. Config is the place to put a restriction you always want, since the failure mode this guards against is an orchestrator forgetting to ask for it.
+
+**Context is granted, not inherited.** A sub-agent starts with a clean slate and receives only what you ask for:
+
+- `memory: "read"` grants read access to your memory store. Default `"none"`, because memories from unrelated work are context the worker pays for and reasons from. Sub-agents can never write to the store — record anything worth keeping yourself, from the worker's report.
+- `instructions: "inherit"` hands over your [instructions file](../usage/instructions.md) verbatim. Default `"none"`, because those instructions describe *you*: your persona, how to address the user, what to volunteer. A worker handed one task by one of your turns is not you. Grant them when the task needs the project's standing rules and quoting the relevant ones into `prompt` would be lossy or expensive; pass a `skill` when the direction is reusable.
+
+Neither can be granted beyond what you hold yourself, so authority only narrows going down a chain of sub-agents. A worker you gave no memory cannot give its own worker any.
+
+**Follow-up.** `agent_spawn` returns the sub-agent's id on the first line of its result, above the report. Keep it if you might have a second question: with it you can call `agent_followup` instead of re-spawning a worker that would have to rediscover everything.
+
+## `agent_list` / `agent_followup` / `agent_delete`
+
+A sub-agent is not a one-shot. Its conversation persists under its own session, so you can go back to it.
+
+- **`agent_list`** — the sub-agents this session spawned, one per line as `<id>\t<cwd>\tturns=<n>\tlast_active=<timestamp>`. Direct children only: a worker's own sub-agents belong to it and appear in *its* list.
+- **`agent_followup({agent, prompt, scratchpad?})`** — asks a sub-agent another question. It still has its own conversation, so it can build on what it already found rather than starting from your summary of it. Returns its new report.
+- **`agent_delete({agent})`** — discards a sub-agent: its conversation, its scratchpad entries, and any sub-agents it spawned in turn. Nothing it wrote to disk is touched. Worth doing once you have what you needed, so a long session isn't carrying every worker it ever ran.
+
+All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's workers.
+
+**A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a worker at `read` and have since switched to write mode, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a worker you deliberately restricted.
+
+Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn.
+
+One follow-up at a time per sub-agent. A second concurrent call on the same worker is refused rather than interleaved, since both would be appending to one conversation from a view of it that the other has already changed.
 
 ## `skill`
 
@@ -209,4 +239,4 @@ After a compaction, the summary message reminds the agent that these tools exist
 
 ## Redirecting output to the scratchpad
 
-Several tools (`execute_command`, `find_files`, `search_contents`, `fetch_url`, `spawn_agent`) accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 200, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.
+Several tools (`execute_command`, `find_files`, `search_contents`, `fetch_url`, `agent_spawn`) accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 200, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.

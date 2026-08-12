@@ -112,7 +112,7 @@ A **second** Ctrl+C during the same turn stops them. Between turns, `/tasks canc
 
 A one-shot run exits with the turn, so there is no later turn to deliver into. Rather than kill the work halfway through, it waits for every outstanding task and then prints the outcomes on stderr. The agent does not see them: its turn is already over. So a background call under `--oneshot` costs the same wall-clock as a synchronous one without the result reaching the model, which makes it worth avoiding rather than a feature to reach for.
 
-Sub-agents (`spawn_agent`) deliberately cannot start background tasks. A sub-agent's session ends with the single turn that spawned it, so it could neither outlive that turn nor be around to hear the result.
+Sub-agents (`agent_spawn`) deliberately cannot start background tasks. A sub-agent's session ends with the single turn that spawned it, so it could neither outlive that turn nor be around to hear the result.
 
 ## Concurrent edits
 

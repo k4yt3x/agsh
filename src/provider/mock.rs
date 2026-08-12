@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::Result,
-    provider::{Message, ModelInfo, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
+    provider::{
+        ContentBlock, Message, ModelInfo, Provider, Role, StopReason, StreamEvent, TokenUsage,
+        ToolDefinition,
+    },
 };
 
 /// Serialized event used by [`MockProvider`]. Mirrors the runtime [`StreamEvent`] enum but uses
@@ -107,9 +110,10 @@ impl From<MockStopReason> for StopReason {
     }
 }
 
-/// A scripted multi-round response. Each call to [`Provider::stream`] drains one round
-/// (`Vec<MockEvent>`); subsequent rounds satisfy subsequent agent loop iterations after tool
-/// results return.
+/// A scripted multi-round response. Each call to [`Provider::stream`] *or* [`Provider::complete`]
+/// drains one round (`Vec<MockEvent>`); subsequent rounds satisfy subsequent agent loop iterations
+/// after tool results return. The two paths share the one queue, so a script that spawns a
+/// sub-agent (which runs non-streaming) must budget a round for each of the sub-agent's turns.
 #[derive(Debug, Default)]
 pub struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
@@ -152,6 +156,9 @@ impl MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
+    /// Drains one round and folds it into a finished message, so a single script drives either
+    /// path. Non-streaming is not an exotic corner: sub-agents run this way (`Agent::new_subagent`
+    /// sets `streaming: false`), as does auto-compaction.
     async fn complete(
         &self,
         _system_prompt: &str,
@@ -163,11 +170,78 @@ impl Provider for MockProvider {
         TokenUsage,
         Vec<crate::provider::Notice>,
     )> {
-        // Tests only drive the streaming path; `complete` is reached only via auto-compaction,
-        // which the ACP test suite doesn't exercise. If a future test needs it, populate the rounds
-        // queue the same way and add a matching impl here.
-        Err(crate::error::MekaError::Provider(
-            "MockProvider::complete is not implemented".to_string(),
+        let events = {
+            let mut rounds = self
+                .rounds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rounds.pop_front().unwrap_or_default()
+        };
+
+        let mut content: Vec<ContentBlock> = Vec::new();
+        let mut text = String::new();
+        let mut pending_tool: Option<(String, String)> = None;
+        let mut stop_reason = StopReason::EndTurn;
+
+        for event in events {
+            match event {
+                MockEvent::Fail { message } => {
+                    return Err(crate::error::MekaError::Provider(message));
+                }
+                MockEvent::FailRetryable {
+                    message,
+                    retry_after_secs,
+                } => {
+                    return Err(crate::error::MekaError::RetryableProvider {
+                        message,
+                        retry_after: retry_after_secs.map(std::time::Duration::from_secs),
+                    });
+                }
+                MockEvent::FailInvalidRequest { message } => {
+                    return Err(crate::error::MekaError::InvalidRequest(message));
+                }
+                MockEvent::Sleep { ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                MockEvent::Text { text: chunk } => text.push_str(&chunk),
+                // Thinking has no place in a non-streaming reply here: the real providers return it
+                // as a block, but no `complete` caller in meka reads one.
+                MockEvent::ThinkingDelta { .. } | MockEvent::ThinkingComplete { .. } => {}
+                MockEvent::ToolUseStart { id, name } => {
+                    // Flush first, so text that preceded this call stays ahead of it and text
+                    // between two calls stays between them. Accumulating everything and appending
+                    // at the end would reorder blocks relative to a real provider.
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text {
+                            text: std::mem::take(&mut text),
+                        });
+                    }
+                    pending_tool = Some((id, name));
+                }
+                MockEvent::ToolInputDelta { .. } => {}
+                MockEvent::ToolUseEnd { input } => {
+                    if let Some((id, name)) = pending_tool.take() {
+                        content.push(ContentBlock::ToolUse { id, name, input });
+                    }
+                }
+                MockEvent::MessageEnd {
+                    stop_reason: reason,
+                } => stop_reason = reason.into(),
+            }
+        }
+
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text });
+        }
+
+        Ok((
+            Message {
+                role: Role::Assistant,
+                content,
+            },
+            stop_reason,
+            TokenUsage::default(),
+            Vec::new(),
         ))
     }
 
@@ -416,6 +490,62 @@ mod tests {
             "FailRetryable must announce itself on the stream before returning",
         );
         assert!(rx.recv().await.is_none(), "and then the stream is over");
+    }
+
+    /// `complete` folds one round into a message, preserving block order: text that preceded a tool
+    /// call stays ahead of it and text between two calls stays between them. Sub-agents take this
+    /// path, so a reordering here would show up as a sub-agent's narration landing after its work.
+    #[tokio::test]
+    async fn test_mock_provider_complete_folds_a_round_preserving_block_order() {
+        let provider = MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Text {
+                    text: "before ".into(),
+                },
+                MockEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"path": "a.txt"}),
+                },
+                MockEvent::Text {
+                    text: "after".into(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::Text {
+                text: "second round".into(),
+            }],
+        ]);
+
+        let (message, stop_reason, ..) = provider.complete("", &[], &[]).await.expect("complete");
+        assert!(matches!(message.role, Role::Assistant));
+        assert_eq!(message.content.len(), 3);
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "before "));
+        assert!(
+            matches!(&message.content[1], ContentBlock::ToolUse { id, name, .. } if id == "call-1" && name == "read_file")
+        );
+        assert!(matches!(&message.content[2], ContentBlock::Text { text } if text == "after"));
+        assert!(matches!(stop_reason, StopReason::ToolUse));
+
+        // The queue is shared with `stream`, so the first round is gone for both paths.
+        let (message, ..) = provider.complete("", &[], &[]).await.expect("second round");
+        assert!(
+            matches!(&message.content[0], ContentBlock::Text { text } if text == "second round")
+        );
+    }
+
+    /// An exhausted script yields an empty assistant message rather than an error, matching
+    /// `stream`'s "drains nothing, returns Ok" behaviour.
+    #[tokio::test]
+    async fn test_mock_provider_complete_on_exhausted_script_is_empty() {
+        let provider = MockProvider::from_rounds(vec![]);
+        let (message, stop_reason, ..) = provider.complete("", &[], &[]).await.expect("complete");
+        assert!(message.content.is_empty());
+        assert!(matches!(stop_reason, StopReason::EndTurn));
     }
 
     /// `ThinkingDelta` + `ThinkingComplete` map straight through to the same-named `StreamEvent`

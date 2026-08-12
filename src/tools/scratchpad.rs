@@ -1019,7 +1019,7 @@ impl Tool for ScratchpadLoadFileTool {
             description: "Read a file's contents directly into the scratchpad without routing \
                 the bytes through the conversation. Useful for staging a large captured log or \
                 document that you want to hand to sub-agents via `inherit_scratchpad` on \
-                `spawn_agent` \u{2014} the model never sees the payload. UTF-8 text only; binary \
+                `agent_spawn` \u{2014} the model never sees the payload. UTF-8 text only; binary \
                 files are rejected with the detected MIME type. For binary content, pass the \
                 file path directly to whatever tool will consume it; sub-agents inherit the \
                 parent's filesystem access. Overwrites an existing entry of the same name. \
@@ -1891,7 +1891,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -1924,7 +1924,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -1960,7 +1960,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -1992,7 +1992,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2043,7 +2043,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2074,7 +2074,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2123,7 +2123,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2164,7 +2164,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2199,7 +2199,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2238,7 +2238,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
 
@@ -2543,7 +2543,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2692,7 +2692,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         manager
@@ -2856,7 +2856,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         manager
@@ -2892,7 +2892,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         manager
@@ -3019,7 +3019,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         manager
@@ -3053,7 +3053,7 @@ mod tests {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
-            .create_child_session(parent, None)
+            .create_child_session(parent, None, None)
             .await
             .expect("child");
         manager

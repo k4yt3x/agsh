@@ -389,16 +389,18 @@ impl Agent {
         &self.cwd
     }
 
-    /// Build an `Agent` configured for sub-agent use: no compaction, no MCP readiness gate.
-    /// Inherits `sandboxed_shell`, `context_messages`, and `user_instructions` from the parent's
-    /// options.
+    /// Build an `Agent` configured for sub-agent use: silent, with no MCP readiness gate.
+    ///
+    /// Inherits `sandboxed_shell`, `context_messages` and the auto-compaction settings from the
+    /// parent's options. `user_instructions` is deliberately *not* inherited: they describe the
+    /// top-level agent, and a worker handed one task by one of its turns is not that agent.
     ///
     /// `sub_system_prompt` is the pre-built sub-agent system prompt (typically from
     /// `build_subagent_system_prompt`); `run_turn` uses it verbatim instead of building one
     /// dynamically.
     ///
     /// `frontend` decides where the sub-agent's output and permission requests go. The standard
-    /// caller (the `spawn_agent` tool) uses [`crate::frontend::PermissionForwardingFrontend`]
+    /// caller (the `agent_spawn` tool) uses [`crate::frontend::PermissionForwardingFrontend`]
     /// wrapping the parent's frontend. That wrapper drops emits (the sub-agent's report flows back
     /// via the tool result) but forwards permission prompts so the user is asked in their original
     /// UI. Tests can pass [`crate::frontend::SilentFrontend`] for fully-isolated sub-agent
@@ -429,12 +431,19 @@ impl Agent {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
             context_messages: parent_options.context_messages,
-            user_instructions: parent_options.user_instructions.clone(),
-            // Sub-agents run silent + one-shot: no streaming UI, no auto-compact, no MCP readiness
-            // gate.
+            // Deliberately not inherited. Instructions are installation-wide and describe the
+            // top-level agent; a worker handed a task by another agent is not that agent. The
+            // sub-agent's system prompt is built by
+            // `crate::tools::subagent::build_subagent_system_prompt` and skills are the reusable
+            // worker-instruction unit.
+            user_instructions: None,
+            // Sub-agents run silent: no streaming UI, no MCP readiness gate.
             streaming: false,
-            auto_compact: false,
-            context_window: 0,
+            // Auto-compaction *is* inherited. A worker handed a large task has the same context
+            // window as its parent and the same need to compact within it; hardcoding this off
+            // meant a big delegated job simply failed once it filled the window.
+            auto_compact: parent_options.auto_compact,
+            context_window: parent_options.context_window,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
@@ -673,7 +682,7 @@ impl Agent {
         // Skipped entirely for sub-agents. They run on a `system_prompt_override` that already
         // lists their tools (`build_subagent_system_prompt`), and that prompt is built once at
         // spawn for a fixed tool set and permission, so there is nothing here for them to
-        // learn and rendering it would bill every `spawn_agent` for a second copy of the
+        // learn and rendering it would bill every `agent_spawn` for a second copy of the
         // catalogue.
         // Read fresh each turn and rendered outside the world-state diff: running tasks are live
         // state, like the todo list, not a record of what the model has been told. Skipped entirely
@@ -737,9 +746,11 @@ impl Agent {
             (rendered, previous)
         };
 
-        // Taken before the block is built, since the block is where it lands. Sub-agents never see
-        // it: they run on a fresh conversation, so `from_events` never set it, and nothing in their
-        // history could be stale in the first place.
+        // Taken before the block is built, since the block is where it lands. A freshly spawned
+        // sub-agent never sees it (its conversation is empty, so `from_events` never set it), but a
+        // followed-up one does, and that is deliberate: it really is running against a fresh
+        // registry, a fresh read tracker and an empty todo list. See
+        // `crate::tools::subagent::AgentFollowupTool`.
         let resumed = messages.take_resumed_notice();
 
         let augmented_input = {
@@ -1747,7 +1758,12 @@ impl Agent {
             //
             // Asks the registry rather than `self.mcp_manager`: a sub-agent has no manager of its
             // own (see `new_subagent`) but its registry does, and it deserves the same answer.
-            if let Some(manager) = self.tool_registry.mcp_manager()
+            //
+            // Denied names are excluded: the explanation names the server and its state, so
+            // offering it to a worker whose denial is meant to make that server invisible would
+            // confirm the server exists and let the worker enumerate the rest by guessing.
+            if !self.tool_registry.denials().denies_tool(name)
+                && let Some(manager) = self.tool_registry.mcp_manager()
                 && let Some(reason) = manager.unavailable_tool_reason(name).await
             {
                 return crate::tools::ToolOutput::text(reason, true);
@@ -1783,7 +1799,7 @@ impl Agent {
         }
 
         // Scope the id across both dispatch paths, so a tool that has to correlate itself with the
-        // client's view of this call -- `spawn_agent`, routing its sub-agent's activity back into
+        // client's view of this call -- `agent_spawn`, routing its sub-agent's activity back into
         // the tool call already on screen -- can read it without every other tool's signature
         // growing a parameter it ignores.
         //
@@ -2160,12 +2176,24 @@ impl Agent {
             "Summarize this conversation into a concise context message.",
         ));
 
-        self.provider.set_thinking_override(Some(false));
+        // The override is process-wide state on a provider every agent in this process shares, so
+        // a sub-agent must not touch it: parallel `agent_spawn` calls run concurrently over one
+        // `Arc<dyn Provider>`, and one worker compacting would silently disable extended thinking
+        // for another worker's in-flight request. Skipping it costs this one summarisation call
+        // whatever thinking is configured, which is a far smaller price than a sibling's turn
+        // quietly losing a capability. Sub-agents only reach compaction at all because they now
+        // inherit `auto_compact`.
+        let scoped_override = !crate::provider::is_subagent();
+        if scoped_override {
+            self.provider.set_thinking_override(Some(false));
+        }
         let compact_result = self
             .provider
             .complete(system_prompt, &compact_messages, &[])
             .await;
-        self.provider.set_thinking_override(None);
+        if scoped_override {
+            self.provider.set_thinking_override(None);
+        }
         let (summary_message, _stop_reason, _usage, notices) = compact_result?;
         // Surface any provider notices from the summary call (e.g. image redaction on a very large
         // compaction window). Rare in practice; emitting before we mutate the conversation keeps

@@ -103,7 +103,7 @@ skill(name: "download-videos")
 
 The tool returns the full body of `SKILL.md` as its output. The agent then follows the instructions.
 
-Whenever a skill body is loaded (by the `skill` tool, `--skill`, `/skill`, `spawn_agent`, or `meka skill show`), it is prefixed with a one-line header naming the skill's directory:
+Whenever a skill body is loaded (by the `skill` tool, `--skill`, `/skill`, `agent_spawn`, or `meka skill show`), it is prefixed with a one-line header naming the skill's directory:
 
 ```
 Base directory for this skill and its bundled files: /home/user/.config/meka/skills/download-videos
@@ -113,14 +113,16 @@ This is what lets the agent locate files bundled alongside `SKILL.md` when the b
 
 ## Running a Skill in a Sub-Agent
 
-The agent can delegate a skill to a sub-agent by passing the `skill` parameter to the `spawn_agent` tool. The sub-agent runs the skill in its own fresh context and returns a report, keeping the skill's instructions out of the parent's conversation:
+The agent can delegate a skill to a sub-agent by passing the `skill` parameter to the `agent_spawn` tool. The sub-agent runs the skill in its own fresh context and returns a report, keeping the skill's instructions out of the parent's conversation:
 
 ```
-spawn_agent(skill: "summarize-financial-news")
-spawn_agent(skill: "summarize-financial-news", prompt: "focus on UK markets")
+agent_spawn(skill: "summarize-financial-news")
+agent_spawn(skill: "summarize-financial-news", prompt: "focus on UK markets")
 ```
 
 `prompt` is optional when `skill` is given; if both are supplied, `prompt` is prepended to the skill body as extra direction (the same ordering as `meka --skill <name> [prompt]`).
+
+A skill is the reusable unit of worker instruction. Sub-agents do not receive the [instructions file](./instructions.md) unless the spawn call asks for it, since it describes the top-level agent rather than a delegate — so a skill is usually the better way to give a worker standing direction.
 
 ## Invoking a Skill from the CLI
 

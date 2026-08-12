@@ -529,7 +529,7 @@ impl BuiltinToolFilter {
     }
 
     pub fn admits(&self, name: &str) -> bool {
-        if self.disabled.contains(name) {
+        if self.denies(name) {
             return false;
         }
         match &self.allowed {
@@ -537,22 +537,143 @@ impl BuiltinToolFilter {
             None => true,
         }
     }
+
+    /// The block-list half alone, for tools that `allowed_tools` was never able to reach.
+    ///
+    /// `allowed_tools` is exhaustive: naming five tools removes everything else. Anyone who wrote
+    /// one before the MCP meta-tools were filterable wrote it against a world where those seven
+    /// registered unconditionally, so applying the allow-list to them now would delete
+    /// `read_mcp_resource` and friends from working installations on upgrade, with nothing in the
+    /// config to explain it. `disabled_tools` has no such problem: naming a tool there has always
+    /// meant "remove this one", so honouring it is what the user already asked for.
+    pub fn denies(&self, name: &str) -> bool {
+        self.disabled.contains(name)
+    }
 }
 
-/// Canonical built-in names for the stale-entry warning pass. Update when adding a new built-in in
-/// [`ToolRegistry::build_default`].
+/// What a sub-agent registry refuses to register, from `[subagents]` unioned with the
+/// `deny_servers` / `deny_tools` of the `agent_spawn` call that built it. Empty on the primary
+/// agent's registry, which is what makes this a sub-agent concept rather than a second `[tools]`
+/// filter.
+///
+/// Denials only ever accumulate ([`Self::union`]): a nested `agent_spawn` inherits its parent's
+/// effective set and adds to it, so no depth of nesting can hand a descendant something config took
+/// away.
+#[derive(Debug, Clone, Default)]
+pub struct ToolDenials {
+    servers: HashSet<String>,
+    tools: HashSet<String>,
+}
+
+impl ToolDenials {
+    pub fn new(
+        servers: impl IntoIterator<Item = String>,
+        tools: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            servers: servers.into_iter().collect(),
+            tools: tools.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty() && self.tools.is_empty()
+    }
+
+    pub fn denies_server(&self, server_name: &str) -> bool {
+        self.servers.contains(server_name)
+    }
+
+    /// A tool is denied by its own registry name, or because it belongs to a denied server. The
+    /// second arm is what makes `disabled_servers` cover tools registered through paths that never
+    /// see a server name, so the two keys can't disagree.
+    pub fn denies_tool(&self, name: &str) -> bool {
+        if self.tools.contains(name) {
+            return true;
+        }
+        match server_of_tool(name) {
+            Some(server) => self.servers.contains(server),
+            None => false,
+        }
+    }
+
+    /// Everything either set denies. Used when a `agent_spawn` call adds to what config already
+    /// denied, and again when the child's own `agent_spawn` inherits the result.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            servers: self.servers.union(&other.servers).cloned().collect(),
+            tools: self.tools.union(&other.tools).cloned().collect(),
+        }
+    }
+
+    /// Sorted, for the persisted spawn spec and for tests. `HashSet` iteration order is not stable,
+    /// and a spec that round-trips differently every time is one nobody can diff.
+    pub fn server_list(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.servers.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn tool_list(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.iter().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+/// Server name out of a namespaced MCP tool name, or `None` for a built-in. Server names cannot
+/// contain `__` (`mcp::sanitize::normalize_server_name`), so the first occurrence splits them.
+pub fn server_of_tool(tool_name: &str) -> Option<&str> {
+    let rest = tool_name.strip_prefix("mcp__")?;
+    rest.split_once("__").map(|(server, _tool)| server)
+}
+
+/// The MCP resource and prompt meta-tools, which `mcp_resources::register_all` registers directly
+/// rather than through `register_builtin`. Deniable via `disabled_tools`, but deliberately outside
+/// `allowed_tools` -- see [`BuiltinToolFilter::denies`].
+pub const MCP_META_TOOL_NAMES: &[&str] = &[
+    "get_mcp_prompt",
+    "list_mcp_prompts",
+    "list_mcp_resource_updates",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "subscribe_mcp_resource",
+    "unsubscribe_mcp_resource",
+];
+
+/// Canonical built-in names for the stale-entry warning pass, sorted.
+///
+/// Every name a user may legitimately put in `[tools]` or `[subagents]`, which is wider than
+/// [`ToolRegistry::build_default`]'s own list: the conditionally-registered families
+/// (`schedule_*`, `task_*`) and the tools registered outside `register_builtin` (the MCP
+/// meta-tools) are all deniable, so leaving them out made the warning fire on correct entries.
+/// Update when adding any new built-in.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "agent_delete",
+    "agent_followup",
+    "agent_list",
+    "agent_spawn",
     "edit_file",
     "execute_command",
     "fetch_url",
     "find_files",
+    "get_mcp_prompt",
+    "list_mcp_prompts",
+    "list_mcp_resource_updates",
+    "list_mcp_resources",
     "load_tool",
     "memory_delete",
     "memory_read",
     "memory_search",
     "memory_write",
     "read_file",
+    "read_mcp_resource",
+    "recall",
+    "recall_read",
     "render_image",
+    "schedule_cancel",
+    "schedule_create",
+    "schedule_list",
     "scratchpad_delete",
     "scratchpad_edit",
     "scratchpad_list",
@@ -564,8 +685,11 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_write",
     "search_contents",
     "skill",
-    "spawn_agent",
+    "subscribe_mcp_resource",
+    "task_cancel",
+    "task_list",
     "todo",
+    "unsubscribe_mcp_resource",
     "web_search",
     "write_file",
 ];
@@ -579,6 +703,17 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
             if !known.contains(name.as_str()) {
                 tracing::warn!(
                     "[tools].allowed_tools entry '{}' doesn't match any built-in tool",
+                    name
+                );
+            } else if MCP_META_TOOL_NAMES.contains(&name.as_str()) {
+                // These register outside the allow-list (see
+                // `ToolRegistry::admits_infrastructure`), so naming one here is
+                // inert. Worth saying: the entry looks like it is keeping the tool,
+                // and before the meta-tools were listed in `BUILTIN_TOOL_NAMES` at all this
+                // case at least warned as unrecognised.
+                tracing::warn!(
+                    "[tools].allowed_tools entry '{}' has no effect: the MCP meta-tools are not \
+                     subject to the allow-list. Use disabled_tools to remove one.",
                     name
                 );
             }
@@ -599,6 +734,43 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
                 name
             );
         }
+    }
+}
+
+/// Warn (never fail) on `[subagents]` entries that match nothing. A typo here denies nothing at all
+/// while reading as a restriction, which is the worst of both: the user believes a worker cannot
+/// reach a server it can reach.
+///
+/// Checked against configured server names rather than advertised tool names, because this runs at
+/// startup before any server has completed its handshake. So `mcp__notion__craete_page` with
+/// `notion` configured is accepted here and never warned about: nothing else checks it either
+/// (`mcp::warn_on_stale_tool_config` only inspects the per-server `[[mcp.servers]]` lists, against
+/// raw un-namespaced names). Catching it would mean deferring this pass until every server has
+/// connected, which is a different shape of startup. Server names, which are the coarse lever and
+/// the more consequential half, are checked exactly.
+pub fn warn_on_stale_subagent_config(denials: &ToolDenials, configured_servers: &[String]) {
+    let servers: HashSet<&str> = configured_servers.iter().map(String::as_str).collect();
+    for name in denials.server_list() {
+        if !servers.contains(name.as_str()) {
+            tracing::warn!(
+                "[subagents].disabled_servers entry '{}' doesn't match any configured MCP server",
+                name
+            );
+        }
+    }
+    let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
+    for name in denials.tool_list() {
+        if known.contains(name.as_str()) {
+            continue;
+        }
+        if server_of_tool(&name).is_some_and(|server| servers.contains(server)) {
+            continue;
+        }
+        tracing::warn!(
+            "[subagents].disabled_tools entry '{}' matches no built-in tool and no configured MCP \
+             server",
+            name
+        );
     }
 }
 
@@ -722,7 +894,7 @@ tokio::task_local! {
     /// `background` call detaches, and nothing on that path reads this (ACP mints its own
     /// `perm-<uuid>` for the permission request).
     /// A task-local rather than a [`Tool::execute`] parameter because exactly
-    /// one tool needs it -- `spawn_agent`, to route its sub-agent's activity back into the tool
+    /// one tool needs it -- `agent_spawn`, to route its sub-agent's activity back into the tool
     /// call the client is already displaying -- and threading it through every implementor to
     /// serve one of them is the wrong trade.
     ///
@@ -780,6 +952,11 @@ pub struct ToolRegistry {
     /// Built-in allow/block-list. MCP tools have their own per-server filtering in `src/mcp.rs`
     /// and bypass this.
     builtin_filter: Arc<BuiltinToolFilter>,
+    /// `[subagents]` denials, empty on the primary agent's registry. Unlike `builtin_filter` this
+    /// covers MCP tools too, and is read back out by
+    /// [`crate::mcp::McpClientManager::install_tools_on`] and
+    /// [`mcp_resources::register_all`] so the registry stays the single place the answer lives.
+    denials: Arc<ToolDenials>,
     /// Files read this session, shared with the file tools so `edit_file` can require a prior
     /// read. Cleared on conversation compaction.
     read_tracker: ReadTracker,
@@ -807,16 +984,66 @@ impl ToolRegistry {
     }
 
     fn new_with_filter(filter: BuiltinToolFilter) -> Self {
+        Self::new_with_filter_and_denials(filter, ToolDenials::default())
+    }
+
+    fn new_with_filter_and_denials(filter: BuiltinToolFilter, denials: ToolDenials) -> Self {
         let overrides = filter.permission_overrides.clone();
         Self {
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
             deferred: Arc::new(std::sync::RwLock::new(HashSet::new())),
             permission_overrides: Arc::new(overrides),
             builtin_filter: Arc::new(filter),
+            denials: Arc::new(denials),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             background_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             read_tracker: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// What this registry refuses to register. Read by the MCP installation paths so they can skip
+    /// a denied server's discovery round trip and its resource/prompt meta-tools, rather than each
+    /// caller threading its own copy of the deny lists.
+    pub(crate) fn denials(&self) -> &ToolDenials {
+        &self.denials
+    }
+
+    /// Whether this registry will accept a tool by that name: it has to pass both the `[tools]`
+    /// filter and the sub-agent deny list.
+    ///
+    /// The single predicate behind [`Self::register_builtin`] *and* the two paths that call
+    /// [`Self::register`] directly ([`mcp_resources::register_all`] and
+    /// [`subagent::register_subagent_tools`]). Those two exist because their tools are built from
+    /// collaborators the generic builder doesn't have, and routing them past `register_builtin`
+    /// used to mean routing them past the filters with it: naming an MCP meta-tool or
+    /// `agent_spawn` in a deny list did nothing at all. Any future direct registration should
+    /// come through here too.
+    pub(crate) fn admits(&self, name: &str) -> bool {
+        if !self.builtin_filter.admits(name) {
+            tracing::info!("skipping tool '{}' (disabled by [tools] config)", name);
+            return false;
+        }
+        self.not_denied(name)
+    }
+
+    /// Like [`Self::admits`] but consulting only `[tools].disabled_tools`, not `allowed_tools`.
+    ///
+    /// For the MCP meta-tools, which an exhaustive `allowed_tools` never used to reach. See
+    /// [`BuiltinToolFilter::denies`] for why widening it now would break working configs.
+    pub(crate) fn admits_infrastructure(&self, name: &str) -> bool {
+        if self.builtin_filter.denies(name) {
+            tracing::info!("skipping tool '{}' (disabled by [tools] config)", name);
+            return false;
+        }
+        self.not_denied(name)
+    }
+
+    fn not_denied(&self, name: &str) -> bool {
+        if self.denials.denies_tool(name) {
+            tracing::info!("skipping tool '{}' for sub-agent (denied by config)", name);
+            return false;
+        }
+        true
     }
 
     /// Clear the read-tracker. Called on conversation compaction: the model's context is reset, so
@@ -856,6 +1083,17 @@ impl ToolRegistry {
     /// the agent. Deferred markers for removed tool names are cleared so the registry's deferred
     /// set doesn't grow unbounded.
     pub fn replace_server_tools(&self, server_name: &str, new_tools: Vec<Arc<dyn Tool>>) {
+        // Filter here rather than only at the call sites: a `tools/list_changed` notification
+        // arriving mid-run goes through this same path, so a denied server would otherwise walk its
+        // tools back in the moment it re-advertised them.
+        let new_tools: Vec<Arc<dyn Tool>> = if self.denials.is_empty() {
+            new_tools
+        } else {
+            new_tools
+                .into_iter()
+                .filter(|tool| !self.denials.denies_tool(&tool.definition().name))
+                .collect()
+        };
         let prefix = format!("mcp__{}__", server_name);
         let mut tools = self
             .tools
@@ -1169,11 +1407,7 @@ impl ToolRegistry {
     /// filter are silently skipped.
     fn register_builtin(&self, tool: Arc<dyn Tool>) {
         let name = tool.definition().name;
-        if !self.builtin_filter.admits(&name) {
-            tracing::info!(
-                "skipping built-in tool '{}' (disabled by [tools] config)",
-                name
-            );
+        if !self.admits(&name) {
             return;
         }
         // A collision here means two builtin tools share a name (a coding bug, not a runtime
@@ -1199,6 +1433,9 @@ impl ToolRegistry {
         todo_list: todo::SharedTodoList,
         skills: Arc<crate::skills::SkillCache>,
         memories: Arc<crate::memory::MemoryCache>,
+        // How much of the memory store this agent may reach. Always `Write` for the primary agent;
+        // for a sub-agent, whatever its `agent_spawn` call granted, which defaults to nothing.
+        memory_access: crate::config::MemoryAccess,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
@@ -1209,9 +1446,9 @@ impl ToolRegistry {
             crate::config::ResolvedScheduleConfig,
             crate::permission::SharedPermission,
         )>,
-        // `None` for sub-agents, for the same reason `schedule` is: a sub-agent's session ends
-        // with the one turn that spawned it, so it can neither start work that outlives
-        // that turn nor be around to hear about it.
+        // `None` for sub-agents. A sub-agent runs only while its parent is waiting on it or
+        // following up, so work that outlives the turn has nobody to report to: the parent has
+        // already returned, and the child is not scheduled again on its own.
         background: Option<crate::background::BackgroundTasks>,
     ) {
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
@@ -1225,17 +1462,28 @@ impl ToolRegistry {
         if skills.enabled() {
             self.register_builtin(Arc::new(skill::SkillTool { skills }));
         }
-        if memories.enabled() {
-            self.register_builtin(Arc::new(memory::MemoryWriteTool {
-                memories: memories.clone(),
-            }));
+        // Two independent gates: `enabled()` is whether this installation keeps memories at all,
+        // `memory_access` is how much of that store the agent in front of us may reach.
+        if memories.enabled() && memory_access != crate::config::MemoryAccess::None {
+            // Registration order is the order the tools reach the provider, and the tool array
+            // heads the prompt-cache prefix. Interleaving the gates rather than grouping them
+            // keeps a full-access agent's order identical to what it was before the levels
+            // existed, so no existing installation pays a cache miss for a set that did not
+            // actually change.
+            if memory_access == crate::config::MemoryAccess::Write {
+                self.register_builtin(Arc::new(memory::MemoryWriteTool {
+                    memories: memories.clone(),
+                }));
+            }
             self.register_builtin(Arc::new(memory::MemoryReadTool {
                 memories: memories.clone(),
             }));
             self.register_builtin(Arc::new(memory::MemorySearchTool {
                 memories: memories.clone(),
             }));
-            self.register_builtin(Arc::new(memory::MemoryDeleteTool { memories }));
+            if memory_access == crate::config::MemoryAccess::Write {
+                self.register_builtin(Arc::new(memory::MemoryDeleteTool { memories }));
+            }
         }
         self.register_builtin(Arc::new(render_image::RenderImageTool {
             session_id: shared_session_id.clone(),
@@ -1370,6 +1618,7 @@ impl ToolRegistry {
             todo_list,
             skills,
             memories,
+            crate::config::MemoryAccess::Write,
             None,
             Vec::new(),
             cwd,
@@ -1383,8 +1632,8 @@ impl ToolRegistry {
     /// parent (load_tool, skill, memory_*, render_image, todo, scratchpad_*) scoped to their own
     /// ephemeral child session.
     ///
-    /// `spawn_agent` is deliberately not registered here, but sub-agents *can* nest: the caller
-    /// adds it afterwards when the recursion budget allows (`SpawnAgentTool::execute`), because
+    /// `agent_spawn` is deliberately not registered here, but sub-agents *can* nest: the caller
+    /// adds it afterwards when the recursion budget allows (`AgentSpawnTool::execute`), because
     /// the child's depth counters aren't known until the parent's `max_depth` override has been
     /// resolved. Registering it outside this builder mirrors the root's own registration in
     /// `assemble_agent`.
@@ -1392,6 +1641,10 @@ impl ToolRegistry {
     /// `parent_session_id` + `inherited_scratchpad_names` enable read-only scratchpad inheritance:
     /// `scratchpad_read` falls back to the parent for allowlisted names, and `scratchpad_list`
     /// enumerates them in an `(inherited)` section. Pass `None`/`Vec::new()` to opt out.
+    ///
+    /// `denials` and `memory_access` are what makes a sub-agent registry narrower than its parent's
+    /// rather than a copy of it. Both are already unioned/resolved by the caller: this builder
+    /// applies them, it does not decide them.
     #[allow(clippy::too_many_arguments)]
     pub fn build_for_subagent(
         web_client_config: crate::config::WebClientConfig,
@@ -1401,18 +1654,20 @@ impl ToolRegistry {
         sandbox_backend: crate::config::SandboxBackend,
         backend_probe: crate::sandbox::BackendProbe,
         builtin_filter: BuiltinToolFilter,
+        denials: ToolDenials,
         todo_list: todo::SharedTodoList,
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
         memories: Arc<crate::memory::MemoryCache>,
+        memory_access: crate::config::MemoryAccess,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
         cwd: crate::agent::SharedCwd,
         roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
-        let registry = Self::new_with_filter(builtin_filter);
+        let registry = Self::new_with_filter_and_denials(builtin_filter, denials);
         registry.register_core_tools(
             &web_client_config,
             shared_permission,
@@ -1430,6 +1685,7 @@ impl ToolRegistry {
             todo_list,
             skills,
             memories,
+            memory_access,
             parent_session_id,
             inherited_scratchpad_names,
             cwd,
@@ -2731,11 +2987,13 @@ pub(crate) mod tests {
             crate::config::SandboxBackend::Landlock,
             backend_probe,
             filter,
+            ToolDenials::default(),
             test_todo_list(),
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             crate::memory::MemoryCache::for_root(None),
+            crate::config::MemoryAccess::Write,
             None,
             Vec::new(),
             crate::agent::test_cwd(),
@@ -2746,7 +3004,308 @@ pub(crate) mod tests {
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("web_search").is_none());
         assert!(registry.get("todo").is_some());
-        assert!(registry.get("spawn_agent").is_none());
+        assert!(registry.get("agent_spawn").is_none());
+    }
+
+    /// Minimal named tool, for registry-level tests that only care whether a name is present.
+    struct StubTool {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new(self.name.clone(), "stub".to_string(), serde_json::json!({}))
+        }
+
+        fn required_permission(&self) -> Permission {
+            Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: CancellationToken,
+        ) -> crate::error::Result<ToolOutput> {
+            Ok(ToolOutput::text(String::new(), false))
+        }
+    }
+
+    /// Test helper for the sub-agent registry: everything but the two knobs under test held at its
+    /// default, so a case reads as "denials X, memory Y" rather than nineteen positional arguments.
+    async fn subagent_registry(
+        denials: ToolDenials,
+        memory_access: crate::config::MemoryAccess,
+    ) -> ToolRegistry {
+        let sandbox_capability = crate::sandbox::detect();
+        let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("failed to open in-memory database");
+        ToolRegistry::build_for_subagent(
+            crate::config::WebClientConfig::default(),
+            crate::permission::SharedPermission::new(
+                Permission::Write,
+                crate::permission::EnabledPermissions::ALL,
+            ),
+            true,
+            sandbox_capability,
+            crate::config::SandboxBackend::Landlock,
+            backend_probe,
+            BuiltinToolFilter::default(),
+            denials,
+            test_todo_list(),
+            session_manager,
+            Arc::new(RwLock::new(None)),
+            crate::skills::SkillCache::for_root(None),
+            crate::memory::MemoryCache::for_root(None),
+            memory_access,
+            None,
+            Vec::new(),
+            crate::agent::test_cwd(),
+            crate::agent::test_roots(),
+            Arc::new(crate::frontend::SilentFrontend),
+        )
+        .expect("subagent registry should build")
+    }
+
+    const MEMORY_TOOLS: [&str; 4] = [
+        "memory_read",
+        "memory_search",
+        "memory_write",
+        "memory_delete",
+    ];
+
+    #[tokio::test]
+    async fn test_subagent_memory_access_none_registers_no_memory_tools() {
+        let registry =
+            subagent_registry(ToolDenials::default(), crate::config::MemoryAccess::None).await;
+        for name in MEMORY_TOOLS {
+            assert!(
+                registry.get(name).is_none(),
+                "memory = \"none\" must not register '{}'",
+                name
+            );
+        }
+        // The gate is memory-specific, not a blanket refusal.
+        assert!(registry.get("read_file").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_memory_access_read_registers_exactly_the_readers() {
+        let registry =
+            subagent_registry(ToolDenials::default(), crate::config::MemoryAccess::Read).await;
+        assert!(registry.get("memory_read").is_some());
+        assert!(registry.get("memory_search").is_some());
+        assert!(
+            registry.get("memory_write").is_none(),
+            "read access must not let a worker edit the store the parent reasons from"
+        );
+        assert!(registry.get("memory_delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_memory_access_write_registers_all_four() {
+        let registry =
+            subagent_registry(ToolDenials::default(), crate::config::MemoryAccess::Write).await;
+        for name in MEMORY_TOOLS {
+            assert!(registry.get(name).is_some(), "expected '{}'", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subagent_denied_builtin_is_absent() {
+        let registry = subagent_registry(
+            ToolDenials::new(Vec::new(), vec!["write_file".to_string()]),
+            crate::config::MemoryAccess::Write,
+        )
+        .await;
+        assert!(registry.get("write_file").is_none());
+        assert!(
+            registry.get("edit_file").is_some(),
+            "denying one tool must not take its neighbours"
+        );
+    }
+
+    /// A denied server's tools never reach the registry even when handed to it directly, which is
+    /// the path a mid-run `tools/list_changed` takes.
+    #[tokio::test]
+    async fn test_subagent_denied_server_tools_are_dropped_on_replace() {
+        let registry = subagent_registry(
+            ToolDenials::new(vec!["blocked".to_string()], Vec::new()),
+            crate::config::MemoryAccess::Write,
+        )
+        .await;
+        registry.replace_server_tools("blocked", vec![Arc::new(StubTool {
+            name: "mcp__blocked__send".to_string(),
+        })]);
+        registry.replace_server_tools("allowed", vec![Arc::new(StubTool {
+            name: "mcp__allowed__send".to_string(),
+        })]);
+        assert!(registry.get("mcp__blocked__send").is_none());
+        assert!(registry.get("mcp__allowed__send").is_some());
+    }
+
+    /// Denials accumulate. Two `agent_spawn` levels each adding a restriction must end up with
+    /// both, or a worker could shed its parent's limits by spawning one more level down.
+    #[test]
+    fn test_tool_denials_union_accumulates() {
+        let parent = ToolDenials::new(vec!["one".to_string()], vec!["alpha".to_string()]);
+        let child = parent.union(&ToolDenials::new(vec!["two".to_string()], vec![
+            "beta".to_string(),
+        ]));
+        assert_eq!(child.server_list(), vec!["one", "two"]);
+        assert_eq!(child.tool_list(), vec!["alpha", "beta"]);
+        assert!(parent.denies_server("one") && !parent.denies_server("two"));
+    }
+
+    /// Denying a server denies its tools without naming each one, so the two config keys can't
+    /// disagree about a server the user has already ruled out.
+    #[test]
+    fn test_tool_denials_server_covers_its_tools() {
+        let denials = ToolDenials::new(vec!["notion".to_string()], Vec::new());
+        assert!(denials.denies_tool("mcp__notion__create_page"));
+        assert!(!denials.denies_tool("mcp__linear__create_issue"));
+        assert!(!denials.denies_tool("write_file"));
+    }
+
+    /// `[subagents]` restricts workers, not the agent doing the delegating. The root registry's own
+    /// denial set is empty, so `admits` is what keeps `disabled_tools = ["agent_spawn"]` -- the
+    /// natural way to write "workers may not spawn workers" -- from deleting the top-level agent's
+    /// ability to delegate at all.
+    #[tokio::test]
+    async fn test_registry_admits_is_answered_by_the_registry_not_the_config() {
+        let root =
+            subagent_registry(ToolDenials::default(), crate::config::MemoryAccess::Write).await;
+        assert!(root.admits("agent_spawn"));
+        assert!(root.admits("agent_delete"));
+
+        let worker = subagent_registry(
+            ToolDenials::new(Vec::new(), vec!["agent_spawn".to_string()]),
+            crate::config::MemoryAccess::Write,
+        )
+        .await;
+        assert!(!worker.admits("agent_spawn"));
+        assert!(worker.admits("agent_list"));
+    }
+
+    /// The MCP meta-tools are registered outside `register_builtin`, so `admits` is the only thing
+    /// standing between them and a deny list that names them. Before it, `disabled_tools =
+    /// ["read_mcp_resource"]` was accepted and silently did nothing.
+    #[tokio::test]
+    async fn test_registry_admits_covers_the_directly_registered_tools() {
+        let registry = subagent_registry(
+            ToolDenials::new(Vec::new(), vec!["read_mcp_resource".to_string()]),
+            crate::config::MemoryAccess::Write,
+        )
+        .await;
+        assert!(!registry.admits("read_mcp_resource"));
+        assert!(registry.admits("list_mcp_resources"));
+    }
+
+    /// `allowed_tools` is exhaustive, and before the MCP meta-tools were filterable at all they
+    /// registered regardless of it. Applying it to them now would delete seven tools from every
+    /// install that has an allow-list, on upgrade, with nothing in the config naming them. The
+    /// block-list half does apply, because naming a tool there has always meant "remove this one".
+    #[tokio::test]
+    async fn test_allowed_tools_does_not_reach_the_mcp_meta_tools() {
+        // Asserted through `register_all` rather than the predicate alone: the regression this
+        // guards was in the wiring (which predicate `register_all` calls), so a test that only
+        // exercised `admits_infrastructure` would pass with the wiring wrong.
+        let manager = crate::mcp::McpClientManager::prepare(
+            &[crate::mcp::tests::bare_server_config("notes")],
+            None,
+            None,
+            crate::mcp::McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+
+        let allow_listed = ToolRegistry::new_with_filter(BuiltinToolFilter::from_config(
+            Some(vec!["read_file".to_string()]),
+            Vec::new(),
+            HashMap::new(),
+        ));
+        mcp_resources::register_all(&allow_listed, std::sync::Arc::clone(&manager));
+        assert!(
+            allow_listed.get("read_mcp_resource").is_some(),
+            "an exhaustive allowed_tools must not silently take the MCP meta-tools"
+        );
+        assert!(
+            !allow_listed.admits("write_file"),
+            "while still biting the tools it always did"
+        );
+
+        let block_listed = ToolRegistry::new_with_filter(BuiltinToolFilter::from_config(
+            None,
+            vec!["read_mcp_resource".to_string()],
+            HashMap::new(),
+        ));
+        mcp_resources::register_all(&block_listed, manager);
+        assert!(
+            block_listed.get("read_mcp_resource").is_none(),
+            "naming one explicitly does remove it"
+        );
+        assert!(block_listed.get("get_mcp_prompt").is_some());
+    }
+
+    /// Every meta-tool name must be a real one, and must be in `BUILTIN_TOOL_NAMES` too — the
+    /// allow-list warning treats "not in `BUILTIN_TOOL_NAMES`" and "is a meta-tool" as different
+    /// cases, so a name in neither list would fall through both.
+    #[test]
+    fn test_mcp_meta_tool_names_are_a_subset_of_the_builtins() {
+        let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
+        for name in MCP_META_TOOL_NAMES {
+            assert!(
+                known.contains(name),
+                "BUILTIN_TOOL_NAMES is missing '{name}'"
+            );
+        }
+        let mut sorted = MCP_META_TOOL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            MCP_META_TOOL_NAMES,
+            sorted.as_slice(),
+            "keep the list sorted"
+        );
+        assert_eq!(MCP_META_TOOL_NAMES.len(), 7);
+    }
+
+    /// Every name a user may put in `[tools]` or `[subagents]` has to be in `BUILTIN_TOOL_NAMES`,
+    /// or the stale-entry warning fires on a correct entry and invites them to "fix" it.
+    #[test]
+    fn test_builtin_tool_names_covers_the_deniable_families() {
+        let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
+        for name in [
+            "recall",
+            "recall_read",
+            "schedule_create",
+            "task_list",
+            "read_mcp_resource",
+            "list_mcp_resource_updates",
+            "agent_followup",
+        ] {
+            assert!(
+                known.contains(name),
+                "BUILTIN_TOOL_NAMES is missing '{name}'"
+            );
+        }
+        let mut sorted = BUILTIN_TOOL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            BUILTIN_TOOL_NAMES,
+            sorted.as_slice(),
+            "keep the list sorted"
+        );
+    }
+
+    #[test]
+    fn test_server_of_tool_splits_on_the_first_separator() {
+        assert_eq!(server_of_tool("mcp__notion__create_page"), Some("notion"));
+        // Tool names may themselves contain `__`; server names may not.
+        assert_eq!(server_of_tool("mcp__notion__a__b"), Some("notion"));
+        assert_eq!(server_of_tool("write_file"), None);
+        assert_eq!(server_of_tool("mcp__malformed"), None);
     }
 
     #[test]
@@ -2772,7 +3331,7 @@ pub(crate) mod tests {
             "scratchpad_delete",
             "skill",
             "render_image",
-            "spawn_agent",
+            "agent_spawn",
             "load_tool",
         ] {
             assert!(

@@ -7,15 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-08-12
+
 ### Added
 
+- `agent_followup` asks a sub-agent another question; it keeps its own conversation.
+- `agent_list` reports a session's sub-agents, with each one's turn count and last activity.
+- `agent_delete` discards a sub-agent, its scratchpad, and any sub-agents it spawned.
+- `agent_spawn` returns the sub-agent's id, so a worker can be reached again.
+- `[subagents]` config: `disabled_servers` and `disabled_tools`, withheld from every sub-agent.
+- `agent_spawn` takes `deny_servers` / `deny_tools`, unioned with what config already denies.
+- A denied MCP server is unreachable through its resources and prompts, not just its tools.
+- `agent_spawn` takes `memory: "read"` to grant a worker your memories; the default is none.
+- `agent_spawn` takes `instructions: "inherit"` to hand a worker the instructions file.
+- Neither grant can exceed what the spawning agent holds, so authority narrows down a chain.
 - The `[Memory]` index names memory files that could not be read, with the reason for each.
 - A resumed session tells the agent that state a tool held outside the conversation may be gone.
 
+### Changed
+
+- **Breaking:** the `spawn_agent` tool is now `agent_spawn`, matching every other tool family.
+- **Breaking:** sub-agents start with no memory and no instructions unless `agent_spawn` asks.
+- **Breaking:** Landlock blocks Unix sockets on kernel 7.1+; `docker` and `psql` fail in read mode.
+
 ### Fixed
 
+- `[tools].disabled_tools` now applies to the MCP resource and prompt tools, which ignored it.
+- `[tools]` no longer warns that `recall`, `schedule_*` or `task_*` match no built-in tool.
+- `[tools].allowed_tools` naming an MCP meta-tool now says so instead of silently doing nothing.
+- `meka acp` and `meka serve` warn about stale `[tools]` entries; only the REPL did.
+- `agent_spawn` ignored a non-string `permission`, silently running the worker unrestricted.
+- Sub-agents inherit auto-compaction, so a worker given a large task no longer just fails.
+- A compacting sub-agent no longer disables extended thinking for a sibling running beside it.
 - `memory_write` without a `body` erased the memory's body; it now keeps what is there.
 - `memory_read` on a name whose file exists but will not parse reported it as never written.
+- A Landlock setup failure could report the wrong `errno`, since `close(2)` may overwrite it.
+
+### Security
+
+- Read-mode commands under Landlock could write anywhere via `systemd-run`; now blocked on ABI v9+.
+- Bubblewrap was never affected: its tmpfs masks already hid the systemd and D-Bus sockets.
 
 ## [0.39.0] - 2026-08-12
 
@@ -1346,7 +1377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.39.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.40.0...HEAD
+[0.40.0]: https://github.com/k4yt3x/meka/compare/0.39.0...0.40.0
 [0.39.0]: https://github.com/k4yt3x/meka/compare/0.38.0...0.39.0
 [0.38.0]: https://github.com/k4yt3x/meka/compare/0.37.0...0.38.0
 [0.37.0]: https://github.com/k4yt3x/meka/compare/0.36.0...0.37.0

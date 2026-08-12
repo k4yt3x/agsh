@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::Cli,
@@ -38,6 +38,7 @@ pub struct ConfigFile {
     pub permissions: Option<PermissionsConfig>,
     pub schedule: Option<ScheduleConfig>,
     pub background: Option<BackgroundConfig>,
+    pub subagents: Option<SubagentsConfig>,
     pub serve: Option<ServeConfig>,
 }
 
@@ -247,6 +248,128 @@ pub struct ToolsConfig {
     pub allowed_tools: Option<Vec<String>>,
     pub disabled_tools: Option<Vec<String>>,
     pub tool_permissions: Option<HashMap<String, String>>,
+}
+
+/// `[subagents]` table: capabilities a sub-agent may never hold.
+///
+/// Deliberately only the two deny lists. The distinction that decides what belongs here: a
+/// *capability* is something config can genuinely withhold, because a tool the registry never
+/// registered cannot be reached however the parent phrases the task. *Context* -- the memory store,
+/// the instructions file -- cannot be withheld the same way, because a parent holding it can copy
+/// it into the worker's prompt; a config key promising otherwise would read as a boundary while
+/// being none. Context is therefore granted per call by `agent_spawn`, defaulting to nothing, and
+/// has no key here.
+///
+/// The forgetting failure these lists exist for is real: MCP servers are inherited by default, so a
+/// parent that never considers the question hands a worker every tool it has -- including one that
+/// messages the user. `agent_spawn`'s `deny_servers` / `deny_tools` union with these, so a parent
+/// can restrict further; there is deliberately no call-site allow-list, which would let a parent
+/// widen what config denied.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentsConfig {
+    /// Whole MCP servers a sub-agent cannot see. The coarse lever and the one that matters: naming
+    /// a server removes its tools, its resources, and its prompts.
+    pub disabled_servers: Option<Vec<String>>,
+    /// Individual tools a sub-agent cannot see, by registry name, so built-ins and namespaced MCP
+    /// tools (`mcp__<server>__<tool>`) share one namespace.
+    pub disabled_tools: Option<Vec<String>>,
+}
+
+/// How much of the memory store an agent may reach.
+///
+/// Not a config key: the primary agent always holds [`MemoryAccess::Write`], and a sub-agent holds
+/// whatever its `agent_spawn` call granted, defaulting to [`MemoryAccess::None`]. Ordered
+/// `None < Read < Write` so `min` reads as "the more restrictive of two", which is how a grant is
+/// clamped against what the granting agent itself holds.
+///
+/// `Write` is deliberately unreachable from `agent_spawn` (see [`Self::parse_grant`]). A worker
+/// that inferred something from one narrow task should not be able to write it into the store every
+/// future turn then reasons from; the parent, which has the whole conversation, is better placed to
+/// decide what is worth remembering, and can record it after reading the worker's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryAccess {
+    /// No memory tools at all.
+    None,
+    /// `memory_read` and `memory_search`; no `memory_write` or `memory_delete`.
+    Read,
+    /// All four memory tools. The primary agent only.
+    Write,
+}
+
+impl MemoryAccess {
+    /// `None`, as a `#[serde(default)]` target for a persisted spec that lost the field: an absent
+    /// grant must cost the worker its memory tools rather than hand it the store.
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    /// Parse a `agent_spawn` grant. `"write"` is refused with its reason rather than clamped, so a
+    /// parent asking for it learns that no sub-agent can have it instead of silently getting
+    /// `read`.
+    pub fn parse_grant(text: &str) -> std::result::Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "read" => Ok(Self::Read),
+            "write" => Err(
+                "memory = \"write\" is not available to sub-agents. Use \"read\" and record \
+                 anything worth keeping yourself, from the worker's report."
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "memory = \"{}\" is not a valid access level. Use \"none\" or \"read\".",
+                other
+            )),
+        }
+    }
+}
+
+/// Whether an agent was handed the installation's instructions file.
+///
+/// Like [`MemoryAccess`], granted per `agent_spawn` call rather than configured, and defaulting to
+/// [`InstructionAccess::None`]. Instructions describe the top-level agent -- its persona, how to
+/// address the user, what to volunteer -- so a worker inherits none of it unless the parent decides
+/// this particular task needs the project's rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstructionAccess {
+    /// A clean slate: the worker's system prompt carries no user instructions.
+    #[default]
+    None,
+    /// The worker receives the instructions verbatim, as the parent has them.
+    Inherit,
+}
+
+impl InstructionAccess {
+    /// Parse a `agent_spawn` grant.
+    pub fn parse_grant(text: &str) -> std::result::Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "inherit" => Ok(Self::Inherit),
+            other => Err(format!(
+                "instructions = \"{}\" is not a valid value. Use \"none\" or \"inherit\".",
+                other
+            )),
+        }
+    }
+}
+
+/// [`SubagentsConfig`] with defaults filled in.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedSubagentsConfig {
+    pub disabled_servers: Vec<String>,
+    pub disabled_tools: Vec<String>,
+}
+
+impl ResolvedSubagentsConfig {
+    fn resolve(raw: Option<SubagentsConfig>) -> Self {
+        let raw = raw.unwrap_or_default();
+        Self {
+            disabled_servers: raw.disabled_servers.unwrap_or_default(),
+            disabled_tools: raw.disabled_tools.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -739,7 +862,7 @@ pub struct ResolvedConfig {
     pub auto_compact: bool,
     pub context_window: Option<u64>,
     /// Maximum sub-agent recursion depth. `1` matches the historical "root spawns, sub-agents
-    /// can't" behavior; `0` disables `spawn_agent` entirely. Seeds the root `SpawnAgentTool`'s
+    /// can't" behavior; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s
     /// depth budget in `main.rs`.
     pub subagent_max_depth: usize,
     /// Whether the active profile's model accepts image input (the ACP `image` prompt capability).
@@ -766,6 +889,9 @@ pub struct ResolvedConfig {
     /// `[background]` with defaults filled. Off unless the installation asks for it; see
     /// [`BackgroundConfig`].
     pub background: ResolvedBackgroundConfig,
+    /// `[subagents]` with defaults filled. Governs what a spawned worker does *not* inherit; see
+    /// [`SubagentsConfig`].
+    pub subagents: ResolvedSubagentsConfig,
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
@@ -1592,6 +1718,7 @@ impl ResolvedConfig {
             .unwrap_or(true);
         let schedule = ResolvedScheduleConfig::resolve(config_file.schedule);
         let background = ResolvedBackgroundConfig::resolve(config_file.background);
+        let subagents = ResolvedSubagentsConfig::resolve(config_file.subagents);
         // Destructure the [mcp] table into its two independent fields so we don't have to re-open
         // the config file later for resolution.
         let (
@@ -1822,6 +1949,7 @@ impl ResolvedConfig {
             memory_enabled,
             schedule,
             background,
+            subagents,
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
@@ -2862,6 +2990,86 @@ max_tasks = 3
         let background = ResolvedBackgroundConfig::resolve(config.background);
         assert!(background.enabled);
         assert_eq!(background.max_tasks, 3);
+    }
+
+    #[test]
+    fn test_subagents_config_deserialization() {
+        let config: ConfigFile = toml::from_str(
+            r#"[subagents]
+disabled_servers = ["mekabridge"]
+disabled_tools = ["mcp__notion__create_page", "write_file"]
+"#,
+        )
+        .expect("config parses");
+        let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
+        assert_eq!(subagents.disabled_servers, vec!["mekabridge".to_string()]);
+        assert_eq!(subagents.disabled_tools, vec![
+            "mcp__notion__create_page".to_string(),
+            "write_file".to_string()
+        ]);
+    }
+
+    /// Absent `[subagents]` denies nothing. What a worker *receives* is not configured at all: it
+    /// is granted per `agent_spawn` call and defaults to nothing.
+    #[test]
+    fn test_subagents_defaults_deny_nothing() {
+        let config: ConfigFile = toml::from_str("").expect("empty config parses");
+        assert!(config.subagents.is_none());
+        let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
+        assert!(subagents.disabled_servers.is_empty());
+        assert!(subagents.disabled_tools.is_empty());
+    }
+
+    /// `memory` was a config key during development and is deliberately not one: config withholds
+    /// capabilities, and the memory store is context a parent can copy into a prompt regardless.
+    /// A leftover key must be an error rather than silently ignored.
+    #[test]
+    fn test_subagents_rejects_the_former_memory_key() {
+        let error = toml::from_str::<ConfigFile>("[subagents]\nmemory = \"none\"\n")
+            .expect_err("a removed key must not be silently ignored");
+        assert!(error.to_string().contains("memory"), "{error}");
+    }
+
+    /// Sub-agents can be granted read access but never write: a worker recording what it inferred
+    /// from one narrow task puts it in front of every future turn.
+    #[test]
+    fn test_memory_grant_parsing_refuses_write() {
+        assert_eq!(MemoryAccess::parse_grant("none"), Ok(MemoryAccess::None));
+        assert_eq!(MemoryAccess::parse_grant("  READ "), Ok(MemoryAccess::Read));
+        let error = MemoryAccess::parse_grant("write").expect_err("write is not grantable");
+        assert!(error.contains("not available to sub-agents"), "{error}");
+        assert!(error.contains("yourself"), "and says what to do instead");
+        assert!(MemoryAccess::parse_grant("readonly").is_err());
+    }
+
+    #[test]
+    fn test_instruction_grant_parsing() {
+        assert_eq!(
+            InstructionAccess::parse_grant("inherit"),
+            Ok(InstructionAccess::Inherit)
+        );
+        assert_eq!(
+            InstructionAccess::parse_grant("None"),
+            Ok(InstructionAccess::None)
+        );
+        assert!(InstructionAccess::parse_grant("yes").is_err());
+        assert_eq!(InstructionAccess::default(), InstructionAccess::None);
+    }
+
+    /// `min` is "the more restrictive of two", which is what clamps a grant against what the
+    /// granting agent itself holds.
+    #[test]
+    fn test_memory_access_orders_restrictive_first() {
+        assert!(MemoryAccess::None < MemoryAccess::Read);
+        assert!(MemoryAccess::Read < MemoryAccess::Write);
+        assert_eq!(
+            MemoryAccess::Read.min(MemoryAccess::None),
+            MemoryAccess::None
+        );
+        assert_eq!(
+            InstructionAccess::Inherit.min(InstructionAccess::None),
+            InstructionAccess::None
+        );
     }
 
     /// The one capability block that is off unless asked for. See [`BackgroundConfig`] for why it

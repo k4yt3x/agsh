@@ -316,7 +316,7 @@ pub const LABEL_MAX_CHARS: usize = 80;
 /// The header is not decoration, for the same reason [`crate::schedule::Wakeup::render_prompt`]
 /// carries one: without it the model reads a bare result as though a human had just typed it, and
 /// answers conversationally to nobody. It also has to be unambiguous about *who* is speaking,
-/// because a backgrounded `spawn_agent` reports in a sub-agent's words, and a sub-agent is
+/// because a backgrounded `agent_spawn` reports in a sub-agent's words, and a sub-agent is
 /// permission-clamped by `resolve_subagent_permission` while its words are not.
 ///
 /// Several outcomes ready at once coalesce into one turn rather than one turn each, as the

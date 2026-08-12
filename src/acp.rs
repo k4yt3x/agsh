@@ -976,7 +976,7 @@ fn tool_kind_for(name: &str) -> ToolKind {
         "find_files" | "search_contents" => ToolKind::Search,
         "execute_command" => ToolKind::Execute,
         "fetch_url" | "web_search" => ToolKind::Fetch,
-        "spawn_agent" => ToolKind::Think,
+        "agent_spawn" => ToolKind::Think,
         // skill, memory_*, scratchpad_*, render_image, load_tool, mcp__*, and any
         // future built-ins.
         _ => ToolKind::Other,
@@ -998,7 +998,7 @@ fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
         ("search_contents", Some(pattern)) => format!("Search {pattern}"),
         ("fetch_url", Some(url)) => format!("Fetch {url}"),
         ("web_search", Some(query)) => format!("Web search: {query}"),
-        ("spawn_agent", Some(task)) => format!("Sub-agent: {task}"),
+        ("agent_spawn", Some(task)) => format!("Sub-agent: {task}"),
         // Any other built-in or MCP (`mcp__server__tool`) tool: show its primary argument when one
         // was resolved (via the tool's JSON Schema), else fall back to the bare tool name.
         (other, Some(argument)) => format!("{other}: {argument}"),
@@ -3343,7 +3343,7 @@ mod tests {
         assert_eq!(tool_kind_for("search_contents"), ToolKind::Search);
         assert_eq!(tool_kind_for("execute_command"), ToolKind::Execute);
         assert_eq!(tool_kind_for("fetch_url"), ToolKind::Fetch);
-        assert_eq!(tool_kind_for("spawn_agent"), ToolKind::Think);
+        assert_eq!(tool_kind_for("agent_spawn"), ToolKind::Think);
         // MCP-loaded tools and anything else fall through.
         assert_eq!(tool_kind_for("mcp__github__create_issue"), ToolKind::Other);
         assert_eq!(tool_kind_for("scratchpad_write"), ToolKind::Other);

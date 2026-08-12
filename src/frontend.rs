@@ -252,7 +252,7 @@ pub enum FrontendEvent {
         title: Option<String>,
         items: Vec<TodoItem>,
     },
-    /// A sub-agent running under the `spawn_agent` tool call `tool_call_id` did something worth
+    /// A sub-agent running under the `agent_spawn` tool call `tool_call_id` did something worth
     /// showing. `summary` is the *whole* rolling activity block, not a delta, because ACP's
     /// `tool_call_update` replaces a tool call's content rather than appending to it.
     ///
@@ -325,7 +325,7 @@ pub enum PermissionOutcome {
 
 /// Frontend wrapper used by sub-agents when the parent is interactive enough to host permission
 /// prompts. Streaming output (text, thinking, todos, token usage) is dropped; sub-agents' final
-/// reports flow back through the parent's `spawn_agent` tool result, not through this frontend.
+/// reports flow back through the parent's `agent_spawn` tool result, not through this frontend.
 /// The exceptions are:
 ///
 /// - `Notice` — provider-side advisories the user should still see, e.g. a redaction during a
@@ -334,14 +334,14 @@ pub enum PermissionOutcome {
 ///   their original UI (REPL approval line, ACP `session/request_permission` /
 ///   `elicitation/create`).
 /// - `ToolCallStarted` — not forwarded as-is, but rolled up into
-///   [`FrontendEvent::SubAgentActivity`] against the parent's `spawn_agent` call so a long
+///   [`FrontendEvent::SubAgentActivity`] against the parent's `agent_spawn` call so a long
 ///   delegated task shows its progress instead of an opaque spinner.
 ///
-/// Constructed in [`crate::tools::subagent::SpawnAgentTool`] with the parent agent's frontend as
+/// Constructed in [`crate::tools::subagent::AgentSpawnTool`] with the parent agent's frontend as
 /// the delegate.
 pub struct PermissionForwardingFrontend {
     delegate: Arc<dyn Frontend>,
-    /// The parent's `tool_use_id` for the `spawn_agent` call this sub-agent is running under, when
+    /// The parent's `tool_use_id` for the `agent_spawn` call this sub-agent is running under, when
     /// one is in scope. `None` outside a tool call (tests, direct construction), which disables
     /// activity forwarding rather than guessing at a correlation id.
     tool_call_id: Option<String>,
@@ -386,7 +386,7 @@ impl Frontend for PermissionForwardingFrontend {
         match event {
             // Provider advisories about the sub-agent's request belong in the user's primary UI.
             FrontendEvent::Notice(_) => self.delegate.emit(event).await,
-            // Roll the sub-agent's tool calls up into the parent's `spawn_agent` tool call, so a
+            // Roll the sub-agent's tool calls up into the parent's `agent_spawn` tool call, so a
             // long-running sub-agent shows what it is doing instead of an opaque spinner. Only the
             // call being *started* is recorded: it answers "where is it now", which is the
             // question an unattended run leaves open, and results still arrive in the report.
@@ -413,7 +413,7 @@ impl Frontend for PermissionForwardingFrontend {
                         .await;
                 }
             }
-            // A nested sub-agent's activity is already summarised as a `spawn_agent` line in this
+            // A nested sub-agent's activity is already summarised as a `agent_spawn` line in this
             // sub-agent's own record; forwarding it too would have two writers fighting over one
             // tool call's content.
             FrontendEvent::SubAgentActivity { .. } => {}
@@ -625,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn test_permission_forwarding_frontend_drops_sub_agent_chrome() {
         // Sub-agent chrome (text, lifecycle, tool indicators) must NOT bubble up to the parent's
-        // UI; the sub-agent's report flows back via the spawn_agent tool result instead.
+        // UI; the sub-agent's report flows back via the agent_spawn tool result instead.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
@@ -738,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn test_permission_forwarding_frontend_drops_nested_sub_agent_activity() {
         // A nested sub-agent's roll-up must not reach the parent: it already appears as a
-        // `spawn_agent` line in this level's own record, and two writers on one tool call's
+        // `agent_spawn` line in this level's own record, and two writers on one tool call's
         // content would overwrite each other.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();

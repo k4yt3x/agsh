@@ -12,9 +12,12 @@
 /// `pre_exec` hook to use.
 #[derive(Debug, Clone)]
 pub enum SandboxCapability {
-    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+). Does NOT block
-    /// Unix-domain-socket mutation; dbus, systemd-user, etc. remain reachable. Prefer Bubblewrap
-    /// when available for full parity.
+    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+). Below ABI v9 the kernel
+    /// has no right governing `connect(2)` on a *pathname* Unix socket, so dbus and systemd-user
+    /// stay reachable and a confined process can have them write on its behalf; from v9 that right
+    /// is handled and granted nowhere, which also costs socket-based clients like `docker` and
+    /// `psql`. Prefer Bubblewrap when available: its tmpfs masks remove the sockets outright, on
+    /// every kernel.
     #[cfg(target_os = "linux")]
     Landlock { abi_version: i32 },
     /// Linux: read-only root bind via `bwrap --ro-bind /` plus tmpfs masks over `/tmp`, `/run`,
@@ -473,8 +476,11 @@ pub unsafe fn apply_landlock_readonly(abi_version: i32) -> Result<(), i32> {
         // Allow read + execute for the entire filesystem
         let root_fd = libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
         if root_fd < 0 {
+            // `close(2)` is permitted to set `errno` even on success, so read the failure reason
+            // before releasing the ruleset.
+            let error = *libc::__errno_location();
             libc::close(ruleset_fd);
-            return Err(*libc::__errno_location());
+            return Err(error);
         }
 
         let path_beneath = LandlockPathBeneathAttr {
@@ -491,17 +497,21 @@ pub unsafe fn apply_landlock_readonly(abi_version: i32) -> Result<(), i32> {
             &path_beneath as *const LandlockPathBeneathAttr,
             0u32,
         );
-        libc::close(root_fd);
         if ret < 0 {
+            let error = *libc::__errno_location();
+            libc::close(root_fd);
             libc::close(ruleset_fd);
-            return Err(*libc::__errno_location());
+            return Err(error);
         }
+        libc::close(root_fd);
 
         let ret = libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32);
-        libc::close(ruleset_fd);
         if ret < 0 {
-            return Err(*libc::__errno_location());
+            let error = *libc::__errno_location();
+            libc::close(ruleset_fd);
+            return Err(error);
         }
+        libc::close(ruleset_fd);
 
         Ok(())
     }
@@ -531,6 +541,9 @@ fn handled_access_for_abi(abi_version: i32) -> u64 {
     // ABI v4 added network access flags (BIND_TCP, CONNECT_TCP), not filesystem flags
     if abi_version >= 5 {
         access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+    if abi_version >= 9 {
+        access |= LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
     }
     access
 }
@@ -586,6 +599,14 @@ const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 #[cfg(target_os = "linux")]
 const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+/// ABI v9 (kernel 7.1). Mediates `connect(2)` and addressed `sendmsg(2)` on *pathname* Unix
+/// sockets, the class Landlock left entirely unmediated before it: the D-Bus system and session
+/// buses, and `/run/systemd/private`. Without this bit in `handled_access_fs` a confined process
+/// can hand work to a privileged daemon and have it done on its behalf, which is a complete bypass
+/// of the filesystem boundary rather than a gap in it. `scoped` covers only *abstract* sockets, so
+/// it does not reach these.
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 
 #[cfg(target_os = "linux")]
 const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
@@ -2014,6 +2035,17 @@ mod tests {
         assert!(access & LANDLOCK_ACCESS_FS_REFER != 0);
         assert!(access & LANDLOCK_ACCESS_FS_TRUNCATE != 0);
         assert!(access & LANDLOCK_ACCESS_FS_IOCTL_DEV == 0);
+    }
+
+    /// The root rule grants only execute, read-file and read-dir, so handling `RESOLVE_UNIX` is
+    /// what denies it: a sandboxed command cannot ask a daemon over the D-Bus or systemd socket to
+    /// write on its behalf. Taking the bit below v9 would make `landlock_create_ruleset` fail with
+    /// `EINVAL` and leave the process unconfined.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_handled_access_takes_resolve_unix_only_from_abi_v9() {
+        assert!(handled_access_for_abi(8) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX == 0);
+        assert!(handled_access_for_abi(9) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX != 0);
     }
 
     #[test]

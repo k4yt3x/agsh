@@ -352,6 +352,29 @@ pub struct SharedDeps {
     pub session_stats: Arc<stats::SessionStats>,
 }
 
+/// Warn once about `[tools]` and `[subagents]` entries that match nothing.
+///
+/// Called from both agent-assembly entry points. `meka acp` and `meka serve` build their agents
+/// through `build_shared_deps` and so used to emit no warning at all: a typo in either block denied
+/// nothing, silently, at every verbosity.
+fn warn_on_stale_tool_config(
+    config: &ResolvedConfig,
+    builtin_filter: &crate::tools::BuiltinToolFilter,
+) {
+    crate::tools::warn_on_stale_builtin_tool_config(builtin_filter);
+    crate::tools::warn_on_stale_subagent_config(
+        &crate::tools::ToolDenials::new(
+            config.subagents.disabled_servers.clone(),
+            config.subagents.disabled_tools.clone(),
+        ),
+        &config
+            .mcp_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
 /// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
@@ -423,6 +446,7 @@ pub async fn build_shared_deps(
         config.builtin_disabled_tools.clone(),
         config.builtin_tool_permissions.clone(),
     );
+    warn_on_stale_tool_config(&config, &builtin_filter);
 
     let context_window = crate::provider::model_metadata::resolve_model_metadata(
         config.context_window,
@@ -477,7 +501,6 @@ struct AgentAssembly<'a> {
     sandbox_capability: crate::sandbox::SandboxCapability,
     sandbox_backend: crate::config::SandboxBackend,
     backend_probe: crate::sandbox::BackendProbe,
-    user_instructions: Option<String>,
     session_manager: SessionManager,
     provider: Arc<dyn provider::Provider>,
     mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
@@ -486,7 +509,7 @@ struct AgentAssembly<'a> {
     builtin_filter: crate::tools::BuiltinToolFilter,
     agent_options: AgentOptions,
     session_stats: Arc<stats::SessionStats>,
-    /// Seeds the root `SpawnAgentTool`'s recursion budget from `session.subagent_max_depth`.
+    /// Seeds the root `AgentSpawnTool`'s recursion budget from `session.subagent_max_depth`.
     subagent_max_depth: usize,
     /// Gates the `schedule_*` tools and supplies their ceilings. Sub-agent registries get `None`
     /// instead; see `ToolRegistry::register_session_scoped_tools`.
@@ -494,12 +517,16 @@ struct AgentAssembly<'a> {
     /// Gates the `background` parameter and the `task_*` tools, and supplies the concurrency
     /// ceiling. Off by default; see `crate::config::BackgroundConfig`.
     background: crate::config::ResolvedBackgroundConfig,
+    /// Capabilities a spawned worker may never hold. Seeds the root `AgentSpawnTool`'s deny lists;
+    /// see `crate::config::SubagentsConfig`. What a worker *receives* is not configured at all,
+    /// and is granted per `agent_spawn` call.
+    subagents: crate::config::ResolvedSubagentsConfig,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
 /// `create_agent_from_config`. Builds the shared todo list / scratchpad cell, the tool registry
 /// (with the session's cwd / permission / frontend baked into the builtins), registers
-/// `spawn_agent` and the MCP resource meta-tools, attaches the registry to the MCP manager, and
+/// `agent_spawn` and the MCP resource meta-tools, attaches the registry to the MCP manager, and
 /// finally constructs the `Agent` itself.
 ///
 /// **MCP attach-before-connector invariant**: the caller is expected to either (a) already have run
@@ -542,34 +569,48 @@ async fn assemble_agent(
         (bundle.background.clone(), background_tasks.clone()),
     )?;
 
-    // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `spawn_agent`); `>= 1`
+    // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `agent_spawn`); `>= 1`
     // seeds the root's soft recursion budget. The `absolute_depth` starts at 0 for the root.
-    if bundle.subagent_max_depth >= 1 && bundle.builtin_filter.admits("spawn_agent") {
-        tool_registry.register(Arc::new(crate::tools::subagent::SpawnAgentTool {
-            provider: Arc::clone(&bundle.provider),
-            parent_permission: shared_permission.clone(),
-            tool_builder_params: crate::tools::subagent::ToolBuilderParams {
-                web_client: bundle.web_client.clone(),
-                sandbox_enabled: bundle.sandbox_enabled,
-                sandbox_capability: bundle.sandbox_capability.clone(),
-                sandbox_backend: bundle.sandbox_backend,
-                backend_probe: bundle.backend_probe.clone(),
-                builtin_filter: bundle.builtin_filter.clone(),
-                skills: bundle.skills.clone(),
-                memories: bundle.memories.clone(),
-                mcp_manager: bundle.mcp_manager.map(Arc::downgrade),
-                session_manager: bundle.session_manager.clone(),
-                parent_shared_session_id: shared_session_id.clone(),
-                session_stats: Arc::clone(&bundle.session_stats),
-                parent_options: bundle.agent_options.clone(),
-                parent_cwd: Arc::clone(&cwd),
-                parent_roots: Arc::clone(&roots),
-                parent_frontend: Arc::clone(&frontend),
+    if bundle.subagent_max_depth >= 1 {
+        crate::tools::subagent::register_subagent_tools(
+            &tool_registry,
+            crate::tools::subagent::AgentSpawnTool {
+                provider: Arc::clone(&bundle.provider),
+                parent_permission: shared_permission.clone(),
+                tool_builder_params: crate::tools::subagent::ToolBuilderParams {
+                    web_client: bundle.web_client.clone(),
+                    sandbox_enabled: bundle.sandbox_enabled,
+                    sandbox_capability: bundle.sandbox_capability.clone(),
+                    sandbox_backend: bundle.sandbox_backend,
+                    backend_probe: bundle.backend_probe.clone(),
+                    builtin_filter: bundle.builtin_filter.clone(),
+                    skills: bundle.skills.clone(),
+                    memories: bundle.memories.clone(),
+                    // The primary agent holds the whole store, so that is the ceiling on what it
+                    // can grant a worker. Whether a worker gets anything is
+                    // decided per `agent_spawn` call, and defaults to nothing.
+                    memory_access: crate::config::MemoryAccess::Write,
+                    config_denials: crate::tools::ToolDenials::new(
+                        bundle.subagents.disabled_servers.clone(),
+                        bundle.subagents.disabled_tools.clone(),
+                    ),
+                    mcp_manager: bundle.mcp_manager.map(Arc::downgrade),
+                    session_manager: bundle.session_manager.clone(),
+                    parent_shared_session_id: shared_session_id.clone(),
+                    session_stats: Arc::clone(&bundle.session_stats),
+                    parent_options: bundle.agent_options.clone(),
+                    parent_cwd: Arc::clone(&cwd),
+                    parent_roots: Arc::clone(&roots),
+                    parent_frontend: Arc::clone(&frontend),
+                },
+                inherited_denials: crate::tools::ToolDenials::new(
+                    bundle.subagents.disabled_servers.clone(),
+                    bundle.subagents.disabled_tools.clone(),
+                ),
+                remaining_depth: bundle.subagent_max_depth,
+                absolute_depth: 0,
             },
-            user_instructions: bundle.user_instructions.clone(),
-            remaining_depth: bundle.subagent_max_depth,
-            absolute_depth: 0,
-        }))?;
+        )?;
     }
 
     if let Some(manager) = bundle.mcp_manager {
@@ -630,7 +671,6 @@ pub async fn build_session_agent(
         sandbox_capability: shared.sandbox_capability.clone(),
         sandbox_backend: shared.config.sandbox_backend,
         backend_probe: shared.config.backend_probe.clone(),
-        user_instructions: shared.config.user_instructions.clone(),
         session_manager: shared.session_manager.clone(),
         provider: Arc::clone(&shared.provider),
         mcp_manager: shared.mcp_manager.as_ref(),
@@ -640,6 +680,7 @@ pub async fn build_session_agent(
         agent_options: shared.agent_options.clone(),
         session_stats: Arc::clone(&shared.session_stats),
         subagent_max_depth: shared.config.subagent_max_depth,
+        subagents: shared.config.subagents.clone(),
     };
     assemble_agent(bundle, shared_permission, frontend, cwd, roots).await
 }
@@ -725,8 +766,8 @@ async fn create_agent_from_config(
     );
 
     // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
-    // sub-agents to inherit `sandboxed_shell` / `context_messages` / `user_instructions` via
-    // `Agent::new_subagent`.
+    // sub-agents to inherit `sandboxed_shell` / `context_messages` / the auto-compaction settings
+    // via `Agent::new_subagent`. `user_instructions` is deliberately not among them.
     let context_window = crate::provider::model_metadata::resolve_model_metadata(
         config.context_window,
         &provider,
@@ -757,7 +798,6 @@ async fn create_agent_from_config(
         sandbox_capability,
         sandbox_backend: config.sandbox_backend,
         backend_probe: config.backend_probe.clone(),
-        user_instructions: config.user_instructions.clone(),
         session_manager: session_manager.clone(),
         provider: Arc::clone(&provider),
         mcp_manager,
@@ -767,6 +807,7 @@ async fn create_agent_from_config(
         agent_options: agent_options.clone(),
         session_stats: Arc::clone(&session_stats),
         subagent_max_depth: config.subagent_max_depth,
+        subagents: config.subagents.clone(),
     };
     let (agent, _tool_registry) = assemble_agent(
         bundle,
@@ -779,7 +820,7 @@ async fn create_agent_from_config(
     )
     .await?;
 
-    crate::tools::warn_on_stale_builtin_tool_config(&builtin_filter);
+    warn_on_stale_tool_config(config, &builtin_filter);
 
     if let Some(manager) = mcp_manager {
         // Kick off the background connector. Each server's adapters are pushed through
@@ -1955,6 +1996,11 @@ struct ExportedSession {
     /// single-root sessions those exports describe.
     #[serde(default)]
     additional_roots: Vec<std::path::PathBuf>,
+    /// A sub-agent's spawn terms. `#[serde(default)]` for the same reason as `additional_roots`:
+    /// an archive written before the field existed is still importable, and its sub-agents simply
+    /// come back unfollowable rather than unimportable.
+    #[serde(default)]
+    subagent_spec_json: Option<String>,
     stats: crate::stats::SessionStatsSnapshot,
     events: Vec<ExportedEvent>,
     tool_outputs: std::collections::BTreeMap<String, String>,
@@ -2053,6 +2099,7 @@ async fn build_session_export(
             permission: meta.permission,
             capabilities_json: meta.capabilities_json,
             additional_roots: meta.additional_roots,
+            subagent_spec_json: meta.subagent_spec_json,
             stats,
             events,
             tool_outputs,
@@ -2229,6 +2276,7 @@ fn plan_import(
             permission: session.permission,
             capabilities_json: session.capabilities_json,
             additional_roots: session.additional_roots,
+            subagent_spec_json: session.subagent_spec_json,
             stats: session.stats,
             events: session
                 .events
@@ -3579,9 +3627,11 @@ mod tests {
             .await
             .expect("stats");
 
-        // A sub-agent child of the root.
+        // A sub-agent child of the root, with the spawn terms `agent_followup` reconstructs from.
+        // An archive that drops these imports a worker nobody can resume.
+        let child_spec = r#"{"permission":"read","enabled_permissions":["read"],"denied_servers":["mekabridge"],"denied_tools":[],"memory":"none","inherited_scratchpad":[],"remaining_depth":0,"absolute_depth":1}"#;
         let child = manager
-            .create_child_session(root, None)
+            .create_child_session(root, None, Some(child_spec.to_string()))
             .await
             .expect("child");
         for event in [
@@ -3615,6 +3665,29 @@ mod tests {
             .find(|meta| meta.id != root_new_id)
             .expect("child present");
         assert_eq!(child_new.parent_id, Some(root_new_id));
+        // The spawn terms survived export -> JSON -> import. This is also the column-alignment
+        // check on `import_sessions`' 17-parameter INSERT: reading the spec back verbatim off a
+        // different column would surface here as a mismatch rather than silently.
+        assert_eq!(
+            manager
+                .load_subagent_spec(child_new.id)
+                .await
+                .expect("load spec"),
+            Some(child_spec.to_string()),
+        );
+        assert_eq!(
+            manager
+                .load_subagent_spec(root_new_id)
+                .await
+                .expect("load root spec"),
+            None,
+            "a top-level session has no spawn terms",
+        );
+        assert_eq!(
+            child_new.cwd, None,
+            "and neighbouring columns are undisturbed"
+        );
+        assert_eq!(child_new.permission, None);
 
         // The event log round-trips byte-for-byte against the untouched original.
         let imported = manager
@@ -3796,6 +3869,7 @@ mod tests {
             permission: None,
             capabilities_json: None,
             additional_roots: Vec::new(),
+            subagent_spec_json: None,
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
             tool_outputs: Vec::new(),

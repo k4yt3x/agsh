@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolOutput, util::require_str};
+use super::{Tool, ToolDenials, ToolOutput, util::require_str};
 use crate::{
     error::{MekaError, Result},
     mcp::{MAX_MCP_DESCRIPTION_LENGTH, McpClientManager, sanitize::sanitize_text, truncate},
@@ -38,8 +38,45 @@ fn no_such_server(tool_name: &str, server: &str, available: &[String]) -> MekaEr
     }
 }
 
+/// Servers a denied sub-agent may still name. Every meta-tool routes its server argument through
+/// this rather than [`McpClientManager::server_names`] directly.
+///
+/// Without it `disabled_servers` would be a tool-list filter and nothing more: the meta-tools take
+/// a server by name and never consult the registry, so a worker denied `mekabridge` could still
+/// read its resources and render its prompts. A denial that covers only one of the three surfaces a
+/// server exposes is not a denial.
+fn visible_servers(manager: &McpClientManager, denials: &ToolDenials) -> Vec<String> {
+    manager
+        .server_names()
+        .into_iter()
+        .filter(|name| !denials.denies_server(name))
+        .collect()
+}
+
+/// Resolve a caller-named server, refusing denied ones the same way an unconfigured name is
+/// refused. Deliberately indistinguishable: telling a worker "that server exists but you may not
+/// have it" hands it the server list its denial was meant to withhold.
+fn visible_server_entry(
+    tool_name: &str,
+    manager: &McpClientManager,
+    denials: &ToolDenials,
+    server: &str,
+) -> Result<Arc<crate::mcp::ServerEntry>> {
+    if denials.denies_server(server) {
+        return Err(no_such_server(
+            tool_name,
+            server,
+            &visible_servers(manager, denials),
+        ));
+    }
+    manager
+        .server_entry(server)
+        .ok_or_else(|| no_such_server(tool_name, server, &visible_servers(manager, denials)))
+}
+
 pub(crate) struct ListMcpResourcesTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -79,16 +116,10 @@ impl Tool for ListMcpResourcesTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            if self.manager.server_entry(name).is_none() {
-                return Err(no_such_server(
-                    "list_mcp_resources",
-                    name,
-                    &self.manager.server_names(),
-                ));
-            }
+            visible_server_entry("list_mcp_resources", &self.manager, &self.denials, name)?;
             vec![name.clone()]
         } else {
-            self.manager.server_names()
+            visible_servers(&self.manager, &self.denials)
         };
 
         if names.is_empty() {
@@ -145,6 +176,7 @@ impl Tool for ListMcpResourcesTool {
 
 pub(crate) struct ReadMcpResourceTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -186,9 +218,8 @@ impl Tool for ReadMcpResourceTool {
         let server = require_str(&input, "server", "read_mcp_resource")?;
         let uri = require_str(&input, "uri", "read_mcp_resource")?;
 
-        let entry = self.manager.server_entry(&server).ok_or_else(|| {
-            no_such_server("read_mcp_resource", &server, &self.manager.server_names())
-        })?;
+        let entry =
+            visible_server_entry("read_mcp_resource", &self.manager, &self.denials, &server)?;
 
         let result = crate::mcp::read_resource(&entry, uri.clone()).await?;
 
@@ -276,6 +307,7 @@ fn format_resource_contents(
 
 pub(crate) struct ListMcpPromptsTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -315,16 +347,10 @@ impl Tool for ListMcpPromptsTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            if self.manager.server_entry(name).is_none() {
-                return Err(no_such_server(
-                    "list_mcp_prompts",
-                    name,
-                    &self.manager.server_names(),
-                ));
-            }
+            visible_server_entry("list_mcp_prompts", &self.manager, &self.denials, name)?;
             vec![name.clone()]
         } else {
-            self.manager.server_names()
+            visible_servers(&self.manager, &self.denials)
         };
 
         if names.is_empty() {
@@ -390,6 +416,7 @@ impl Tool for ListMcpPromptsTool {
 
 pub(crate) struct GetMcpPromptTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -440,9 +467,7 @@ impl Tool for GetMcpPromptTool {
 
         let arguments = input.get("arguments").and_then(|v| v.as_object()).cloned();
 
-        let entry = self.manager.server_entry(&server).ok_or_else(|| {
-            no_such_server("get_mcp_prompt", &server, &self.manager.server_names())
-        })?;
+        let entry = visible_server_entry("get_mcp_prompt", &self.manager, &self.denials, &server)?;
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments).await?;
 
@@ -509,59 +534,69 @@ impl Tool for GetMcpPromptTool {
 #[allow(clippy::expect_used)]
 pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClientManager>) {
     // Skip registration if no servers are configured. These tools rely on the manager and there's
-    // nothing useful to do without at least one.
-    if manager.server_names().is_empty() {
+    // nothing useful to do without at least one. A sub-agent denied every configured server is in
+    // exactly that position, so it takes the same exit: seven tools that can only answer "unknown
+    // server" are worse than no tools, because the model spends turns discovering that.
+    let denials = Arc::new(registry.denials().clone());
+    if visible_servers(&manager, &denials).is_empty() {
         return;
     }
-    registry
-        .register(Arc::new(ListMcpResourcesTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin list_mcp_resources tool name collision");
-    registry
-        .register(Arc::new(ReadMcpResourceTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin read_mcp_resource tool name collision");
-    registry
-        .register(Arc::new(ListMcpPromptsTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin list_mcp_prompts tool name collision");
-    registry
-        .register(Arc::new(GetMcpPromptTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin get_mcp_prompt tool name collision");
-    registry
-        .register(Arc::new(SubscribeMcpResourceTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin subscribe_mcp_resource tool name collision");
-    registry
-        .register(Arc::new(UnsubscribeMcpResourceTool {
-            manager: Arc::clone(&manager),
-        }))
-        .expect("builtin unsubscribe_mcp_resource tool name collision");
-    registry
-        .register(Arc::new(ListMcpResourceUpdatesTool))
-        .expect("builtin list_mcp_resource_updates tool name collision");
+    // These seven are registered directly rather than through `register_builtin`, so they only
+    // honour the `[tools]` block-list and the sub-agent deny list if this asks. Without it, naming
+    // one in `disabled_tools` did nothing at all. `admits_infrastructure` deliberately ignores
+    // `allowed_tools`, which never reached these and would silently delete them from any install
+    // that has one.
+    //
+    // All seven are discovery-style helpers, so each is marked deferred: they stay out of the tool
+    // list until a prompt/resource-focused flow needs them, and the registry's auto-activate path
+    // promotes them when invoked.
+    // Marking deferred rides along in the same macro: a deferred marker for a tool that was never
+    // registered is a name `load_tool` would offer and then fail to find.
+    macro_rules! register_meta {
+        ($name:expr, $tool:expr) => {
+            if registry.admits_infrastructure($name) {
+                registry.register(Arc::new($tool)).expect(concat!(
+                    "builtin ",
+                    $name,
+                    " tool name collision"
+                ));
+                registry.mark_deferred($name);
+            }
+        };
+    }
+    register_meta!("list_mcp_resources", ListMcpResourcesTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("read_mcp_resource", ReadMcpResourceTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("list_mcp_prompts", ListMcpPromptsTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("get_mcp_prompt", GetMcpPromptTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("subscribe_mcp_resource", SubscribeMcpResourceTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("unsubscribe_mcp_resource", UnsubscribeMcpResourceTool {
+        manager: Arc::clone(&manager),
+        denials: Arc::clone(&denials),
+    });
+    register_meta!("list_mcp_resource_updates", ListMcpResourceUpdatesTool {
+        denials
+    });
     drop(manager);
-
-    // These tools are discovery-style helpers; mark them deferred so they don't clutter the tool
-    // list until a prompt/resource-focused flow is activated. The registry's auto-activate path
-    // already promotes them to the API when invoked.
-    registry.mark_deferred("list_mcp_resources");
-    registry.mark_deferred("read_mcp_resource");
-    registry.mark_deferred("list_mcp_prompts");
-    registry.mark_deferred("get_mcp_prompt");
-    registry.mark_deferred("subscribe_mcp_resource");
-    registry.mark_deferred("unsubscribe_mcp_resource");
-    registry.mark_deferred("list_mcp_resource_updates");
 }
 
 pub(crate) struct SubscribeMcpResourceTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -596,13 +631,12 @@ impl Tool for SubscribeMcpResourceTool {
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "subscribe_mcp_resource")?;
         let uri = require_str(&input, "uri", "subscribe_mcp_resource")?;
-        let entry = self.manager.server_entry(&server).ok_or_else(|| {
-            no_such_server(
-                "subscribe_mcp_resource",
-                &server,
-                &self.manager.server_names(),
-            )
-        })?;
+        let entry = visible_server_entry(
+            "subscribe_mcp_resource",
+            &self.manager,
+            &self.denials,
+            &server,
+        )?;
         crate::mcp::subscribe_resource(&entry, uri.clone())
             .await
             .map_err(|error| MekaError::ToolExecution {
@@ -618,6 +652,7 @@ impl Tool for SubscribeMcpResourceTool {
 
 pub(crate) struct UnsubscribeMcpResourceTool {
     pub manager: Arc<McpClientManager>,
+    pub denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -649,13 +684,12 @@ impl Tool for UnsubscribeMcpResourceTool {
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "unsubscribe_mcp_resource")?;
         let uri = require_str(&input, "uri", "unsubscribe_mcp_resource")?;
-        let entry = self.manager.server_entry(&server).ok_or_else(|| {
-            no_such_server(
-                "unsubscribe_mcp_resource",
-                &server,
-                &self.manager.server_names(),
-            )
-        })?;
+        let entry = visible_server_entry(
+            "unsubscribe_mcp_resource",
+            &self.manager,
+            &self.denials,
+            &server,
+        )?;
         crate::mcp::unsubscribe_resource(&entry, uri.clone())
             .await
             .map_err(|error| MekaError::ToolExecution {
@@ -669,7 +703,9 @@ impl Tool for UnsubscribeMcpResourceTool {
     }
 }
 
-pub(crate) struct ListMcpResourceUpdatesTool;
+pub(crate) struct ListMcpResourceUpdatesTool {
+    pub denials: Arc<ToolDenials>,
+}
 
 #[async_trait]
 impl Tool for ListMcpResourceUpdatesTool {
@@ -693,7 +729,12 @@ impl Tool for ListMcpResourceUpdatesTool {
         _input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let updates = crate::mcp::resource_updates::snapshot();
+        // The update log is process-wide, so a parent's subscription to a denied server would show
+        // that server's resource URIs to a worker that cannot otherwise see it exists.
+        let updates: Vec<_> = crate::mcp::resource_updates::snapshot()
+            .into_iter()
+            .filter(|(server, _uri, _stamp)| !self.denials.denies_server(server))
+            .collect();
         if updates.is_empty() {
             return Ok(ToolOutput::text(
                 "(no MCP resource updates recorded)".to_string(),

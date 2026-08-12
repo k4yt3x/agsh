@@ -7,7 +7,7 @@ meka uses a four-level permission system to control what tools the agent can use
 | Level | Indicator | Allowed Tools |
 |-------|-----------|---------------|
 | **None** | `[n]` (green) | No tools. The agent can only respond with text. |
-| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`, `execute_command` (sandboxed), `todo`, `spawn_agent`, scratchpad tools |
+| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`, `execute_command` (sandboxed), `todo`, `agent_spawn`, scratchpad tools |
 | **Ask** | `[a]` (magenta) | All tools, but each call requires user approval (Y/n prompt) |
 | **Write** | `[w]` (red) | All tools without restrictions: `write_file`, `edit_file`, `execute_command` (unsandboxed) |
 
@@ -102,7 +102,7 @@ Any built-in tool's required permission can be overridden from `config.toml` wit
 
 ### Sub-agent permissions
 
-Sub-agents spawned via `spawn_agent` inherit the parent's permission level by default. In write mode the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; in read mode it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `spawn_agent({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. Alternatively, cycle the parent into a lower mode before issuing the spawning prompt to restrict every sub-agent it spawns.
+Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. In write mode the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; in read mode it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. Alternatively, cycle the parent into a lower mode before issuing the spawning prompt to restrict every sub-agent it spawns.
 
 ## Examples
 
