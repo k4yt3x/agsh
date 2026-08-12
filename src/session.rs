@@ -3046,6 +3046,29 @@ impl TokenStore {
             })
     }
 
+    /// Every profile name that has a stored credential, sorted.
+    ///
+    /// Credentials are keyed by profile name and nothing enforces that the name still exists in
+    /// `config.toml`: deleting a `[providers.<name>]` block by hand leaves its API key or OAuth
+    /// refresh token here indefinitely. Without this query the leftover cannot be named, so it
+    /// cannot be reported or removed; `meka provider list` diffs the result against the configured
+    /// profiles.
+    pub async fn list_credential_profiles(&self) -> Result<Vec<String>> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection
+                    .prepare("SELECT profile FROM provider_credentials ORDER BY profile")?;
+                let profiles = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(profiles)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to list provider credentials: {}", error))
+            })
+    }
+
     pub async fn load_mcp_credentials(&self, server_name: &str) -> Result<Option<String>> {
         let server_name = server_name.to_string();
         self.connection
@@ -3104,6 +3127,28 @@ impl TokenStore {
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to clear MCP credentials: {}", error))
+            })
+    }
+
+    /// Every MCP server name that has stored OAuth credentials, sorted.
+    ///
+    /// The counterpart to [`Self::list_credential_profiles`], and stale for the same reason:
+    /// deleting an `[[mcp.servers]]` entry by hand strands its OAuth bundle here. `meka mcp list`
+    /// diffs the result against the configured servers.
+    pub async fn list_mcp_credential_servers(&self) -> Result<Vec<String>> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT server_name FROM mcp_oauth_credentials ORDER BY server_name",
+                )?;
+                let servers = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(servers)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to list MCP credentials: {}", error))
             })
     }
 
@@ -5892,6 +5937,68 @@ mod tests {
             .delete_provider_credential("work")
             .await
             .expect("delete missing is a no-op");
+    }
+
+    /// The listing queries exist so a credential whose config entry was deleted by hand can still
+    /// be named. Nothing else in the codebase enumerates either table, so an unlisted row is an
+    /// invisible one: a live API key or OAuth refresh token no surface can report or remove.
+    #[tokio::test]
+    async fn test_credential_listings_name_every_stored_row() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        assert!(
+            store
+                .list_credential_profiles()
+                .await
+                .expect("list empty")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_mcp_credential_servers()
+                .await
+                .expect("list empty")
+                .is_empty()
+        );
+
+        store
+            .save_provider_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save work");
+        store
+            .save_provider_credential("archive", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save archive");
+        store
+            .save_mcp_credentials("linear", r#"{"tokens":{"access_token":"at"}}"#)
+            .await
+            .expect("save linear");
+
+        // Sorted, so the reported order doesn't depend on insertion order.
+        assert_eq!(store.list_credential_profiles().await.expect("list"), vec![
+            "archive".to_string(),
+            "work".to_string()
+        ]);
+        assert_eq!(
+            store.list_mcp_credential_servers().await.expect("list"),
+            vec!["linear".to_string()]
+        );
+
+        // The two tables are independent: clearing one must not hide rows in the other.
+        store
+            .delete_provider_credential("work")
+            .await
+            .expect("delete");
+        assert_eq!(store.list_credential_profiles().await.expect("list"), vec![
+            "archive".to_string()
+        ]);
+        assert_eq!(
+            store.list_mcp_credential_servers().await.expect("list"),
+            vec!["linear".to_string()]
+        );
     }
 
     async fn job_fixture(

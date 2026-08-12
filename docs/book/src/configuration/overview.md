@@ -60,3 +60,8 @@ acquired interactively:
 
 Because secrets are keyed per profile, two profiles using the same backend (for example, two Claude
 accounts) keep independent credentials.
+
+Deleting a `[providers.<name>]` block by hand removes the settings but not the secret, which stays in
+the database under that name. `meka provider list` names any credential left that way, and `meka
+provider remove <name>` deletes it; see [Leftover
+credentials](./config-file.md#leftover-credentials).

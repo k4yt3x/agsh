@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `provider list` and `mcp list` now report stored credentials that no config entry claims.
 - A live `Thinking... (150 tokens)` indicator, so redacted reasoning is no longer a silent pause.
 - Background tool calls: `background: true` returns a task id and reports the result later.
 - A background task always reports back, including as `interrupted` when a restart killed it.
@@ -28,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mcp remove` clears the credential of a server deleted from config by hand instead of refusing.
+- `provider remove` no longer reports success for a name with no profile and no credential.
 - `edit_file` overwrote a file that changed after the read; it now reports the change instead.
 - Under ACP, `read_file` with `regex` searched the file on disk rather than the editor's copy.
 - A wrong-typed `scratchpad` argument is refused, rather than silently discarding the output.

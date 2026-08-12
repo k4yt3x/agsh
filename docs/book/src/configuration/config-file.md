@@ -193,16 +193,42 @@ config file.
 | Command | Action |
 |---|---|
 | `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-oauth` / `openai-codex`, API-key prompt for `claude-api` / `openai-api`). Sets `default_provider` when it's the first profile. |
-| `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. |
+| `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
 | `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
-| `meka provider remove <name>` | Logout + delete: best-effort revoke the OAuth token, delete the stored credential from the database, and remove the `[providers.<name>]` entry from the config file. |
+| `meka provider remove <name>` | Logout + delete: best-effort revoke the OAuth token, delete the stored credential from the database, and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
 
 ```console
 $ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-api --model gpt-4o --api-key-stdin
 ```
+
+### Leftover credentials
+
+Adding a profile by hand works: write a `[providers.<name>]` block, then run `meka provider login
+<name>` to attach the credential. Deleting one by hand is only half the job. Credentials live in the
+database keyed by profile name, so removing the block takes the settings away and leaves the API key
+or OAuth refresh token behind, still valid.
+
+Nothing deletes it on your behalf. meka will not sweep the database against the config at startup:
+`MEKA_CONFIG_DIR` and `MEKA_DATA_DIR` are independent, so a config read from the wrong place, or one
+meka could not parse, would present as "no profiles configured" against a real database and take
+every credential with it. Losing an OAuth refresh token that way means redoing the browser login for
+each account.
+
+Instead, `meka provider list` reports what it finds:
+
+```console
+$ meka provider list
+Name  Type        Model          Authenticated  Default
+work  claude-api  claude-opus-5  yes            *
+
+Stored credentials with no profile: archive
+```
+
+`meka provider remove archive` then deletes it. The same applies to MCP servers, reported by [`meka
+mcp list`](#meka-mcp-cli) and cleaned by `meka mcp remove <name>`.
 
 ## Examples
 
@@ -734,10 +760,10 @@ Manage configured servers without editing `config.toml` by hand:
 
 | Command | Action |
 |---|---|
-| `meka mcp list` | Print all configured servers. |
+| `meka mcp list` | Print all configured servers, plus any stored OAuth credential that no server claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka mcp get <name>` | Print full details for one server. |
 | `meka mcp add <name> <url-or-command> [args...] [flags]` | Persist a server. Transport is auto-detected: a URL starting with `http[s]://` means HTTP, anything else means stdio. Preserves existing formatting/comments via `toml_edit`. |
-| `meka mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. |
+| `meka mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. A name with stored credentials but no config entry is cleaned rather than refused. |
 | `meka mcp disable <name>` | Set `disabled = true` on the server entry. The next `meka` start skips it entirely. |
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
 | `meka mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |

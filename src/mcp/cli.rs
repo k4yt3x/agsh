@@ -22,9 +22,15 @@ fn config_err(message: impl Into<String>) -> MekaError {
 pub async fn run_list(
     servers: &[McpServerConfig],
     manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
+    token_store: &TokenStore,
 ) -> Result<()> {
+    // Computed before the early return below: "every server is gone but the OAuth bundles are still
+    // here" is precisely the state worth reporting, and it is the one that return would hide.
+    let orphans = orphaned_credentials(servers, token_store).await?;
+
     if servers.is_empty() {
         println!("(no MCP servers configured)");
+        report_orphaned_credentials(&orphans);
         return Ok(());
     }
 
@@ -110,7 +116,46 @@ pub async fn run_list(
         &["Name", "Transport", "Required", "Permission", "Target"]
     };
     print!("{}", crate::render::format_columns(headers, &rows));
+    report_orphaned_credentials(&orphans);
     Ok(())
+}
+
+/// Server names holding stored OAuth credentials that no configured server claims.
+///
+/// Credentials are keyed by server name and nothing deletes them when the `[[mcp.servers]]` entry
+/// goes away by hand, so an OAuth bundle can outlive its server indefinitely. This diff is the only
+/// thing that can name one, and `meka mcp remove <name>` then clears it.
+///
+/// Safe to compute here only because every caller of `run_list` has already failed on an unreadable
+/// config. An empty server list that came from a config meka could not parse would report every
+/// credential in the database as an orphan.
+async fn orphaned_credentials(
+    servers: &[McpServerConfig],
+    token_store: &TokenStore,
+) -> Result<Vec<String>> {
+    Ok(token_store
+        .list_mcp_credential_servers()
+        .await?
+        .into_iter()
+        .filter(|name| !servers.iter().any(|config| &config.name == name))
+        .collect())
+}
+
+/// Print the orphan block, if there is one. The names go to stdout with the rest of the answer --
+/// hiding them behind a stderr-only note is how they stayed invisible in the first place -- and the
+/// instruction for acting on them is a stderr hint.
+fn report_orphaned_credentials(orphans: &[String]) {
+    if orphans.is_empty() {
+        return;
+    }
+    println!();
+    println!("Stored credentials with no server: {}", orphans.join(", "));
+    // Says only what the diff proves: the config no longer names this server. Deleting the entry by
+    // hand is the usual cause, but a rollback that itself failed leaves the same trace.
+    crate::render::render_hint(
+        "left over from a server that is no longer configured; \
+         delete one with `meka mcp remove <name>`",
+    );
 }
 
 /// Run `meka mcp get <name>`. Prints a single server config in detail.
@@ -1343,12 +1388,27 @@ fn insert_string_array(table: &mut toml_edit::Table, key: &str, values: Option<&
     table.insert(key, toml_edit::Item::Value(toml_edit::Value::Array(arr)));
 }
 
+/// What [`purge_server`] found to remove.
+enum Purged {
+    /// The `[[mcp.servers]]` entry was removed, along with any local state.
+    Server(std::path::PathBuf),
+    /// There was no config entry, but stored credentials were cleared: the leftover of a server
+    /// deleted from `config.toml` by hand.
+    CredentialsOnly,
+}
+
 /// Wipe every trace of `name`: the `[[mcp.servers]]` entry in `config.toml`, any stored OAuth
 /// credentials (revoked server-side via RFC 7009 first, best-effort), the auth-probe cache row, and
 /// any resource-update ledger entries. Silent: callers print their own user-facing line. Used by
 /// both `run_remove` (user-invoked) and `run_add`'s auto-login rollback path (on OAuth failure
 /// after the config entry has already been written).
-async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path::PathBuf> {
+///
+/// A missing config entry is only an error when there is nothing else to remove either. This is the
+/// one command that deletes an MCP credential as part of deleting a server, so refusing on a name
+/// that is absent from `config.toml` would strand the OAuth bundle of a server whose entry was
+/// deleted by hand: no surface would clear it, and until `mcp list` learned to report it, none
+/// would even name it.
+async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
     let existing = std::fs::read_to_string(&path)
@@ -1357,30 +1417,39 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| config_err(format!("failed to parse config: {}", error)))?;
 
-    let servers = document
+    let removed_from_config = document
         .get_mut("mcp")
         .and_then(|m| m.as_table_mut())
         .and_then(|t| t.get_mut("servers"))
-        .and_then(|s| s.as_array_of_tables_mut());
+        .and_then(|s| s.as_array_of_tables_mut())
+        .is_some_and(|servers| {
+            let original_len = servers.len();
+            servers.retain(|entry| entry.get("name").and_then(|v| v.as_str()) != Some(name));
+            servers.len() != original_len
+        });
 
-    let Some(servers) = servers else {
-        return Err(config_err(
-            "no MCP servers in config; nothing to remove".to_string(),
-        ));
-    };
-
-    let original_len = servers.len();
-    servers.retain(|entry| entry.get("name").and_then(|v| v.as_str()) != Some(name));
-    if servers.len() == original_len {
-        return Err(config_err(format!("no server named '{}' in config", name)));
+    if !removed_from_config {
+        if token_store.load_mcp_credentials(name).await?.is_none() {
+            return Err(config_err(format!("no server named '{}' in config", name)));
+        }
+        clear_server_state(name, token_store).await?;
+        return Ok(Purged::CredentialsOnly);
     }
 
     crate::config::write_file_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
 
-    // Best-effort OAuth token revocation per RFC 7009 before we drop the local credentials. If the
-    // caller is rolling back a never-succeeded login there won't be any credentials;
-    // `revoke_stored_token` early- returns in that case so the call is safe regardless.
+    clear_server_state(name, token_store).await?;
+    Ok(Purged::Server(path))
+}
+
+/// Drop everything meka stores about `name` outside `config.toml`: the OAuth bundle (revoked
+/// server-side via RFC 7009 first, best-effort), the auth-probe cache row, and the resource-update
+/// ledger. Shared by both of [`purge_server`]'s exits so a leftover credential is cleaned as
+/// thoroughly as one attached to a real server.
+async fn clear_server_state(name: &str, token_store: &TokenStore) -> Result<()> {
+    // If the caller is rolling back a never-succeeded login there won't be any credentials;
+    // `revoke_stored_token` early-returns in that case so the call is safe regardless.
     if let Err(error) = crate::mcp::auth::revoke_stored_token(token_store, name).await {
         tracing::warn!(
             "failed to revoke token at server '{}' during purge: {} (continuing)",
@@ -1392,14 +1461,19 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
     token_store.clear_mcp_credentials(name).await?;
     token_store.clear_auth_probe(name).await?;
     crate::mcp::resource_updates::clear_for_server(name);
-    Ok(path)
+    Ok(())
 }
 
 /// Run `meka mcp remove <name>`: delete the entry from config.toml, best-effort revoke OAuth
 /// tokens at the provider, clear local state.
 pub async fn run_remove(name: &str, token_store: &TokenStore) -> Result<()> {
-    let path = purge_server(name, token_store).await?;
-    tracing::info!("removed '{}' from {}", name, path.display());
+    match purge_server(name, token_store).await? {
+        Purged::Server(path) => tracing::info!("removed '{}' from {}", name, path.display()),
+        Purged::CredentialsOnly => tracing::info!(
+            "cleared stored credentials for '{}'; no server was configured",
+            name
+        ),
+    }
     Ok(())
 }
 
@@ -1709,5 +1783,93 @@ mod tests {
     #[test]
     fn describe_one_line_empty_passes_through() {
         assert_eq!(describe_one_line(""), "");
+    }
+
+    fn server_named(name: &str) -> McpServerConfig {
+        let resolved = resolve_add_args(bare_add(name, Some("https://example.test/mcp")))
+            .expect("resolve add args");
+        resolved_to_server_config(&resolved)
+    }
+
+    async fn memory_token_store() -> TokenStore {
+        crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("memory store")
+            .token_store()
+    }
+
+    /// OAuth bundles are keyed by server name and nothing prunes them, so a hand-deleted
+    /// `[[mcp.servers]]` entry leaves a live refresh token behind. This diff is the only thing that
+    /// can name one.
+    #[tokio::test]
+    async fn orphaned_credentials_names_bundles_no_server_claims() {
+        let store = memory_token_store().await;
+        for name in ["linear", "retired"] {
+            store
+                .save_mcp_credentials(name, r#"{"tokens":{"access_token":"at"}}"#)
+                .await
+                .expect("save");
+        }
+
+        // `notion` is configured but never logged in to, which is not an orphan: the diff runs in
+        // one direction only.
+        let servers = vec![server_named("linear"), server_named("notion")];
+        let orphans = orphaned_credentials(&servers, &store)
+            .await
+            .expect("diff credentials against servers");
+        assert_eq!(orphans, vec!["retired".to_string()]);
+    }
+
+    /// `remove` is the only command that clears an MCP credential, so requiring a config entry
+    /// would leave a hand-deleted server's OAuth bundle unreachable from every surface meka has.
+    #[tokio::test]
+    async fn remove_clears_credentials_for_a_server_no_longer_in_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "[mcp]\nstrict = true\n")
+            .expect("write config");
+        let store = memory_token_store().await;
+        store
+            .save_mcp_credentials("retired", r#"{"tokens":{"access_token":"at"}}"#)
+            .await
+            .expect("save");
+
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every test
+        // that touches it, and the guard is held across the whole set → run → clear cycle.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_remove("retired", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        result.expect("removing an orphaned credential succeeds");
+
+        assert!(
+            store
+                .load_mcp_credentials("retired")
+                .await
+                .expect("load")
+                .is_none(),
+            "the stored OAuth bundle must be gone"
+        );
+    }
+
+    /// The relaxation above must not turn every typo into a silent success: with no config entry
+    /// *and* no stored credential there is genuinely nothing to remove.
+    #[tokio::test]
+    async fn remove_still_refuses_a_name_that_exists_nowhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "[mcp]\nstrict = true\n")
+            .expect("write config");
+        let store = memory_token_store().await;
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_remove("typo", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("removing a name that exists nowhere must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no server named 'typo'"), "{error}");
     }
 }

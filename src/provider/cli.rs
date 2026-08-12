@@ -148,11 +148,42 @@ async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
 }
 
 async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
-    // Delete the credential first; the config edit can fail (missing key) but the secret should go
-    // regardless so a `remove` always logs you out.
+    // Deliberately does not require a configured profile: this is the only path that deletes a
+    // credential, so it has to work on one whose `[providers.<name>]` block was deleted by hand.
+    // Both sides are read before either is touched so the confirmation can say which of them
+    // actually existed, and so a typo'd name fails instead of reporting a removal that removed
+    // nothing. `open_document` rather than the parsed config on purpose: `remove` must still run on
+    // a config.toml that meka can't deserialize, since it is one of the ways such a file gets
+    // repaired.
+    let has_credential = token_store.load_provider_credential(name).await?.is_some();
+    let (path, mut document) = open_document()?;
+    let has_profile = document
+        .get("providers")
+        .and_then(|item| item.as_table())
+        .is_some_and(|providers| providers.contains_key(name));
+
+    if !has_profile && !has_credential {
+        anyhow::bail!("no provider profile or stored credential named '{}'", name);
+    }
+
+    // Delete the credential first; the config write can still fail, but the secret should go
+    // regardless so a `remove` that gets this far always logs you out. A config meka cannot *read*
+    // stops the command above instead, with nothing done: an error that leaves the secret deleted
+    // reads to the user as "nothing happened", which is the one thing it must not mean.
     token_store.delete_provider_credential(name).await?;
-    remove_profile(name)?;
-    eprintln!("ok: removed provider profile '{}'", name);
+    // Written even with no profile to remove: `default_provider` can still point at the name, and
+    // dropping that dangling pointer is exactly the cleanup this case is for.
+    remove_profile_document(&mut document, name);
+    config::write_file_atomic(&path, &document.to_string())?;
+
+    if has_profile {
+        eprintln!("ok: removed provider profile '{}'", name);
+    } else {
+        eprintln!(
+            "ok: deleted the stored credential for '{}'; no profile was configured",
+            name
+        );
+    }
     Ok(())
 }
 
@@ -172,8 +203,13 @@ fn run_use(name: &str) -> anyhow::Result<()> {
 
 async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
+    // Computed before the early return below: "every profile is gone but the secrets are still
+    // here" is precisely the state worth reporting, and it is the one the old early return hid.
+    let orphans = orphaned_profiles(token_store, &config_file).await?;
+
     if config_file.providers.is_empty() {
         println!("(no provider profiles configured)");
+        report_orphaned_profiles(&orphans);
         return Ok(());
     }
     let default = config_file.default_provider.as_deref();
@@ -204,7 +240,48 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
             &rows
         )
     );
+    report_orphaned_profiles(&orphans);
     Ok(())
+}
+
+/// Profile names holding a stored credential that no configured profile claims.
+///
+/// A credential is keyed by profile name and nothing deletes it when the `[providers.<name>]` block
+/// goes away by hand, so an API key or OAuth refresh token can outlive its profile indefinitely.
+/// This diff is the only thing that can name one, and `provider list` is where a name is worth
+/// something: `meka provider remove <name>` then clears it.
+///
+/// Safe to compute here only because the caller already failed on an unreadable config. An empty
+/// profile map that came from a config meka could not parse would report every credential in the
+/// database as an orphan.
+async fn orphaned_profiles(
+    token_store: &TokenStore,
+    config_file: &config::ConfigFile,
+) -> anyhow::Result<Vec<String>> {
+    Ok(token_store
+        .list_credential_profiles()
+        .await?
+        .into_iter()
+        .filter(|profile| !config_file.providers.contains_key(profile))
+        .collect())
+}
+
+/// Print the orphan block, if there is one. The names go to stdout with the rest of the answer --
+/// hiding them behind a stderr-only note is how they stayed invisible in the first place -- and the
+/// instruction for acting on them is a stderr hint.
+fn report_orphaned_profiles(orphans: &[String]) {
+    if orphans.is_empty() {
+        return;
+    }
+    println!();
+    println!("Stored credentials with no profile: {}", orphans.join(", "));
+    // Says only what the diff proves. Deleting the block by hand is the usual cause, but an `add`
+    // that stored the secret and then failed to write the profile leaves the same trace, and a hint
+    // that names one cause would send that user looking for an edit they never made.
+    crate::render::render_hint(
+        "left over from a profile that is no longer configured; \
+         delete one with `meka provider remove <name>`",
+    );
 }
 
 fn validate_backend(value: &str) -> anyhow::Result<&str> {
@@ -369,13 +446,6 @@ fn write_profile(
 fn set_default_provider(name: &str) -> anyhow::Result<()> {
     let (path, mut document) = open_document()?;
     document["default_provider"] = toml_edit::value(name);
-    config::write_file_atomic(&path, &document.to_string())?;
-    Ok(())
-}
-
-fn remove_profile(name: &str) -> anyhow::Result<()> {
-    let (path, mut document) = open_document()?;
-    remove_profile_document(&mut document, name);
     config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
@@ -921,6 +991,109 @@ mod tests {
 
         let (_, document) = result.expect("a missing config is not an error");
         assert!(document.as_table().is_empty());
+    }
+
+    async fn memory_token_store() -> TokenStore {
+        crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("memory store")
+            .token_store()
+    }
+
+    /// The credential table is keyed by profile name and nothing prunes it, so a hand-deleted
+    /// `[providers.<name>]` block leaves a live API key or refresh token behind. This diff is the
+    /// only thing that can name one.
+    #[tokio::test]
+    async fn orphaned_profiles_names_credentials_no_profile_claims() {
+        let store = memory_token_store().await;
+        for profile in ["work", "archive"] {
+            store
+                .save_provider_credential(profile, &AuthCredential::ApiKey("key".to_string()))
+                .await
+                .expect("save");
+        }
+
+        // `personal` is configured but never logged in to: the `Authenticated` column's job, not
+        // an orphan. The diff runs in one direction only.
+        let config_file: config::ConfigFile = toml::from_str(
+            "[providers.work]\ntype = \"claude-api\"\nmodel = \"claude-opus-5\"\n\
+             [providers.personal]\ntype = \"openai-api\"\nmodel = \"gpt-5.6-sol\"\n",
+        )
+        .expect("parse config");
+
+        let orphans = orphaned_profiles(&store, &config_file)
+            .await
+            .expect("diff credentials against profiles");
+        assert_eq!(orphans, vec!["archive".to_string()]);
+    }
+
+    /// `remove` is the only path that deletes a credential, so requiring a configured profile would
+    /// leave a hand-deleted profile's secret unreachable from every surface meka has.
+    #[tokio::test]
+    async fn remove_deletes_a_credential_whose_profile_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default_provider = \"work\"\n",
+        )
+        .expect("write config");
+        let store = memory_token_store().await;
+        store
+            .save_provider_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save");
+
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every test
+        // that touches it, and the guard is held across the whole set → run → clear cycle.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_remove("work", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        result.expect("removing an orphaned credential succeeds");
+
+        assert!(
+            store
+                .load_provider_credential("work")
+                .await
+                .expect("load")
+                .is_none(),
+            "the stored credential must be gone"
+        );
+        // The profile was already absent, but `default_provider` still pointed at it; that dangling
+        // pointer is part of the same leftover.
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(!contents.contains("default_provider"), "{contents}");
+    }
+
+    /// Without this, `provider remove typo` printed `ok: removed provider profile 'typo'` and
+    /// exited 0 having done nothing at all.
+    #[tokio::test]
+    async fn remove_refuses_a_name_with_neither_profile_nor_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers.work]\ntype = \"claude-api\"\nmodel = \"claude-opus-5\"\n",
+        )
+        .expect("write config");
+        let store = memory_token_store().await;
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_remove("typo", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("removing a name that exists nowhere must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("no provider profile or stored credential"),
+            "{error}"
+        );
+        // The untouched profile is still there: a failed remove must not rewrite anything.
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("[providers.work]"), "{contents}");
     }
 
     #[test]

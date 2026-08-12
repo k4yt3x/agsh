@@ -1551,8 +1551,12 @@ async fn run_interactive(
                         None => eprintln!("No active session to fork."),
                     },
                     repl::SlashCommand::McpList => {
-                        if let Err(error) =
-                            mcp::cli::run_list(&config.mcp_servers, mcp_manager.as_ref()).await
+                        if let Err(error) = mcp::cli::run_list(
+                            &config.mcp_servers,
+                            mcp_manager.as_ref(),
+                            &session_manager.token_store(),
+                        )
+                        .await
                         {
                             render::render_error(&error);
                         }
@@ -2300,7 +2304,7 @@ async fn run_mcp_subcommand(
     }
     let token_store = session_manager.token_store();
     match action {
-        cli::McpAction::List => mcp::cli::run_list(&config.mcp_servers, None).await?,
+        cli::McpAction::List => mcp::cli::run_list(&config.mcp_servers, None, &token_store).await?,
         cli::McpAction::Get { name } => mcp::cli::run_get(&config.mcp_servers, name).await?,
         cli::McpAction::Reconnect { name } => {
             mcp::cli::run_reconnect(&config.mcp_servers, &token_store, name).await?
