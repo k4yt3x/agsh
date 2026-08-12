@@ -497,6 +497,12 @@ impl Frontend for AcpFrontend {
                     agent_client_protocol::schema::v1::TextContent::new(text),
                 )))
             }
+            // Nothing to show, and no transient UI to close: ACP thought chunks accumulate, so a
+            // counter meant to be drawn over and replaced would leave a trail of stale figures in
+            // the thread. Matched explicitly rather than left to the catch-all below, which is for
+            // REPL signage an editor has its own UI for -- these two are the opposite case, signals
+            // this frontend structurally cannot represent.
+            FrontendEvent::ThinkingProgress { .. } | FrontendEvent::ThinkingEnded => return,
             FrontendEvent::ThinkingBlock { content, .. } => {
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
                     agent_client_protocol::schema::v1::TextContent::new(content),

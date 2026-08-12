@@ -178,6 +178,22 @@ pub enum FrontendEvent {
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),
+    /// The model is thinking, with the server's running token estimate when it offers one.
+    ///
+    /// A transient indicator, not content: it is expected to be drawn in place and erased when
+    /// anything else prints. Exists because thinking is frequently *silent* — under Claude's
+    /// `redact-thinking` beta no thinking text is ever streamed — so without this the reasoning
+    /// phase is an unexplained pause, and a long one on a hard prompt.
+    ThinkingProgress { estimated_tokens: Option<u64> },
+    /// A thinking block closed without any text to show for it.
+    ///
+    /// Emitted instead of [`Self::ThinkingBlock`] when the block carried no readable content, which
+    /// is every block under Claude's `redact-thinking` beta. Frontends drawing a transient
+    /// indicator use it to close that indicator out at the moment the block actually ends, rather
+    /// than leaving the line open until some later event happens to arrive -- a turn that errors or
+    /// is interrupted emits no further events at all, and the error text would land on the
+    /// indicator's line.
+    ThinkingEnded,
     /// A complete thinking block. Emitted after the provider's `ThinkingComplete` stream event.
     ThinkingBlock {
         content: String,

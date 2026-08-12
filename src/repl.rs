@@ -1503,6 +1503,64 @@ struct ReplFrontendState {
     /// Open across consecutive `AssistantTextDelta` events; closed by any non-text event (or
     /// `TurnFinished`).
     renderer: Option<StreamingRenderer>,
+    /// The thinking indicator currently drawn on the cursor's line, which has to be erased before
+    /// anything else prints. `None` when nothing is drawn.
+    thinking_indicator: Option<ThinkingIndicator>,
+}
+
+/// The thinking indicator currently on screen.
+struct ThinkingIndicator {
+    /// The highest estimate drawn for the thinking block in progress.
+    ///
+    /// The server's figure is not monotonic -- a single block was observed bouncing 100 <-> 150
+    /// repeatedly -- and a counter that runs backwards reads as a bug rather than as progress.
+    /// Real thinking spend only accumulates, so the peak is both the steadier reading and the
+    /// truer one.
+    peak_estimate: Option<u64>,
+}
+
+/// What closing out the thinking indicator means for a given event.
+///
+/// A pure decision, separated from `emit` so it can be asserted over every [`FrontendEvent`]
+/// variant. The three bugs this indicator shipped with all lived in that dispatch, and its
+/// catch-all silently absorbs any variant added later -- a test that enumerates the alternatives is
+/// the only thing that makes a wrong default visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndicatorAction {
+    /// Leave the line open: the indicator is redrawing itself.
+    Keep,
+    /// Erase without a trace, because real thinking text is about to render in its place and would
+    /// otherwise print the `Thinking...` prefix twice for one phase of reasoning.
+    Erase,
+    /// Write the withheld newline, making the last figure drawn a permanent line.
+    Commit,
+    /// Forget the indicator without writing anything.
+    ///
+    /// Reached only when a turn ended mid-block without closing it, which today means an interrupt:
+    /// a stream error emits [`FrontendEvent::ThinkingEnded`] and so commits. The interrupt notice
+    /// opens with a newline (`"\nInterrupted."`), which has already terminated the indicator's line
+    /// by the time the next turn starts, so committing another one here would leave a stray blank.
+    Drop,
+}
+
+fn indicator_action(event: &FrontendEvent) -> IndicatorAction {
+    match event {
+        FrontendEvent::ThinkingProgress { .. } => IndicatorAction::Keep,
+        FrontendEvent::ThinkingBlock { .. } => IndicatorAction::Erase,
+        FrontendEvent::TurnStarted => IndicatorAction::Drop,
+        // Everything else means the thinking phase is over and nothing further will describe it,
+        // so the indicator is the only record that the model spent that time.
+        _ => IndicatorAction::Commit,
+    }
+}
+
+/// The figure to draw, given the peak already drawn for the block in progress.
+///
+/// `incoming` is `None` only when a thinking block opens (the provider drops the null estimate that
+/// closes a block), so a `None` resets the peak instead of redrawing the previous block's total: a
+/// fresh block is a fresh count, and holding the old figure would attribute it to the new one.
+fn peak_estimate(previous: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    incoming.map(|estimate| previous.map_or(estimate, |peak| peak.max(estimate)))
 }
 
 impl ReplFrontend {
@@ -1512,7 +1570,32 @@ impl ReplFrontend {
             state: Mutex::new(ReplFrontendState {
                 spacing: OutputSpacing::new(),
                 renderer: None,
+                thinking_indicator: None,
             }),
+        }
+    }
+
+    /// Close out the thinking indicator, if one is drawn, by keeping it.
+    ///
+    /// Writes the newline the redraw loop deliberately withheld, so the last figure drawn becomes a
+    /// permanent line. The reasoning phase is then legible after the fact -- the same way a visible
+    /// thinking block stays on screen -- rather than vanishing the instant the answer starts.
+    fn commit_thinking_indicator(state: &mut ReplFrontendState) {
+        if state.thinking_indicator.take().is_some() {
+            // The indicator is only ever `Some` when the draw succeeded, which requires a terminal,
+            // so there is nothing to guard here.
+            eprintln!();
+        }
+    }
+
+    /// Drop the thinking indicator without keeping it.
+    ///
+    /// Only for the case where a thinking block with real text is about to render: that block opens
+    /// with the same `Thinking...` prefix, so committing first would print the word twice for one
+    /// phase of reasoning.
+    fn erase_thinking_indicator(state: &mut ReplFrontendState) {
+        if state.thinking_indicator.take().is_some() {
+            render::clear_thinking_indicator();
         }
     }
 
@@ -1540,6 +1623,17 @@ impl Frontend for ReplFrontend {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Close out the indicator before anything else reaches the screen. Done once, here, rather
+        // than in each arm that prints: the indicator sits on a line the next write would otherwise
+        // overwrite halfway, and a missed call site is the kind of omission that only shows up on
+        // the one path nobody exercised.
+        match indicator_action(&event) {
+            IndicatorAction::Keep => {}
+            IndicatorAction::Erase => Self::erase_thinking_indicator(&mut state),
+            IndicatorAction::Commit => Self::commit_thinking_indicator(&mut state),
+            IndicatorAction::Drop => state.thinking_indicator = None,
+        }
 
         match event {
             FrontendEvent::SessionStarted { id } => {
@@ -1579,6 +1673,44 @@ impl Frontend for ReplFrontend {
                     tracing::debug!("frontend renderer push_delta failed: {}", error);
                 }
             }
+            FrontendEvent::ThinkingProgress { estimated_tokens } => {
+                // Redraw in place. The text run stays open deliberately: thinking can interleave
+                // with streamed text mid-turn, and closing the renderer here would break one
+                // paragraph into two around a line that gets erased anyway.
+                // Nothing below produces output without a terminal to redraw on, and the steps
+                // that follow move state shared with every other event: closing a text run and
+                // taking a blank line from `spacing`. Doing either for an indicator that cannot be
+                // drawn shifts the layout of output that *is* produced.
+                if !render::live_indicator_supported() {
+                    return;
+                }
+                if state.thinking_indicator.is_none() {
+                    // Thinking can follow streamed text inside one turn, and the indicator is
+                    // drawn from column zero: with a text run still open it would overwrite the
+                    // tail of the last line, and now that the indicator is kept rather than erased
+                    // that damage would stay on screen.
+                    Self::close_text_run(&mut state);
+                    // Spaced like the thinking block it stands in for, so the committed line sits
+                    // apart from what preceded it.
+                    if state.spacing.before_thinking() {
+                        eprintln!();
+                    }
+                }
+                let shown = peak_estimate(
+                    state
+                        .thinking_indicator
+                        .as_ref()
+                        .and_then(|indicator| indicator.peak_estimate),
+                    estimated_tokens,
+                );
+                state.thinking_indicator =
+                    render::render_thinking_indicator(shown).then_some(ThinkingIndicator {
+                        peak_estimate: shown,
+                    });
+            }
+            // The indicator was committed by the hook above, which is the whole point of the
+            // event; there is no block text to render.
+            FrontendEvent::ThinkingEnded => {}
             FrontendEvent::ThinkingBlock {
                 content,
                 signature: _,
@@ -1824,6 +1956,125 @@ mod tests {
     }
 
     use super::*;
+
+    /// Enumerates every `FrontendEvent` variant against the indicator decision.
+    ///
+    /// The dispatch has a catch-all, so a variant added later is absorbed silently as `Commit` --
+    /// right for most events and wrong for any that renders in the indicator's place or arrives
+    /// after its line is gone. Listing them here forces that choice to be made deliberately: adding
+    /// a variant without adding it below leaves this test failing on the count.
+    #[test]
+    fn test_every_event_has_a_deliberate_indicator_action() {
+        use crate::frontend::FrontendEvent as E;
+
+        let cases: Vec<(E, IndicatorAction)> = vec![
+            (
+                E::ThinkingProgress {
+                    estimated_tokens: Some(50),
+                },
+                IndicatorAction::Keep,
+            ),
+            (
+                E::ThinkingBlock {
+                    content: "reasoning".to_string(),
+                    signature: None,
+                },
+                IndicatorAction::Erase,
+            ),
+            (E::TurnStarted, IndicatorAction::Drop),
+            // The rest close the phase out: the indicator is the only record of it.
+            (E::ThinkingEnded, IndicatorAction::Commit),
+            (E::TurnFinished, IndicatorAction::Commit),
+            (
+                E::SessionStarted {
+                    id: uuid::Uuid::nil(),
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::AssistantTextDelta("hi".to_string()),
+                IndicatorAction::Commit,
+            ),
+            (
+                E::ToolCallStarted {
+                    id: "1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                    display_summary: None,
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::ToolCallCompleted {
+                    id: "1".to_string(),
+                    name: "read_file".to_string(),
+                    is_error: false,
+                    content: Vec::new(),
+                    metadata: None,
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::ToolCallOutputDelta {
+                    id: "1".to_string(),
+                    chunk: String::new(),
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::TodoListUpdated {
+                    title: None,
+                    items: Vec::new(),
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::SubAgentActivity {
+                    tool_call_id: "1".to_string(),
+                    summary: String::new(),
+                },
+                IndicatorAction::Commit,
+            ),
+            (
+                E::TokenUsage(crate::provider::TokenUsage::default()),
+                IndicatorAction::Commit,
+            ),
+        ];
+
+        for (event, expected) in &cases {
+            assert_eq!(
+                indicator_action(event),
+                *expected,
+                "unexpected indicator action for {event:?}",
+            );
+        }
+    }
+
+    /// The server's estimate is not monotonic -- a single thinking block was observed reporting
+    /// 100, then 150, then 100 again -- so drawing it raw makes the counter appear to count down.
+    /// Real thinking spend only accumulates, so the indicator holds the peak.
+    #[test]
+    fn test_thinking_estimate_never_runs_backwards() {
+        let mut shown = None;
+        for reported in [Some(100), Some(150), Some(100), Some(150), Some(100)] {
+            let next = peak_estimate(shown, reported);
+            assert!(
+                next >= shown,
+                "the drawn figure fell from {shown:?} to {next:?} on a reported {reported:?}",
+            );
+            shown = next;
+        }
+        assert_eq!(shown, Some(150), "the peak is what stays on screen");
+    }
+
+    /// A `None` marks a new block opening, and a new block is a new count: carrying the previous
+    /// block's peak forward would credit this block with thinking it has not done.
+    #[test]
+    fn test_a_new_thinking_block_restarts_the_estimate() {
+        let carried = peak_estimate(Some(900), None);
+        assert_eq!(carried, None, "a block opening resets rather than inherits");
+        assert_eq!(peak_estimate(carried, Some(50)), Some(50));
+    }
 
     #[test]
     fn test_handle_cd_updates_shared_cwd_without_mutating_process_cwd() {

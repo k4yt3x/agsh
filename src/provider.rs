@@ -509,6 +509,17 @@ impl ToolDefinition {
 pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// The model has entered a thinking block, carrying the server's running estimate of the
+    /// thinking tokens spent so far when it offers one (`None` at the start of the block, before
+    /// any estimate has arrived).
+    ///
+    /// Separate from [`Self::ThinkingDelta`] because thinking can be *silent*: under Claude's
+    /// `redact-thinking` beta every delta carries an empty string, so a UI driven by deltas alone
+    /// shows nothing at all for the whole reasoning phase. This event is the liveness signal, and
+    /// the estimate is what distinguishes "still working" from "wedged".
+    ThinkingProgress {
+        estimated_tokens: Option<u64>,
+    },
     ThinkingComplete {
         signature: Option<String>,
     },

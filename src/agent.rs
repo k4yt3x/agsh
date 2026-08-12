@@ -1413,8 +1413,22 @@ impl Agent {
                 StreamEvent::ThinkingDelta(text) => {
                     current_thinking.push_str(&text);
                 }
+                StreamEvent::ThinkingProgress { estimated_tokens } => {
+                    // Deliberately does not set `content_started`: this is a transient indicator
+                    // the frontend erases, not output the turn produced. Counting it would make an
+                    // interrupted think look like a partial answer.
+                    self.frontend
+                        .emit(FrontendEvent::ThinkingProgress { estimated_tokens })
+                        .await;
+                }
                 StreamEvent::ThinkingComplete { signature } => {
                     let content = std::mem::take(&mut current_thinking);
+                    if content.is_empty() {
+                        // Nothing to render, but the block is over: say so, so a frontend showing a
+                        // live indicator can close it here instead of holding the line open for an
+                        // event that may never come.
+                        self.frontend.emit(FrontendEvent::ThinkingEnded).await;
+                    }
                     // Keep the block whenever it carries replayable state: visible text and/or a
                     // signature. Under `redact-thinking` the text is empty but the signature must
                     // survive to continue the reasoning chain on the next turn.
@@ -1552,6 +1566,16 @@ impl Agent {
                     // (e.g. `RetryableProvider` vs. plain `Provider`) — returning a generic
                     // `MekaError::Provider(error)` here would discard that classification before
                     // `run_streaming`'s retry logic ever saw it.
+                    // Close out any thinking *before* logging, and keep it that way. Whatever was
+                    // in flight is over, and nothing else will say so: a failed turn emits no
+                    // `TurnFinished`, and `ThinkingComplete` only comes from a `content_block_stop`
+                    // this stream never reached, so a frontend drawing a live indicator would hold
+                    // its line open. The log below goes to the same stderr at a level shown by
+                    // default -- emitting after it would print the error onto the indicator's row,
+                    // which is the exact mess this prevents. Sent unconditionally because every
+                    // frontend ignores it when nothing is drawn, which is cheaper than tracking
+                    // block state to suppress it.
+                    self.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     tracing::error!("stream error: {}", error);
                 }
             }
@@ -2622,6 +2646,17 @@ mod tests {
 
     /// Minimal in-memory agent driving `provider`: no tools, no skills, no memories, silent
     /// frontend. Enough to exercise `run_turn`'s recovery arms, which touch none of that.
+    /// Same harness, but with a frontend that records what the turn emitted.
+    async fn test_agent_recording(
+        provider: Arc<dyn Provider>,
+    ) -> (Agent, Arc<crate::frontend::testing::RecordingFrontend>) {
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        let (mut agent, _session_manager) =
+            test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await;
+        agent.frontend = frontend.clone();
+        (agent, frontend)
+    }
+
     async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
         test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
     }
@@ -2961,6 +2996,146 @@ mod tests {
         assert!(results.contains("Sent (message id 1)"), "{results}");
         assert!(results.contains("as_photo"), "the omitted flag: {results}");
         assert!(results.contains("load_tool"), "{results}");
+    }
+
+    /// A thinking block that carries no text still has to announce that it ended.
+    ///
+    /// This is the contract the live indicator rests on: it holds a line open across the reasoning
+    /// phase, and under `redact-thinking` no text ever arrives to close it. Without this event the
+    /// line stays open until some later event happens to occur -- and a turn that errors or is
+    /// interrupted emits none, so an error message would print onto the indicator's row.
+    #[tokio::test]
+    async fn test_a_silent_thinking_block_announces_that_it_ended() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            // No `ThinkingDelta`: the block produces a signature and nothing readable, which is
+            // every block under `redact-thinking`.
+            MockEvent::ThinkingComplete {
+                signature: Some("sig".to_string()),
+            },
+            MockEvent::Text {
+                text: "done".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, frontend) = test_agent_recording(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let events = frontend.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ThinkingEnded)),
+            "a silent block must report its end: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ThinkingBlock { .. })),
+            "there is no text to render, so no block event belongs here: {events:?}",
+        );
+    }
+
+    /// A stream that dies has to close out any thinking in flight.
+    ///
+    /// The failing turn emits no `TurnFinished`, and `ThinkingComplete` only arrives from a
+    /// `content_block_stop` the stream never reached -- so without this the frontend's live
+    /// indicator keeps its line open and the error message prints onto that row.
+    #[tokio::test]
+    async fn test_a_failed_stream_closes_out_thinking() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![MockEvent::Fail {
+            message: "Overloaded".to_string(),
+        }]]));
+        let (agent, frontend) = test_agent_recording(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the turn is supposed to fail here");
+
+        let events = frontend.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ThinkingEnded)),
+            "a dying stream must release the indicator's line: {events:?}",
+        );
+    }
+
+    /// The other direction: a block with readable text renders as a block, and must *not* also
+    /// report an empty ending -- the frontend erases the indicator for one and keeps it for the
+    /// other, so emitting both would erase a line and then commit nothing.
+    #[tokio::test]
+    async fn test_a_thinking_block_with_text_reports_only_the_block() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::ThinkingDelta {
+                text: "weighing the options".to_string(),
+            },
+            MockEvent::ThinkingComplete {
+                signature: Some("sig".to_string()),
+            },
+            MockEvent::Text {
+                text: "done".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, frontend) = test_agent_recording(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let events = frontend.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ThinkingBlock { .. })),
+            "readable thinking must render as a block: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::ThinkingEnded)),
+            "the block event already closes the indicator: {events:?}",
+        );
     }
 
     /// A tool that blocks until cancelled, standing in for a long build.

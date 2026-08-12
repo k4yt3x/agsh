@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A live `Thinking... (150 tokens)` indicator, so redacted reasoning is no longer a silent pause.
 - Background tool calls: `background: true` returns a task id and reports the result later.
 - A background task always reports back, including as `interrupted` when a restart killed it.
 - `[background]` config, off by default, with `enabled` and a per-session `max_tasks` ceiling.

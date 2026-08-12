@@ -126,7 +126,7 @@ effort = "xhigh"
 
 ### `redact_thinking`
 
-`claude-oauth` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds; the visible effect is that live thinking output goes quiet for these models. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
+`claude-oauth` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
 
 ```toml
 [providers.work]
@@ -538,6 +538,10 @@ subagent_max_depth = 3
 
 Settings for extended thinking (`claude-api` and `claude-oauth` providers). Claude 4.6+ models use adaptive thinking automatically; older models use a fixed token budget.
 
+While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-oauth` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `claude-api` does not report one, so the line stays bare. The count is coarse -- a progress signal, not an accounting figure.
+
+When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
+
 ### `thinking.enabled`
 
 Whether to enable extended thinking. When enabled, the model can use additional tokens for internal reasoning before responding.
@@ -552,7 +556,7 @@ Default: `16000`
 
 ### `thinking.show_content`
 
-Whether to render thinking blocks inline in the terminal as the model produces them. When `false`, thinking is silently consumed (still sent on subsequent turns for cache continuity, just not displayed). When `true`, thinking deltas are streamed under a dimmed header.
+Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
 
 Default: `false`
 

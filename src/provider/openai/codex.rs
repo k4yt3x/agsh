@@ -428,6 +428,10 @@ async fn aggregate_stream(
             StreamEvent::RedactedThinking { data } => {
                 content_blocks.push(ContentBlock::RedactedThinking { data });
             }
+            // A display-only liveness signal with nothing to accumulate. Only the Claude providers
+            // emit it today; the arm exists so adding it there cannot silently change what this
+            // provider persists.
+            StreamEvent::ThinkingProgress { .. } => {}
             StreamEvent::ToolUseStart { id, name } => {
                 if !current_text.is_empty() {
                     content_blocks.push(ContentBlock::Text {

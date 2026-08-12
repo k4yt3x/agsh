@@ -1530,6 +1530,77 @@ fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_befo
     true
 }
 
+/// Whether a live, redrawn-in-place indicator can be shown at all.
+///
+/// Callers gate their whole indicator path on this rather than relying on the drawer's own check:
+/// drawing is only the last step, and the steps before it (closing a text run, claiming a blank
+/// line from [`OutputSpacing`]) are shared state that must not move for output that will never
+/// appear. Piping a run through `cat` otherwise gained a stray blank line per thinking block.
+pub fn live_indicator_supported() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Draw the live thinking indicator in place, returning whether anything was drawn.
+///
+/// Redraws overwrite each other, but the *last* draw is normally kept: the caller commits it with a
+/// newline when the thinking phase ends, so the record of what the model spent survives in
+/// scrollback the way a visible thinking block does. It is erased only when a thinking block with
+/// real text is about to replace it.
+///
+/// Returns `false` without drawing when stderr is not a terminal. Redrawing in place needs a
+/// terminal that honours a carriage return; redirected to a file this would accumulate one line per
+/// token estimate.
+///
+/// Redraws by returning to column zero, writing the label, and clearing to the end of the line --
+/// not by overwriting the previous label's width. The label does not grow monotonically with the
+/// count (`format_token_count` switches to `M` at a million, so `1000.0k tokens` is *wider* than
+/// `1.0M tokens`), so a width-tracking erase would strand the tail of a longer previous draw.
+/// Clearing to the line end makes that class of bug unrepresentable.
+///
+/// Written with no trailing newline, so the cursor stays parked on the line for the next redraw or
+/// erase.
+pub fn render_thinking_indicator(estimated_tokens: Option<u64>) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return false;
+    }
+    let label = match estimated_tokens {
+        Some(tokens) => format!("Thinking... ({} tokens)", format_token_count(tokens)),
+        // No estimate yet: the block has only just opened. The bare word is still worth drawing --
+        // it is the difference between a wait the user can interpret and one they cannot.
+        None => "Thinking...".to_string(),
+    };
+    // One `execute!`, so a redraw cannot be torn between the carriage return and the text.
+    crossterm::execute!(
+        std::io::stderr(),
+        crossterm::cursor::MoveToColumn(0),
+        crossterm::style::Print(label.as_str().with(Color::DarkGrey)),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
+    )
+    .is_ok()
+}
+
+/// Erase the thinking indicator and return the cursor to column zero.
+///
+/// Only for the case where a thinking block with real content is about to render in its place --
+/// otherwise the indicator is committed rather than erased, so the time the model spent stays on
+/// screen.
+pub fn clear_thinking_indicator() {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    if let Err(error) = crossterm::execute!(
+        std::io::stderr(),
+        crossterm::cursor::MoveToColumn(0),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
+    ) {
+        // A broken pipe or closed terminal. Nothing to recover: the indicator is cosmetic and the
+        // caller has already dropped its state.
+        tracing::debug!("failed to clear the thinking indicator: {}", error);
+    }
+}
+
 pub fn render_thinking_block(thinking: &str, show_full: bool) {
     if show_full {
         eprintln!(
@@ -1774,6 +1845,30 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The indicator's label is **not** monotonically wider as the count grows: at a million
+    /// `format_token_count` switches suffix, so `1000.0k tokens` (20 columns) becomes `1.0M tokens`
+    /// (17). A redraw that erased only its own width would leave three characters of the previous
+    /// label stranded on the line.
+    ///
+    /// Asserted as a counterexample so the drawer's clear-to-end-of-line is not "simplified" back
+    /// into width tracking, which looks equivalent and is not.
+    #[test]
+    fn test_indicator_label_can_shrink_as_the_count_grows() {
+        let width = |tokens: u64| {
+            format!("Thinking... ({} tokens)", format_token_count(tokens))
+                .chars()
+                .count()
+        };
+        assert!(
+            width(1_000_000) < width(999_999),
+            "expected the label to shrink crossing 1M ({} -> {}); if this ever stops holding the \
+             comment on `render_thinking_indicator` needs revisiting, not the erase strategy",
+            width(999_999),
+            width(1_000_000),
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -624,6 +624,20 @@ pub(super) async fn drive_claude_sse_stream(
 
                                 if block_type == "thinking" {
                                     in_thinking = true;
+                                    // Announce the block itself, before any estimate: this is the
+                                    // earliest point the pause becomes explainable, and on a
+                                    // redacted block it is otherwise the only thing that happens
+                                    // for seconds at a time.
+                                    if event_sender
+                                        .send(StreamEvent::ThinkingProgress {
+                                            estimated_tokens: None,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        tracing::trace!("stream event receiver dropped");
+                                        break;
+                                    }
                                 } else if block_type == "redacted_thinking" {
                                     // The opaque `data` arrives whole in the start event; forward it
                                     // so the agent can replay it verbatim on later turns.
@@ -683,6 +697,23 @@ pub(super) async fn drive_claude_sse_stream(
 
                                 match delta_type {
                                     "thinking_delta" => {
+                                        // `estimated_tokens` is the server's running count of
+                                        // thinking spent so far (the `thinking-token-count` beta).
+                                        // It is the only progress signal on a redacted block,
+                                        // where `thinking` is `""` on every delta. The final delta
+                                        // of a block carries `null`; skipping it leaves the last
+                                        // real figure on screen rather than blanking the display
+                                        // just before the block ends.
+                                        if let Some(estimated) =
+                                            delta.get("estimated_tokens").and_then(|t| t.as_u64())
+                                            && event_sender.send(
+                                                StreamEvent::ThinkingProgress {
+                                                    estimated_tokens: Some(estimated),
+                                                },
+                                            ).await.is_err() {
+                                                tracing::trace!("stream event receiver dropped");
+                                                break;
+                                            }
                                         if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str())
                                             && !thinking.is_empty()
                                                 && event_sender.send(

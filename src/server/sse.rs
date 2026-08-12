@@ -109,6 +109,18 @@ pub fn translate(
             SseEventType::AssistantTextDelta,
             serde_json::json!({ "text": text }),
         ),
+        FrontendEvent::ThinkingProgress { .. } => {
+            // Not forwarded. Every event on this stream is content a client appends and keeps,
+            // whereas this one is meant to be drawn over and erased; delivering it as a
+            // `thinking.delta` would leave a trail of stale counters in the transcript. Giving
+            // remote clients a live indicator means a distinct event type they can treat as
+            // transient, which is an addition to the HTTP contract rather than a rendering change.
+            return None;
+        }
+        FrontendEvent::ThinkingEnded => {
+            // Closes a transient indicator this stream never carried; see `ThinkingProgress`.
+            return None;
+        }
         FrontendEvent::ThinkingBlock { content, .. } => {
             if !capabilities.supports_reasoning_stream {
                 return None;

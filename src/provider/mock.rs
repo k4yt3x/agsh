@@ -199,19 +199,26 @@ impl Provider for MockProvider {
                 return Ok(());
             }
             match event {
+                // Each failure sends `StreamEvent::Error` before returning its typed error, the
+                // way the real SSE drivers do. `Agent`'s handler documents that as an invariant of
+                // every producer and acts on it, so a mock that skipped it would exercise a path
+                // production never takes.
                 MockEvent::Fail { message } => {
+                    send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::Provider(message));
                 }
                 MockEvent::FailRetryable {
                     message,
                     retry_after_secs,
                 } => {
+                    send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::RetryableProvider {
                         message,
                         retry_after: retry_after_secs.map(std::time::Duration::from_secs),
                     });
                 }
                 MockEvent::FailInvalidRequest { message } => {
+                    send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
                 MockEvent::Sleep { ms } => {
@@ -282,6 +289,18 @@ pub fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
     Ok(Some(rounds))
 }
 
+/// Send the `StreamEvent::Error` that every real driver emits immediately before returning its own
+/// typed error. A dropped receiver is the normal shutdown race and carries no information here.
+async fn send_stream_error(event_sender: &mpsc::Sender<StreamEvent>, message: &str) {
+    if event_sender
+        .send(StreamEvent::Error(message.to_string()))
+        .await
+        .is_err()
+    {
+        tracing::trace!("stream event receiver dropped");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,9 +359,10 @@ mod tests {
         assert!(rx.recv().await.is_none(), "exhausted script emits nothing");
     }
 
-    /// `Fail` returns `Err(MekaError::Provider(_))` from [`Provider::stream`] without emitting any
-    /// events. The agent loop turns that into a non-Interrupted `run_turn` error, which the ACP
-    /// layer maps to a JSON-RPC `internal_error` response.
+    /// `Fail` returns `Err(MekaError::Provider(_))` from [`Provider::stream`], preceded by the
+    /// `StreamEvent::Error` every real driver sends before its typed return. The agent loop turns
+    /// the typed error into a non-Interrupted `run_turn` error, which the ACP layer maps to a
+    /// JSON-RPC `internal_error` response.
     #[tokio::test]
     async fn test_mock_provider_fail_event_returns_error() {
         let provider = MockProvider::from_rounds(vec![vec![MockEvent::Fail {
@@ -358,13 +378,19 @@ mod tests {
             "unexpected error: {:?}",
             error
         );
-        // No events were sent before the failure.
-        assert!(rx.recv().await.is_none(), "Fail must not emit events");
+        // The error rides the channel first, then the channel closes. `Agent` depends on that
+        // ordering: its `StreamEvent::Error` arm deliberately does not return, because the typed
+        // error arriving from the join handle is the one carrying the retry classification.
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::Error(message)) if message == "boom"),
+            "Fail must announce itself on the stream before returning",
+        );
+        assert!(rx.recv().await.is_none(), "and then the stream is over");
     }
 
     /// `FailRetryable` returns `Err(MekaError::RetryableProvider { .. })` carrying the configured
-    /// `retry_after`, without emitting any events — mirrors `Fail`'s shape but with the typed
-    /// variant `Agent::run_streaming`'s retry loop pattern-matches on.
+    /// `retry_after` — mirrors `Fail`'s shape, including the preceding `StreamEvent::Error`, but
+    /// with the typed variant `Agent::run_streaming`'s retry loop pattern-matches on.
     #[tokio::test]
     async fn test_mock_provider_fail_retryable_event_returns_typed_error() {
         let provider = MockProvider::from_rounds(vec![vec![MockEvent::FailRetryable {
@@ -386,9 +412,10 @@ mod tests {
             other => panic!("expected RetryableProvider, got {other:?}"),
         }
         assert!(
-            rx.recv().await.is_none(),
-            "FailRetryable must not emit events"
+            matches!(rx.recv().await, Some(StreamEvent::Error(message)) if message == "overloaded"),
+            "FailRetryable must announce itself on the stream before returning",
         );
+        assert!(rx.recv().await.is_none(), "and then the stream is over");
     }
 
     /// `ThinkingDelta` + `ThinkingComplete` map straight through to the same-named `StreamEvent`
