@@ -91,7 +91,7 @@ meka memory add tz --description "K4YT3X is in UTC+8" --priority 2
 meka memory remove stale-note
 ```
 
-In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body.
+In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body. The listing is the table alone; the priority distribution is reserved for `meka memory list`, where you have gone looking for it.
 
 Because memories are plain Markdown files in one directory, everything else works too: `grep` them, edit them in `$EDITOR`, keep the directory in git, or back it up with the rest of your config.
 

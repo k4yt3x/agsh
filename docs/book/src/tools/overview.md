@@ -29,6 +29,13 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
 | [`recall`](./overview.md#recall) | Read | Search the full conversation history, including compacted turns |
 | [`recall_read`](./overview.md#recall) | Read | Read conversation turns by index |
+| [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
+| [`schedule_list`](../usage/scheduling.md) | Read | List this session's scheduled jobs |
+| [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a scheduled job |
+| [`task_list`](../usage/background.md) | Read | List this session's background tasks |
+| [`task_cancel`](../usage/background.md) | Read | Stop a running background task |
+
+The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-file.md#schedule) (on by default) and the `task_*` tools require [`[background] enabled`](../configuration/config-file.md#background) (off by default). A disabled subsystem registers no tools at all, rather than shipping schemas that could only fail.
 
 ## Permission Requirements
 
@@ -90,6 +97,20 @@ load_tool({"name": ["mcp__notion__search", "mcp__notion__fetch"]})
 Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#mcp-servers) skip all of this: their schemas ship from turn 1. Use it for tools whose optional parameters matter and that the agent reaches for constantly.
 
 **When writing a tool description for a server meka will consume**, put whatever a caller must know to use the tool correctly in the first two sentences. That may be all anyone ever sees.
+
+## Background Calls
+
+With [`[background] enabled`](../configuration/config-file.md#background), every tool gains an optional `background` parameter, MCP tools included. A call that sets it returns a task id immediately and delivers its result later as its own turn, which is what makes a twenty-minute build affordable. See [Background Tasks](../usage/background.md).
+
+```text
+execute_command({"command": "cargo test --all", "background": true})
+```
+
+Like `scratchpad`, `background` is meka's own: it is consumed by the agent loop and removed from the arguments before the tool, or a remote MCP server, ever sees it.
+
+A tool that advertises `background` itself keeps it. meka does not splice its own parameter over a name a tool already uses, and does not strip or interpret one either, so a server with a `background` colour or a detach flag of its own receives the argument untouched and the call does not detach.
+
+These two are also the only parameters meka type-checks. A `background` that is not a boolean, or a `scratchpad` that is not a string, refuses the call and says what was expected, rather than being read as absent. Both decide what a call *does* rather than what it is called with, so ignoring a wrong type would silently turn a detached call into a blocking one, or drop output the agent asked to keep. A tool's own arguments are the tool's to validate: meka reports a mismatch as an advisory on the result and lets the call through, since a remote server is the authority on what it accepts. `null` counts as absent for both, which is what models emit for an optional argument they are not using.
 
 ## Scratchpad Parameter
 

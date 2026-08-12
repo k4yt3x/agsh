@@ -118,6 +118,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "[cancel <id>]",
     },
     CommandSpec {
+        name: "tasks",
+        aliases: &[],
+        help: "List background tasks, or cancel one by id",
+        arg_hint: "[cancel <id|--all>]",
+    },
+    CommandSpec {
         name: "mcp",
         aliases: &[],
         help: "Manage MCP servers and prompts",
@@ -553,6 +559,13 @@ pub enum SlashCommand {
     ScheduleCancel {
         id: String,
     },
+    /// `/tasks`: list this session's background tasks.
+    TaskList,
+    /// `/tasks cancel <id>`, or `/tasks cancel --all`.
+    TaskCancel {
+        /// `None` means every running task in this session.
+        id: Option<String>,
+    },
     /// `/memory <name>`: print one memory's body, the in-session equivalent of
     /// `meka memory show`.
     MemoryShow {
@@ -590,10 +603,11 @@ pub enum SlashCommand {
 pub enum ReplEvent {
     UserInput(String),
     Command(SlashCommand),
-    /// A scheduled job for this session came due. Carries no payload: the agent side re-reads the
-    /// due jobs itself, because between the scheduler noticing and this arriving the job could have
-    /// been cancelled, and firing a prompt the user just cancelled is worse than missing it.
-    ScheduledTurn,
+    /// Something out-of-band wants a turn: a scheduled job came due, or a background task has an
+    /// outcome to report. Carries no payload; the agent side re-reads both, because between the
+    /// watcher noticing and this arriving the job could have been cancelled, and firing a prompt
+    /// the user just cancelled is worse than missing it.
+    Wake,
     Exit,
 }
 
@@ -635,6 +649,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "session" => Some(SlashCommand::Session),
         "memory" => Some(parse_memory_slash(argument.as_deref().unwrap_or(""))),
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
+        "tasks" => Some(parse_tasks_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
         "rewind" => Some(SlashCommand::Rewind(
@@ -685,6 +700,23 @@ fn parse_schedule_slash(rest: &str) -> SlashCommand {
     match rest.strip_prefix("cancel").map(str::trim) {
         Some(id) if !id.is_empty() => SlashCommand::ScheduleCancel { id: id.to_string() },
         _ => SlashCommand::ScheduleList,
+    }
+}
+
+/// Parse the argument to `/tasks …`.
+///
+/// Bare `/tasks` lists; `/tasks cancel <id>` stops one; `/tasks cancel --all` stops them all. There
+/// is no way to *start* one here, for the same reason `/schedule` has no `create`: the decision to
+/// detach belongs to the agent making the call.
+fn parse_tasks_slash(rest: &str) -> SlashCommand {
+    let rest = rest.trim();
+    match rest.strip_prefix("cancel").map(str::trim) {
+        Some("--all" | "all") => SlashCommand::TaskCancel { id: None },
+        Some(id) if !id.is_empty() => SlashCommand::TaskCancel {
+            id: Some(id.to_string()),
+        },
+        // A bare `cancel` names nothing; listing is the safe reading, and the user sees the ids.
+        _ => SlashCommand::TaskList,
     }
 }
 
@@ -800,6 +832,57 @@ fn print_help() {
     eprintln!("  Ctrl+D        Exit the shell");
 }
 
+/// The `[display]` blank lines that bracket anything printed between two prompts.
+///
+/// Carried rather than read from a global because the REPL thread and the agent loop each answer a
+/// different half of the slash commands, and both have to space their output the same way for the
+/// setting to mean anything.
+///
+/// The blanks bracket *output*, so a command that prints nothing gets neither: two blank lines
+/// around an empty region is a gap the user has to work out the meaning of, and the meaning is
+/// "nothing happened". The rule that keeps this simple is that a REPL command always says
+/// something, even if only that a list is empty, so the brackets always have content. Two
+/// exceptions: a successful `/cd` says nothing because the prompt itself changes, and it is
+/// therefore not spaced; `!command` is spaced unconditionally because the child owns the terminal
+/// from the moment it starts and meka never learns whether it wrote anything.
+#[derive(Clone, Copy)]
+pub struct CommandSpacing {
+    pub newline_after_prompt: bool,
+    pub newline_before_prompt: bool,
+}
+
+impl SlashCommand {
+    /// Whether this command answers by running an agent turn.
+    ///
+    /// Such a command's output is already bracketed by `TurnStarted` / `TurnFinished` in the REPL
+    /// frontend, so the command dispatcher must not bracket it again or every blank line doubles.
+    /// Both can also bail before the turn starts (an unknown skill, a server that will not render
+    /// its prompt), in which case the error prints unspaced: terse enough not to be worth the
+    /// plumbing that telling the two cases apart would take.
+    pub fn answers_by_running_a_turn(&self) -> bool {
+        matches!(
+            self,
+            SlashCommand::McpPrompt { .. } | SlashCommand::SkillInvoke { .. }
+        )
+    }
+}
+
+impl CommandSpacing {
+    /// Blank line between the line the user typed and whatever the command prints.
+    fn after_prompt(self) {
+        if self.newline_after_prompt {
+            eprintln!();
+        }
+    }
+
+    /// Blank line between a command's output and the next prompt.
+    fn before_prompt(self) {
+        if self.newline_before_prompt {
+            eprintln!();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_repl(
     shared_permission: SharedPermission,
@@ -817,6 +900,11 @@ pub fn run_repl(
     // polls it inside `read_line` and returns `Signal::ExternalBreak`, which is what lets a wakeup
     // interrupt an idle prompt instead of waiting for the user to press Enter.
     wake: Arc<AtomicBool>,
+    // `[display]` blank-line spacing, for the commands this thread answers itself. The ones it
+    // forwards are bracketed by the agent loop, and a turn's own output by `TurnStarted` /
+    // `TurnFinished`; all three read the same two config values so the setting means one thing
+    // wherever the output came from.
+    spacing: CommandSpacing,
 ) {
     // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
     // `read_line()`. From this point on, log lines (including async MCP-connect warnings that fire
@@ -901,8 +989,8 @@ pub fn run_repl(
                 // The prompt line is closed on the agent side, not here, because only that side
                 // knows whether a job actually fires: a wake can be spurious when another process
                 // claims the job first, and a blank line printed for a turn that never happens is
-                // a stray gap above the redrawn prompt. See `ReplEvent::ScheduledTurn` in `main`.
-                if input_sender.send(ReplEvent::ScheduledTurn).is_err() {
+                // a stray gap above the redrawn prompt. See `ReplEvent::Wake` in `main`.
+                if input_sender.send(ReplEvent::Wake).is_err() {
                     break;
                 }
                 if !wait_for_agent(&agent_event_receiver) {
@@ -930,7 +1018,9 @@ pub fn run_repl(
                             break;
                         }
                         Some(SlashCommand::Help) => {
+                            spacing.after_prompt();
                             print_help();
+                            spacing.before_prompt();
                             continue;
                         }
                         Some(SlashCommand::Clear) => {
@@ -946,6 +1036,7 @@ pub fn run_repl(
                             continue;
                         }
                         Some(SlashCommand::Permission(argument)) => {
+                            spacing.after_prompt();
                             match argument {
                                 None => {
                                     let current = shared_permission.get();
@@ -976,10 +1067,17 @@ pub fn run_repl(
                                     }
                                 }
                             }
+                            spacing.before_prompt();
                             continue;
                         }
                         Some(SlashCommand::Cd(argument)) => {
-                            handle_cd(&cwd, argument.as_deref().unwrap_or(""));
+                            if let Some(message) =
+                                handle_cd(&cwd, argument.as_deref().unwrap_or(""))
+                            {
+                                spacing.after_prompt();
+                                eprintln!("{}", message);
+                                spacing.before_prompt();
+                            }
                             continue;
                         }
                         Some(
@@ -997,6 +1095,8 @@ pub fn run_repl(
                             | SlashCommand::MemoryShow { .. }
                             | SlashCommand::ScheduleList
                             | SlashCommand::ScheduleCancel { .. }
+                            | SlashCommand::TaskList
+                            | SlashCommand::TaskCancel { .. }
                             | SlashCommand::SkillList
                             | SlashCommand::SkillInvoke { .. }
                             | SlashCommand::Status
@@ -1012,10 +1112,12 @@ pub fn run_repl(
                             continue;
                         }
                         None => {
+                            spacing.after_prompt();
                             eprintln!(
                                 "Unknown command: {}. Type /help for available commands.",
                                 trimmed
                             );
+                            spacing.before_prompt();
                             continue;
                         }
                     }
@@ -1032,6 +1134,13 @@ pub fn run_repl(
                     if shell_command.is_empty() {
                         continue;
                     }
+                    // Spaced like any other command: the child inherits stdio, so its output lands
+                    // between two prompts exactly as a slash command's does. Unlike a slash
+                    // command this is spaced unconditionally, because the terminal is the child's
+                    // from here and meka never learns whether it wrote anything: a silent
+                    // `!touch foo` gets brackets around nothing, and the alternative is capturing
+                    // the child's output, which would break every interactive `!` command.
+                    spacing.after_prompt();
                     // Run in the session's working directory so `!` commands track `/cd`. `/cd`
                     // updates the `SharedCwd` (not the process cwd), so without this `!pwd` would
                     // report the original launch directory.
@@ -1061,6 +1170,7 @@ pub fn run_repl(
                             eprintln!("Failed to execute command: {}", error);
                         }
                     }
+                    spacing.before_prompt();
                     continue;
                 }
 
@@ -1336,13 +1446,14 @@ fn expand_cd_target(target: &str) -> Option<PathBuf> {
     }
 }
 
-fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
-    let raw = match expand_cd_target(target) {
-        Some(raw) => raw,
-        None => {
-            eprintln!("cd: could not determine home directory");
-            return;
-        }
+/// Move the session's working directory, returning the failure to report and `None` on success.
+///
+/// The message is returned rather than printed because the caller owns the `[display]` spacing: a
+/// `cd` that works says nothing (the prompt already shows where you are), and blank lines wrapped
+/// around no output are a gap with nothing in it.
+fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) -> Option<String> {
+    let Some(raw) = expand_cd_target(target) else {
+        return Some("cd: could not determine home directory".to_string());
     };
 
     // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
@@ -1350,19 +1461,16 @@ fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
     let resolved = crate::agent::resolve_against_cwd(cwd, &raw);
     let canonical = match std::fs::canonicalize(&resolved) {
         Ok(canonical) => canonical,
-        Err(error) => {
-            eprintln!("cd: {}: {}", raw.display(), error);
-            return;
-        }
+        Err(error) => return Some(format!("cd: {}: {}", raw.display(), error)),
     };
     if !canonical.is_dir() {
-        eprintln!("cd: {}: not a directory", canonical.display());
-        return;
+        return Some(format!("cd: {}: not a directory", canonical.display()));
     }
     match cwd.write() {
         Ok(mut guard) => *guard = canonical,
         Err(poisoned) => *poisoned.into_inner() = canonical,
     }
+    None
 }
 
 /// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
@@ -1673,6 +1781,48 @@ mod frontend_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Every command that prints its own output must be bracketed by the dispatcher, and every
+    /// command that answers by running a turn must not be, or its blank lines double.
+    #[test]
+    fn test_only_turn_running_commands_opt_out_of_command_spacing() {
+        assert!(
+            SlashCommand::SkillInvoke {
+                name: "s".to_string(),
+                extra: String::new(),
+            }
+            .answers_by_running_a_turn()
+        );
+        assert!(
+            SlashCommand::McpPrompt {
+                server: "fs".to_string(),
+                prompt: "p".to_string(),
+                args: Vec::new(),
+            }
+            .answers_by_running_a_turn()
+        );
+
+        // Everything that prints for itself. `/tasks` is the one that prompted this: its table
+        // rendered flush against the prompt above and the prompt below.
+        for command in [
+            SlashCommand::TaskList,
+            SlashCommand::TaskCancel { id: None },
+            SlashCommand::MemoryList,
+            SlashCommand::ScheduleList,
+            SlashCommand::SkillList,
+            SlashCommand::McpList,
+            SlashCommand::Status,
+            SlashCommand::Usage,
+            SlashCommand::History(None),
+            SlashCommand::Session,
+            SlashCommand::Export,
+        ] {
+            assert!(
+                !command.answers_by_running_a_turn(),
+                "a command that prints its own output must be spaced by the dispatcher",
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1687,14 +1837,48 @@ mod tests {
         let cwd: crate::agent::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
             std::path::PathBuf::from("/this/path/does/not/exist"),
         ));
-        handle_cd(&cwd, target.to_str().expect("utf-8 tempdir"));
+        let complaint = handle_cd(&cwd, target.to_str().expect("utf-8 tempdir"));
 
+        assert_eq!(
+            complaint, None,
+            "a `cd` that worked has nothing to say, and the caller keys the `[display]` blank \
+             lines off exactly that",
+        );
         let stored = cwd.read().expect("cwd lock").clone();
         assert_eq!(stored, target, "shared cwd must point at the new directory");
         let process_cwd_after = std::env::current_dir().expect("read process cwd after /cd");
         assert_eq!(
             process_cwd_after, process_cwd_before,
             "process cwd must NOT be mutated by /cd",
+        );
+    }
+
+    #[test]
+    fn test_handle_cd_reports_a_failure_rather_than_moving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, b"x").expect("write file");
+        let start = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+
+        let cwd: crate::agent::SharedCwd =
+            std::sync::Arc::new(std::sync::RwLock::new(start.clone()));
+
+        let missing = handle_cd(&cwd, "/this/path/does/not/exist");
+        assert!(
+            missing.is_some_and(|message| message.starts_with("cd: ")),
+            "a target that cannot be resolved must produce a message to print",
+        );
+
+        let not_a_directory = handle_cd(&cwd, file.to_str().expect("utf-8 path"));
+        assert!(
+            not_a_directory.is_some_and(|message| message.contains("not a directory")),
+            "an existing non-directory must be refused, not silently accepted",
+        );
+
+        assert_eq!(
+            *cwd.read().expect("cwd lock"),
+            start,
+            "a failed `cd` must leave the session where it was",
         );
     }
 
@@ -2400,6 +2584,8 @@ mod tests {
             Some(SlashCommand::MemoryShow { .. }) => "MemoryShow",
             Some(SlashCommand::ScheduleList) => "ScheduleList",
             Some(SlashCommand::ScheduleCancel { .. }) => "ScheduleCancel",
+            Some(SlashCommand::TaskList) => "TaskList",
+            Some(SlashCommand::TaskCancel { .. }) => "TaskCancel",
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",

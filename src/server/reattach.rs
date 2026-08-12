@@ -131,6 +131,10 @@ pub async fn ensure_session_loaded(
             .with("session_id", id.to_string())
         })?;
 
+    // Whatever the last owner left running is ours to retire now; see
+    // `crate::background::claim_session`.
+    crate::background::claim_session(&state.shared.session_manager, id).await;
+
     let events = state
         .shared
         .session_manager

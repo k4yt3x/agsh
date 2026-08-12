@@ -7,18 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-08-12
+
 ### Added
 
-- Calling a deferred tool without its schema now reports the parameters it left defaulted.
-- Arguments a tool's schema doesn't declare are reported instead of being silently dropped.
+- Background tool calls: `background: true` returns a task id and reports the result later.
+- A background task always reports back, including as `interrupted` when a restart killed it.
+- `[background]` config, off by default, with `enabled` and a per-session `max_tasks` ceiling.
+- `task_list` / `task_cancel` tools, a `/tasks` command, and a `[Background]` context section.
+- Ctrl+C cancels the turn and leaves background tasks running; a second press stops them.
 - `load_tool` accepts an array of names, so several tools off one server cost one round trip.
 - An unknown tool name suggests the closest match, allowing for a missing `mcp__` prefix.
+- The agent is told when a call sends undeclared arguments or leaves documented parameters unset.
 - `[Context budget]` tells the agent its context occupancy and when auto-compaction will fire.
+
+### Changed
+
+- **Breaking:** `[display].render_mode` defaults to `termimad`; set `syntect` for the old look.
 
 ### Fixed
 
-- Deferred tool summaries kept only the first sentence, hiding parameters documented later.
-- Tool summaries clip on a sentence or word boundary, never mid-token, and are marked with `…`.
+- `edit_file` overwrote a file that changed after the read; it now reports the change instead.
+- Under ACP, `read_file` with `regex` searched the file on disk rather than the editor's copy.
+- A wrong-typed `scratchpad` argument is refused, rather than silently discarding the output.
+- `/mcp <server>:<prompt>` with an unknown server hung the REPL instead of drawing a new prompt.
+- `termimad` hard-wrapped redirected output to a 50-column fallback instead of not wrapping.
+- `[display]` blank-line spacing now brackets slash-command output, not only agent responses.
+- `/export` now reports the path it wrote to; it used to save a file and say nothing.
+- `/history` on an empty conversation, and `/mcp reconnect|login|logout`, now say what happened.
+- `meka tools list` used fixed column widths, so a long MCP tool name ran the columns together.
+- Deferred tool summaries were cut at the first sentence, hiding parameters documented later.
 - `[Tool discovery]` claimed deferred tools were "not yet callable" when calling one works.
 
 ## [0.38.0] - 2026-08-11
@@ -1314,7 +1332,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.38.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.39.0...HEAD
+[0.39.0]: https://github.com/k4yt3x/meka/compare/0.38.0...0.39.0
 [0.38.0]: https://github.com/k4yt3x/meka/compare/0.37.0...0.38.0
 [0.37.0]: https://github.com/k4yt3x/meka/compare/0.36.0...0.37.0
 [0.36.0]: https://github.com/k4yt3x/meka/compare/0.35.0...0.36.0

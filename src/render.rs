@@ -78,10 +78,17 @@ impl OutputSpacing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
-    /// syntect-based highlighter (default). Named after the `syntect` crate that does the
-    /// in-process highlighting.
-    #[default]
+    /// syntect-based highlighter. Named after the `syntect` crate that does the in-process
+    /// highlighting. Shows the markdown source as the model wrote it, reflowing nothing, so a wide
+    /// table runs past the terminal edge.
     Syntect,
+    /// Rendered CommonMark, reflowed to the terminal (default).
+    ///
+    /// The default because meka's own output is table-heavy: `task_list`, `scratchpad_list`, and
+    /// anything the model formats as a table all wrap inside their box here and run off the right
+    /// edge under `syntect`. Reading rendered prose is also the common case; wanting to see the
+    /// markers is the exception, and `syntect` is one config line away.
+    #[default]
     Termimad,
     Raw,
     /// Emits no output to stdout/stderr. Used by sub-agents and any other in-process
@@ -340,9 +347,14 @@ impl StreamingRenderer {
         // out and applies the skin, but the text it receives carries no markup, so nothing depends
         // on minimad's dialect matching what the model wrote.
         let document = markdown::MarkdownDoc::parse(markdown);
-        let width = self
-            .width
-            .or_else(|| Some(termimad::terminal_size().0 as usize));
+        let width = self.width.or_else(|| {
+            // Only wrap when there is a real terminal to wrap to. With stdout redirected,
+            // `termimad::terminal_size()` reports a 50-column fallback, and reflowing an answer to
+            // 50 columns on its way into a file or another tool is narrower than anyone asked for.
+            // `None` tells termimad not to reflow at all, which is what an unbounded sink wants.
+            std::io::IsTerminal::is_terminal(&std::io::stdout())
+                .then(|| termimad::terminal_size().0 as usize)
+        });
         format!(
             "{}",
             termimad::FmtText::from_text(&self.skin, document.to_minimad(), width)
@@ -1395,10 +1407,17 @@ pub struct HistoryRenderOptions {
 /// flows through [`OutputSpacing`] (the same state machine the live loop uses) so transitions like
 /// tool-indicator → text get a blank line; user-prompt spacing follows the `newline_before_prompt`
 /// / `newline_after_prompt` config flags just like the live REPL.
-pub fn render_message_history(messages: &[crate::provider::Message], opts: &HistoryRenderOptions) {
+///
+/// Returns whether anything reached the terminal. A slice can render to nothing (it is empty, or it
+/// holds only tool results and blank text), and the caller has to know: its own blank lines bracket
+/// this output, and bracketing nothing leaves a gap that reads as a rendering fault.
+pub fn render_message_history(
+    messages: &[crate::provider::Message],
+    opts: &HistoryRenderOptions,
+) -> bool {
     use crate::provider::{ContentBlock, Role};
     if messages.is_empty() {
-        return;
+        return false;
     }
     let mut spacing = OutputSpacing::new();
     // The caller (e.g. the `/history` dispatch) is expected to emit the leading blank, the
@@ -1476,6 +1495,7 @@ pub fn render_message_history(messages: &[crate::provider::Message], opts: &Hist
             }
         }
     }
+    emitted_any
 }
 
 fn render_assistant_text(text: &str, render_mode: RenderMode) {
@@ -1610,6 +1630,22 @@ fn tool_display_name(name: &str) -> &str {
     }
 }
 
+/// Whether [`builtin_primary_param`] has a rule for `name`.
+///
+/// Exists so a test can assert the invariant that every tool taking arguments can display one,
+/// without having to synthesise a valid input for each. A tool with no `required` array relies
+/// entirely on having a rule here, since the schema fallback has no first entry to read.
+#[cfg(test)]
+pub fn has_primary_param_rule(name: &str) -> bool {
+    // A probe input that satisfies whichever branch applies. `builtin_primary_param` returns `None`
+    // for a mapped tool given the wrong shape, so the probe carries every key any rule looks at.
+    let probe = serde_json::json!({
+        "from_scratchpad": "x", "id": "x", "command": "x", "path": "x", "pattern": "x",
+        "url": "x", "query": "x", "prompt": "x", "name": "x",
+    });
+    builtin_primary_param(name, &probe).is_some()
+}
+
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     // `render_image` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
@@ -1653,6 +1689,20 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
             ));
         }
         return Some("read".to_string());
+    }
+
+    // `task_cancel` takes either an id or `all`, and declares neither as required, so there is no
+    // `required[0]` for the schema fallback to reach for. Without this the indicator would render
+    // the tool name with no argument, which is the one thing a cancellation must be specific about.
+    if name == "task_cancel" {
+        if input
+            .get("all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Some("all".to_string());
+        }
+        return input.get("id").and_then(|v| v.as_str()).map(str::to_string);
     }
 
     let key = match name {
@@ -2086,6 +2136,51 @@ mod tests {
         assert_eq!(
             builtin_primary_param("skill", &input).as_deref(),
             Some("setup-postgres")
+        );
+    }
+
+    /// A cancellation has to say what it cancelled. `task_cancel` declares neither `id` nor `all`
+    /// as required, so without a rule it renders as a bare tool name.
+    #[test]
+    fn test_builtin_primary_param_task_cancel() {
+        assert_eq!(
+            builtin_primary_param("task_cancel", &serde_json::json!({"id": "7f3a1c22"})).as_deref(),
+            Some("7f3a1c22")
+        );
+        assert_eq!(
+            builtin_primary_param("task_cancel", &serde_json::json!({"all": true})).as_deref(),
+            Some("all")
+        );
+        // `all: false` alongside an id is the ordinary single cancel, not a bulk one.
+        assert_eq!(
+            builtin_primary_param(
+                "task_cancel",
+                &serde_json::json!({"id": "7f3a1c22", "all": false})
+            )
+            .as_deref(),
+            Some("7f3a1c22")
+        );
+        assert_eq!(
+            builtin_primary_param("task_cancel", &serde_json::json!({})),
+            None
+        );
+    }
+
+    /// The whole path the indicator actually uses, not just the built-in map.
+    #[test]
+    fn test_resolve_primary_param_renders_a_task_cancellation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "all": {"type": "boolean"}}
+        });
+        assert_eq!(
+            resolve_primary_param(
+                "task_cancel",
+                &serde_json::json!({"id": "7f3a1c22"}),
+                Some(&schema)
+            )
+            .as_deref(),
+            Some("7f3a1c22")
         );
     }
 
@@ -2800,9 +2895,35 @@ mod tests {
         );
     }
 
+    /// The default reaches every path that does not name a mode, so it is worth pinning rather than
+    /// inheriting from whichever variant happens to be declared first.
     #[test]
     fn test_render_mode_default() {
-        assert_eq!(RenderMode::default(), RenderMode::Syntect);
+        assert_eq!(RenderMode::default(), RenderMode::Termimad);
+    }
+
+    /// With stdout redirected there is no width to reflow to, and `termimad::terminal_size()`
+    /// answers with a 50-column fallback. Wrapping an answer that narrowly on its way into a file
+    /// is worse than not wrapping it, and this is the default mode now, so every piped run would
+    /// hit it. Tests run without a terminal, which is exactly the case being pinned.
+    #[test]
+    fn test_termimad_does_not_reflow_without_a_terminal() {
+        let sentence = "word ".repeat(60);
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
+        renderer.started = true;
+        renderer.buffer = sentence;
+        let rendered = renderer.finish_termimad_output(renderer.buffer.clone().trim_end());
+
+        let longest = rendered
+            .lines()
+            .map(|line| strip_ansi_escapes(line).chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest > 50,
+            "a redirected run must not be hard-wrapped to the 50-column fallback; longest line \
+             was {longest}",
+        );
     }
 
     #[test]
@@ -3312,24 +3433,24 @@ mod tests {
             newline_before_prompt: true,
             newline_after_prompt: true,
         };
-        render_message_history(&messages, &opts_with_thinking);
+        assert!(render_message_history(&messages, &opts_with_thinking));
         // And off: the call must still complete cleanly.
         let opts_no_thinking = HistoryRenderOptions {
             show_thinking: false,
             ..opts_with_thinking
         };
-        render_message_history(&messages, &opts_no_thinking);
+        assert!(render_message_history(&messages, &opts_no_thinking));
         // Also: no-newline-prompt config must still produce non-panicking output.
         let opts_tight = HistoryRenderOptions {
             newline_before_prompt: false,
             newline_after_prompt: false,
             ..opts_with_thinking
         };
-        render_message_history(&messages, &opts_tight);
+        assert!(render_message_history(&messages, &opts_tight));
     }
 
     #[test]
-    fn test_render_message_history_empty_is_a_noop() {
+    fn test_render_message_history_reports_when_it_showed_nothing() {
         let opts = HistoryRenderOptions {
             render_mode: RenderMode::Raw,
             show_thinking: false,
@@ -3337,6 +3458,30 @@ mod tests {
             newline_before_prompt: true,
             newline_after_prompt: true,
         };
-        render_message_history(&[], &opts);
+        assert!(!render_message_history(&[], &opts));
+
+        // Non-empty but invisible: tool results are deliberately not echoed and blank assistant
+        // text is skipped, so this renders to nothing at all. `/history` prints its empty-state
+        // line off this answer, and the caller's `[display]` blanks would otherwise bracket a
+        // region with nothing in it.
+        let invisible = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "   \n".to_string(),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "u1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "hello".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            },
+        ];
+        assert!(!render_message_history(&invisible, &opts));
     }
 }

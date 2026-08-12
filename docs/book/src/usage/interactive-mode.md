@@ -111,9 +111,13 @@ meka supports `/` prefix commands for controlling the shell:
 | `/compact` | Summarize and compact the session history |
 | `/rewind [N]` | Drop the last `N` turns (default 1) from the conversation the model sees |
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
+| `/export` | Write the session to `session-<id>.md` and print where it landed |
 | `/cd [path]` | Change working directory |
 | `/schedule` | List this session's scheduled jobs |
 | `/schedule cancel <id>` | Cancel a scheduled job by id or unique prefix |
+| `/tasks` | List this session's [background tasks](./background.md) |
+| `/tasks cancel <id>` | Stop one background task by id or unique prefix |
+| `/tasks cancel --all` | Stop every running background task |
 | `/mcp list` | List configured MCP servers with their live state (`pending` / `connected` / `failed` / `disabled`) |
 | `/mcp reconnect <server>` | Smoke-test connect for one server |
 | `/mcp login <server>` | Run the OAuth flow from the REPL |

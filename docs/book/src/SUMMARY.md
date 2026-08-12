@@ -26,6 +26,7 @@
 - [Skills](./usage/skills.md)
 - [Memory](./usage/memory.md)
 - [Scheduling](./usage/scheduling.md)
+- [Background Tasks](./usage/background.md)
 - [Account Info](./usage/account.md)
 
 # Providers

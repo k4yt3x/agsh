@@ -22,15 +22,24 @@ pub struct AddArgs<'a> {
     pub force: bool,
 }
 
-/// `meka memory list`: a table of every memory in index order, followed by the priority
-/// distribution.
+/// Whether a listing ends with the priority histogram.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ListDetail {
+    /// `meka memory list`: the table plus the distribution.
+    WithDistribution,
+    /// `/memory`: the table alone. A mid-session glance is asking "what do I have saved", and a
+    /// histogram of a handful of entries is noise around the answer.
+    TableOnly,
+}
+
+/// A table of every memory in index order, optionally followed by the priority distribution.
 ///
-/// The distribution is the point of the command as much as the listing. The agent picks a priority
-/// at write time and everything feels important then, so priorities drift downward (toward 0) over
-/// a long-lived instance until the index stops ranking anything. Printing the histogram makes that
+/// The distribution is half the point of `meka memory list`. The agent picks a priority at write
+/// time and everything feels important then, so priorities drift downward (toward 0) over a
+/// long-lived instance until the index stops ranking anything. Printing the histogram makes that
 /// drift something you can see and rebalance rather than something you discover when the index
-/// stops being useful.
-pub async fn run_list() -> Result<()> {
+/// stops being useful. That is a deliberate inspection, though, not what `/memory` is for.
+pub async fn run_list(detail: ListDetail) -> Result<()> {
     let memories = memory::discover_memories();
     if memories.is_empty() {
         println!("(no memories saved)");
@@ -55,15 +64,17 @@ pub async fn run_list() -> Result<()> {
         crate::render::format_columns(&["Name", "Priority", "Updated", "Description"], &rows)
     );
 
-    println!();
-    println!("{} memories. Priority distribution:", memories.len());
-    for priority in memory::MIN_PRIORITY..=memory::MAX_PRIORITY {
-        let count = memories
-            .iter()
-            .filter(|entry| entry.priority == priority)
-            .count();
-        if count > 0 {
-            println!("  p{}: {}", priority, count);
+    if detail == ListDetail::WithDistribution {
+        println!();
+        println!("{} memories. Priority distribution:", memories.len());
+        for priority in memory::MIN_PRIORITY..=memory::MAX_PRIORITY {
+            let count = memories
+                .iter()
+                .filter(|entry| entry.priority == priority)
+                .count();
+            if count > 0 {
+                println!("  p{}: {}", priority, count);
+            }
         }
     }
     Ok(())

@@ -283,6 +283,13 @@ pub struct Agent {
     /// advisory lives on in the conversation, so a second copy teaches nothing and costs context
     /// on every later call.
     schema_advisories_sent: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Live handles for background tool calls this agent started. Empty and inert unless
+    /// `[background] enabled`; shared with the `task_*` tools and the REPL so all three act on one
+    /// set. See [`crate::background`].
+    background_tasks: crate::background::BackgroundTasks,
+    /// Ceiling on this session's concurrent background tasks, from `[background] max_tasks`. Zero
+    /// when the feature is off, which is also what refuses a call that somehow arrives anyway.
+    background_max_tasks: usize,
     /// Optional MCP client manager; used to read server-supplied `InitializeResult.instructions`
     /// for inclusion in the system prompt.
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
@@ -352,6 +359,10 @@ impl Agent {
             schema_advisories_sent: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            // Off until `enable_background` says otherwise, so every path that forgets to configure
+            // it gets today's synchronous behaviour rather than a half-wired detach.
+            background_tasks: crate::background::BackgroundTasks::default(),
+            background_max_tasks: 0,
             mcp_manager: None,
             session_stats,
             persist_session_stats: true,
@@ -506,6 +517,32 @@ impl Agent {
         *self.last_rendered_world.write().await = None;
     }
 
+    /// Turn on background tool calls and hand this agent the shared task registry.
+    ///
+    /// Called only on the primary agent, before the first turn. Sub-agents are deliberately never
+    /// enabled: a sub-agent's session ends with the one turn that spawned it, so a task outliving
+    /// that turn would have no conversation left to report into.
+    pub fn enable_background(
+        &mut self,
+        tasks: crate::background::BackgroundTasks,
+        max_tasks: usize,
+    ) {
+        self.tool_registry.enable_background();
+        self.background_tasks = tasks;
+        self.background_max_tasks = max_tasks;
+    }
+
+    /// The shared registry, for the REPL's `/tasks` command and its Ctrl+C handling.
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background_tasks.clone()
+    }
+
+    /// This agent's session store, so a signal handler can record a terminal outcome without the
+    /// REPL threading a second handle through every call site.
+    pub fn session_manager(&self) -> SessionManager {
+        self.session_manager.clone()
+    }
+
     /// Point this agent's live context counter at an externally-owned atomic so the REPL prompt
     /// (constructed before the agent) can read the same value the agent writes after each turn.
     /// Safe to call only before the first turn; the primary REPL path uses it, sub-agents don't.
@@ -638,6 +675,22 @@ impl Agent {
         // spawn for a fixed tool set and permission, so there is nothing here for them to
         // learn and rendering it would bill every `spawn_agent` for a second copy of the
         // catalogue.
+        // Read fresh each turn and rendered outside the world-state diff: running tasks are live
+        // state, like the todo list, not a record of what the model has been told. Skipped entirely
+        // when the `task_*` tools are unregistered, which is the default.
+        let background_tasks =
+            match (*session_id).filter(|_| context::background_index_is_live(&catalogue)) {
+                Some(id) => self
+                    .session_manager
+                    .list_running_background_tasks(id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!("failed to load background tasks for context: {}", error);
+                        Vec::new()
+                    }),
+                None => Vec::new(),
+            };
+
         let (world_state, world_state_rollback) = if self.options.system_prompt_override.is_some() {
             (String::new(), None)
         } else {
@@ -704,6 +757,7 @@ impl Agent {
                         .auto_compact
                         .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
                 }),
+                &background_tasks,
             );
             format!("{}\n\n{}", block, user_input)
         };
@@ -1704,18 +1758,44 @@ impl Agent {
         // so this is only `None` on paths that never established a session.
         let session_id = *self.shared_session_id.read().await;
         let schema = tool.definition().parameters;
-        let dispatch = crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
-            if permission == crate::permission::Permission::Ask {
-                return self
-                    .execute_with_approval(&*tool, name, input, cancellation)
-                    .await;
-            }
 
-            Self::run_tool(&*tool, input, cancellation, &self.frontend).await
-        });
-        let mut output = match session_id {
-            Some(id) => crate::mcp::with_session_id(id, dispatch).await,
-            None => dispatch.await,
+        // Refused before anything runs, rather than read as absent. `background` and `scratchpad`
+        // are consumed by this loop, not by the tool, and each decides what the call *does*, so a
+        // wrong type that we shrugged off would be a silent no-op the model has no way to notice:
+        // a detach that quietly blocked, or output it asked to keep that was never kept.
+        if let Some(complaint) = crate::tools::meka_parameter_error(input, &schema) {
+            return crate::tools::ToolOutput::text(complaint, true);
+        }
+
+        // `background` is meka's own, spliced into the schema by the registry and consumed here, so
+        // it is taken out of the arguments before any tool (least of all a remote MCP server) sees
+        // a key it never advertised. The schema goes along to settle whose parameter it is: a tool
+        // that declares `background` itself never received the splice and keeps its argument.
+        let (input, detach) = crate::tools::take_background_flag(input, &schema);
+        let input = &input;
+
+        // Approval resolves *before* a detach, never inside it. A prompt surfacing minutes after
+        // the turn that caused it, with nothing on screen to explain it, is worse than the
+        // round trip it would save.
+        if permission == crate::permission::Permission::Ask
+            && let Some(denial) = self
+                .request_approval(name, input, &schema, &cancellation)
+                .await
+        {
+            return denial;
+        }
+
+        let mut output = if detach {
+            self.start_background_call(&tool, tool_call_id, name, input, session_id)
+                .await
+        } else {
+            let dispatch = crate::tools::with_tool_call_id(tool_call_id.to_string(), async move {
+                Self::run_tool(&*tool, input, cancellation, &self.frontend).await
+            });
+            match session_id {
+                Some(id) => crate::mcp::with_session_id(id, dispatch).await,
+                None => dispatch.await,
+            }
         };
         if let Some(advisory) = self.schema_advisory(name, input, &schema, loaded, !output.is_error)
         {
@@ -1762,15 +1842,20 @@ impl Agent {
         first_time.then_some(advisory)
     }
 
-    async fn execute_with_approval(
+    /// Ask the user to approve one call in `ask` mode. `None` means run it; `Some` is the result to
+    /// return instead.
+    ///
+    /// Split out of the dispatch path so approval can be settled *before* a `background` call
+    /// detaches. Left inline, the prompt would surface minutes later with nothing on screen to
+    /// explain what it belonged to.
+    async fn request_approval(
         &self,
-        tool: &dyn crate::tools::Tool,
         name: &str,
         input: &serde_json::Value,
-        cancellation: CancellationToken,
-    ) -> crate::tools::ToolOutput {
-        let schema = tool.definition().parameters;
-        let primary_param = crate::render::resolve_primary_param(name, input, Some(&schema));
+        schema: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Option<crate::tools::ToolOutput> {
+        let primary_param = crate::render::resolve_primary_param(name, input, Some(schema));
         let outcome = self
             .frontend
             .request_permission(PermissionRequest {
@@ -1780,16 +1865,188 @@ impl Agent {
             })
             .await;
         match outcome {
-            PermissionOutcome::Allow => {
-                Self::run_tool(tool, input, cancellation, &self.frontend).await
-            }
-            PermissionOutcome::Deny => {
-                crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)
-            }
-            PermissionOutcome::Cancelled => {
-                crate::tools::ToolOutput::text("Approval request was cancelled.".to_string(), true)
-            }
+            PermissionOutcome::Allow => None,
+            PermissionOutcome::Deny => Some(crate::tools::ToolOutput::text(
+                "User denied tool execution.".to_string(),
+                true,
+            )),
+            PermissionOutcome::Cancelled => Some(crate::tools::ToolOutput::text(
+                "Approval request was cancelled.".to_string(),
+                true,
+            )),
         }
+    }
+
+    /// Detach one call: record it, spawn it, and hand the model a task id instead of a result.
+    ///
+    /// The spawned work gets a **fresh** cancellation token rather than the turn's. Sharing the
+    /// turn's would kill the task the instant the turn ended, which is the whole thing this exists
+    /// to avoid; the cost is that Ctrl+C no longer reaches it, which is why `task_cancel` and the
+    /// second-press escalation exist.
+    async fn start_background_call(
+        &self,
+        tool: &Arc<dyn crate::tools::Tool>,
+        tool_call_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        session_id: Option<Uuid>,
+    ) -> crate::tools::ToolOutput {
+        let Some(session_id) = session_id else {
+            return crate::tools::ToolOutput::text(
+                "Error: background calls need a session to report back into. Run this one \
+                 normally, without `background`."
+                    .to_string(),
+                true,
+            );
+        };
+        if self.background_max_tasks == 0 {
+            return crate::tools::ToolOutput::text(
+                "Error: background calls are disabled on this installation. Run this one normally, \
+                 without `background`."
+                    .to_string(),
+                true,
+            );
+        }
+        let schema = tool.definition().parameters;
+        let label = crate::render::resolve_primary_param(name, input, Some(&schema))
+            .unwrap_or_else(|| name.to_string());
+        let task = crate::background::BackgroundTask {
+            id: Uuid::new_v4().to_string(),
+            session_id,
+            tool_name: name.to_string(),
+            label,
+            status: crate::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_name: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            delivered_at: None,
+        };
+        // Claim a slot before anything else. Atomic against the sibling calls in this same
+        // assistant message, which `execute_tool_calls` dispatches concurrently: a
+        // count-then-register would let four calls all read "zero running" and every one of
+        // them start.
+        let cancellation = CancellationToken::new();
+        if !self
+            .background_tasks
+            .try_reserve(
+                task.id.clone(),
+                session_id,
+                cancellation.clone(),
+                self.background_max_tasks,
+            )
+            .await
+        {
+            return crate::tools::ToolOutput::text(
+                format!(
+                    "Error: {} background tasks are already running, which is the limit. Wait for \
+                     one to report, cancel one with `task_cancel`, or run this call without \
+                     `background`.",
+                    self.background_max_tasks
+                ),
+                true,
+            );
+        }
+
+        // Recorded before the spawn, so a process that dies in between leaves a `running` row the
+        // sweep can retire rather than work nobody knows happened.
+        if let Err(error) = self.session_manager.start_background_task(&task).await {
+            // Hand the slot back, or a failed start would shrink the ceiling for the session's
+            // lifetime.
+            self.background_tasks.forget(&task.id).await;
+            return crate::tools::ToolOutput::text(
+                format!("Error: could not record the background task: {}", error),
+                true,
+            );
+        }
+
+        let join = tokio::spawn({
+            let tool = Arc::clone(tool);
+            let input = input.clone();
+            let frontend = Arc::clone(&self.frontend);
+            let session_manager = self.session_manager.clone();
+            let tasks = self.background_tasks.clone();
+            let cancellation = cancellation.clone();
+            let tool_call_id = tool_call_id.to_string();
+            let task_id = task.id.clone();
+            let tool_name = task.tool_name.clone();
+            async move {
+                let run = crate::tools::with_tool_call_id(tool_call_id, async move {
+                    Self::run_tool(&*tool, &input, cancellation.clone(), &frontend).await
+                });
+                // A panic must not escape this task. Nothing awaits its `JoinHandle` outside
+                // `--oneshot`, so an unwind here would skip both the outcome write and the slot
+                // release: the agent would wait forever on a report that is never coming, and the
+                // ceiling would be permanently one lower. Turning it into a `failed` outcome is
+                // what the rest of the machinery already knows how to deliver.
+                use futures::FutureExt;
+                let output = match std::panic::AssertUnwindSafe(crate::mcp::with_session_id(
+                    session_id, run,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(output) => output,
+                    Err(_) => {
+                        tracing::error!("background task {} panicked", task_id);
+                        crate::tools::ToolOutput::text(
+                            "The tool panicked while running in the background.".to_string(),
+                            true,
+                        )
+                    }
+                };
+
+                let text = crate::provider::ContentBlock::tool_result_text_content(&output.content);
+                let (inline, spilled) = crate::background::split_outcome(&text);
+                let mut scratchpad_name = None;
+                if let Some(full) = spilled {
+                    let name = crate::background::spill_entry_name(&task_id, &tool_name);
+                    match session_manager
+                        .save_tool_output(session_id, &name, &full)
+                        .await
+                    {
+                        Ok(()) => scratchpad_name = Some(name),
+                        // Not fatal: the head still reaches the model, and losing the tail is far
+                        // better than losing the whole report.
+                        Err(error) => tracing::warn!(
+                            "background task {}: could not spill output to the scratchpad: {}",
+                            task_id,
+                            error
+                        ),
+                    }
+                }
+
+                let status = if output.is_error {
+                    crate::background::TaskStatus::Failed
+                } else {
+                    crate::background::TaskStatus::Completed
+                };
+                if let Err(error) = session_manager
+                    .finish_background_task(&task_id, status, Some(inline), scratchpad_name)
+                    .await
+                {
+                    tracing::warn!(
+                        "background task {} finished but could not be recorded: {}",
+                        task_id,
+                        error
+                    );
+                }
+                tasks.forget(&task_id).await;
+            }
+        });
+        self.background_tasks.attach(&task.id, join).await;
+
+        crate::tools::ToolOutput::text(
+            format!(
+                "Started in the background as task {} ({}). It is still running; its result will \
+                 be delivered to you when it finishes. Do not wait for it here. Use `task_list` to \
+                 check on it and `task_cancel` with \"{}\" to stop it.",
+                task.short_id(),
+                task.label,
+                task.short_id(),
+            ),
+            false,
+        )
     }
 
     /// Invoke a tool, scoping the per-session frontend into a task-local so MCP-originated
@@ -2704,6 +2961,524 @@ mod tests {
         assert!(results.contains("Sent (message id 1)"), "{results}");
         assert!(results.contains("as_photo"), "the omitted flag: {results}");
         assert!(results.contains("load_tool"), "{results}");
+    }
+
+    /// A tool that blocks until cancelled, standing in for a long build.
+    struct SlowFixture;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SlowFixture {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "execute_command".to_string(),
+                description: "Run a shell command.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "The command"}
+                    },
+                    "required": ["command"]
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            cancellation: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            cancellation.cancelled().await;
+            Err(MekaError::Interrupted)
+        }
+    }
+
+    /// A tool that returns at once, for the ordinary completion path.
+    struct QuickFixture;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for QuickFixture {
+        fn definition(&self) -> ToolDefinition {
+            SlowFixture.definition()
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text(
+                "42 passed".to_string(),
+                false,
+            ))
+        }
+    }
+
+    async fn background_agent(
+        provider: Arc<dyn Provider>,
+        tool: Arc<dyn crate::tools::Tool>,
+    ) -> (Agent, SessionManager) {
+        let registry = crate::tools::ToolRegistry::new();
+        registry.enable_background();
+        registry.register(tool).expect("register fixture");
+        let (mut agent, session_manager) = test_agent_with_registry(provider, registry).await;
+        agent.enable_background(crate::background::BackgroundTasks::default(), 2);
+        (agent, session_manager)
+    }
+
+    fn background_round(command: &str) -> Vec<crate::provider::mock::MockEvent> {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "execute_command".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"command": command, "background": true}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    fn text_round(text: &str) -> Vec<crate::provider::mock::MockEvent> {
+        use crate::provider::mock::{MockEvent, MockStopReason};
+        vec![
+            MockEvent::Text {
+                text: text.to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]
+    }
+
+    /// The whole point: the turn ends without waiting, and the model is handed a task id rather
+    /// than a result.
+    #[tokio::test]
+    async fn test_a_background_call_returns_a_handle_and_ends_the_turn() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("sleep 600"),
+            text_round("started it"),
+        ]));
+        let (agent, session_manager) = background_agent(provider, Arc::new(SlowFixture)).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "run the suite".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn must not block on the task");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(results.contains("Started in the background"), "{results}");
+        assert!(results.contains("task_cancel"), "{results}");
+
+        let running = session_manager
+            .list_running_background_tasks(session_id.expect("session"))
+            .await
+            .expect("list running");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].label, "sleep 600");
+
+        // Leave nothing behind for the next test's runtime to trip over.
+        agent.background_tasks().cancel_all().await;
+    }
+
+    /// With `[background] enabled = false` the parameter is never offered, so a model asking for it
+    /// is guessing. It still must not be silently ignored: running a twenty-minute command in the
+    /// foreground because a flag was dropped is exactly the surprise the whole feature exists to
+    /// avoid, and the refusal tells the model to reissue the call plainly.
+    #[tokio::test]
+    async fn test_background_is_refused_when_the_installation_disabled_it() {
+        use crate::provider::mock::MockProvider;
+
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(QuickFixture))
+            .expect("register fixture");
+        // Deliberately no `enable_background`: this is what a default installation looks like.
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("cargo test"),
+            text_round("understood"),
+        ]));
+        let (agent, session_manager) = test_agent_with_registry(provider, registry).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "run the suite".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.contains("background calls are disabled"),
+            "{results}"
+        );
+        assert!(results.contains("without `background`"), "{results}");
+        assert!(
+            !results.contains("42 passed"),
+            "the call must be refused, not quietly run in the foreground: {results}"
+        );
+        assert!(
+            session_manager
+                .list_background_tasks(session_id.expect("session"))
+                .await
+                .expect("list")
+                .is_empty(),
+            "a disabled installation must not record tasks"
+        );
+    }
+
+    /// A finished task's outcome has to reach the conversation, and exactly once.
+    #[tokio::test]
+    async fn test_a_finished_task_is_recorded_for_delivery_once() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("cargo test"),
+            text_round("started it"),
+        ]));
+        let (agent, session_manager) = background_agent(provider, Arc::new(QuickFixture)).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "run the suite".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+        let session_id = session_id.expect("session");
+        agent.background_tasks().wait_for_session(session_id).await;
+
+        let ready = session_manager
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list undelivered");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].status, crate::background::TaskStatus::Completed);
+        assert_eq!(ready[0].outcome.as_deref(), Some("42 passed"));
+
+        let rendered = crate::background::render_outcomes(&ready);
+        assert!(rendered.contains("42 passed"), "{rendered}");
+        assert!(rendered.contains("cargo test"), "{rendered}");
+
+        let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+        session_manager
+            .mark_background_tasks_delivered(&ids)
+            .await
+            .expect("stamp");
+        assert!(
+            session_manager
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list undelivered")
+                .is_empty(),
+            "an outcome must reach the conversation once, not on every tick"
+        );
+    }
+
+    /// Nothing awaits a background task's `JoinHandle` outside `--oneshot`, so an unwind that
+    /// escaped would skip both the outcome write and the slot release: a report that never comes,
+    /// and a ceiling permanently one lower.
+    #[tokio::test]
+    async fn test_a_panicking_background_tool_still_reports_and_frees_its_slot() {
+        use crate::provider::mock::MockProvider;
+
+        struct PanicFixture;
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for PanicFixture {
+            fn definition(&self) -> ToolDefinition {
+                SlowFixture.definition()
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _cancellation: CancellationToken,
+            ) -> Result<crate::tools::ToolOutput> {
+                panic!("tool exploded");
+            }
+        }
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("boom"),
+            text_round("started"),
+        ]));
+        let (agent, session_manager) = background_agent(
+            provider,
+            Arc::new(PanicFixture) as Arc<dyn crate::tools::Tool>,
+        )
+        .await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "run it".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+        let session_id = session_id.expect("session");
+        agent.background_tasks().wait_for_session(session_id).await;
+
+        let ready = session_manager
+            .list_undelivered_background_tasks(session_id)
+            .await
+            .expect("list undelivered");
+        assert_eq!(ready.len(), 1, "the panic must still produce a report");
+        assert_eq!(ready[0].status, crate::background::TaskStatus::Failed);
+
+        assert_eq!(
+            agent.background_tasks().running_count(session_id).await,
+            0,
+            "the slot must be released, or the ceiling shrinks for the session's lifetime"
+        );
+    }
+
+    /// The concurrency ceiling refuses rather than silently queueing, so the model can decide
+    /// whether to wait or run the call in the foreground.
+    #[tokio::test]
+    async fn test_the_task_ceiling_refuses_with_something_actionable() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("sleep 1"),
+            background_round("sleep 2"),
+            background_round("sleep 3"),
+            text_round("done"),
+        ]));
+        let (agent, _session_manager) = background_agent(provider, Arc::new(SlowFixture)).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "start three".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(results.contains("which is the limit"), "{results}");
+        assert!(results.contains("without `background`"), "{results}");
+
+        agent.background_tasks().cancel_all().await;
+    }
+
+    /// `background` is meka's own. A tool must never see it, least of all a remote MCP server that
+    /// never advertised the key.
+    #[tokio::test]
+    async fn test_the_background_flag_never_reaches_the_tool() {
+        use crate::provider::mock::MockProvider;
+
+        struct RecordingFixture(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for RecordingFixture {
+            fn definition(&self) -> ToolDefinition {
+                SlowFixture.definition()
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                input: serde_json::Value,
+                _cancellation: CancellationToken,
+            ) -> Result<crate::tools::ToolOutput> {
+                *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(input);
+                Ok(crate::tools::ToolOutput::text("ok".to_string(), false))
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            background_round("make"),
+            text_round("started"),
+        ]));
+        let (agent, _session_manager) = background_agent(
+            provider,
+            Arc::new(RecordingFixture(Arc::clone(&seen))) as Arc<dyn crate::tools::Tool>,
+        )
+        .await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "build".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+        agent
+            .background_tasks()
+            .wait_for_session(session_id.expect("session"))
+            .await;
+
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let seen = seen.expect("the tool ran");
+        assert_eq!(seen, serde_json::json!({"command": "make"}));
+    }
+
+    /// A wrong-typed `background` refuses the call and says what to send, rather than running it in
+    /// the foreground. Models that stringify every argument (GLM through OpenRouter does) would
+    /// otherwise get a twenty-minute block where they asked for a detach, with nothing in the
+    /// transcript accounting for it; here they are told, and the retry is theirs to make.
+    #[tokio::test]
+    async fn test_a_wrong_typed_background_flag_refuses_the_call() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        struct WitnessFixture(Arc<std::sync::atomic::AtomicBool>);
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for WitnessFixture {
+            fn definition(&self) -> ToolDefinition {
+                SlowFixture.definition()
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _cancellation: CancellationToken,
+            ) -> Result<crate::tools::ToolOutput> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::tools::ToolOutput::text("ok".to_string(), false))
+            }
+        }
+
+        let stringified = vec![
+            MockEvent::ToolUseStart {
+                id: "call-1".to_string(),
+                name: "execute_command".to_string(),
+            },
+            MockEvent::ToolUseEnd {
+                input: serde_json::json!({"command": "make", "background": "true"}),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::ToolUse,
+            },
+        ];
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            stringified,
+            text_round("understood"),
+        ]));
+        let (agent, _session_manager) = background_agent(
+            provider,
+            Arc::new(WitnessFixture(Arc::clone(&ran))) as Arc<dyn crate::tools::Tool>,
+        )
+        .await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "build".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a call meka could not read must not run at all, least of all in the foreground",
+        );
+        let results: String = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(results.contains("background"), "{results}");
+        assert!(results.contains("boolean"), "{results}");
     }
 
     /// A call that never executed must not spend the tool's one advisory. Otherwise a permission

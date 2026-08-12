@@ -53,6 +53,91 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
     })
 }
 
+/// Start the background-outcome poller for a running ACP process.
+///
+/// Same limit as the scheduler above: only sessions the editor currently has open. A session it
+/// closed is not this host's to revive, and the outcome keeps its `delivered_at IS NULL` until
+/// something opens it again.
+pub(super) fn spawn_background_poller(
+    state: Arc<super::ServerState>,
+) -> tokio::task::JoinHandle<()> {
+    if !state.shared.config.background.enabled {
+        return tokio::spawn(async {});
+    }
+    let poll_interval = state.shared.config.schedule.poll_interval;
+    tracing::info!("background tasks enabled for ACP: open sessions only");
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let open: Vec<(String, super::SessionEntry)> = {
+                let sessions = state.sessions.read().await;
+                sessions
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.clone()))
+                    .collect()
+            };
+            for (key, entry) in open {
+                let Ok(session_uuid) = uuid::Uuid::parse_str(&key) else {
+                    continue;
+                };
+                let ready = match state
+                    .shared
+                    .session_manager
+                    .list_undelivered_background_tasks(session_uuid)
+                    .await
+                {
+                    Ok(ready) if !ready.is_empty() => ready,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!("background poller failed for {}: {}", session_uuid, error);
+                        continue;
+                    }
+                };
+                let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+                if let Err(error) = state
+                    .shared
+                    .session_manager
+                    .mark_background_tasks_delivered(&ids)
+                    .await
+                {
+                    tracing::warn!("failed to stamp background outcomes delivered: {}", error);
+                    continue;
+                }
+                deliver_outcomes(&entry, crate::background::render_outcomes(&ready)).await;
+            }
+        }
+    })
+}
+
+/// Run one outcome report inside an open session, mirroring `run_wakeup`'s ordering: take the lock
+/// first, then show the prompt, so the transcript reads trigger-then-reply and the report never
+/// lands in the middle of a turn the user typed.
+async fn deliver_outcomes(entry: &super::SessionEntry, prompt: String) {
+    let mut runtime = entry.runtime.lock().await;
+    entry.frontend.push_out_of_band_prompt(&prompt);
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    entry.publish_cancellation(cancellation.clone());
+
+    let mut session_uuid = Some(runtime.session_uuid);
+    let runtime_inner = &mut *runtime;
+    if let Err(error) = runtime_inner
+        .agent
+        .run_turn(
+            &mut session_uuid,
+            &mut runtime_inner.messages,
+            prompt,
+            Vec::new(),
+            cancellation,
+        )
+        .await
+    {
+        tracing::warn!("background outcome turn failed: {}", error);
+    }
+}
+
 /// Run one fired job in the session the editor has open for it.
 async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutcome {
     let job_id = wakeup.job.short_id().to_string();
@@ -126,8 +211,8 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
 /// Zed skips an echoed `UserMessageChunk` only when it matches a message it optimistically added
 /// itself before calling `session/prompt`. A scheduled turn has no such message, so this renders --
 /// and without it the editor would show an answer with nothing above it explaining the question.
-pub(super) fn scheduled_prompt_update(wakeup: &Wakeup) -> SessionUpdate {
+pub(super) fn out_of_band_prompt_update(prompt: &str) -> SessionUpdate {
     SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
-        wakeup.render_prompt(),
+        prompt.to_string(),
     ))))
 }

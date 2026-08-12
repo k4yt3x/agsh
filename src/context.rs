@@ -107,6 +107,7 @@ pub struct WorldSnapshot {
 const SKILL_INDEX_TOOL: &str = "skill";
 const MEMORY_INDEX_TOOL: &str = "memory_read";
 const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
+const TASK_INDEX_TOOL: &str = crate::tools::background::TASK_INDEX_TOOL;
 
 /// Longest job prompt shown in the `[Scheduled]` index before it is elided. A prompt can be
 /// paragraphs; the index only has to be recognisable enough to prevent a duplicate.
@@ -117,6 +118,13 @@ const SCHEDULE_SUMMARY_MAX_CHARS: usize = 80;
 /// every turn of an installation that has scheduling switched off.
 pub fn schedule_index_is_live(catalogue: &[ToolCatalogueEntry]) -> bool {
     catalogue_has(catalogue, SCHEDULE_INDEX_TOOL)
+}
+
+/// Whether the `[Background]` index has a tool to open it, and therefore whether the caller needs
+/// to query for running tasks at all. Lets `Agent::run_turn` skip that query on every turn of an
+/// installation with background calls switched off, which is the default.
+pub fn background_index_is_live(catalogue: &[ToolCatalogueEntry]) -> bool {
+    catalogue_has(catalogue, TASK_INDEX_TOOL)
 }
 
 /// Whether `name` is registered, deferred or not. A deferred tool still counts: its schema is
@@ -596,6 +604,44 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
 /// double-booking a reminder. `schedule_list` is there for the rest.
 const SCHEDULE_INDEX_MAX_ENTRIES: usize = 20;
 
+/// The `[Background]` section: what is still running, and nothing else.
+///
+/// Rendered fresh every turn from live state, like `[Todo list]`, rather than living in
+/// [`WorldSnapshot`]. The snapshot is a record of what the model has been *told*, diffed so an
+/// unchanged picture costs nothing, and it carries an invariant that every difference must produce
+/// something to read. Running tasks fit neither half of that: they churn, a departure is already
+/// reported by its own outcome turn, and announcing departures here as well would say the same
+/// thing twice. Always-current is also simply more useful, since the model can read what is running
+/// instead of reconstructing it from arrival notices.
+///
+/// Deliberately carries no results. An outcome is permanent and belongs in the conversation.
+fn render_background_section(tasks: &[crate::background::BackgroundTask]) -> String {
+    let mut out = String::from(
+        "[Background]\nTasks you started and did not wait for, still running. Each will report to \
+         you on its own when it finishes; do not poll for them and do not start a second copy of \
+         work already listed here. Call `task_list` for full detail, `task_cancel` to stop one.\n\n",
+    );
+    for task in tasks.iter().take(BACKGROUND_INDEX_MAX_ENTRIES) {
+        out.push_str(&format!(
+            "- **{}**: {}\n",
+            task.short_id(),
+            elide(&task.label, crate::background::LABEL_MAX_CHARS)
+        ));
+    }
+    let hidden = tasks.len().saturating_sub(BACKGROUND_INDEX_MAX_ENTRIES);
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{} more not shown here; use `task_list` to see them.\n",
+            hidden
+        ));
+    }
+    out
+}
+
+/// Ceiling on tasks listed in `[Background]`. Well above `[background] max_tasks`'s default, so in
+/// practice every running task is shown and this only guards a raised ceiling.
+const BACKGROUND_INDEX_MAX_ENTRIES: usize = 20;
+
 /// Render the `[Scheduled]` index.
 ///
 /// Deliberately omits next-fire times. They move every time a job fires, and [`WorldSnapshot`] is
@@ -983,6 +1029,7 @@ pub fn build_turn_context(
     roots: &[std::path::PathBuf],
     world_state: &str,
     budget: Option<ContextBudget>,
+    background: &[crate::background::BackgroundTask],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -996,6 +1043,10 @@ pub fn build_turn_context(
 
     if !todos.items.is_empty() {
         sections.push(todo::format_todo_state(todos));
+    }
+
+    if !background.is_empty() {
+        sections.push(render_background_section(background));
     }
 
     let environment_context = build_environment_context(permission, cwd, roots);
@@ -2213,6 +2264,91 @@ mod tests {
         assert!(prompt.contains("**deploy-app**"));
     }
 
+    fn task_catalogue() -> Vec<ToolCatalogueEntry> {
+        vec![(
+            TASK_INDEX_TOOL.to_string(),
+            "List background tasks".to_string(),
+            Permission::Read,
+            false,
+        )]
+    }
+
+    fn running_task(short: &str, label: &str) -> crate::background::BackgroundTask {
+        crate::background::BackgroundTask {
+            id: format!("{short}-0000-0000-0000-000000000000"),
+            session_id: uuid::Uuid::nil(),
+            tool_name: "execute_command".to_string(),
+            label: label.to_string(),
+            status: crate::background::TaskStatus::Running,
+            outcome: None,
+            scratchpad_name: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            delivered_at: None,
+        }
+    }
+
+    /// The probe `Agent::run_turn` uses to skip querying for running tasks at all. With background
+    /// calls off (the default) the `task_*` tools are unregistered, and without this gate every
+    /// single turn of every such installation would pay a database round trip for a section that is
+    /// then discarded.
+    #[test]
+    fn test_background_index_is_live_only_with_its_tool() {
+        assert!(background_index_is_live(&task_catalogue()));
+        assert!(!background_index_is_live(&sample_catalogue()));
+    }
+
+    /// Running tasks render every turn from live state, beside the todo list, not through the
+    /// world-state diff. See [`render_background_section`] for why.
+    #[test]
+    fn test_background_section_lists_running_tasks() {
+        let context = build_turn_context(
+            Permission::Read,
+            &TodoState::default(),
+            std::path::Path::new("."),
+            &[],
+            "",
+            None,
+            &[running_task("7f3a1c22", "cargo test --all")],
+        );
+        assert!(context.contains("[Background]"), "{context}");
+        assert!(context.contains("7f3a1c22"), "{context}");
+        assert!(context.contains("cargo test --all"), "{context}");
+    }
+
+    #[test]
+    fn test_background_section_is_absent_with_nothing_running() {
+        let context = build_turn_context(
+            Permission::Read,
+            &TodoState::default(),
+            std::path::Path::new("."),
+            &[],
+            "",
+            None,
+            &[],
+        );
+        assert!(!context.contains("[Background]"), "{context}");
+    }
+
+    /// The section carries no results: an outcome is permanent and belongs in the conversation,
+    /// while this block is re-rendered and forgotten.
+    #[test]
+    fn test_background_section_carries_no_outcomes() {
+        let mut finished = running_task("7f3a1c22", "cargo test --all");
+        finished.status = crate::background::TaskStatus::Completed;
+        finished.outcome = Some("42 passed".to_string());
+        let context = build_turn_context(
+            Permission::Read,
+            &TodoState::default(),
+            std::path::Path::new("."),
+            &[],
+            "",
+            None,
+            &[finished],
+        );
+        assert!(!context.contains("42 passed"), "{context}");
+    }
+
     #[test]
     fn test_world_state_omits_skills_section_when_empty() {
         let rendered = world_state_for(&sample_catalogue(), &[], &[]);
@@ -2351,6 +2487,7 @@ mod tests {
             &[],
             "",
             None,
+            &[],
         );
         assert!(context.starts_with("<context>\n"));
         assert!(context.ends_with("</context>"));
@@ -2424,6 +2561,7 @@ mod tests {
                 window: 200_000,
                 compact_at_percent: Some(80),
             }),
+            &[],
         );
         assert!(context.contains("[Context budget]"), "{context}");
     }
@@ -2437,6 +2575,7 @@ mod tests {
             &[],
             "",
             None,
+            &[],
         );
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
@@ -2455,6 +2594,7 @@ mod tests {
             &[],
             "",
             None,
+            &[],
         );
         assert!(context.contains("write tests"));
         assert!(context.contains("[Environment context]"));
@@ -2474,6 +2614,7 @@ mod tests {
             &[],
             "",
             None,
+            &[],
         );
         assert!(context.contains("do a thing"));
         assert!(context.contains("[Permission context]"));

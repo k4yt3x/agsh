@@ -14,6 +14,7 @@
 
 mod acp;
 mod agent;
+mod background;
 mod cli;
 mod config;
 mod context;
@@ -490,6 +491,9 @@ struct AgentAssembly<'a> {
     /// Gates the `schedule_*` tools and supplies their ceilings. Sub-agent registries get `None`
     /// instead; see `ToolRegistry::register_session_scoped_tools`.
     schedule: crate::config::ResolvedScheduleConfig,
+    /// Gates the `background` parameter and the `task_*` tools, and supplies the concurrency
+    /// ceiling. Off by default; see `crate::config::BackgroundConfig`.
+    background: crate::config::ResolvedBackgroundConfig,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -514,6 +518,9 @@ async fn assemble_agent(
     );
     let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
+    // One registry per session, shared by the agent that dispatches tasks, the `task_*` tools that
+    // manage them, and the REPL's `/tasks` and Ctrl+C handling.
+    let background_tasks = crate::background::BackgroundTasks::default();
 
     let tool_registry = ToolRegistry::build_default(
         bundle.web_client.clone(),
@@ -532,6 +539,7 @@ async fn assemble_agent(
         Arc::clone(&roots),
         Arc::clone(&frontend),
         bundle.schedule.clone(),
+        (bundle.background.clone(), background_tasks.clone()),
     )?;
 
     // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `spawn_agent`); `>= 1`
@@ -593,6 +601,9 @@ async fn assemble_agent(
     if let Some(manager) = bundle.mcp_manager {
         agent.set_mcp_manager(Arc::clone(manager));
     }
+    if bundle.background.enabled {
+        agent.enable_background(background_tasks, bundle.background.max_tasks);
+    }
 
     Ok((agent, tool_registry))
 }
@@ -613,6 +624,7 @@ pub async fn build_session_agent(
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let bundle = AgentAssembly {
         schedule: shared.config.schedule.clone(),
+        background: shared.config.background.clone(),
         web_client: shared.config.web_client.clone(),
         sandbox_enabled: shared.config.sandbox,
         sandbox_capability: shared.sandbox_capability.clone(),
@@ -739,6 +751,7 @@ async fn create_agent_from_config(
 
     let bundle = AgentAssembly {
         schedule: config.schedule.clone(),
+        background: config.background.clone(),
         web_client: config.web_client.clone(),
         sandbox_enabled: config.sandbox,
         sandbox_capability,
@@ -780,6 +793,63 @@ async fn create_agent_from_config(
     Ok(agent)
 }
 
+/// Say what a cancelled turn left running.
+///
+/// Ctrl+C stops the turn, not the detached work, which is the shell's contract and the right
+/// default. But the user may not have registered that anything was detached, so what survived has
+/// to be visible rather than merely discoverable.
+async fn report_background_survivors(agent: &Agent) {
+    let running = agent.background_tasks().running_count_all().await;
+    if running > 0 {
+        eprintln!(
+            "{} background task(s) still running. Press Ctrl+C again during a turn to stop them, \
+             or use /tasks.",
+            running
+        );
+    }
+}
+
+/// Claim this session's undelivered task outcomes, ready to be rendered into one turn.
+///
+/// Stamped delivered *before* the turn runs, matching `stamp_scheduled_job_fired` and for the same
+/// reason: an outcome that reliably wedges the process would otherwise be redelivered on every
+/// restart, turning one bad result into a boot loop. Losing one report is the cheaper failure.
+///
+/// Returns empty on a database error rather than propagating, because failing to *report* a
+/// finished task must not also fail whatever else the caller was about to do.
+async fn collect_background_outcomes(
+    session_manager: &SessionManager,
+    session_id: Option<uuid::Uuid>,
+) -> Vec<crate::background::BackgroundTask> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let ready = match session_manager
+        .list_undelivered_background_tasks(session_id)
+        .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!("failed to load background task outcomes: {}", error);
+            return Vec::new();
+        }
+    };
+    if ready.is_empty() {
+        return ready;
+    }
+    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+    if let Err(error) = session_manager.mark_background_tasks_delivered(&ids).await {
+        tracing::warn!(
+            "failed to stamp background outcomes as delivered: {}",
+            error
+        );
+        // Not delivering is better than delivering forever: without the stamp the next tick would
+        // repeat these, and every tick after it.
+        return Vec::new();
+    }
+    ready
+}
+
 /// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Spawns a `ctrl_c()` listener
 /// for the turn's duration and aborts it afterward, so a SIGINT during the turn cancels it (and
 /// every tool and sub-agent it spawned), while a SIGINT between turns is not consumed by a leaked
@@ -794,9 +864,38 @@ async fn run_turn_interruptible(
     let cancellation = CancellationToken::new();
     let signal_handle = {
         let cancellation = cancellation.clone();
+        let tasks = agent.background_tasks();
+        let signal_session_manager = agent.session_manager();
         tokio::spawn(async move {
+            // The shell's contract: the first SIGINT reaches the foreground job only. Background
+            // work survives, because losing a twenty-minute build to a Ctrl+C aimed at the answer
+            // on screen is unrecoverable and is not what the keystroke meant.
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            cancellation.cancel();
+            // A second press within the same turn escalates. Between turns, `/tasks cancel --all`
+            // is the route; this listener is aborted the moment the turn ends.
             if tokio::signal::ctrl_c().await.is_ok() {
-                cancellation.cancel();
+                // Recorded before signalling, so what the agent hears is "you stopped it" rather
+                // than the `failed` its own interruption would otherwise write.
+                for id in tasks.task_ids().await {
+                    if let Err(error) = signal_session_manager
+                        .finish_background_task(
+                            &id,
+                            crate::background::TaskStatus::Cancelled,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!("could not record task {} as cancelled: {}", id, error);
+                    }
+                }
+                let signalled = tasks.cancel_all().await;
+                if signalled > 0 {
+                    eprintln!("\nStopping {} background task(s).", signalled);
+                }
             }
         })
     };
@@ -873,6 +972,35 @@ async fn run_oneshot(
         Err(error) => return Err(error.into()),
     }
 
+    // A one-shot run exits with the turn, so there is no later turn to deliver an outcome into.
+    // Waiting here degrades a background call into a slow synchronous one, which is a worse deal
+    // than the agent asked for but an honest one; exiting instead would leave a promise nothing can
+    // keep, and kill the work halfway through besides.
+    if config.background.enabled
+        && let Some(id) = session_id
+    {
+        let outstanding = agent.background_tasks().running_count(id).await;
+        if outstanding > 0 {
+            tracing::info!(
+                "waiting for {} background task(s) before exiting; a one-shot run has no later \
+                 turn to report them in",
+                outstanding
+            );
+            agent.background_tasks().wait_for_session(id).await;
+        }
+        // Collected unconditionally, not only when this process started something. Resuming a
+        // session sweeps whatever the *last* process left running into `interrupted`, and without
+        // this a one-shot resume would answer the prompt and exit while that report sat
+        // undelivered.
+        let outcomes = collect_background_outcomes(&session_manager, session_id).await;
+        if !outcomes.is_empty() {
+            // Printed rather than delivered as a turn: the agent's answer has already been given
+            // and the process is on its way out, so this is for the human reading the output.
+            eprintln!();
+            eprint!("{}", crate::background::render_outcomes(&outcomes));
+        }
+    }
+
     if let Some(id) = session_id
         && config.show_session_id_on_exit
     {
@@ -919,13 +1047,15 @@ async fn run_interactive(
     if !messages.is_empty() {
         match config.resume_show_recent {
             Some(n) if n > 0 => {
-                render::render_message_history(
+                let rendered = render::render_message_history(
                     render::last_n_turns(messages.as_slice(), n),
                     &history_render_options(&config),
                 );
                 // Match the live-turn-end convention: blank line between the rendered content and
-                // the first REPL prompt. `reprint_last_message` does the same.
-                if config.newline_before_prompt {
+                // the first REPL prompt. `reprint_last_message` does the same. Skipped when the
+                // replay came to nothing (a tail of tool calls with no text), since then there is
+                // no rendered content for it to sit below.
+                if rendered && config.newline_before_prompt {
                     eprintln!();
                 }
             }
@@ -1029,6 +1159,10 @@ async fn run_interactive(
             repl_mcp_server_names,
             repl_history_db_path,
             repl_wake,
+            repl::CommandSpacing {
+                newline_after_prompt: config.newline_after_prompt,
+                newline_before_prompt: config.newline_before_prompt,
+            },
         );
     });
 
@@ -1087,14 +1221,16 @@ async fn run_interactive(
 
     // Watcher, not a scheduler: it only nudges reedline awake. The agent loop below owns the
     // conversation, so it has to be the thing that evaluates gates and runs the turn -- otherwise
-    // two tasks would be appending to `messages`.
+    // two tasks would be appending to `messages`. Background outcomes ride the same watcher and the
+    // same flag for the same reason.
     let schedule_watcher = {
         let session_manager = session_manager.clone();
         let shared_session_id = Arc::clone(&repl_shared_session_id);
         let poll_interval = config.schedule.poll_interval;
-        let enabled = config.schedule.enabled;
+        let schedule_enabled = config.schedule.enabled;
+        let background_enabled = config.background.enabled;
         tokio::spawn(async move {
-            if !enabled {
+            if !schedule_enabled && !background_enabled {
                 return;
             }
             let mut ticker = tokio::time::interval(poll_interval);
@@ -1108,15 +1244,29 @@ async fn run_interactive(
                 else {
                     continue;
                 };
-                match session_manager
-                    .list_due_scheduled_jobs(chrono::Utc::now())
-                    .await
-                {
-                    Ok(due) if due.iter().any(|job| job.session_id == current) => {
-                        schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
+                if schedule_enabled {
+                    match session_manager
+                        .list_due_scheduled_jobs(chrono::Utc::now())
+                        .await
+                    {
+                        Ok(due) if due.iter().any(|job| job.session_id == current) => {
+                            schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("scheduler watcher failed: {}", error),
                     }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!("scheduler watcher failed: {}", error),
+                }
+                if background_enabled {
+                    match session_manager
+                        .list_undelivered_background_tasks(current)
+                        .await
+                    {
+                        Ok(ready) if !ready.is_empty() => {
+                            schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("background watcher failed: {}", error),
+                    }
                 }
             }
         })
@@ -1124,7 +1274,7 @@ async fn run_interactive(
 
     while let Some(event) = input_receiver.recv().await {
         match event {
-            ReplEvent::ScheduledTurn => {
+            ReplEvent::Wake => {
                 let scope = match session_id {
                     Some(id) => crate::schedule::SchedulerScope::OneSession(id),
                     // Nothing can be due before the session exists; the watcher would not have
@@ -1143,20 +1293,27 @@ async fn run_interactive(
                 // access to `messages` and `session_id`, which belong to this loop alone. Gating
                 // and stamping have already happened by the time a wakeup lands here.
                 let fired = std::sync::Mutex::new(Vec::new());
-                if let Err(error) = crate::schedule::run_due(
-                    &session_manager,
-                    &config.schedule,
-                    &scope,
-                    &|wakeup: crate::schedule::Wakeup| {
-                        if let Ok(mut collected) = fired.lock() {
-                            collected.push(wakeup);
-                        }
-                        // The REPL owns this session outright, so it never defers: the turn runs
-                        // below, on this same loop, before anything else is handled.
-                        std::future::ready(crate::schedule::FireOutcome::Ran)
-                    },
-                )
-                .await
+                // Gated on the switch, not just on having been woken. `run_due` has no `enabled`
+                // check of its own -- the flag is enforced by whoever decides to poll -- and this
+                // arm is now also reached by a finished background task setting the same wake flag.
+                // Without this, turning scheduling off while background calls are on would still
+                // fire the jobs already in the database.
+                if config.schedule.enabled
+                    && let Err(error) = crate::schedule::run_due(
+                        &session_manager,
+                        &config.schedule,
+                        &scope,
+                        &|wakeup: crate::schedule::Wakeup| {
+                            if let Ok(mut collected) = fired.lock() {
+                                collected.push(wakeup);
+                            }
+                            // The REPL owns this session outright, so it never defers: the turn
+                            // runs below, on this same loop, before
+                            // anything else is handled.
+                            std::future::ready(crate::schedule::FireOutcome::Ran)
+                        },
+                    )
+                    .await
                 {
                     render::render_error(&error);
                 }
@@ -1174,8 +1331,36 @@ async fn run_interactive(
                 // of producing a gap. Emitting the terminator here starts the turn at column zero
                 // of a fresh line, which is where a typed turn starts, so both `[display]` spacing
                 // settings mean the same thing either way.
-                if !fired.is_empty() {
+                // Outcomes are collected here, alongside the due jobs, so one wake delivers both
+                // rather than one of them and then another tick.
+                let outcomes = if config.background.enabled {
+                    collect_background_outcomes(&session_manager, session_id).await
+                } else {
+                    Vec::new()
+                };
+                if !fired.is_empty() || !outcomes.is_empty() {
                     eprintln!();
+                }
+                if !outcomes.is_empty() {
+                    let prompt = crate::background::render_outcomes(&outcomes);
+                    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error::MekaError::Interrupted) => {
+                            eprintln!("\nInterrupted.");
+                            report_background_survivors(&agent).await;
+                            if config.newline_before_prompt {
+                                eprintln!();
+                            }
+                        }
+                        Err(error) => {
+                            render::render_error(&error);
+                            if config.newline_before_prompt {
+                                eprintln!();
+                            }
+                        }
+                    }
                 }
                 for wakeup in fired {
                     // The REPL has one agent and one conversation, so an isolated job runs here
@@ -1197,6 +1382,7 @@ async fn run_interactive(
                         Ok(()) => {}
                         Err(error::MekaError::Interrupted) => {
                             eprintln!("\nInterrupted.");
+                            report_background_survivors(&agent).await;
                             if config.newline_before_prompt {
                                 eprintln!();
                             }
@@ -1221,6 +1407,7 @@ async fn run_interactive(
                     Ok(()) => {}
                     Err(error::MekaError::Interrupted) => {
                         eprintln!("\nInterrupted.");
+                        report_background_survivors(&agent).await;
                         if config.newline_before_prompt {
                             eprintln!();
                         }
@@ -1252,6 +1439,15 @@ async fn run_interactive(
                 }
             }
             ReplEvent::Command(command) => {
+                // Bracket a command's output with the same blank lines the REPL puts around a
+                // turn, so `[display]` spacing means one thing whether the line the user typed was
+                // a prompt or a slash command. `/history` used to do this for itself; everything
+                // else printed flush against the prompt above and the prompt below. The commands
+                // this thread does not handle are bracketed in `repl::run_repl` instead.
+                let spaced_by_its_turn = command.answers_by_running_a_turn();
+                if !spaced_by_its_turn && config.newline_after_prompt {
+                    eprintln!();
+                }
                 match command {
                     repl::SlashCommand::Session => match &session_id {
                         Some(id) => render::render_session_id("Current session", &id.to_string()),
@@ -1302,7 +1498,7 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Export => match &session_id {
                         Some(id) => {
-                            if let Err(error) = export_session(
+                            match export_session(
                                 &session_manager,
                                 *id,
                                 None,
@@ -1310,7 +1506,21 @@ async fn run_interactive(
                             )
                             .await
                             {
-                                render::render_error(&error);
+                                // The name is generated from the session id and the file lands in
+                                // the working directory, so a REPL user who is not told it has
+                                // nowhere to look. `meka session export` stays quiet: there the
+                                // shell is the one that knows.
+                                Ok(Some(path)) => {
+                                    // Shown absolute: `/cd` moves the session's directory while
+                                    // the export lands in the process's, so a bare filename would
+                                    // point at the wrong one.
+                                    let shown = std::env::current_dir()
+                                        .map(|dir| dir.join(&path))
+                                        .unwrap_or(path);
+                                    eprintln!("Exported session to {}", shown.display());
+                                }
+                                Ok(None) => {}
+                                Err(error) => render::render_error(&error),
                             }
                         }
                         None => eprintln!("No active session to export."),
@@ -1347,118 +1557,137 @@ async fn run_interactive(
                             render::render_error(&error);
                         }
                     }
+                    // These three report success at `info!` and print nothing, which is right for
+                    // the `meka mcp …` CLI (the exit code carries it) and wrong here: a REPL
+                    // command has no exit code, so silence is indistinguishable from the command
+                    // never having run, and it leaves the `[display]` blank lines wrapped around
+                    // an empty region. `/permission` sets the precedent for confirming a state
+                    // change the user asked for.
                     repl::SlashCommand::McpReconnect { server } => {
-                        if let Err(error) =
-                            mcp::cli::run_reconnect(&config.mcp_servers, &token_store, &server)
-                                .await
+                        match mcp::cli::run_reconnect(&config.mcp_servers, &token_store, &server)
+                            .await
                         {
-                            render::render_error(&error);
+                            // "Connected", not "Reconnected": this is a smoke test on a throwaway
+                            // client, and the session's own connection to that server is untouched.
+                            Ok(()) => eprintln!("Connected to '{}'.", server),
+                            Err(error) => render::render_error(&error),
                         }
                     }
                     repl::SlashCommand::McpLogin { server } => {
-                        if let Err(error) =
-                            mcp::cli::run_login(&config.mcp_servers, &token_store, &server).await
+                        match mcp::cli::run_login(&config.mcp_servers, &token_store, &server).await
                         {
-                            render::render_error(&error);
+                            Ok(()) => eprintln!("Authorized '{}'.", server),
+                            Err(error) => render::render_error(&error),
                         }
                     }
                     repl::SlashCommand::McpLogout { server } => {
-                        if let Err(error) =
-                            mcp::cli::run_logout(&config.mcp_servers, &token_store, &server).await
+                        match mcp::cli::run_logout(&config.mcp_servers, &token_store, &server).await
                         {
-                            render::render_error(&error);
+                            Ok(()) => eprintln!("Cleared credentials for '{}'.", server),
+                            Err(error) => render::render_error(&error),
                         }
                     }
                     repl::SlashCommand::McpPrompt {
                         server,
                         prompt: prompt_name,
                         args,
-                    } => match mcp_manager.as_ref() {
-                        Some(manager) => {
-                            let entry = manager.server_entry(&server);
-                            let Some(entry) = entry else {
-                                eprintln!(
-                                    "unknown MCP server '{}'; configured: {:?}",
-                                    server,
-                                    manager.server_names()
-                                );
-                                continue;
-                            };
-                            // Map positional args to declared prompt argument names (lookup via
-                            // prompts/list).
-                            let arg_names = match mcp::list_prompts(&entry).await {
-                                Ok(prompts) => prompts
-                                    .into_iter()
-                                    .find(|p| p.name == prompt_name)
-                                    .and_then(|p| p.arguments)
-                                    .map(|args| {
-                                        args.into_iter().map(|a| a.name).collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default(),
-                                Err(error) => {
-                                    eprintln!("list_prompts failed: {}", error);
-                                    Vec::new()
-                                }
-                            };
-                            let mut arguments: Option<serde_json::Map<String, serde_json::Value>> =
-                                None;
-                            if !arg_names.is_empty() {
-                                let mut map = serde_json::Map::new();
-                                for (i, name) in arg_names.iter().enumerate() {
-                                    if let Some(value) = args.get(i) {
-                                        map.insert(
-                                            name.clone(),
-                                            serde_json::Value::String(value.clone()),
-                                        );
-                                    }
-                                }
-                                arguments = Some(map);
-                            }
-                            match mcp::get_prompt(&entry, prompt_name.clone(), arguments).await {
-                                Ok(result) => {
-                                    // Render the prompt messages as a single user turn, same shape
-                                    // as the `get_mcp_prompt` tool output.
-                                    let mut body = String::new();
-                                    for message in &result.messages {
-                                        let role = match message.role {
-                                            rmcp::model::Role::User => "user",
-                                            rmcp::model::Role::Assistant => "assistant",
-                                        };
-                                        if let rmcp::model::ContentBlock::Text(text) =
-                                            &message.content
-                                        {
-                                            body.push_str(&format!("{}: {}\n", role, text.text));
-                                        }
-                                    }
-                                    let user_input = body.trim().to_string();
-                                    if !user_input.is_empty() {
-                                        match run_turn_interruptible(
-                                            &agent,
-                                            &mut session_id,
-                                            &mut messages,
-                                            user_input,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {}
-                                            Err(error::MekaError::Interrupted) => {
-                                                eprintln!("\nInterrupted.");
-                                            }
-                                            Err(error) => render::render_error(&error),
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    eprintln!("get_prompt failed: {}", error);
-                                }
-                            }
-                        }
-                        None => {
+                    } => 'prompt: {
+                        let Some(manager) = mcp_manager.as_ref() else {
                             eprintln!("no MCP servers configured");
+                            break 'prompt;
+                        };
+                        let entry = manager.server_entry(&server);
+                        let Some(entry) = entry else {
+                            // Labelled break, not `continue`: `continue` targets the agent
+                            // loop, skipping the `AgentToReplEvent::Done` send below and
+                            // leaving the REPL thread parked in `wait_for_agent` with no
+                            // prompt, for good. Same reason as `SkillInvoke`'s `'invoke`.
+                            eprintln!(
+                                "unknown MCP server '{}'; configured: {:?}",
+                                server,
+                                manager.server_names()
+                            );
+                            break 'prompt;
+                        };
+                        // Map positional args to declared prompt argument names (lookup via
+                        // prompts/list).
+                        let arg_names = match mcp::list_prompts(&entry).await {
+                            Ok(prompts) => prompts
+                                .into_iter()
+                                .find(|p| p.name == prompt_name)
+                                .and_then(|p| p.arguments)
+                                .map(|args| args.into_iter().map(|a| a.name).collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                            Err(error) => {
+                                eprintln!("list_prompts failed: {}", error);
+                                Vec::new()
+                            }
+                        };
+                        let mut arguments: Option<serde_json::Map<String, serde_json::Value>> =
+                            None;
+                        if !arg_names.is_empty() {
+                            let mut map = serde_json::Map::new();
+                            for (i, name) in arg_names.iter().enumerate() {
+                                if let Some(value) = args.get(i) {
+                                    map.insert(
+                                        name.clone(),
+                                        serde_json::Value::String(value.clone()),
+                                    );
+                                }
+                            }
+                            arguments = Some(map);
                         }
-                    },
+                        match mcp::get_prompt(&entry, prompt_name.clone(), arguments).await {
+                            Ok(result) => {
+                                // Render the prompt messages as a single user turn, same shape
+                                // as the `get_mcp_prompt` tool output.
+                                let mut body = String::new();
+                                for message in &result.messages {
+                                    let role = match message.role {
+                                        rmcp::model::Role::User => "user",
+                                        rmcp::model::Role::Assistant => "assistant",
+                                    };
+                                    if let rmcp::model::ContentBlock::Text(text) = &message.content
+                                    {
+                                        body.push_str(&format!("{}: {}\n", role, text.text));
+                                    }
+                                }
+                                let user_input = body.trim().to_string();
+                                if user_input.is_empty() {
+                                    // Every other exit from this arm prints; a server whose
+                                    // prompt renders to nothing would otherwise return the user
+                                    // straight to a fresh prompt, which reads as "the command
+                                    // did nothing" rather than "the prompt was empty".
+                                    eprintln!(
+                                        "'{}:{}' rendered an empty prompt; nothing to send.",
+                                        server, prompt_name
+                                    );
+                                } else {
+                                    match run_turn_interruptible(
+                                        &agent,
+                                        &mut session_id,
+                                        &mut messages,
+                                        user_input,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {}
+                                        Err(error::MekaError::Interrupted) => {
+                                            eprintln!("\nInterrupted.");
+                                        }
+                                        Err(error) => render::render_error(&error),
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("get_prompt failed: {}", error);
+                            }
+                        }
+                    }
                     repl::SlashCommand::MemoryList => {
-                        if let Err(error) = memory::cli::run_list().await {
+                        if let Err(error) =
+                            memory::cli::run_list(memory::cli::ListDetail::TableOnly).await
+                        {
                             render::render_error(&error);
                         }
                     }
@@ -1492,6 +1721,43 @@ async fn run_interactive(
                                 }
                                 Ok(None) => {
                                     eprintln!("No scheduled job matching '{}'.", id);
+                                }
+                                Err(error) => render::render_error(&error),
+                            }
+                        }
+                        None => eprintln!("No active session yet."),
+                    },
+                    repl::SlashCommand::TaskList => match session_id {
+                        Some(id) => {
+                            if let Err(error) =
+                                crate::background::cli::run_list_for_session(&session_manager, id)
+                                    .await
+                            {
+                                render::render_error(&error);
+                            }
+                        }
+                        None => eprintln!("No active session yet."),
+                    },
+                    repl::SlashCommand::TaskCancel { id } => match session_id {
+                        Some(session) => {
+                            // Recorded first, then signalled: `finish_background_task` only
+                            // overwrites a `running` row, so a task finishing in the same instant
+                            // cannot report success after the user was told it stopped.
+                            match crate::background::cli::cancel(
+                                &session_manager,
+                                session,
+                                id.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(cancelled) if cancelled.is_empty() => {
+                                    eprintln!("No running background tasks.")
+                                }
+                                Ok(cancelled) => {
+                                    for task_id in &cancelled {
+                                        agent.background_tasks().cancel(task_id).await;
+                                    }
+                                    eprintln!("Cancelling {} background task(s).", cancelled.len());
                                 }
                                 Err(error) => render::render_error(&error),
                             }
@@ -1578,20 +1844,25 @@ async fn run_interactive(
                             Some(n) => render::last_n_turns(materialised, n),
                             None => materialised,
                         };
-                        // Bracket the rendered history with the same blank-line spacing the live
-                        // REPL puts around a regular turn: a `newline_after_prompt` blank between
-                        // the user's `/history` line and the rendered content, plus a
-                        // `newline_before_prompt` blank between the content and the next REPL
-                        // prompt.
-                        if config.newline_after_prompt {
-                            eprintln!();
-                        }
-                        render::render_message_history(slice, &history_render_options(&config));
-                        if config.newline_before_prompt {
-                            eprintln!();
+                        // Say so rather than printing nothing, like every other list command
+                        // (`/tasks`, `/memory`, `/skill`). Silence here would be ambiguous between
+                        // "no history" and "the command did not run", and it would leave the
+                        // `[display]` blank lines bracketing an empty region. `/history 0` asks
+                        // for nothing and gets the neutral wording: there may well be a
+                        // conversation, it just wasn't what was asked for.
+                        if !render::render_message_history(slice, &history_render_options(&config))
+                        {
+                            if materialised.is_empty() {
+                                eprintln!("No conversation history yet.");
+                            } else {
+                                eprintln!("Nothing to show.");
+                            }
                         }
                     }
                     _ => {}
+                }
+                if !spaced_by_its_turn && config.newline_before_prompt {
+                    eprintln!();
                 }
 
                 if agent_event_sender
@@ -1692,12 +1963,17 @@ struct ExportedEvent {
     event: crate::conversation::Event,
 }
 
+/// Returns the file the export landed in, or `None` when the body went to stdout.
+///
+/// The path is returned rather than only logged because `/export` in the REPL writes to a generated
+/// name in the working directory: the CLI can leave "quiet on success" to the shell, but a REPL
+/// user who is not told the name has no way to find the file.
 async fn export_session(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
     output: Option<&str>,
     format: cli::SessionExportFormat,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<std::path::PathBuf>> {
     if !session_manager.session_exists(session_id).await? {
         anyhow::bail!("session not found: {}", session_id);
     }
@@ -1727,19 +2003,20 @@ async fn export_session(
     match output {
         Some("-") => {
             print!("{}", body);
+            Ok(None)
         }
         Some(path) => {
             std::fs::write(path, &body)?;
             tracing::info!("exported session to {}", path);
+            Ok(Some(std::path::PathBuf::from(path)))
         }
         None => {
-            let path = format!("session-{}.{}", session_id, default_ext);
+            let path = std::path::PathBuf::from(format!("session-{}.{}", session_id, default_ext));
             std::fs::write(&path, &body)?;
-            tracing::info!("exported session to {}", path);
+            tracing::info!("exported session to {}", path.display());
+            Ok(Some(path))
         }
     }
-
-    Ok(())
 }
 
 /// Assemble the structured JSON export envelope for a session and every sub-agent descendant.
@@ -2163,43 +2440,53 @@ async fn run_tools_subcommand(
                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
                 std::sync::Arc::new(crate::frontend::SilentFrontend),
                 config.schedule.clone(),
+                (
+                    config.background.clone(),
+                    crate::background::BackgroundTasks::default(),
+                ),
             )?;
 
             let catalogue = reference.tool_catalogue();
-            println!(
-                "{:<20} {:<9} {:<9} {:<10} description",
-                "NAME", "REQUIRED", "SOURCE", "VISIBILITY"
+            // `format_columns`, like every other listing meka prints. The fixed `{:<20}` this used
+            // to hand-roll silently ran its columns together for any name longer than the width,
+            // and a namespaced MCP tool (`mcp__mekabridge__send_file`) is 26
+            // characters.
+            let rows: Vec<Vec<String>> = catalogue
+                .iter()
+                .map(|(name, description, required, is_deferred)| {
+                    let override_entry = filter.permission_overrides.get(name);
+                    let effective = override_entry.copied().unwrap_or(*required);
+                    vec![
+                        name.clone(),
+                        effective.to_string(),
+                        if override_entry.is_some() {
+                            "override".to_string()
+                        } else {
+                            "builtin".to_string()
+                        },
+                        if filter.admits(name) {
+                            if *is_deferred { "deferred" } else { "enabled" }
+                        } else {
+                            "disabled"
+                        }
+                        .to_string(),
+                        description
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(60)
+                            .collect::<String>(),
+                    ]
+                })
+                .collect();
+            print!(
+                "{}",
+                render::format_columns(
+                    &["Name", "Required", "Source", "Visibility", "Description"],
+                    &rows
+                )
             );
-            println!("{}", "-".repeat(78));
-            for (name, description, required, is_deferred) in &catalogue {
-                let override_entry = filter.permission_overrides.get(name);
-                let effective = override_entry.copied().unwrap_or(*required);
-                let source = if override_entry.is_some() {
-                    "override"
-                } else {
-                    "builtin"
-                };
-                let visibility = if filter.admits(name) {
-                    if *is_deferred { "deferred" } else { "enabled" }
-                } else {
-                    "disabled"
-                };
-                let short = description
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect::<String>();
-                println!(
-                    "{:<20} {:<9} {:<9} {:<10} {}",
-                    name,
-                    effective.to_string(),
-                    source,
-                    visibility,
-                    short
-                );
-            }
         }
     }
     Ok(())
@@ -2253,7 +2540,9 @@ fn display_path(path: Option<std::path::PathBuf>) -> String {
 
 async fn run_memory_subcommand(action: &cli::MemoryAction) -> anyhow::Result<()> {
     match action {
-        cli::MemoryAction::List => memory::cli::run_list().await?,
+        cli::MemoryAction::List => {
+            memory::cli::run_list(memory::cli::ListDetail::WithDistribution).await?
+        }
         cli::MemoryAction::Get { name } => memory::cli::run_get(name).await?,
         cli::MemoryAction::Show { name } => memory::cli::run_show(name).await?,
         cli::MemoryAction::Add {
@@ -2574,7 +2863,12 @@ async fn run_session_subcommand(
             session_id,
             output,
             format,
-        } => export_session(session_manager, *session_id, output.as_deref(), *format).await,
+        } => {
+            // The written path is only interesting to the REPL; out here the shell (and the `-o`
+            // the user typed) already knows where it went.
+            export_session(session_manager, *session_id, output.as_deref(), *format).await?;
+            Ok(())
+        }
         cli::SessionAction::Delete {
             session_ids,
             all,
@@ -3035,6 +3329,10 @@ async fn load_session_messages(
     // Hydrate the event log directly. Legacy databases (rows predating the event-log refactor)
     // decode their `user`/`assistant`/`tool_results` rows as `Event::Append` so resume is forward-
     // and backward- compatible without a schema migration.
+    // Retire whatever the last process left running before hydrating anything else; see
+    // `crate::background::claim_session`.
+    crate::background::claim_session(session_manager, session_id).await;
+
     let events = session_manager.load_events(session_id).await?;
     let mut log = conversation::Conversation::from_events(events);
 

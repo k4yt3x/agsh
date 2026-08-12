@@ -2,6 +2,7 @@
 //! consults to resolve tool names to executable handlers, plus the per-tool submodules (file, find,
 //! grep, scratchpad, shell, etc.).
 
+pub(crate) mod background;
 mod file;
 mod find;
 mod grep;
@@ -51,6 +52,194 @@ const MAX_ADVISED_PARAMETERS: usize = 5;
 /// than by the tool itself. See [`crate::tools::scratchpad::save_explicit_scratchpad_results`].
 const SCRATCHPAD_PARAMETER: &str = "scratchpad";
 
+/// The universal detach parameter, consumed by the agent loop. Where `scratchpad` changes *where* a
+/// tool's output goes, this changes *when* it arrives. See [`crate::background`].
+pub const BACKGROUND_PARAMETER: &str = "background";
+
+/// Whether `background` in this call means the *tool's* `background`, not meka's.
+///
+/// [`offer_background`] refuses to shadow a name the tool already advertises, so a tool whose
+/// schema declares `background` at all never received meka's splice and owns the name outright.
+/// The consumption side has to ask the same question: an image tool with `background:
+/// "transparent"`, or an exec server with a detach flag of its own, would otherwise have its
+/// argument eaten before dispatch and the call quietly detached meka's way instead.
+fn tool_owns_background(schema: &serde_json::Value) -> bool {
+    declared_type(schema, BACKGROUND_PARAMETER).is_some()
+}
+
+/// Whether `scratchpad` in this call means the tool's own parameter.
+///
+/// A weaker test than [`tool_owns_background`], because it has to be: meka's builtins declare
+/// `scratchpad` themselves, as a string, so its presence in a schema proves nothing. Only a
+/// different declared *type* says the tool means something else by the name.
+fn tool_owns_scratchpad(schema: &serde_json::Value) -> bool {
+    matches!(declared_type(schema, SCRATCHPAD_PARAMETER), Some(kind) if kind != "string")
+}
+
+/// The `type` a schema declares for one property, or `None` when it declares neither.
+fn declared_type<'a>(schema: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    let property = schema.get("properties")?.as_object()?.get(name)?;
+    // A property declared with no `type` (or a union) is still declared. Report it as the empty
+    // string so `tool_owns_background` sees a declaration while `tool_owns_scratchpad`, which is
+    // looking for a conflicting type, also treats it as the tool's.
+    Some(
+        property
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    )
+}
+
+/// Reject a call whose meka-owned parameters are the wrong type, naming what was expected.
+///
+/// These two are validated where every other argument is left to the tool because meka is the one
+/// that consumes them, and both change what a call *does* rather than what it is called with:
+/// `background` decides whether the turn waits for the result, `scratchpad` decides whether the
+/// output is kept. Reading a wrong type as "absent" makes each of those a silent no-op, so the
+/// model asks for a detached call and blocks for twenty minutes, or asks for its output to be saved
+/// and finds nothing saved, with no way to discover why. An error costs one round trip and says
+/// exactly what to send instead.
+///
+/// Guessing is the third option and the worst one: reading `"true"` as `true` would leave `"yes"`,
+/// `1` and `"1"` still silently false, so the contract becomes "some wrong types work", which is
+/// harder to write against than either strict rule.
+///
+/// A tool's *own* arguments are deliberately not checked here. The tool, or a remote MCP server, is
+/// the authority on what it accepts, and refusing a call the server would have honoured would take
+/// away capability to enforce a schema meka does not own. Those get an advisory instead; see
+/// [`schema_disagreement`]. That includes these two names when the tool turns out to own them: see
+/// [`tool_owns_background`] and [`tool_owns_scratchpad`].
+///
+/// `null` counts as absent throughout: models emit it for optional arguments they are not using,
+/// and refusing that would be pedantry rather than a bug caught.
+pub fn meka_parameter_error(
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Option<String> {
+    let object = input.as_object()?;
+    let wrong_type = |key: &str, want: &str, value: &serde_json::Value| {
+        format!(
+            "Error: `{}` must be {}, but this call sent {}. Retry the call with a real {}, or \
+             leave `{}` out.",
+            key,
+            want,
+            json_type_name(value),
+            want,
+            key,
+        )
+    };
+
+    if let Some(value) = object.get(BACKGROUND_PARAMETER)
+        && !tool_owns_background(schema)
+        && !value.is_null()
+        && !value.is_boolean()
+    {
+        return Some(wrong_type(
+            BACKGROUND_PARAMETER,
+            "a boolean (`true` or `false`, unquoted)",
+            value,
+        ));
+    }
+    if let Some(value) = object.get(SCRATCHPAD_PARAMETER)
+        && !tool_owns_scratchpad(schema)
+        && !value.is_null()
+        && !value.is_string()
+    {
+        return Some(wrong_type(
+            SCRATCHPAD_PARAMETER,
+            "a string naming the entry to save under",
+            value,
+        ));
+    }
+    None
+}
+
+/// What a JSON value is, for an error message aimed at whoever sent it.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Split `background` out of a call's arguments, returning what the tool should receive and whether
+/// it asked to be detached.
+///
+/// Removing rather than ignoring is the point: the property is spliced in by
+/// [`ToolRegistry::definitions_active_with_loaded`] and is meka's, so forwarding it would hand an
+/// MCP server a key it never advertised.
+///
+/// Unless the tool advertised it first, in which case the argument is passed straight through and
+/// the call does not detach. [`offer_background`] declines to shadow a name a tool already uses,
+/// and stripping what it declined to splice would be the same collision one step later, with the
+/// tool losing an argument it does declare.
+///
+/// Only a real boolean detaches. A wrong type never reaches here, having been refused by
+/// [`meka_parameter_error`]; `null` and absent both mean the call was not asking to detach.
+pub fn take_background_flag(
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> (serde_json::Value, bool) {
+    let Some(object) = input.as_object() else {
+        return (input.clone(), false);
+    };
+    if !object.contains_key(BACKGROUND_PARAMETER) || tool_owns_background(schema) {
+        return (input.clone(), false);
+    }
+    let mut object = object.clone();
+    let detach = object
+        .remove(BACKGROUND_PARAMETER)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    (serde_json::Value::Object(object), detach)
+}
+
+/// Splice `background` into one tool's schema.
+///
+/// Done here, on the definitions handed to the provider, rather than declared per-tool the way
+/// `scratchpad` is. One insertion point instead of seven, config-gated in one place, and it reaches
+/// MCP tools too, which matters because a slow MCP call is exactly the kind worth detaching.
+///
+/// That last part is a deliberate exception to passing an MCP server's `input_schema` through
+/// verbatim (see `crate::mcp`): the property is meka's own, and
+/// `Agent::resolve_and_execute_tool` strips it from the arguments before the adapter forwards them,
+/// so no server ever sees a key it did not advertise.
+fn offer_background(parameters: &mut serde_json::Value) {
+    let Some(object) = parameters.as_object_mut() else {
+        return;
+    };
+    // A schema with no `properties` describes a tool taking no arguments in the shape every
+    // provider expects; creating the map here would change what the tool advertises.
+    let Some(properties) = object
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    // Never shadow a real parameter. A server that already advertises `background` owns the name,
+    // and silently overwriting its meaning would be a far worse bug than losing the feature on that
+    // one tool.
+    if properties.contains_key(BACKGROUND_PARAMETER) {
+        return;
+    }
+    properties.insert(
+        BACKGROUND_PARAMETER.to_string(),
+        serde_json::json!({
+            "type": "boolean",
+            "default": false,
+            "description":
+                "Run this call in the background. It returns a task id immediately and its result \
+                 is delivered to you when it finishes, so use it for work that takes minutes (long \
+                 builds, test suites, large downloads) and not for anything you need in order to \
+                 continue this turn. Track it with `task_list` and stop it with `task_cancel`.",
+        }),
+    );
+}
+
 /// An advisory appended to a `tool_result` when the call and the tool's advertised schema disagree,
 /// or `None` when they don't.
 ///
@@ -88,10 +277,10 @@ pub fn schema_disagreement(
         .iter()
         .copied()
         .filter(|key| !properties.contains_key(*key))
-        // `scratchpad` is meka's own, accepted on every tool and consumed by
-        // `save_explicit_scratchpad_results` rather than by the tool. An MCP server's schema has no
-        // reason to declare it, so flagging it would fire on a documented feature.
-        .filter(|key| *key != SCRATCHPAD_PARAMETER)
+        // `scratchpad` and `background` are meka's own, accepted on every tool and consumed by the
+        // agent loop rather than by the tool. Neither appears in the raw definition this function
+        // reads, so flagging them would fire on documented features.
+        .filter(|key| *key != SCRATCHPAD_PARAMETER && *key != BACKGROUND_PARAMETER)
         .collect();
     // An explicit `additionalProperties: true` means the server documented that it takes more than
     // it lists, so an undeclared key there is intentional rather than a mistake.
@@ -413,7 +602,72 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
     }
 }
 
-pub type ReadTracker = Arc<RwLock<HashSet<PathBuf>>>;
+/// What a file looked like when a tool last read it, so a later `edit_file` can tell "you never
+/// read this" from "this moved under you".
+///
+/// Metadata rather than a content hash: both fields come off the `stat` the read already performs,
+/// so recording them is free, and any edit that changes a file changes at least one of them in
+/// practice. A hash would be exact but would mean re-reading every file on every edit.
+/// Compared against whatever the *same source* says at edit time, which is the whole reason this is
+/// an enum. A file read through an editor's hosted filesystem and a file read off the disk are two
+/// different documents that happen to share a path, and checking one against the other produces a
+/// false alarm every time the user saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStamp {
+    /// Read from the filesystem. Metadata rather than a content hash: both fields come off the
+    /// `stat` the read already performs, so recording them is free, and any edit that changes a
+    /// file changes at least one of them in practice.
+    ///
+    /// `mtime` is `None` on the platforms and filesystems that don't report one; two `None` stamps
+    /// compare equal, so such a filesystem degrades to length-only detection rather than to a false
+    /// "changed on disk" on every edit.
+    Disk {
+        mtime: Option<std::time::SystemTime>,
+        len: u64,
+    },
+    /// Served by the frontend's hosted filesystem (see [`crate::frontend::Frontend`]), which is the
+    /// editor's document and not the bytes on disk.
+    ///
+    /// Fingerprints what was served, because that is the only thing the disk cannot answer for. An
+    /// editor serves its buffer for any file it owns, saved or not, so a disk comparison here is
+    /// wrong in both directions: it fires when the user saves (the buffer did not change) and stays
+    /// silent when the user types (the disk did not change).
+    Delegated { fingerprint: u64 },
+}
+
+impl ReadStamp {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self::Disk {
+            mtime: metadata.modified().ok(),
+            len: metadata.len(),
+        }
+    }
+
+    /// The stamp for a path, or `None` when it can't be stated.
+    pub async fn of_path(path: &std::path::Path) -> Option<Self> {
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|metadata| Self::from_metadata(&metadata))
+    }
+
+    /// The stamp for text the frontend served, or that meka wrote back through it.
+    pub fn of_delegated(text: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        Self::Delegated {
+            fingerprint: hasher.finish(),
+        }
+    }
+}
+
+/// Files a tool has read this session, and what they looked like at the time.
+///
+/// A set of paths would answer "has this been read", which is the question `edit_file` used to ask.
+/// It could not answer "is that read still valid", so an edit against a file rewritten in between
+/// (by a shell command, a concurrent agent, or the user's editor) silently clobbered.
+pub type ReadTracker = Arc<RwLock<HashMap<PathBuf, ReadStamp>>>;
 
 #[derive(Debug, Default)]
 pub struct ToolOutput {
@@ -463,7 +717,10 @@ impl ToolOutput {
 
 tokio::task_local! {
     /// The provider's `tool_use_id` for the call executing on this task, scoped by
-    /// `Agent::resolve_and_execute_tool` so it covers the approval path as well as the direct one.
+    /// `Agent::resolve_and_execute_tool` around the tool's own execution, inline and backgrounded
+    /// alike. Approval is deliberately outside it: `Agent::request_approval` runs before a
+    /// `background` call detaches, and nothing on that path reads this (ACP mints its own
+    /// `perm-<uuid>` for the permission request).
     /// A task-local rather than a [`Tool::execute`] parameter because exactly
     /// one tool needs it -- `spawn_agent`, to route its sub-agent's activity back into the tool
     /// call the client is already displaying -- and threading it through every implementor to
@@ -533,6 +790,10 @@ pub struct ToolRegistry {
     /// server isn't connected". `Weak` because the manager owns the registry list, not the other
     /// way round.
     mcp_manager: Arc<std::sync::OnceLock<std::sync::Weak<crate::mcp::McpClientManager>>>,
+    /// Whether the `background` property is spliced into the schemas this registry hands the
+    /// provider. Off leaves it out entirely rather than refusing it at dispatch: a parameter the
+    /// model can see but cannot use is worse than one it cannot see.
+    background_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolRegistry {
@@ -553,7 +814,8 @@ impl ToolRegistry {
             permission_overrides: Arc::new(overrides),
             builtin_filter: Arc::new(filter),
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
-            read_tracker: Arc::new(RwLock::new(HashSet::new())),
+            background_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_tracker: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -657,6 +919,21 @@ impl ToolRegistry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(name.to_string());
+    }
+
+    /// Offer `background` on every tool this registry hands the provider.
+    ///
+    /// Set once, from `[background] enabled`. Sub-agent registries are deliberately left off: a
+    /// sub-agent's session ends with the single turn that spawned it, so a task outliving that turn
+    /// would have no conversation to report back into.
+    pub fn enable_background(&self) {
+        self.background_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn background_enabled(&self) -> bool {
+        self.background_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every registered tool name. Unlike [`Self::tool_catalogue`] this clones no descriptions and
@@ -789,6 +1066,12 @@ impl ToolRegistry {
             }
             if let Some(tool) = tools.iter().find(|tool| &tool.definition().name == name) {
                 definitions.push(tool.definition());
+            }
+        }
+
+        if self.background_enabled() {
+            for definition in &mut definitions {
+                offer_background(&mut definition.parameters);
             }
         }
 
@@ -926,6 +1209,10 @@ impl ToolRegistry {
             crate::config::ResolvedScheduleConfig,
             crate::permission::SharedPermission,
         )>,
+        // `None` for sub-agents, for the same reason `schedule` is: a sub-agent's session ends
+        // with the one turn that spawned it, so it can neither start work that outlives
+        // that turn nor be around to hear about it.
+        background: Option<crate::background::BackgroundTasks>,
     ) {
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
@@ -963,6 +1250,14 @@ impl ToolRegistry {
                 schedule_config,
                 shared_permission,
             ) {
+                self.register_builtin(tool);
+            }
+        }
+        if let Some(tasks) = background
+            && self.background_enabled()
+        {
+            for tool in background::build(session_manager.clone(), shared_session_id.clone(), tasks)
+            {
                 self.register_builtin(tool);
             }
         }
@@ -1046,8 +1341,18 @@ impl ToolRegistry {
         roots: crate::agent::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
         schedule: crate::config::ResolvedScheduleConfig,
+        background: (
+            crate::config::ResolvedBackgroundConfig,
+            crate::background::BackgroundTasks,
+        ),
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
+        // Before the tools are registered, because both the `task_*` registration and the schema
+        // splice read this flag.
+        let (background_config, background_tasks) = background;
+        if background_config.enabled {
+            registry.enable_background();
+        }
         registry.register_core_tools(
             &web_client_config,
             shared_permission.clone(),
@@ -1069,6 +1374,7 @@ impl ToolRegistry {
             Vec::new(),
             cwd,
             Some((schedule, shared_permission)),
+            Some(background_tasks),
         );
         Ok(registry)
     }
@@ -1128,6 +1434,7 @@ impl ToolRegistry {
             inherited_scratchpad_names,
             cwd,
             None,
+            None,
         );
         Ok(registry)
     }
@@ -1154,6 +1461,63 @@ pub(crate) mod tests {
 
     fn test_todo_list() -> todo::SharedTodoList {
         Arc::new(RwLock::new(todo::TodoState::default()))
+    }
+
+    /// Every tool that takes a meaningful argument must be able to show one in the tool-call
+    /// indicator.
+    ///
+    /// `resolve_primary_param` tries the built-in map first and falls back to `required[0]`, so a
+    /// tool with arguments but no `required` array falls through both and renders as a bare name.
+    /// `task_cancel` shipped exactly that way: an id-or-`all` schema with nothing required, so a
+    /// cancellation displayed without saying what it cancelled.
+    #[tokio::test]
+    async fn test_every_tool_with_arguments_can_show_a_primary_param() {
+        // meka's own universal parameters. A tool whose schema is only these takes no argument of
+        // its own and has nothing to display.
+        const UNIVERSAL: &[&str] = &[SCRATCHPAD_PARAMETER, BACKGROUND_PARAMETER];
+
+        let registry = test_registry().await;
+        registry.enable_background();
+        for tool in background::build(
+            SessionManager::open(Some(std::path::Path::new(":memory:")))
+                .await
+                .expect("in-memory db"),
+            Arc::new(RwLock::new(None)),
+            crate::background::BackgroundTasks::default(),
+        ) {
+            registry.register(tool).expect("register task tool");
+        }
+
+        for definition in registry.definitions_active_with_loaded(&[]) {
+            let own_properties = definition
+                .parameters
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .filter(|key| !UNIVERSAL.contains(&key.as_str()))
+                        .count()
+                })
+                .unwrap_or(0);
+            if own_properties == 0 {
+                continue;
+            }
+            let has_required = definition
+                .parameters
+                .get("required")
+                .and_then(|required| required.as_array())
+                .is_some_and(|required| !required.is_empty());
+            // Probe the built-in map with an empty object: a mapped tool answers for at least one
+            // shape of input, which is what distinguishes "has a rule" from "falls through".
+            let mapped = crate::render::has_primary_param_rule(&definition.name);
+            assert!(
+                has_required || mapped,
+                "{} takes arguments but has no `required` and no built-in rule, so its tool-call \
+                 indicator would render with no argument",
+                definition.name,
+            );
+        }
     }
 
     async fn test_registry() -> ToolRegistry {
@@ -1184,6 +1548,10 @@ pub(crate) mod tests {
             crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly")
     }
@@ -1456,6 +1824,221 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_background_is_absent_until_enabled_and_present_after() {
+        let registry = ToolRegistry::new();
+        register_deferred_fixture(&registry, "fixture_alpha");
+        let has_background = |registry: &ToolRegistry| {
+            registry
+                .definitions_active_with_loaded(&["fixture_alpha".to_string()])
+                .iter()
+                .any(|definition| {
+                    definition
+                        .parameters
+                        .get("properties")
+                        .and_then(|properties| properties.get(BACKGROUND_PARAMETER))
+                        .is_some()
+                })
+        };
+
+        assert!(
+            !has_background(&registry),
+            "a parameter the model can see but cannot use is worse than one it cannot see"
+        );
+        registry.enable_background();
+        assert!(has_background(&registry));
+    }
+
+    /// A server that already advertises `background` owns the name. Silently redefining it would be
+    /// a far worse bug than losing the feature on that one tool.
+    #[test]
+    fn test_offer_background_never_shadows_a_real_parameter() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "background": {"type": "string", "description": "Wallpaper to set"}
+            }
+        });
+        offer_background(&mut schema);
+        assert_eq!(
+            schema["properties"]["background"]["type"],
+            serde_json::json!("string")
+        );
+    }
+
+    #[test]
+    fn test_offer_background_leaves_a_no_argument_schema_alone() {
+        let mut schema = serde_json::json!({"type": "object"});
+        offer_background(&mut schema);
+        assert!(schema.get("properties").is_none());
+    }
+
+    /// A schema for a tool that declares neither of meka's parameters, which is the ordinary case
+    /// and the one where meka owns both names.
+    fn plain_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}}
+        })
+    }
+
+    /// The flag is meka's, so it must never reach the tool, least of all a remote MCP server that
+    /// never advertised the key.
+    #[test]
+    fn test_take_background_flag_removes_it_from_the_arguments() {
+        let schema = plain_schema();
+        let (input, detach) = take_background_flag(
+            &serde_json::json!({"command": "make", "background": true}),
+            &schema,
+        );
+        assert!(detach);
+        assert_eq!(input, serde_json::json!({"command": "make"}));
+
+        let (input, detach) = take_background_flag(
+            &serde_json::json!({"command": "make", "background": false}),
+            &schema,
+        );
+        assert!(!detach);
+        assert_eq!(input, serde_json::json!({"command": "make"}));
+
+        let (input, detach) =
+            take_background_flag(&serde_json::json!({"command": "make"}), &schema);
+        assert!(!detach);
+        assert_eq!(input, serde_json::json!({"command": "make"}));
+    }
+
+    #[test]
+    fn test_take_background_flag_treats_a_non_boolean_as_absent() {
+        for value in [
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let (input, detach) =
+                take_background_flag(&serde_json::json!({"background": value}), &plain_schema());
+            assert!(!detach, "a wrong-typed flag must not detach by accident");
+            assert_eq!(input, serde_json::json!({}));
+        }
+    }
+
+    /// A tool that advertises `background` itself owns the name: `offer_background` declines to
+    /// shadow it, so the model is looking at the *tool's* parameter and the argument is the tool's
+    /// to receive. An image tool taking `background: "transparent"`, or an exec server with a
+    /// detach flag of its own, would otherwise have the argument eaten before dispatch.
+    #[test]
+    fn test_a_tool_that_declares_background_keeps_its_own_argument() {
+        let owned = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "background": {"type": "string", "description": "Backdrop colour"}
+            }
+        });
+
+        // Not spliced, so the model never saw meka's version.
+        let mut offered = owned.clone();
+        offer_background(&mut offered);
+        assert_eq!(offered, owned, "meka must not shadow the tool's parameter");
+
+        // Not stripped, not detached, and not refused for being the wrong type for a flag it is
+        // not.
+        let call = serde_json::json!({"prompt": "a cat", "background": "transparent"});
+        let (input, detach) = take_background_flag(&call, &owned);
+        assert!(!detach, "the tool's parameter is not a detach request");
+        assert_eq!(
+            input, call,
+            "the tool must receive the argument it declared"
+        );
+        assert_eq!(meka_parameter_error(&call, &owned), None);
+    }
+
+    /// The same question for `scratchpad`, which needs a weaker test: meka's own builtins declare
+    /// it, as a string, so presence proves nothing and only a conflicting *type* means the tool
+    /// has its own idea of the name.
+    #[test]
+    fn test_scratchpad_ownership_turns_on_the_declared_type() {
+        let builtin_style = serde_json::json!({
+            "type": "object",
+            "properties": {"scratchpad": {"type": "string"}}
+        });
+        let complaint = meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &builtin_style);
+        assert!(
+            complaint.is_some(),
+            "a tool declaring it as a string agrees with meka, so the check still applies",
+        );
+
+        let someone_elses = serde_json::json!({
+            "type": "object",
+            "properties": {"scratchpad": {"type": "integer"}}
+        });
+        assert_eq!(
+            meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &someone_elses),
+            None,
+            "a tool that means a number by the name is entitled to be sent one",
+        );
+    }
+
+    /// Some models emit every argument as a string whatever the schema says; GLM does it through
+    /// OpenRouter, which is where this came up. Both of meka's own parameters decide what a call
+    /// does rather than what it is called with, so the answer is to say so and let the model retry,
+    /// not to read the wrong type as absent (a silent no-op) or to guess at it (a contract where
+    /// `"true"` works and `"yes"` does not).
+    #[test]
+    fn test_a_wrong_typed_meka_parameter_is_refused_by_name() {
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+        ] {
+            let complaint =
+                meka_parameter_error(&serde_json::json!({"background": value}), &plain_schema())
+                    .expect("a wrong-typed background flag must be refused, not silently ignored");
+            assert!(complaint.contains("background"), "{complaint}");
+            assert!(complaint.contains("boolean"), "{complaint}");
+        }
+
+        let complaint =
+            meka_parameter_error(&serde_json::json!({"scratchpad": 7}), &plain_schema())
+                .expect("a wrong-typed scratchpad name must be refused");
+        assert!(complaint.contains("scratchpad"), "{complaint}");
+        assert!(complaint.contains("string"), "{complaint}");
+    }
+
+    /// Models emit `null` for optional arguments they are not using, and a tool's own arguments
+    /// belong to the tool: refusing either would cost capability without catching a bug.
+    #[test]
+    fn test_well_formed_and_absent_parameters_pass() {
+        for input in [
+            serde_json::json!({"command": "make", "background": true}),
+            serde_json::json!({"command": "make", "background": false}),
+            serde_json::json!({"command": "make", "background": null}),
+            serde_json::json!({"command": "make", "scratchpad": "build-log"}),
+            serde_json::json!({"command": "make", "scratchpad": null}),
+            serde_json::json!({"command": "make"}),
+            // The tool's own arguments, wrong-typed on purpose: not meka's to police.
+            serde_json::json!({"command": 12, "timeout": "30"}),
+            serde_json::json!("not an object at all"),
+        ] {
+            assert_eq!(
+                meka_parameter_error(&input, &plain_schema()),
+                None,
+                "{input}"
+            );
+        }
+    }
+
+    /// `background` is spliced into the definitions sent to the provider, not into the raw one this
+    /// check reads, so without an exemption it would be reported as an undeclared argument.
+    #[test]
+    fn test_schema_disagreement_ignores_the_background_parameter() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "Shell command"}},
+        });
+        let input = serde_json::json!({"command": "make", "background": true});
+        assert!(schema_disagreement("execute_command", &input, &schema, false).is_none());
+    }
+
     /// The commonest slip: naming the tool without its `mcp__<server>__` prefix. Edit distance
     /// alone puts the answer seventeen operations away, so the segment match has to carry it.
     #[test]
@@ -1719,6 +2302,10 @@ pub(crate) mod tests {
             crate::agent::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
 

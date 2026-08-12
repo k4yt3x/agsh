@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ReadTracker, Tool, ToolOutput,
+    ReadStamp, ReadTracker, Tool, ToolOutput,
     util::{MAX_SEARCH_MATCHES, canonicalize_for_tool, require_str, search_lines, truncate_string},
 };
 use crate::{
@@ -23,6 +23,109 @@ use crate::{
     permission::Permission,
     provider::{ImageSource, ToolDefinition, ToolResultContent},
 };
+
+/// Record `canonical` as read, stamped with what the file looks like right now.
+///
+/// A path that cannot be stated is simply not recorded, so the next `edit_file` asks for a re-read.
+/// That is the right instruction: whatever stopped the stat will surface as a real error on the
+/// second read, where it is legible, rather than as a silent edit against a file that moved.
+async fn record_read(tracker: &ReadTracker, canonical: std::path::PathBuf) {
+    if let Some(stamp) = ReadStamp::of_path(&canonical).await {
+        tracker.write().await.insert(canonical, stamp);
+    }
+}
+
+/// Record a read the frontend served, fingerprinting the text it gave us.
+///
+/// Not a disk stamp, because the two describe different documents. An editor serves its own copy of
+/// every file it owns, saved or not, so a disk comparison is wrong in both directions: it fires
+/// when the user saves a file nobody edited, and stays quiet when the user rewrites the buffer the
+/// agent is about to edit. What *is* comparable is the next thing the editor serves, which
+/// `edit_file` fetches anyway before editing.
+async fn record_delegated_read(tracker: &ReadTracker, canonical: std::path::PathBuf, text: &str) {
+    tracker
+        .write()
+        .await
+        .insert(canonical, ReadStamp::of_delegated(text));
+}
+
+/// Record a file this tool has just written, stamped in whatever terms the route can answer for.
+///
+/// `content` is what was written, which on the delegated route is exactly what the editor now
+/// holds, so the next edit compares against it and consecutive edits do not trip. Stamping a
+/// delegated write from disk instead would leave the file looking unchanged until the user saved
+/// and changed on the first save after that.
+async fn record_write(
+    tracker: &ReadTracker,
+    canonical: std::path::PathBuf,
+    route: FileRoute,
+    content: &str,
+) {
+    if route.is_delegated() {
+        record_delegated_read(tracker, canonical, content).await;
+    } else {
+        record_read(tracker, canonical).await;
+    }
+}
+
+/// The complaint to return when the file moved under the agent since it read it, or `None` when the
+/// read still stands.
+///
+/// Every comparison is like against like. A [`ReadStamp::Disk`] record is checked against the disk;
+/// a [`ReadStamp::Delegated`] one against the text the frontend has just served. Crossing them is
+/// what makes the check useless on an editor-hosted file: the editor serves its own copy of
+/// everything it owns, saved or not, so disk state answers a different question than the one asked.
+///
+/// A record whose source no longer matches the route is passed rather than guessed at. That happens
+/// when the editor adopts or disowns a file between the read and the edit, and neither source can
+/// speak for the other; the next write re-stamps it in the current terms, so it self-corrects after
+/// one call.
+async fn stale_read_complaint(
+    recorded: Option<ReadStamp>,
+    route: FileRoute,
+    content: &str,
+    canonical: &Path,
+    path: &str,
+) -> Option<String> {
+    match recorded? {
+        // If the file cannot be stated now, say nothing: the edit's own write will produce the real
+        // error, which is more legible than a staleness complaint about an unreachable file.
+        disk @ ReadStamp::Disk { .. } if !route.is_delegated() => {
+            (ReadStamp::of_path(canonical).await? != disk).then(|| {
+                format!(
+                    "Error: file '{}' changed on disk after you read it. Something else wrote to \
+                     it (a shell command, another agent, or the user). Read it again before \
+                     editing so you are not overwriting that change, or set force=true to edit \
+                     anyway.",
+                    path
+                )
+            })
+        }
+        served @ ReadStamp::Delegated { .. } if route.is_delegated() => {
+            (ReadStamp::of_delegated(content) != served).then(|| {
+                format!(
+                    "Error: file '{}' changed in the editor after you read it. Someone edited the \
+                     buffer, or the editor reloaded the file. Read it again before editing so you \
+                     are not overwriting that change, or set force=true to edit anyway.",
+                    path
+                )
+            })
+        }
+        // Said out loud at debug level rather than merely returning: a check that quietly declines
+        // to run looks exactly like a check that ran and passed, and this whole comparison was
+        // broken for a release by precisely that.
+        mismatched => {
+            tracing::debug!(
+                "edit_file: '{}' was read from a different source than this edit ({:?} vs route \
+                 {:?}); skipping the freshness check",
+                canonical.display(),
+                mismatched,
+                route,
+            );
+            None
+        }
+    }
+}
 
 /// Open a file for reading, refusing to follow a symlink on Unix. Callers pass a canonicalized
 /// `PathBuf` so the check closes the canonicalize→open TOCTOU window: if the target was replaced by
@@ -352,7 +455,7 @@ impl Tool for ReadFileTool {
 
                 let base64_data = base64::engine::general_purpose::STANDARD.encode(&payload);
 
-                self.read_tracker.write().await.insert(canonical);
+                record_read(&self.read_tracker, canonical).await;
 
                 return Ok(ToolOutput {
                     content: vec![
@@ -384,29 +487,44 @@ impl Tool for ReadFileTool {
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
         let regex = input.get("regex").and_then(|v| v.as_str());
 
-        // Plain text reads delegate to the editor when it offers `fs.read_text_file` (in-buffer
-        // view wins over on-disk). Regex / image reads have no `fs/*` analogue; always local.
-        if regex.is_none() {
-            let delegate_line =
-                offset.map(|o| u32::try_from(o.saturating_add(1)).unwrap_or(u32::MAX));
-            // Mirror the local fallback's `DEFAULT_LINE_LIMIT` so the delegate path can't
-            // accidentally pull an unbounded file into the agent's context when the caller passed
-            // no limit. Without this, an `fs.read_text_file`-capable client (e.g. Zed) returns the
+        // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
+        // shown the document the editor will apply an edit against rather than the bytes under it.
+        //
+        // Including a regex read. There is no `fs/*` analogue for searching, but none is needed:
+        // fetch the file through the same route and filter it here. Routing this one locally
+        // instead searched the disk while `edit_file` went on to edit the buffer, and stamped the
+        // read in terms `edit_file`'s freshness check could not compare against that buffer, so on
+        // the common find-then-edit path the check silently skipped. Image reads stay local: they
+        // are bytes, not text, and nothing edits them.
+        {
+            // The whole file for a regex read, which is a search and has no business being
+            // windowed; otherwise mirror the local fallback's `DEFAULT_LINE_LIMIT` so the delegate
+            // path can't pull an unbounded file into the agent's context when the caller passed no
+            // limit. Without that, an `fs.read_text_file`-capable client (e.g. Zed) returns the
             // whole file while the local path would cap at 2000 lines with a truncation marker:
             // divergent behavior + context-window risk.
-            let delegate_limit = Some(
-                limit
-                    .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
-                    .unwrap_or(DEFAULT_LINE_LIMIT as u32),
-            );
+            let (delegate_line, delegate_limit) = match regex {
+                Some(_) => (None, None),
+                None => (
+                    offset.map(|o| u32::try_from(o.saturating_add(1)).unwrap_or(u32::MAX)),
+                    Some(
+                        limit
+                            .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
+                            .unwrap_or(DEFAULT_LINE_LIMIT as u32),
+                    ),
+                ),
+            };
             match self
                 .frontend
                 .delegate_fs_read(&canonical, delegate_line, delegate_limit)
                 .await
             {
                 Some(Ok(content)) => {
-                    self.read_tracker.write().await.insert(canonical);
-                    return Ok(ToolOutput::text(content, false));
+                    record_delegated_read(&self.read_tracker, canonical, &content).await;
+                    return match regex {
+                        Some(pattern) => search_lines(&content, pattern, "read_file"),
+                        None => Ok(ToolOutput::text(content, false)),
+                    };
                 }
                 // The client will not serve this path, so it holds no buffer for it either: the
                 // local bytes are not a degraded substitute for the delegate's view, they are the
@@ -442,7 +560,7 @@ impl Tool for ReadFileTool {
                 })?;
 
         if let Some(pattern) = regex {
-            self.read_tracker.write().await.insert(canonical);
+            record_read(&self.read_tracker, canonical).await;
             return search_lines(&content, pattern, "read_file");
         }
 
@@ -466,7 +584,7 @@ impl Tool for ReadFileTool {
             result
         };
 
-        self.read_tracker.write().await.insert(canonical);
+        record_read(&self.read_tracker, canonical).await;
 
         Ok(ToolOutput::text(result, false))
     }
@@ -598,7 +716,11 @@ impl Tool for EditFileTool {
         let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let canonical = canonicalize_for_tool("edit_file", &resolved).await?;
 
-        if !force && !self.read_tracker.read().await.contains(&canonical) {
+        // Bound the guard to a `let` rather than matching on it directly: a temporary in a match
+        // scrutinee lives for the whole match, which would hold the lock across the `of_path` await
+        // below.
+        let recorded = self.read_tracker.read().await.get(&canonical).copied();
+        if !force && recorded.is_none() {
             return Ok(ToolOutput::text(
                 format!(
                     "Error: file '{}' must be read before editing. \
@@ -642,6 +764,22 @@ impl Tool for EditFileTool {
                 FileRoute::Local,
             ),
         };
+
+        // Checked here, after the read, because a delegated record can only be checked against
+        // what the same source serves now, and that is the text just fetched. Each stamp is
+        // compared against its own kind of source; a record and a route that disagree (the editor
+        // has since disowned the file, or adopted it) prove nothing about each other and pass.
+        //
+        // Deliberately not the "must be read" message below. The file *was* read, and the agent's
+        // next move differs: re-read to see what changed, then decide whether the edit still
+        // applies. Sending it to `read_file` for the wrong reason hides that something else is
+        // writing here.
+        if !force
+            && let Some(stale) =
+                stale_read_complaint(recorded, route, &content, &canonical, &path).await
+        {
+            return Ok(ToolOutput::text(stale, true));
+        }
 
         if !content.contains(&old_string) {
             return Ok(ToolOutput::text(
@@ -696,6 +834,12 @@ impl Tool for EditFileTool {
             "edit_file",
         )
         .await?;
+
+        // Re-stamp: this edit is itself a change to the file, so without it the next `edit_file`
+        // would compare against the pre-edit stamp and report the agent's own write as somebody
+        // else's. Consecutive edits to one file are the common case, so that would be a constant
+        // false alarm.
+        record_write(&self.read_tracker, canonical.clone(), route, &new_content).await;
 
         let snippet = build_context_snippet(&new_content, first_match_byte, 3);
         let trailer = if count > 1 {
@@ -906,7 +1050,7 @@ impl Tool for WriteFileTool {
         // Record the canonical path so subsequent `edit_file` calls accept it without `force:
         // true`. We just produced the content, so the "must read first" safety check has nothing to
         // gain.
-        self.read_tracker.write().await.insert(target.clone());
+        record_write(&self.read_tracker, target.clone(), route, &content).await;
 
         Ok(ToolOutput::text(
             format!(
@@ -927,7 +1071,7 @@ impl Tool for WriteFileTool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::HashMap, sync::Arc};
 
     use tokio::sync::RwLock;
 
@@ -935,14 +1079,29 @@ mod tests {
     use crate::tools::tests::text_content;
 
     fn test_tracker() -> ReadTracker {
-        Arc::new(RwLock::new(HashSet::new()))
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// Seed the tracker as though `path` had just been read, stamped with its current state, so an
+    /// `edit_file` under test passes the freshness gate the way a real read would leave it.
+    async fn mark_read(tracker: &ReadTracker, path: &std::path::Path) -> std::path::PathBuf {
+        let canonical = std::fs::canonicalize(path).expect("canonicalize");
+        record_read(tracker, canonical.clone()).await;
+        canonical
     }
 
     /// A frontend whose hosted filesystem answers with a scripted outcome, so each branch of the
     /// routing rule can be driven directly.
+    ///
+    /// The serving variant models a real editor rather than a fixed reply: it holds a buffer that
+    /// reads return and writes update. Freshness on this route is judged by comparing what the
+    /// editor served then against what it serves now, so a fixture that answered the same string
+    /// forever could not tell a working check from an absent one.
     struct ScriptedDelegateFrontend {
+        /// Consulted only when there is no buffer, which is how the failure fixtures answer.
         read: Option<std::result::Result<String, crate::frontend::FrontendError>>,
         write: Option<std::result::Result<(), crate::frontend::FrontendError>>,
+        buffer: std::sync::Mutex<Option<String>>,
         delegated_writes: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
@@ -957,6 +1116,7 @@ mod tests {
                 write: Some(Err(crate::frontend::FrontendError::unservable_path(
                     "fs/write_text_file failed: Resource not found",
                 ))),
+                buffer: std::sync::Mutex::new(None),
                 delegated_writes: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -970,6 +1130,7 @@ mod tests {
                 write: Some(Err(crate::frontend::FrontendError::new(
                     "fs/write_text_file failed: Internal error",
                 ))),
+                buffer: std::sync::Mutex::new(None),
                 delegated_writes: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -979,8 +1140,15 @@ mod tests {
             Self {
                 read: Some(Ok(buffer.to_string())),
                 write: Some(Ok(())),
+                buffer: std::sync::Mutex::new(Some(buffer.to_string())),
                 delegated_writes: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// Someone else changes the document: the user typing, or the editor reloading a file that
+        /// was rewritten underneath it.
+        fn set_buffer(&self, text: &str) {
+            *self.buffer.lock().expect("lock") = Some(text.to_string());
         }
     }
 
@@ -1001,19 +1169,30 @@ mod tests {
             _line: Option<u32>,
             _limit: Option<u32>,
         ) -> Option<std::result::Result<String, crate::frontend::FrontendError>> {
-            self.read.clone()
+            match self.buffer.lock().expect("lock").clone() {
+                Some(text) => Some(Ok(text)),
+                None => self.read.clone(),
+            }
         }
 
         async fn delegate_fs_write(
             &self,
             path: &Path,
-            _content: &str,
+            content: &str,
         ) -> Option<std::result::Result<(), crate::frontend::FrontendError>> {
             self.delegated_writes
                 .lock()
                 .expect("lock")
                 .push(path.to_path_buf());
-            self.write.clone()
+            let outcome = self.write.clone();
+            // An accepted write lands in the document, so later reads see it. Without this the
+            // fixture would serve pre-edit text forever and consecutive edits could not be tested.
+            if matches!(outcome, Some(Ok(())))
+                && let Some(buffer) = self.buffer.lock().expect("lock").as_mut()
+            {
+                *buffer = content.to_string();
+            }
+            outcome
         }
     }
 
@@ -1100,10 +1279,7 @@ mod tests {
 
         let frontend = Arc::new(ScriptedDelegateFrontend::unservable());
         let tracker = test_tracker();
-        tracker
-            .write()
-            .await
-            .insert(std::fs::canonicalize(&file_path).expect("canonicalize"));
+        mark_read(&tracker, &file_path).await;
         let tool = EditFileTool {
             read_tracker: tracker,
             cwd: crate::agent::test_cwd(),
@@ -1144,10 +1320,7 @@ mod tests {
         std::fs::write(&file_path, "before\n").expect("write");
 
         let tracker = test_tracker();
-        tracker
-            .write()
-            .await
-            .insert(std::fs::canonicalize(&file_path).expect("canonicalize"));
+        mark_read(&tracker, &file_path).await;
         let tool = EditFileTool {
             read_tracker: tracker,
             cwd: crate::agent::test_cwd(),
@@ -1172,6 +1345,217 @@ mod tests {
         );
     }
 
+    /// The Zed workflow: a file open with unsaved edits, read through the delegate, then saved by
+    /// the user before the agent edits it. The save moves the disk stamp while changing nothing the
+    /// agent had not already been shown, so a disk comparison would refuse the edit and blame a
+    /// concurrent writer that does not exist.
+    #[tokio::test]
+    async fn test_a_delegated_read_is_not_invalidated_by_the_user_saving() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open-in-editor.md");
+        std::fs::write(&file_path, "saved bytes\n").expect("write");
+        let canonical = std::fs::canonicalize(&file_path).expect("canonicalize");
+
+        // Read through the editor, which is holding unsaved changes.
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving("unsaved buffer\n"));
+        let tracker = test_tracker();
+        record_delegated_read(&tracker, canonical.clone(), "unsaved buffer\n").await;
+
+        // The user hits save: the disk now matches the buffer, and its stamp has moved.
+        std::fs::write(&file_path, "unsaved buffer\n").expect("save");
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend,
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "buffer",
+                    "new_string": "BUFFER"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(
+            !result.is_error,
+            "saving one's own unsaved edits is not a third party overwriting the file: {}",
+            text_content(&result)
+        );
+    }
+
+    /// The same false alarm one step later. The edit itself re-stamps the file, and stamping a
+    /// delegated write from disk would put the tracker straight back into the state the test above
+    /// exists to prevent: the write went to the editor's document, so the disk it left behind is
+    /// still the user's to save whenever they like.
+    #[tokio::test]
+    async fn test_a_delegated_write_is_not_invalidated_by_the_user_saving() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open-in-editor.md");
+        std::fs::write(&file_path, "saved bytes\n").expect("write");
+        let canonical = std::fs::canonicalize(&file_path).expect("canonicalize");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving("alpha in the buffer\n"));
+        let tracker = test_tracker();
+        record_delegated_read(&tracker, canonical.clone(), "alpha in the buffer\n").await;
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend,
+        };
+        let first = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "alpha",
+                    "new_string": "beta"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        assert!(!first.is_error, "{}", text_content(&first));
+
+        // The user saves. The document the editor serves is unchanged -- it already held the
+        // agent's edit -- so nothing the agent was shown has moved; only the bytes on disk.
+        std::fs::write(&file_path, "something else entirely\n").expect("save");
+
+        let second = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "beta",
+                    "new_string": "gamma"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        assert!(
+            !second.is_error,
+            "a delegated write must be stamped in the editor's terms, not the disk's: {}",
+            text_content(&second)
+        );
+    }
+
+    /// A regex read is a read, so it has to leave the tracker in the same terms as any other.
+    ///
+    /// It used to route locally on the grounds that searching has no `fs/*` call of its own, which
+    /// left the find-then-edit path -- grep for the anchor, then edit it, the most ordinary thing
+    /// the agent does -- searching the disk while the edit went to the buffer, and recording a
+    /// stamp the freshness check could not compare against that buffer. The check does not fail
+    /// loudly in that state; it declines to run.
+    #[tokio::test]
+    async fn test_a_delegated_regex_read_searches_and_stamps_the_editors_copy() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open-in-editor.md");
+        std::fs::write(&file_path, "on disk only\n").expect("write");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving("needle in the buffer\n"));
+        let tracker = test_tracker();
+        let read = ReadFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: frontend.clone(),
+        };
+        let found = read
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "regex": "needle"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        let text = text_content(&found);
+        assert!(
+            text.contains("needle in the buffer"),
+            "a search must run over the document the editor holds: {text}"
+        );
+
+        // Someone rewrites the document between the search and the edit.
+        frontend.set_buffer("needle, and a paragraph the agent has never seen\n");
+
+        let edit = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend,
+        };
+        let result = edit
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "needle",
+                    "new_string": "pin"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        assert!(
+            result.is_error,
+            "a search read must arm the same freshness check every other read does"
+        );
+        assert!(text_content(&result).contains("changed in the editor"));
+    }
+
+    /// The other half, and the half whose absence let a broken check ship: an editor-hosted file
+    /// whose *document* changes between the read and the edit must be refused.
+    ///
+    /// This is the ordinary case, not an exotic one. An editor serves its copy of every file it
+    /// owns, saved or not, so under ACP essentially every project file is read through the
+    /// delegate. Exempting that route from freshness checking altogether -- which is what comparing
+    /// it against the disk and then giving up amounts to -- switches the protection off for the
+    /// whole project, and nothing that only tests the no-false-alarm direction can see it.
+    ///
+    /// The replacement text is still present in the new document, so a `not found` rejection cannot
+    /// be what fires here.
+    #[tokio::test]
+    async fn test_a_delegated_read_is_invalidated_by_the_document_changing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("open-in-editor.md");
+        std::fs::write(&file_path, "alpha\n").expect("write");
+        let canonical = std::fs::canonicalize(&file_path).expect("canonicalize");
+
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving("alpha\n"));
+        let tracker = test_tracker();
+        record_delegated_read(&tracker, canonical.clone(), "alpha\n").await;
+
+        // Someone rewrites the document: the user typing into the buffer, or the editor reloading
+        // a file that a shell command or another agent rewrote underneath it.
+        frontend.set_buffer("alpha, plus a paragraph the agent has never seen\n");
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend,
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "alpha",
+                    "new_string": "beta"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(
+            result.is_error,
+            "a document that moved under the agent must be reported, not edited blind"
+        );
+        let text = text_content(&result);
+        assert!(text.contains("changed in the editor"), "{text}");
+        assert!(!text.contains("must be read before editing"), "{text}");
+    }
+
     #[tokio::test]
     async fn test_edit_file_writes_back_through_the_route_it_read_from() {
         // Route consistency: the edit was computed from the client's buffer, so it has to be
@@ -1183,7 +1567,7 @@ mod tests {
 
         let frontend = Arc::new(ScriptedDelegateFrontend::serving("unsaved buffer\n"));
         let tracker = test_tracker();
-        tracker.write().await.insert(canonical.clone());
+        record_read(&tracker, canonical.clone()).await;
         let tool = EditFileTool {
             read_tracker: tracker,
             cwd: crate::agent::test_cwd(),
@@ -1233,10 +1617,11 @@ mod tests {
             read: Some(Ok("unsaved buffer\n".to_string())),
             // No `fs.writeTextFile` capability.
             write: None,
+            buffer: std::sync::Mutex::new(Some("unsaved buffer\n".to_string())),
             delegated_writes: std::sync::Mutex::new(Vec::new()),
         });
         let tracker = test_tracker();
-        tracker.write().await.insert(canonical);
+        record_read(&tracker, canonical).await;
         let tool = EditFileTool {
             read_tracker: tracker,
             cwd: crate::agent::test_cwd(),
@@ -1283,6 +1668,7 @@ mod tests {
             write: Some(Err(crate::frontend::FrontendError::new(
                 "fs/write_text_file failed: invalid path",
             ))),
+            buffer: std::sync::Mutex::new(None),
             delegated_writes: std::sync::Mutex::new(Vec::new()),
         });
         let tool = WriteFileTool {
@@ -1681,6 +2067,205 @@ mod tests {
 
         assert!(result.is_error);
         assert!(text_content(&result).contains("must be read before editing"));
+    }
+
+    /// The silent-clobber shape: read, something else writes, edit lands against bytes that are no
+    /// longer there. A shell `sed -i`, a concurrent agent, or the user's editor all produce it.
+    #[tokio::test]
+    async fn test_edit_refuses_a_file_that_changed_after_the_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("raced.txt");
+        std::fs::write(&file_path, "hello world").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+
+        // Something else rewrites it. Length differs, so the stamp differs even where the
+        // filesystem's mtime resolution is coarse.
+        std::fs::write(&file_path, "hello world, and then some").expect("rewrite");
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(result.is_error);
+        let text = text_content(&result);
+        assert!(text.contains("changed on disk"), "{text}");
+        // Must not be the never-read message: the agent's next move differs, and sending it to
+        // `read_file` for the wrong reason hides that something else is writing here.
+        assert!(!text.contains("must be read before editing"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "hello world, and then some",
+            "the other writer's content must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_accepts_a_file_that_is_unchanged_since_the_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("quiet.txt");
+        std::fs::write(&file_path, "hello world").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(!result.is_error, "{}", text_content(&result));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "hello rust"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_bypasses_the_changed_on_disk_check_too() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("forced.txt");
+        std::fs::write(&file_path, "hello world").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+        std::fs::write(&file_path, "hello world, changed").expect("rewrite");
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "world",
+                    "new_string": "rust",
+                    "force": true
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(!result.is_error, "{}", text_content(&result));
+    }
+
+    /// Editing twice in a row is the common case. Without re-stamping after a write, the second
+    /// edit would report the agent's own change as somebody else's.
+    #[tokio::test]
+    async fn test_consecutive_edits_do_not_report_a_change() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("twice.txt");
+        std::fs::write(&file_path, "alpha beta gamma").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+
+        let edit = |old: &'static str, new: &'static str| {
+            let path = file_path.clone();
+            let tool = &tool;
+            async move {
+                tool.execute(
+                    serde_json::json!({
+                        "path": path.to_str().expect("path"),
+                        "old_string": old,
+                        "new_string": new
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("should return Ok")
+            }
+        };
+
+        // Length-changing on purpose: an equal-length replacement would leave the stamps equal on a
+        // filesystem with coarse mtime resolution, and the test would pass whether or not the
+        // re-stamp exists.
+        let first = edit("alpha", "ALPHA_EXPANDED").await;
+        assert!(!first.is_error, "{}", text_content(&first));
+        let second = edit("gamma", "GAMMA").await;
+        assert!(!second.is_error, "{}", text_content(&second));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "ALPHA_EXPANDED beta GAMMA"
+        );
+    }
+
+    /// `write_file` records the file it just produced, so an immediately following `edit_file`
+    /// neither demands a read nor reports a change.
+    #[tokio::test]
+    async fn test_write_then_edit_needs_no_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("fresh.txt");
+        let tracker = test_tracker();
+
+        let writer = WriteFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        writer
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "hello world"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write succeeds");
+
+        let editor = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = editor
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(!result.is_error, "{}", text_content(&result));
     }
 
     #[tokio::test]

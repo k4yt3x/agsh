@@ -259,11 +259,15 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 
 | Value | Description |
 |-------|-------------|
-| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed (default) |
-| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colours as `syntect`, and code blocks are highlighted by it. Alias: `rich` |
+| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
+| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colours as `syntect`, and code blocks are highlighted by it. Alias: `rich` (default) |
 | `raw` | Raw markdown printed verbatim with aligned tables |
 
-Default: `syntect`
+Default: `termimad`
+
+Reflowing only happens when there is a terminal to reflow to. With output redirected or piped,
+`termimad` renders without wrapping, so a captured answer is not hard-wrapped to some fallback
+width.
 
 ```toml
 [display]
@@ -302,15 +306,26 @@ Default: `false`
 
 ### `display.newline_before_prompt`
 
-Whether to add a blank line before the prompt after each agent response.
+Whether to add a blank line before the prompt, after whatever the previous line produced.
 
 Default: `true`
 
 ### `display.newline_after_prompt`
 
-Whether to add a blank line after the prompt (before the agent response).
+Whether to add a blank line after the line you typed, before its output.
 
 Default: `true`
+
+Both apply to **anything printed between two prompts**, not only agent responses: a slash command's
+output (`/tasks`, `/memory`, `/help`, …) is bracketed the same way a turn is. A command that answers
+by running a turn, such as `/skill <name>`, is spaced once by the turn rather than twice.
+
+The blank lines bracket output, so a command that prints nothing gets neither. In practice every
+slash command says something, even if only that a list is empty, so there is always something to
+bracket. Two exceptions: a successful `/cd` prints nothing at all, because the prompt itself is the
+confirmation, and gets no blank lines either; `!command` is always bracketed, because meka hands the
+terminal to the child process and never learns whether it wrote anything, so a silent `!touch file`
+still gets its blank lines.
 
 ### `display.show_token_usage`
 
@@ -1067,6 +1082,29 @@ max_jobs = 50
 Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing jobs on disk without firing.
 
 As with `[skills]` and `[memory]`, there is no environment variable and no CLI flag: whether an agent may schedule its own turns is a property of the installation.
+
+## `[background]`
+
+Controls tool calls the agent starts and does not wait for. See the [Background Tasks](../usage/background.md) guide.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Offer the `background` parameter and register the `task_*` tools |
+| `max_tasks` | int | `10` | Concurrent tasks per session, refused at dispatch |
+
+```toml
+[background]
+enabled = true
+max_tasks = 10
+```
+
+**Alone among the capability blocks, this one is off by default.** `[schedule]`, `[skills]`, and `[memory]` add capability without changing when a turn ends; this changes the contract of the primary interaction into "you asked, it answered, and something else may interrupt you later". That is right for an unattended assistant and wrong for someone using the REPL as a command line. A scheduled job also takes an explicit act to create, whereas `background` is reachable from any tool call, so an agent will reach for it unprompted.
+
+Setting `enabled = false` keeps the `background` property out of every tool schema and the two `task_*` tools out of every request, rather than advertising a parameter that would only ever be refused.
+
+Outcome delivery shares [`[schedule].poll_interval`](#schedule), so that key sets how long a finished task waits before it is reported, whether or not scheduling itself is enabled.
+
+Config-only, like the blocks above: no environment variable, no CLI flag.
 
 ## `[serve]`
 

@@ -43,6 +43,82 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
     )
 }
 
+/// Start the background-outcome poller. Separate task from the scheduler because the two are
+/// independent switches: an installation can want timers without detached work, or the reverse.
+///
+/// Only sessions already resident are polled. Reviving an evicted session to deliver an outcome
+/// would rebuild its whole runtime and pin it in memory, and the outcome is not going anywhere: it
+/// keeps its `delivered_at IS NULL` until something opens that session again. The session-load
+/// sweep is what guarantees the row exists to be found.
+pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()> {
+    let config = state.shared.config.background.clone();
+    if !config.enabled {
+        return tokio::spawn(async {});
+    }
+    let poll_interval = state.shared.config.schedule.poll_interval;
+    tracing::info!(
+        "background tasks enabled: max_tasks={}, poll_interval={:?}",
+        config.max_tasks,
+        poll_interval
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = state.shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            // Snapshot the ids and drop the lock before any await: holding the sessions map
+            // across a turn would block every request that needs to look a session up.
+            let resident: Vec<uuid::Uuid> = {
+                let sessions = state.sessions.read().await;
+                sessions.keys().copied().collect()
+            };
+            for session_id in resident {
+                let ready = match state
+                    .shared
+                    .session_manager
+                    .list_undelivered_background_tasks(session_id)
+                    .await
+                {
+                    Ok(ready) if !ready.is_empty() => ready,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!("background poller failed for {}: {}", session_id, error);
+                        continue;
+                    }
+                };
+                let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+                // Stamped before the turn, like `stamp_scheduled_job_fired`: an outcome that wedges
+                // the process must not be redelivered on every restart.
+                if let Err(error) = state
+                    .shared
+                    .session_manager
+                    .mark_background_tasks_delivered(&ids)
+                    .await
+                {
+                    tracing::warn!("failed to stamp background outcomes delivered: {}", error);
+                    continue;
+                }
+                if let Err(error) = run_prompt_in_session(
+                    &state,
+                    session_id,
+                    crate::background::render_outcomes(&ready),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "background outcome turn for {} failed: {:?}",
+                        session_id,
+                        error
+                    );
+                }
+            }
+        }
+    })
+}
+
 /// Run one fired job. Errors are logged rather than propagated: the scheduler must survive a job
 /// whose session has gone missing or whose provider call failed.
 async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
@@ -76,6 +152,7 @@ async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
 
 /// Why a scheduled run did not complete. The distinction exists solely to separate "this host
 /// cannot take the job" (retry elsewhere) from "the job ran and went wrong" (do not retry).
+#[derive(Debug)]
 enum RunError {
     SessionBusyElsewhere,
     Failed(anyhow::Error),
@@ -95,7 +172,18 @@ impl From<crate::error::MekaError> for RunError {
 
 /// Deliver the prompt into the conversation that created the job.
 async fn run_in_session(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunError> {
-    let entry = reattach::ensure_session_loaded(state, wakeup.job.session_id)
+    run_prompt_in_session(state, wakeup.job.session_id, wakeup.render_prompt()).await
+}
+
+/// Run one out-of-band prompt inside a live session. Shared by scheduled jobs and background-task
+/// outcomes, which want identical treatment: wait on a busy session rather than drop the
+/// occurrence, and publish a cancellation token so `POST /cancel` can reach the turn.
+async fn run_prompt_in_session(
+    state: &ServerState,
+    session_id: uuid::Uuid,
+    prompt: String,
+) -> Result<(), RunError> {
+    let entry = reattach::ensure_session_loaded(state, session_id)
         .await
         .map_err(|problem| {
             if problem.type_uri == crate::server::errors::ErrorKind::SessionLocked.type_uri() {
@@ -128,7 +216,7 @@ async fn run_in_session(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunE
         .run_turn(
             &mut session_uuid,
             &mut runtime_inner.messages,
-            wakeup.render_prompt(),
+            prompt,
             Vec::new(),
             cancellation,
         )

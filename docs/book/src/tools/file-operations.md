@@ -20,7 +20,7 @@ Read the contents of a file at a given path. Supports text files and images.
 
 - When `offset` and `limit` are both omitted, defaults to the first 2000 lines. If the file has more, a truncation notice is appended.
 - Use `offset`/`limit` to page through large files.
-- `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content.
+- `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
 
 ### Image files
 
@@ -76,6 +76,25 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 - If `old_string` matches more than once and `replace_all` is not set, the edit is **rejected**. Add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
 - To delete text, use replace mode with an empty `new_string`.
 - The file must have been previously read with `read_file` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
+- The read must still be **valid**. meka records the file's modification time and size when it is read, and rejects an edit if either has changed since:
+
+  ```text
+  Error: file 'src/main.rs' changed on disk after you read it. Something else
+  wrote to it (a shell command, another agent, or the user). Read it again
+  before editing so you are not overwriting that change, or set force=true.
+  ```
+
+  This is a deliberately different message from the never-read case, because the next move differs: re-read to see what changed, then decide whether the edit still applies. Anything can be the other writer, an `execute_command` running `sed -i`, a [background task](../usage/background.md), or you in another window. `write_file` and a successful `edit_file` both re-record the file, so consecutive edits never trip it.
+
+  A read served by the editor under [ACP](../usage/acp.md) is checked against the editor, not the disk. Those are two different documents that share a path: the editor serves its own copy of every file it owns, saved or not, so comparing one to the other would fire every time you save a file nobody edited and stay silent when you rewrite the buffer the agent is about to edit. meka fingerprints what the editor served and compares it against what the editor serves when the edit arrives, which it fetches anyway. Editing the buffer, or the editor reloading a file something else rewrote, is reported:
+
+  ```text
+  Error: file 'src/main.rs' changed in the editor after you read it. Someone edited
+  the buffer, or the editor reloaded the file. Read it again before editing so you
+  are not overwriting that change, or set force=true to edit anyway.
+  ```
+
+  Saving does not trip it: the document is unchanged, only the bytes on disk moved.
 - If `old_string` is not found, the tool returns an error (without modifying the file).
 - On success, the response includes a small ±3-line snippet (with line numbers, lines truncated at 200 chars) around the first edited site so you can confirm the change landed without re-reading the file.
 

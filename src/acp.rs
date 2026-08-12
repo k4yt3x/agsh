@@ -398,10 +398,17 @@ impl AcpFrontend {
     /// has a prompt, it just came from a timer instead of a keystroke. Without it the editor shows
     /// a reply with nothing above it explaining the question.
     pub(crate) fn push_scheduled_prompt(&self, wakeup: &crate::schedule::Wakeup) {
+        self.push_out_of_band_prompt(&wakeup.render_prompt());
+    }
+
+    /// Show any prompt the user did not type, for the same reason: a reply with nothing above it
+    /// explaining the question reads as the agent talking to itself. Used by scheduled jobs and by
+    /// background-task outcome reports.
+    pub(crate) fn push_out_of_band_prompt(&self, prompt: &str) {
         send_session_update(
             &self.connection,
             &self.session_id,
-            super::acp::schedule::scheduled_prompt_update(wakeup),
+            super::acp::schedule::out_of_band_prompt_update(prompt),
         );
     }
 
@@ -2006,6 +2013,11 @@ pub async fn run_acp(
     let scheduler_handle = schedule::spawn(Arc::clone(&state));
     let _scheduler_guard = AbortOnDrop(scheduler_handle);
 
+    // Reports background-task outcomes into whichever sessions the editor has open, on the same
+    // terms and with the same abort-on-drop lifetime.
+    let background_handle = schedule::spawn_background_poller(Arc::clone(&state));
+    let _background_guard = AbortOnDrop(background_handle);
+
     // Observe stdin EOF so the connection shuts down when the client disconnects (or the parent
     // dies). The connection future does not resolve on idle EOF by itself, so wrap the incoming
     // side; `acp_run_until_disconnect` (the `connect_with` closure below) waits on this token.
@@ -2656,6 +2668,10 @@ async fn handle_load_session(
         );
     }
 
+    // Whatever the last owner left running is ours to retire now; see
+    // `crate::background::claim_session`.
+    crate::background::claim_session(&state.shared.session_manager, session_uuid).await;
+
     let events = match state.shared.session_manager.load_events(session_uuid).await {
         Ok(events) => events,
         Err(error) => {
@@ -2867,6 +2883,10 @@ async fn handle_resume_session(
         );
     }
 
+    // Whatever the last owner left running is ours to retire now; see
+    // `crate::background::claim_session`.
+    crate::background::claim_session(&state.shared.session_manager, session_uuid).await;
+
     let events = match state.shared.session_manager.load_events(session_uuid).await {
         Ok(events) => events,
         Err(error) => {
@@ -3041,6 +3061,10 @@ async fn handle_fork_session(
             ));
         }
     };
+
+    // Whatever the last owner left running is ours to retire now; see
+    // `crate::background::claim_session`.
+    crate::background::claim_session(&state.shared.session_manager, session_uuid).await;
 
     let events = match state.shared.session_manager.load_events(session_uuid).await {
         Ok(events) => events,

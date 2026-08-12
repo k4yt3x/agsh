@@ -37,6 +37,7 @@ pub struct ConfigFile {
     pub memory: Option<MemoryConfig>,
     pub permissions: Option<PermissionsConfig>,
     pub schedule: Option<ScheduleConfig>,
+    pub background: Option<BackgroundConfig>,
     pub serve: Option<ServeConfig>,
 }
 
@@ -114,6 +115,51 @@ impl ResolvedScheduleConfig {
 }
 
 impl Default for ResolvedScheduleConfig {
+    fn default() -> Self {
+        Self::resolve(None)
+    }
+}
+
+/// `[background]` table: tool calls the agent starts and does not wait for ([`crate::background`]).
+///
+/// Config-only, like `[schedule]`, `[skills]`, and `[memory]`.
+///
+/// Alone among them it defaults **off**, which is deliberate rather than caution. Those three add
+/// capability without changing when a turn ends; this changes the contract of the primary
+/// interaction from "you asked, it answered" into "and something else may interrupt you later",
+/// which is right for an unattended assistant and wrong for someone using the REPL as a command
+/// line. A scheduled job also takes an explicit, visible act to create, whereas `background` is
+/// reachable from any tool call, so an agent will reach for it unprompted.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundConfig {
+    pub enabled: Option<bool>,
+    /// Ceiling on tasks running at once per session, refused at dispatch. Default 10.
+    pub max_tasks: Option<usize>,
+}
+
+/// [`BackgroundConfig`] with every default filled in.
+#[derive(Debug, Clone)]
+pub struct ResolvedBackgroundConfig {
+    pub enabled: bool,
+    pub max_tasks: usize,
+}
+
+impl ResolvedBackgroundConfig {
+    /// Enough for a fan-out of parallel work, low enough that a runaway loop is capped before it
+    /// has spawned a hundred shells.
+    const DEFAULT_MAX_TASKS: usize = 10;
+
+    fn resolve(raw: Option<BackgroundConfig>) -> Self {
+        let raw = raw.unwrap_or_default();
+        Self {
+            enabled: raw.enabled.unwrap_or(false),
+            max_tasks: raw.max_tasks.unwrap_or(Self::DEFAULT_MAX_TASKS),
+        }
+    }
+}
+
+impl Default for ResolvedBackgroundConfig {
     fn default() -> Self {
         Self::resolve(None)
     }
@@ -717,6 +763,9 @@ pub struct ResolvedConfig {
     /// `[schedule]` with defaults filled. Resolved here rather than at the call site because both
     /// the REPL and `meka serve` start a scheduler and would otherwise each re-derive it.
     pub schedule: ResolvedScheduleConfig,
+    /// `[background]` with defaults filled. Off unless the installation asks for it; see
+    /// [`BackgroundConfig`].
+    pub background: ResolvedBackgroundConfig,
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
@@ -1542,6 +1591,7 @@ impl ResolvedConfig {
             .enabled
             .unwrap_or(true);
         let schedule = ResolvedScheduleConfig::resolve(config_file.schedule);
+        let background = ResolvedBackgroundConfig::resolve(config_file.background);
         // Destructure the [mcp] table into its two independent fields so we don't have to re-open
         // the config file later for resolution.
         let (
@@ -1771,6 +1821,7 @@ impl ResolvedConfig {
             skills_enabled,
             memory_enabled,
             schedule,
+            background,
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
@@ -2797,6 +2848,46 @@ max_jobs = 10
         assert!(!schedule.poll_interval.is_zero());
         assert!(!schedule.gate_timeout.is_zero());
         assert!(schedule.max_jobs > 0);
+    }
+
+    #[test]
+    fn test_background_config_deserialization() {
+        let config: ConfigFile = toml::from_str(
+            "[background]
+enabled = true
+max_tasks = 3
+",
+        )
+        .expect("config parses");
+        let background = ResolvedBackgroundConfig::resolve(config.background);
+        assert!(background.enabled);
+        assert_eq!(background.max_tasks, 3);
+    }
+
+    /// The one capability block that is off unless asked for. See [`BackgroundConfig`] for why it
+    /// departs from `[schedule]` / `[skills]` / `[memory]`.
+    #[test]
+    fn test_background_is_off_by_default() {
+        let config: ConfigFile = toml::from_str("").expect("empty config parses");
+        assert!(config.background.is_none());
+        let background = ResolvedBackgroundConfig::resolve(config.background);
+        assert!(
+            !background.enabled,
+            "background tasks are off unless turned on"
+        );
+        assert!(background.max_tasks > 0);
+    }
+
+    #[test]
+    fn test_background_config_rejects_unknown_keys() {
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[background]
+detach = true
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]

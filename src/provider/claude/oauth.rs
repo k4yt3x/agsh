@@ -2213,6 +2213,10 @@ mod tests {
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
 
@@ -2231,6 +2235,7 @@ mod tests {
                 &[],
                 "",
                 None,
+                &[],
             );
             format!("{}\n\n{}", block, "list files under /tmp")
         };
@@ -2252,6 +2257,7 @@ mod tests {
                 &[],
                 "",
                 None,
+                &[],
             );
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
@@ -2336,6 +2342,10 @@ mod tests {
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
         // Register a deferred fixture *after* `build_default` so it lands at the tail of the tools
@@ -2355,6 +2365,7 @@ mod tests {
                 &[],
                 "",
                 None,
+                &[],
             );
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
@@ -2472,6 +2483,10 @@ mod tests {
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "mcp__fs__old_tool");
@@ -2583,6 +2598,10 @@ mod tests {
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
@@ -2690,6 +2709,10 @@ mod tests {
             crate::agent::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
         )
         .expect("default web client config should build cleanly");
 

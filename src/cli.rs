@@ -657,7 +657,7 @@ pub struct Cli {
     #[arg(long = "no-stream")]
     pub no_stream: bool,
 
-    /// Markdown render mode: syntect (default), rich, or raw
+    /// Markdown render mode: termimad (default), syntect, or raw
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
 
