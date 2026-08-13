@@ -7,7 +7,7 @@ meka uses a four-level permission system to control what tools the agent can use
 | Level | Indicator | Allowed Tools |
 |-------|-----------|---------------|
 | **None** | `[n]` (green) | No tools. The agent can only respond with text. |
-| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`, `execute_command` (sandboxed), `todo`, `agent_spawn`, scratchpad tools |
+| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`, `execute_command` (sandboxed), `todo`, `agent_spawn`, scratchpad tools |
 | **Ask** | `[a]` (magenta) | All tools, but each call requires user approval (Y/n prompt) |
 | **Write** | `[w]` (red) | All tools without restrictions: `write_file`, `edit_file`, `execute_command` (unsandboxed) |
 
@@ -98,7 +98,7 @@ MCP tools are classified through a 5-step resolution chain: per-tool override â†
 
 ### Built-in tool permissions
 
-Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `web_search` in a locked-down environment).
+Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `search_web` in a locked-down environment).
 
 ### Sub-agent permissions
 

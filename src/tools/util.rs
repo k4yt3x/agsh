@@ -76,7 +76,7 @@ impl WalkBudget {
 }
 
 /// Resolve the active session id for a session-scoped tool, erroring if no session is open. Shared
-/// by the scratchpad and recall tool families.
+/// by the scratchpad and conversation tool families.
 pub(super) async fn resolve_session_id(
     session_id: &Arc<RwLock<Option<Uuid>>>,
     tool_name: &str,

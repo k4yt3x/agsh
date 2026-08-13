@@ -1,6 +1,6 @@
 //! Builtin tools exposing MCP resources and prompts to the agent:
-//! `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, and
-//! `get_mcp_prompt`. Each tool routes through a shared [`McpClientManager`]
+//! `mcp_resource_list`, `mcp_resource_read`, `mcp_prompt_list`, and
+//! `mcp_prompt_get`. Each tool routes through a shared [`McpClientManager`]
 //! so it can target any configured server by name.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Cap on total bytes returned by `read_mcp_resource` across all content
+/// Cap on total bytes returned by `mcp_resource_read` across all content
 /// chunks from a single server response. Mirrors `MAX_MCP_IMAGE_BYTES`:
 /// servers can return large blob or text resources that would otherwise be
 /// cloned verbatim into the provider request and blown through the user's
@@ -83,7 +83,7 @@ pub(crate) struct ListMcpResourcesTool {
 impl Tool for ListMcpResourcesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "list_mcp_resources".to_string(),
+            name: "mcp_resource_list".to_string(),
             description: "List resources advertised by MCP servers. If `server` is provided, \
                  list only that server's resources; otherwise list all configured \
                  servers. Each row is `<server>\\t<uri>\\t<name>\\t<mime>\\t<description>`."
@@ -116,7 +116,7 @@ impl Tool for ListMcpResourcesTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("list_mcp_resources", &self.manager, &self.denials, name)?;
+            visible_server_entry("mcp_resource_list", &self.manager, &self.denials, name)?;
             vec![name.clone()]
         } else {
             visible_servers(&self.manager, &self.denials)
@@ -183,7 +183,7 @@ pub(crate) struct ReadMcpResourceTool {
 impl Tool for ReadMcpResourceTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "read_mcp_resource".to_string(),
+            name: "mcp_resource_read".to_string(),
             description: "Read an MCP resource by URI from a specific server. Text \
                           resources are returned inline; binary resources are \
                           returned base64-encoded with their declared MIME type."
@@ -197,7 +197,7 @@ impl Tool for ReadMcpResourceTool {
                     },
                     "uri": {
                         "type": "string",
-                        "description": "Resource URI (e.g. file:///path/to/file). Exactly as listed by `list_mcp_resources`."
+                        "description": "Resource URI (e.g. file:///path/to/file). Exactly as listed by `mcp_resource_list`."
                     }
                 },
                 "required": ["server", "uri"]
@@ -215,11 +215,11 @@ impl Tool for ReadMcpResourceTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let server = require_str(&input, "server", "read_mcp_resource")?;
-        let uri = require_str(&input, "uri", "read_mcp_resource")?;
+        let server = require_str(&input, "server", "mcp_resource_read")?;
+        let uri = require_str(&input, "uri", "mcp_resource_read")?;
 
         let entry =
-            visible_server_entry("read_mcp_resource", &self.manager, &self.denials, &server)?;
+            visible_server_entry("mcp_resource_read", &self.manager, &self.denials, &server)?;
 
         let result = crate::mcp::read_resource(&entry, uri.clone()).await?;
 
@@ -314,7 +314,7 @@ pub(crate) struct ListMcpPromptsTool {
 impl Tool for ListMcpPromptsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "list_mcp_prompts".to_string(),
+            name: "mcp_prompt_list".to_string(),
             description: "List prompts advertised by MCP servers. If `server` is provided, \
                  list only that server's prompts; otherwise list all configured \
                  servers. Each row is `<server>\\t<name>\\t<description>\\t<args>`."
@@ -347,7 +347,7 @@ impl Tool for ListMcpPromptsTool {
             .map(String::from);
 
         let names: Vec<String> = if let Some(name) = &server_filter {
-            visible_server_entry("list_mcp_prompts", &self.manager, &self.denials, name)?;
+            visible_server_entry("mcp_prompt_list", &self.manager, &self.denials, name)?;
             vec![name.clone()]
         } else {
             visible_servers(&self.manager, &self.denials)
@@ -423,11 +423,11 @@ pub(crate) struct GetMcpPromptTool {
 impl Tool for GetMcpPromptTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "get_mcp_prompt".to_string(),
+            name: "mcp_prompt_get".to_string(),
             description: "Render an MCP prompt by name from a specific server. \
                           Returns the prompt's messages serialised as `<role>: \
                           <text>` lines. `arguments` are passed verbatim to the \
-                          server; see `list_mcp_prompts` for each prompt's \
+                          server; see `mcp_prompt_list` for each prompt's \
                           declared arguments."
                 .to_string(),
             parameters: serde_json::json!({
@@ -439,7 +439,7 @@ impl Tool for GetMcpPromptTool {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Prompt name, as returned by `list_mcp_prompts`."
+                        "description": "Prompt name, as returned by `mcp_prompt_list`."
                     },
                     "arguments": {
                         "type": "object",
@@ -462,12 +462,12 @@ impl Tool for GetMcpPromptTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let server = require_str(&input, "server", "get_mcp_prompt")?;
-        let name = require_str(&input, "name", "get_mcp_prompt")?;
+        let server = require_str(&input, "server", "mcp_prompt_get")?;
+        let name = require_str(&input, "name", "mcp_prompt_get")?;
 
         let arguments = input.get("arguments").and_then(|v| v.as_object()).cloned();
 
-        let entry = visible_server_entry("get_mcp_prompt", &self.manager, &self.denials, &server)?;
+        let entry = visible_server_entry("mcp_prompt_get", &self.manager, &self.denials, &server)?;
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments).await?;
 
@@ -564,31 +564,31 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
             }
         };
     }
-    register_meta!("list_mcp_resources", ListMcpResourcesTool {
+    register_meta!("mcp_resource_list", ListMcpResourcesTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("read_mcp_resource", ReadMcpResourceTool {
+    register_meta!("mcp_resource_read", ReadMcpResourceTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("list_mcp_prompts", ListMcpPromptsTool {
+    register_meta!("mcp_prompt_list", ListMcpPromptsTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("get_mcp_prompt", GetMcpPromptTool {
+    register_meta!("mcp_prompt_get", GetMcpPromptTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("subscribe_mcp_resource", SubscribeMcpResourceTool {
+    register_meta!("mcp_resource_subscribe", SubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("unsubscribe_mcp_resource", UnsubscribeMcpResourceTool {
+    register_meta!("mcp_resource_unsubscribe", UnsubscribeMcpResourceTool {
         manager: Arc::clone(&manager),
         denials: Arc::clone(&denials),
     });
-    register_meta!("list_mcp_resource_updates", ListMcpResourceUpdatesTool {
+    register_meta!("mcp_resource_updates_list", ListMcpResourceUpdatesTool {
         denials
     });
     drop(manager);
@@ -603,10 +603,10 @@ pub(crate) struct SubscribeMcpResourceTool {
 impl Tool for SubscribeMcpResourceTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "subscribe_mcp_resource".to_string(),
+            name: "mcp_resource_subscribe".to_string(),
             description: "Subscribe to change notifications for an MCP resource. After \
                           subscribing, the server will send resources/updated notifications \
-                          that meka records; query them with `list_mcp_resource_updates`."
+                          that meka records; query them with `mcp_resource_updates_list`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -629,10 +629,10 @@ impl Tool for SubscribeMcpResourceTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let server = require_str(&input, "server", "subscribe_mcp_resource")?;
-        let uri = require_str(&input, "uri", "subscribe_mcp_resource")?;
+        let server = require_str(&input, "server", "mcp_resource_subscribe")?;
+        let uri = require_str(&input, "uri", "mcp_resource_subscribe")?;
         let entry = visible_server_entry(
-            "subscribe_mcp_resource",
+            "mcp_resource_subscribe",
             &self.manager,
             &self.denials,
             &server,
@@ -640,7 +640,7 @@ impl Tool for SubscribeMcpResourceTool {
         crate::mcp::subscribe_resource(&entry, uri.clone())
             .await
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "subscribe_mcp_resource".to_string(),
+                tool_name: "mcp_resource_subscribe".to_string(),
                 message: format!("subscribe failed: {}", error),
             })?;
         Ok(ToolOutput::text(
@@ -659,7 +659,7 @@ pub(crate) struct UnsubscribeMcpResourceTool {
 impl Tool for UnsubscribeMcpResourceTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "unsubscribe_mcp_resource".to_string(),
+            name: "mcp_resource_unsubscribe".to_string(),
             description: "Cancel a prior subscription to an MCP resource.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -682,10 +682,10 @@ impl Tool for UnsubscribeMcpResourceTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let server = require_str(&input, "server", "unsubscribe_mcp_resource")?;
-        let uri = require_str(&input, "uri", "unsubscribe_mcp_resource")?;
+        let server = require_str(&input, "server", "mcp_resource_unsubscribe")?;
+        let uri = require_str(&input, "uri", "mcp_resource_unsubscribe")?;
         let entry = visible_server_entry(
-            "unsubscribe_mcp_resource",
+            "mcp_resource_unsubscribe",
             &self.manager,
             &self.denials,
             &server,
@@ -693,7 +693,7 @@ impl Tool for UnsubscribeMcpResourceTool {
         crate::mcp::unsubscribe_resource(&entry, uri.clone())
             .await
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "unsubscribe_mcp_resource".to_string(),
+                tool_name: "mcp_resource_unsubscribe".to_string(),
                 message: format!("unsubscribe failed: {}", error),
             })?;
         Ok(ToolOutput::text(
@@ -711,7 +711,7 @@ pub(crate) struct ListMcpResourceUpdatesTool {
 impl Tool for ListMcpResourceUpdatesTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "list_mcp_resource_updates".to_string(),
+            name: "mcp_resource_updates_list".to_string(),
             description: "List all resources that have been reported as updated since \
                           this meka session started. Rows are `<server>\\t<uri>\\t<unix_ts>`."
                 .to_string(),
@@ -908,13 +908,13 @@ mod tests {
             entries.iter().map(|(n, _, _, d)| (n.clone(), *d)).collect();
 
         for name in [
-            "list_mcp_resources",
-            "read_mcp_resource",
-            "list_mcp_prompts",
-            "get_mcp_prompt",
-            "subscribe_mcp_resource",
-            "unsubscribe_mcp_resource",
-            "list_mcp_resource_updates",
+            "mcp_resource_list",
+            "mcp_resource_read",
+            "mcp_prompt_list",
+            "mcp_prompt_get",
+            "mcp_resource_subscribe",
+            "mcp_resource_unsubscribe",
+            "mcp_resource_updates_list",
         ] {
             assert!(
                 by_name.contains_key(name),

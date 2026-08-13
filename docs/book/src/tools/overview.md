@@ -12,7 +12,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`find_files`](./search.md#find_files) | Read | Find files by glob pattern |
 | [`search_contents`](./search.md#search_contents) | Read | Search file contents with regex |
 | [`fetch_url`](./web.md#fetch_url) | Read | Fetch a web page as markdown |
-| [`web_search`](./web.md#web_search) | Read | Search the web |
+| [`search_web`](./web.md#search_web) | Read | Search the web |
 | [`execute_command`](./shell.md#execute_command) | Read/Write | Run a shell command |
 | [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
@@ -30,8 +30,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`memory_search`](../usage/memory.md) | Read | Regex over the full text of every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
-| [`recall`](./overview.md#recall) | Read | Search the full conversation history, including compacted turns |
-| [`recall_read`](./overview.md#recall) | Read | Read conversation turns by index |
+| [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
+| [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
 | [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
 | [`schedule_list`](../usage/scheduling.md) | Read | List this session's scheduled jobs |
 | [`schedule_cancel`](../usage/scheduling.md) | Read | Cancel a scheduled job |
@@ -45,10 +45,10 @@ The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-fi
 Tools are grouped by the minimum permission level required:
 
 **Read permission** (available in read, ask, and write modes):
-- `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
+- `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`
 - `execute_command` (sandboxed, filesystem write-protected)
 - `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `skill`, `render_image`
-- `recall`, `recall_read`
+- `conversation_search`, `conversation_read`
 - All scratchpad tools
 - All memory tools. Writing a memory needs only read permission: the store is meka's own, under
   its config directory, not your working tree
@@ -72,13 +72,13 @@ meka also exposes seven built-in **MCP meta-tools** for browsing server-side res
 
 | Tool | Permission | Description |
 |------|-----------|-------------|
-| `list_mcp_resources` | Read | List resources a server exposes |
-| `read_mcp_resource` | Read | Read a server resource by URI |
-| `list_mcp_prompts` | Read | List server-defined prompts |
-| `get_mcp_prompt` | Read | Render a server prompt with arguments |
-| `subscribe_mcp_resource` | Read | Receive change notifications for a resource |
-| `unsubscribe_mcp_resource` | Read | Stop receiving change notifications |
-| `list_mcp_resource_updates` | Read | Inspect pending resource-change notifications |
+| `mcp_resource_list` | Read | List resources a server exposes |
+| `mcp_resource_read` | Read | Read a server resource by URI |
+| `mcp_prompt_list` | Read | List server-defined prompts |
+| `mcp_prompt_get` | Read | Render a server prompt with arguments |
+| `mcp_resource_subscribe` | Read | Receive change notifications for a resource |
+| `mcp_resource_unsubscribe` | Read | Stop receiving change notifications |
+| `mcp_resource_updates_list` | Read | Inspect pending resource-change notifications |
 
 ## Deferred Tools
 
@@ -211,31 +211,31 @@ The bytes must decode to a supported raster image. PNG, JPEG, GIF, WebP, and BMP
 
 Only call `render_image` when the current model supports vision input.
 
-## `recall` / `recall_read`
+## `conversation_search` / `conversation_read`
 
 Search and re-read this session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read straight from the on-disk event log, so a detail the compaction summary dropped is still recoverable.
 
-`recall` searches and returns matching lines, each tagged with a message index (`#N`) and role:
+`conversation_search` searches and returns matching lines, each tagged with a message index (`#N`) and role:
 
 ```text
-recall({"query": "auth token", "regex": false, "limit": 20})
+conversation_search({"query": "auth token", "regex": false, "limit": 20})
 ```
 
 - `query` (required) — text to search for; a literal substring (case-insensitive) unless `regex` is set.
 - `regex` — treat `query` as a case-sensitive regular expression. Default: `false`.
 - `limit` — maximum matches to return (capped at 100). Default: 20.
 
-`recall_read` reads turns by the `#N` index that `recall` reports:
+`conversation_read` reads turns by the `#N` index that `conversation_search` reports:
 
 ```text
-recall_read({"start": 47, "count": 3})
+conversation_read({"start": 47, "count": 3})
 ```
 
 - `start` (required) — 1-based message index to read from.
 - `count` — number of consecutive messages to read (max 20). Default: 1.
 - `scratchpad` — save the output to a scratchpad entry instead of returning it inline.
 
-After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `recall` and `recall_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
+After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `conversation_search` and `conversation_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
 
 ## Redirecting output to the scratchpad
 

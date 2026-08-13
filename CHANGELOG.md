@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-08-13
+
+### Changed
+
+- **Breaking:** `web_search` is now `search_web`.
+- **Breaking:** `recall` and `recall_read` are now `conversation_search` and `conversation_read`.
+- **Breaking:** MCP meta-tools put the object first: `read_mcp_resource` is now `mcp_resource_read`.
+- **Breaking:** a `disabled_tools` entry naming a renamed tool stops denying it; update on upgrade.
+
 ## [0.40.0] - 2026-08-12
 
 ### Added
@@ -1377,7 +1386,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.40.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.41.0...HEAD
+[0.41.0]: https://github.com/k4yt3x/meka/compare/0.40.0...0.41.0
 [0.40.0]: https://github.com/k4yt3x/meka/compare/0.39.0...0.40.0
 [0.39.0]: https://github.com/k4yt3x/meka/compare/0.38.0...0.39.0
 [0.38.0]: https://github.com/k4yt3x/meka/compare/0.37.0...0.38.0

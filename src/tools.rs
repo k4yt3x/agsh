@@ -3,13 +3,13 @@
 //! grep, scratchpad, shell, etc.).
 
 pub(crate) mod background;
+mod conversation;
 mod file;
 mod find;
 mod grep;
 mod load_tool;
 pub(crate) mod mcp_resources;
 mod memory;
-mod recall;
 mod render_image;
 mod schedule;
 pub(crate) mod scratchpad;
@@ -543,7 +543,7 @@ impl BuiltinToolFilter {
     /// `allowed_tools` is exhaustive: naming five tools removes everything else. Anyone who wrote
     /// one before the MCP meta-tools were filterable wrote it against a world where those seven
     /// registered unconditionally, so applying the allow-list to them now would delete
-    /// `read_mcp_resource` and friends from working installations on upgrade, with nothing in the
+    /// `mcp_resource_read` and friends from working installations on upgrade, with nothing in the
     /// config to explain it. `disabled_tools` has no such problem: naming a tool there has always
     /// meant "remove this one", so honouring it is what the user already asked for.
     pub fn denies(&self, name: &str) -> bool {
@@ -632,13 +632,13 @@ pub fn server_of_tool(tool_name: &str) -> Option<&str> {
 /// rather than through `register_builtin`. Deniable via `disabled_tools`, but deliberately outside
 /// `allowed_tools` -- see [`BuiltinToolFilter::denies`].
 pub const MCP_META_TOOL_NAMES: &[&str] = &[
-    "get_mcp_prompt",
-    "list_mcp_prompts",
-    "list_mcp_resource_updates",
-    "list_mcp_resources",
-    "read_mcp_resource",
-    "subscribe_mcp_resource",
-    "unsubscribe_mcp_resource",
+    "mcp_prompt_get",
+    "mcp_prompt_list",
+    "mcp_resource_list",
+    "mcp_resource_read",
+    "mcp_resource_subscribe",
+    "mcp_resource_unsubscribe",
+    "mcp_resource_updates_list",
 ];
 
 /// Canonical built-in names for the stale-entry warning pass, sorted.
@@ -653,23 +653,25 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "agent_followup",
     "agent_list",
     "agent_spawn",
+    "conversation_read",
+    "conversation_search",
     "edit_file",
     "execute_command",
     "fetch_url",
     "find_files",
-    "get_mcp_prompt",
-    "list_mcp_prompts",
-    "list_mcp_resource_updates",
-    "list_mcp_resources",
     "load_tool",
+    "mcp_prompt_get",
+    "mcp_prompt_list",
+    "mcp_resource_list",
+    "mcp_resource_read",
+    "mcp_resource_subscribe",
+    "mcp_resource_unsubscribe",
+    "mcp_resource_updates_list",
     "memory_delete",
     "memory_read",
     "memory_search",
     "memory_write",
     "read_file",
-    "read_mcp_resource",
-    "recall",
-    "recall_read",
     "render_image",
     "schedule_cancel",
     "schedule_create",
@@ -684,13 +686,11 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_save_file",
     "scratchpad_write",
     "search_contents",
+    "search_web",
     "skill",
-    "subscribe_mcp_resource",
     "task_cancel",
     "task_list",
     "todo",
-    "unsubscribe_mcp_resource",
-    "web_search",
     "write_file",
 ];
 
@@ -1521,11 +1521,11 @@ impl ToolRegistry {
             parent_session_id,
             inherited_names: inherited_scratchpad_names.clone(),
         }));
-        self.register_builtin(Arc::new(recall::RecallTool {
+        self.register_builtin(Arc::new(conversation::ConversationSearchTool {
             session_manager: session_manager.clone(),
             session_id: shared_session_id.clone(),
         }));
-        self.register_builtin(Arc::new(recall::RecallReadTool {
+        self.register_builtin(Arc::new(conversation::ConversationReadTool {
             session_manager: session_manager.clone(),
             session_id: shared_session_id.clone(),
         }));
@@ -2505,7 +2505,7 @@ pub(crate) mod tests {
         assert!(registry.get("search_contents").is_some());
         assert!(registry.get("execute_command").is_some());
         assert!(registry.get("fetch_url").is_some());
-        assert!(registry.get("web_search").is_some());
+        assert!(registry.get("search_web").is_some());
         assert!(registry.get("todo").is_some());
         assert!(registry.get("scratchpad_write").is_some());
         assert!(registry.get("scratchpad_read").is_some());
@@ -2893,15 +2893,15 @@ pub(crate) mod tests {
     async fn test_registry_filter_drops_disabled_tools() {
         let filter = BuiltinToolFilter::from_config(
             None,
-            vec!["web_search".to_string(), "fetch_url".to_string()],
+            vec!["search_web".to_string(), "fetch_url".to_string()],
             HashMap::new(),
         );
         let registry = build_test_registry(filter).await;
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(
-            registry.get("web_search").is_none(),
-            "web_search should be filtered out"
+            registry.get("search_web").is_none(),
+            "search_web should be filtered out"
         );
         assert!(
             registry.get("fetch_url").is_none(),
@@ -2921,7 +2921,7 @@ pub(crate) mod tests {
         assert!(registry.get("find_files").is_some());
         assert!(registry.get("write_file").is_none());
         assert!(registry.get("execute_command").is_none());
-        assert!(registry.get("web_search").is_none());
+        assert!(registry.get("search_web").is_none());
     }
 
     #[tokio::test]
@@ -2969,7 +2969,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_subagent_registry_honours_filter() {
         let filter =
-            BuiltinToolFilter::from_config(None, vec!["web_search".to_string()], HashMap::new());
+            BuiltinToolFilter::from_config(None, vec!["search_web".to_string()], HashMap::new());
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
@@ -3002,7 +3002,7 @@ pub(crate) mod tests {
         )
         .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());
-        assert!(registry.get("web_search").is_none());
+        assert!(registry.get("search_web").is_none());
         assert!(registry.get("todo").is_some());
         assert!(registry.get("agent_spawn").is_none());
     }
@@ -3191,16 +3191,16 @@ pub(crate) mod tests {
 
     /// The MCP meta-tools are registered outside `register_builtin`, so `admits` is the only thing
     /// standing between them and a deny list that names them. Before it, `disabled_tools =
-    /// ["read_mcp_resource"]` was accepted and silently did nothing.
+    /// ["mcp_resource_read"]` was accepted and silently did nothing.
     #[tokio::test]
     async fn test_registry_admits_covers_the_directly_registered_tools() {
         let registry = subagent_registry(
-            ToolDenials::new(Vec::new(), vec!["read_mcp_resource".to_string()]),
+            ToolDenials::new(Vec::new(), vec!["mcp_resource_read".to_string()]),
             crate::config::MemoryAccess::Write,
         )
         .await;
-        assert!(!registry.admits("read_mcp_resource"));
-        assert!(registry.admits("list_mcp_resources"));
+        assert!(!registry.admits("mcp_resource_read"));
+        assert!(registry.admits("mcp_resource_list"));
     }
 
     /// `allowed_tools` is exhaustive, and before the MCP meta-tools were filterable at all they
@@ -3228,7 +3228,7 @@ pub(crate) mod tests {
         ));
         mcp_resources::register_all(&allow_listed, std::sync::Arc::clone(&manager));
         assert!(
-            allow_listed.get("read_mcp_resource").is_some(),
+            allow_listed.get("mcp_resource_read").is_some(),
             "an exhaustive allowed_tools must not silently take the MCP meta-tools"
         );
         assert!(
@@ -3238,15 +3238,15 @@ pub(crate) mod tests {
 
         let block_listed = ToolRegistry::new_with_filter(BuiltinToolFilter::from_config(
             None,
-            vec!["read_mcp_resource".to_string()],
+            vec!["mcp_resource_read".to_string()],
             HashMap::new(),
         ));
         mcp_resources::register_all(&block_listed, manager);
         assert!(
-            block_listed.get("read_mcp_resource").is_none(),
+            block_listed.get("mcp_resource_read").is_none(),
             "naming one explicitly does remove it"
         );
-        assert!(block_listed.get("get_mcp_prompt").is_some());
+        assert!(block_listed.get("mcp_prompt_get").is_some());
     }
 
     /// Every meta-tool name must be a real one, and must be in `BUILTIN_TOOL_NAMES` too — the
@@ -3277,12 +3277,12 @@ pub(crate) mod tests {
     fn test_builtin_tool_names_covers_the_deniable_families() {
         let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
         for name in [
-            "recall",
-            "recall_read",
+            "conversation_search",
+            "conversation_read",
             "schedule_create",
             "task_list",
-            "read_mcp_resource",
-            "list_mcp_resource_updates",
+            "mcp_resource_read",
+            "mcp_resource_updates_list",
             "agent_followup",
         ] {
             assert!(
@@ -3322,7 +3322,7 @@ pub(crate) mod tests {
             "search_contents",
             "execute_command",
             "fetch_url",
-            "web_search",
+            "search_web",
             "todo",
             "scratchpad_read",
             "scratchpad_write",

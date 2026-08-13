@@ -46,7 +46,7 @@ Only fetch image URLs when the current model supports vision input; text-only mo
 
 ---
 
-## `web_search`
+## `search_web`
 
 Search DuckDuckGo and return the top results.
 
@@ -70,7 +70,7 @@ Search DuckDuckGo and return the top results.
 
 ### CAPTCHA detection
 
-DuckDuckGo occasionally serves a bot-challenge page instead of results (detected by the `anomaly-modal` element). `web_search` returns a distinct error so the agent doesn't silently retry:
+DuckDuckGo occasionally serves a bot-challenge page instead of results (detected by the `anomaly-modal` element). `search_web` returns a distinct error so the agent doesn't silently retry:
 
 ```
 DuckDuckGo served a CAPTCHA challenge (bot detection / rate limit).

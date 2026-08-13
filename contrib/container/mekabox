@@ -49,7 +49,7 @@ Limit all changes to within this container; do not attempt to modify the host sy
 changes persisting outside mounted volumes.
 
 Prefer Exa Search (`mcp__exa__web_search_exa` and `mcp__exa__web_fetch_exa`) over the built-in
-`web_search` tool for searches, when available.'
+`search_web` tool for searches, when available.'
 
 # `MEKA_SANDBOX_BACKEND=landlock` pins the read-mode sandbox to Landlock inside the container.
 # Bubblewrap rarely works in a nested container, and the image has no host config to pin it in

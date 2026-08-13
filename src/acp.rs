@@ -975,7 +975,7 @@ fn tool_kind_for(name: &str) -> ToolKind {
         "edit_file" | "write_file" => ToolKind::Edit,
         "find_files" | "search_contents" => ToolKind::Search,
         "execute_command" => ToolKind::Execute,
-        "fetch_url" | "web_search" => ToolKind::Fetch,
+        "fetch_url" | "search_web" => ToolKind::Fetch,
         "agent_spawn" => ToolKind::Think,
         // skill, memory_*, scratchpad_*, render_image, load_tool, mcp__*, and any
         // future built-ins.
@@ -997,7 +997,7 @@ fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
         ("find_files", Some(pattern)) => format!("Find {pattern}"),
         ("search_contents", Some(pattern)) => format!("Search {pattern}"),
         ("fetch_url", Some(url)) => format!("Fetch {url}"),
-        ("web_search", Some(query)) => format!("Web search: {query}"),
+        ("search_web", Some(query)) => format!("Web search: {query}"),
         ("agent_spawn", Some(task)) => format!("Sub-agent: {task}"),
         // Any other built-in or MCP (`mcp__server__tool`) tool: show its primary argument when one
         // was resolved (via the tool's JSON Schema), else fall back to the bare tool name.
@@ -3509,7 +3509,7 @@ mod tests {
         let cwd: SharedCwd = Arc::new(std::sync::RwLock::new(PathBuf::from("/")));
         let input = serde_json::json!({"command": "ls"});
         assert!(tool_locations("execute_command", &input, &cwd).is_empty());
-        assert!(tool_locations("web_search", &input, &cwd).is_empty());
+        assert!(tool_locations("search_web", &input, &cwd).is_empty());
     }
 
     #[test]
@@ -3574,7 +3574,7 @@ mod tests {
             "Fetch https://example.com"
         );
         assert_eq!(
-            tool_call_title("web_search", Some("rust acp")),
+            tool_call_title("search_web", Some("rust acp")),
             "Web search: rust acp"
         );
         // MCP / unknown tool with a resolved primary argument.

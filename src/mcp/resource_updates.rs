@@ -1,5 +1,5 @@
 //! In-memory ledger of resources that have been reported as changed via
-//! `notifications/resources/updated`. The agent can query this via the `list_mcp_resource_updates`
+//! `notifications/resources/updated`. The agent can query this via the `mcp_resource_updates_list`
 //! builtin tool to see which resources need refreshing without subscribing again.
 
 use std::{

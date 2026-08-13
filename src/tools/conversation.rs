@@ -1,8 +1,8 @@
-//! `recall` / `recall_read`: read-only search and retrieval over the current session's full
-//! conversation log, including turns that compaction summarized away and removed from the model's
-//! context. Compaction never deletes (it appends a boundary, [`crate::conversation`]), so every
-//! turn is still on disk in the `messages` table; these tools give the model a way back to detail
-//! the summary may have dropped.
+//! `conversation_search` / `conversation_read`: read-only search and retrieval over the current
+//! session's full conversation log, including turns that compaction summarized away and removed
+//! from the model's context. Compaction never deletes (it appends a boundary,
+//! [`crate::conversation`]), so every turn is still on disk in the `messages` table; these tools
+//! give the model a way back to detail the summary may have dropped.
 //!
 //! A rewind is the one thing that does remove turns from this view. That is deliberate: `/rewind`
 //! exists to take a turn back, and a search that could hand it straight back to the model would
@@ -27,11 +27,12 @@ use crate::{
     session::SessionManager,
 };
 
-/// Default number of matches `recall` returns when the caller doesn't set `limit`.
-const DEFAULT_RECALL_LIMIT: usize = 20;
-/// Hard cap on how many messages `recall_read` returns in one call.
-const MAX_RECALL_READ_MESSAGES: usize = 20;
-/// Each `recall` match line is truncated to this many characters so the result stays compact.
+/// Default number of matches `conversation_search` returns when the caller doesn't set `limit`.
+const DEFAULT_CONVERSATION_SEARCH_LIMIT: usize = 20;
+/// Hard cap on how many messages `conversation_read` returns in one call.
+const MAX_CONVERSATION_READ_MESSAGES: usize = 20;
+/// Each `conversation_search` match line is truncated to this many characters so the result stays
+/// compact.
 const SNIPPET_CHARS: usize = 200;
 
 fn role_label(role: &Role) -> &'static str {
@@ -102,7 +103,7 @@ fn searchable_text(message: &Message) -> String {
     segments.join("\n")
 }
 
-/// Full, untruncated rendering of a message for `recall_read`.
+/// Full, untruncated rendering of a message for `conversation_read`.
 fn render_message_full(message: &Message) -> String {
     let mut segments: Vec<String> = Vec::new();
     for block in &message.content {
@@ -156,7 +157,10 @@ enum Matcher {
 impl Matcher {
     fn build(query: &str, use_regex: bool) -> Result<Self> {
         if use_regex {
-            Ok(Matcher::Regex(compile_user_regex(query, "recall")?))
+            Ok(Matcher::Regex(compile_user_regex(
+                query,
+                "conversation_search",
+            )?))
         } else {
             Ok(Matcher::Substring(query.to_lowercase()))
         }
@@ -229,7 +233,7 @@ fn search_events(events: &[Event], query: &str, use_regex: bool, limit: usize) -
     if let Some(index) = first_index {
         writeln!(
             output,
-            "\nRead a full turn with `recall_read` (e.g. {{\"start\": {index}}})."
+            "\nRead a full turn with `conversation_read` (e.g. {{\"start\": {index}}})."
         )
         .ok();
     }
@@ -243,11 +247,11 @@ fn read_messages(events: &[Event], start: usize, count: usize) -> Result<String>
     let total = messages.len();
     if start == 0 || start > total {
         return Err(MekaError::ToolExecution {
-            tool_name: "recall_read".to_string(),
+            tool_name: "conversation_read".to_string(),
             message: format!("start {start} is out of range (valid: 1..={total})"),
         });
     }
-    let count = count.clamp(1, MAX_RECALL_READ_MESSAGES);
+    let count = count.clamp(1, MAX_CONVERSATION_READ_MESSAGES);
     let end = (start - 1 + count).min(total);
 
     let mut output = String::new();
@@ -261,20 +265,20 @@ fn read_messages(events: &[Event], start: usize, count: usize) -> Result<String>
     Ok(output)
 }
 
-pub(super) struct RecallTool {
+pub(super) struct ConversationSearchTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
 }
 
 #[async_trait]
-impl Tool for RecallTool {
+impl Tool for ConversationSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "recall".to_string(),
+            name: "conversation_search".to_string(),
             description: format!(
                 "Search this session's full conversation history, including earlier turns that \
                  compaction summarized away and removed from your context. Returns matching lines, \
-                 each tagged with its message index (#N) and role; follow up with `recall_read` to \
+                 each tagged with its message index (#N) and role; follow up with `conversation_read` to \
                  read a full turn. Use this to recover a detail the compaction summary may have \
                  omitted. Substring matching is case-insensitive; set `regex: true` to match \
                  `query` as a case-sensitive regular expression. Large tool outputs appear as \
@@ -294,7 +298,7 @@ impl Tool for RecallTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": format!("Maximum matches to return (max {MAX_SEARCH_MATCHES}). Default: {DEFAULT_RECALL_LIMIT}.")
+                        "description": format!("Maximum matches to return (max {MAX_SEARCH_MATCHES}). Default: {DEFAULT_CONVERSATION_SEARCH_LIMIT}.")
                     }
                 },
                 "required": ["query"]
@@ -312,7 +316,7 @@ impl Tool for RecallTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let query = require_str(&input, "query", "recall")?;
+        let query = require_str(&input, "query", "conversation_search")?;
         let use_regex = input
             .get("regex")
             .and_then(serde_json::Value::as_bool)
@@ -321,9 +325,9 @@ impl Tool for RecallTool {
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize)
-            .unwrap_or(DEFAULT_RECALL_LIMIT);
+            .unwrap_or(DEFAULT_CONVERSATION_SEARCH_LIMIT);
 
-        let session_id = resolve_session_id(&self.session_id, "recall").await?;
+        let session_id = resolve_session_id(&self.session_id, "conversation_search").await?;
         let events = self.session_manager.load_events(session_id).await?;
         Ok(ToolOutput::text(
             search_events(&events, &query, use_regex, limit)?,
@@ -332,31 +336,31 @@ impl Tool for RecallTool {
     }
 }
 
-pub(super) struct RecallReadTool {
+pub(super) struct ConversationReadTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
 }
 
 #[async_trait]
-impl Tool for RecallReadTool {
+impl Tool for ConversationReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "recall_read".to_string(),
+            name: "conversation_read".to_string(),
             description: format!(
                 "Read the full content of conversation turns by message index, including turns \
-                 compaction removed from your context. Use the #N indices reported by `recall`. \
-                 Reads up to {MAX_RECALL_READ_MESSAGES} messages starting at `start`."
+                 compaction removed from your context. Use the #N indices reported by `conversation_search`. \
+                 Reads up to {MAX_CONVERSATION_READ_MESSAGES} messages starting at `start`."
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "start": {
                         "type": "integer",
-                        "description": "1-based message index to start reading from (the #N from `recall`)."
+                        "description": "1-based message index to start reading from (the #N from `conversation_search`)."
                     },
                     "count": {
                         "type": "integer",
-                        "description": format!("Number of consecutive messages to read (max {MAX_RECALL_READ_MESSAGES}). Default: 1.")
+                        "description": format!("Number of consecutive messages to read (max {MAX_CONVERSATION_READ_MESSAGES}). Default: 1.")
                     },
                     "scratchpad": {
                         "type": "string",
@@ -383,7 +387,7 @@ impl Tool for RecallReadTool {
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize)
             .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "recall_read".to_string(),
+                tool_name: "conversation_read".to_string(),
                 message: "missing or invalid 'start' parameter".to_string(),
             })?;
         let count = input
@@ -392,7 +396,7 @@ impl Tool for RecallReadTool {
             .map(|value| value as usize)
             .unwrap_or(1);
 
-        let session_id = resolve_session_id(&self.session_id, "recall_read").await?;
+        let session_id = resolve_session_id(&self.session_id, "conversation_read").await?;
         let events = self.session_manager.load_events(session_id).await?;
         Ok(ToolOutput::text(
             read_messages(&events, start, count)?,
@@ -416,7 +420,7 @@ mod tests {
     }
 
     /// A log where the first two turns were compacted away (a boundary sits after them) and one
-    /// turn follows. `recall` must still see the pre-boundary turns.
+    /// turn follows. `conversation_search` must still see the pre-boundary turns.
     fn compacted_log() -> Vec<Event> {
         vec![
             Event::Append(Message::user("the auth token expired unexpectedly")),

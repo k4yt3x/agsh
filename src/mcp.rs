@@ -2115,13 +2115,13 @@ pub(crate) mod tests {
         manager.install_tools_on(&registry).await;
 
         for name in [
-            "list_mcp_resources",
-            "read_mcp_resource",
-            "list_mcp_prompts",
-            "get_mcp_prompt",
-            "subscribe_mcp_resource",
-            "unsubscribe_mcp_resource",
-            "list_mcp_resource_updates",
+            "mcp_resource_list",
+            "mcp_resource_read",
+            "mcp_prompt_list",
+            "mcp_prompt_get",
+            "mcp_resource_subscribe",
+            "mcp_resource_unsubscribe",
+            "mcp_resource_updates_list",
         ] {
             assert!(
                 registry.get(name).is_some(),
@@ -2144,7 +2144,7 @@ pub(crate) mod tests {
         manager.install_tools_on(&registry).await;
 
         assert!(
-            registry.get("list_mcp_resources").is_none(),
+            registry.get("mcp_resource_list").is_none(),
             "no MCP meta-tools should land on the registry when no servers configured"
         );
     }

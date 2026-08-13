@@ -1685,7 +1685,7 @@ async fn run_interactive(
                         match mcp::get_prompt(&entry, prompt_name.clone(), arguments).await {
                             Ok(result) => {
                                 // Render the prompt messages as a single user turn, same shape
-                                // as the `get_mcp_prompt` tool output.
+                                // as the `mcp_prompt_get` tool output.
                                 let mut body = String::new();
                                 for message in &result.messages {
                                     let role = match message.role {

@@ -1687,7 +1687,7 @@ fn tool_display_name(name: &str) -> &str {
         "find_files" => "FindFiles",
         "search_contents" => "SearchContents",
         "fetch_url" => "FetchUrl",
-        "web_search" => "WebSearch",
+        "search_web" => "SearchWeb",
         "todo" => "Todo",
         "agent_spawn" => "AgentSpawn",
         "agent_list" => "AgentList",
@@ -1784,7 +1784,7 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "read_file" | "write_file" | "edit_file" => "path",
         "find_files" | "search_contents" => "pattern",
         "fetch_url" => "url",
-        "web_search" => "query",
+        "search_web" => "query",
         "agent_spawn" => "prompt",
         "scratchpad_write" | "scratchpad_read" | "scratchpad_edit" | "scratchpad_delete" => "name",
         "skill" => "name",
@@ -2222,10 +2222,20 @@ mod tests {
         assert_eq!(tool_display_name("find_files"), "FindFiles");
         assert_eq!(tool_display_name("search_contents"), "SearchContents");
         assert_eq!(tool_display_name("fetch_url"), "FetchUrl");
-        assert_eq!(tool_display_name("web_search"), "WebSearch");
+        assert_eq!(tool_display_name("search_web"), "SearchWeb");
         assert_eq!(tool_display_name("skill"), "Skill");
         assert_eq!(tool_display_name("render_image"), "RenderImage");
         assert_eq!(tool_display_name("custom_tool"), "custom_tool");
+        // Every family member has a mapping; a missing one falls through to raw snake_case and
+        // shows up beside its PascalCase siblings.
+        for (name, display) in [
+            ("agent_spawn", "AgentSpawn"),
+            ("agent_list", "AgentList"),
+            ("agent_followup", "AgentFollowup"),
+            ("agent_delete", "AgentDelete"),
+        ] {
+            assert_eq!(tool_display_name(name), display);
+        }
     }
 
     #[test]

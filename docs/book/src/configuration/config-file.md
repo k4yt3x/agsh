@@ -403,7 +403,7 @@ input_style = "none"    # or "cyan", "bold", "dim", etc.
 
 ## `[web]`
 
-Settings for the HTTP client shared by `fetch_url` and `web_search`. All keys are optional; unset fields use the defaults shown below.
+Settings for the HTTP client shared by `fetch_url` and `search_web`. All keys are optional; unset fields use the defaults shown below.
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
@@ -856,13 +856,13 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 
 | Builtin | Purpose |
 |---------|---------|
-| `list_mcp_resources` | List resources from one or every configured server. |
-| `read_mcp_resource` | Read a resource by `server` + `uri`; text inline, binary base64-encoded. |
-| `list_mcp_prompts` | List prompts from one or every configured server, including their declared arguments. |
-| `get_mcp_prompt` | Render a prompt by `server` + `name` with optional `arguments`; returns `<role>: <text>` lines. |
-| `subscribe_mcp_resource` | Subscribe to `resources/updated` notifications for a specific URI. |
-| `unsubscribe_mcp_resource` | Cancel a prior subscription. |
-| `list_mcp_resource_updates` | Print every resource that has been reported as updated since the session started. |
+| `mcp_resource_list` | List resources from one or every configured server. |
+| `mcp_resource_read` | Read a resource by `server` + `uri`; text inline, binary base64-encoded. |
+| `mcp_prompt_list` | List prompts from one or every configured server, including their declared arguments. |
+| `mcp_prompt_get` | Render a prompt by `server` + `name` with optional `arguments`; returns `<role>: <text>` lines. |
+| `mcp_resource_subscribe` | Subscribe to `resources/updated` notifications for a specific URI. |
+| `mcp_resource_unsubscribe` | Cancel a prior subscription. |
+| `mcp_resource_updates_list` | Print every resource that has been reported as updated since the session started. |
 
 ### Connection lifecycle
 
@@ -1022,7 +1022,7 @@ If `client_id` is omitted, meka attempts [dynamic client registration](https://d
 
 ## `[tools]`: built-in tool filters
 
-The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, `web_search`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
+The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, `search_web`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
 
 | Key | Purpose |
 |---|---|
@@ -1047,7 +1047,7 @@ execute_command = "write"
 Disable web access entirely in a locked-down environment:
 ```toml
 [tools]
-disabled_tools = ["web_search", "fetch_url"]
+disabled_tools = ["search_web", "fetch_url"]
 ```
 
 Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.

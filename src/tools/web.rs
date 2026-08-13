@@ -1,5 +1,5 @@
 //! Web tools: `fetch_url` (HTTP GET with HTML→markdown conversion or multimodal image return) and
-//! `web_search` (DuckDuckGo HTML scraping with CAPTCHA detection).
+//! `search_web` (DuckDuckGo HTML scraping with CAPTCHA detection).
 
 use std::sync::LazyLock;
 
@@ -20,7 +20,7 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Build the shared `reqwest::Client` for `fetch_url` + `web_search` from the resolved
+/// Build the shared `reqwest::Client` for `fetch_url` + `search_web` from the resolved
 /// [`WebClientConfig`]. Errors propagate so startup fails cleanly on a bad proxy URL or unreadable
 /// CA file, safer than silently falling back to an unconfigured client that ignores user intent.
 pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client> {
@@ -428,7 +428,7 @@ pub(super) struct WebSearchTool {
 impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "web_search".to_string(),
+            name: "search_web".to_string(),
             description: "Search DuckDuckGo and return the top results. May occasionally \
                 fail with a CAPTCHA error when DuckDuckGo rate-limits us."
                 .to_string(),
@@ -464,7 +464,7 @@ impl Tool for WebSearchTool {
         input: serde_json::Value,
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let query = require_str(&input, "query", "web_search")?;
+        let query = require_str(&input, "query", "search_web")?;
 
         let request = apply_headers(
             self.client
@@ -476,7 +476,7 @@ impl Tool for WebSearchTool {
             .send()
             .await
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "web_search".to_string(),
+                tool_name: "search_web".to_string(),
                 message: format!(
                     "search request failed: {}",
                     crate::error::format_reqwest_error(&error)
@@ -487,7 +487,7 @@ impl Tool for WebSearchTool {
             .text()
             .await
             .map_err(|error| MekaError::ToolExecution {
-                tool_name: "web_search".to_string(),
+                tool_name: "search_web".to_string(),
                 message: format!("failed to read search response: {}", error),
             })?;
 
@@ -498,7 +498,7 @@ impl Tool for WebSearchTool {
                 false,
             )),
             DdgOutcome::Captcha => Err(MekaError::ToolExecution {
-                tool_name: "web_search".to_string(),
+                tool_name: "search_web".to_string(),
                 message: "DuckDuckGo served a CAPTCHA challenge (bot detection / rate limit). \
                           Retry later."
                     .to_string(),
@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_web_search_definition_has_headers() {
+    fn test_search_web_definition_has_headers() {
         let tool = WebSearchTool {
             client: reqwest::Client::new(),
         };

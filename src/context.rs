@@ -39,16 +39,20 @@ pub type ToolCatalogueEntry = (String, String, Permission, bool);
 const TOOL_SUMMARY_MAX_CHARS: usize = 250;
 
 /// Names of the seven built-in MCP-resource helper tools (defined in `src/tools/mcp_resources.rs`).
-/// They share no common simple prefix, so they're enumerated explicitly. Used to group deferred
-/// entries into the `MCP resource tools` subsection of `[Tool discovery]`.
+/// Used to group deferred entries into the `MCP resource tools` subsection of `[Tool discovery]`.
+///
+/// Enumerated rather than matched on their shared `mcp_` prefix: a server tool is
+/// `mcp__<server>__<tool>`, so a `starts_with("mcp_")` test would swallow every MCP server's tools
+/// into this group as well. Exact membership is checked before the `mcp__` split below for the same
+/// reason.
 const MCP_RESOURCE_TOOLS: &[&str] = &[
-    "list_mcp_resources",
-    "read_mcp_resource",
-    "list_mcp_prompts",
-    "get_mcp_prompt",
-    "subscribe_mcp_resource",
-    "unsubscribe_mcp_resource",
-    "list_mcp_resource_updates",
+    "mcp_resource_list",
+    "mcp_resource_read",
+    "mcp_prompt_list",
+    "mcp_prompt_get",
+    "mcp_resource_subscribe",
+    "mcp_resource_unsubscribe",
+    "mcp_resource_updates_list",
 ];
 
 /// The mutable half of what the model knows: which tools exist, which skills are installed, and
@@ -1346,13 +1350,13 @@ pub fn build_post_compact_context(
     }
 
     // The summary above replaces the earlier turns; if a needed detail is missing from it, the full
-    // history is still searchable. `recall` is a Read-tier tool, so the nudge only applies when
-    // tools can run at all (not in `none` mode).
+    // history is still searchable. `conversation_search` is a Read-tier tool, so the nudge only
+    // applies when tools can run at all (not in `none` mode).
     if permission != Permission::None {
         parts.push(
             "[Earlier turns were summarized above. If you need a detail the summary omitted, use \
-             the `recall` tool to search the full conversation history and `recall_read` to read a \
-             specific turn.]"
+             the `conversation_search` tool to search the full conversation history and \
+             `conversation_read` to read a specific turn.]"
                 .to_string(),
         );
     }
@@ -2244,7 +2248,7 @@ mod tests {
                 true,
             ),
             (
-                "list_mcp_resources".to_string(),
+                "mcp_resource_list".to_string(),
                 "List MCP resources".to_string(),
                 Permission::Read,
                 true,

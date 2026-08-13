@@ -2,7 +2,7 @@
 
 Memory is the agent's own set of durable notes. It writes them itself, they survive compaction, and they outlive any single session.
 
-Without it, an agent's only state is its context window. When a long session compacts, detail is summarised away; `recall` can still search the message log, but only for something you remember to look for. Memory is the deliberate half: a fact the agent decided was worth keeping, in a place it will always see.
+Without it, an agent's only state is its context window. When a long session compacts, detail is summarised away; `conversation_search` can still search the message log, but only for something you remember to look for. Memory is the deliberate half: a fact the agent decided was worth keeping, in a place it will always see.
 
 ## How memory works
 

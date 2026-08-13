@@ -87,6 +87,51 @@ meka has several configuration surfaces. Keep coverage principled rather than ad
 - **Environment variables are operational-only**: config/data dirs (`MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`), permission, instructions, sandbox backend, render mode, MCP timeout, and `RUST_LOG`. For these the precedence is **CLI flags > env > `config.toml`** (the idiom is `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`).
 - **Session and display tuning stays config-only** (e.g. `context_messages`, `retention_days`, `auto_compact`, `newline_*`, `show_*`) — don't add env vars or flags for set-once preferences.
 
+## Built-in tool naming
+
+Tool names are read by the model on every turn, and `tool_catalogue` is sorted, so a name is both a
+label and a sort key. Two rules:
+
+- **A family shares a noun prefix**: `<subsystem>_<verb>`. `memory_read`, `scratchpad_write`,
+  `agent_spawn`, `schedule_cancel`. The prefix is what makes the family arrive as one block in the
+  sorted catalogue instead of scattered through it, so it is functional rather than cosmetic. The
+  prefix names what the tools act on, which is not always the module they live in: the `[background]`
+  subsystem's tools are `task_list` and `task_cancel`, because a task is what the model manipulates.
+  Where a subsystem *manages* more than one kind of object, each with its own set of operations,
+  qualify before the verb and keep the object first so operations on one object stay adjacent:
+  `mcp_resource_read`, `mcp_prompt_list`. A verb that merely mentions a noun does not make that noun
+  a managed object. `scratchpad_save_file` and `scratchpad_load_file` both act on a scratchpad entry
+  and take a path as the source or destination, so the scratchpad manages one kind of object, not
+  two; `scratchpad_file_save` would invent a `file` object with no other operations.
+- **A standalone tool reads as a natural verb phrase**: `<verb>_<object>`. `read_file`,
+  `execute_command`, `fetch_url`, `search_web`. A subsystem with exactly one operation may use the
+  bare noun: `todo`, `skill`.
+
+Two deliberate exceptions, both worth keeping:
+
+- **An industry-standard name beats internal consistency.** `read_file`, `write_file`, `edit_file`
+  and `execute_command` are what every harness calls these, and models reach for them zero-shot.
+  Renaming them to fit a pattern would trade real accuracy for tidiness. A family member that
+  deliberately mirrors one keeps the echo for the same reason: `scratchpad_save_file` reads as the
+  scratchpad's `write_file`, and its description says so.
+- **`load_tool`** stays verb-first despite acting on meka's own registry: `tool_load` reads worse,
+  and the name appears verbatim in the `[Tool discovery]` preamble the model reads every turn.
+
+Renaming a tool is a breaking change: it appears in `[tools]` / `[subagents]` config lists, in
+user-authored skills and instructions, and in the conversation history of every existing session
+(where a resumed model may reach for the old name once). Prefer getting it right when the tool is
+introduced. When a rename is right anyway, do it while the family is new rather than breaking users
+twice, add a `**Breaking:**` changelog line, and update `BUILTIN_TOOL_NAMES` (kept sorted),
+`MCP_META_TOOL_NAMES` if applicable, and `tool_display_name` in `src/render.rs`.
+
+Two traps when carrying a rename through the tree. A blanket find-and-replace will rewrite tool
+names meka does not own, because an MCP server's tool may contain a built-in's name as a substring
+(`mcp__exa__web_search_exa` is Exa's, and renaming `web_search` must leave it alone); anchor every
+substitution to a name boundary and read the hits. And a rename that reverses word order defeats
+`did_you_mean_hint`, which is edit-distance based: `spawn_agent` is ~10 edits from `agent_spawn`,
+far past the threshold, so neither a resumed model nor a stale `disabled_tools` entry gets pointed
+at the new name. Both are silent, so neither shows up in the test suite.
+
 ## CLI help text
 
 Clap `///` doc-comments must render within 80 columns when shown via `-h`. Verify by running the actual binary for every changed subcommand: source-line length doesn't account for clap's indent, value-name length, or auto-appended hints like `[possible values: ...]`. Put `Examples:` and other long-form prose after a blank `///` line so they only show in `--help`, not `-h`. When that long-form prose has multiple lines or indented blocks (e.g. an `Examples:` list), add `#[command(verbatim_doc_comment)]` to the struct/variant so clap preserves the line breaks instead of re-wrapping them into one paragraph.
