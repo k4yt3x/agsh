@@ -2071,6 +2071,7 @@ mod tests {
                 sandboxed_shell: false,
                 context_messages: None,
                 auto_compact: false,
+                compact_checkpoint: false,
                 context_window: 0,
                 user_instructions: Some("never inherited by a worker".to_string()),
                 mcp_grace: std::time::Duration::ZERO,

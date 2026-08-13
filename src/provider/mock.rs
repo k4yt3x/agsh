@@ -123,9 +123,25 @@ pub struct MockProvider {
     /// Value [`Provider::needs_effort_catalog`] returns; `true` mimics Codex wanting its effort
     /// catalog probed so a resolver test can assert a table-known model still gets probed.
     reports_effort: bool,
+    /// Messages handed to each [`Provider::complete`] call, in order.
+    ///
+    /// Recorded because some behaviour is only observable in the *request*: whether the checkpoint
+    /// turn respects `context_messages`, or emits two consecutive user turns. A test that rebuilds
+    /// the expected list itself asserts on its own arithmetic and passes even when the production
+    /// path is reverted, which is worse than no test at all.
+    completions: Mutex<Vec<Vec<Message>>>,
 }
 
 impl MockProvider {
+    /// The messages behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub fn completions(&self) -> Vec<Vec<Message>> {
+        self.completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),
@@ -162,7 +178,7 @@ impl Provider for MockProvider {
     async fn complete(
         &self,
         _system_prompt: &str,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolDefinition],
     ) -> Result<(
         Message,
@@ -170,6 +186,11 @@ impl Provider for MockProvider {
         TokenUsage,
         Vec<crate::provider::Notice>,
     )> {
+        self.completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(messages.to_vec());
+
         let events = {
             let mut rounds = self
                 .rounds

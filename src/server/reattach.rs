@@ -168,6 +168,8 @@ pub async fn ensure_session_loaded(
         cwd.clone(),
         // The HTTP API is single-root: additional workspace roots are an ACP-only surface.
         Arc::new(std::sync::RwLock::new(Vec::new())),
+        // The HTTP surface has no context gauge of its own; the session owns the counter.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await
     .map_err(|error| {

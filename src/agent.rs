@@ -166,7 +166,17 @@ use crate::{
 
 /// Trigger auto-compaction once a turn's input tokens exceed this fraction of the configured
 /// context window.
-const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
+pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
+
+/// Token budget for the verbatim tail a compaction keeps: about a tenth of the window, floored and
+/// capped so a small window still keeps something usable and a large one doesn't carry half the
+/// conversation past the boundary.
+///
+/// Shared with `context_check`, which reports it so the model can tell whether its current thread
+/// of work would survive a compaction intact.
+pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
+    (context_window / 10).clamp(4_000, 16_000)
+}
 
 /// How many times a single turn may emergency-compact-and-retry after the provider reports a
 /// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
@@ -198,6 +208,13 @@ pub struct AgentOptions {
     /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of [`Self::context_window`]. Requires `context_window >
     /// 0`.
     pub auto_compact: bool,
+    /// When true, a compaction is preceded by a *checkpoint turn*: the agent itself, holding its
+    /// real system prompt and memory index, decides what survives and writes durable notes for
+    /// anything that must outlive the window (see [`Agent::run_checkpoint_turn`]).
+    ///
+    /// Off means every compaction uses [`Agent::summarize_via_provider`], which is also the
+    /// unconditional path for [`CompactOrigin::Emergency`] regardless of this flag.
+    pub compact_checkpoint: bool,
     /// Provider's advertised context window in tokens. Drives auto-compact.
     pub context_window: u64,
     /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
@@ -213,6 +230,142 @@ pub struct AgentOptions {
     /// updates or permission changes, which is fine for one-shot sub-agents whose tool list and
     /// permission level are fixed at spawn time.
     pub system_prompt_override: Option<String>,
+}
+
+/// What set a compaction going. Selects the summarisation strategy, so it is not merely
+/// diagnostic.
+///
+/// Every origin but [`Self::Emergency`] can afford the checkpoint turn. `Emergency` cannot: it runs
+/// *after* the provider rejected the request for exceeding the window, and a checkpoint turn sends
+/// the same conversation again, so it would be refused for the same reason. That path needs a call
+/// that is deliberately smaller than the one that just failed, which is exactly what
+/// [`Agent::summarize_via_provider`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactOrigin {
+    /// The previous turn's reported usage crossed the threshold.
+    Reactive,
+    /// This turn's projected request would cross it.
+    Proactive,
+    /// A human ran `/compact`.
+    Manual,
+    /// The agent asked, via `context_compact`.
+    Requested,
+    /// The provider refused the request as too large.
+    Emergency,
+}
+
+/// One compaction, and the instructions shaping it.
+#[derive(Debug, Clone)]
+pub struct CompactRequest {
+    pub origin: CompactOrigin,
+    /// Free-text guidance on what to preserve or drop, from `/compact <instructions>` or
+    /// `context_compact`. Reaches the checkpoint turn and the fallback summariser alike, so the
+    /// channel works whichever strategy runs.
+    pub instructions: Option<String>,
+    /// Whether to keep the recent turns verbatim after the summary. `None` means "unspecified",
+    /// which resolves to `true`; `context_replace` may override it with a better-informed answer,
+    /// since only the checkpoint turn knows whether the summary already covers them.
+    pub keep_recent: Option<bool>,
+}
+
+impl CompactRequest {
+    pub fn new(origin: CompactOrigin) -> Self {
+        Self {
+            origin,
+            instructions: None,
+            keep_recent: None,
+        }
+    }
+}
+
+/// Which strategy produced the summary that replaced the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactSource {
+    /// The checkpoint turn, via `context_replace`. The intended path.
+    Checkpoint,
+    /// The checkpoint turn ran but never called `context_replace`, so its closing text was used.
+    /// `Provider::complete` has no `tool_choice`, so the call cannot be forced and this is
+    /// reachable on any backend.
+    CheckpointText,
+    /// The standalone summariser: the emergency path, a disabled checkpoint, or a checkpoint that
+    /// produced nothing usable.
+    Summarizer,
+}
+
+/// What a compaction did, for the caller to report. `/compact` is the only consumer today; the
+/// automatic triggers discard it.
+#[derive(Debug, Clone)]
+pub struct CompactOutcome {
+    pub source: CompactSource,
+    /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
+    /// self-reported, so this cannot disagree with what actually landed on disk.
+    pub memories_written: Vec<String>,
+    pub kept_recent: bool,
+}
+
+/// Provider round-trips one checkpoint turn may take before its summary is read off.
+///
+/// A bound, not a budget: the turn should need one or two (write a memory, then submit). This only
+/// stops a model that keeps finding more to save from compacting forever, and a turn that reaches
+/// it still lands on the text fallback rather than failing outright.
+const CHECKPOINT_MAX_ITERATIONS: usize = 8;
+
+/// What a checkpoint turn produced.
+struct Checkpoint {
+    summary: String,
+    source: CompactSource,
+    memories_written: Vec<String>,
+    keep_recent: Option<bool>,
+}
+
+/// The user message that turns an ordinary turn into a checkpoint.
+///
+/// A *user* message and not a system-prompt swap, which is the whole design in one detail: the
+/// agent's own prompt is what makes a checkpoint worth more than the standalone summariser, and
+/// replacing it would discard exactly the identity, instructions and memory index that make the
+/// difference.
+fn checkpoint_instruction(request: &CompactRequest) -> String {
+    let mut instruction = String::from("[Checkpoint: your context is about to be summarized]\n\n");
+    instruction.push_str(match request.origin {
+        CompactOrigin::Requested => "You asked for this compaction.\n\n",
+        CompactOrigin::Manual => "The user ran `/compact`.\n\n",
+        // Reactive and Proactive alike: the agent did not choose the moment, so say so rather than
+        // letting it read an involuntary interruption as its own decision.
+        _ => {
+            "The conversation has grown close to the context window, so this is happening now \
+              rather than when you would have chosen.\n\n"
+        }
+    });
+    instruction.push_str(
+        "Everything above is about to be replaced by a summary you write here, except for a short \
+         run of the most recent turns, which is kept as-is. This is the one moment you can act \
+         before that happens.\n\n\
+         First, save whatever must outlive this conversation. `memory_write` is for what should \
+         still be true in a future session: facts about the user, standing preferences, decisions \
+         and the reasons behind them. The scratchpad is for working material this task still \
+         needs. Prefer updating an existing memory to writing a near-duplicate.\n\n\
+         Then call `context_replace` with a summary written for yourself, in your own voice, \
+         covering: what is being worked on and why, what is done and what is left, decisions and \
+         their reasons, what the user asked for or corrected (quote any constraint on what not to \
+         do verbatim, so it keeps applying), commitments you have made but not yet delivered, and \
+         the immediate next step.\n\n\
+         The full history stays on disk and `conversation_search` reaches it, so do not try to \
+         reproduce it here. Write what someone would need to carry the work on without it.",
+    );
+    if let Some(extra) = &request.instructions {
+        instruction.push_str(&format!(
+            "\n\nInstructions for this specific compaction, which take precedence over the \
+             above:\n{}",
+            extra
+        ));
+    }
+    if request.keep_recent == Some(false) {
+        instruction.push_str(
+            "\n\nThis compaction was asked to keep nothing verbatim, so those recent turns will be \
+             discarded as well. Your summary has to cover them too.",
+        );
+    }
+    instruction
 }
 
 /// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
@@ -275,6 +428,21 @@ pub struct Agent {
     /// until the next real response corrects it. Per-`Agent`, so sub-agents (own counter) are
     /// excluded from a parent's reading.
     last_context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Estimated tokens of system prompt + tool schemas, re-stamped each turn. Shared with
+    /// `context_check`, which reports it as the floor compaction cannot get below. Never read by
+    /// the agent itself: an estimate is good enough to inform a decision but not to drive one, and
+    /// the real occupancy is already known exactly from [`Self::last_context_tokens`].
+    context_overhead_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// A compaction `context_compact` asked for, drained by `run_turn` once the tool loop is done.
+    /// `None` on registries that never register the tool (sub-agents).
+    pending_compaction: Option<crate::tools::context::PendingCompaction>,
+    /// How many times this session has been compacted, for the `[Context budget]` block.
+    ///
+    /// Held in memory and seeded lazily from the database ([`GENERATION_UNKNOWN`]) rather than
+    /// queried per turn: the count only changes when this agent compacts, so one read per process
+    /// is enough and a resumed session still reports its true generation. `context_check` goes to
+    /// the database directly, since it is on demand and can afford to be authoritative.
+    compaction_generation: std::sync::atomic::AtomicU64,
     /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by MCP tool adapters so
     /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
     /// Cleared between turns by `persist_oversized_results`.
@@ -322,6 +490,9 @@ pub struct Agent {
 /// compaction rewrites the conversation and makes earlier lengths incomparable.
 const LAST_ACCEPTED_UNKNOWN: usize = usize::MAX;
 
+/// Sentinel for [`Agent::compaction_generation`] before it has been read from the database.
+const GENERATION_UNKNOWN: u64 = u64::MAX;
+
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -355,6 +526,9 @@ impl Agent {
             cwd,
             roots,
             last_context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            context_overhead_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_compaction: None,
+            compaction_generation: std::sync::atomic::AtomicU64::new(GENERATION_UNKNOWN),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             schema_advisories_sent: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -443,6 +617,11 @@ impl Agent {
             // window as its parent and the same need to compact within it; hardcoding this off
             // meant a big delegated job simply failed once it filled the window.
             auto_compact: parent_options.auto_compact,
+            // Inherited for the same reason as `auto_compact`: a worker that compacts is about to
+            // discard its own working state, and the checkpoint is what lets it keep the part that
+            // mattered. It reaches its own memory only if the spawn granted it any, so a worker
+            // with no memory access still gets the better summary and simply has nowhere to write.
+            compact_checkpoint: parent_options.compact_checkpoint,
             context_window: parent_options.context_window,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
@@ -559,6 +738,20 @@ impl Agent {
         self.last_context_tokens = handle;
     }
 
+    /// Point this agent at the counters and request slot the `context_*` tools were registered
+    /// with, so all three read and write one set of values.
+    ///
+    /// Separate from `Agent::new` because the registry is built first, and the tools have to exist
+    /// before the agent that dispatches them.
+    pub fn attach_context_tools(
+        &mut self,
+        overhead: Arc<std::sync::atomic::AtomicU64>,
+        pending: crate::tools::context::PendingCompaction,
+    ) {
+        self.context_overhead_tokens = overhead;
+        self.pending_compaction = Some(pending);
+    }
+
     /// Shared handle to the auto-refreshing skill cache. The REPL's `/skill <name>` dispatch reads
     /// from this so the agent's system prompt and the user-invocable list never diverge.
     pub fn skills(&self) -> &Arc<SkillCache> {
@@ -651,7 +844,15 @@ impl Agent {
                     self.options.context_window
                 );
                 tracing::info!("auto-compacting conversation");
-                if let Err(error) = self.compact_session(session_id, messages).await {
+                if let Err(error) = self
+                    .compact_session(
+                        session_id,
+                        messages,
+                        CompactRequest::new(CompactOrigin::Reactive),
+                        cancellation.clone(),
+                    )
+                    .await
+                {
                     tracing::warn!("auto-compact failed: {}", error);
                 }
             }
@@ -772,6 +973,7 @@ impl Agent {
                         .options
                         .auto_compact
                         .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
+                    generation: self.compaction_generation(sid).await,
                 }),
                 &background_tasks,
                 resumed,
@@ -829,7 +1031,15 @@ impl Agent {
                     AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.options.context_window
                 );
-                if let Err(error) = self.compact_session(session_id, messages).await {
+                if let Err(error) = self
+                    .compact_session(
+                        session_id,
+                        messages,
+                        CompactRequest::new(CompactOrigin::Proactive),
+                        cancellation.clone(),
+                    )
+                    .await
+                {
                     tracing::warn!("proactive compaction failed: {}", error);
                 }
             }
@@ -898,6 +1108,28 @@ impl Agent {
                     crate::conversation::extract_loaded_tool_names_from_events(messages.events());
                 let tools: Arc<[ToolDefinition]> =
                     Arc::from(self.tool_registry.definitions_active_with_loaded(&loaded));
+
+                // The part of the window that is not conversation, for `context_check` to report.
+                // Re-stamped per round because the active tool set grows as `load_tool` pulls in
+                // deferred schemas. Written, never read by the agent: an estimate is fine for
+                // informing the model's decision, while the agent's own thresholds run off the
+                // provider's exact numbers.
+                self.context_overhead_tokens.store(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            crate::tokens::estimate_text(&tool.name)
+                                .saturating_add(crate::tokens::estimate_text(&tool.description))
+                                .saturating_add(crate::tokens::estimate_text(
+                                    &tool.parameters.to_string(),
+                                ))
+                        })
+                        .fold(
+                            crate::tokens::estimate_text(&system_prompt),
+                            |total, cost| total.saturating_add(cost),
+                        ),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 // Streaming and blocking paths converge on `(Message, StopReason, TokenUsage)`. The
                 // blocking provider call surfaces notices in its return tuple (no event channel);
@@ -971,7 +1203,14 @@ impl Agent {
                             "provider reported context overflow; compacting and retrying ({})",
                             message
                         );
-                        if let Err(compact_error) = self.compact_session(session_id, messages).await
+                        if let Err(compact_error) = self
+                            .compact_session(
+                                session_id,
+                                messages,
+                                CompactRequest::new(CompactOrigin::Emergency),
+                                cancellation.clone(),
+                            )
+                            .await
                         {
                             tracing::warn!("emergency compaction failed: {}", compact_error);
                             break 'turn Err(MekaError::ContextOverflow(message));
@@ -1013,7 +1252,15 @@ impl Agent {
                             .last_accepted_len
                             .load(std::sync::atomic::Ordering::Relaxed)
                         {
-                            LAST_ACCEPTED_UNKNOWN => suspect_floor,
+                            // Clamped like the arm below, and for a sharper reason: `suspect_floor`
+                            // is captured before this turn's message is appended and is *not* reset
+                            // by a proactive compaction, which can leave it pointing past the end
+                            // of a conversation that has just collapsed
+                            // to a summary. Compaction also
+                            // sets `last_accepted_len` to `LAST_ACCEPTED_UNKNOWN`, so this is the
+                            // arm a post-compaction rejection takes, and the slice below would
+                            // panic rather than fail the turn.
+                            LAST_ACCEPTED_UNKNOWN => suspect_floor.min(messages.len()),
                             accepted => accepted.min(messages.len()),
                         };
                         let Some(degraded) = degrade_rejected_content(
@@ -1331,6 +1578,39 @@ impl Agent {
                 }
             }
             _ => {}
+        }
+
+        // A compaction `context_compact` asked for, run now that the tool loop has drained and the
+        // turn's events are persisted.
+        //
+        // Taken in its own binding rather than inside the `if` below so the `std::sync::MutexGuard`
+        // is dropped before the `.await`; held across one it would make this future non-`Send` and
+        // break every `tokio::spawn` of a turn.
+        //
+        // Taken unconditionally, so a request left behind by a turn that then failed cannot linger
+        // and fire against a later, unrelated turn.
+        let requested_compaction = self.pending_compaction.as_ref().and_then(|pending| {
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        });
+        // Acted on only when the turn succeeded: an interrupted or failed turn has just popped or
+        // repaired its own messages, and compacting on top of that would rewrite a conversation
+        // still being put back together. The request is dropped rather than deferred; the agent can
+        // ask again on a turn that works.
+        if let Some(request) = requested_compaction
+            && result.is_ok()
+        {
+            tracing::info!("compacting at the agent's request");
+            if let Err(error) = self
+                .compact_session(session_id, messages, request, cancellation.clone())
+                .await
+            {
+                // Non-fatal, and deliberately not surfaced as a turn error: the turn itself
+                // succeeded, and its answer is what the user asked for.
+                tracing::warn!("requested compaction failed: {}", error);
+            }
         }
 
         result
@@ -2125,11 +2405,19 @@ impl Agent {
         .await
     }
 
+    /// Replace the conversation's head with a summary of it, keeping a recent tail verbatim.
+    ///
+    /// Two strategies produce the summary. The checkpoint turn ([`Self::run_checkpoint_turn`]) is
+    /// the agent summarising itself, which is what lets it persist to memory on the way past;
+    /// [`Self::summarize_via_provider`] is a standalone call that knows nothing but the transcript.
+    /// Everything after the summary text is chosen is common to both.
     pub async fn compact_session(
         &self,
         session_id: &mut Option<Uuid>,
         messages: &mut Conversation,
-    ) -> Result<()> {
+        request: CompactRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CompactOutcome> {
         let Some(sid) = *session_id else {
             return Err(MekaError::Config(
                 "no active session to compact".to_string(),
@@ -2140,74 +2428,81 @@ impl Agent {
             return Err(MekaError::Config("no messages to compact".to_string()));
         }
 
-        let system_prompt = "You are a conversation summarizer. Produce a structured summary \
-             that will replace the conversation. Write in second person \
-             (\"You were working on...\").\n\n\
-             Cover these sections (skip any that don't apply):\n\n\
-             1. **Primary task**: What the user asked for and the overall goal.\n\
-             2. **Current state**: What has been completed, what is in progress, what remains.\n\
-             3. **Key files**: Files read, created, or modified (list paths).\n\
-             4. **Key decisions**: Important choices made and their rationale.\n\
-             5. **Errors and fixes**: Problems encountered and how they were resolved.\n\
-             6. **User preferences and constraints**: Feedback or corrections about how to \
-             work. Preserve any security-relevant instructions verbatim (sensitive files or \
-             data to avoid, operations that must not be performed, secret-handling rules) so \
-             they keep applying after compaction.\n\
-             7. **All user requests**: Every distinct request the user made, in order, so none \
-             of their intent is lost.\n\
-             8. **Next step**: The immediate next action. If a task was mid-flight, quote the \
-             user's most recent request verbatim so the work does not drift.";
+        let checkpoint =
+            if request.origin == CompactOrigin::Emergency || !self.options.compact_checkpoint {
+                None
+            } else {
+                match self
+                    .run_checkpoint_turn(&request, messages.as_slice(), cancellation)
+                    .await
+                {
+                    Ok(result) => result,
+                    // Never fatal. Compaction is what keeps a session alive, and the summariser
+                    // below can always do the job, so a checkpoint that fails
+                    // costs fidelity and nothing else.
+                    Err(error) => {
+                        tracing::warn!("checkpoint turn failed, summarizing instead: {}", error);
+                        None
+                    }
+                }
+            };
+
+        let keep_recent = match &checkpoint {
+            // `context_replace` decided last and knew most, having just read the conversation, so
+            // its answer outranks the one the caller guessed at.
+            Some(checkpoint) => checkpoint
+                .keep_recent
+                .or(request.keep_recent)
+                .unwrap_or(true),
+            // A `keep_recent: false` is a bet that the checkpoint captured everything worth
+            // keeping, usually into memory. With no checkpoint the bet was never placed: nothing
+            // was saved, and the summariser works from a copy with every long block truncated.
+            // Honouring the request here would discard the verbatim tail *and* summarise the rest
+            // from an excerpt, compounding a failure into real data loss. Keep the tail instead.
+            None => true,
+        };
+
+        // A trailing user message is one nobody has answered yet. `CompactOrigin::Proactive` fires
+        // *after* `run_turn` appends this turn's prompt and *before* `base_messages` is built from
+        // the compacted conversation, so honouring `keep_recent: false` there would delete the
+        // request the model is about to answer and then answer the summary instead - the user's
+        // words gone from the window, and the reply addressed to whatever "next step" the summary
+        // happened to name.
+        //
+        // Phrased as a property of the conversation rather than a check on the origin, so a future
+        // call site cannot reintroduce it by picking a different one.
+        let keep_recent = keep_recent
+            || messages
+                .as_slice()
+                .last()
+                .is_some_and(|last| last.role == Role::User && !has_tool_results(&last.content));
 
         // Split into a head to summarize and a recent tail to keep verbatim. The tail is the
         // largest recent suffix that fits a token budget (~10% of the window, capped), snapped back
         // to a clean user boundary so tool_use/tool_result pairs are never orphaned.
-        let keep_budget = (self.options.context_window / 10).clamp(4_000, 16_000);
-        let (to_summarize, to_keep) = compute_compaction_split(messages.as_slice(), keep_budget);
+        let (to_summarize, to_keep) = if keep_recent {
+            let keep_budget = compaction_tail_budget(self.options.context_window);
+            compute_compaction_split(messages.as_slice(), keep_budget)
+        } else {
+            // Keeping nothing means the summary has to cover everything, tail included. Only the
+            // checkpoint turn is in a position to ask for this, because it read the whole
+            // conversation; the summariser is handed the head alone and would drop the rest on the
+            // floor. Honoured on the summariser path anyway by widening what it summarises.
+            (messages.as_slice().to_vec(), Vec::new())
+        };
 
-        // Clone and preprocess messages for the summarizer: strip images and truncate large text
-        // blocks to avoid overwhelming the summary call.
-        let mut compact_messages = to_summarize;
-        for message in &mut compact_messages {
-            strip_images_and_truncate(&mut message.content);
-        }
-
-        // Append a user message so the conversation ends with a user turn.
-        compact_messages.push(Message::user(
-            "Summarize this conversation into a concise context message.",
-        ));
-
-        // The override is process-wide state on a provider every agent in this process shares, so
-        // a sub-agent must not touch it: parallel `agent_spawn` calls run concurrently over one
-        // `Arc<dyn Provider>`, and one worker compacting would silently disable extended thinking
-        // for another worker's in-flight request. Skipping it costs this one summarisation call
-        // whatever thinking is configured, which is a far smaller price than a sibling's turn
-        // quietly losing a capability. Sub-agents only reach compaction at all because they now
-        // inherit `auto_compact`.
-        let scoped_override = !crate::provider::is_subagent();
-        if scoped_override {
-            self.provider.set_thinking_override(Some(false));
-        }
-        let compact_result = self
-            .provider
-            .complete(system_prompt, &compact_messages, &[])
-            .await;
-        if scoped_override {
-            self.provider.set_thinking_override(None);
-        }
-        let (summary_message, _stop_reason, _usage, notices) = compact_result?;
-        // Surface any provider notices from the summary call (e.g. image redaction on a very large
-        // compaction window). Rare in practice; emitting before we mutate the conversation keeps
-        // the user-facing order stable.
-        for notice in notices {
-            self.frontend.emit(FrontendEvent::Notice(notice)).await;
-        }
-
-        let summary_text = summary_message.text_content();
-        if summary_text.is_empty() {
-            return Err(MekaError::Provider(
-                "LLM returned an empty summary".to_string(),
-            ));
-        }
+        let (summary_text, source, memories_written) = match checkpoint {
+            Some(checkpoint) => (
+                checkpoint.summary,
+                checkpoint.source,
+                checkpoint.memories_written,
+            ),
+            None => (
+                self.summarize_via_provider(&request, to_summarize).await?,
+                CompactSource::Summarizer,
+                Vec::new(),
+            ),
+        };
 
         // Build post-compact context: environment, todos, scratchpad inventory.
         let post_context = self.build_post_compact_context(sid).await;
@@ -2288,7 +2583,387 @@ impl Agent {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        Ok(())
+        // `/compact` reports this to the user directly (`render::compaction_summary`); the four
+        // automatic paths discard the outcome, so without this line a reactive, proactive or
+        // agent-requested compaction would write durable, instance-scoped notes with no trace at
+        // any verbosity. `info!` rather than `warn!`: this is a lifecycle signpost, not a problem.
+        if !memories_written.is_empty() {
+            tracing::info!(
+                "checkpoint wrote {} memor{}: {}",
+                memories_written.len(),
+                if memories_written.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                memories_written.join(", "),
+            );
+        }
+
+        // One more generation of remove from the original turns. Left alone when the count has not
+        // been read yet, so the lazy seed below still picks up the true figure including this one.
+        let generation = self
+            .compaction_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if generation != GENERATION_UNKNOWN {
+            self.compaction_generation.store(
+                generation.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        Ok(CompactOutcome {
+            source,
+            memories_written,
+            // The outcome, not the intent: `compute_compaction_split` yields an empty tail whenever
+            // the snapped boundary lands below `MIN_SUMMARIZE`, which is routine in a session whose
+            // user turns are separated by long tool runs. Reporting the request would tell the user
+            // their recent turns survived on exactly the occasions they did not.
+            kept_recent: !to_keep.is_empty(),
+        })
+    }
+
+    /// Let the agent summarise itself, saving anything durable on the way past.
+    ///
+    /// Returns `None` when the turn produced nothing usable, which is the caller's cue to fall back
+    /// to [`Self::summarize_via_provider`].
+    ///
+    /// Three things make this better than the standalone summariser, and all three come from it
+    /// being an ordinary turn rather than a special one:
+    ///
+    /// - It runs on the agent's *real* system prompt, so its persona, user instructions and memory
+    ///   index are all present. The checkpoint instruction rides an appended user message rather
+    ///   than replacing that prompt.
+    /// - It has tools, so the moment information is about to be destroyed is finally a moment the
+    ///   agent can act in. `memory_write` is the point of the exercise.
+    /// - It sees full text (only images are stripped), so it judges what actually happened rather
+    ///   than a head-and-tail excerpt of it.
+    ///
+    /// Cancellable through the caller's token. A bare `CancellationToken::new()` here would be a
+    /// token with no signal source, which `run_turn_interruptible` documents as silently swallowing
+    /// Ctrl+C - and the checkpoint is the longest thing compaction does: up to
+    /// `CHECKPOINT_MAX_ITERATIONS` full-conversation calls, plus a prompt at `ask` permission that
+    /// blocks until a human answers.
+    async fn run_checkpoint_turn(
+        &self,
+        request: &CompactRequest,
+        messages: &[Message],
+        cancellation: CancellationToken,
+    ) -> Result<Option<Checkpoint>> {
+        let slot: crate::tools::context::SubmissionSlot = Arc::new(std::sync::Mutex::new(
+            None::<crate::tools::context::Submission>,
+        ));
+        let permission = self.shared_permission.get();
+        let tools = self
+            .tool_registry
+            .checkpoint_tools(permission, Arc::clone(&slot));
+        let definitions: Vec<ToolDefinition> = tools.iter().map(|tool| tool.definition()).collect();
+        let by_name: std::collections::HashMap<String, Arc<dyn crate::tools::Tool>> = tools
+            .into_iter()
+            .map(|tool| (tool.definition().name, tool))
+            .collect();
+
+        let system_prompt = match &self.options.system_prompt_override {
+            Some(prompt) => prompt.clone(),
+            None => context::build_system_prompt(
+                self.options.sandboxed_shell,
+                self.options.user_instructions.as_deref(),
+            ),
+        };
+
+        // Bounded by the same window a normal turn uses. Without this the checkpoint would be the
+        // largest request meka ever sends: `context_messages` defaults to 200, and the reactive
+        // trigger means "the last 200-message request already filled 80% of the window", so handing
+        // the whole log over invites an overflow whose only trace is a warn line and a silent
+        // fallback - the checkpoint quietly doing nothing in exactly the long sessions it exists
+        // for.
+        let mut checkpoint_messages: Vec<Message> =
+            truncate_messages_for_context(messages, self.options.context_messages);
+        for message in &mut checkpoint_messages {
+            strip_images(&mut message.content);
+        }
+
+        // Deliver the instruction as a trailing text block on an existing user message when the
+        // conversation already ends with one, and only otherwise as a message of its own.
+        //
+        // `CompactOrigin::Proactive` is why: it fires *after* this turn's user message is appended
+        // (`run_turn`, the `messages.append(user_message)` above the pre-send check), so blindly
+        // pushing would produce two consecutive user turns. Anthropic rejects that, and the failure
+        // is near-silent - `compact_session` catches the error and falls back to the summariser -
+        // so the proactive trigger would quietly never checkpoint at all, which is exactly the kind
+        // of degradation that never shows up in a test.
+        let instruction = checkpoint_instruction(request);
+        match checkpoint_messages.last_mut() {
+            Some(last) if last.role == Role::User => {
+                last.content.push(ContentBlock::Text { text: instruction });
+            }
+            _ => checkpoint_messages.push(Message::user(instruction)),
+        }
+
+        let mut memories_written: Vec<String> = Vec::new();
+        let mut last_text = String::new();
+
+        for _ in 0..CHECKPOINT_MAX_ITERATIONS {
+            // Checked per round as well as inside the tools, so an interrupt ends the checkpoint at
+            // the next boundary instead of running out the whole iteration budget. Returning `None`
+            // hands the caller to the summariser, which is the right outcome: the user asked for
+            // this to stop, not for the compaction to fail the turn.
+            if cancellation.is_cancelled() {
+                tracing::warn!("checkpoint turn interrupted; summarizing instead");
+                return Ok(None);
+            }
+            let (assistant_message, _stop_reason, usage, notices) = self
+                .provider
+                .complete(&system_prompt, &checkpoint_messages, &definitions)
+                .await?;
+            self.session_stats.record_untracked_tokens(&usage);
+            for notice in notices {
+                self.frontend.emit(FrontendEvent::Notice(notice)).await;
+            }
+
+            let text = assistant_message.text_content();
+            if !text.trim().is_empty() {
+                last_text = text;
+            }
+
+            let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, input } => {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if tool_uses.is_empty() {
+                break;
+            }
+
+            checkpoint_messages.push(assistant_message);
+            let mut results = Vec::with_capacity(tool_uses.len());
+            for (tool_use_id, name, input) in tool_uses {
+                let output = match by_name.get(&name) {
+                    // `Ask` means "prompt me before every action", and a checkpoint's writes are
+                    // actions: `memory_write` overwrites an existing note in place, durably and
+                    // instance-wide. Dispatching straight to `run_tool` would make the checkpoint
+                    // the one place that silently ignores the mode, and invisibly, since the loop
+                    // emits no tool-call indicators either. `Permission::allows` is no help here:
+                    // `Ask` admits everything, which is precisely why the prompt is the gate.
+                    // `context_replace` is exempt, for the same reason it bypasses the permission
+                    // filter in `checkpoint_tools`: it performs no action, it hands the summary
+                    // back to the caller. Prompting for it would ask the user to approve the
+                    // checkpoint's own conclusion, and a denial would silently discard the summary
+                    // and drop the whole compaction to the fallback summarizer.
+                    Some(tool)
+                        if name != "context_replace"
+                            && permission == crate::permission::Permission::Ask
+                            && let Some(denial) = self
+                                .request_approval(
+                                    &name,
+                                    &input,
+                                    &tool.definition().parameters,
+                                    &cancellation,
+                                )
+                                .await =>
+                    {
+                        denial
+                    }
+                    Some(tool) => {
+                        Self::run_tool(tool.as_ref(), &input, cancellation.clone(), &self.frontend)
+                            .await
+                    }
+                    // Names the constraint rather than reporting the tool as missing, which would
+                    // read as "meka has no such tool" and invite the model to look for a synonym.
+                    None => crate::tools::ToolOutput::text(
+                        format!(
+                            "'{}' is not available during a checkpoint. A checkpoint can save what \
+                             already happened, not do more work. Save what must last, then call \
+                             `context_replace`.",
+                            name
+                        ),
+                        true,
+                    ),
+                };
+                // Observed, never self-reported: a derived list cannot disagree with what landed on
+                // disk. Only successful writes count.
+                if name == "memory_write"
+                    && !output.is_error
+                    && let Some(memory) = input["name"].as_str()
+                {
+                    memories_written.push(memory.to_string());
+                }
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: bound_checkpoint_result(output.content),
+                    is_error: output.is_error,
+                });
+            }
+            checkpoint_messages.push(Message {
+                role: Role::User,
+                content: results,
+            });
+
+            if slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+            {
+                break;
+            }
+        }
+
+        let submission = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        // Tier 1: the tool was called, which is the path everything else is a hedge against.
+        if let Some(submission) = submission {
+            return Ok(Some(Checkpoint {
+                summary: submission.summary,
+                source: CompactSource::Checkpoint,
+                memories_written,
+                keep_recent: submission.keep_recent,
+            }));
+        }
+
+        // Tier 2. `Provider::complete` carries no `tool_choice` on any backend, so the call cannot
+        // be forced and a model that summarised in prose instead has still done the work.
+        let last_text = last_text.trim();
+        if !last_text.is_empty() {
+            tracing::warn!(
+                "checkpoint turn ended without calling context_replace; using its closing text"
+            );
+            return Ok(Some(Checkpoint {
+                summary: last_text.to_string(),
+                source: CompactSource::CheckpointText,
+                memories_written,
+                // Prose carries no answer to this, so take the safe direction explicitly rather
+                // than returning `None`: `None` defers to the *caller's* `keep_recent`, and a
+                // `context_compact(keep_recent: false)` would then discard the tail on the
+                // strength of a summary the model never actually submitted.
+                keep_recent: Some(true),
+            }));
+        }
+
+        tracing::warn!("checkpoint turn produced no summary; falling back to the summarizer");
+        Ok(None)
+    }
+
+    /// Summarise `to_summarize` in one standalone call that carries no tools and none of the
+    /// agent's own identity.
+    ///
+    /// This is the original compaction mechanism, kept for the two cases the checkpoint turn cannot
+    /// serve: [`CompactOrigin::Emergency`], where the provider has already refused a request this
+    /// size, and any checkpoint that fails or comes back empty. Both want the same thing, a call
+    /// deliberately smaller than the conversation, which is what stripping images and truncating
+    /// long blocks buys.
+    async fn summarize_via_provider(
+        &self,
+        request: &CompactRequest,
+        to_summarize: Vec<Message>,
+    ) -> Result<String> {
+        let mut system_prompt = String::from(
+            "You are a conversation summarizer. Produce a structured summary \
+             that will replace the conversation. Write in second person \
+             (\"You were working on...\").\n\n\
+             Cover these sections (skip any that don't apply):\n\n\
+             1. **Primary task**: What the user asked for and the overall goal.\n\
+             2. **Current state**: What has been completed, what is in progress, what remains.\n\
+             3. **Key files**: Files read, created, or modified (list paths).\n\
+             4. **Key decisions**: Important choices made and their rationale.\n\
+             5. **Errors and fixes**: Problems encountered and how they were resolved.\n\
+             6. **Standing commitments**: Anything promised to the user but not yet delivered, \
+             and any deadline or follow-up still outstanding.\n\
+             7. **User preferences and constraints**: Feedback or corrections about how to \
+             work. Preserve any security-relevant instructions verbatim (sensitive files or \
+             data to avoid, operations that must not be performed, secret-handling rules) so \
+             they keep applying after compaction.\n\
+             8. **All user requests**: Every distinct request the user made, in order, so none \
+             of their intent is lost.\n\
+             9. **Next step**: The immediate next action. If a task was mid-flight, quote the \
+             user's most recent request verbatim so the work does not drift.",
+        );
+        // Last, so it outranks the standing sections it may contradict ("drop the debugging").
+        if let Some(instructions) = &request.instructions {
+            system_prompt.push_str(&format!(
+                "\n\nThe following instructions were given for this specific compaction and take \
+                 precedence over the sections above:\n{}",
+                instructions
+            ));
+        }
+
+        // Clone and preprocess messages for the summarizer: strip images and truncate large text
+        // blocks to avoid overwhelming the summary call.
+        let mut compact_messages = to_summarize;
+        for message in &mut compact_messages {
+            strip_images_and_truncate(&mut message.content);
+        }
+
+        // Append a user message so the conversation ends with a user turn.
+        compact_messages.push(Message::user(
+            "Summarize this conversation into a concise context message.",
+        ));
+
+        // The override is process-wide state on a provider every agent in this process shares, so
+        // a sub-agent must not touch it: parallel `agent_spawn` calls run concurrently over one
+        // `Arc<dyn Provider>`, and one worker compacting would silently disable extended thinking
+        // for another worker's in-flight request. Skipping it costs this one summarisation call
+        // whatever thinking is configured, which is a far smaller price than a sibling's turn
+        // quietly losing a capability. Sub-agents only reach compaction at all because they now
+        // inherit `auto_compact`.
+        let scoped_override = !crate::provider::is_subagent();
+        if scoped_override {
+            self.provider.set_thinking_override(Some(false));
+        }
+        let compact_result = self
+            .provider
+            .complete(&system_prompt, &compact_messages, &[])
+            .await;
+        if scoped_override {
+            self.provider.set_thinking_override(None);
+        }
+        let (summary_message, _stop_reason, usage, notices) = compact_result?;
+        self.session_stats.record_untracked_tokens(&usage);
+        // Surface any provider notices from the summary call (e.g. image redaction on a very large
+        // compaction window). Rare in practice; emitting before we mutate the conversation keeps
+        // the user-facing order stable.
+        for notice in notices {
+            self.frontend.emit(FrontendEvent::Notice(notice)).await;
+        }
+
+        let summary_text = summary_message.text_content();
+        if summary_text.is_empty() {
+            return Err(MekaError::Provider(
+                "LLM returned an empty summary".to_string(),
+            ));
+        }
+        Ok(summary_text)
+    }
+
+    /// How many compactions this session has been through, reading the database once and caching.
+    ///
+    /// A read that fails reports zero rather than propagating: an unknown generation is a missing
+    /// line in a context block, not a reason to fail a turn.
+    async fn compaction_generation(&self, session_id: Uuid) -> u64 {
+        let cached = self
+            .compaction_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cached != GENERATION_UNKNOWN {
+            return cached;
+        }
+        let counted = self
+            .session_manager
+            .count_compactions(session_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::debug!("failed to count compactions: {}", error);
+                0
+            });
+        self.compaction_generation
+            .store(counted, std::sync::atomic::Ordering::Relaxed);
+        counted
     }
 
     async fn build_post_compact_context(&self, session_id: Uuid) -> String {
@@ -2628,6 +3303,77 @@ fn should_nudge_thinking_only(
 
 /// Preprocess message content blocks for the compaction summarizer:
 /// replace images with "[image]" markers and truncate large text blocks.
+/// Cap a checkpoint tool result at the size a normal turn would allow inline.
+///
+/// A normal turn spills anything larger to the scratchpad
+/// ([`crate::tools::scratchpad::persist_oversized_results`]), but that runs in `run_turn` and the
+/// checkpoint loop is not a turn. Without a bound here the checkpoint would be the one place in
+/// meka where a tool result enters the conversation at unlimited size, and it would do so at the
+/// worst possible moment: the window is near full, which is why compaction is running at all. A
+/// single `read_file` could then overflow the request, and the only visible consequence would be a
+/// warn line and a silent fall back to the summariser.
+///
+/// Truncated rather than spilled, because spilling would create scratchpad entries nobody asked
+/// for during an automatic operation, and a checkpoint needs enough of a result to decide what to
+/// write down, not all of it.
+fn bound_checkpoint_result(
+    content: Vec<crate::provider::ToolResultContent>,
+) -> Vec<crate::provider::ToolResultContent> {
+    use crate::provider::ToolResultContent;
+
+    let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+    content
+        .into_iter()
+        .map(|item| match item {
+            ToolResultContent::Text { text } if text.len() > limit => {
+                let end = text.floor_char_boundary(limit);
+                ToolResultContent::Text {
+                    text: format!(
+                        "{}\n... (truncated: this result was too large to carry into a \
+                         checkpoint)",
+                        &text[..end]
+                    ),
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Replace every image with a `[image]` placeholder, leaving all text intact.
+///
+/// The checkpoint turn's preprocessing, and deliberately only half of what
+/// [`strip_images_and_truncate`] does. Images are the expensive part of re-sending a conversation
+/// and almost never what a summary needs to carry; text is exactly what the agent has to read to
+/// judge what matters, so truncating it would hand the agent the same degraded view that made the
+/// standalone summariser worth replacing.
+fn strip_images(content: &mut [ContentBlock]) {
+    use crate::provider::ToolResultContent;
+
+    for block in content.iter_mut() {
+        match block {
+            ContentBlock::ToolResult {
+                content: tool_content,
+                ..
+            } => {
+                for item in tool_content.iter_mut() {
+                    if matches!(item, ToolResultContent::Image { .. }) {
+                        *item = ToolResultContent::Text {
+                            text: "[image]".to_string(),
+                        };
+                    }
+                }
+            }
+            ContentBlock::Image { .. } => {
+                *block = ContentBlock::Text {
+                    text: "[image]".to_string(),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
 fn strip_images_and_truncate(content: &mut [ContentBlock]) {
     use crate::provider::ToolResultContent;
 
@@ -2711,6 +3457,7 @@ mod tests {
             sandboxed_shell: false,
             context_messages: None,
             auto_compact: false,
+            compact_checkpoint: false,
             context_window: 0,
             user_instructions: None,
             mcp_grace: std::time::Duration::from_secs(0),
@@ -4963,5 +5710,727 @@ mod tests {
             &api_t2_iter2[..shared],
             "turn 2 iter1→iter2 prefix",
         );
+    }
+
+    /// Compaction strategy selection and the fallback ladder.
+    ///
+    /// The ladder exists because `Provider::complete` carries no `tool_choice` on any backend, so
+    /// `context_replace` cannot be forced. Each rung is reachable in production and so is asserted
+    /// here.
+    mod compaction {
+        use super::*;
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        fn text_round(text: &str) -> Vec<MockEvent> {
+            vec![
+                MockEvent::Text {
+                    text: text.to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        }
+
+        fn replace_round(summary: &str, keep_recent: Option<bool>) -> Vec<MockEvent> {
+            let mut input = serde_json::json!({ "summary": summary });
+            if let Some(keep_recent) = keep_recent {
+                input["keep_recent"] = serde_json::json!(keep_recent);
+            }
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "context_replace".to_string(),
+                },
+                MockEvent::ToolUseEnd { input },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ]
+        }
+
+        /// Ten alternating turns, each large enough that the whole conversation overruns the tail
+        /// budget.
+        ///
+        /// Size is load-bearing, not incidental: `compute_compaction_split` grows the tail until
+        /// the budget stops it, so a conversation that fits entirely inside the budget is
+        /// summarized whole with *no* tail at all. A small fixture would make every
+        /// `keep_recent` assertion below pass for the wrong reason.
+        fn conversation() -> Conversation {
+            let body = "x".repeat(4_000);
+            let mut conversation = Conversation::new();
+            for index in 0..5 {
+                conversation.append(Message::user(format!("user {index} {body}")));
+                conversation.append(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: format!("assistant {index} {body}"),
+                    }],
+                });
+            }
+            conversation
+        }
+
+        /// A tool that exists only to be found by name, so a checkpoint call resolves and reaches
+        /// the dispatch path under test.
+        struct StubTool {
+            name: String,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for StubTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.name.clone(),
+                    description: "stub".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    title: None,
+                    annotations: None,
+                    meta: None,
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _cancellation: CancellationToken,
+            ) -> Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput::text(
+                    "stub ran".to_string(),
+                    false,
+                ))
+            }
+        }
+
+        async fn agent_with_registry_and_checkpoint(
+            provider: Arc<dyn Provider>,
+            registry: crate::tools::ToolRegistry,
+        ) -> (Agent, SessionManager) {
+            let (mut agent, session_manager) = test_agent_with_registry(provider, registry).await;
+            agent.options.compact_checkpoint = true;
+            agent.options.context_window = 40_000;
+            (agent, session_manager)
+        }
+
+        async fn agent_with_checkpoint(
+            provider: Arc<dyn Provider>,
+            checkpoint: bool,
+        ) -> (Agent, SessionManager) {
+            let (mut agent, session_manager) = test_agent(provider).await;
+            agent.options.compact_checkpoint = checkpoint;
+            agent.options.context_window = 40_000;
+            (agent, session_manager)
+        }
+
+        async fn compact(
+            agent: &Agent,
+            session_manager: &SessionManager,
+            messages: &mut Conversation,
+            request: CompactRequest,
+        ) -> CompactOutcome {
+            let mut session_id = Some(
+                session_manager
+                    .create_session(None)
+                    .await
+                    .expect("create session"),
+            );
+            agent
+                .compact_session(&mut session_id, messages, request, CancellationToken::new())
+                .await
+                .expect("compaction")
+        }
+
+        #[tokio::test]
+        async fn checkpoint_summary_comes_from_the_tool_call() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "what I was doing",
+                None,
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+            )
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::Checkpoint);
+            assert!(outcome.kept_recent);
+            assert!(
+                messages.len() > 1,
+                "a tail should survive when keep_recent is left unset"
+            );
+            assert!(
+                messages.as_slice()[0]
+                    .text_content()
+                    .contains("what I was doing"),
+                "summary should be the tool argument, got {:?}",
+                messages.as_slice()[0].text_content()
+            );
+        }
+
+        /// Tier 2. The model summarised in prose instead of submitting, which is still the work
+        /// done, so it is used rather than thrown away for a second model call.
+        #[tokio::test]
+        async fn checkpoint_falls_back_to_its_closing_text() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![text_round(
+                "here is the state of things",
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+            )
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::CheckpointText);
+            assert!(
+                messages.as_slice()[0]
+                    .text_content()
+                    .contains("here is the state of things")
+            );
+        }
+
+        /// Tier 3. A checkpoint that produces neither a call nor text must not lose the
+        /// conversation; the standalone summariser takes the next round.
+        #[tokio::test]
+        async fn checkpoint_producing_nothing_falls_back_to_the_summarizer() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                vec![MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                }],
+                text_round("summarized separately"),
+            ]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+            )
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::Summarizer);
+            assert!(
+                messages.as_slice()[0]
+                    .text_content()
+                    .contains("summarized separately")
+            );
+        }
+
+        /// The emergency path runs after the provider refused the request for being too large. A
+        /// checkpoint turn re-sends that same conversation, so it would be refused identically; the
+        /// degraded summariser is the only call that can still get through.
+        #[tokio::test]
+        async fn emergency_skips_the_checkpoint_even_when_it_is_enabled() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![text_round(
+                "emergency summary",
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Emergency),
+            )
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::Summarizer);
+        }
+
+        #[tokio::test]
+        async fn disabled_checkpoint_uses_the_summarizer_on_every_origin() {
+            for origin in [
+                CompactOrigin::Reactive,
+                CompactOrigin::Proactive,
+                CompactOrigin::Manual,
+                CompactOrigin::Requested,
+            ] {
+                let provider =
+                    Arc::new(MockProvider::from_rounds(vec![text_round("plain summary")]));
+                let (agent, session_manager) = agent_with_checkpoint(provider, false).await;
+                let mut messages = conversation();
+
+                let outcome = compact(
+                    &agent,
+                    &session_manager,
+                    &mut messages,
+                    CompactRequest::new(origin),
+                )
+                .await;
+
+                assert_eq!(outcome.source, CompactSource::Summarizer, "{origin:?}");
+            }
+        }
+
+        /// Turning the page: the summary is all that is left, with no verbatim tail behind it.
+        #[tokio::test]
+        async fn keep_recent_false_leaves_only_the_summary() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "the whole day",
+                Some(false),
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Requested),
+            )
+            .await;
+
+            assert!(!outcome.kept_recent);
+            assert_eq!(messages.len(), 1, "only the summary should remain");
+        }
+
+        /// `context_replace` knows more than the caller did, because it ran after reading the
+        /// conversation, so its answer wins over the request's.
+        #[tokio::test]
+        async fn the_tools_tail_decision_overrides_the_requests() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "still need the recent turns",
+                Some(true),
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(&agent, &session_manager, &mut messages, CompactRequest {
+                origin: CompactOrigin::Requested,
+                instructions: None,
+                keep_recent: Some(false),
+            })
+            .await;
+
+            assert!(outcome.kept_recent);
+            assert!(messages.len() > 1);
+        }
+
+        /// The proactive trigger fires *after* this turn's user message is appended, so a
+        /// checkpoint that blindly pushed its instruction would send two consecutive user turns.
+        /// Anthropic rejects that, and `compact_session` swallows the error into the summariser
+        /// fallback, so the damage would be a permanently-degraded trigger and one warn line.
+        #[tokio::test]
+        async fn the_checkpoint_instruction_never_creates_two_user_turns() {
+            let recorded = Arc::new(MockProvider::from_rounds(vec![replace_round("ok", None)]));
+            let (agent, session_manager) =
+                agent_with_checkpoint(Arc::clone(&recorded) as Arc<dyn Provider>, true).await;
+            let mut messages = conversation();
+            // Exactly the shape the proactive path compacts in: a user message on the end.
+            messages.append(Message::user("the request that pushed us over"));
+
+            compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Proactive),
+            )
+            .await;
+
+            // What the provider was actually handed, not a local reconstruction of it: an
+            // assertion built from the test's own arithmetic passes just as happily when the
+            // production path is reverted.
+            let sent = recorded.completions();
+            let sent = sent.first().expect("the checkpoint made a call");
+            for pair in sent.windows(2) {
+                assert!(
+                    !(pair[0].role == Role::User && pair[1].role == Role::User),
+                    "two consecutive user messages would be refused by the provider"
+                );
+            }
+            let last = sent.last().expect("non-empty");
+            assert!(
+                last.text_content().contains("Checkpoint"),
+                "the instruction must be the last thing the model reads"
+            );
+            assert!(
+                last.text_content()
+                    .contains("the request that pushed us over"),
+                "merging must not drop the message it merged into"
+            );
+        }
+
+        /// `keep_recent: false` is a bet that the checkpoint saved what mattered. When the
+        /// checkpoint never ran, the bet was never placed, so discarding the tail on top of a
+        /// truncated summary would turn one failure into permanent data loss.
+        #[tokio::test]
+        async fn a_failed_checkpoint_does_not_honour_keep_recent_false() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                vec![MockEvent::Fail {
+                    message: "checkpoint call failed".to_string(),
+                }],
+                text_round("fallback summary"),
+            ]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(&agent, &session_manager, &mut messages, CompactRequest {
+                origin: CompactOrigin::Requested,
+                instructions: None,
+                keep_recent: Some(false),
+            })
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::Summarizer);
+            assert!(
+                outcome.kept_recent,
+                "a failed checkpoint must not also cost the verbatim tail"
+            );
+            assert!(messages.len() > 1);
+        }
+
+        /// The checkpoint runs when the window is nearly full, so an unbounded tool result would
+        /// overflow the very request that is supposed to shrink it. A normal turn spills oversized
+        /// results to the scratchpad; the checkpoint loop is not a turn, so it truncates instead.
+        #[test]
+        fn checkpoint_tool_results_are_bounded_like_a_normal_turn() {
+            use crate::provider::ToolResultContent;
+
+            let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+            let bounded = bound_checkpoint_result(vec![ToolResultContent::Text {
+                text: "x".repeat(limit * 3),
+            }]);
+            let ToolResultContent::Text { text } = &bounded[0] else {
+                panic!("text in, text out");
+            };
+            assert!(text.len() < limit * 2, "still {} bytes", text.len());
+            assert!(
+                text.contains("truncated"),
+                "the cut has to be visible to the model"
+            );
+
+            // Anything already within the limit is passed through untouched, so the common case
+            // costs nothing and reads exactly as the tool wrote it.
+            let small = bound_checkpoint_result(vec![ToolResultContent::Text {
+                text: "short".to_string(),
+            }]);
+            let ToolResultContent::Text { text } = &small[0] else {
+                panic!("text in, text out");
+            };
+            assert_eq!(text, "short");
+        }
+
+        /// A compaction must not inflate the turn count `/status` reports: it is work meka did on
+        /// its own, not a turn the user asked for. The matching "the tokens *are* billed" half
+        /// lives in `crate::stats`, which can observe a non-zero usage the mock cannot produce.
+        #[tokio::test]
+        async fn compaction_is_not_counted_as_a_turn() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round("done", None)]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let before = agent.session_stats.snapshot();
+            compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Manual),
+            )
+            .await;
+            let after = agent.session_stats.snapshot();
+
+            assert_eq!(
+                after.turns, before.turns,
+                "a compaction is not a turn the user asked for"
+            );
+            // The token half is asserted in `crate::stats`: `MockProvider` reports
+            // `TokenUsage::default()`, so there is nothing here for a total to grow by.
+        }
+
+        /// The proactive trigger fires after this turn's user message is appended and before
+        /// `base_messages` is rebuilt, so a `keep_recent: false` there would delete the request the
+        /// model is about to answer, and it would answer the summary instead.
+        #[tokio::test]
+        async fn a_trailing_unanswered_request_is_never_discarded() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![replace_round(
+                "everything is covered",
+                Some(false),
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+            messages.append(Message::user("refactor this to async"));
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Proactive),
+            )
+            .await;
+
+            assert!(outcome.kept_recent, "the pending request must survive");
+            let survived = messages
+                .as_slice()
+                .iter()
+                .any(|message| message.text_content().contains("refactor this to async"));
+            assert!(survived, "the user's unanswered request was compacted away");
+        }
+
+        /// Tier 2 never saw a `context_replace`, so it cannot know whether the tail is covered.
+        /// Returning `None` deferred that to the caller, letting a `context_compact(keep_recent:
+        /// false)` discard the tail on the strength of a summary the model never submitted.
+        #[tokio::test]
+        async fn the_text_fallback_keeps_the_tail_even_when_the_caller_asked_not_to() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![text_round(
+                "now let me save the last one",
+            )]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(&agent, &session_manager, &mut messages, CompactRequest {
+                origin: CompactOrigin::Requested,
+                instructions: None,
+                keep_recent: Some(false),
+            })
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::CheckpointText);
+            assert!(
+                outcome.kept_recent,
+                "a stray sentence must not become the whole context"
+            );
+            assert!(messages.len() > 1);
+        }
+
+        /// The checkpoint must never be the largest request meka sends. The reactive trigger means
+        /// the last `context_messages`-bounded request already filled the window, so handing over
+        /// the whole log would overflow and degrade to the summariser precisely in the long
+        /// sessions the checkpoint exists for.
+        #[tokio::test]
+        async fn the_checkpoint_respects_the_context_message_window() {
+            let recorded = Arc::new(MockProvider::from_rounds(vec![replace_round("ok", None)]));
+            let (mut agent, session_manager) =
+                agent_with_checkpoint(Arc::clone(&recorded) as Arc<dyn Provider>, true).await;
+            agent.options.context_messages = Some(4);
+            let mut messages = conversation();
+            let full = messages.len();
+
+            compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+            )
+            .await;
+
+            let sent = recorded.completions();
+            let sent = sent.first().expect("the checkpoint made a call");
+            assert!(
+                sent.len() < full,
+                "checkpoint sent {} of {full} messages; the window was not applied",
+                sent.len()
+            );
+            // The cap, plus the appended instruction when it lands as its own message. Snapping to
+            // a user boundary can only keep fewer, never more.
+            assert!(
+                sent.len() <= 5,
+                "checkpoint sent {} messages against a limit of 4",
+                sent.len()
+            );
+        }
+
+        /// A checkpoint runs unattended and can call `memory_write`, which overwrites a note in
+        /// place, durably and instance-wide. `ask` is the mode whose whole contract is "prompt me
+        /// before every action", and `Permission::allows` is no help: it returns true for
+        /// everything at `ask`, which is exactly why the prompt has to be the gate.
+        #[tokio::test]
+        async fn ask_permission_is_honoured_inside_the_checkpoint() {
+            use crate::frontend::{PermissionOutcome, testing::RecordingFrontend};
+
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                vec![
+                    MockEvent::ToolUseStart {
+                        id: "call-1".to_string(),
+                        name: "memory_write".to_string(),
+                    },
+                    MockEvent::ToolUseEnd {
+                        input: serde_json::json!({"name": "note", "description": "d"}),
+                    },
+                    MockEvent::MessageEnd {
+                        stop_reason: MockStopReason::ToolUse,
+                    },
+                ],
+                replace_round("summary after a refusal", None),
+            ]));
+            let frontend = Arc::new(RecordingFrontend::with_permission(PermissionOutcome::Deny));
+            // A registry that actually holds `memory_write`, so the call resolves and reaches the
+            // gate. Against an empty registry it would fall through to "not available during a
+            // checkpoint" and the test would assert nothing.
+            let registry = crate::tools::ToolRegistry::new();
+            registry
+                .register(Arc::new(StubTool {
+                    name: "memory_write".to_string(),
+                }))
+                .expect("register stub");
+            let (mut agent, session_manager) =
+                agent_with_registry_and_checkpoint(provider, registry).await;
+            agent.frontend = frontend.clone();
+            agent.shared_permission = SharedPermission::new(
+                crate::permission::Permission::Ask,
+                crate::permission::EnabledPermissions::ALL,
+            );
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Manual),
+            )
+            .await;
+
+            // The denial is a tool error, not a dead end: the checkpoint carries on and still
+            // submits, so a refused write costs a note rather than the whole summary.
+            assert_eq!(outcome.source, CompactSource::Checkpoint);
+            assert_eq!(
+                frontend.permission_requests(),
+                vec!["memory_write".to_string()],
+                "the write must be gated, and `context_replace` must not be"
+            );
+            assert!(
+                outcome.memories_written.is_empty(),
+                "a denied write must not be reported as written"
+            );
+        }
+
+        /// The checkpoint is the longest thing compaction does, and at `ask` it can block on a
+        /// human. A bare token with no signal source would make Ctrl+C a no-op, which
+        /// `run_turn_interruptible` documents as the bug to avoid.
+        #[tokio::test]
+        async fn an_interrupt_ends_the_checkpoint_and_falls_back() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![text_round("fallback")]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+            let mut session_id = Some(
+                session_manager
+                    .create_session(None)
+                    .await
+                    .expect("create session"),
+            );
+
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let outcome = agent
+                .compact_session(
+                    &mut session_id,
+                    &mut messages,
+                    CompactRequest::new(CompactOrigin::Manual),
+                    cancellation,
+                )
+                .await
+                .expect("compaction still completes");
+
+            // Interrupting the checkpoint must not fail the compaction: the user asked for the
+            // checkpoint to stop, not for the window to stay full.
+            assert_eq!(outcome.source, CompactSource::Summarizer);
+        }
+
+        /// A model that never submits must not compact forever. The cap ends the loop, and the run
+        /// still yields a summary via the text tier rather than failing.
+        #[tokio::test]
+        async fn the_iteration_cap_ends_a_checkpoint_that_never_submits() {
+            let mut rounds = Vec::new();
+            for index in 0..CHECKPOINT_MAX_ITERATIONS {
+                rounds.push(vec![
+                    MockEvent::Text {
+                        text: format!("thinking {index}"),
+                    },
+                    MockEvent::ToolUseStart {
+                        id: format!("call-{index}"),
+                        name: "memory_write".to_string(),
+                    },
+                    MockEvent::ToolUseEnd {
+                        input: serde_json::json!({"name": "note"}),
+                    },
+                    MockEvent::MessageEnd {
+                        stop_reason: MockStopReason::ToolUse,
+                    },
+                ]);
+            }
+            let provider = Arc::new(MockProvider::from_rounds(rounds));
+            let (agent, session_manager) = agent_with_checkpoint(provider, true).await;
+            let mut messages = conversation();
+
+            let outcome = compact(
+                &agent,
+                &session_manager,
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Reactive),
+            )
+            .await;
+
+            assert_eq!(outcome.source, CompactSource::CheckpointText);
+            // The registry here is empty, so `memory_write` was refused as unavailable and nothing
+            // may be claimed as written.
+            assert!(outcome.memories_written.is_empty());
+        }
+
+        /// Compaction rewrites the head of the conversation; every subsequent one summarises the
+        /// previous summary. The count is what tells the model how far from the original it is.
+        #[tokio::test]
+        async fn each_compaction_advances_the_generation() {
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                text_round("first"),
+                text_round("second"),
+            ]));
+            let (agent, session_manager) = agent_with_checkpoint(provider, false).await;
+            let mut session_id = Some(
+                session_manager
+                    .create_session(None)
+                    .await
+                    .expect("create session"),
+            );
+            let mut messages = conversation();
+
+            assert_eq!(
+                agent
+                    .compaction_generation(session_id.expect("session"))
+                    .await,
+                0
+            );
+            for expected in 1..=2 {
+                agent
+                    .compact_session(
+                        &mut session_id,
+                        &mut messages,
+                        CompactRequest::new(CompactOrigin::Manual),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("compaction");
+                assert_eq!(
+                    agent
+                        .compaction_generation(session_id.expect("session"))
+                        .await,
+                    expected
+                );
+            }
+
+            // The database is the authority the in-memory counter is seeded from, and
+            // `prune_compacted_events` has already dropped the earlier boundary from the log.
+            assert_eq!(
+                session_manager
+                    .count_compactions(session_id.expect("session"))
+                    .await
+                    .expect("count"),
+                2
+            );
+        }
     }
 }

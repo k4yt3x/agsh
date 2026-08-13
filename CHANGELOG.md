@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Compaction now runs a checkpoint turn first: the agent saves what must last and writes the summary.
+- `context_check` reports live context occupancy, headroom and compaction count on demand.
+- `context_compact` lets the agent request a compaction at the end of the current turn.
+- `keep_recent: false` compacts without keeping a verbatim tail, for turning the page cleanly.
+- `/compact <instructions>` says what to keep or drop, and reports the memories written.
+- `[session].compact_checkpoint` (default `true`) switches the checkpoint turn off.
+
+### Changed
+
+- The `[Context budget]` block reports the compaction count once a session has compacted twice.
+- The compaction summary gained a standing-commitments section, and honours per-run instructions.
+
+### Fixed
+
+- `/status` counts compaction tokens, which were spent but never reported against the session.
+- A turn that rewrote the conversation could panic on a later malformed-request repair.
+- Ctrl+C interrupts a compaction; it previously ran to completion with no way to stop it.
+
+### Security
+
+- Checkpoint tool calls honour `ask` permission; they previously ran unprompted and unrendered.
+
 ## [0.41.0] - 2026-08-13
 
 ### Changed

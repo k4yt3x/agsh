@@ -1600,6 +1600,29 @@ impl SessionManager {
             .map_err(|error| MekaError::Database(format!("failed to load messages: {}", error)))
     }
 
+    /// How many times this session has been compacted, i.e. its compaction *generation*.
+    ///
+    /// Read from the database rather than the in-memory log because
+    /// [`crate::conversation::Conversation::prune_compacted_events`] drains every event preceding
+    /// the most recent boundary, so the log in memory holds at most one no matter how many
+    /// compactions have run. Every boundary is still its own row here.
+    ///
+    /// Worth surfacing to the model: a fourth summary-of-a-summary has lost far more than a first,
+    /// and an agent that knows its generation can compensate by writing to memory more readily.
+    pub async fn count_compactions(&self, session_id: Uuid) -> Result<u64> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role = ?2",
+                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_ROLE],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| MekaError::Database(format!("failed to count compactions: {}", error)))
+    }
+
     pub async fn last_session_id(&self) -> Result<Option<Uuid>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -5023,6 +5046,7 @@ mod tests {
                 used: 42_000,
                 window: 200_000,
                 compact_at_percent: Some(80),
+                generation: 0,
             }),
             &[],
             // Likewise the resume notice: it heads the block, so it is the first thing

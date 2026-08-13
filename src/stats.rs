@@ -47,6 +47,23 @@ impl SessionStats {
             .fetch_add(usage.cache_read_input_tokens, Relaxed);
     }
 
+    /// Record tokens spent outside any turn: the compaction calls, both the checkpoint turn and
+    /// the standalone summarizer.
+    ///
+    /// Separate from [`Self::record_turn`] only because that also increments the turn counter, and
+    /// a compaction is not a turn the user asked for. The tokens are real spend and belong in the
+    /// totals regardless: compaction is the most expensive thing meka does without being asked,
+    /// and leaving it out made `/status` disagree with the provider's bill by exactly the amount
+    /// the user would most want explained.
+    pub fn record_untracked_tokens(&self, usage: &TokenUsage) {
+        self.input_tokens.fetch_add(usage.input_tokens, Relaxed);
+        self.output_tokens.fetch_add(usage.output_tokens, Relaxed);
+        self.cache_creation_input_tokens
+            .fetch_add(usage.cache_creation_input_tokens, Relaxed);
+        self.cache_read_input_tokens
+            .fetch_add(usage.cache_read_input_tokens, Relaxed);
+    }
+
     /// Record a single body-redaction event from one of the Claude providers. Called when
     /// image-block redaction fires on an oversized request body.
     pub fn record_redaction(&self, images: u64, bytes: u64) {
@@ -105,6 +122,28 @@ impl SessionStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compaction spend has to reach the totals without pretending to be a turn, so `/status`
+    /// agrees with the provider's bill while still reporting how many turns the user actually ran.
+    #[test]
+    fn untracked_tokens_add_spend_without_adding_a_turn() {
+        let stats = SessionStats::default();
+        stats.record_turn(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        });
+        stats.record_untracked_tokens(&TokenUsage {
+            input_tokens: 900,
+            output_tokens: 90,
+            ..Default::default()
+        });
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.turns, 1, "the compaction must not count as a turn");
+        assert_eq!(snapshot.input_tokens, 1_000);
+        assert_eq!(snapshot.output_tokens, 100);
+    }
 
     #[test]
     fn record_turn_accumulates() {

@@ -3,6 +3,7 @@
 //! grep, scratchpad, shell, etc.).
 
 pub(crate) mod background;
+pub(crate) mod context;
 mod conversation;
 mod file;
 mod find;
@@ -653,6 +654,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "agent_followup",
     "agent_list",
     "agent_spawn",
+    "context_check",
+    "context_compact",
     "conversation_read",
     "conversation_search",
     "edit_file",
@@ -692,6 +695,35 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "task_list",
     "todo",
     "write_file",
+];
+
+/// Tools a checkpoint turn may reach, on top of the `context_replace` it is given.
+///
+/// An allow-list, because the guiding rule is that **a checkpoint can save, but not act**: the turn
+/// exists to preserve what already happened, not to do more work while the window is about to be
+/// rewritten. So no `execute_command`, no `write_file` / `edit_file`, no `agent_spawn`, no
+/// `schedule_*`, and no MCP tools.
+///
+/// The read tools *are* here, because deciding what is worth keeping sometimes means checking
+/// something first. The two delete tools are not: deleting is not saving, and a mistaken
+/// `memory_delete` in an unattended checkpoint is unrecoverable, while the agent can still delete
+/// on any ordinary turn.
+///
+/// Kept sorted, and every entry must exist in [`BUILTIN_TOOL_NAMES`]; a test enforces both.
+pub const CHECKPOINT_TOOL_NAMES: &[&str] = &[
+    "conversation_read",
+    "conversation_search",
+    "find_files",
+    "memory_read",
+    "memory_search",
+    "memory_write",
+    "read_file",
+    "scratchpad_edit",
+    "scratchpad_list",
+    "scratchpad_read",
+    "scratchpad_write",
+    "search_contents",
+    "todo",
 ];
 
 /// Warn (never fail) on `[tools]` entries that don't match any known built-in. Mirrors MCP's
@@ -1309,6 +1341,15 @@ impl ToolRegistry {
 
         if self.background_enabled() {
             for definition in &mut definitions {
+                // `context_compact` is excluded: it does not do work, it parks a request that
+                // `run_turn` drains once the tool loop ends. Detaching it would race that drain -
+                // the spawned call may set the request after the drain has already run - leaving it
+                // to fire against the next, unrelated turn, which is the exact hazard the drain is
+                // written to prevent. It would also persist a `background_tasks` row for an
+                // operation that takes microseconds.
+                if definition.name == "context_compact" {
+                    continue;
+                }
                 offer_background(&mut definition.parameters);
             }
         }
@@ -1569,6 +1610,72 @@ impl ToolRegistry {
             inherited_names: inherited_scratchpad_names,
             cwd,
         }));
+    }
+
+    /// Register the always-on half of the `context_*` family.
+    ///
+    /// Outside [`Self::build_default`] for the same reason `agent_spawn` is: the counters these
+    /// read are owned by the `Agent`, which does not exist when the registry is built. The caller
+    /// makes them, hands them here, and points the agent at the same handles.
+    ///
+    /// `context_replace` is deliberately absent. It only exists inside a checkpoint turn, which
+    /// builds its own tool list; registering it here would offer the model a way to blank its
+    /// context during ordinary work.
+    ///
+    /// Sub-agents get neither. A worker's window is its own, but the compaction it would be asking
+    /// for happens inside a turn its parent is waiting on, and the parent owns that conversation.
+    pub fn register_context_tools(
+        &self,
+        gauge: context::ContextGauge,
+        pending: context::PendingCompaction,
+        checkpoint_enabled: bool,
+        session_manager: SessionManager,
+        shared_session_id: Arc<RwLock<Option<Uuid>>>,
+    ) {
+        self.register_builtin(Arc::new(context::ContextCheckTool {
+            gauge,
+            session_manager,
+            session_id: shared_session_id,
+        }));
+        self.register_builtin(Arc::new(context::ContextCompactTool {
+            pending,
+            checkpoint_enabled,
+        }));
+    }
+
+    /// The tools a checkpoint turn may use: this registry's, filtered to
+    /// [`CHECKPOINT_TOOL_NAMES`] and the caller's permission, plus a fresh `context_replace` bound
+    /// to `slot`.
+    ///
+    /// Read *out of* the live registry rather than built fresh, so a tool the user disabled in
+    /// `[tools]` stays disabled here, and every tool keeps the session's cwd, permission and
+    /// frontend already baked into it.
+    pub fn checkpoint_tools(
+        &self,
+        permission: Permission,
+        slot: context::SubmissionSlot,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = CHECKPOINT_TOOL_NAMES
+            .iter()
+            .filter_map(|name| self.get(name))
+            .filter(|tool| {
+                let definition = tool.definition();
+                let required = self
+                    .permission_overrides
+                    .get(&definition.name)
+                    .copied()
+                    .unwrap_or_else(|| tool.required_permission());
+                permission.allows(required)
+            })
+            .collect();
+        // Unconditional, deliberately outside the permission filter above. `context_replace` has
+        // no effect outside this process - it writes a summary into a slot the caller owns - and
+        // without it a checkpoint has no way to finish, so filtering it out would silently
+        // downgrade every compaction at `none` permission to the fallback summarizer. That leaves
+        // a `none`-permission checkpoint holding exactly one tool, which is the right shape: it
+        // can still write the summary, it just has nowhere to save anything.
+        tools.push(Arc::new(context::ContextReplaceTool { slot }));
+        tools
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2796,6 +2903,94 @@ pub(crate) mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "tool_catalogue must return sorted entries");
+    }
+
+    /// `CHECKPOINT_TOOL_NAMES` is an allow-list read at compaction time, so an entry that is not a
+    /// real built-in is silently inert rather than an error: `checkpoint_tools` just finds nothing
+    /// under that name and the checkpoint quietly loses a capability.
+    #[test]
+    fn test_checkpoint_tool_names_are_sorted_and_real() {
+        let mut sorted = CHECKPOINT_TOOL_NAMES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(CHECKPOINT_TOOL_NAMES, sorted.as_slice());
+
+        let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
+        for name in CHECKPOINT_TOOL_NAMES {
+            assert!(known.contains(name), "{name} is not a built-in tool");
+        }
+    }
+
+    /// The rule the allow-list encodes: a checkpoint can save, but not act. Asserted by name
+    /// because the list is the only thing standing between an unattended turn and the shell.
+    #[test]
+    fn test_checkpoint_tool_names_exclude_acting_and_deleting() {
+        for name in [
+            "execute_command",
+            "write_file",
+            "edit_file",
+            "agent_spawn",
+            "schedule_create",
+            "fetch_url",
+            "search_web",
+            "memory_delete",
+            "scratchpad_delete",
+        ] {
+            assert!(
+                !CHECKPOINT_TOOL_NAMES.contains(&name),
+                "{name} must not be reachable from a checkpoint turn"
+            );
+        }
+    }
+
+    /// `context_replace` is always supplied, even against a registry holding nothing else, because
+    /// a checkpoint with no way to submit could only ever fall through to the text tier.
+    #[tokio::test]
+    async fn test_checkpoint_tools_are_the_allow_list_plus_context_replace() {
+        let registry = test_registry().await;
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let names: HashSet<String> = registry
+            .checkpoint_tools(Permission::Write, slot)
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect();
+
+        assert!(names.contains("context_replace"));
+        assert!(names.contains("memory_write"));
+        assert!(names.contains("read_file"));
+        assert!(!names.contains("execute_command"));
+        assert!(!names.contains("write_file"));
+        assert!(!names.contains("agent_spawn"));
+    }
+
+    /// A tool the user switched off in `[tools]` must stay off inside a checkpoint too: the list is
+    /// read out of the live registry precisely so config keeps applying.
+    #[tokio::test]
+    async fn test_checkpoint_tools_respect_disabled_tools() {
+        let registry = build_test_registry(BuiltinToolFilter::from_config(
+            None,
+            vec!["memory_write".to_string()],
+            std::collections::HashMap::new(),
+        ))
+        .await;
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let names: HashSet<String> = registry
+            .checkpoint_tools(Permission::Write, slot)
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect();
+
+        assert!(!names.contains("memory_write"));
+        assert!(names.contains("context_replace"));
+    }
+
+    /// `context_replace` is deliberately absent from `BUILTIN_TOOL_NAMES`. Listing it would make
+    /// `disabled_tools = ["context_replace"]` a valid-looking entry that silently downgrades every
+    /// compaction to the fallback summarizer; left out, it warns as unrecognised instead.
+    #[test]
+    fn test_context_replace_is_not_a_configurable_builtin() {
+        assert!(!BUILTIN_TOOL_NAMES.contains(&"context_replace"));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"context_check"));
+        assert!(BUILTIN_TOOL_NAMES.contains(&"context_compact"));
     }
 
     #[tokio::test]

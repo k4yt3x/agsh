@@ -1277,6 +1277,12 @@ pub struct ContextBudget {
     pub window: u64,
     /// Occupancy at which auto-compaction fires, or `None` when it is switched off.
     pub compact_at_percent: Option<u64>,
+    /// How many times this session has already been compacted.
+    ///
+    /// Reported because fidelity degrades with each pass: a fourth summary is a summary of a
+    /// summary of a summary, and an agent that knows which generation it is on can compensate by
+    /// writing to memory sooner rather than trusting detail to survive another round.
+    pub generation: u64,
 }
 
 impl ContextBudget {
@@ -1298,12 +1304,26 @@ impl ContextBudget {
                 "Auto-compaction is off, so a request past the window fails the turn.".to_string()
             }
         };
+        // Only from the second compaction on. Announcing "1" would read as a warning about a
+        // conversation that has lost very little, and the post-compaction block already says a
+        // summary happened.
+        let fidelity = if self.generation >= 2 {
+            format!(
+                " This conversation has been summarised {} times, so early detail is now several \
+                 removes from what was said; write anything that must last to memory rather than \
+                 relying on it surviving another pass.",
+                self.generation
+            )
+        } else {
+            String::new()
+        };
         Some(format!(
-            "[Context budget]\nUsing ~{} of {} tokens ({}%). {}\n",
+            "[Context budget]\nUsing ~{} of {} tokens ({}%). {}{}\n",
             round_tokens(self.used),
             round_tokens(self.window),
             percent,
             policy,
+            fidelity,
         ))
     }
 }
@@ -3079,6 +3099,7 @@ mod tests {
             used: 84_000,
             window: 200_000,
             compact_at_percent: Some(80),
+            generation: 0,
         }
         .render()
         .expect("a measured turn reports");
@@ -3091,12 +3112,45 @@ mod tests {
         );
     }
 
+    /// The fidelity warning starts at the second compaction, not the first.
+    ///
+    /// After one pass the model is reading a summary of real turns, which the post-compaction block
+    /// already tells it. From the second, it is reading a summary of a summary, and that is the
+    /// point at which "write it to memory instead" becomes the right advice.
+    #[test]
+    fn test_context_budget_warns_about_fidelity_only_from_the_second_compaction() {
+        let render_at = |generation| {
+            ContextBudget {
+                used: 84_000,
+                window: 200_000,
+                compact_at_percent: Some(80),
+                generation,
+            }
+            .render()
+            .expect("a measured turn reports")
+        };
+
+        assert!(!render_at(0).contains("summarised 0 times"));
+        assert!(
+            !render_at(1).contains("has been summarised"),
+            "{}",
+            render_at(1)
+        );
+        let third = render_at(3);
+        assert!(third.contains("summarised 3 times"), "{third}");
+        assert!(
+            third.contains("write anything that must last to memory"),
+            "{third}"
+        );
+    }
+
     #[test]
     fn test_context_budget_says_when_compaction_is_off() {
         let rendered = ContextBudget {
             used: 10_000,
             window: 100_000,
             compact_at_percent: None,
+            generation: 0,
         }
         .render()
         .expect("some");
@@ -3112,6 +3166,7 @@ mod tests {
                 used: 5_000,
                 window: 0,
                 compact_at_percent: Some(80),
+                generation: 0,
             }
             .render()
             .is_none()
@@ -3121,6 +3176,7 @@ mod tests {
                 used: 0,
                 window: 200_000,
                 compact_at_percent: Some(80),
+                generation: 0,
             }
             .render()
             .is_none()
@@ -3139,6 +3195,7 @@ mod tests {
                 used: 42_000,
                 window: 200_000,
                 compact_at_percent: Some(80),
+                generation: 0,
             }),
             &[],
             false,

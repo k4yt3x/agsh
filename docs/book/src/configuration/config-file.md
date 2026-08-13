@@ -538,6 +538,21 @@ Default: `true`
 auto_compact = false
 ```
 
+### `session.compact_checkpoint`
+
+Run a *checkpoint turn* before each compaction, in which the agent saves anything that must outlive the window and writes the replacement summary itself. See [Compacting a Session](../usage/sessions.md#compacting-a-session).
+
+Costs one extra model call per compaction. Turning it off falls back to a standalone summarizer that has no tools and none of the agent's identity, so it cannot save to memory and cannot apply any judgment about what this particular agent is for.
+
+Note that this applies to automatic compactions too, so an unattended checkpoint can write memory with nobody watching.
+
+Default: `true`
+
+```toml
+[session]
+compact_checkpoint = false
+```
+
 ### `session.context_window`
 
 Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this.

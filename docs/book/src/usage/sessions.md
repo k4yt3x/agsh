@@ -142,11 +142,48 @@ The tool catalogue and skill list travel in the conversation rather than the sys
 
 ### Compacting a Session
 
-If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace older messages with a structured summary. A token-budgeted tail of the most recent messages is preserved verbatim (snapped to a clean user-turn boundary so tool calls aren't split). The structured summary captures the primary task and current state, key files and decisions, errors and fixes, every distinct user request, the next step (quoted verbatim to avoid drift), and any security-relevant constraints the user stated (preserved verbatim so they keep applying after compaction).
+When a session becomes too long, `/compact` replaces the older turns with a summary and keeps a token-budgeted tail of the most recent messages verbatim (snapped to a clean user-turn boundary so tool calls aren't split).
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. The tool catalogue, skill list, and MCP server instructions are restated in full on the next turn too, since the messages that carried them may have been summarized away. The summary message ends with a directive to resume the work directly rather than narrate the summary. Tools that the model loaded via `load_tool` before compaction stay loaded after; the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
+By default the summary is written by **the agent itself**, in a *checkpoint turn* that runs before anything is discarded. The agent gets its real system prompt, its memory index, the full conversation, and a small set of tools, and is told its context is about to be replaced. It saves whatever must outlive the window (`memory_write` for facts and decisions that should still be true in a future session, the scratchpad for working material), then calls `context_replace` with the summary.
+
+This matters because compaction is the one moment information is destroyed, and before this it was also the one moment the agent could not act. The alternative, a separate summarizer call, knows nothing about who the agent is or what it is for.
+
+A checkpoint can **save, but not act**. It reaches the memory, scratchpad, todo, conversation-history and read-only search tools, and nothing else: no shell, no file writes, no sub-agents, no scheduling, no MCP. The delete tools are excluded too, since deleting is not saving and a mistaken delete in an unattended checkpoint is unrecoverable. A tool disabled in `[tools]` stays disabled here.
+
+You can say what to keep:
+
+```text
+/compact keep the auth refactor decisions, drop the debugging
+```
+
+The confirmation reports what was written, because memories are durable and instance-scoped:
+
+```text
+Session compacted. Wrote 2 memories: deploy-pipeline-quirks, api-rate-limits.
+```
+
+Note that an *automatic* compaction runs a checkpoint too, unattended, and can write memory without anyone watching.
+
+Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented afterwards. The tool catalogue, skill list, and MCP server instructions are restated in full on the next turn, since the messages that carried them may have been summarized away. Tools loaded via `load_tool` stay loaded; the deferred-tool active set is snapshotted into the compaction boundary. If a detail was dropped, the model can `conversation_search` / `conversation_read` the full pre-compaction history, which stays on disk.
 
 Internally, compaction does not delete pre-compaction rows from the database. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only.
+
+#### When the summarizer runs instead
+
+A standalone summarizer, with no tools and none of the agent's identity, is the fallback. It runs when:
+
+- The compaction is an **emergency** one, i.e. the provider has already rejected the request for exceeding the window. A checkpoint turn re-sends that same conversation, so it would be refused identically; the summarizer strips images and truncates long blocks, which is what lets it get through.
+- The checkpoint turn **fails or produces nothing usable**.
+- `compact_checkpoint` is off.
+
+There is one rung in between: if the checkpoint turn ends without calling `context_replace` but did write a summary in prose, that text is used. `tool_choice` isn't available across meka's providers, so the call can't be forced.
+
+```toml
+[session]
+compact_checkpoint = true   # default
+```
+
+Turning it off restores the pre-0.42 behaviour and saves one model call per compaction, at the cost of the agent having no say in what survives.
 
 ### Auto-Compact
 
@@ -157,6 +194,18 @@ When `auto_compact` is enabled (default: `true`), meka automatically compacts th
 auto_compact = true
 context_window = 200000  # optional override
 ```
+
+### Agent-Initiated Compaction
+
+The agent doesn't have to wait for the threshold. `context_compact` asks for a compaction at the end of the current turn:
+
+```text
+context_compact(instructions: "the day's work is in memory now", keep_recent: false)
+```
+
+`keep_recent: false` skips the verbatim tail entirely, so the summary is all that remains. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a scheduled job at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
+
+The request is deferred to the end of the turn rather than applied where it is made, so compaction still never happens mid-tool-loop.
 
 ### What the Agent Sees
 
@@ -171,6 +220,16 @@ Using ~84k of 200k tokens (42%). The conversation is summarised automatically at
 The agent is expected to budget its own reading and to decide when a task will fit, so it needs the same number the harness uses. Without it, those are guesses. The line is suppressed when the window is unknown, and on the first turn of a session, when there is no measurement yet rather than a genuine zero.
 
 It rides the per-turn context block rather than the system prompt because it changes every turn and the system prompt is the cached prefix.
+
+From the second compaction onward the line also reports how many have happened, since a summary of a summary has lost considerably more than a first pass:
+
+```text
+This conversation has been summarised 3 times, so early detail is now several
+removes from what was said; write anything that must last to memory rather than
+relying on it surviving another pass.
+```
+
+Because that block is rendered once per turn, it does not move while the agent works. During a long tool loop, which is exactly when context moves fastest, it is stale. `context_check` reports the live figures on demand: occupancy, headroom in tokens, the fixed overhead compaction cannot reclaim, how much of the recent conversation would survive verbatim, and the compaction count. Refreshing the pushed block instead would rewrite a message the provider's prompt cache already covers, invalidating it on every iteration; a tool result appends at the tail and is cache-safe.
 
 ## Listing Sessions
 

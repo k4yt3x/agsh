@@ -72,8 +72,8 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "compact",
         aliases: &[],
-        help: "Summarize and compact the session",
-        arg_hint: "",
+        help: "Summarize and compact the session, optionally saying what to keep",
+        arg_hint: "[instructions]",
     },
     CommandSpec {
         name: "rewind",
@@ -526,7 +526,8 @@ pub enum SlashCommand {
     Clear,
     Session,
     Permission(Option<String>),
-    Compact,
+    /// `/compact [instructions]`: compact now, optionally saying what to keep or drop.
+    Compact(Option<String>),
     Export,
     /// `/fork`: copy the current session and continue in the copy. The in-memory conversation is
     /// untouched, so the branch happens at the current head and the original freezes where it was.
@@ -651,7 +652,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
         "tasks" => Some(parse_tasks_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
-        "compact" => Some(SlashCommand::Compact),
+        "compact" => Some(SlashCommand::Compact(argument)),
         "rewind" => Some(SlashCommand::Rewind(
             argument
                 .as_deref()
@@ -1082,7 +1083,7 @@ pub fn run_repl(
                         }
                         Some(
                             command @ (SlashCommand::Session
-                            | SlashCommand::Compact
+                            | SlashCommand::Compact(_)
                             | SlashCommand::Rewind(_)
                             | SlashCommand::Export
                             | SlashCommand::Fork
@@ -2253,7 +2254,9 @@ mod tests {
         let completer = empty_completer();
         assert!(completer.suggestions("/permission", 11)[0].append_whitespace);
         assert!(completer.suggestions("/cd", 3)[0].append_whitespace);
-        assert!(!completer.suggestions("/compact", 8)[0].append_whitespace);
+        // `/compact` takes optional instructions, so completing it leaves the cursor ready to type
+        // them.
+        assert!(completer.suggestions("/compact", 8)[0].append_whitespace);
         assert!(!completer.suggestions("/help", 5)[0].append_whitespace);
     }
 
@@ -2448,7 +2451,18 @@ mod tests {
     fn test_parse_slash_command_compact() {
         assert!(matches!(
             parse_slash_command("/compact"),
-            Some(SlashCommand::Compact)
+            Some(SlashCommand::Compact(None))
+        ));
+    }
+
+    /// Everything after the command is the instruction, verbatim: it is prose for a model, not a
+    /// parsed argument, so splitting or validating it would only be able to get it wrong.
+    #[test]
+    fn test_parse_slash_command_compact_with_instructions() {
+        assert!(matches!(
+            parse_slash_command("/compact keep the auth decisions, drop the debugging"),
+            Some(SlashCommand::Compact(Some(instructions)))
+                if instructions == "keep the auth decisions, drop the debugging"
         ));
     }
 
@@ -2822,7 +2836,7 @@ mod tests {
             Some(SlashCommand::Clear) => "Clear",
             Some(SlashCommand::Session) => "Session",
             Some(SlashCommand::Permission(_)) => "Permission",
-            Some(SlashCommand::Compact) => "Compact",
+            Some(SlashCommand::Compact(_)) => "Compact",
             Some(SlashCommand::Export) => "Export",
             Some(SlashCommand::Fork) => "Fork",
             Some(SlashCommand::Cd(_)) => "Cd",

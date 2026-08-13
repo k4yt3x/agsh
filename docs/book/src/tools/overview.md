@@ -30,6 +30,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`memory_search`](../usage/memory.md) | Read | Regex over the full text of every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
+| [`context_check`](./overview.md#context_check--context_compact) | Read | Measure the context window live: occupancy, headroom, compaction count |
+| [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction at the end of this turn |
 | [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
 | [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
 | [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
@@ -48,7 +50,7 @@ Tools are grouped by the minimum permission level required:
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`
 - `execute_command` (sandboxed, filesystem write-protected)
 - `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `skill`, `render_image`
-- `conversation_search`, `conversation_read`
+- `conversation_search`, `conversation_read`, `context_check`, `context_compact`
 - All scratchpad tools
 - All memory tools. Writing a memory needs only read permission: the store is meka's own, under
   its config directory, not your working tree
@@ -236,6 +238,32 @@ conversation_read({"start": 47, "count": 3})
 - `scratchpad` — save the output to a scratchpad entry instead of returning it inline.
 
 After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `conversation_search` and `conversation_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
+
+## `context_check` / `context_compact`
+
+Where `conversation_*` reads the **archive** (the full log on disk, including turns compaction removed from the window entirely), `context_*` manages the **live window**.
+
+`context_check` takes no arguments and reports the current state:
+
+```text
+Using 84000 of 200000 tokens (42%).
+Headroom: 76000 tokens before auto-compaction fires at 80%.
+Kept verbatim on compaction: about 16000 tokens of the most recent turns; everything
+older is replaced by a summary.
+Fixed overhead: about 12000 tokens of system prompt and tool schemas (estimated).
+Compaction does not reclaim this.
+Conversation: about 72000 tokens, which is the part compaction acts on.
+Compactions so far: none, so nothing has been summarized away yet.
+```
+
+This exists because the pushed `[Context budget]` block is rendered once, at the start of a turn, and so does not move while the agent works. During a long tool loop it is stale. See [What the Agent Sees](../usage/sessions.md#what-the-agent-sees).
+
+`context_compact` requests a compaction at the end of the current turn:
+
+- `instructions` — what to preserve or drop. Takes precedence over the default summary sections.
+- `keep_recent` — whether to keep the most recent turns verbatim. Default `true`; `false` starts clean.
+
+There is a third tool, `context_replace`, that exists only inside a checkpoint turn and is how the agent submits its summary. It is deliberately absent from the ordinary catalogue and from `[tools]` configuration. See [Compacting a Session](../usage/sessions.md#compacting-a-session).
 
 ## Redirecting output to the scratchpad
 

@@ -3256,7 +3256,7 @@ async fn build_session_runtime(
     let permission =
         SharedPermission::new(shared.config.permission, shared.config.enabled_permissions);
 
-    // Shared with the agent (adopted via `set_context_tokens` below) so the frontend can read the
+    // Shared with the agent (adopted inside `build_session_agent`) so the frontend can read the
     // current context occupancy when emitting `usage_update`.
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let acp_frontend = Arc::new(AcpFrontend::new(
@@ -3269,17 +3269,18 @@ async fn build_session_runtime(
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
-    let (mut agent, tool_registry) = crate::build_session_agent(
+    let (agent, tool_registry) = crate::build_session_agent(
         shared,
         permission.clone(),
         frontend,
         Arc::clone(&cwd),
         Arc::clone(&roots),
+        Arc::clone(&context_tokens),
     )
     .await?;
-    // Point the agent's context counter at the shared atomic and capture its resolved window, so
-    // the frontend's `usage_update` reports the same occupancy/size the REPL gauge would.
-    agent.set_context_tokens(Arc::clone(&context_tokens));
+    // Capture the resolved window so the frontend's `usage_update` reports the same size the REPL
+    // gauge would. The counter itself is adopted inside `build_session_agent`, which also builds
+    // `context_check` around it; setting it here instead would leave that tool on a dead atomic.
     acp_frontend.set_context_window(agent.context_usage().1);
 
     Ok(SessionRuntime {

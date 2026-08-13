@@ -720,6 +720,11 @@ pub struct SessionConfig {
     /// everything: conversation history is not reproducible, so meka never discards it unasked.
     pub retention_days: Option<u64>,
     pub auto_compact: Option<bool>,
+    /// Run a checkpoint turn before each compaction, letting the agent save what must survive and
+    /// write the summary itself. Default `true`. Costs one extra model call per compaction; off
+    /// falls back to the standalone summarizer, which has no tools and none of the agent's
+    /// identity.
+    pub compact_checkpoint: Option<bool>,
     pub context_window: Option<u64>,
     pub subagent_max_depth: Option<usize>,
 }
@@ -860,6 +865,7 @@ pub struct ResolvedConfig {
     /// `redact-thinking-2026-02-12` beta. Default false.
     pub redact_thinking: bool,
     pub auto_compact: bool,
+    pub compact_checkpoint: bool,
     pub context_window: Option<u64>,
     /// Maximum sub-agent recursion depth. `1` matches the historical "root spawns, sub-agents
     /// can't" behavior; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s
@@ -1932,6 +1938,7 @@ impl ResolvedConfig {
             effort: active.and_then(|profile| profile.effort.clone()),
             redact_thinking,
             auto_compact: file_session.auto_compact.unwrap_or(true),
+            compact_checkpoint: file_session.compact_checkpoint.unwrap_or(true),
             // Precedence: profile > `[session].context_window` > model-name inference (applied at
             // the call sites in `main.rs` via `context_window_for_model`).
             context_window: active

@@ -492,6 +492,9 @@ pub mod testing {
     pub struct RecordingFrontend {
         events: Mutex<Vec<FrontendEvent>>,
         permission_response: Mutex<PermissionOutcome>,
+        /// Tool names this frontend was asked to approve, in order. Lets a test assert that a gate
+        /// actually ran, rather than only that its outcome was survivable.
+        permission_requests: Mutex<Vec<String>>,
     }
 
     impl RecordingFrontend {
@@ -499,6 +502,7 @@ pub mod testing {
             Self {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(PermissionOutcome::Allow),
+                permission_requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -506,11 +510,16 @@ pub mod testing {
             Self {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(response),
+                permission_requests: Mutex::new(Vec::new()),
             }
         }
 
         pub fn events(&self) -> Vec<FrontendEvent> {
             self.events.lock().unwrap().clone()
+        }
+
+        pub fn permission_requests(&self) -> Vec<String> {
+            self.permission_requests.lock().unwrap().clone()
         }
     }
 
@@ -526,7 +535,11 @@ pub mod testing {
             self.events.lock().unwrap().push(event);
         }
 
-        async fn request_permission(&self, _request: PermissionRequest) -> PermissionOutcome {
+        async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
+            self.permission_requests
+                .lock()
+                .unwrap()
+                .push(request.tool_name);
             self.permission_response.lock().unwrap().clone()
         }
     }

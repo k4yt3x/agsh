@@ -462,6 +462,7 @@ pub async fn build_shared_deps(
         sandboxed_shell,
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
+        compact_checkpoint: config.compact_checkpoint,
         context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_grace: config.mcp_grace,
@@ -521,6 +522,17 @@ struct AgentAssembly<'a> {
     /// see `crate::config::SubagentsConfig`. What a worker *receives* is not configured at all,
     /// and is granted per `agent_spawn` call.
     subagents: crate::config::ResolvedSubagentsConfig,
+    /// The live context counter, supplied by the caller rather than made here because a frontend
+    /// gauge (the REPL prompt, ACP's `usage_update`) holds the same atomic and is constructed
+    /// before the agent exists. The agent writes it after every provider response; `context_check`
+    /// and the frontend read it.
+    ///
+    /// It has to arrive here rather than be set afterwards: `assemble_agent` builds the
+    /// `context_check` gauge around this handle, and `Agent::set_context_tokens` *replaces* the
+    /// agent's handle without touching the gauge. A caller that constructs its own atomic and
+    /// re-points the agent later leaves the tool reading a counter nobody writes, which reports a
+    /// serenely empty context forever.
+    context_tokens: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -613,6 +625,28 @@ async fn assemble_agent(
         )?;
     }
 
+    // The `context_*` tools and the agent must share one set of counters, so they are made here and
+    // handed to both. Registered outside `build_default` for the same reason `agent_spawn` is: what
+    // they read belongs to the agent, which does not exist yet.
+    let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pending_compaction: crate::tools::context::PendingCompaction =
+        Arc::new(std::sync::Mutex::new(None));
+    tool_registry.register_context_tools(
+        crate::tools::context::ContextGauge {
+            used: Arc::clone(&bundle.context_tokens),
+            overhead: Arc::clone(&context_overhead),
+            window: bundle.agent_options.context_window,
+            compact_at_percent: bundle
+                .agent_options
+                .auto_compact
+                .then_some(crate::agent::AUTO_COMPACT_THRESHOLD_PERCENT),
+        },
+        Arc::clone(&pending_compaction),
+        bundle.agent_options.compact_checkpoint,
+        bundle.session_manager.clone(),
+        shared_session_id.clone(),
+    );
+
     if let Some(manager) = bundle.mcp_manager {
         // Register MCP resource meta-tools upfront; they delegate through
         // `ServerEntry::require_connected` so they tolerate Pending / Failed servers until a
@@ -639,6 +673,8 @@ async fn assemble_agent(
         roots,
         Arc::clone(&bundle.session_stats),
     );
+    agent.set_context_tokens(Arc::clone(&bundle.context_tokens));
+    agent.attach_context_tools(context_overhead, pending_compaction);
     if let Some(manager) = bundle.mcp_manager {
         agent.set_mcp_manager(Arc::clone(manager));
     }
@@ -662,6 +698,7 @@ pub async fn build_session_agent(
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::agent::SharedCwd,
     roots: crate::agent::SharedRoots,
+    context_tokens: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let bundle = AgentAssembly {
         schedule: shared.config.schedule.clone(),
@@ -681,6 +718,7 @@ pub async fn build_session_agent(
         session_stats: Arc::clone(&shared.session_stats),
         subagent_max_depth: shared.config.subagent_max_depth,
         subagents: shared.config.subagents.clone(),
+        context_tokens,
     };
     assemble_agent(bundle, shared_permission, frontend, cwd, roots).await
 }
@@ -699,6 +737,7 @@ async fn create_agent_from_config(
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::agent::SharedCwd,
     session_stats: Arc<stats::SessionStats>,
+    context_tokens: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
@@ -782,6 +821,7 @@ async fn create_agent_from_config(
         sandboxed_shell,
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
+        compact_checkpoint: config.compact_checkpoint,
         context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_grace: config.mcp_grace,
@@ -808,6 +848,7 @@ async fn create_agent_from_config(
         session_stats: Arc::clone(&session_stats),
         subagent_max_depth: config.subagent_max_depth,
         subagents: config.subagents.clone(),
+        context_tokens,
     };
     let (agent, _tool_registry) = assemble_agent(
         bundle,
@@ -889,6 +930,36 @@ async fn collect_background_outcomes(
         return Vec::new();
     }
     ready
+}
+
+/// Run a `/compact` with Ctrl+C wired to a fresh cancellation token, aborting the listener
+/// afterwards.
+///
+/// Compaction is not a turn, but it makes provider calls and - at `ask` permission - can block on
+/// an approval prompt, so it needs a signal source for exactly the reason
+/// [`run_turn_interruptible`] documents: a bare token silently swallows Ctrl+C. Simpler than that
+/// function because a compaction spawns no background tasks, so there is no second-press
+/// escalation to handle.
+async fn compact_interruptible(
+    agent: &Agent,
+    session_id: &mut Option<uuid::Uuid>,
+    messages: &mut conversation::Conversation,
+    request: crate::agent::CompactRequest,
+) -> error::Result<crate::agent::CompactOutcome> {
+    let cancellation = CancellationToken::new();
+    let signal_handle = {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancellation.cancel();
+            }
+        })
+    };
+    let result = agent
+        .compact_session(session_id, messages, request, cancellation)
+        .await;
+    signal_handle.abort();
+    result
 }
 
 /// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Spawns a `ctrl_c()` listener
@@ -996,6 +1067,7 @@ async fn run_oneshot(
         oneshot_frontend,
         cwd,
         Arc::clone(&session_stats),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
 
@@ -1240,6 +1312,7 @@ async fn run_interactive(
         Arc::clone(&repl_frontend),
         Arc::clone(&cwd),
         Arc::clone(&session_stats),
+        Arc::clone(&context_tokens),
     )
     .await
     {
@@ -1494,10 +1567,21 @@ async fn run_interactive(
                         Some(id) => render::render_session_id("Current session", &id.to_string()),
                         None => eprintln!("No active session yet."),
                     },
-                    repl::SlashCommand::Compact => {
-                        match agent.compact_session(&mut session_id, &mut messages).await {
-                            Ok(()) => {
-                                render::render_hint("Session compacted.");
+                    repl::SlashCommand::Compact(instructions) => {
+                        let request = crate::agent::CompactRequest {
+                            origin: crate::agent::CompactOrigin::Manual,
+                            instructions: instructions
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                            keep_recent: None,
+                        };
+                        match compact_interruptible(&agent, &mut session_id, &mut messages, request)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                render::render_hint(&render::compaction_summary(&outcome));
                             }
                             Err(error) => {
                                 render::render_error(&error);

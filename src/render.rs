@@ -1700,8 +1700,49 @@ fn tool_display_name(name: &str) -> &str {
         "scratchpad_delete" => "ScratchpadDelete",
         "skill" => "Skill",
         "render_image" => "RenderImage",
+        "context_check" => "ContextCheck",
+        "context_compact" => "ContextCompact",
         other => other,
     }
+}
+
+/// The `/compact` confirmation line.
+///
+/// Names the memories the checkpoint turn wrote, because they are durable and instance-scoped:
+/// leaving them unmentioned would let notes accumulate invisibly under a command whose name
+/// suggests it only removes things. Derived from the calls that actually ran, never self-reported.
+pub fn compaction_summary(outcome: &crate::agent::CompactOutcome) -> String {
+    let mut line = String::from("Session compacted");
+    if !outcome.kept_recent {
+        line.push_str(" (recent turns discarded too)");
+    }
+    line.push('.');
+    match outcome.source {
+        crate::agent::CompactSource::Checkpoint => {}
+        // Both fallbacks are worth naming: the summary is not the one the agent chose to write, so
+        // a user comparing results across compactions has an explanation for the difference.
+        crate::agent::CompactSource::CheckpointText => {
+            line.push_str(
+                " The checkpoint ended without submitting, so its closing text was used.",
+            );
+        }
+        crate::agent::CompactSource::Summarizer => {
+            line.push_str(" Summarized without a checkpoint.");
+        }
+    }
+    if !outcome.memories_written.is_empty() {
+        line.push_str(&format!(
+            " Wrote {} {}: {}.",
+            outcome.memories_written.len(),
+            if outcome.memories_written.len() == 1 {
+                "memory"
+            } else {
+                "memories"
+            },
+            outcome.memories_written.join(", "),
+        ));
+    }
+    line
 }
 
 /// Whether [`builtin_primary_param`] has a rule for `name`.
@@ -1848,6 +1889,46 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The `/compact` line has to name what the checkpoint wrote, because a memory is durable and
+    /// instance-scoped: notes accumulating unmentioned under a command called "compact" is the
+    /// surprise this reporting exists to prevent.
+    #[test]
+    fn test_compaction_summary_names_memories_written() {
+        let line = super::compaction_summary(&crate::agent::CompactOutcome {
+            source: crate::agent::CompactSource::Checkpoint,
+            memories_written: vec!["deploy-quirks".to_string(), "rate-limits".to_string()],
+            kept_recent: true,
+        });
+        assert_eq!(
+            line,
+            "Session compacted. Wrote 2 memories: deploy-quirks, rate-limits."
+        );
+    }
+
+    #[test]
+    fn test_compaction_summary_is_quiet_on_the_ordinary_path() {
+        let line = super::compaction_summary(&crate::agent::CompactOutcome {
+            source: crate::agent::CompactSource::Checkpoint,
+            memories_written: Vec::new(),
+            kept_recent: true,
+        });
+        assert_eq!(line, "Session compacted.");
+    }
+
+    /// Both fallbacks are named. A user comparing one compaction against another needs to know the
+    /// summary was not the one the agent chose to write.
+    #[test]
+    fn test_compaction_summary_reports_a_fallback_and_a_discarded_tail() {
+        let line = super::compaction_summary(&crate::agent::CompactOutcome {
+            source: crate::agent::CompactSource::Summarizer,
+            memories_written: Vec::new(),
+            kept_recent: false,
+        });
+        assert_eq!(
+            line,
+            "Session compacted (recent turns discarded too). Summarized without a checkpoint."
+        );
+    }
 
     /// The indicator's label is **not** monotonically wider as the count grows: at a million
     /// `format_token_count` switches suffix, so `1000.0k tokens` (20 columns) becomes `1.0M tokens`

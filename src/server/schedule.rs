@@ -276,6 +276,8 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
         Arc::new(SilentFrontend),
         cwd,
         roots,
+        // The HTTP surface has no context gauge of its own; the session owns the counter.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
 
