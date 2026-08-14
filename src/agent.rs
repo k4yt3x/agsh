@@ -314,7 +314,6 @@ const CHECKPOINT_MAX_ITERATIONS: usize = 8;
 struct Checkpoint {
     summary: String,
     source: CompactSource,
-    memories_written: Vec<String>,
     keep_recent: Option<bool>,
 }
 
@@ -676,6 +675,32 @@ impl Agent {
         )
     }
 
+    /// The occupancy figures behind the `[Context budget]` block the turn path pushes to the model.
+    ///
+    /// `GET /v1/sessions/{id}/context` deliberately does *not* route through here: it reads the
+    /// same counters off `SessionEntry` as atomics so it can answer during a turn instead of
+    /// waiting on the runtime mutex. The two agree because they read the same handles, not because
+    /// they share this function, so a change here has to be mirrored there.
+    ///
+    /// `used` is `0` until the first provider
+    /// response of this process lands, which is also true of a session that was just re-attached
+    /// from disk: the conversation is long but nothing has measured it yet. Callers that render a
+    /// percentage must treat `0` as unmeasured rather than empty, the way
+    /// [`crate::context::ContextBudget::render`] does.
+    pub async fn context_budget(&self, session_id: Uuid) -> crate::context::ContextBudget {
+        crate::context::ContextBudget {
+            used: self
+                .last_context_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            window: self.options.context_window,
+            compact_at_percent: self
+                .options
+                .auto_compact
+                .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
+            generation: self.compaction_generation(session_id).await,
+        }
+    }
+
     /// The reasoning-effort value this agent's provider will send on the wire, or `None` when it
     /// sends none. Used by the `/status` model block.
     pub fn resolved_effort(&self) -> Option<String> {
@@ -964,17 +989,7 @@ impl Agent {
                 &cwd_snapshot,
                 &roots_snapshot,
                 &world_state,
-                Some(context::ContextBudget {
-                    used: self
-                        .last_context_tokens
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    window: self.options.context_window,
-                    compact_at_percent: self
-                        .options
-                        .auto_compact
-                        .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
-                    generation: self.compaction_generation(sid).await,
-                }),
+                Some(self.context_budget(sid).await),
                 &background_tasks,
                 resumed,
             );
@@ -2428,12 +2443,23 @@ impl Agent {
             return Err(MekaError::Config("no messages to compact".to_string()));
         }
 
+        // Owned here rather than returned by the checkpoint, because a `memory_write` is durable
+        // the moment it runs and the turn can still fail or be cancelled afterwards. Returned by
+        // value it would be dropped on exactly those paths, so the notes would be on disk --
+        // overwriting whatever was there -- while the caller was told none were written, with no
+        // trace at any verbosity. `CompactResponse::memories_written` promises the opposite.
+        let mut memories_written: Vec<String> = Vec::new();
         let checkpoint =
             if request.origin == CompactOrigin::Emergency || !self.options.compact_checkpoint {
                 None
             } else {
                 match self
-                    .run_checkpoint_turn(&request, messages.as_slice(), cancellation)
+                    .run_checkpoint_turn(
+                        &request,
+                        messages.as_slice(),
+                        cancellation,
+                        &mut memories_written,
+                    )
                     .await
                 {
                     Ok(result) => result,
@@ -2491,16 +2517,14 @@ impl Agent {
             (messages.as_slice().to_vec(), Vec::new())
         };
 
-        let (summary_text, source, memories_written) = match checkpoint {
-            Some(checkpoint) => (
-                checkpoint.summary,
-                checkpoint.source,
-                checkpoint.memories_written,
-            ),
+        // `memories_written` is deliberately *not* re-read from the checkpoint here: the
+        // accumulator above holds what actually ran, including on the fallback path where the
+        // checkpoint half-completed and then failed.
+        let (summary_text, source) = match checkpoint {
+            Some(checkpoint) => (checkpoint.summary, checkpoint.source),
             None => (
                 self.summarize_via_provider(&request, to_summarize).await?,
                 CompactSource::Summarizer,
-                Vec::new(),
             ),
         };
 
@@ -2545,13 +2569,36 @@ impl Agent {
                     "compact boundary missing after replace_for_compaction".to_string(),
                 )
             })?;
-        self.session_manager
-            .save_event(sid, &boundary_event)
-            .await?;
-        for message in &to_keep {
-            self.session_manager
-                .save_event(sid, &crate::conversation::Event::Append(message.clone()))
-                .await?;
+        let replaced_count = match &boundary_event {
+            crate::conversation::Event::CompactBoundary { replaced_count, .. } => *replaced_count,
+            // Unreachable: the `find` above matched on this variant. Zero rather than a panic
+            // because a miscounted advisory figure is not worth failing a compaction over.
+            _ => 0,
+        };
+        // One transaction, for the reason `save_events_atomic` exists: a boundary that commits and
+        // a tail write that then fails leaves the database holding a *valid* boundary with a
+        // truncated tail, which puts those messages permanently outside the materialised view of
+        // every future load. Silent, unrecoverable, and reported to the caller as a failure. The
+        // whole rewrite is one unit or none of it is.
+        let mut compaction_events = Vec::with_capacity(to_keep.len() + 1);
+        compaction_events.push(boundary_event);
+        compaction_events.extend(
+            to_keep
+                .iter()
+                .map(|message| crate::conversation::Event::Append(message.clone())),
+        );
+        if let Err(error) = self
+            .session_manager
+            .save_events_atomic(sid, compaction_events)
+            .await
+        {
+            // Put the conversation back. The rewrite above already happened in memory, so without
+            // this the caller is told the compaction failed while the model goes on reasoning from
+            // a summary the database has never heard of -- and `GET /messages`, reading the DB,
+            // still serves the full history with `revision` unmoved. `POST /rewind` guards the
+            // same hazard with `pop_repair`; this is the compaction-shaped half of it.
+            messages.pop_compaction();
+            return Err(error);
         }
 
         // Pre-boundary events are now fully superseded and already persisted; drop them so the
@@ -2612,6 +2659,26 @@ impl Agent {
             );
         }
 
+        // Announced after everything is persisted and the counters are settled, so a frontend
+        // acting on it (an SSE client refetching `/messages`) cannot observe a half-applied
+        // compaction. Every trigger reaches here, including the automatic ones nobody asked for,
+        // which are exactly the ones a remote client would otherwise never learn about.
+        // Read back rather than reusing the counter above: when the cache was `GENERATION_UNKNOWN`
+        // the bump was skipped, and only this call goes to the database for the true figure, which
+        // now includes the boundary just saved.
+        let reported_generation = self.compaction_generation(sid).await;
+        self.frontend
+            .emit(FrontendEvent::Compacted {
+                source: match source {
+                    CompactSource::Checkpoint => "checkpoint",
+                    CompactSource::CheckpointText => "checkpoint_text",
+                    CompactSource::Summarizer => "summarizer",
+                },
+                replaced_count,
+                generation: reported_generation,
+            })
+            .await;
+
         Ok(CompactOutcome {
             source,
             memories_written,
@@ -2649,6 +2716,9 @@ impl Agent {
         request: &CompactRequest,
         messages: &[Message],
         cancellation: CancellationToken,
+        // Accumulated in the caller's buffer rather than returned, so a checkpoint that writes a
+        // memory and *then* fails or is cancelled still reports what landed on disk.
+        memories_written: &mut Vec<String>,
     ) -> Result<Option<Checkpoint>> {
         let slot: crate::tools::context::SubmissionSlot = Arc::new(std::sync::Mutex::new(
             None::<crate::tools::context::Submission>,
@@ -2700,7 +2770,6 @@ impl Agent {
             _ => checkpoint_messages.push(Message::user(instruction)),
         }
 
-        let mut memories_written: Vec<String> = Vec::new();
         let mut last_text = String::new();
 
         for _ in 0..CHECKPOINT_MAX_ITERATIONS {
@@ -2823,7 +2892,6 @@ impl Agent {
             return Ok(Some(Checkpoint {
                 summary: submission.summary,
                 source: CompactSource::Checkpoint,
-                memories_written,
                 keep_recent: submission.keep_recent,
             }));
         }
@@ -2838,7 +2906,6 @@ impl Agent {
             return Ok(Some(Checkpoint {
                 summary: last_text.to_string(),
                 source: CompactSource::CheckpointText,
-                memories_written,
                 // Prose carries no answer to this, so take the safe direction explicitly rather
                 // than returning `None`: `None` defers to the *caller's* `keep_recent`, and a
                 // `context_compact(keep_recent: false)` would then discard the tail on the

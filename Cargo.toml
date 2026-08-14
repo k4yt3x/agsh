@@ -26,6 +26,7 @@ glob = "0.3"
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+hmac = "0.13.0"
 humantime-serde = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 infer = { version = "0.19", default-features = false }
@@ -80,6 +81,7 @@ windows-sys = { version = "0.61", features = [
 winres = "0.1"
 
 [dev-dependencies]
+filetime = "0.2.29"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"
 

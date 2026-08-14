@@ -3276,6 +3276,9 @@ async fn build_session_runtime(
         Arc::clone(&cwd),
         Arc::clone(&roots),
         Arc::clone(&context_tokens),
+        // ACP reports occupancy through `usage_update`, driven by the counter above; it has no
+        // separate reader for the fixed overhead, so a fresh handle is all it needs.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
     // Capture the resolved window so the frontend's `usage_update` reports the same size the REPL

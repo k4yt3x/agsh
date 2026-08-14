@@ -536,6 +536,11 @@ struct AgentAssembly<'a> {
     /// re-points the agent later leaves the tool reading a counter nobody writes, which reports a
     /// serenely empty context forever.
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Fixed overhead (system prompt + tool schemas), on the bundle for the same reason
+    /// `context_tokens` is: `assemble_agent` builds the `context_check` gauge around this exact
+    /// handle, so a caller wanting to read it later has to supply it rather than adopt one after
+    /// the fact.
+    context_overhead: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -632,13 +637,12 @@ async fn assemble_agent(
     // The `context_*` tools and the agent must share one set of counters, so they are made here and
     // handed to both. Registered outside `build_default` for the same reason `agent_spawn` is: what
     // they read belongs to the agent, which does not exist yet.
-    let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pending_compaction: crate::tools::context::PendingCompaction =
         Arc::new(std::sync::Mutex::new(None));
     tool_registry.register_context_tools(
         crate::tools::context::ContextGauge {
             used: Arc::clone(&bundle.context_tokens),
-            overhead: Arc::clone(&context_overhead),
+            overhead: Arc::clone(&bundle.context_overhead),
             window: bundle.agent_options.context_window,
             compact_at_percent: bundle
                 .agent_options
@@ -678,7 +682,7 @@ async fn assemble_agent(
         Arc::clone(&bundle.session_stats),
     );
     agent.set_context_tokens(Arc::clone(&bundle.context_tokens));
-    agent.attach_context_tools(context_overhead, pending_compaction);
+    agent.attach_context_tools(Arc::clone(&bundle.context_overhead), pending_compaction);
     if let Some(manager) = bundle.mcp_manager {
         agent.set_mcp_manager(Arc::clone(manager));
     }
@@ -703,6 +707,11 @@ pub async fn build_session_agent(
     cwd: crate::agent::SharedCwd,
     roots: crate::agent::SharedRoots,
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    // `context_overhead` is a parameter for the same reason `context_tokens` is: a caller that
+    // wants to read the gauge without holding the session's runtime mutex has to own the handle,
+    // because the `Agent` that writes it lives inside that mutex. `meka serve` retains both so
+    // `GET /v1/sessions/{id}/context` never blocks on a turn.
+    context_overhead: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let bundle = AgentAssembly {
         schedule: shared.config.schedule.clone(),
@@ -724,6 +733,7 @@ pub async fn build_session_agent(
         subagent_max_depth: shared.config.subagent_max_depth,
         subagents: shared.config.subagents.clone(),
         context_tokens,
+        context_overhead,
     };
     assemble_agent(bundle, shared_permission, frontend, cwd, roots).await
 }
@@ -855,6 +865,9 @@ async fn create_agent_from_config(
         subagent_max_depth: config.subagent_max_depth,
         subagents: config.subagents.clone(),
         context_tokens,
+        // The REPL reads occupancy through `/status`, which goes via the agent it owns outright;
+        // nothing here needs a separate handle on the overhead counter.
+        context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let (agent, _tool_registry) = assemble_agent(
         bundle,
@@ -2056,14 +2069,23 @@ async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
 /// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
 /// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
 /// session import` rejects versions it doesn't recognize.
-const SESSION_EXPORT_FORMAT_VERSION: u32 = 1;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 1;
+
+/// Sessions one `POST /v1/sessions/import` will accept.
+///
+/// Enforced by the HTTP handler, not by [`plan_import`], because the reason for it is
+/// contention-specific: `import_sessions` runs the whole tree in one closure on the process's
+/// single SQLite connection, so every other in-flight request queues behind it. A one-shot
+/// `meka session import` restoring its own backup has nothing to contend with, and refusing it
+/// would mean a tree that exported fine cannot be restored.
+pub(crate) const MAX_IMPORT_SESSIONS: usize = 1_000;
 
 /// Root envelope for a JSON session export. Carries the session plus any sub-agent descendants as a
 /// flat, root-first list; parent links are by original id and get remapped on import. Deliberately
 /// secret-free: credentials live in separate global tables and the `token_id` fingerprint is
 /// omitted.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SessionExport {
+pub(crate) struct SessionExport {
     format_version: u32,
     meka_version: String,
     exported_at: String,
@@ -2161,7 +2183,7 @@ async fn export_session(
 
 /// Assemble the structured JSON export envelope for a session and every sub-agent descendant.
 /// Per-event timestamps and cumulative stats are preserved; `token_id` is intentionally excluded.
-async fn build_session_export(
+pub(crate) async fn build_session_export(
     session_manager: &SessionManager,
     root: uuid::Uuid,
 ) -> anyhow::Result<SessionExport> {
@@ -2313,7 +2335,7 @@ async fn fork_session_command(
 /// ID. Validates the format version, mints a new ID per session, and remaps parent links (a parent
 /// pointing outside the exported set collapses to `None`, importing that session as a new top-level
 /// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
-fn plan_import(
+pub(crate) fn plan_import(
     export: SessionExport,
 ) -> anyhow::Result<(Vec<crate::session::ImportSessionRecord>, uuid::Uuid)> {
     if export.format_version != SESSION_EXPORT_FORMAT_VERSION {
@@ -2325,6 +2347,14 @@ fn plan_import(
     }
     if export.sessions.is_empty() {
         anyhow::bail!("session export contains no sessions");
+    }
+    // Caught here rather than at the `sessions.id` primary key, which would surface a caller's
+    // malformed envelope as an internal error.
+    let mut seen = std::collections::HashSet::with_capacity(export.sessions.len());
+    for session in &export.sessions {
+        if !seen.insert(session.id.clone()) {
+            anyhow::bail!("session export contains duplicate id '{}'", session.id);
+        }
     }
 
     let remap: std::collections::HashMap<String, uuid::Uuid> = export

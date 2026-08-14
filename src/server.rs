@@ -16,15 +16,17 @@ pub(crate) mod openapi;
 pub(crate) mod poisoned;
 pub(crate) mod reattach;
 pub(crate) mod schedule;
+pub(crate) mod scope;
 pub(crate) mod sse;
 pub(crate) mod state;
+pub(crate) mod webhook;
 
 use std::sync::Arc;
 
 use axum::{
     Router, middleware,
     response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
@@ -132,6 +134,22 @@ pub async fn run_serve(
         shared
     };
 
+    if !serve.webhooks.is_empty() {
+        // Named at startup because an outbound request is the one thing meka does that leaves the
+        // machine unprompted, and an operator inheriting a config should not have to read it to
+        // find out that it does.
+        tracing::info!(
+            "{} webhook endpoint(s) configured: {}",
+            serve.webhooks.len(),
+            serve
+                .webhooks
+                .iter()
+                .map(|hook| format!("{} ({})", hook.url, hook.events.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
     let auth = AuthRegistry::new(serve.tokens.clone());
     let serve_arc = Arc::new(serve);
     let idempotency_cache = idempotency::IdempotencyCache::standard();
@@ -199,8 +217,12 @@ pub async fn run_serve(
     Ok(())
 }
 
-/// Fire every session's cancellation token during a graceful drain. The SSE handler also
-/// watches `state.shutdown` directly; this ensures the *blocking* path's agent loop unwinds.
+/// Fire every session's cancellation token during a graceful drain.
+///
+/// This is now the only thing that stops an in-flight turn on shutdown. The streaming handler used
+/// to watch `state.shutdown` in its own `select!` as well, which was redundant with this and has
+/// been dropped; the turn task still reads the shutdown token, but only to label its terminal event
+/// `server_shutdown` rather than `client`.
 async fn drain_active_sessions(state: &ServerState) {
     let sessions = state.sessions.read().await;
     for entry in sessions.values() {
@@ -237,12 +259,68 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             post(handlers::turn::cancel_turn),
         )
         .route(
+            "/v1/sessions/{id}/stream",
+            get(handlers::turn::stream_turn),
+        )
+        .route(
             "/v1/sessions/{id}/responses/{request_id}",
             post(handlers::responses::respond),
         )
+        // Conversation-shaping operations. `/v1/sessions/import` is a static segment, so matchit
+        // prefers it over `/v1/sessions/{id}` regardless of registration order.
+        .route(
+            "/v1/sessions/import",
+            post(handlers::conversation::import),
+        )
+        .route(
+            "/v1/sessions/{id}/compact",
+            post(handlers::conversation::compact),
+        )
+        .route(
+            "/v1/sessions/{id}/context",
+            get(handlers::conversation::context),
+        )
+        .route(
+            "/v1/sessions/{id}/rewind",
+            post(handlers::conversation::rewind),
+        )
+        .route(
+            "/v1/sessions/{id}/export",
+            get(handlers::conversation::export),
+        )
+        .route("/v1/sessions/{id}/tasks", get(handlers::jobs::list_tasks))
+        .route(
+            "/v1/sessions/{id}/tasks/{task_id}",
+            delete(handlers::jobs::cancel_task),
+        )
+        .route("/v1/schedule", get(handlers::jobs::list_all))
+        .route("/v1/schedule/{job_id}", delete(handlers::jobs::cancel))
+        .route(
+            "/v1/sessions/{id}/schedule",
+            get(handlers::jobs::list_for_session),
+        )
+        .route(
+            "/v1/sessions/{id}/schedule",
+            post(handlers::jobs::create),
+        )
+        .route("/v1/sessions/{id}/tools", get(handlers::stores::list_tools))
         .route("/v1/info", get(handlers::info::info))
         .route("/v1/skills", get(handlers::info::skills))
+        .route("/v1/skills/{name}", get(handlers::stores::get_skill))
+        .route("/v1/skills/{name}", put(handlers::stores::put_skill))
+        .route("/v1/skills/{name}", delete(handlers::stores::delete_skill))
+        .route("/v1/memory", get(handlers::stores::list_memories))
+        .route("/v1/memory/{name}", get(handlers::stores::get_memory))
+        .route("/v1/memory/{name}", put(handlers::stores::put_memory))
+        .route("/v1/memory/{name}", delete(handlers::stores::delete_memory))
+        .route("/v1/instructions", get(handlers::stores::instructions))
+        .route("/v1/providers", get(handlers::stores::providers))
         .route("/v1/mcp", get(handlers::info::mcp))
+        .route("/v1/mcp/{name}/tools", get(handlers::info::mcp_tools))
+        .route(
+            "/v1/mcp/{name}/reconnect",
+            post(handlers::info::mcp_reconnect),
+        )
         .layer(middleware::from_fn_with_state(
             auth.clone(),
             crate::server::auth::bearer_auth,
@@ -255,6 +333,12 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
     authenticated
         .merge(public)
         .merge(openapi::router())
+        // `RequestBodyLimitLayer` is the only authority on body size. Without disabling axum's
+        // own default, the `Bytes` extractor every handler uses applies a 2 MiB cap of its own, so
+        // any `max_body_bytes` above that was silently inert -- and the 413 this middleware
+        // rewrites would name a limit that had not fired. The docs tell operators to raise
+        // `max_body_bytes` for multi-image turns, which only works now.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(middleware::from_fn_with_state(
             max_body_bytes,

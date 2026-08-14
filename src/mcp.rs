@@ -872,6 +872,100 @@ impl McpClientManager {
         }
     }
 
+    /// Heal one server on demand, picking the right repair for the state it is actually in.
+    ///
+    /// The dispatch is the whole point, because the two repairs are not interchangeable.
+    /// [`ServerEntry::reconnect`] only swaps the transport, which is all a *previously connected*
+    /// server needs: its tool adapters already exist and resolve the live peer at dispatch time.
+    /// An entry that failed its initial connect never reached `discover_and_register_tools`, so
+    /// healing it that way would leave a server reporting `connected` while exposing no tools at
+    /// all. [`connector::connect_one`] re-registers tools and is the right call there.
+    ///
+    /// A `Failed` server is already being retried in the background with exponential backoff, so
+    /// this is an impatience button rather than the only route back: it collapses the wait for an
+    /// operator who has just fixed whatever was wrong.
+    pub async fn reconnect_server(
+        self: &Arc<Self>,
+        server_name: &str,
+        connect_timeout: std::time::Duration,
+    ) -> Result<ServerState> {
+        let Some(entry) = self.servers.get(server_name).cloned() else {
+            return Err(MekaError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!("no MCP server named '{}'", server_name),
+            });
+        };
+        match entry.state().await {
+            // Refused, not honoured. `run_connector` owns every `Pending` entry and will connect
+            // it without taking `reconnect_lock` (it iterates the list captured at `prepare`
+            // time), so firing a second `connect_one` here races it: two child processes for a
+            // stdio server, and if the second attempt loses, `record_connect_failure` overwrites a
+            // working `Connected` with `Failed`. Startup ordering makes this reachable -- servers
+            // past `stdio_concurrency` sit `Pending` for seconds, which is exactly when a
+            // dashboard polling `GET /v1/mcp` would see "not connected" and try to help.
+            // Defensive, and currently unreachable: the one caller
+            // (`server::handlers::info::mcp_reconnect`) reads the state first and answers 200
+            // `pending`, because over the wire a refusal reads as "the server failed" when nothing
+            // was even attempted. Kept so a future caller cannot race `run_connector` into a
+            // second `connect_one` on the same entry -- but the handler's own check is what
+            // produces the 200, so do not delete it on the strength of this arm.
+            ServerState::Pending => {
+                return Err(MekaError::McpConnection {
+                    server_name: server_name.to_string(),
+                    message: format!(
+                        "server '{}' is still being connected; wait for it to settle",
+                        server_name
+                    ),
+                });
+            }
+            ServerState::Disabled => {
+                return Err(MekaError::McpConnection {
+                    server_name: server_name.to_string(),
+                    message: format!(
+                        "server '{}' is disabled in config; enable it with `meka mcp enable {}`",
+                        server_name, server_name
+                    ),
+                });
+            }
+            ServerState::Connected { .. } => {
+                // Reconnect is still the right call: it no-ops unless the transport has actually
+                // closed underneath a state that still says `Connected`, which is exactly the case
+                // an operator reaching for this button cannot see from outside.
+                //
+                // Bounded here rather than inside: `ServerEntry::reconnect` retries an HTTP
+                // transport up to five times with its own backoff and wraps none of it in a
+                // timeout, so an endpoint that blackholes connections would hold this request far
+                // past the budget the caller passed in.
+                tokio::time::timeout(connect_timeout, entry.reconnect())
+                    .await
+                    .map_err(|_| MekaError::McpConnection {
+                        server_name: server_name.to_string(),
+                        message: format!("reconnect did not complete within {:?}", connect_timeout),
+                    })??;
+            }
+            ServerState::Failed { .. } => {
+                // Under `reconnect_lock`, which is the same guard `retry_until_connected` takes
+                // around this call. Without it two of these requests, or one racing the background
+                // retry, drive two `connect_one`s into the same entry: two child processes for a
+                // stdio server, both writing `state`, the loser's service orphaned, and
+                // `update_server_tools` fanned out twice.
+                let _guard = entry.reconnect_lock.lock().await;
+                // Re-checked under the lock: whoever held it may have just connected this entry,
+                // in which case a second connect would replace a healthy transport for nothing.
+                if matches!(entry.state().await, ServerState::Failed { .. }) {
+                    connector::connect_one(
+                        Arc::clone(&entry),
+                        Arc::clone(self),
+                        self.mcp_default_permission,
+                        connect_timeout,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(entry.state().await)
+    }
+
     /// Connect to the named server and list EVERY advertised tool, including ones currently
     /// filtered out by `allowed_tools` / `disabled_tools` so users editing those lists can see what
     /// names are available. Permission is resolved through the normal 5-step chain with the winning

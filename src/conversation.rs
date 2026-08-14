@@ -221,6 +221,31 @@ impl Conversation {
         let _ = summary;
     }
 
+    /// Undo the most recent [`Self::replace_for_compaction`], restoring the pre-compaction view.
+    ///
+    /// The counterpart to [`Self::pop_repair`], and it exists for the same reason: compaction
+    /// rewrites the in-memory conversation *before* it persists, so a failed write would otherwise
+    /// leave the model reasoning from a summary the database has never heard of, while
+    /// `GET /messages` still serves the full history with `revision` unmoved. The caller was told
+    /// the compaction failed, so the two must agree that it did.
+    ///
+    /// Only correct while the caller still holds the lock it compacted under, and before
+    /// [`Self::prune_compacted_events`] has dropped the superseded events: this truncates back to
+    /// the boundary on the assumption that everything from there on is what the compaction just
+    /// pushed. Returns `false` when there is no boundary to undo.
+    pub fn pop_compaction(&mut self) -> bool {
+        let Some(boundary) = self
+            .events
+            .iter()
+            .rposition(|event| matches!(event, Event::CompactBoundary { .. }))
+        else {
+            return false;
+        };
+        self.events.truncate(boundary);
+        self.rebuild_materialized();
+        true
+    }
+
     /// Replace the trailing `replaced_count` materialized messages with `messages`, appending one
     /// [`Event::Repair`]. Returns that event so the caller can persist it; the log is only ever
     /// appended to, so the originals stay in memory and on disk for `meka session export`.
@@ -815,6 +840,69 @@ mod tests {
         assert_eq!(before, after);
         // And the event log is clean, not carrying a repair that cancels another repair.
         assert_eq!(log.events().len(), 3);
+    }
+
+    /// The rollback compaction takes when its write fails. Getting this wrong is silent: the model
+    /// would keep reasoning from a summary the database never accepted.
+    #[test]
+    fn test_pop_compaction_restores_the_pre_compaction_view() {
+        let mut log = Conversation::new();
+        log.append(Message::user("one"));
+        log.append(Message::assistant_text("two"));
+        log.append(Message::user("three"));
+        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        let events_before = log.events().len();
+
+        log.replace_for_compaction(
+            Message::user("summary"),
+            vec![Message::user("three")],
+            HashSet::new(),
+        );
+        assert_ne!(log.len(), before.len(), "compaction must have rewritten it");
+
+        assert!(log.pop_compaction());
+        assert_eq!(
+            before,
+            log.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            log.events().len(),
+            events_before,
+            "the boundary and its re-appended tail must both be gone"
+        );
+    }
+
+    /// The second compaction of a session must roll back to the *first* boundary's view, not past
+    /// it. `rposition` picking the wrong boundary would resurrect turns the earlier compaction
+    /// legitimately retired.
+    #[test]
+    fn test_pop_compaction_on_an_already_compacted_session() {
+        let mut log = Conversation::new();
+        log.append(Message::user("old"));
+        log.append(Message::assistant_text("older"));
+        log.replace_for_compaction(Message::user("summary one"), Vec::new(), HashSet::new());
+        log.append(Message::user("after the first summary"));
+        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+
+        log.replace_for_compaction(
+            Message::user("summary two"),
+            vec![Message::user("kept")],
+            HashSet::new(),
+        );
+        assert!(log.pop_compaction());
+        assert_eq!(
+            before,
+            log.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>(),
+            "rollback must land on the first boundary's view"
+        );
+    }
+
+    #[test]
+    fn test_pop_compaction_without_a_boundary_is_a_no_op() {
+        let mut log = Conversation::new();
+        log.append(Message::user("only"));
+        assert!(!log.pop_compaction());
+        assert_eq!(log.len(), 1);
     }
 
     #[test]

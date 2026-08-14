@@ -366,6 +366,11 @@ impl Tool for SkillWriteTool {
             tool_name: "skill_write".to_string(),
             message,
         })?;
+        // The write is only visible to the next `current()` if the cache notices it, and a
+        // `(mtime, size)` snapshot cannot see a same-tick rewrite of the same length. That is
+        // not hypothetical here: the dispatcher flow writes a skill and hands it to
+        // `agent_spawn(skill:)` milliseconds later, in the same turn.
+        self.skills.invalidate().await;
 
         tracing::info!("saved skill to {}", path.display());
         Ok(ToolOutput::text(
@@ -464,6 +469,8 @@ impl Tool for SkillDeleteTool {
                 tool_name: "skill_delete".to_string(),
                 message,
             })?;
+        // See the note in `skill_write`: the index must not keep listing a skill that is gone.
+        self.skills.invalidate().await;
 
         tracing::info!("deleted skill {}", dir.display());
         Ok(ToolOutput::text(

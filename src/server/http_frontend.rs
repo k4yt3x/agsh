@@ -50,11 +50,13 @@ const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// the channel.
 pub struct HttpFrontend {
     recorder: Mutex<Recorder>,
-    /// Per-turn streaming channel. Set by the turn handler before calling `run_turn` (via
-    /// [`Self::install_stream`]) and cleared after (via [`Self::clear_stream`]). When `Some`,
-    /// every emitted event is translated into an `SseEvent` and published on the broadcast.
-    /// `None` means blocking-mode: events go only to the recorder.
-    stream: Mutex<Option<StreamSink>>,
+    /// The current (or most recent) turn's SSE stream. Set by the turn handler before calling
+    /// `run_turn` (via [`Self::install_stream`]) and ended after (via [`Self::end_stream`]). While
+    /// its sender is live, every emitted event is translated into an `SseEvent`, published on the
+    /// broadcast, and recorded in the replay ring. `None` means no streaming turn has run on this
+    /// session yet; a `Some` whose sender is `None` means the last one has finished and only its
+    /// tail is being held for a late reconnect.
+    stream: Mutex<Option<TurnStream>>,
     /// In-memory parking lot for mid-turn pause primitives (`request_permission` and
     /// `handle_elicitation`). The HTTP turn handler emits an SSE event with the `request_id`,
     /// then `POST /v1/sessions/{id}/responses/{request_id}` pushes the resolution through the
@@ -71,6 +73,15 @@ pub struct HttpFrontend {
     /// Symmetric `deny_always` set. Tools the client has chosen "always deny" for short-circuit
     /// to `Deny`.
     never_allowed: Mutex<HashSet<String>>,
+    /// Event ids, monotonic across the *session* rather than restarting per turn.
+    ///
+    /// Per-turn ids look tidier and make `Last-Event-ID` unusable: a client holding id 5 from one
+    /// turn and reconnecting during the next cannot be told apart from one that is up to date,
+    /// because the new turn issues id 5 too. Filtering against it then discards the entire backlog
+    /// as already-delivered. Session-scoped ids make a stale position sort strictly below
+    /// everything the current turn emitted, so the ordinary `event.id > last` filter is correct
+    /// without needing to know which turn the id came from.
+    ids: Arc<EventIdGenerator>,
 }
 
 /// Per-session capabilities flags declared at create time. Defaults match the bot/bridge use
@@ -112,10 +123,80 @@ impl Default for SessionCapabilities {
     }
 }
 
-#[derive(Clone)]
-struct StreamSink {
-    sender: broadcast::Sender<SseEvent>,
+/// One turn's SSE event stream, retained past the end of the turn so a client that reconnects can
+/// still collect the tail.
+///
+/// The ring is what `Last-Event-ID` resumption is built on. Everything else on this stream is
+/// additive, so a client that misses an event still holds a prefix of the truth and could limp
+/// along; the *terminal* event is not, because a client that never receives one waits forever. So
+/// the terminal is recorded here too, by the spawned turn task rather than by the response stream.
+/// That distinction is load-bearing: in the case re-attach exists for, the client's connection has
+/// dropped and axum has already discarded the response stream, so anything only that future
+/// computes is computed for nobody.
+pub struct TurnStream {
+    turn_id: uuid::Uuid,
     ids: Arc<EventIdGenerator>,
+    /// `None` once the turn has ended. Dropping the sender is what closes every live subscriber,
+    /// and is also how [`HttpFrontend::is_streaming`] reports the turn as over while the ring is
+    /// still held for late reconnects.
+    sender: Option<broadcast::Sender<SseEvent>>,
+    /// Recent events, oldest first, capped at `replay_capacity`.
+    replay: std::collections::VecDeque<SseEvent>,
+    replay_capacity: usize,
+    /// The turn's terminal event, once known.
+    terminal: Option<SseEvent>,
+    /// When the last subscriber went away, or `None` while one is attached.
+    ///
+    /// Zero subscribers used to mean "cancel the turn, nobody is listening". That is the right
+    /// instinct (a turn with no audience is burning provider tokens for nobody) and the wrong
+    /// deadline, because the case re-attach exists for looks identical for its first instant: a
+    /// client whose connection dropped and is about to come back. The stamp turns the check into a
+    /// grace period, so a reconnect inside the window finds the turn still running.
+    disconnected_since: Option<std::time::Instant>,
+    /// How long to hold a turn open for a reconnect before treating the client as gone.
+    reattach_grace: Duration,
+}
+
+impl TurnStream {
+    fn record(&mut self, event: SseEvent) {
+        if self.replay_capacity == 0 {
+            return;
+        }
+        while self.replay.len() >= self.replay_capacity {
+            self.replay.pop_front();
+        }
+        self.replay.push_back(event);
+    }
+}
+
+/// What a re-attaching client gets: the backlog it missed, plus a live subscription, taken
+/// together under one lock so nothing can be emitted in the gap between them.
+pub struct StreamAttachment {
+    pub turn_id: uuid::Uuid,
+    /// Buffered events with an id greater than the client's `Last-Event-ID`, oldest first.
+    pub backlog: Vec<SseEvent>,
+    /// `None` when the turn has already ended; the backlog and `terminal` are then the whole
+    /// story.
+    pub receiver: Option<broadcast::Receiver<SseEvent>>,
+    /// Present once the turn is over. A client that reconnects after the fact gets it immediately
+    /// rather than waiting on a stream that will never produce another event.
+    pub terminal: Option<SseEvent>,
+    /// True when the client's `Last-Event-ID` is older than the oldest event still buffered, so
+    /// the replay has a hole in it. Reported rather than papered over: a transcript with a silent
+    /// gap is worse than one the client knows is incomplete.
+    pub gap: bool,
+    /// The position resumption should actually use, after discarding a `Last-Event-ID` that this
+    /// turn never issued.
+    ///
+    /// `None` means "send everything you have".
+    ///
+    /// Ids run monotonically across the whole session, so an id from an *earlier* turn sorts below
+    /// this turn's backlog and filters nothing -- that is the case this field is designed to let
+    /// through. What it discards is an id at or above the high-water mark: one fabricated, or
+    /// carried over from a different session by a browser `EventSource` that re-sends its stored
+    /// id automatically. Honouring such an id would filter the entire backlog, and the terminal
+    /// with it, as already-delivered, leaving the client waiting on a turn it can never see end.
+    pub resume_from: Option<u64>,
 }
 
 /// One parked permission request. Carries `tool_name` so the resolve handler can record sticky
@@ -152,6 +233,7 @@ impl HttpFrontend {
             capabilities,
             always_allowed: Mutex::new(HashSet::new()),
             never_allowed: Mutex::new(HashSet::new()),
+            ids: Arc::new(EventIdGenerator::default()),
         }
     }
 
@@ -179,7 +261,10 @@ impl HttpFrontend {
     /// selection: streaming → park in `pending`, blocking → short-circuit to safe default.
     fn is_streaming(&self) -> bool {
         let guard = super::poisoned::lock(&self.stream, "http_frontend::is_streaming");
-        guard.is_some()
+        // The sender, not the slot: a `TurnStream` outlives its turn so a late reconnect can still
+        // read the tail, and treating that as "streaming" would send the next blocking turn's
+        // permission prompt to a channel nobody is listening on.
+        guard.as_ref().is_some_and(|stream| stream.sender.is_some())
     }
 
     /// Resolve a pending mid-turn permission request by `request_id`. Returns true iff the entry
@@ -227,24 +312,156 @@ impl HttpFrontend {
     pub fn install_stream(
         &self,
         capacity: usize,
+        replay_capacity: usize,
+        reattach_grace: Duration,
+        turn_id: uuid::Uuid,
     ) -> (broadcast::Receiver<SseEvent>, Arc<EventIdGenerator>) {
         let (sender, receiver) = broadcast::channel::<SseEvent>(capacity);
-        let ids = Arc::new(EventIdGenerator::default());
-        let sink = StreamSink {
-            sender,
-            ids: ids.clone(),
-        };
+        // The session's generator, not a fresh one: see the field docs. Ids continue across turns.
+        let ids = Arc::clone(&self.ids);
         let mut guard = super::poisoned::lock(&self.stream, "http_frontend::install_stream");
-        *guard = Some(sink);
+        // Replaces any retained previous turn outright: the previous turn's tail is superseded the
+        // moment a new one starts, and a client reconnecting now wants the live one.
+        *guard = Some(TurnStream {
+            turn_id,
+            ids: ids.clone(),
+            sender: Some(sender),
+            replay: std::collections::VecDeque::with_capacity(replay_capacity.min(64)),
+            replay_capacity,
+            terminal: None,
+            disconnected_since: None,
+            reattach_grace,
+        });
         (receiver, ids)
     }
 
-    /// Tear down the broadcast sink. Subsequent `emit()` calls go back to recording into the
-    /// blocking-mode recorder only. Called by the streaming turn handler after `run_turn`
-    /// returns.
-    pub fn clear_stream(&self) {
-        let mut guard = super::poisoned::lock(&self.stream, "http_frontend::clear_stream");
-        *guard = None;
+    /// Record the turn's terminal event, so a client that re-attaches learns how it ended.
+    ///
+    /// Called from the spawned turn task, deliberately, and not from the response stream: see the
+    /// note on [`TurnStream`]. Assigning the id here rather than at the call site keeps the
+    /// per-turn sequence dense even when the response stream was dropped long ago.
+    pub fn record_terminal(&self, event_type: SseEventType, data: serde_json::Value) -> SseEvent {
+        let mut guard = super::poisoned::lock(&self.stream, "http_frontend::record_terminal");
+        let Some(stream) = guard.as_mut() else {
+            // Unreachable today: the only caller is the streaming turn task, which installs a
+            // stream before it spawns. Still drawn from the session generator rather than
+            // hardcoded, because ids are session-scoped now and a fabricated `0` would collide
+            // with the session's genuine first event if this ever did fire.
+            return SseEvent {
+                id: self.ids.next(),
+                event_type,
+                data,
+            };
+        };
+        let event = SseEvent {
+            id: stream.ids.next(),
+            event_type,
+            data,
+        };
+        stream.record(event.clone());
+        stream.terminal = Some(event.clone());
+        event
+    }
+
+    /// End the turn's stream: drop the sender so live subscribers see the close, keeping the ring
+    /// and the terminal for a late reconnect. Called by the streaming turn handler's guard after
+    /// `run_turn` returns.
+    pub fn end_stream(&self) {
+        let mut guard = super::poisoned::lock(&self.stream, "http_frontend::end_stream");
+        if let Some(stream) = guard.as_mut() {
+            stream.sender = None;
+        }
+    }
+
+    /// The terminal event of the most recent turn, once it has one.
+    ///
+    /// Re-read after a live subscription closes rather than trusted from the attachment snapshot:
+    /// a client that attached mid-turn captured `terminal: None` because the turn had not ended
+    /// yet, and [`Self::record_terminal`] deliberately does not broadcast (the primary stream
+    /// yields its own copy from the join handle, and a broadcast one would race it into a
+    /// duplicate). So the only way a live re-attacher learns the outcome is to ask again.
+    /// Scoped to `turn_id`, because `install_stream` replaces the whole [`TurnStream`], terminal
+    /// included. A re-attacher wakes on its broadcast closing and asks again; if the next turn has
+    /// already started by then, an unscoped read would hand it the new turn's terminal (or `None`
+    /// for a turn that actually succeeded). Returning `None` on a mismatch lets the caller say what
+    /// is true: the turn ended and its outcome is no longer held here.
+    pub fn recorded_terminal(&self, turn_id: uuid::Uuid) -> Option<SseEvent> {
+        let guard = super::poisoned::lock(&self.stream, "http_frontend::recorded_terminal");
+        guard
+            .as_ref()
+            .filter(|stream| stream.turn_id == turn_id)
+            .and_then(|stream| stream.terminal.clone())
+    }
+
+    /// Attach to the current turn's stream, replaying anything after `last_event_id`.
+    ///
+    /// The backlog snapshot and the `subscribe()` happen under one lock, and [`Self::emit`] takes
+    /// the same lock to append. That is what makes the replay gap-free: without it an event
+    /// emitted between the snapshot and the subscribe would be in neither.
+    ///
+    /// `None` when no turn has ever streamed on this session.
+    pub fn attach_stream(&self, last_event_id: Option<u64>) -> Option<StreamAttachment> {
+        let mut guard = super::poisoned::lock(&self.stream, "http_frontend::attach_stream");
+        let stream = guard.as_mut()?;
+        // Someone is listening again, so the grace clock restarts. Cleared here and not only in
+        // `client_disconnected`, which the agent loop reaches at provider-round boundaries: a
+        // client that reconnects and drops again before the next boundary would otherwise have its
+        // second grace measured from the *first* disconnect, and so get almost none of it.
+        stream.disconnected_since = None;
+        // Ids are session-monotonic, so an id at or above the high-water mark was never issued
+        // here at all -- a fabricated value, or one carried over from a different session. Discard
+        // it rather than filter against it, which would silently deliver nothing.
+        let stale = last_event_id.is_some_and(|last| last >= stream.ids.peek());
+        let resume_from = if stale { None } else { last_event_id };
+        // Taking `pending` while holding `stream` is safe in this order only: `request_permission`
+        // releases `pending` before it acquires `stream` (see `park_permission` / `emit_pause`),
+        // and `resolve_permission` never touches `stream` at all, so there is no inversion.
+        let still_pending = super::poisoned::lock(&self.pending, "http_frontend::attach_pending");
+        let backlog: Vec<SseEvent> = stream
+            .replay
+            .iter()
+            .filter(|event| resume_from.is_none_or(|last| event.id > last))
+            // A pause is stateful, not additive. Replaying one the client already answered (or
+            // that timed out) would put an approval prompt back on screen for a request that no
+            // longer exists, and any decision sent for it comes back 404. Replay it only while it
+            // is still actionable, which is exactly while it is still parked.
+            .filter(|event| {
+                if event.event_type != SseEventType::PermissionRequired {
+                    return true;
+                }
+                event
+                    .data
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|request_id| still_pending.contains_key(request_id))
+            })
+            .cloned()
+            .collect();
+        drop(still_pending);
+        // A hole exists only relative to a position the client actually claims. `id + 1` because
+        // resuming from exactly the oldest retained id is contiguous.
+        //
+        // A client that names no `Last-Event-ID` is joining, not resuming, and has lost nothing:
+        // warning it about the events before it arrived would fire on every first attach, since
+        // the ring never holds the `turn.started` the response stream generates for itself. A
+        // *stale* id is always a gap, because whatever the client was following has ended.
+        let gap = stale
+            || match (resume_from, stream.replay.front()) {
+                (Some(last), Some(oldest)) => oldest.id > last.saturating_add(1),
+                // Replay is switched off (`stream_replay_events = 0`), so a client resuming from a
+                // position has been handed nothing between there and now. Reporting no gap would
+                // be the silent truncation the notice exists to rule out.
+                (Some(_), None) => stream.replay_capacity == 0,
+                _ => false,
+            };
+        Some(StreamAttachment {
+            turn_id: stream.turn_id,
+            backlog,
+            receiver: stream.sender.as_ref().map(|sender| sender.subscribe()),
+            terminal: stream.terminal.clone(),
+            gap,
+            resume_from,
+        })
     }
 
     /// Drop SSE events the per-session capabilities don't enable. Currently only the
@@ -282,21 +499,27 @@ impl Frontend for HttpFrontend {
         // concurrent emitters can't reorder monotonic ids. `broadcast::Sender::send` is
         // synchronous, so there's no await-under-lock hazard.
         {
-            let guard = super::poisoned::lock(&self.stream, "http_frontend::emit_stream");
-            if let Some(sink) = guard.as_ref()
+            let mut guard = super::poisoned::lock(&self.stream, "http_frontend::emit_stream");
+            if let Some(stream) = guard.as_mut()
+                && let Some(sender) = stream.sender.clone()
                 && self.event_passes_capability_filter(&event)
                 && let Some((event_type, data)) = translate(event.clone(), self.capabilities)
             {
                 let sse = SseEvent {
-                    id: sink.ids.next(),
+                    id: stream.ids.next(),
                     event_type,
                     data,
                 };
+                // Recorded before sending, so an event is in the replay ring by the time any
+                // subscriber can observe it. The reverse order would let a client re-attach in
+                // the window between and miss it in both places.
+                stream.record(sse.clone());
                 // `send` returns Err only when there are no subscribers: that means the SSE
                 // client has disconnected. The recorder still gets the event so the turn
                 // handler can produce the blocking-mode JSON fallback (or in the streaming
-                // case, just discard the events after run_turn returns).
-                let _ = sink.sender.send(sse);
+                // case, just discard the events after run_turn returns). The ring keeps it
+                // either way, which is what a re-attaching client reads back.
+                let _ = sender.send(sse);
             }
         }
 
@@ -356,19 +579,24 @@ impl Frontend for HttpFrontend {
         // Hold the stream lock across `ids.next()` + `sender.send()` to preserve monotonic id
         // ordering, mirroring `emit()`.
         {
-            let guard = super::poisoned::lock(&self.stream, "http_frontend::emit_pause");
-            if let Some(sink) = guard.as_ref() {
+            let mut guard = super::poisoned::lock(&self.stream, "http_frontend::emit_pause");
+            if let Some(stream) = guard.as_mut()
+                && let Some(sender) = stream.sender.clone()
+            {
                 let payload = serde_json::json!({
                     "request_id": request_id,
                     "tool_name": request.tool_name,
                     "expires_in_seconds": MID_TURN_REQUEST_TIMEOUT.as_secs(),
                 });
                 let event = SseEvent {
-                    id: sink.ids.next(),
+                    id: stream.ids.next(),
                     event_type: SseEventType::PermissionRequired,
                     data: payload,
                 };
-                let _ = sink.sender.send(event);
+                // Recorded like any other event: a client that reconnects mid-pause has to learn
+                // that the turn is waiting on it, or the turn sits there until the timeout.
+                stream.record(event.clone());
+                let _ = sender.send(event);
             }
         }
 
@@ -424,17 +652,35 @@ impl Frontend for HttpFrontend {
     // The HTTP frontend does not expose client-hosted tool delegation. Returning `None`
     // routes the call to the agent's local I/O path.
 
-    /// SSE-mode disconnect detection. When a `StreamSink` is installed and the broadcast has zero
-    /// remaining subscribers, the SSE consumer has dropped; the agent loop should short-circuit
-    /// at its next iteration so we don't keep burning provider tokens for an audience that's
-    /// gone away. Blocking mode (no `StreamSink`) has no transport-level disconnect to observe
-    /// until the response writes complete, so we keep the trait default `false` there.
+    /// SSE-mode disconnect detection, with a reconnect grace period.
+    ///
+    /// Zero remaining subscribers means the SSE consumer has dropped, and the agent loop
+    /// short-circuits so we don't keep burning provider tokens for an audience that has gone away.
+    /// It reports the disconnect only once the count has been zero for
+    /// [`TurnStream::reattach_grace`], because a client whose connection dropped a moment ago and
+    /// one that is never coming back are the same observation until the window expires. A
+    /// reconnect through [`Self::attach_stream`] clears the stamp on its next poll.
+    ///
+    /// Blocking mode (no stream installed) has no transport-level disconnect to observe until the
+    /// response writes complete, so the trait default `false` stands there.
     fn client_disconnected(&self) -> bool {
-        let stream = super::poisoned::lock(&self.stream, "http_frontend::client_disconnected");
-        match stream.as_ref() {
-            Some(sink) => sink.sender.receiver_count() == 0,
-            None => false,
+        let mut guard = super::poisoned::lock(&self.stream, "http_frontend::client_disconnected");
+        let Some(stream) = guard.as_mut() else {
+            return false;
+        };
+        let Some(sender) = stream.sender.as_ref() else {
+            return false;
+        };
+        if sender.receiver_count() > 0 {
+            stream.disconnected_since = None;
+            return false;
         }
+        // Stamped and evaluated in one step so a zero grace means exactly no grace, rather than
+        // "one poll interval": the first observation would otherwise always report `false`.
+        let since = *stream
+            .disconnected_since
+            .get_or_insert_with(std::time::Instant::now);
+        since.elapsed() >= stream.reattach_grace
     }
 }
 
@@ -499,7 +745,8 @@ mod tests {
             supports_permission_prompts: false,
             ..Default::default()
         }));
-        let (_receiver, _ids) = frontend.install_stream(16);
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -587,7 +834,8 @@ mod tests {
     async fn resolve_permission_allow_always_records_sticky() {
         let frontend = HttpFrontend::new();
         // Install a stream so request_permission parks instead of blocking-mode short-circuit.
-        let (_receiver, _ids) = frontend.install_stream(16);
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
 
         let pending_handle = {
             let frontend_clone = Arc::new(frontend);
@@ -632,7 +880,8 @@ mod tests {
     #[tokio::test]
     async fn thinking_delta_is_filtered_when_capability_is_off() {
         let frontend = HttpFrontend::with_capabilities(SessionCapabilities::default());
-        let (mut receiver, _ids) = frontend.install_stream(16);
+        let (mut receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
         frontend
             .emit(FrontendEvent::ThinkingBlock {
                 content: "musing".into(),
@@ -643,7 +892,7 @@ mod tests {
             .emit(FrontendEvent::AssistantTextDelta("answer".into()))
             .await;
         // Drop the stream to close the broadcast and drain.
-        frontend.clear_stream();
+        frontend.end_stream();
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             events.push(event);
@@ -669,14 +918,15 @@ mod tests {
             supports_reasoning_stream: true,
             ..Default::default()
         });
-        let (mut receiver, _ids) = frontend.install_stream(16);
+        let (mut receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
         frontend
             .emit(FrontendEvent::ThinkingBlock {
                 content: "musing".into(),
                 signature: None,
             })
             .await;
-        frontend.clear_stream();
+        frontend.end_stream();
         let event = receiver.try_recv().expect("thinking event should stream");
         assert_eq!(event.event_type, super::SseEventType::ThinkingDelta);
     }
@@ -684,11 +934,14 @@ mod tests {
     /// When the SSE consumer disconnects (all broadcast receivers dropped) while
     /// `request_permission` is parked, the permission wait should resolve to `Cancelled`
     /// within `DISCONNECT_POLL_INTERVAL` instead of blocking until the 60s timeout.
+    ///
+    /// Zero grace, so this tests the resolution path rather than the reconnect window;
+    /// `client_disconnected_waits_out_the_reattach_grace` covers the window itself.
     #[tokio::test]
     async fn request_permission_detects_sse_disconnect() {
         let frontend = Arc::new(HttpFrontend::new());
         // Install a stream so request_permission takes the streaming (park) path.
-        let (receiver, _ids) = frontend.install_stream(16);
+        let (receiver, _ids) = frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil());
 
         let frontend_inner = Arc::clone(&frontend);
         let join = tokio::spawn(async move {
@@ -740,6 +993,193 @@ mod tests {
                 .len(),
             0,
             "pending entry should be cleaned up after disconnect"
+        );
+    }
+
+    /// A dropped consumer is not immediately a departed one. Re-attach exists because networks
+    /// drop connections, and for the first instant those two look identical; reporting a disconnect
+    /// straight away would cancel exactly the turns a client is about to rejoin.
+    #[tokio::test]
+    async fn client_disconnected_waits_out_the_reattach_grace() {
+        let frontend = HttpFrontend::new();
+        let (receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_millis(150), uuid::Uuid::nil());
+        assert!(
+            !frontend.client_disconnected(),
+            "a live consumer is attached"
+        );
+
+        drop(receiver);
+        assert!(
+            !frontend.client_disconnected(),
+            "the first zero-subscriber observation starts the grace period, it does not end it"
+        );
+        assert!(!frontend.client_disconnected(), "still inside the window");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            frontend.client_disconnected(),
+            "past the window with nobody attached, the client really is gone"
+        );
+    }
+
+    /// Reconnecting inside the window clears the stamp, so the turn keeps running.
+    #[tokio::test]
+    async fn reattaching_cancels_a_pending_disconnect() {
+        let frontend = HttpFrontend::new();
+        let (receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_millis(100), uuid::Uuid::nil());
+        drop(receiver);
+        assert!(!frontend.client_disconnected(), "grace period starts");
+
+        let attachment = frontend.attach_stream(None).expect("a stream is installed");
+        let _receiver = attachment.receiver.expect("the turn is still live");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !frontend.client_disconnected(),
+            "a reconnect inside the window must clear the pending disconnect, not merely delay it"
+        );
+    }
+
+    /// The ring is what `Last-Event-ID` replay reads. It must drop oldest-first at capacity and
+    /// hand back only what the client has not already seen.
+    #[tokio::test]
+    async fn replay_ring_is_bounded_and_resumes_after_the_given_id() {
+        let frontend = HttpFrontend::new();
+        let (_receiver, _ids) =
+            frontend.install_stream(64, 3, Duration::from_secs(30), uuid::Uuid::nil());
+        for index in 0..5 {
+            frontend
+                .emit(FrontendEvent::AssistantTextDelta(format!("chunk{index}")))
+                .await;
+        }
+
+        let all = frontend.attach_stream(None).expect("stream installed");
+        assert_eq!(
+            all.backlog.len(),
+            3,
+            "the ring holds its capacity, not the history"
+        );
+        assert_eq!(
+            all.backlog[0].id, 2,
+            "oldest-first eviction keeps the newest three"
+        );
+        assert!(
+            !all.gap,
+            "a client naming no Last-Event-ID is joining, not resuming, so it has lost nothing"
+        );
+
+        let resumed = frontend.attach_stream(Some(3)).expect("stream installed");
+        let ids: Vec<u64> = resumed.backlog.iter().map(|event| event.id).collect();
+        assert_eq!(ids, vec![4], "resume delivers strictly after the given id");
+        assert!(
+            !resumed.gap,
+            "id 3 is still buffered, so the replay is contiguous"
+        );
+
+        let stale = frontend.attach_stream(Some(0)).expect("stream installed");
+        assert!(
+            stale.gap,
+            "resuming from id 0 when the ring starts at 2 skips event 1, and must say so"
+        );
+    }
+
+    /// A client that reconnects after the turn ended still has to learn how it ended.
+    #[tokio::test]
+    async fn attach_after_the_turn_ends_yields_the_terminal() {
+        let frontend = HttpFrontend::new();
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta("hi".into()))
+            .await;
+        frontend.record_terminal(
+            SseEventType::TurnFinished,
+            serde_json::json!({"stop_reason": "end_turn"}),
+        );
+        frontend.end_stream();
+
+        let attachment = frontend
+            .attach_stream(None)
+            .expect("stream retained past the turn");
+        assert!(
+            attachment.receiver.is_none(),
+            "the turn is over; there is nothing live left to subscribe to"
+        );
+        let terminal = attachment.terminal.expect("terminal must be retained");
+        assert_eq!(terminal.event_type, SseEventType::TurnFinished);
+        assert!(
+            attachment
+                .backlog
+                .iter()
+                .any(|event| event.event_type.is_terminal()),
+            "the terminal is in the ring too, so a replaying client receives it in order"
+        );
+    }
+
+    /// A pause the client already answered must not come back on reconnect: it would put an
+    /// approval prompt on screen for a request that no longer exists, and a decision sent for it
+    /// returns 404. Additive events replay; stateful ones only while they are still true.
+    #[tokio::test]
+    async fn replay_drops_permission_prompts_that_are_no_longer_pending() {
+        let frontend = Arc::new(HttpFrontend::new());
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+
+        let asking = Arc::clone(&frontend);
+        let join = tokio::spawn(async move {
+            asking
+                .request_permission(PermissionRequest {
+                    tool_name: "execute_command".into(),
+                    primary_param: Some("echo hi".into()),
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // While parked, the prompt is real and must be replayed.
+        let parked = frontend.attach_stream(None).expect("stream installed");
+        assert!(
+            parked
+                .backlog
+                .iter()
+                .any(|event| event.event_type == SseEventType::PermissionRequired),
+            "a live prompt must reach a reconnecting client, or the turn stalls until timeout"
+        );
+        let request_id = parked
+            .backlog
+            .iter()
+            .find(|event| event.event_type == SseEventType::PermissionRequired)
+            .and_then(|event| event.data.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .expect("prompt carries a request_id")
+            .to_string();
+
+        assert!(frontend.resolve_permission(&request_id, PermissionResolution::Allow));
+        assert_eq!(join.await.expect("task"), PermissionOutcome::Allow);
+
+        let after = frontend.attach_stream(None).expect("stream installed");
+        assert!(
+            !after
+                .backlog
+                .iter()
+                .any(|event| event.event_type == SseEventType::PermissionRequired),
+            "an answered prompt must not be replayed"
+        );
+    }
+
+    /// A finished-but-retained stream must not read as "streaming", or the next blocking turn
+    /// would park its permission prompt on a channel nobody is listening to.
+    #[tokio::test]
+    async fn a_retained_stream_is_not_reported_as_streaming() {
+        let frontend = HttpFrontend::new();
+        let (_receiver, _ids) =
+            frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+        assert!(frontend.is_streaming());
+        frontend.end_stream();
+        assert!(
+            !frontend.is_streaming(),
+            "the ring outlives the turn; the streaming mode must not"
         );
     }
 

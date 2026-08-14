@@ -151,6 +151,10 @@ impl Tool for MemoryWriteTool {
                     message,
                 }
             })?;
+        // The memory snapshot keys on mtime alone, so *any* second write inside one clock tick is
+        // invisible to it. Without this the agent's own note would not be in the index it reads
+        // back on the very next turn.
+        self.memories.invalidate().await;
 
         tracing::info!("saved memory to {}", path.display());
         Ok(ToolOutput::text(
@@ -409,6 +413,8 @@ impl Tool for MemoryDeleteTool {
                 tool_name: "memory_delete".to_string(),
                 message: format!("failed to delete {}: {}", path.display(), error),
             })?;
+        // See the note in `memory_write`.
+        self.memories.invalidate().await;
 
         tracing::info!("deleted memory {}", path.display());
         Ok(ToolOutput::text(

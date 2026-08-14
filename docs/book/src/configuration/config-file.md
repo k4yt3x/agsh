@@ -1220,6 +1220,26 @@ Process-wide cap on in-flight turns across all sessions. When the cap is reached
 |------|---------|
 | `integer` | unbounded |
 
+### `serve.stream_replay_events`
+
+How many SSE events per turn to retain so a client reconnecting to `GET /v1/sessions/{id}/stream` with `Last-Event-ID` can replay what it missed.
+
+| Type | Default |
+|------|---------|
+| `integer` | `256` |
+
+Matches the live broadcast channel's capacity: retaining more than the channel can buffer would let a reconnecting client replay events a *connected* consumer would have been dropped for missing. Raising it buys a longer reconnect window at the cost of per-session memory during a turn. `0` switches replay off, so a reconnect receives only what happens from then on and is told its replay is incomplete rather than being handed a silently truncated one.
+
+### `serve.stream_reattach_grace`
+
+How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a reconnect. Accepts duration strings.
+
+| Type | Default |
+|------|---------|
+| `string` (duration) | `"30s"` |
+
+Zero subscribers means nobody is listening, and a turn with no audience is spending provider tokens for nothing. That is the right instinct and the wrong deadline: a client whose connection just dropped and one that is never coming back are the same observation until the window expires. Set `"0s"` to cancel a turn the moment its stream drops, which spends less on abandoned work and makes re-attach useful only for turns that already finished.
+
 ### `serve.idle_timeout`
 
 How long a session can sit idle (no turns submitted) before the GC evicts it from memory. Accepts duration strings like `"24h"`, `"30m"`, `"7d"`. Set to `"0"` to disable idle GC.
@@ -1297,11 +1317,45 @@ description = "telegram bridge"
 scopes = ["sessions:r", "sessions:w"]
 ```
 
-Admin token with all read scopes:
+Admin token with every scope:
 
 ```toml
 [[serve.tokens]]
 token = "${MEKA_ADMIN_TOKEN}"
 description = "operator"
-scopes = ["sessions:r", "sessions:w", "mcp:r", "skills:r"]
+scopes = [
+    "sessions:r", "sessions:w",
+    "skills:r", "skills:w",
+    "memory:r", "memory:w",
+    "schedule:r", "schedule:w",
+    "mcp:r", "mcp:w",
+]
 ```
+
+Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the other. See the [HTTP API scope table](../usage/http-api.md#scopes) for what each permits. An unrecognised scope logs a warning at startup and grants nothing, so a typo like `sessions:write` is visible rather than silently inert.
+
+### `[[serve.webhooks]]`
+
+Outbound endpoints meka POSTs to when something happens that no client is waiting on: a scheduled job firing, a background task finishing. Omit the block entirely and meka never makes an outbound request.
+
+```toml
+[[serve.webhooks]]
+url = "https://bridge.example/meka-hook"
+secret = "${MEKA_WEBHOOK_SECRET}"     # or secret_file = "/etc/meka/hook.secret"
+events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired"]
+timeout = "10s"
+max_retries = 3
+```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `url` | `string` | required | `https://` or `http://`; supports `${ENV_VAR}` |
+| `secret` | `string` | none | HMAC key for `X-Meka-Signature`; supports `${ENV_VAR}` |
+| `secret_file` | `path` | none | Mutually exclusive with `secret`; chmod 0600 |
+| `events` | `array` | required | One or more of the four names above |
+| `timeout` | `duration` | `"10s"` | Per attempt |
+| `max_retries` | `integer` | `3` | Retries after the first attempt |
+
+`events` is required and every name must be recognised. An unknown event is a startup **error**, not a warning, unlike an unknown token scope: a scope that grants nothing leaves the token working for whatever else it holds, whereas an endpoint whose only subscription is a typo is silently never called at all.
+
+Payloads carry identifiers and metadata, never message content. Omitting `secret` sends unsigned deliveries and logs a warning. See [Webhooks](../usage/http-api.md#webhooks) for the payload shape and the signature-verification recipe.

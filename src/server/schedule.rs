@@ -76,6 +76,32 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                 sessions.keys().copied().collect()
             };
             for session_id in resident {
+                // Re-checked per session, not just per tick. Each iteration stamps its outcomes
+                // delivered *before* awaiting a turn that can take minutes, which is right for a
+                // turn that wedges but fatal across a shutdown: the sessions later in this loop
+                // would be stamped and then never processed, and
+                // `list_undelivered_background_tasks` never returns a stamped row again, so the
+                // model would never learn its task finished.
+                if state.shutdown.is_cancelled() {
+                    return;
+                }
+                // Skipped rather than queued behind. This sweep is serial, so waiting on one busy
+                // session delays every later session's outcomes in the same tick. Checked *before
+                // anything is stamped*, so the next tick picks this session up unchanged -- which
+                // is why the delivery below can afford to wait if a turn starts in the gap.
+                // A session that has left the map since the snapshot counts as un-takeable too,
+                // not as idle: falling through would stamp its outcomes and then have
+                // `ensure_session_loaded` rebuild the whole runtime and pin the file lock, which
+                // is exactly the revival this poller documents itself as never doing.
+                if state
+                    .sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .is_none_or(|entry| entry.runtime.try_lock().is_err())
+                {
+                    continue;
+                }
                 let ready = match state
                     .shared
                     .session_manager
@@ -101,10 +127,30 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                     tracing::warn!("failed to stamp background outcomes delivered: {}", error);
                     continue;
                 }
+                // Fired before the delivery turn rather than after it: the fact a task finished
+                // is the news, and it should not wait on a model call that may itself fail.
+                for task in &ready {
+                    state.webhooks.send(
+                        crate::server::webhook::WebhookEvent::TaskFinished,
+                        // No `label`. It is the tool's primary argument, which for
+                        // `execute_command` is the shell command line -- the highest-entropy
+                        // field in the system and the one most likely to carry a credential
+                        // someone pasted into a `curl`. A subscriber that wants it reads
+                        // `GET /v1/sessions/{id}/tasks` with its own token, which is the whole
+                        // reason deliveries carry identifiers rather than content.
+                        serde_json::json!({
+                            "task_id": task.id,
+                            "session_id": task.session_id,
+                            "tool_name": task.tool_name,
+                            "status": task.status.as_str(),
+                        }),
+                    );
+                }
                 if let Err(error) = run_prompt_in_session(
                     &state,
                     session_id,
                     crate::background::render_outcomes(&ready),
+                    true,
                 )
                 .await
                 {
@@ -128,9 +174,40 @@ async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
     } else {
         run_in_session(&state, &wakeup).await
     };
+    // Announced whatever the outcome, because "the 3am job ran and failed" and "the 3am job never
+    // fired" need very different responses from whoever is watching, and without this both look
+    // like silence. Deferral is excluded deliberately: the occurrence was handed back, not spent,
+    // and another host is about to run it.
+    let notify = |status: &str| {
+        state.webhooks.send(
+            crate::server::webhook::WebhookEvent::ScheduleFired,
+            serde_json::json!({
+                "job_id": wakeup.job.id,
+                "session_id": wakeup.job.session_id,
+                "isolated": wakeup.job.isolated,
+                "status": status,
+            }),
+        );
+    };
+    // Checked before the outcome is classified, because a drain makes every outcome a lie. The
+    // scheduler keeps ticking until it is aborted, which happens *after* the drain window, and by
+    // then `state.shutdown` has already been fired -- so the turn's token starts cancelled,
+    // `run_turn` returns `Interrupted` immediately, and this would score a job that never ran as
+    // `Ran`. `prepare` has already deleted a one-shot's row or advanced a recurring job's
+    // `next_fire_at`, so scoring it `Ran` spends the occurrence outright: the 3am job is gone
+    // because someone deployed at 3am. Deferring hands it back, which is exactly what the
+    // `SessionBusyElsewhere` arm below exists to do for the other "this host cannot take it now".
+    if state.shutdown.is_cancelled() {
+        tracing::info!(
+            "scheduled job {} fired during shutdown; deferring the occurrence",
+            job_id
+        );
+        return FireOutcome::Deferred;
+    }
     match outcome {
         Ok(()) => {
             tracing::info!("scheduled job {} completed", job_id);
+            notify("completed");
             FireOutcome::Ran
         }
         Err(RunError::SessionBusyElsewhere) => {
@@ -145,6 +222,7 @@ async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
         }
         Err(RunError::Failed(error)) => {
             tracing::warn!("scheduled job {} failed: {}", job_id, error);
+            notify("failed");
             FireOutcome::Ran
         }
     }
@@ -171,17 +249,34 @@ impl From<crate::error::MekaError> for RunError {
 }
 
 /// Deliver the prompt into the conversation that created the job.
+///
+/// An ungated job does not wait: the sweep fires jobs one at a time, so queueing behind a session
+/// that is mid-turn holds up every *other* session's jobs in the same tick, and a recurring job
+/// that misses its slot has its occurrences coalesced rather than run. Deferring hands the
+/// occurrence back for the next tick instead.
+///
+/// A *gated* job does wait, because deferral is not free for it. `prepare` evaluates the gate
+/// before this host gets a say, and restoring the job puts its fire time back in the past, so it
+/// comes due again on the very next tick: a gated hourly job on a session busy for ten minutes
+/// would run its shell command every `poll_interval` instead of once. Blocking the sweep is the
+/// lesser cost, and it is what this did before deferral existed.
 async fn run_in_session(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunError> {
-    run_prompt_in_session(state, wakeup.job.session_id, wakeup.render_prompt()).await
+    let wait = wakeup.job.gate.is_some();
+    run_prompt_in_session(state, wakeup.job.session_id, wakeup.render_prompt(), wait).await
 }
 
-/// Run one out-of-band prompt inside a live session. Shared by scheduled jobs and background-task
-/// outcomes, which want identical treatment: wait on a busy session rather than drop the
-/// occurrence, and publish a cancellation token so `POST /cancel` can reach the turn.
+/// Run one out-of-band prompt inside a live session, publishing a cancellation token so
+/// `POST /cancel` can reach the turn.
+///
+/// `wait` decides what a busy session means. A scheduled job defers and is retried whole on the
+/// next tick, so it does not wait. Background-outcome delivery has already stamped its rows
+/// `delivered` by the time it gets here and cannot be retried, so it does wait -- its caller
+/// pre-checks instead, which keeps that from becoming a queue in practice.
 async fn run_prompt_in_session(
     state: &ServerState,
     session_id: uuid::Uuid,
     prompt: String,
+    wait: bool,
 ) -> Result<(), RunError> {
     let entry = reattach::ensure_session_loaded(state, session_id)
         .await
@@ -193,11 +288,23 @@ async fn run_prompt_in_session(
             }
         })?;
 
-    // Wait for the session rather than skipping, unlike `POST /turn`, which rejects a busy session
-    // with 409. A caller can retry; a fired job cannot -- the scheduler has already advanced its
-    // next-fire time, so a skip here loses the occurrence outright. The scheduler awaits each fire
-    // in turn, so this only ever delays the tick.
-    let mut runtime = entry.runtime.lock().await;
+    let mut runtime = match wait {
+        true => entry.runtime.lock().await,
+        false => match entry.runtime.try_lock() {
+            Ok(runtime) => runtime,
+            // Reported as busy rather than waited out. `prepare` has already advanced the job's
+            // next-fire time, so the caller turns this into a deferral, which hands the occurrence
+            // back intact -- the same treatment a session held by another process gets.
+            Err(_) => return Err(RunError::SessionBusyElsewhere),
+        },
+    };
+
+    // Marked busy for the length of the turn. An out-of-band turn is still a turn: without this
+    // the counter reads zero while the agent is mid-tool, so `GET /v1/sessions/{id}` reports
+    // `turn_in_flight: false`, `PATCH` slips a permission change into a running unattended turn,
+    // and `DELETE` deletes the row out from under it -- all three past guards that exist to stop
+    // exactly that. Taken after the lock, so it never contends with the turn it is describing.
+    let _busy = crate::server::state::InFlightGuard::mark_busy(&entry);
 
     // Publish the token so `POST /v1/sessions/{id}/cancel` reaches a scheduled turn. It reads
     // `entry.cancellation` (`handlers::turn::cancel_turn`), so a turn that only held a shutdown
@@ -270,7 +377,7 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
     ));
     let roots: crate::agent::SharedRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
-    let (agent, _registry) = crate::build_session_agent(
+    let (agent, registry) = crate::build_session_agent(
         &state.shared,
         permission,
         Arc::new(SilentFrontend),
@@ -278,13 +385,14 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
         roots,
         // The HTTP surface has no context gauge of its own; the session owns the counter.
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
 
     // `None` makes `run_turn` create the session row, so the isolated run gets its own id.
     let mut session_uuid = None;
     let mut messages = Conversation::new();
-    agent
+    let outcome = agent
         .run_turn(
             &mut session_uuid,
             &mut messages,
@@ -292,7 +400,19 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
             Vec::new(),
             state.shutdown.child_token(),
         )
-        .await?;
+        .await;
+
+    // Before the `?`, so a failed run cleans up too. `build_session_agent` hands the registry to
+    // the MCP manager, which holds a *strong* clone; an isolated agent is discarded at the end of
+    // this function, so without a detach every fire leaves one behind. An hourly isolated job adds
+    // 24 a day, indefinitely, each pinning a whole dead tool set and lengthening every
+    // `tools/list_changed` fan-out. Sessions get this from `handle_close_session`, the GC and
+    // `DELETE /v1/sessions/{id}`; an isolated fire has no such moment but the end of its own turn.
+    if let Some(manager) = state.shared.mcp_manager.as_ref() {
+        manager.detach_registry(&registry).await;
+    }
+    outcome?;
+
     if let Some(id) = session_uuid {
         tracing::info!(
             "scheduled job {} ran in isolated session {}",

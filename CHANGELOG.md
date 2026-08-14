@@ -10,37 +10,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Compaction runs a checkpoint turn first: the agent saves what must last and writes the summary.
-- `context_check` reports live context occupancy, headroom and compaction count on demand.
-- `context_compact` lets the agent request a compaction at the end of the current turn.
-- `keep_recent: false` compacts without keeping a verbatim tail, for turning the page cleanly.
 - `/compact <instructions>` says what to keep or drop, and reports the memories written.
-- `[session].compact_checkpoint` (default `true`) switches the checkpoint turn off.
+- `context_check` and `context_compact` let the agent read its own headroom and ask to compact.
 - `skill_search` greps the full text of every installed skill, bodies included.
-- `skill_write` and `skill_delete` let the agent author its own skills, off by default.
-- `[skills].agent_managed` (default `false`) registers the two skill-authoring tools.
+- `skill_write` / `skill_delete` let the agent author skills, off unless `[skills].agent_managed`.
 - Skills take an optional `priority` in frontmatter, ordering the `[Skills]` index like memory's.
-- `meka skill add --priority`, and priority and author columns in `meka skill list`.
+- HTTP: compact, rewind, export and import sessions, and report context occupancy.
+- HTTP: manage scheduled jobs and background tasks.
+- HTTP: full CRUD for skills and memory, behind new `skills:w`, `memory:r` and `memory:w` scopes.
+- HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
+- HTTP: rejoin a turn's SSE stream with `Last-Event-ID` after a dropped connection.
+- HTTP: compaction is visible through a `revision` counter, a summary marker, and an SSE event.
+- HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.
+- `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
 
 ### Changed
 
-- **Breaking:** the `skill` tool is now `skill_read`, one of a four-tool `skill_*` family.
-- `[tools]` and `[subagents]` entries naming `skill` go stale on upgrade and warn at startup.
-- The `[Skills]` index is capped at 200 entries and 8 KiB, then points at `skill_search`.
-- Skills are listed by priority, not name; existing installs re-render the index once.
-- An unknown tool name that prefixes a tool family now suggests it, e.g. `skill` to `skill_read`.
-- Stale `[tools]` entries suggest the built-in they probably meant instead of only reporting a miss.
-- The `[Context budget]` block reports the compaction count once a session has compacted twice.
-- The compaction summary gained a standing-commitments section, and honours per-run instructions.
+- **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
+- The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
+- An unknown or stale tool name now suggests the built-in it probably meant.
+- A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
+- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
+- `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.
+- An unrecognised `[[serve.tokens]]` scope warns at startup instead of silently granting nothing.
 
 ### Fixed
 
 - `/status` counts compaction tokens, which were spent but never reported against the session.
-- A turn that rewrote the conversation could panic on a later malformed-request repair.
 - Ctrl+C interrupts a compaction; it previously ran to completion with no way to stop it.
+- A turn that rewrote the conversation could panic on a later malformed-request repair.
+- A compaction that fails to save no longer leaves the conversation half-rewritten.
+- A blocking turn survives its client hanging up; an `Idempotency-Key` retry then replays it.
+- A skill or memory rewritten twice within one clock tick is no longer served stale from cache.
+- Deleting a session stops its running background tasks instead of orphaning their processes.
+- `DELETE` and `PATCH` are refused during a scheduled turn, which they could previously interrupt.
+- A scheduled job that fires during shutdown runs next time instead of being silently skipped.
+- One session's long turn no longer delays the scheduled jobs of every other session.
+- A restart mid-sweep no longer loses background outcomes the agent was never told about.
+- A recurring `isolated` scheduled job no longer leaks its tool registry on every fire.
+- Deleting or evicting a session no longer stalls other requests or locks out unrelated ones.
+- `[serve].max_body_bytes` above 2 MiB is honoured; larger bodies were refused regardless.
+- `[serve].gc_scan_interval = "0s"` is rejected rather than silently killing session eviction.
 
 ### Security
 
-- `memory_write` / `memory_delete` refuse a symlinked path rather than writing outside meka's store.
+- `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
 
 ## [0.41.0] - 2026-08-13
 

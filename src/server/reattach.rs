@@ -28,6 +28,35 @@ use crate::{
     permission::{Permission, SharedPermission},
 };
 
+/// Assert a session exists, without building anything.
+///
+/// The counterpart to [`ensure_session_loaded`] for read-only handlers. Reconstruction builds an
+/// `Agent`, a `ToolRegistry` and an MCP-attached registry, then pins the result in the session map
+/// until the GC scanner evicts it again; a handler that only reads rows out of SQLite (messages,
+/// export, background tasks, scheduled jobs) has no use for any of that and should not resurrect a
+/// session as a side effect of being asked about it. Sub-agent transcripts make the difference
+/// concrete: listing a spawn tree would otherwise revive every worker in it.
+pub async fn require_session_exists(state: &ServerState, id: Uuid) -> Result<(), ProblemDetail> {
+    let exists = state
+        .shared
+        .session_manager
+        .session_exists(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to look up session", error)
+                .with("session_id", id.to_string())
+        })?;
+    if exists {
+        return Ok(());
+    }
+    Err(ProblemDetail::new(
+        ErrorKind::SessionNotFound,
+        StatusCode::NOT_FOUND,
+        format!("session '{}' does not exist", id),
+    )
+    .with("session_id", id.to_string()))
+}
+
 /// Look up a session, reconstructing it from the persisted DB row if the in-memory entry has been
 /// evicted. Returns the (now in-memory) `SessionEntry` on success, a 404 problem detail when the
 /// session id is unknown to both the map and the DB, or a 500-class problem detail when
@@ -161,6 +190,8 @@ pub async fn ensure_session_loaded(
     let http_frontend = Arc::new(HttpFrontend::with_capabilities(capabilities));
     let frontend_dyn: Arc<dyn crate::frontend::Frontend> = http_frontend.clone();
 
+    let context_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (agent, tool_registry) = crate::build_session_agent(
         &state.shared,
         shared_permission.clone(),
@@ -168,8 +199,8 @@ pub async fn ensure_session_loaded(
         cwd.clone(),
         // The HTTP API is single-root: additional workspace roots are an ACP-only surface.
         Arc::new(std::sync::RwLock::new(Vec::new())),
-        // The HTTP surface has no context gauge of its own; the session owns the counter.
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::clone(&context_used),
+        Arc::clone(&context_overhead),
     )
     .await
     .map_err(|error| {
@@ -177,11 +208,11 @@ pub async fn ensure_session_loaded(
             .with("session_id", id.to_string())
     })?;
 
+    let background_tasks = agent.background_tasks();
     let runtime = SessionRuntime {
         session_uuid: id,
         messages: conversation,
         agent,
-        tool_registry,
     };
 
     // Use DB-persisted timestamps so GC + re-attach doesn't reset creation time.
@@ -200,6 +231,10 @@ pub async fn ensure_session_loaded(
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         permission: shared_permission,
         cwd,
+        background_tasks,
+        tool_registry,
+        context_used,
+        context_overhead,
         created_at: parsed_created_at,
         updated_at: Arc::new(RwLock::new(parsed_updated_at)),
         // `last_turn_at` is monotonic and used by GC; reset to `now` so a re-attached session

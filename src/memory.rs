@@ -436,6 +436,8 @@ pub struct MemoryCache {
 }
 
 struct CacheState {
+    /// Set by [`MemoryCache::invalidate`]; consumed by the next `current`. See its docs.
+    force_rediscover: bool,
     index: Arc<MemoryIndex>,
     snapshot: BTreeMap<PathBuf, SystemTime>,
 }
@@ -459,6 +461,7 @@ impl MemoryCache {
             root,
             enabled: true,
             state: Mutex::new(CacheState {
+                force_rediscover: false,
                 index: Arc::new(index),
                 snapshot,
             }),
@@ -472,6 +475,7 @@ impl MemoryCache {
             root: None,
             enabled: false,
             state: Mutex::new(CacheState {
+                force_rediscover: false,
                 index: Arc::new(MemoryIndex::default()),
                 snapshot: BTreeMap::new(),
             }),
@@ -481,6 +485,24 @@ impl MemoryCache {
     /// Whether the subsystem is switched on. See the field docs on [`MemoryCache::enabled`].
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Force the next [`Self::current`] to re-discover, whatever the disk snapshot says.
+    ///
+    /// The snapshot keys on mtime alone, from a coarse clock that advances per tick, so *any*
+    /// second write inside one tick is indistinguishable from no write at all -- a wider hazard
+    /// than [`crate::skills::SkillCache`]'s, which also compares size. The cache then keeps serving
+    /// the old content to every agent, and to the read-back in the request that just did the
+    /// writing, which reports the *previous* values in its own 200 response.
+    ///
+    /// Every writer of this store calls it: the HTTP handlers, and the agent's own write and
+    /// delete tools.
+    ///
+    /// A flag rather than clearing the snapshot: an empty snapshot compares equal to an empty
+    /// directory, so clearing it would be a no-op in precisely the case that matters most -- the
+    /// deletion of the last entry, after which `current` would keep serving a file that is gone.
+    pub async fn invalidate(&self) {
+        self.state.lock().await.force_rediscover = true;
     }
 
     /// Return the current index, re-discovering first if the on-disk snapshot changed since the
@@ -503,8 +525,14 @@ impl MemoryCache {
                 _ => return self.state.lock().await.index.clone(),
             }
         };
-        if self.state.lock().await.snapshot == now {
-            return self.state.lock().await.index.clone();
+        {
+            let mut state = self.state.lock().await;
+            // Taken, not merely read: one forced re-discovery is enough, and leaving it set would
+            // make every subsequent `current` walk the filesystem.
+            let forced = std::mem::take(&mut state.force_rediscover);
+            if !forced && state.snapshot == now {
+                return state.index.clone();
+            }
         }
         // Run discovery *without* holding the state lock so concurrent callers aren't blocked
         // behind the filesystem walk. A racing caller may discover in parallel; harmless, since

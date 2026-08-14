@@ -167,6 +167,12 @@ without submitting a speculative turn and reading the `409`. A dropped stream do
 turn; the work continues server-side and resubmitting would duplicate a reply the user is about to
 receive. Poll `GET /v1/sessions/{id}` and wait for it to go `false` rather than retrying blind.
 
+The same holds for a **blocking** turn whose client gives up: a request timeout on your side does
+not stop the turn. It runs to completion, persists its messages, and fires its webhook; you just
+never see the response body. Read the reply from `GET /v1/sessions/{id}/messages`. This is why a
+client timeout shorter than your longest turn is safe, and why retrying on one duplicates work
+rather than recovering it.
+
 ### Turns
 
 A turn is one round-trip: you send a user message, the agent processes it (potentially calling tools in a loop), and returns a result. Turns are ephemeral: they're not stored as their own resource, but the messages they produce are persisted in the session's conversation history.
@@ -212,6 +218,19 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
   it raised.
 - **Errors name the offender.** A bad attachment returns `422` with a detail like
   `` `images[1]` is invalid: unsupported image format ``.
+
+### Detecting a rewritten history
+
+`GET /messages` returns the *materialised* view: what the model can currently see. Three things rewrite it rather than appending to it — compaction, `POST /rewind`, and a mid-turn repair of a malformed request — and after any of them your copy is no longer a prefix of the server's.
+
+Two signals cover this:
+
+- **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all three causes.
+- **`compaction`** on a message identifies a summary and says how many messages it replaced and which compaction it was. Only compaction leaves a message behind to carry it; a rewind removes messages with nothing in their place, which is why `revision` exists.
+
+`total` alone is not enough: a shrinking `total` is indistinguishable from the server losing your conversation.
+
+Note that neither `GET /context` nor `GET /v1/sessions/{id}/tools` will load an evicted session. Reading is not permitted to take the session's cross-process lock, which a write would hold for `idle_timeout`. `/context` answers from the database with the live counters omitted; `/tools` returns 409, since a catalogue needs a loaded session.
 
 ### Messages
 
@@ -306,6 +325,16 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 | `notice` | `level`, `text` | Provider advisories or warnings |
 | `permission_required` | `request_id`, `tool_name`, `expires_in_seconds` | Permission approval needed (Ask mode) |
 
+#### Context
+
+| Event | Payload | When |
+|-------|---------|------|
+| `context.compacted` | `source`, `replaced_count`, `generation` | The conversation was summarised and the window replaced |
+
+`context.compacted` is the one event on this stream that is not additive. Everything else appends, so a client that misses one still holds a prefix of the truth; a compaction *removes* messages the client has already rendered. `source` is `checkpoint`, `checkpoint_text`, or `summarizer` (they differ in fidelity, not just mechanism), `replaced_count` is how many messages the boundary removed from the view (the whole pre-compaction window, including the tail compaction re-appends verbatim), and `generation` counts compactions from 1.
+
+The same information appears on `GET /messages`: the summary message carries a `compaction` object with `replaced_count` and `generation`, and every other message omits the field. Without it a polling client sees `total` shrink with no explanation, which is indistinguishable from the server losing the conversation.
+
 ### Heartbeats
 
 A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these automatically. The stream also sends `retry: 3000` as its first line, hinting clients to reconnect after 3 seconds on disconnect.
@@ -322,7 +351,80 @@ The client should retry by submitting a new turn. Use `GET /messages` to inspect
 
 ### Reconnection
 
-There is no `Last-Event-ID` resumption. If the connection drops mid-turn, submit a new turn or use `GET /messages` to read what happened.
+`GET /v1/sessions/{id}/stream` rejoins the current turn. Send the last id you received as a `Last-Event-ID` header (browser `EventSource` does this automatically) or as a `?last_event_id=` query parameter, and the server replays what you missed before following the live stream.
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+     -H "Last-Event-ID: 42" \
+     "http://localhost:8080/v1/sessions/$SESSION/stream"
+```
+
+The stream opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you actually rejoined, which is the only way to tell "my stream resumed" from "a newer turn started while I was away". That opening event is synthesised by the reconnect rather than replayed, so unlike the original it carries no `started_at` and no `id:` — a resumed stream must not move your stored resume position backwards before the replay has run. Every event after it is the real thing, ids included. The stream always terminates: if the turn has already finished, the buffered tail and its terminal event are delivered and the connection closes.
+
+Three limits, all deliberate:
+
+- **The replay buffer is bounded** by `[serve] stream_replay_events` (default 256). If your `Last-Event-ID` is older than the oldest retained event, you get a `notice` saying the replay has a hole rather than a transcript that silently skips. Read `GET /messages` to fill it.
+- **Only the most recent turn is retained.** Reconnecting after a newer turn started gives you that turn.
+- **A disconnected turn is not cancelled immediately.** It keeps running for `[serve] stream_reattach_grace` (default 30s) waiting for you to come back; after that the agent loop stops, since nobody is listening. Set `"0s"` to restore the older behaviour where a dropped stream cancels the turn at once, which spends fewer provider tokens on abandoned work.
+
+## Webhooks
+
+`meka serve` can POST to configured endpoints when something happens that no client is necessarily waiting on: a scheduled job firing overnight, a background task finishing long after the turn that started it.
+
+```toml
+[[serve.webhooks]]
+url = "https://bridge.example/meka-hook"
+secret = "${MEKA_WEBHOOK_SECRET}"     # or secret_file = "/etc/meka/hook.secret"
+events = ["turn.finished", "turn.failed", "task.finished", "schedule.fired"]
+timeout = "10s"                        # per attempt, default 10s
+max_retries = 3                        # after the first attempt, default 3
+```
+
+`events` is required and every name must be recognised: an endpoint whose only subscription is a typo would be silently never called, so an unknown event is a startup error rather than a warning.
+
+The four do not overlap. `turn.finished` and `turn.failed` cover turns submitted through `POST /turn`; a turn the *server* started fires `schedule.fired` (which carries its own `status`) or `task.finished` instead, so one occurrence never produces two deliveries. A client that wants to know about everything the agent did should subscribe to all four.
+
+### Payloads
+
+Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific identifiers:
+
+```json
+{
+  "delivery_id": "6c1f...",
+  "event": "schedule.fired",
+  "timestamp": "2026-02-01T03:00:00Z",
+  "job_id": "9f2c...",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "isolated": true,
+  "status": "completed"
+}
+```
+
+**Payloads never carry message content.** A webhook URL is a string in a config file: it can be mistyped, it can outlive whatever owned it, and anything that learns it can reach it. So a delivery tells you *what happened to which session*, and you fetch the conversation with your own bearer token over the API you already authenticate against. A compromised endpoint learns that a session was active, not what was said in it.
+
+### Verifying a delivery
+
+When `secret` is set, each request carries `X-Meka-Signature: sha256=<hex>`, an HMAC-SHA256 over `<timestamp>.<body>` keyed with the secret. The timestamp is *inside* the signed material, so a captured delivery cannot be replayed forever: reject anything whose `X-Meka-Timestamp` is too old and the window closes.
+
+```python
+import hmac, hashlib
+
+def verify(secret: str, timestamp: str, body: bytes, signature: str) -> bool:
+    expected = "sha256=" + hmac.new(
+        secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+Deliveries also carry `X-Meka-Event`, `X-Meka-Delivery` (unique per delivery, for deduplicating retries), and `X-Meka-Timestamp`.
+
+Omitting `secret` is allowed for loopback receivers and logs a startup warning; no signature header is sent, rather than one computed over an empty key.
+
+### Delivery semantics
+
+Deliveries are notifications, not a durable queue. They are not persisted, not retried across a restart, and outstanding attempts are abandoned when the process exits: a delivery in flight during a `SIGTERM` is lost. That is the trade for never blocking the work that triggered it. Anything you cannot afford to miss should be reconciled by polling (`GET /v1/schedule`, `GET /v1/sessions/{id}/tasks`), with the webhook as the fast path rather than the only one.
+
+Delivery is fire-and-forget on a detached task, so a slow or dead receiver never wedges the scheduler behind it. A `5xx` or a transport error is retried with exponential backoff (1s, 2s, 4s, capped at 30s) up to `max_retries`. A `4xx` is not, since retrying cannot fix a request the receiver considers malformed, with two exceptions: `429 Too Many Requests` and `408 Request Timeout` say "not now" rather than "not ever" and are retried like a `5xx`. That matters because several jobs sharing a cron minute deliver as a burst, which is exactly when a receiver rate-limits. `Retry-After` is not honoured; the backoff above is used regardless. After the last attempt meka logs one `warn` and gives up. Turn cancellations are not delivered: the client that cancelled already knows.
 
 ## Permission modes over HTTP
 
@@ -368,12 +470,24 @@ Each token carries a set of scopes that control what it can access:
 
 | Scope | Permits |
 |-------|---------|
-| `sessions:r` | List sessions, get session details, read messages |
-| `sessions:w` | Create, modify, delete sessions; submit and cancel turns; respond to permission prompts |
-| `skills:r` | List installed skills |
-| `mcp:r` | List MCP server status |
+| `sessions:r` | List sessions, get details, read messages, context occupancy, export, tools, background tasks, re-attach a stream |
+| `sessions:w` | Create, modify, delete sessions; submit and cancel turns; compact, rewind, import; respond to permission prompts; cancel background tasks |
+| `skills:r` | Read installed skills, including bodies |
+| `skills:w` | Create, update, delete skills |
+| `memory:r` | Read the memory store |
+| `memory:w` | Create, update, delete memories |
+| `schedule:r` | List scheduled jobs. `GET /v1/schedule` is server-wide and returns each job's full `prompt` and, where set, its `gate.command` — so this reads instruction text and shell commands, not just schedules |
+| `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a raw shell command and additionally requires `sessions:w` (see below) |
+| `mcp:r` | Read MCP server status and advertised tools |
+| `mcp:w` | Reconnect an MCP server |
 
-Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`) accept any token with at least one read scope.
+Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`, `/v1/providers`) accept any token with at least one read scope. Two deliberately do not: `GET /v1/skills/{name}` needs `skills:r` and `GET /v1/instructions` needs `sessions:r`, because both return instruction *text* rather than a listing.
+
+Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the other. Operations *on a conversation* stay under `sessions:*`, because the thing being read or changed is one session. The process-wide stores carry their own scopes so a bridge token that runs turns cannot also empty the memory directory or plant an unattended scheduled job.
+
+An unrecognised scope logs a warning at startup and grants nothing, so a typo like `sessions:write` is visible rather than silently inert.
+
+> **Note:** `[skills] agent_managed` and `[memory] access` govern what the *model* may do on its own initiative. They do not gate these endpoints. A token is the operator acting remotely, equivalent to running `meka skill add` in a shell, so a `skills:w` token writes skills even when `agent_managed = false`.
 
 ### Token configuration
 
@@ -416,6 +530,23 @@ If the same key is replayed, the server returns the cached response. If the same
 
 Idempotency keys are **ignored for streaming responses**; streaming clients should reconnect by submitting a new turn.
 
+### Which endpoints are safe to retry
+
+`Idempotency-Key` covers blocking turns only. For everything else, know what a blind retry does before you configure one:
+
+| Endpoint | Retry-safe | On a duplicate |
+|---|---|---|
+| `POST /turn` (blocking, with a key) | yes | cached response returned |
+| `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}` | yes | already-done is the same state |
+| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure — treat it as success if you are retrying blind |
+| `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same file |
+| `POST /compact` | mostly | a second compaction summarises the summary; fidelity drops, nothing is lost |
+| `POST /rewind` | **no** | drops another turn. A client that retries on a connection error loses conversation |
+| `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
+| `POST /sessions/{id}/schedule` | **no** | creates a second job |
+
+The three marked **no** are administrative operations meant to be driven deliberately. If your HTTP stack retries failed POSTs by default, exclude them, or check the outcome first: `POST /rewind` returns `messages_before` and `messages_after`, and `GET /messages` returns a `revision` that increments on every rewrite.
+
 ## Error handling
 
 All HTTP error responses use [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457) with `Content-Type: application/problem+json`:
@@ -440,7 +571,10 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 |------|--------|---------|
 | `/errors/auth` | 401 | Missing or invalid bearer token |
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
+| `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}` — a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session ID |
+| `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, or turn stream |
+| `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel` — there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's DB lock (e.g. two `meka serve` instances sharing one DB); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-cancelled` | 409 | Turn was cancelled |
@@ -450,6 +584,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes` |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
+| `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
 | `/errors/provider` | 502 | Upstream provider call failed |
 | `/errors/internal` | 500 | Unhandled server error |
 
@@ -666,8 +801,44 @@ Key points:
 | POST | `/v1/sessions/{id}/turn` | `sessions:w` | Submit turn |
 | POST | `/v1/sessions/{id}/cancel` | `sessions:w` | Cancel turn |
 | POST | `/v1/sessions/{id}/responses/{request_id}` | `sessions:w` | Resolve permission prompt |
+| GET | `/v1/sessions/{id}/stream` | `sessions:r` | Re-attach to the current turn's SSE stream |
+| POST | `/v1/sessions/{id}/compact` | `sessions:w` | Summarise the conversation now |
+| GET | `/v1/sessions/{id}/context` | `sessions:r` | Context occupancy and cumulative usage |
+| POST | `/v1/sessions/{id}/rewind` | `sessions:w` | Drop trailing turns |
+| GET | `/v1/sessions/{id}/export` | `sessions:r` | Full transcript (`?format=markdown\|json`) |
+| POST | `/v1/sessions/import` | `sessions:w` | Recreate a session tree from an export |
+| GET | `/v1/sessions/{id}/tools` | `sessions:r` | Tool catalogue for this session (409 if not loaded) |
+| GET | `/v1/sessions/{id}/tasks` | `sessions:r` | Background tasks |
+| DELETE | `/v1/sessions/{id}/tasks/{task_id}` | `sessions:w` | Cancel a background task |
+| GET | `/v1/schedule` | `schedule:r` | All scheduled jobs |
+| GET | `/v1/sessions/{id}/schedule` | `schedule:r` | Scheduled jobs for one session |
+| POST | `/v1/sessions/{id}/schedule` | `schedule:w` (+ `sessions:w` for a `gate`) | Create a scheduled job |
+| DELETE | `/v1/schedule/{job_id}` | `schedule:w` | Cancel a scheduled job |
+| GET | `/v1/skills/{name}` | `skills:r` | One skill, with its body |
+| PUT | `/v1/skills/{name}` | `skills:w` | Create or update a skill |
+| DELETE | `/v1/skills/{name}` | `skills:w` | Delete a skill |
+| GET | `/v1/memory` | `memory:r` | Memory index |
+| GET | `/v1/memory/{name}` | `memory:r` | One memory, with its body |
+| PUT | `/v1/memory/{name}` | `memory:w` | Create or update a memory |
+| DELETE | `/v1/memory/{name}` | `memory:w` | Delete a memory |
+| GET | `/v1/mcp/{name}/tools` | `mcp:r` | Tools one MCP server advertises |
+| POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
+| GET | `/v1/instructions` | `sessions:r` | Resolved system instructions |
+| GET | `/v1/providers` | read | Configured provider profiles |
 | GET | `/v1/openapi.json` | None | OpenAPI spec |
 | GET | `/v1/docs` | None | Swagger UI |
+
+`GET /v1/sessions` takes `include_children=true` to list sub-agent sessions alongside top-level ones, and `cwd=<path>` to filter by working directory. Every session record carries `parent_id`, which is what reconnects a spawned worker to the session that dispatched it.
+
+A scheduled job's optional `gate` is the sharpest grant on this API. The command runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. It therefore requires `sessions:w` in addition to `schedule:w`, and the session must be at `write`. A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a shell. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
+
+`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools — the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation.
+
+Cancelling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `cancelled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
+
+`POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout_seconds`.
+
+MCP OAuth login and logout are deliberately absent: the flow opens a browser and pastes back a callback, which does not belong on a service-to-service surface. Use `meka mcp login` on the host. `/v1/providers` is read-only for the same reason provider selection has no environment tier: an ambient value must never silently rebind which account a named profile bills.
 
 For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it interactively at `/v1/docs` (Swagger UI). Both endpoints are unauthenticated so CI pipelines and code generators can fetch the spec without a token.
 

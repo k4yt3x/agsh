@@ -13,8 +13,9 @@ use crate::{
     frontend::FrontendEvent, provider::Notice, server::http_frontend::SessionCapabilities,
 };
 
-/// One SSE event emitted on the wire. Monotonic `id` per turn, reserved for future
-/// `Last-Event-ID` resumption (out of current spec scope).
+/// One SSE event emitted on the wire. Monotonic `id` per turn, which is what makes
+/// `Last-Event-ID` resumption work: a re-attaching client names the last id it saw and the replay
+/// ring hands back everything after it. See [`crate::server::http_frontend::TurnStream`].
 #[derive(Debug, Clone)]
 pub struct SseEvent {
     pub id: u64,
@@ -24,10 +25,11 @@ pub struct SseEvent {
 
 /// Stable event-name strings shipped on the wire. Keep these in lockstep with the HTTP API docs.
 ///
-/// Lifecycle events (`turn.started`, `turn.finished`, `turn.failed`, `turn.cancelled`) are
-/// emitted directly by the streaming-turn handler via `Event::default().event(...)` rather
-/// than through this enum because they carry one-off envelopes (e.g. usage on
-/// `turn.finished`); they don't pass through `translate`.
+/// Lifecycle events (`turn.started`, `turn.finished`, `turn.failed`, `turn.cancelled`) do not pass
+/// through [`translate`]: they carry one-off envelopes the turn handler assembles rather than
+/// anything a `FrontendEvent` describes. They are named here, and ride on [`SseEvent`], because a
+/// re-attaching client has to be able to receive a *terminal* event, and that means the terminal
+/// has to be storable in the replay ring like everything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseEventType {
     AssistantTextDelta,
@@ -36,6 +38,22 @@ pub enum SseEventType {
     ToolCallCompleted,
     Notice,
     PermissionRequired,
+    ContextCompacted,
+    TurnStarted,
+    TurnFinished,
+    TurnFailed,
+    TurnCancelled,
+}
+
+impl SseEventType {
+    /// Whether this event ends the stream. A client receiving one should expect the connection to
+    /// close and must not wait for more.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::TurnFinished | Self::TurnFailed | Self::TurnCancelled
+        )
+    }
 }
 
 impl SseEventType {
@@ -47,6 +65,11 @@ impl SseEventType {
             Self::ToolCallCompleted => "tool_call.completed",
             Self::Notice => "notice",
             Self::PermissionRequired => "permission_required",
+            Self::ContextCompacted => "context.compacted",
+            Self::TurnStarted => "turn.started",
+            Self::TurnFinished => "turn.finished",
+            Self::TurnFailed => "turn.failed",
+            Self::TurnCancelled => "turn.cancelled",
         }
     }
 }
@@ -69,8 +92,11 @@ impl SseEvent {
     }
 }
 
-/// Per-turn event ID counter. Provides monotonic `id` values; reserved for future
-/// `Last-Event-ID` resumption.
+/// Per-*session* event ID counter, owned by [`crate::server::http_frontend::HttpFrontend`].
+///
+/// Session-scoped rather than per-turn precisely so `Last-Event-ID` works: an id from a finished
+/// turn sorts strictly below everything the current one emits, which is what makes the plain
+/// `event.id > last` replay filter correct without knowing which turn an id belongs to.
 #[derive(Debug, Default)]
 pub struct EventIdGenerator {
     next: AtomicU64,
@@ -78,9 +104,19 @@ pub struct EventIdGenerator {
 
 impl EventIdGenerator {
     /// Returns a monotonic 0-based id. The spec's example stream shows `id: 0` on the first
-    /// event (`turn.started`), so we match that convention exactly.
+    /// event (`turn.started`) of a session, so the first turn matches that convention exactly;
+    /// later turns continue the sequence rather than restarting.
     pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The id the next event would get, i.e. one past the highest issued.
+    ///
+    /// A `Last-Event-ID` at or above this was never issued by this session at all: a fabricated
+    /// value, or one carried over from a different session. Resumption discards it rather than
+    /// filtering against it, which would hand back nothing.
+    pub fn peek(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
     }
 }
 
@@ -172,6 +208,22 @@ pub fn translate(
         | FrontendEvent::ToolCallOutputDelta { .. }
         | FrontendEvent::McpProgress(_) => return None,
         FrontendEvent::Notice(notice) => (SseEventType::Notice, notice_view(notice)),
+        // The one event a streaming client cannot infer. Everything else on this stream is
+        // additive, so a client that misses one still holds a prefix of the truth; a compaction
+        // *removes* messages it has already rendered, and without this it would only find out by
+        // noticing `total` went down on the next `GET /messages`.
+        FrontendEvent::Compacted {
+            source,
+            replaced_count,
+            generation,
+        } => (
+            SseEventType::ContextCompacted,
+            serde_json::json!({
+                "source": source,
+                "replaced_count": replaced_count,
+                "generation": generation,
+            }),
+        ),
         FrontendEvent::SessionStarted { .. } => return None,
     };
     Some(pair)

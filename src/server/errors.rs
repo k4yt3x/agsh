@@ -123,9 +123,32 @@ pub enum ErrorKind {
     Auth,
     AuthScope,
     SessionNotFound,
+    /// A named resource that is not a session: a skill, a memory, an MCP server, a background
+    /// task, a turn stream. Distinct from [`Self::SessionNotFound`] because `type` is the
+    /// machine-readable code a client switches on, and "your session is gone" and "that skill does
+    /// not exist" call for very different responses.
+    NotFound,
+    /// The token's scopes are sufficient, but the *session* sits at too low a permission for what
+    /// was asked.
+    ///
+    /// Distinct from [`Self::AuthScope`], which is the same 403 with the opposite remedy. A client
+    /// routing on `type` reads `auth-scope` as "get a better token" and will re-provision forever;
+    /// the fix here is `PATCH /v1/sessions/{id}` with a higher `permission`.
+    SessionPermission,
     SessionLocked,
+    /// The session exists but is not resident in memory, and the endpoint needs live state.
+    ///
+    /// Distinct from [`Self::TurnInFlight`], which reads as "something is running, cancel it" and
+    /// sends a client into a `POST /cancel` loop that returns 204 forever because there is no turn.
+    /// The remedy here is the opposite: submit a turn, which loads the session.
+    SessionNotLoaded,
     TurnInFlight,
     TurnCancelled,
+    /// A re-attached stream ended with no recorded outcome, because the task that would have
+    /// recorded one died. Only ever carried inside a terminal `turn.failed` SSE event, never as an
+    /// HTTP response body, but catalogued here so the type URI has one definition rather than a
+    /// string literal at the emitting site.
+    StreamDetached,
     RequestNotFound,
     Idempotency,
     InvalidBody,
@@ -141,9 +164,13 @@ impl ErrorKind {
             Self::Auth => "https://meka.so/errors/auth",
             Self::AuthScope => "https://meka.so/errors/auth-scope",
             Self::SessionNotFound => "https://meka.so/errors/session-not-found",
+            Self::NotFound => "https://meka.so/errors/not-found",
+            Self::SessionPermission => "https://meka.so/errors/session-permission",
             Self::SessionLocked => "https://meka.so/errors/session-locked",
+            Self::SessionNotLoaded => "https://meka.so/errors/session-not-loaded",
             Self::TurnInFlight => "https://meka.so/errors/turn-in-flight",
             Self::TurnCancelled => "https://meka.so/errors/turn-cancelled",
+            Self::StreamDetached => "https://meka.so/errors/stream-detached",
             Self::RequestNotFound => "https://meka.so/errors/request-not-found",
             Self::Idempotency => "https://meka.so/errors/idempotency",
             Self::InvalidBody => "https://meka.so/errors/invalid-body",
@@ -159,9 +186,13 @@ impl ErrorKind {
             Self::Auth => "Authentication failed",
             Self::AuthScope => "Insufficient scope",
             Self::SessionNotFound => "Session not found",
+            Self::NotFound => "Resource not found",
+            Self::SessionPermission => "Session permission too low",
             Self::SessionLocked => "Session is locked by another process",
+            Self::SessionNotLoaded => "Session is not loaded",
             Self::TurnInFlight => "Turn already in flight",
             Self::TurnCancelled => "Turn cancelled",
+            Self::StreamDetached => "Turn outcome unavailable",
             Self::RequestNotFound => "Pending request not found",
             Self::Idempotency => "Idempotency-Key conflict",
             Self::InvalidBody => "Invalid request body",

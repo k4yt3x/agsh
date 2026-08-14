@@ -162,7 +162,9 @@ max_jobs = 50           # per-session ceiling, refused at schedule_create
 once per interval.
 
 Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves
-existing jobs on disk without firing.
+existing jobs on disk without firing. `POST /v1/sessions/{id}/schedule` refuses with a 422 rather
+than accepting a job that could never run; `GET /v1/schedule` and `DELETE /v1/schedule/{job_id}`
+keep working, so jobs left over from before the flag was flipped can still be listed and cleared.
 
 ## Tips
 

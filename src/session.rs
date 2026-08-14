@@ -132,6 +132,11 @@ pub struct SessionSummary {
     /// SHA-256 fingerprint of the bearer token that created this session. `None` for legacy
     /// rows and for sessions not created via the HTTP API.
     pub token_id: Option<String>,
+    /// The session this one was spawned from, for a sub-agent. `None` for a top-level session.
+    /// Surfaced so a client listing with `include_children` can rebuild the spawn tree rather than
+    /// receiving a flat list in which a worker is indistinguishable from the agent that dispatched
+    /// it.
+    pub parent_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -1750,7 +1755,7 @@ impl SessionManager {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -1787,7 +1792,8 @@ impl SessionManager {
                     let capabilities_json: Option<String> = row.get(5)?;
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
-                    let preview: String = row.get(8)?;
+                    let parent_id: Option<String> = row.get(8)?;
+                    let preview: String = row.get(9)?;
                     Ok((
                         id_str,
                         created_at,
@@ -1797,6 +1803,7 @@ impl SessionManager {
                         capabilities_json,
                         additional_roots_json,
                         token_id,
+                        parent_id,
                         preview,
                     ))
                 })?;
@@ -1812,6 +1819,7 @@ impl SessionManager {
                         capabilities_json,
                         additional_roots_json,
                         token_id,
+                        parent_id,
                         preview,
                     ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
@@ -1828,6 +1836,7 @@ impl SessionManager {
                         capabilities_json,
                         additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
+                        parent_id: parent_id.as_deref().and_then(|raw| Uuid::parse_str(raw).ok()),
                     });
                 }
                 Ok(summaries)
@@ -1853,7 +1862,7 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -1872,7 +1881,8 @@ impl SessionManager {
                     let capabilities_json: Option<String> = row.get(5)?;
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
-                    let preview: String = row.get(8)?;
+                    let parent_id: Option<String> = row.get(8)?;
+                    let preview: String = row.get(9)?;
                     Ok((
                         id_str,
                         created_at,
@@ -1882,6 +1892,7 @@ impl SessionManager {
                         capabilities_json,
                         additional_roots_json,
                         token_id,
+                        parent_id,
                         preview,
                     ))
                 })?;
@@ -1896,6 +1907,7 @@ impl SessionManager {
                             capabilities_json,
                             additional_roots_json,
                             token_id,
+                            parent_id,
                             preview,
                         ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
@@ -1913,6 +1925,9 @@ impl SessionManager {
                             ),
                             capabilities_json,
                             token_id,
+                            parent_id: parent_id
+                                .as_deref()
+                                .and_then(|raw| Uuid::parse_str(raw).ok()),
                         }))
                     }
                     None => Ok(None),

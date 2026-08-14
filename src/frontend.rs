@@ -275,6 +275,27 @@ pub enum FrontendEvent {
     /// (carriage-return overwrite); `AcpFrontend` logs at `info!` today (no protocol primitive
     /// yet). `SilentFrontend` drops them.
     McpProgress(crate::mcp::progress::ProgressUpdate),
+    /// The conversation was just summarised and the window replaced.
+    ///
+    /// Emitted for every compaction whatever triggered it, including the automatic ones that fire
+    /// mid-turn without anyone asking. A frontend holding its own view of the transcript needs this
+    /// because compaction is the one event that makes messages it already rendered stop existing:
+    /// the REPL and ACP re-read from the agent each turn and so never noticed, but an HTTP client
+    /// polling `GET /messages` sees `total` shrink with no explanation unless it is told.
+    Compacted {
+        /// `checkpoint`, `checkpoint_text`, or `summarizer`. The three differ in fidelity, not
+        /// just mechanism.
+        source: &'static str,
+        /// How many materialised messages the boundary removed.
+        ///
+        /// The whole pre-compaction window, including the recent tail that is then re-appended
+        /// verbatim -- so this over-counts what the summary actually stands for. It is the figure
+        /// the replay algorithm uses, and the one the `compaction` marker on `GET /messages`
+        /// reports, so the two always agree.
+        replaced_count: usize,
+        /// Which compaction this was, counting from 1.
+        generation: u64,
+    },
 }
 
 /// Structured side-channel a tool can attach to its [`crate::tools::ToolOutput`] for frontends that

@@ -222,9 +222,195 @@ pub struct ServeConfig {
     pub max_concurrent_turns: Option<usize>,
     /// Request body size limit (bytes). Default 10 MiB.
     pub max_body_bytes: Option<usize>,
+    /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
+    /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
+    ///
+    /// Raising it buys a longer reconnect window at the cost of holding more per-session memory
+    /// during a turn; `0` switches replay off, so a reconnect gets only what happens from then on.
+    pub stream_replay_events: Option<usize>,
+    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
+    /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.
+    ///
+    /// `"0s"` restores the older behaviour where a dropped stream cancels the turn immediately.
+    /// That spends fewer provider tokens on abandoned work, and makes re-attach useful only for
+    /// turns that already finished.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub stream_reattach_grace: Option<std::time::Duration>,
     /// Bearer tokens configured for this deployment. An empty list means no caller can
     /// authenticate; the server runs but every request is rejected with 401.
     pub tokens: Option<Vec<ServeTokenConfig>>,
+    /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
+    pub webhooks: Option<Vec<WebhookConfig>>,
+}
+
+/// One entry in `[[serve.webhooks]]`.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Where to POST. `http://` is accepted for loopback development but logged as a warning:
+    /// deliveries are signed, not encrypted, so anything on the path can read them.
+    pub url: String,
+    /// Shared secret for the `X-Meka-Signature` HMAC. Supports `${ENV_VAR}` substitution.
+    /// Mutually exclusive with `secret_file`.
+    pub secret: Option<String>,
+    /// Path to a file whose contents (trimmed) are the secret. chmod 0600 recommended.
+    pub secret_file: Option<std::path::PathBuf>,
+    /// Which events to deliver. Required and non-empty: an endpoint subscribed to nothing is
+    /// almost certainly a mistake, and silently never firing is the worst way to find out.
+    pub events: Vec<String>,
+    /// Per-attempt request timeout. Accepts humantime strings like `"10s"`. Default `"10s"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub timeout: Option<std::time::Duration>,
+    /// Retries after the first attempt, with exponential backoff. Default 3.
+    pub max_retries: Option<u32>,
+}
+
+// Manual `Debug` so a secret cannot reach a log through the *raw* struct either. Nothing prints
+// this today, but the derived one would have been the single unredacted path in the webhook chain,
+// and that is exactly the kind of thing a later `dbg!` finds.
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("url", &self.url)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("secret_file", &self.secret_file)
+            .field("events", &self.events)
+            .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
+}
+
+/// Scheme + host of a webhook URL, for log lines that run at the default verbosity.
+///
+/// The path is dropped because it frequently *is* the secret (Slack, Discord, and every other
+/// "unguessable URL" webhook). Enough to tell two endpoints apart; not enough to call one.
+pub(crate) fn webhook_host(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or(rest);
+            format!("{}://{}", scheme, host)
+        }
+        None => "<malformed>".to_string(),
+    }
+}
+
+/// Upper bound on `[[serve.webhooks]] max_retries`. See where it is applied for the reasoning.
+const MAX_WEBHOOK_RETRIES: u32 = 10;
+
+/// Validated webhook endpoint, with `${ENV}` substitution applied and `secret_file` loaded.
+#[derive(Clone)]
+pub struct ResolvedWebhook {
+    pub url: String,
+    pub secret: Option<String>,
+    pub events: Vec<String>,
+    pub timeout: std::time::Duration,
+    pub max_retries: u32,
+}
+
+// Manual `Debug` so a configured secret never reaches a log line, matching `ResolvedServeToken`.
+impl std::fmt::Debug for ResolvedWebhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedWebhook")
+            .field("url", &self.url)
+            .field(
+                "secret",
+                &self
+                    .secret
+                    .as_ref()
+                    .map(|secret| format_args!("[REDACTED len={}]", secret.len()).to_string()),
+            )
+            .field("events", &self.events)
+            .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
+}
+
+impl ResolvedWebhook {
+    fn resolve(raw: WebhookConfig) -> Result<Self, String> {
+        if raw.url.trim().is_empty() {
+            return Err("[serve.webhooks] entry has an empty `url`".into());
+        }
+        let (url, _) = substitute_env(&raw.url)?;
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(format!(
+                "[serve.webhooks] url '{}' must start with https:// or http://",
+                url
+            ));
+        }
+        let secret = match (raw.secret, raw.secret_file) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "[serve.webhooks] entry has both `secret` and `secret_file`; pick one".into(),
+                );
+            }
+            (Some(inline), None) => {
+                let (resolved, _) = substitute_env(&inline)?;
+                Some(resolved)
+            }
+            (None, Some(path)) => {
+                let resolved = std::fs::read_to_string(&path)
+                    .map(|contents| contents.trim().to_string())
+                    .map_err(|error| {
+                        format!("failed to read `secret_file` {}: {}", path.display(), error)
+                    })?;
+                warn_if_world_readable(&path);
+                Some(resolved)
+            }
+            (None, None) => None,
+        };
+        if raw.events.is_empty() {
+            return Err(format!(
+                "[serve.webhooks] entry for '{}' subscribes to no events; set `events` to one \
+                 or more of: {}",
+                url,
+                crate::server::webhook::WebhookEvent::ALL.join(", ")
+            ));
+        }
+        for event in &raw.events {
+            if !crate::server::webhook::WebhookEvent::ALL.contains(&event.as_str()) {
+                // Rejected rather than warned, unlike an unknown token scope: a scope that grants
+                // nothing still leaves the token working for whatever else it holds, whereas an
+                // endpoint whose only subscription is a typo is silently never called at all.
+                return Err(format!(
+                    "[serve.webhooks] unknown event '{}'; expected one of: {}",
+                    event,
+                    crate::server::webhook::WebhookEvent::ALL.join(", ")
+                ));
+            }
+        }
+        if secret.as_deref().is_some_and(str::is_empty) {
+            // An empty key still produces a well-formed HMAC, so the receiver would see a valid
+            // `X-Meka-Signature` computed over nothing and the "unsigned deliveries" warning would
+            // not fire. Rejected rather than treated as absent: reaching here means the operator
+            // meant to sign, and an env var that resolved to empty is the likeliest cause.
+            return Err(format!(
+                "[serve.webhooks] entry for '{}' has an empty `secret`; omit the field to send \
+                 unsigned deliveries, or supply a non-empty key",
+                url
+            ));
+        }
+        if raw.timeout == Some(std::time::Duration::ZERO) {
+            // reqwest treats a zero timeout as "already elapsed", so every delivery fails its
+            // whole retry schedule and the only symptom is a warn per event with no hint why.
+            return Err(format!(
+                "[serve.webhooks] entry for '{}' has `timeout = \"0s\"`, which fails every \
+                 delivery before it is sent. Omit the field for the default (10s).",
+                url
+            ));
+        }
+        Ok(Self {
+            url,
+            secret,
+            events: raw.events,
+            timeout: raw.timeout.unwrap_or(std::time::Duration::from_secs(10)),
+            // Clamped rather than trusted: each retry holds a task and sleeps, so a config typo of
+            // `max_retries = 100000` would keep one alive for days against an endpoint that is
+            // plainly not coming back. Ten attempts spans about two minutes of backoff.
+            max_retries: raw.max_retries.unwrap_or(3).min(MAX_WEBHOOK_RETRIES),
+        })
+    }
 }
 
 /// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See
@@ -896,6 +1082,18 @@ pub struct ResolvedConfig {
     /// `[mcp]` default configured"; resolution falls through to the hardcoded Write.
     pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
+    /// Where [`Self::user_instructions`] came from, rendered (`--instructions`,
+    /// `MEKA_INSTRUCTIONS`, or the contributing file paths). Kept alongside the text so an
+    /// operator asking "why is it behaving like that" over the API gets the provenance, not just
+    /// the prose.
+    pub user_instructions_source: Option<String>,
+    /// Non-secret projection of the configured `[providers.<name>]` profiles: `(name, backend,
+    /// model)`.
+    ///
+    /// A projection rather than the profiles themselves, so a field added to [`ProviderProfile`]
+    /// later cannot start appearing on `GET /v1/providers` by accident. Credentials were never in
+    /// here to begin with; they live in the database keyed by profile name.
+    pub provider_profiles: Vec<(String, String, Option<String>)>,
     /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
     /// rendered. Defaults to `true`; see [`SkillsConfig`].
     pub skills_enabled: bool,
@@ -944,7 +1142,13 @@ pub struct ResolvedServeConfig {
     pub shutdown_drain_timeout: std::time::Duration,
     pub max_concurrent_turns: Option<usize>,
     pub max_body_bytes: usize,
+    /// How many SSE events per turn to retain for `Last-Event-ID` replay.
+    pub stream_replay_events: usize,
+    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
+    /// reconnect. Zero means the previous behaviour: a dropped stream cancels the turn at once.
+    pub stream_reattach_grace: std::time::Duration,
     pub tokens: Vec<ResolvedServeToken>,
+    pub webhooks: Vec<ResolvedWebhook>,
 }
 
 /// Validated token entry. The `token` field carries the final secret value with `${ENV}`
@@ -1015,12 +1219,47 @@ impl ResolvedServeConfig {
                     .into(),
             );
         }
+        if raw.gc_scan_interval == Some(std::time::Duration::ZERO) {
+            // `tokio::time::interval(ZERO)` panics, and the GC handle is only ever aborted, never
+            // joined, so the panic is swallowed: eviction silently never runs and every session
+            // lock is held until the process exits. `[schedule].poll_interval` guards the same
+            // shape for the same reason.
+            return Err(
+                "[serve] `gc_scan_interval = \"0s\"` would stop the session GC from ever running. \
+                 Omit the field for the default (5m), or set a positive duration."
+                    .into(),
+            );
+        }
         let tokens = raw
             .tokens
             .unwrap_or_default()
             .into_iter()
             .map(ResolvedServeToken::resolve)
             .collect::<Result<Vec<_>, _>>()?;
+        let webhooks = raw
+            .webhooks
+            .unwrap_or_default()
+            .into_iter()
+            .map(ResolvedWebhook::resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        for webhook in &webhooks {
+            if webhook.secret.is_none() {
+                tracing::warn!(
+                    // Host only. `warn` is the default level, so this line lands in logs an
+                    // operator may well paste elsewhere, and for a Slack- or Discord-style
+                    // endpoint the URL path *is* the credential. The full URL is at `info`.
+                    endpoint = %webhook_host(&webhook.url),
+                    "webhook has no `secret`; deliveries are unsigned and a receiver cannot \
+                     tell them apart from anything else that can reach it",
+                );
+            }
+            if webhook.url.starts_with("http://") {
+                tracing::warn!(
+                    endpoint = %webhook_host(&webhook.url),
+                    "webhook uses plaintext http; deliveries are signed but not encrypted",
+                );
+            }
+        }
         Ok(Self {
             bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
             idle_timeout: raw
@@ -1035,7 +1274,15 @@ impl ResolvedServeConfig {
                 .unwrap_or(std::time::Duration::from_secs(30)),
             max_concurrent_turns: raw.max_concurrent_turns,
             max_body_bytes: raw.max_body_bytes.unwrap_or(10 * 1024 * 1024),
+            // Matches the broadcast channel's capacity: retaining more than the live channel can
+            // buffer would let a client replay events a *connected* consumer would have been
+            // dropped for missing.
+            stream_replay_events: raw.stream_replay_events.unwrap_or(256),
+            stream_reattach_grace: raw
+                .stream_reattach_grace
+                .unwrap_or(std::time::Duration::from_secs(30)),
             tokens,
+            webhooks,
         })
     }
 }
@@ -1073,6 +1320,7 @@ impl ResolvedServeToken {
         if token.is_empty() {
             return Err("[serve.tokens] resolved token is empty".into());
         }
+        crate::server::scope::warn_unknown(&raw.scopes, raw.description.as_deref());
         Ok(Self {
             token,
             description: raw.description,
@@ -1158,10 +1406,10 @@ fn substitute_env(input: &str) -> Result<(String, bool), String> {
                     name.push(inner);
                 }
                 if !closed {
-                    return Err("unclosed `${` in token value".into());
+                    return Err("unclosed `${` in a substituted config value".into());
                 }
                 let value = std::env::var(&name)
-                    .map_err(|_| format!("env var `{}` referenced in token is unset", name))?;
+                    .map_err(|_| format!("env var `{}` referenced in config is unset", name))?;
                 out.push_str(&value);
                 substituted = true;
             }
@@ -1804,7 +2052,12 @@ impl ResolvedConfig {
             crate::instructions::warn_if_large(found);
             tracing::info!("instructions loaded from {}", found.source);
         }
+        let user_instructions_source = instructions.as_ref().map(|found| found.source.to_string());
         let user_instructions = instructions.map(|found| found.text);
+        let provider_profiles: Vec<(String, String, Option<String>)> = providers
+            .iter()
+            .map(|(name, profile)| (name.clone(), profile.backend.clone(), profile.model.clone()))
+            .collect();
 
         let builtin_allowed_tools = file_tools
             .allowed_tools
@@ -1975,6 +2228,8 @@ impl ResolvedConfig {
             mcp_servers,
             mcp_default_permission,
             user_instructions,
+            user_instructions_source,
+            provider_profiles,
             skills_enabled,
             skills_agent_managed,
             memory_enabled,

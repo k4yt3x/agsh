@@ -37,11 +37,15 @@ pub struct ServerState {
     /// Process-wide count of in-flight turns. Inspected by `submit_turn` for the
     /// `max_concurrent_turns` cap; incremented + decremented via [`TurnGuard`].
     pub concurrent_turns: Arc<AtomicUsize>,
-    /// Cancellation token fired when the process receives SIGTERM / SIGINT. Streaming
-    /// turn handlers watch it via `tokio::select!` and emit a final
-    /// `turn.cancelled{reason:"server_shutdown"}` SSE event before closing. Per-session
-    /// `cancellation` tokens are *also* fired during shutdown so the agent loop unwinds.
+    /// Cancellation token fired when the process receives SIGTERM / SIGINT.
+    ///
+    /// What actually stops an in-flight turn is `server::drain_active_sessions`, which fires every
+    /// per-session `cancellation` token. A streaming turn's task reads *this* one only to label
+    /// its terminal event `turn.cancelled{reason:"server_shutdown"}` rather than `client`.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// Outbound webhook fan-out. Empty unless `[[serve.webhooks]]` is configured, in which case
+    /// every `send` is a no-op, so call sites need no `if configured` guard of their own.
+    pub webhooks: super::webhook::WebhookDispatcher,
 }
 
 /// Per-session map entry. Most mutable state lives behind nested locks so cancel / mode /
@@ -68,6 +72,23 @@ pub struct SessionEntry {
     pub permission: SharedPermission,
     /// Per-session working directory, hoisted for the same reason.
     pub cwd: SharedCwd,
+    /// A clone of the session's tool registry, hoisted so `GET /v1/sessions/{id}/tools` can read
+    /// the catalogue without waiting on a turn. `ToolRegistry` is internally `Arc`-backed, so this
+    /// observes the same registry the agent dispatches through, including live MCP updates.
+    pub tool_registry: crate::tools::ToolRegistry,
+    /// Live context occupancy, hoisted for the same reason: the `Agent` that writes these counters
+    /// lives inside the runtime mutex, and the moment a client asks about headroom is the moment
+    /// the session is busy. Written by the agent after every provider round.
+    pub context_used: Arc<std::sync::atomic::AtomicU64>,
+    /// System prompt + tool schemas: the part of the window compaction cannot reclaim.
+    pub context_overhead: Arc<std::sync::atomic::AtomicU64>,
+    /// The session's background-task registry, hoisted for the same reason again.
+    ///
+    /// `DELETE /v1/sessions/{id}/tasks/{task_id}` needs it, and reaching it through
+    /// `runtime.agent` would mean waiting on the mutex an in-flight turn holds. That is precisely
+    /// backwards: the moment somebody wants to stop a detached task is while the session is busy,
+    /// so the one path that must not block on a turn would have blocked on every turn.
+    pub background_tasks: crate::background::BackgroundTasks,
     /// Wall-clock creation time, captured at the start of `POST /v1/sessions`. Surfaced in
     /// session-record responses so clients can sort / display ages without a separate query
     /// to the DB row.
@@ -111,10 +132,6 @@ pub struct SessionRuntime {
     pub session_uuid: Uuid,
     pub messages: Conversation,
     pub agent: crate::agent::Agent,
-    /// Held so `delete_session` / `gc::evict_idle` can call
-    /// `McpClientManager::detach_registry` and stop `tools/list_changed` notifications from
-    /// targeting this dead session. Not otherwise read.
-    pub tool_registry: crate::tools::ToolRegistry,
 }
 
 impl ServerState {
@@ -123,6 +140,7 @@ impl ServerState {
         config: Arc<crate::config::ResolvedServeConfig>,
         idempotency: IdempotencyCache,
     ) -> Self {
+        let config_webhooks = config.webhooks.clone();
         Self {
             shared,
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -130,6 +148,7 @@ impl ServerState {
             idempotency,
             concurrent_turns: Arc::new(AtomicUsize::new(0)),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            webhooks: super::webhook::WebhookDispatcher::new(config_webhooks),
         }
     }
 }
@@ -159,6 +178,58 @@ impl SessionEntry {
         }
         let last = *super::poisoned::read(&self.last_turn_at, "session::is_idle");
         last.elapsed() >= timeout
+    }
+}
+
+/// RAII guard marking a session busy for something that is not a turn.
+///
+/// Compaction and rewind rewrite the conversation, so they need the same two protections a turn
+/// gets from [`TurnGuard`]: nothing else may start on the session, and the GC scanner must not
+/// evict it partway through. They do *not* want the process-wide concurrency cap, which exists to
+/// bound provider load from client-submitted turns, so this is a narrower guard rather than a
+/// reuse of that one.
+///
+/// Acquisition is a compare-and-swap on the session counter, which is what makes the check
+/// atomic: reading `in_flight` and then locking would let two callers both observe zero.
+#[must_use = "dropping the guard immediately defeats the in-flight tracking"]
+pub struct InFlightGuard {
+    session: Arc<AtomicUsize>,
+}
+
+impl InFlightGuard {
+    /// `Err(())` when the session is already busy. The caller turns that into a 409.
+    pub fn acquire(entry: &SessionEntry) -> Result<Self, ()> {
+        entry
+            .in_flight
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self {
+                session: Arc::clone(&entry.in_flight),
+            })
+            .map_err(|_| ())
+    }
+
+    /// Mark a session busy unconditionally, for a caller that already holds the runtime mutex.
+    ///
+    /// The out-of-band turns (a scheduled job, background-outcome delivery) *wait* on that mutex
+    /// rather than refusing, so they cannot use the CAS above: by the time they hold the lock they
+    /// are entitled to the flag, and a failing `POST /turn` that briefly holds it while its own
+    /// `try_lock` bounces would make the CAS spuriously fail.
+    ///
+    /// Without this the counter reads zero for the entire length of an unattended turn, and
+    /// everything built on it is wrong exactly then: `turn_in_flight` reports `false` mid-turn,
+    /// `PATCH` lands a permission change on a running turn nobody is watching, and `DELETE`
+    /// cascades the row away underneath it.
+    pub fn mark_busy(entry: &SessionEntry) -> Self {
+        entry.in_flight.fetch_add(1, Ordering::AcqRel);
+        Self {
+            session: Arc::clone(&entry.in_flight),
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.session.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

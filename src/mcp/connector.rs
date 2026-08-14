@@ -225,7 +225,12 @@ async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cau
 /// capture instructions, discover + register tools into the registry, and flip the entry's state to
 /// `Connected` on success or `Failed` on error. Never panics; errors are logged and reflected in
 /// [`ServerState::Failed`] so the turn gate can surface them.
-async fn connect_one(
+/// **Precondition:** the caller holds `entry.reconnect_lock`, or is the initial sweep in
+/// [`run_connector`], which owns every `Pending` entry outright. Two concurrent calls against one
+/// entry spawn two transports and let the loser's `record_connect_failure` overwrite the winner's
+/// `Connected` state. [`retry_until_connected`] and `McpClientManager::reconnect_server` both take
+/// the lock for this reason.
+pub(crate) async fn connect_one(
     entry: Arc<ServerEntry>,
     manager: Arc<McpClientManager>,
     mcp_default_permission: Option<Permission>,

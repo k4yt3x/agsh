@@ -19,6 +19,7 @@ use crate::{
     server::{
         auth::Principal,
         errors::{ErrorKind, ProblemDetail},
+        scope,
         state::ServerState,
     },
 };
@@ -36,6 +37,16 @@ pub struct MessagesResponse {
     pub session_id: Uuid,
     pub messages: Vec<MessageView>,
     pub total: usize,
+    /// How many times this conversation has been rewritten rather than appended to.
+    ///
+    /// Increments on every compaction, rewind, and mid-turn repair. A polling client that sees it
+    /// change knows its copy is no longer a prefix of the server's and must re-fetch rather than
+    /// diff; `total` alone cannot tell it apart from data loss.
+    ///
+    /// The per-message `compaction` marker explains one of those three. This covers the other two:
+    /// a rewind removes messages with nothing left behind to attach a marker to, which would
+    /// otherwise reproduce exactly the silent-rewrite failure the marker was added to prevent.
+    pub revision: u64,
 }
 
 /// Lightweight wire view of a `Message`. Strips provider-internal blocks like `Thinking`
@@ -59,6 +70,27 @@ pub struct MessageView {
     /// `turn_id` on `POST /v1/sessions/{id}/turn` is a different identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Present only on a message that *is* a compaction summary.
+    ///
+    /// Without this a client polling `/messages` watches history rewrite itself: a compaction
+    /// truncates the materialised tail and pushes a summary in its place, so `total` shrinks and
+    /// messages the client already rendered stop coming back. The marker is what lets it tell
+    /// "the window was summarised" from "the server lost my conversation".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionMarker>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CompactionMarker {
+    /// How many materialised messages the boundary removed.
+    ///
+    /// The whole pre-compaction window, including the recent tail that compaction then re-appends
+    /// verbatim, so it over-counts what the summary itself stands for. Use it to detect *that* the
+    /// view was rewritten, not to compute how much was lost.
+    pub replaced_count: usize,
+    /// Which compaction produced it, counting from 1. Fidelity degrades with each pass, so a
+    /// client rendering a transcript can say how far from the original it is.
+    pub generation: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -127,13 +159,7 @@ pub async fn list_messages(
     Path(id): Path<Uuid>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponse>, ProblemDetail> {
-    if !principal.has_scope("sessions:r") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:r` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:r")?;
     let events_with_ts = state
         .shared
         .session_manager
@@ -166,7 +192,12 @@ pub async fn list_messages(
     // `Conversation::rebuild_materialized` but with a parallel timestamp
     // vec: Event::Append pushes (timestamp, message); Event::CompactBoundary truncates the
     // tail and pushes (boundary_timestamp, summary). Result: `messages.len() == timestamps.len()`.
-    let (materialized, timestamps) = materialize_with_timestamps(&events_with_ts);
+    let Materialized {
+        messages: materialized,
+        timestamps,
+        markers,
+        revision,
+    } = materialize_with_timestamps(&events_with_ts);
     let total = materialized.len();
     let offset = query.offset.unwrap_or(0).min(total);
     let limit = query.limit.unwrap_or(200).min(1000);
@@ -179,7 +210,8 @@ pub async fn list_messages(
         .iter()
         .zip(timestamps[offset..end].iter())
         .zip(turn_indexes[offset..end].iter())
-        .map(|((message, timestamp), turn_index)| MessageView {
+        .zip(markers[offset..end].iter())
+        .map(|(((message, timestamp), turn_index), marker)| MessageView {
             role: match message.role {
                 Role::User => "user".to_string(),
                 Role::Assistant => "assistant".to_string(),
@@ -187,12 +219,14 @@ pub async fn list_messages(
             content: message.content.iter().map(view_for_block).collect(),
             created_at: Some(timestamp.clone()),
             turn_id: Some(turn_index.clone()),
+            compaction: marker.clone(),
         })
         .collect();
     Ok(Json(MessagesResponse {
         session_id: id,
         messages,
         total,
+        revision,
     }))
 }
 
@@ -200,44 +234,80 @@ pub async fn list_messages(
 /// 1:1. `Event::Append` pushes the message + its created_at; `Event::CompactBoundary` truncates
 /// the tail by `replaced_count` and pushes the boundary's summary + the boundary row's
 /// created_at. Mirrors `Conversation::rebuild_materialized` byte-for-byte on the messages side.
-fn materialize_with_timestamps(events: &[(String, Event)]) -> (Vec<Message>, Vec<String>) {
+fn materialize_with_timestamps(events: &[(String, Event)]) -> Materialized {
     let mut messages: Vec<Message> = Vec::with_capacity(events.len());
     let mut timestamps: Vec<String> = Vec::with_capacity(events.len());
+    let mut markers: Vec<Option<CompactionMarker>> = Vec::with_capacity(events.len());
+    let mut generation: u64 = 0;
+    let mut revision: u64 = 0;
     for (ts, event) in events {
         match event {
             Event::Append(message) => {
                 messages.push(message.clone());
                 timestamps.push(ts.clone());
+                markers.push(None);
             }
             Event::CompactBoundary {
                 summary,
                 replaced_count,
                 ..
             } => {
+                revision = revision.saturating_add(1);
                 let truncate_to = messages.len().saturating_sub(*replaced_count);
                 messages.truncate(truncate_to);
                 timestamps.truncate(truncate_to);
+                markers.truncate(truncate_to);
                 messages.push(summary.clone());
                 timestamps.push(ts.clone());
+                generation = generation.saturating_add(1);
+                // `replaced_count` as the event recorded it, not `messages.len() - truncate_to`:
+                // a boundary can legitimately claim more messages than are still materialised
+                // (a prior boundary already collapsed some), and the event's own figure is what
+                // actually happened.
+                markers.push(Some(CompactionMarker {
+                    replaced_count: *replaced_count,
+                    generation,
+                }));
             }
             Event::Repair {
                 replaced_count,
                 messages: replacements,
             } => {
+                revision = revision.saturating_add(1);
                 let truncate_to = messages.len().saturating_sub(*replaced_count);
                 messages.truncate(truncate_to);
                 timestamps.truncate(truncate_to);
+                markers.truncate(truncate_to);
                 // The repair row's own timestamp, not the replaced messages', because that is when
                 // this content came into being. Keeping the originals' would put the replacement
                 // ahead of messages that predate it in a client sorting by time.
                 for replacement in replacements {
                     messages.push(replacement.clone());
                     timestamps.push(ts.clone());
+                    markers.push(None);
                 }
             }
         }
     }
-    (messages, timestamps)
+    Materialized {
+        messages,
+        timestamps,
+        markers,
+        revision,
+    }
+}
+
+/// The replayed event log, as three vectors the caller indexes in lockstep.
+///
+/// A struct rather than a tuple because the invariant is that all three have the same length, and
+/// every arm of the replay has to maintain it; a fourth parallel `Vec` returned loose is exactly
+/// how that gets silently broken.
+struct Materialized {
+    messages: Vec<Message>,
+    timestamps: Vec<String>,
+    markers: Vec<Option<CompactionMarker>>,
+    /// Count of non-`Append` events: every point at which the log was rewritten.
+    revision: u64,
 }
 
 /// Group materialized messages into virtual turns. Every user-role message opens a new turn;

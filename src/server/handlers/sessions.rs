@@ -24,6 +24,7 @@ use crate::{
         errors::{ErrorKind, ProblemDetail},
         http_frontend::{HttpFrontend, SessionCapabilities},
         reattach::ensure_session_loaded,
+        scope,
         state::{ServerState, SessionEntry, SessionRuntime},
     },
     session::SessionManager,
@@ -175,6 +176,9 @@ pub struct SessionResponse {
     ///
     /// Always `false` for a GC-evicted session, since eviction requires an idle session.
     pub turn_in_flight: bool,
+    /// The session this one was spawned from, for a sub-agent; absent for a top-level session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -183,6 +187,17 @@ pub struct ListSessionsQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Include sub-agent sessions. Default `false`, which lists only top-level conversations.
+    ///
+    /// Off by default because a dispatcher that spawns freely would otherwise bury its own
+    /// sessions under the workers it started, and a client paging through the list wants the
+    /// conversations it created. Turn it on to audit what was spawned; `parent_id` on each row is
+    /// what reconnects a worker to the session that dispatched it.
+    #[serde(default)]
+    pub include_children: Option<bool>,
+    /// Only list sessions whose working directory matches this path exactly.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -259,6 +274,7 @@ fn validate_cwd(path: &std::path::Path) -> Result<(), ProblemDetail> {
         (status = 201, description = "Session created", body = SessionResponse),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -268,13 +284,7 @@ pub async fn create_session(
     Extension(principal): Extension<Principal>,
     raw_body: Bytes,
 ) -> Result<(StatusCode, Json<SessionResponse>), ProblemDetail> {
-    if !principal.has_scope("sessions:w") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:w` is required to create sessions",
-        ));
-    }
+    scope::require(&principal, "sessions:w")?;
 
     let body: CreateSessionRequest = serde_json::from_slice(&raw_body).map_err(|_| {
         ProblemDetail::new(
@@ -360,6 +370,10 @@ pub async fn create_session(
         .map_err(|error| ProblemDetail::internal_sanitized("failed to lock session", error))?;
 
     // Build the per-session Agent + ToolRegistry.
+    // Retained so `GET /context` and `GET /tools` can read them without the runtime mutex; see
+    // the note on `SessionEntry::context_used`.
+    let context_used = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (agent, tool_registry) = crate::build_session_agent(
         &state.shared,
         shared_permission.clone(),
@@ -367,17 +381,17 @@ pub async fn create_session(
         cwd.clone(),
         // The HTTP API is single-root: additional workspace roots are an ACP-only surface.
         Arc::new(std::sync::RwLock::new(Vec::new())),
-        // The HTTP surface has no context gauge of its own; the session owns the counter.
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::clone(&context_used),
+        Arc::clone(&context_overhead),
     )
     .await
     .map_err(|error| ProblemDetail::internal_sanitized("failed to build session agent", error))?;
 
+    let background_tasks = agent.background_tasks();
     let runtime = SessionRuntime {
         session_uuid,
         messages: Conversation::new(),
         agent,
-        tool_registry,
     };
 
     let entry = SessionEntry {
@@ -386,6 +400,10 @@ pub async fn create_session(
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         permission: shared_permission,
         cwd: cwd.clone(),
+        background_tasks,
+        tool_registry,
+        context_used,
+        context_overhead,
         created_at: created_at_wall,
         updated_at: Arc::new(RwLock::new(created_at_wall)),
         last_turn_at: Arc::new(RwLock::new(std::time::Instant::now())),
@@ -426,6 +444,9 @@ pub async fn create_session(
             title,
             capabilities,
             turn_in_flight: false,
+            // Top-level by construction: `POST /v1/sessions` has no way to name a parent, and a
+            // sub-agent session is only ever minted by `agent_spawn` inside a turn.
+            parent_id: None,
         }),
     ))
 }
@@ -460,6 +481,7 @@ pub struct ForkSessionBody {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -471,13 +493,7 @@ pub async fn fork_session(
     Path(id): Path<Uuid>,
     raw_body: Bytes,
 ) -> Result<(StatusCode, Json<SessionResponse>), ProblemDetail> {
-    if !principal.has_scope("sessions:w") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:w` is required to fork sessions",
-        ));
-    }
+    scope::require(&principal, "sessions:w")?;
 
     // An empty body is the common case (`inherit everything`), and axum hands it to us as zero
     // bytes, which is not valid JSON.
@@ -546,14 +562,16 @@ pub async fn fork_session(
         principal.token_id,
     );
 
-    let title = state
+    let forked_info = state
         .shared
         .session_manager
         .session_info(forked.id)
         .await
         .ok()
-        .flatten()
-        .map(|info| info.preview)
+        .flatten();
+    let title = forked_info
+        .as_ref()
+        .map(|info| info.preview.clone())
         .unwrap_or_default();
 
     Ok((
@@ -568,6 +586,9 @@ pub async fn fork_session(
             title,
             capabilities: entry.capabilities,
             turn_in_flight: false,
+            // Read back rather than assumed: forking a sub-agent session keeps it under the same
+            // parent, so the copy is a sibling of the original, not a new root.
+            parent_id: forked_info.and_then(|info| info.parent_id),
         }),
     ))
 }
@@ -592,18 +613,18 @@ pub async fn list_sessions(
     Extension(principal): Extension<Principal>,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<ListSessionsResponse>, ProblemDetail> {
-    if !principal.has_scope("sessions:r") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:r` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:r")?;
     let limit = query.limit.unwrap_or(50).min(200);
+    let cwd_filter = query.cwd.as_deref().map(std::path::Path::new);
     let (rows, next_cursor) = state
         .shared
         .session_manager
-        .list_sessions(limit, false, None, query.cursor.as_deref())
+        .list_sessions(
+            limit,
+            query.include_children.unwrap_or(false),
+            cwd_filter,
+            query.cursor.as_deref(),
+        )
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to list sessions", error))?;
 
@@ -651,6 +672,7 @@ pub async fn list_sessions(
                 title: row.preview,
                 capabilities,
                 turn_in_flight,
+                parent_id: row.parent_id,
             }
         })
         .collect();
@@ -682,13 +704,7 @@ pub async fn get_session(
     Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SessionResponse>, ProblemDetail> {
-    if !principal.has_scope("sessions:r") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:r` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:r")?;
     if let Some(entry) = state.sessions.read().await.get(&id).cloned() {
         let updated_at = entry
             .updated_at
@@ -698,14 +714,16 @@ pub async fn get_session(
             .unwrap_or_default();
         // Title isn't cached in-memory; a DB error falls back to empty rather than 500
         // because title is descriptive, not load-bearing.
-        let title = state
+        let info = state
             .shared
             .session_manager
             .session_info(id)
             .await
             .ok()
-            .flatten()
-            .map(|info| info.preview)
+            .flatten();
+        let title = info
+            .as_ref()
+            .map(|info| info.preview.clone())
             .unwrap_or_default();
         let last_turn_at = entry
             .last_turn_at_wall
@@ -722,6 +740,7 @@ pub async fn get_session(
             title,
             capabilities: entry.capabilities,
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+            parent_id: info.and_then(|info| info.parent_id),
         }));
     }
     let summary = state
@@ -750,6 +769,7 @@ pub async fn get_session(
         title: summary.preview,
         capabilities,
         turn_in_flight: false,
+        parent_id: summary.parent_id,
     }))
 }
 
@@ -771,6 +791,7 @@ pub async fn get_session(
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "Turn in flight; cancel first", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -782,13 +803,7 @@ pub async fn patch_session(
     Path(id): Path<Uuid>,
     raw_body: Bytes,
 ) -> Result<Json<SessionResponse>, ProblemDetail> {
-    if !principal.has_scope("sessions:w") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:w` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:w")?;
 
     let body: PatchSessionRequest = serde_json::from_slice(&raw_body).map_err(|_| {
         ProblemDetail::new(
@@ -895,14 +910,16 @@ pub async fn patch_session(
         .ok()
         .map(|guard| guard.to_rfc3339())
         .unwrap_or_default();
-    let title = state
+    let info = state
         .shared
         .session_manager
         .session_info(id)
         .await
         .ok()
-        .flatten()
-        .map(|info| info.preview)
+        .flatten();
+    let title = info
+        .as_ref()
+        .map(|info| info.preview.clone())
         .unwrap_or_default();
     let last_turn_at = entry
         .last_turn_at_wall
@@ -919,6 +936,7 @@ pub async fn patch_session(
         title,
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
+        parent_id: info.and_then(|info| info.parent_id),
     }))
 }
 
@@ -938,7 +956,7 @@ pub struct PatchSessionRequest {
 /// Build the 409 returned when a mutating session operation races an in-flight turn. The
 /// `detail` message varies per call site (delete vs patch); the type, status, and `session_id`
 /// extension are fixed.
-fn turn_in_flight_conflict(id: Uuid, detail: impl Into<String>) -> ProblemDetail {
+pub(crate) fn turn_in_flight_conflict(id: Uuid, detail: impl Into<String>) -> ProblemDetail {
     ProblemDetail::new(ErrorKind::TurnInFlight, StatusCode::CONFLICT, detail)
         .with("session_id", id.to_string())
 }
@@ -963,13 +981,7 @@ pub async fn delete_session(
     Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ProblemDetail> {
-    if !principal.has_scope("sessions:w") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:w` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:w")?;
     // Refuse DELETE while a turn is in flight: silently destroying agent work would surprise
     // callers. DB-delete runs BEFORE the in-memory remove so a transient DB failure leaves
     // the session usable (client can retry).
@@ -1004,34 +1016,73 @@ pub async fn delete_session(
         }
     }
 
-    let mut map = state.sessions.write().await;
-    if let Some(entry) = map.get(&id)
-        && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
-    {
-        return Err(turn_in_flight_conflict(
-            id,
-            "session has an in-flight turn; cancel it first via POST /v1/sessions/{id}/cancel",
-        ));
-    }
-    // DB-delete first: on failure the in-memory entry stays so the session keeps working.
+    // The write lock covers the in-flight re-check and the map removal, and nothing else. It used
+    // to span the DB delete as well, which is a cascading `DELETE` plus a lock-directory sweep that
+    // does blocking `read_dir` / `remove_file` on the connection thread -- and that thread is
+    // shared, so the call can queue behind a large `GET /export` or `POST /import`. Held across
+    // that, and with tokio's `RwLock` being write-preferring, a single DELETE stalls every reader
+    // in the process: `POST /cancel`, `GET /stream`, the GC scan, the background poller.
+    //
+    // Shortening it is safe because the map lock is not what serialises this against a concurrent
+    // re-attach: the removed entry still owns the session's cross-process `SessionLock`, and holds
+    // it until the end of this function. A request arriving in the gap finds no map entry, loads
+    // the row, fails to take the file lock, and gets `session-locked` -- never a second live entry
+    // for a session being deleted.
+    //
+    // The one case that argument does not cover is a session that was already evicted, where there
+    // is no entry and so no lock to hold. A re-attach that has taken the file lock and passed its
+    // own existence re-check could then insert an entry for a row this delete is about to remove.
+    // The window is the few instructions between the two, and both sides funnel through the single
+    // database connection, which orders the delete ahead of the re-check in practice.
+    let removed = {
+        let mut map = state.sessions.write().await;
+        if let Some(entry) = map.get(&id)
+            && entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0
+        {
+            return Err(turn_in_flight_conflict(
+                id,
+                "session has an in-flight turn; cancel it first via POST /v1/sessions/{id}/cancel",
+            ));
+        }
+        map.remove(&id)
+    };
+
+    // A failure here leaves the row in place with the entry already evicted, so the session is
+    // still usable: the next request re-attaches it from the row it just failed to delete.
     state
         .shared
         .session_manager
         .delete_session(id)
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to delete session", error))?;
-    let removed = map.remove(&id);
-    drop(map);
 
-    // Detach the tool registry from MCP so `tools/list_changed` callbacks stop targeting it.
-    // `try_lock` is safe: the in-flight check passed and the entry is removed from the map.
-    if let Some(entry) = removed.as_ref()
-        && let Some(manager) = state.shared.mcp_manager.as_ref()
-        && let Ok(runtime) = entry.runtime.try_lock()
-    {
-        let registry = runtime.tool_registry.clone();
-        drop(runtime);
-        manager.detach_registry(&registry).await;
+    if let Some(entry) = removed.as_ref() {
+        // Signalled after the row is gone, not before: a failed DB delete leaves the session
+        // usable, and killing its work first would make that rollback a lie.
+        //
+        // The in-flight check above only covers *turns*. A detached background task never sets
+        // `in_flight`, so DELETE sails past one, and the cascade has just taken the
+        // `background_tasks` rows with the session -- which is what makes this the last chance to
+        // stop it. Without this the task and its whole process group run on with no row to find
+        // them by, so `DELETE /v1/sessions/{id}/tasks/{task_id}` now 404s and only restarting the
+        // server (which still would not reap the process group) ends it. The REPL does the same
+        // thing on its way out.
+        let signalled = entry.background_tasks.cancel_session(id).await;
+        if signalled > 0 {
+            tracing::info!(
+                "deleting session {} signalled {} running background task(s) to stop",
+                id,
+                signalled
+            );
+        }
+
+        // Detach the tool registry from MCP so `tools/list_changed` callbacks stop targeting it.
+        // Read off the hoisted handle rather than through `runtime`: a `try_lock` here fails
+        // against anything holding the mutex, and skipping the detach would leak the registry into
+        // the manager for the life of the process.
+        if let Some(manager) = state.shared.mcp_manager.as_ref() {
+            manager.detach_registry(&entry.tool_registry).await;
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

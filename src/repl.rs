@@ -1770,6 +1770,12 @@ impl Frontend for ReplFrontend {
             // parent's own renderer; a rolling rewrite of one tool call's content has no place in
             // a scrolling transcript.
             FrontendEvent::SubAgentActivity { .. } => {}
+            // Nothing to draw: the transcript on screen is a scrollback the user wrote, not a view
+            // of the model's window, so a compaction does not invalidate anything they can see.
+            // `/compact` reports its own outcome through `render::compaction_summary`, and the
+            // automatic paths log at `info!`. The event exists for clients that hold a *mirror* of
+            // the conversation and would otherwise watch it shrink; see `server::sse`.
+            FrontendEvent::Compacted { .. } => {}
             FrontendEvent::McpProgress(update) => {
                 // Forward through the existing REPL channel so the blocking REPL thread renders
                 // the inline status line (carriage-return overwrite via `render_progress_update`).

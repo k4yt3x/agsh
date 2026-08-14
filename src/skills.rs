@@ -185,6 +185,8 @@ pub struct SkillCache {
 }
 
 struct CacheState {
+    /// Set by [`SkillCache::invalidate`]; consumed by the next `current`. See its docs.
+    force_rediscover: bool,
     skills: Arc<Vec<Skill>>,
     snapshot: BTreeMap<PathBuf, (SystemTime, u64)>,
 }
@@ -209,6 +211,7 @@ impl SkillCache {
             root,
             enabled: true,
             state: Mutex::new(CacheState {
+                force_rediscover: false,
                 skills: Arc::new(skills),
                 snapshot,
             }),
@@ -222,6 +225,7 @@ impl SkillCache {
             root: None,
             enabled: false,
             state: Mutex::new(CacheState {
+                force_rediscover: false,
                 skills: Arc::new(Vec::new()),
                 snapshot: BTreeMap::new(),
             }),
@@ -238,6 +242,24 @@ impl SkillCache {
     /// install to" in their error text.
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Force the next [`Self::current`] to re-discover, whatever the disk snapshot says.
+    ///
+    /// The snapshot keys on `(mtime, size)`, and mtime comes from a coarse clock that advances per
+    /// tick. Two writes inside one tick that render to the same length are therefore
+    /// indistinguishable from no write at all, and the cache keeps serving the old content -- to
+    /// every agent, and to the read-back in the request that just did the writing, which then
+    /// reports the *previous* values in its own 200 response.
+    ///
+    /// Every writer of this store calls it: the HTTP handlers, and the agent's own write and
+    /// delete tools.
+    ///
+    /// A flag rather than clearing the snapshot: an empty snapshot compares equal to an empty
+    /// directory, so clearing it would be a no-op in precisely the case that matters most -- the
+    /// deletion of the last entry, after which `current` would keep serving a file that is gone.
+    pub async fn invalidate(&self) {
+        self.state.lock().await.force_rediscover = true;
     }
 
     /// Return the current skill list, re-discovering first if the on-disk snapshot has changed
@@ -258,8 +280,14 @@ impl SkillCache {
                 _ => return self.state.lock().await.skills.clone(),
             }
         };
-        if self.state.lock().await.snapshot == now {
-            return self.state.lock().await.skills.clone();
+        {
+            let mut state = self.state.lock().await;
+            // Taken, not merely read: one forced re-discovery is enough, and leaving it set would
+            // make every subsequent `current` walk the filesystem.
+            let forced = std::mem::take(&mut state.force_rediscover);
+            if !forced && state.snapshot == now {
+                return state.skills.clone();
+            }
         }
         // Run discovery *without* holding the state lock so concurrent `current()` callers aren't
         // blocked behind the filesystem walk. A racing caller may discover in parallel. Harmless:
@@ -340,6 +368,24 @@ pub async fn load_skill_body(skill: &Skill) -> Result<String, String> {
         .unwrap_or(content);
 
     Ok(format!("{}\n\n{}", skill_context_header(skill), body))
+}
+
+/// The skill body exactly as stored, frontmatter stripped and nothing added.
+///
+/// [`load_skill_body`] is the *agent-facing* rendering: it prepends a base-directory line so
+/// relative references in the body resolve against the skill. That header is a render-time
+/// decoration, not part of the file, and handing it to an editing client is lossy -- a
+/// `GET`-edit-`PUT` cycle would write it into `SKILL.md`, and the next cycle would write it again,
+/// each copy freezing an absolute host path that goes stale the moment the config directory moves.
+/// `GET /v1/skills/{name}` therefore reads through this, which round-trips through
+/// `PUT /v1/skills/{name}` byte for byte, the way the memory store's already does.
+pub async fn load_skill_source(skill: &Skill) -> Result<String, String> {
+    let content = tokio::fs::read_to_string(&skill.body_path)
+        .await
+        .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
+    Ok(split_frontmatter(&content)
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(content))
 }
 
 /// Build the one-line context header prepended to a skill body by [`load_skill_body`]. Points the
@@ -571,6 +617,69 @@ pub fn render_template(
 
 #[cfg(test)]
 mod tests {
+    /// A same-length rewrite inside one clock tick leaves `(mtime, size)` unchanged, so the cache
+    /// would keep serving the old skill. `invalidate` is what every writer calls to stop that,
+    /// and this is the property it has to hold: a forced re-discovery even when disk looks
+    /// identical.
+    #[tokio::test]
+    async fn invalidate_forces_rediscovery_when_the_snapshot_cannot_see_the_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let dir = root.join("same-size");
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        let render = |priority: u8| {
+            format!(
+                "---\ndescription: a description\npriority: {}\n---\n\nbody\n",
+                priority
+            )
+        };
+        std::fs::write(dir.join("SKILL.md"), render(3)).expect("write v1");
+
+        let cache = super::SkillCache::for_root(Some(root.clone()));
+        assert_eq!(cache.current().await[0].priority, 3);
+
+        // Identical length, and the mtime is restored so the snapshot genuinely cannot tell.
+        let before = std::fs::metadata(dir.join("SKILL.md"))
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        std::fs::write(dir.join("SKILL.md"), render(7)).expect("write v2");
+        filetime::set_file_mtime(
+            dir.join("SKILL.md"),
+            filetime::FileTime::from_system_time(before),
+        )
+        .ok();
+
+        // Without invalidation the cache is entitled to serve the stale value; with it, it must
+        // not. Only the second half is a guarantee, so only that is asserted.
+        cache.invalidate().await;
+        assert_eq!(
+            cache.current().await[0].priority,
+            7,
+            "invalidate must force a re-read even when mtime and size are unchanged"
+        );
+    }
+
+    /// Deleting the last entry is the case a snapshot-clearing implementation got wrong: an empty
+    /// snapshot compares equal to an empty directory, so the cache kept serving a deleted file.
+    #[tokio::test]
+    async fn invalidate_sees_the_deletion_of_the_last_skill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let dir = root.join("only");
+        std::fs::create_dir_all(&dir).expect("create skill dir");
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: d\n---\n\nbody\n").expect("write");
+
+        let cache = super::SkillCache::for_root(Some(root.clone()));
+        assert_eq!(cache.current().await.len(), 1);
+
+        std::fs::remove_dir_all(&dir).expect("delete");
+        cache.invalidate().await;
+        assert!(
+            cache.current().await.is_empty(),
+            "a deleted skill must not survive in the cache"
+        );
+    }
+
     use super::*;
 
     fn write_skill(root: &Path, name: &str, skill_md: &str) {

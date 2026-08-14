@@ -19,6 +19,7 @@ use crate::server::{
     errors::{ErrorKind, ProblemDetail},
     http_frontend::PermissionResolution,
     reattach::ensure_session_loaded,
+    scope,
     state::ServerState,
 };
 
@@ -51,6 +52,7 @@ pub enum PermissionDecision {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session or request not found / already resolved", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -62,13 +64,7 @@ pub async fn respond(
     Path((session_id, request_id)): Path<(Uuid, String)>,
     raw_body: Bytes,
 ) -> Result<StatusCode, ProblemDetail> {
-    if !principal.has_scope("sessions:w") {
-        return Err(ProblemDetail::new(
-            ErrorKind::AuthScope,
-            StatusCode::FORBIDDEN,
-            "scope `sessions:w` is required",
-        ));
-    }
+    scope::require(&principal, "sessions:w")?;
     // Parse via `serde_json` directly so `deny_unknown_fields` rejections produce a
     // `application/problem+json` 422 instead of axum's default text/plain response.
     let body: ResponseBody = serde_json::from_slice(&raw_body).map_err(|error| {
