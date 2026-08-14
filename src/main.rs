@@ -506,6 +506,9 @@ struct AgentAssembly<'a> {
     provider: Arc<dyn provider::Provider>,
     mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
     skills: Arc<skills::SkillCache>,
+    /// Whether this agent gets `skill_write` / `skill_delete`, from `[skills] agent_managed`.
+    /// Never reaches a sub-agent registry; see `ToolRegistry::register_session_scoped_tools`.
+    skills_agent_managed: bool,
     memories: Arc<memory::MemoryCache>,
     builtin_filter: crate::tools::BuiltinToolFilter,
     agent_options: AgentOptions,
@@ -572,6 +575,7 @@ async fn assemble_agent(
         bundle.session_manager.clone(),
         shared_session_id.clone(),
         bundle.skills.clone(),
+        bundle.skills_agent_managed,
         bundle.memories.clone(),
         bundle.builtin_filter.clone(),
         cwd.clone(),
@@ -712,6 +716,7 @@ pub async fn build_session_agent(
         provider: Arc::clone(&shared.provider),
         mcp_manager: shared.mcp_manager.as_ref(),
         skills: shared.skills.clone(),
+        skills_agent_managed: shared.config.skills_agent_managed,
         memories: shared.memories.clone(),
         builtin_filter: shared.builtin_filter.clone(),
         agent_options: shared.agent_options.clone(),
@@ -842,6 +847,7 @@ async fn create_agent_from_config(
         provider: Arc::clone(&provider),
         mcp_manager,
         skills: skills.clone(),
+        skills_agent_managed: config.skills_agent_managed,
         memories: memories.clone(),
         builtin_filter: builtin_filter.clone(),
         agent_options: agent_options.clone(),
@@ -2566,6 +2572,7 @@ async fn run_tools_subcommand(
                 } else {
                     crate::skills::SkillCache::disabled()
                 },
+                config.skills_agent_managed,
                 if config.memory_enabled {
                     crate::memory::MemoryCache::for_root(None)
                 } else {
@@ -2712,6 +2719,7 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
         cli::SkillAction::Add {
             name,
             description,
+            priority,
             version,
             author,
             source_url,
@@ -2722,6 +2730,7 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
             skills::cli::run_add(skills::cli::AddArgs {
                 name,
                 description: description.as_deref(),
+                priority: *priority,
                 version: version.as_deref(),
                 author: author.as_deref(),
                 source_url: source_url.as_deref(),

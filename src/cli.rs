@@ -260,6 +260,10 @@ pub enum SkillAction {
         #[arg(long)]
         description: Option<String>,
 
+        /// Listing rank 0-9, lower first. Defaults to 5
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+        priority: Option<u8>,
+
         /// Version label
         #[arg(long)]
         version: Option<String>,
@@ -268,11 +272,11 @@ pub enum SkillAction {
         #[arg(long)]
         author: Option<String>,
 
-        /// https:// URL the skill can be re-fetched from by `skill update`
+        /// https:// URL `skill update` re-fetches from
         #[arg(long = "source-url", value_name = "URL")]
         source_url: Option<String>,
 
-        /// Copy this file's contents instead of the default template
+        /// Copy this file instead of the template
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
 
@@ -280,7 +284,7 @@ pub enum SkillAction {
         #[arg(long)]
         force: bool,
 
-        /// Open the new SKILL.md in $EDITOR after scaffolding
+        /// Open the new SKILL.md in $EDITOR afterwards
         #[arg(long)]
         edit: bool,
     },

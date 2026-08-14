@@ -42,6 +42,85 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
     }
 }
 
+/// Refuse a store path that is a symlink, so a write stays inside the store it was aimed at.
+///
+/// [`validate_entry_name`] keeps a *name* from escaping the root, but it cannot see what is already
+/// on disk under that name: a symlink planted at `<root>/<entry>` redirects the write wherever it
+/// points, while the path meka checked still looks local. Archives preserve symlinks, so unpacking
+/// a downloaded skill or memory bundle is enough to plant one, with no code execution involved.
+///
+/// This matters because these stores are writable at [`crate::permission::Permission::Read`], whose
+/// whole contract is that nothing outside meka's own directory changes. Following a symlink out of
+/// the store breaks exactly that. Checked with `symlink_metadata`, which does not follow the link.
+pub(crate) fn reject_symlinked_path(path: &std::path::Path, noun: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            // Warned as well as returned. The error reaches the model, which will recover by
+            // picking another name and say nothing more about it; but a symlink inside meka's own
+            // config directory is something the person running it should hear about once, since
+            // they did not put it there by using meka.
+            tracing::warn!(
+                "refusing to write through symlinked {} path {}; it points outside the store",
+                noun,
+                path.display()
+            );
+            Err(format!(
+                "{} path {} is a symlink; refusing to write through it, because it would leave \
+                 the store meka owns",
+                noun,
+                path.display()
+            ))
+        }
+        // Absent is fine: the caller is about to create it. Any other stat error is left to the
+        // write itself, which reports it with more context than a bare "could not stat".
+        _ => Ok(()),
+    }
+}
+
+/// Collapse a description to the single line it is contractually meant to be.
+///
+/// Load-bearing rather than cosmetic, and the reason it lives here rather than in either store: a
+/// description is written into a YAML scalar, and an embedded newline breaks the frontmatter it
+/// sits in. A description of `"step 1\n---\nstep 2"` renders a `---` line inside the header, which
+/// [`split_frontmatter`] then takes for the closing fence, leaving an unterminated quoted scalar
+/// that no parser will accept. A bare `\r` does the same without even tripping [`yaml_scalar`]'s
+/// quoting check. `split_whitespace` handles every such character in one pass.
+pub fn normalize_description(description: &str) -> String {
+    description.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Priority assigned when frontmatter omits the field. The midpoint of [`MIN_PRIORITY`] ..=
+/// [`MAX_PRIORITY`], so an unranked entry sorts below deliberate standing rules and above
+/// deliberate noise.
+pub const DEFAULT_PRIORITY: u8 = 5;
+pub const MIN_PRIORITY: u8 = 0;
+pub const MAX_PRIORITY: u8 = 9;
+
+/// Clamp a frontmatter `priority` into [`MIN_PRIORITY`] ..= [`MAX_PRIORITY`], defaulting to
+/// [`DEFAULT_PRIORITY`] when absent. `noun` names the store in the warning text ("skill",
+/// "memory"), the same way [`validate_entry_name`] takes it.
+///
+/// Out-of-range values are clamped rather than rejected: a nonsense priority is not a reason to
+/// make the entry itself unreachable.
+pub fn parse_priority(raw: Option<i64>, noun: &str, name: &str) -> u8 {
+    let Some(value) = raw else {
+        return DEFAULT_PRIORITY;
+    };
+    let clamped = value.clamp(MIN_PRIORITY as i64, MAX_PRIORITY as i64);
+    if clamped != value {
+        tracing::warn!(
+            "{} '{}' has priority {} outside {}..={}; clamped to {}",
+            noun,
+            name,
+            value,
+            MIN_PRIORITY,
+            MAX_PRIORITY,
+            clamped
+        );
+    }
+    clamped as u8
+}
+
 /// Maximum length of a store entry's name. Bounded so an index line in the per-turn context stays
 /// readable and per-line bounded.
 pub(crate) const MAX_ENTRY_NAME_LEN: usize = 64;

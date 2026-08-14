@@ -129,6 +129,18 @@ meka [r] > add a comment to the top of main.rs
 
 The agent will explain that it cannot write files in read mode and suggest switching to write mode.
 
+#### What read mode does still write
+
+Read mode means the agent cannot modify **your tree**. It can still write to stores meka owns, because otherwise an agent at read permission could never remember anything:
+
+| Store | Location | Tools |
+|-------|----------|-------|
+| Memory | `~/.config/meka/memory/` | `memory_write`, `memory_delete` |
+| Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
+| Scratchpad, todos, scheduled jobs, background tasks | the session database | various |
+
+Nothing else in read mode reaches the filesystem for writing. That boundary is enforced in two places: entry names are restricted to `[A-Za-z0-9_-]`, so a name cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the store. `write_file`, `edit_file` and `scratchpad_save_file` are the only tools that touch your tree, and all three require write mode.
+
 > **Note:** The read-only sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands are not available in read mode. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config File](../configuration/config-file.md)).
 
 ### Write Mode

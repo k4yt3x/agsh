@@ -1,7 +1,7 @@
 //! Skill discovery and loading. Walks `~/.config/meka/skills/<name>/SKILL.md`, parses the YAML
 //! frontmatter (`description`, `version`, `author`, `source_url`; unknown keys are ignored), and
-//! exposes the resulting [`Skill`] structs to the agent for system-prompt injection and `skill`
-//! tool dispatch.
+//! exposes the resulting [`Skill`] structs to the agent for per-turn index injection and
+//! `skill_*` tool dispatch.
 
 pub mod cli;
 
@@ -15,7 +15,7 @@ use std::{
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::store::{split_frontmatter, validate_entry_name, yaml_scalar};
+use crate::store::{parse_priority, split_frontmatter, validate_entry_name, yaml_scalar};
 
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -27,7 +27,20 @@ pub struct Skill {
     pub author: Option<String>,
     /// Optional `https://` URL the skill's `SKILL.md` can be re-fetched from. When set, `meka skill
     /// update` can refresh the skill in place. `None` skills are skipped by `update`.
+    ///
+    /// Also what makes a skill off-limits to the `skill_write` and `skill_delete` tools: an agent
+    /// edit to an upstream-managed skill is not merely risky but futile, because the next
+    /// `meka skill update` silently reverts it.
     pub source_url: Option<String>,
+    /// Listing rank, [`crate::store::MIN_PRIORITY`] ..= [`crate::store::MAX_PRIORITY`], lower
+    /// first. Orders the `[Skills]` index and therefore decides which skills the index's cap
+    /// drops.
+    ///
+    /// Deliberately *not* rendered into that index, unlike a memory's priority. A memory's level
+    /// tells the model how to weigh a note it is already reasoning from; a skill is inert until
+    /// invoked, and the section header already says to invoke one only when the request matches
+    /// its stated purpose. A visible rank would invite "this one matters more, apply it".
+    pub priority: u8,
     pub body_path: PathBuf,
 }
 
@@ -37,6 +50,7 @@ struct Frontmatter {
     version: Option<String>,
     author: Option<String>,
     source_url: Option<String>,
+    priority: Option<i64>,
 }
 
 pub fn skills_dir() -> Option<PathBuf> {
@@ -92,17 +106,32 @@ fn discover_skills_in(root: &Path) -> Vec<Skill> {
         }
     }
 
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    // Priority first so the `[Skills]` index cap drops the least important skills rather than
+    // whichever ones sort late alphabetically. Name breaks ties, keeping the order stable across
+    // runs: `WorldSnapshot` is diffed by equality, so an unstable order would re-render the whole
+    // section on turns where nothing actually changed.
+    skills.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     skills
 }
 
-/// Snapshot the disk state of a skills root: `subdir/SKILL.md → mtime` for every non-dot
+/// Snapshot the disk state of a skills root: `subdir/SKILL.md → (mtime, size)` for every non-dot
 /// subdirectory. Used by [`SkillCache`] to decide whether to re-run discovery on the next turn.
+///
+/// Size is in the key alongside mtime because `skill_write` made rapid rewrites possible. Until an
+/// agent could author skills, edits arrived from a human with an editor, seconds apart, and mtime
+/// alone settled it. Two writes inside one filesystem's mtime granularity now happen in a single
+/// turn, and on a filesystem with coarse timestamps that would serve a stale skill to the very
+/// `agent_spawn` the write was preparing. Any edit that changes the length is caught regardless of
+/// clock resolution.
 ///
 /// Returns `None` when `read_dir` fails with anything other than `NotFound`; that signals the
 /// caller to serve the cached (stale) state rather than wiping it on a transient filesystem hiccup.
 /// A `NotFound` error maps to `Some(empty)` so a deleted skills dir properly clears the cache.
-fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, SystemTime>> {
+fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, (SystemTime, u64)>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -124,12 +153,12 @@ fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, SystemTime>> {
             continue;
         }
         let skill_file = path.join("SKILL.md");
-        // Stat failure (file missing, perm denied) maps to UNIX_EPOCH so a later stat-success
-        // transition forces a snapshot diff and reload.
-        let mtime = std::fs::metadata(&skill_file)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        map.insert(skill_file, mtime);
+        // Stat failure (file missing, perm denied) maps to the epoch and zero length so a later
+        // stat-success transition forces a snapshot diff and reload.
+        let stamp = std::fs::metadata(&skill_file)
+            .and_then(|metadata| Ok((metadata.modified()?, metadata.len())))
+            .unwrap_or((SystemTime::UNIX_EPOCH, 0));
+        map.insert(skill_file, stamp);
     }
     Some(map)
 }
@@ -147,17 +176,17 @@ pub struct SkillCache {
     /// Whether the subsystem is switched on at all, from `[skills] enabled`.
     ///
     /// Deliberately separate from `root`: a cache with no root is an *empty* store (nothing on
-    /// disk, or test scaffolding), and its `skill` tool still belong in the registry. A disabled
-    /// cache means the feature is off, so they are not registered and the `[Skills]` section
-    /// never renders. Conflating the two made `meka tools list` hide tools that a real session
-    /// would have had.
+    /// disk, or test scaffolding), and its `skill_*` tools still belong in the registry. A
+    /// disabled cache means the feature is off, so they are not registered and the `[Skills]`
+    /// section never renders. Conflating the two made `meka tools list` hide tools that a real
+    /// session would have had.
     enabled: bool,
     state: Mutex<CacheState>,
 }
 
 struct CacheState {
     skills: Arc<Vec<Skill>>,
-    snapshot: BTreeMap<PathBuf, SystemTime>,
+    snapshot: BTreeMap<PathBuf, (SystemTime, u64)>,
 }
 
 impl SkillCache {
@@ -202,6 +231,13 @@ impl SkillCache {
     /// Whether the subsystem is switched on. See the field docs on [`SkillCache::enabled`].
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// The resolved skills root, or `None` for a rootless cache. The write and delete tools join
+    /// names onto this, so a `None` here is what distinguishes "nothing installed" from "nowhere to
+    /// install to" in their error text.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// Return the current skill list, re-discovering first if the on-disk snapshot has changed
@@ -279,6 +315,7 @@ pub fn parse_skill_definition(
         version: frontmatter.version,
         author: frontmatter.author,
         source_url: frontmatter.source_url,
+        priority: parse_priority(frontmatter.priority, "skill", name),
         body_path: skill_file.to_path_buf(),
     })
 }
@@ -332,37 +369,204 @@ pub fn skill_dir_for(name: &str) -> Option<PathBuf> {
     skills_dir().map(|root| root.join(name))
 }
 
-/// Render the default `SKILL.md` template for a new skill. Optional fields are emitted only when
-/// set, so the resulting file stays as minimal as the user's input.
-pub fn render_template(
+/// Write one skill's `SKILL.md`, creating its directory if needed, and return the path written.
+///
+/// The agent-facing counterpart to `meka skill add`, and the reason it is a store function rather
+/// than living in the tool: the name is joined onto `root` here, so [`validate_skill_name`] has to
+/// run before any of it. Callers validate too; this is the backstop that makes the join safe
+/// regardless.
+///
+/// `body: None` preserves whatever the existing file said. That asymmetry is deliberate and mirrors
+/// `memory_write`: a call that changes only the description or the priority is one the schema
+/// invites, and rendering an absent body as empty would silently delete everything the skill
+/// documented on exactly that call.
+///
+/// `Some("")` empties it, which renders as a bare `# <name>` heading rather than nothing at all:
+/// unlike a memory, a skill *is* its body, and a file whose body is zero bytes gives `skill_read`
+/// nothing to return but the base-directory header.
+///
+/// Preserves `version`, `author` and `source_url` from the existing file, so a rewrite does not
+/// strip metadata the caller was never asked about. `author` is therefore only stamped on a *new*
+/// skill: overwriting a human's attribution because an agent edited their file loses information
+/// nothing else records.
+///
+/// Refuses outright when the file exists but does not parse. Such a file is invisible everywhere
+/// else in meka (discovery skips it with a warning, so it is in no index and no listing), which
+/// means neither the caller nor the model can know what is about to be overwritten. Clobbering it
+/// destroys content whose only copy is that file, and the caller can always pick another name.
+pub fn write_skill(
+    root: &Path,
     name: &str,
     description: &str,
+    priority: u8,
+    author: Option<&str>,
+    body: Option<&str>,
+) -> Result<PathBuf, String> {
+    validate_skill_name(name)?;
+    // Same guard `write_memory` applies. An empty description parses back as a missing required
+    // field, so without this a write succeeds and produces a skill that can never be loaded again.
+    if description.trim().is_empty() {
+        return Err("description cannot be empty".to_string());
+    }
+
+    let dir = root.join(name);
+    let skill_file = dir.join("SKILL.md");
+    // Both levels: a skill is a directory, so either the directory or the file inside it can be
+    // the redirect. See [`crate::store::reject_symlinked_path`].
+    crate::store::reject_symlinked_path(&dir, "skill")?;
+    crate::store::reject_symlinked_path(&skill_file, "skill")?;
+
+    let existing = std::fs::read_to_string(&skill_file).ok();
+    let existing_skill = match existing.as_deref() {
+        Some(content) => match parse_skill_definition(name, &dir, &skill_file, content) {
+            Ok(skill) => Some(skill),
+            Err(reason) => {
+                return Err(format!(
+                    "{} exists but is not a valid skill ({}); refusing to overwrite it. Fix or \
+                     remove that file, or use a different name.",
+                    skill_file.display(),
+                    reason
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let body = match body {
+        Some(body) => body.to_string(),
+        None => existing
+            .as_deref()
+            .and_then(|content| split_frontmatter(content).map(|(_, body)| body.to_string()))
+            .unwrap_or_default(),
+    };
+
+    let rendered = render_skill_file(
+        name,
+        description,
+        priority,
+        existing_skill.as_ref().and_then(|s| s.version.as_deref()),
+        existing_skill
+            .as_ref()
+            .and_then(|s| s.author.as_deref())
+            .or(author),
+        existing_skill
+            .as_ref()
+            .and_then(|s| s.source_url.as_deref()),
+        &body,
+    );
+
+    // Parse the bytes we are about to write, exactly as discovery will. Without this a description
+    // the renderer could not represent produces a file that writes fine, reports success, and is
+    // then skipped by discovery forever: absent from the index, unreachable by `skill_read`, and
+    // now refused by this function's own clobber guard, so the agent cannot even repair it. The
+    // check also makes any future change to the renderer fail here rather than silently.
+    parse_skill_definition(name, &dir, &skill_file, &rendered)
+        .map_err(|error| format!("refusing to write a skill that would not parse back: {error}"))?;
+
+    // Atomic, like `write_memory`. `fs::write` truncates in place, so an interrupted write leaves a
+    // half-file that discovery rejects and the guard above then refuses to overwrite. That was
+    // survivable when only `meka skill add` wrote skills; an agent that may write on any turn makes
+    // it worth the rename.
+    crate::config::write_file_atomic(&skill_file, &rendered)
+        .map_err(|error| format!("failed to write {}: {}", skill_file.display(), error))?;
+    Ok(skill_file)
+}
+
+/// Delete one skill's whole directory, returning the path removed.
+///
+/// The directory, not just `SKILL.md`: a skill's bundled scripts and data files are part of it, and
+/// leaving them behind would turn a delete into a broken half-skill that discovery keeps warning
+/// about. Matches `meka skill remove`.
+pub fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
+    validate_skill_name(name)?;
+    let dir = root.join(name);
+    // `remove_dir_all` does not follow the link, so a symlinked entry would lose the link and keep
+    // whatever it pointed at. Reporting that as a deleted skill is a lie about what happened, and
+    // the user planted the link for a reason.
+    crate::store::reject_symlinked_path(&dir, "skill")?;
+    if !dir.is_dir() {
+        return Err(format!("skill '{}' not found", name));
+    }
+    std::fs::remove_dir_all(&dir)
+        .map_err(|error| format!("failed to remove {}: {}", dir.display(), error))?;
+    Ok(dir)
+}
+
+/// Render a complete `SKILL.md`. Shared by [`write_skill`] and [`render_template`] so the
+/// frontmatter key order and quoting rules have one owner.
+///
+/// `priority` is omitted when it equals the default, keeping the common file's header short, the
+/// same way [`crate::memory`] renders its own.
+#[allow(clippy::too_many_arguments)]
+fn render_skill_file(
+    name: &str,
+    description: &str,
+    priority: u8,
     version: Option<&str>,
     author: Option<&str>,
     source_url: Option<&str>,
+    body: &str,
 ) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     out.push_str("---\n");
-    let _ = writeln!(out, "description: {}", yaml_scalar(description));
-    if let Some(v) = version {
-        let _ = writeln!(out, "version: {}", yaml_scalar(v));
+    // Normalised, not merely quoted: a newline in the description renders a `---` line inside the
+    // header, which `split_frontmatter` then mistakes for the closing fence. See
+    // [`crate::store::normalize_description`].
+    let _ = writeln!(
+        out,
+        "description: {}",
+        yaml_scalar(&crate::store::normalize_description(description))
+    );
+    if priority != crate::store::DEFAULT_PRIORITY {
+        let _ = writeln!(out, "priority: {}", priority);
     }
-    if let Some(a) = author {
-        let _ = writeln!(out, "author: {}", yaml_scalar(a));
+    if let Some(version) = version {
+        let _ = writeln!(out, "version: {}", yaml_scalar(version));
+    }
+    if let Some(author) = author {
+        let _ = writeln!(out, "author: {}", yaml_scalar(author));
     }
     if let Some(url) = source_url {
         let _ = writeln!(out, "source_url: {}", yaml_scalar(url));
     }
     out.push_str("---\n\n");
-    let _ = writeln!(out, "# {}", name);
-    out.push('\n');
-    out.push_str(
-        "Skill body. Reference files bundled in this skill's directory by relative path\n\
-         (e.g. `scripts/helper.sh`); they resolve against the directory this file is in.\n",
-    );
+    if body.trim().is_empty() {
+        let _ = writeln!(out, "# {}", name);
+    } else {
+        out.push_str(body.trim_start_matches('\n'));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     out
+}
+
+/// Render the default `SKILL.md` template for a new skill. Optional fields are emitted only when
+/// set, so the resulting file stays as minimal as the user's input.
+pub fn render_template(
+    name: &str,
+    description: &str,
+    priority: u8,
+    version: Option<&str>,
+    author: Option<&str>,
+    source_url: Option<&str>,
+) -> String {
+    render_skill_file(
+        name,
+        description,
+        priority,
+        version,
+        author,
+        source_url,
+        &format!(
+            "# {}\n\nSkill body. Reference files bundled in this skill's directory by relative \
+             path\n(e.g. `scripts/helper.sh`); they resolve against the directory this file is \
+             in.\n",
+            name
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -610,6 +814,342 @@ mod tests {
         let header = skill_context_header(&skill);
         assert!(header.contains("bundled files"));
         assert!(header.contains(&skill_path.display().to_string()));
+    }
+
+    #[test]
+    fn test_priority_defaults_and_clamps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "unranked", &valid_frontmatter("x"));
+        write_skill(
+            temp.path(),
+            "ranked",
+            "---\ndescription: x\npriority: 1\n---\nbody\n",
+        );
+        write_skill(
+            temp.path(),
+            "nonsense",
+            "---\ndescription: x\npriority: 99\n---\nbody\n",
+        );
+
+        let skills = discover_skills_in(temp.path());
+        let priority_of = |name: &str| {
+            skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .map(|skill| skill.priority)
+                .expect("skill present")
+        };
+        assert_eq!(priority_of("unranked"), crate::store::DEFAULT_PRIORITY);
+        assert_eq!(priority_of("ranked"), 1);
+        // Clamped rather than rejected: a nonsense priority is not a reason to make the skill
+        // itself unreachable.
+        assert_eq!(priority_of("nonsense"), crate::store::MAX_PRIORITY);
+    }
+
+    /// Discovery order is what the `[Skills]` cap cuts from, so priority has to beat name.
+    #[test]
+    fn test_discovery_sorts_by_priority_then_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "zzz",
+            "---\ndescription: x\npriority: 0\n---\n",
+        );
+        write_skill(temp.path(), "aaa", &valid_frontmatter("x"));
+        write_skill(temp.path(), "bbb", &valid_frontmatter("x"));
+
+        let discovered = discover_skills_in(temp.path());
+        let names: Vec<&str> = discovered.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, vec!["zzz", "aaa", "bbb"]);
+    }
+
+    /// A metadata-only rewrite must not strip attribution the agent was never asked about, or
+    /// `meka skill update` would stop recognising a vendored skill as vendored.
+    #[test]
+    fn test_write_skill_preserves_untouched_metadata_and_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "vendored",
+            "---\n\
+             description: old\n\
+             version: \"2.1\"\n\
+             source_url: https://example.com/SKILL.md\n\
+             ---\nORIGINAL BODY\n",
+        );
+
+        super::write_skill(temp.path(), "vendored", "new", 3, None, None).expect("write");
+
+        let skills = discover_skills_in(temp.path());
+        let skill = skills.first().expect("one skill");
+        assert_eq!(skill.description, "new");
+        assert_eq!(skill.priority, 3);
+        assert_eq!(skill.version.as_deref(), Some("2.1"));
+        assert_eq!(
+            skill.source_url.as_deref(),
+            Some("https://example.com/SKILL.md")
+        );
+        let content = std::fs::read_to_string(&skill.body_path).expect("read");
+        assert!(content.contains("ORIGINAL BODY"), "{content}");
+    }
+
+    /// A file that exists but does not parse is invisible everywhere else in meka: discovery skips
+    /// it, so it is in no index and no listing, and nothing could have told the caller what was
+    /// about to be lost. Overwriting it destroyed content whose only copy was that file.
+    #[test]
+    fn test_write_skill_refuses_to_clobber_an_unparseable_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("triage");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "No frontmatter here.\nPROCEDURE THE USER CARES ABOUT.\n",
+        )
+        .expect("seed");
+
+        // Both arms: an omitted body used to silently render the file empty, and an explicit body
+        // is no better, since the caller still cannot know what it is replacing.
+        for body in [None, Some("replacement")] {
+            let error = super::write_skill(temp.path(), "triage", "new desc", 5, None, body)
+                .expect_err("must refuse an unparseable file");
+            assert!(error.contains("refusing to overwrite"), "{error}");
+        }
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("PROCEDURE THE USER CARES ABOUT"),
+            "the file must be untouched"
+        );
+    }
+
+    /// An empty description parses back as a missing required field, so without this guard the
+    /// write succeeds and leaves behind a skill that can never be discovered or loaded again.
+    #[test]
+    fn test_write_skill_rejects_an_empty_description() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for description in ["", "   ", "\n\t"] {
+            assert!(
+                super::write_skill(temp.path(), "blank", description, 5, None, Some("b")).is_err(),
+                "description {description:?} must be rejected"
+            );
+        }
+        assert!(!temp.path().join("blank").exists());
+    }
+
+    /// Attribution is the one field nothing else records. An agent refining a skill you wrote must
+    /// not reassign it to itself, so an existing `author` wins over the caller's.
+    #[test]
+    fn test_write_skill_keeps_an_existing_author() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "handwritten",
+            "---\ndescription: mine\nauthor: Jane Doe <jane@example.com>\n---\nbody\n",
+        );
+
+        super::write_skill(
+            temp.path(),
+            "handwritten",
+            "refined",
+            5,
+            Some("meka (agent-authored)"),
+            None,
+        )
+        .expect("write");
+
+        let skills = discover_skills_in(temp.path());
+        let skill = skills.first().expect("one skill");
+        assert_eq!(skill.author.as_deref(), Some("Jane Doe <jane@example.com>"));
+        assert_eq!(skill.description, "refined");
+
+        // A skill with no author still takes the caller's, which is how a created one is stamped.
+        super::write_skill(temp.path(), "fresh", "d", 5, Some("meka"), Some("b")).expect("write");
+        let skills = discover_skills_in(temp.path());
+        let fresh = skills.iter().find(|s| s.name == "fresh").expect("fresh");
+        assert_eq!(fresh.author.as_deref(), Some("meka"));
+    }
+
+    /// The body is written below the closing fence, so content that looks like frontmatter has to
+    /// survive a write/parse round trip: `split_frontmatter` takes the *first* `---` after the
+    /// opening one, and a body full of them must not be able to steal that role.
+    #[test]
+    fn test_write_skill_round_trips_a_hostile_body() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hostile = "---\nnot: frontmatter\n---\n\nA line with: a colon\n# heading\n---\n";
+        super::write_skill(
+            temp.path(),
+            "hostile",
+            "desc: with a colon, and a # hash",
+            0,
+            None,
+            Some(hostile),
+        )
+        .expect("write");
+
+        let skills = discover_skills_in(temp.path());
+        let skill = skills.first().expect("skill must still parse");
+        assert_eq!(skill.description, "desc: with a colon, and a # hash");
+        assert_eq!(skill.priority, 0);
+
+        let content = std::fs::read_to_string(&skill.body_path).expect("read");
+        let (_, body) = split_frontmatter(&content).expect("splits");
+        assert!(body.contains("not: frontmatter"), "{body}");
+        assert!(body.contains("A line with: a colon"), "{body}");
+    }
+
+    /// A description is written into a YAML scalar, so a newline in it renders a `---` line inside
+    /// the header that `split_frontmatter` mistakes for the closing fence. Without normalisation
+    /// the write succeeded, reported success, and left a skill discovery could never load again.
+    #[test]
+    fn test_write_skill_survives_a_description_that_would_break_the_frontmatter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hostile = [
+            ("newline", "step 1\nstep 2"),
+            ("fence", "step 1\n---\nstep 2"),
+            ("carriage", "a\rb"),
+            ("tabs", "a\tb"),
+        ];
+        for (name, description) in hostile {
+            super::write_skill(temp.path(), name, description, 5, None, Some("body")).expect(name);
+        }
+
+        let skills = discover_skills_in(temp.path());
+        assert_eq!(
+            skills.len(),
+            hostile.len(),
+            "every written skill must parse back: {:?}",
+            skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let fence = skills
+            .iter()
+            .find(|skill| skill.name == "fence")
+            .expect("fence");
+        assert_eq!(fence.description, "step 1 --- step 2");
+    }
+
+    /// A directory with no `SKILL.md` has nothing in it to lose: a half-finished `meka skill add`
+    /// or an interrupted write. Creating there must work rather than being refused as unreadable.
+    #[test]
+    fn test_write_skill_creates_into_a_bare_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("halfmade")).expect("mkdir");
+
+        super::write_skill(temp.path(), "halfmade", "now real", 5, None, Some("b")).expect("write");
+        let skills = discover_skills_in(temp.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "now real");
+    }
+
+    /// `validate_skill_name` stops a name from escaping the root, but it cannot see a symlink
+    /// already sitting at that name. Archives preserve symlinks, so unpacking a downloaded skill
+    /// bundle is enough to plant one, and following it would write outside the store at *read*
+    /// permission, whose whole contract is that the user's tree does not change.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_and_delete_refuse_a_symlinked_skill_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("evil")).expect("symlink");
+
+        let error = super::write_skill(&root, "evil", "d", 5, None, Some("PWNED"))
+            .expect_err("must refuse a symlinked directory");
+        assert!(error.contains("symlink"), "{error}");
+        assert!(
+            !outside.join("SKILL.md").exists(),
+            "nothing may be written outside the store"
+        );
+
+        let error = super::delete_skill(&root, "evil").expect_err("must refuse to delete through");
+        assert!(error.contains("symlink"), "{error}");
+        assert!(outside.is_dir(), "the target must survive");
+    }
+
+    /// The file inside a legitimate directory is the second way in.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_refuses_a_symlinked_skill_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        let victim = temp.path().join("victim.md");
+        std::fs::create_dir_all(root.join("sneaky")).expect("dir");
+        std::fs::write(&victim, "ORIGINAL").expect("victim");
+        std::os::unix::fs::symlink(&victim, root.join("sneaky").join("SKILL.md")).expect("symlink");
+
+        let error = super::write_skill(&root, "sneaky", "d", 5, None, Some("PWNED"))
+            .expect_err("must refuse a symlinked file");
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "ORIGINAL",
+            "the target must be untouched"
+        );
+    }
+
+    #[test]
+    fn test_write_skill_rejects_a_traversing_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(super::write_skill(temp.path(), "../escape", "d", 5, None, Some("b")).is_err());
+        assert!(super::write_skill(temp.path(), "a/b", "d", 5, None, Some("b")).is_err());
+    }
+
+    #[test]
+    fn test_delete_skill_removes_the_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "doomed", &valid_frontmatter("x"));
+        std::fs::write(temp.path().join("doomed/data.txt"), "payload").expect("bundled file");
+
+        delete_skill(temp.path(), "doomed").expect("delete");
+        assert!(!temp.path().join("doomed").exists());
+        assert!(
+            delete_skill(temp.path(), "doomed").is_err(),
+            "second delete"
+        );
+    }
+
+    /// The dispatcher's actual sequence, inside one turn: write a skill, then immediately reach for
+    /// it. Both hops must see the write without the mtime bump the other cache tests fake, because
+    /// nothing bumps the clock between two tool calls in the same turn.
+    ///
+    /// The second write is the one that used to be at risk: creating a skill adds a key to the
+    /// snapshot and is detected whatever the timestamps say, but *updating* one changed only the
+    /// mtime, so a coarse-resolution filesystem could serve the pre-edit body to the `agent_spawn`
+    /// the edit was preparing. The size in the snapshot is what closes that.
+    #[tokio::test]
+    async fn test_cache_sees_a_write_and_a_rewrite_without_waiting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        assert!(cache.current().await.is_empty());
+
+        super::write_skill(temp.path(), "brief", "first", 5, None, Some("VERSION ONE"))
+            .expect("w1");
+        let skills = cache.current().await;
+        assert_eq!(skills.len(), 1, "a new skill must be visible immediately");
+        assert_eq!(skills[0].description, "first");
+
+        super::write_skill(
+            temp.path(),
+            "brief",
+            "second",
+            5,
+            None,
+            Some("VERSION TWO IS LONGER"),
+        )
+        .expect("w2");
+        let skills = cache.current().await;
+        assert_eq!(
+            skills[0].description, "second",
+            "a rewrite must be visible in the same turn"
+        );
+        let body = std::fs::read_to_string(&skills[0].body_path).expect("read");
+        assert!(body.contains("VERSION TWO"), "{body}");
+
+        // Deletion closes the loop: the key leaves the snapshot, so this never depended on mtime.
+        super::delete_skill(temp.path(), "brief").expect("delete");
+        assert!(cache.current().await.is_empty());
     }
 
     #[tokio::test]

@@ -353,10 +353,17 @@ pub fn schema_disagreement(
 /// the likeliest mistake by far and puts the right answer seventeen edits away. So an exact match
 /// on the final `__` segment is tried first and wins outright; distance is only the fallback for
 /// genuine typos.
+///
+/// A bare noun that has since become a family prefix is matched the same way, and for the same
+/// reason. When `skill` grew into `skill_read` / `skill_write` / …, distance alone stopped finding
+/// it: the threshold scales with the *typed* name, so a five-character needle allows one edit while
+/// the answer is five away. A resumed session reaching for the old name would have got a bare
+/// unknown-tool error, silently, which is exactly the case a rename most needs to cover.
 pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a str>) -> String {
     const MAX_SUGGESTIONS: usize = 3;
     let needle = target.to_ascii_lowercase();
     let needle_tail = needle.rsplit("__").next().unwrap_or(needle.as_str());
+    let family_prefix = format!("{}_", needle);
     let threshold = (needle.chars().count() / 3).clamp(1, 5);
 
     let mut by_segment: Vec<&str> = Vec::new();
@@ -366,6 +373,7 @@ pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a 
         if lowered == needle
             || lowered.rsplit("__").next() == Some(needle.as_str())
             || lowered == needle_tail
+            || lowered.starts_with(&family_prefix)
         {
             by_segment.push(candidate);
             continue;
@@ -380,7 +388,11 @@ pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a 
         by_distance.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         by_distance.into_iter().map(|(_, name)| name).collect()
     } else {
-        by_segment.sort_unstable();
+        // Destructive members last, then alphabetical. A whole family can exceed `MAX_SUGGESTIONS`,
+        // and plain alphabetical order put `skill_delete` first and dropped `skill_write` for a
+        // model reaching for the renamed `skill`. Leading a retry with the destructive verb is the
+        // one ordering worth ruling out.
+        by_segment.sort_unstable_by_key(|name| (is_destructive(name), *name));
         by_segment
     };
     suggestions.truncate(MAX_SUGGESTIONS);
@@ -393,6 +405,14 @@ pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a 
         .map(|name| format!("`{}`", name))
         .collect();
     format!(" Did you mean {}?", rendered.join(" or "))
+}
+
+/// Whether a tool name reads as one that destroys something, by its verb.
+///
+/// Only used to order suggestions. A suggestion list is read by a model about to retry, so which
+/// member of a family it sees first is not cosmetic.
+fn is_destructive(name: &str) -> bool {
+    name.ends_with("_delete") || name.ends_with("_cancel") || name.ends_with("_remove")
 }
 
 /// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
@@ -690,7 +710,10 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_write",
     "search_contents",
     "search_web",
-    "skill",
+    "skill_delete",
+    "skill_read",
+    "skill_search",
+    "skill_write",
     "task_cancel",
     "task_list",
     "todo",
@@ -734,8 +757,9 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
         for name in allowed {
             if !known.contains(name.as_str()) {
                 tracing::warn!(
-                    "[tools].allowed_tools entry '{}' doesn't match any built-in tool",
-                    name
+                    "[tools].allowed_tools entry '{}' doesn't match any built-in tool.{}",
+                    name,
+                    builtin_name_hint(name)
                 );
             } else if MCP_META_TOOL_NAMES.contains(&name.as_str()) {
                 // These register outside the allow-list (see
@@ -754,19 +778,30 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
     for name in &filter.disabled {
         if !known.contains(name.as_str()) {
             tracing::warn!(
-                "[tools].disabled_tools entry '{}' doesn't match any built-in tool",
-                name
+                "[tools].disabled_tools entry '{}' doesn't match any built-in tool.{}",
+                name,
+                builtin_name_hint(name)
             );
         }
     }
     for name in filter.permission_overrides.keys() {
         if !known.contains(name.as_str()) {
             tracing::warn!(
-                "[tools.tool_permissions] entry '{}' doesn't match any built-in tool",
-                name
+                "[tools.tool_permissions] entry '{}' doesn't match any built-in tool.{}",
+                name,
+                builtin_name_hint(name)
             );
         }
     }
+}
+
+/// Suggest a built-in for a `[tools]` entry that matches none.
+///
+/// The same service `did_you_mean_hint` does for the model, for the other reader of these names.
+/// A rename leaves stale entries in config files, and a bare "matches nothing" makes a `[tools]`
+/// block that silently stopped applying look like a typo the user has to hunt for.
+fn builtin_name_hint(name: &str) -> String {
+    did_you_mean_hint(name, BUILTIN_TOOL_NAMES.iter().copied())
 }
 
 /// Warn (never fail) on `[subagents]` entries that match nothing. A typo here denies nothing at all
@@ -1458,7 +1493,7 @@ impl ToolRegistry {
         self.register(tool).expect("builtin tool name collision");
     }
 
-    /// Register the session-scoped tools (load_tool, skill, render_image, todo_*, scratchpad_*) on
+    /// Register the session-scoped tools (load_tool, skill_*, render_image, todo, scratchpad_*) on
     /// the registry. Shared between [`Self::build_default`] and [`Self::build_for_subagent`] so
     /// adding a new such tool to the parent automatically gives it to sub-agents too. Todo-list
     /// rendering is the [`crate::frontend::Frontend`]'s concern now, not the tool's.
@@ -1473,6 +1508,9 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         todo_list: todo::SharedTodoList,
         skills: Arc<crate::skills::SkillCache>,
+        // Whether this agent may author skills, from `[skills] agent_managed`. Always `false` for
+        // a sub-agent regardless of the setting; see the registration site.
+        skills_managed: bool,
         memories: Arc<crate::memory::MemoryCache>,
         // How much of the memory store this agent may reach. Always `Write` for the primary agent;
         // for a sub-agent, whatever its `agent_spawn` call granted, which defaults to nothing.
@@ -1501,7 +1539,22 @@ impl ToolRegistry {
         // the whole point of the config switch: a disabled subsystem must keep its schemas out of
         // every request, not ship tools that can only ever fail.
         if skills.enabled() {
-            self.register_builtin(Arc::new(skill::SkillTool { skills }));
+            self.register_builtin(Arc::new(skill::SkillReadTool {
+                skills: skills.clone(),
+            }));
+            self.register_builtin(Arc::new(skill::SkillSearchTool {
+                skills: skills.clone(),
+            }));
+            // Authoring is opt-in per installation and never reaches a sub-agent. Same reasoning
+            // as `MemoryAccess::Write` being unreachable from `agent_spawn`, and stronger here: a
+            // worker that inferred something from one narrow task should not rewrite the store
+            // every future agent reasons from, and a skill is additionally spawnable *as* a task.
+            if skills_managed {
+                self.register_builtin(Arc::new(skill::SkillWriteTool {
+                    skills: skills.clone(),
+                }));
+                self.register_builtin(Arc::new(skill::SkillDeleteTool { skills }));
+            }
         }
         // Two independent gates: `enabled()` is whether this installation keeps memories at all,
         // `memory_access` is how much of that store the agent in front of us may reach.
@@ -1690,6 +1743,7 @@ impl ToolRegistry {
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
+        skills_managed: bool,
         memories: Arc<crate::memory::MemoryCache>,
         builtin_filter: BuiltinToolFilter,
         cwd: crate::agent::SharedCwd,
@@ -1724,6 +1778,7 @@ impl ToolRegistry {
             shared_session_id,
             todo_list,
             skills,
+            skills_managed,
             memories,
             crate::config::MemoryAccess::Write,
             None,
@@ -1736,7 +1791,7 @@ impl ToolRegistry {
     }
 
     /// Build a tool registry for sub-agents. Sub-agents get the same session-scoped tools as the
-    /// parent (load_tool, skill, memory_*, render_image, todo, scratchpad_*) scoped to their own
+    /// parent (load_tool, skill_*, memory_*, render_image, todo, scratchpad_*) scoped to their own
     /// ephemeral child session.
     ///
     /// `agent_spawn` is deliberately not registered here, but sub-agents *can* nest: the caller
@@ -1791,6 +1846,8 @@ impl ToolRegistry {
             shared_session_id,
             todo_list,
             skills,
+            // Never, whatever the installation's `agent_managed` says. See the registration site.
+            false,
             memories,
             memory_access,
             parent_session_id,
@@ -1888,6 +1945,13 @@ pub(crate) mod tests {
     }
 
     async fn build_test_registry(filter: BuiltinToolFilter) -> ToolRegistry {
+        build_test_registry_with(filter, false).await
+    }
+
+    async fn build_test_registry_with(
+        filter: BuiltinToolFilter,
+        skills_managed: bool,
+    ) -> ToolRegistry {
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database");
@@ -1905,6 +1969,7 @@ pub(crate) mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
+            skills_managed,
             crate::memory::MemoryCache::for_root(None),
             filter,
             crate::agent::test_cwd(),
@@ -2418,6 +2483,52 @@ pub(crate) mod tests {
         assert_eq!(hint, " Did you mean `read_file`?");
     }
 
+    /// The `skill` -> `skill_read` rename in miniature, and the reason the prefix rule exists.
+    ///
+    /// Distance alone cannot find this: the threshold scales with the *typed* name, so a
+    /// five-character needle allows one edit while every answer is five away. Without the rule a
+    /// resumed session reaching for the old name gets a bare unknown-tool error and no direction.
+    #[test]
+    fn test_did_you_mean_points_a_bare_noun_at_its_family() {
+        let registered = ["skill_read", "skill_write", "read_file"];
+        let hint = did_you_mean_hint("skill", registered.into_iter());
+        assert!(hint.contains("`skill_read`"), "{hint}");
+        assert!(hint.contains("`skill_write`"), "{hint}");
+        assert!(!hint.contains("read_file"), "{hint}");
+    }
+
+    /// A whole family can exceed `MAX_SUGGESTIONS`, so which members survive truncation matters.
+    /// Alphabetically `skill_delete` leads and `skill_write` is cut, which points a retrying model
+    /// at the destructive verb first. The full four-tool set is the case the smaller fixture above
+    /// cannot show.
+    #[test]
+    fn test_did_you_mean_never_leads_with_the_destructive_family_member() {
+        let registered = [
+            "skill_delete",
+            "skill_read",
+            "skill_search",
+            "skill_write",
+            "read_file",
+        ];
+        let hint = did_you_mean_hint("skill", registered.into_iter());
+        let delete = hint.find("skill_delete");
+        let read = hint.find("skill_read").expect("read must be suggested");
+        assert!(
+            delete.is_none_or(|delete| delete > read),
+            "the delete tool must never come first: {hint}"
+        );
+        assert!(hint.contains("`skill_write`"), "{hint}");
+    }
+
+    /// The prefix has to be a *name segment*, not any shared start, or `search_web` would answer
+    /// for `search` alongside genuinely-related tools and `scratchpad_read` would answer for
+    /// `scratch`.
+    #[test]
+    fn test_did_you_mean_prefix_rule_requires_an_underscore_boundary() {
+        let registered = ["skillet_read"];
+        assert_eq!(did_you_mean_hint("skill", registered.into_iter()), "");
+    }
+
     #[test]
     fn test_did_you_mean_is_silent_when_nothing_is_close() {
         let registered = ["read_file", "run_shell"];
@@ -2619,7 +2730,7 @@ pub(crate) mod tests {
         assert!(registry.get("scratchpad_edit").is_some());
         assert!(registry.get("scratchpad_list").is_some());
         assert!(registry.get("scratchpad_delete").is_some());
-        assert!(registry.get("skill").is_some());
+        assert!(registry.get("skill_read").is_some());
         assert!(registry.get("memory_write").is_some());
         assert!(registry.get("memory_read").is_some());
         assert!(registry.get("memory_search").is_some());
@@ -2635,8 +2746,66 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_empty_store_still_registers_its_tools() {
         let registry = test_registry().await;
-        assert!(registry.get("skill").is_some());
+        assert!(registry.get("skill_read").is_some());
         assert!(registry.get("memory_write").is_some());
+    }
+
+    /// Reading skills is always on; authoring them is opt-in per installation. Two independent
+    /// gates, so a default session never sees a tool that rewrites the user's skill store.
+    #[tokio::test]
+    async fn test_skill_authoring_is_off_by_default_and_on_with_agent_managed() {
+        let registry = test_registry().await;
+        assert!(registry.get("skill_read").is_some());
+        assert!(registry.get("skill_search").is_some());
+        assert!(
+            registry.get("skill_write").is_none(),
+            "skill_write must not register without [skills] agent_managed"
+        );
+        assert!(registry.get("skill_delete").is_none());
+
+        let registry = build_test_registry_with(BuiltinToolFilter::default(), true).await;
+        assert!(registry.get("skill_write").is_some());
+        assert!(registry.get("skill_delete").is_some());
+    }
+
+    /// The other half of the rename hazard: a `[tools]` block naming the old tool silently stops
+    /// applying, and "matches nothing" alone reads as a typo the user has to hunt for.
+    #[test]
+    fn test_stale_config_entry_is_pointed_at_the_renamed_tool() {
+        let hint = builtin_name_hint("skill");
+        assert!(hint.contains("`skill_read`"), "{hint:?}");
+        // Still silent when the entry really is nonsense, so the hint stays worth reading.
+        assert_eq!(builtin_name_hint("frobnicate_widget"), "");
+    }
+
+    /// The rename's actual failure case, against the real registry rather than a hand-made list:
+    /// a resumed session whose history contains a `skill` call must be pointed somewhere useful,
+    /// and that only holds if the family really is registered under those names.
+    #[tokio::test]
+    async fn test_a_stale_skill_call_is_pointed_at_the_renamed_tool() {
+        let registry = test_registry().await;
+        let registered = registry.registered_tool_names();
+        let hint = did_you_mean_hint("skill", registered.iter().map(String::as_str));
+        assert!(
+            hint.contains("`skill_read`"),
+            "the old name must lead somewhere, got: {hint:?}"
+        );
+    }
+
+    /// A sub-agent never gets the authoring tools, whatever the installation says. Mirrors
+    /// `MemoryAccess::Write` being unreachable from `agent_spawn`, and matters more here because a
+    /// skill is spawnable: a worker could otherwise rewrite the instructions its siblings run on.
+    #[tokio::test]
+    async fn test_subagent_never_gets_skill_authoring_tools() {
+        let registry =
+            subagent_registry(ToolDenials::default(), crate::config::MemoryAccess::Write).await;
+        assert!(
+            registry.get("skill_read").is_some(),
+            "a sub-agent still reads skills"
+        );
+        assert!(registry.get("skill_search").is_some());
+        assert!(registry.get("skill_write").is_none());
+        assert!(registry.get("skill_delete").is_none());
     }
 
     /// Disabling a subsystem keeps its schemas out of the request entirely, which is the whole
@@ -2659,6 +2828,7 @@ pub(crate) mod tests {
             session_manager,
             Arc::new(RwLock::new(None)),
             crate::skills::SkillCache::disabled(),
+            false,
             crate::memory::MemoryCache::disabled(),
             BuiltinToolFilter::default(),
             crate::agent::test_cwd(),
@@ -2672,7 +2842,7 @@ pub(crate) mod tests {
         )
         .expect("default web client config should build cleanly");
 
-        assert!(registry.get("skill").is_none());
+        assert!(registry.get("skill_read").is_none());
         for name in [
             "memory_write",
             "memory_read",
@@ -3524,7 +3694,10 @@ pub(crate) mod tests {
             "scratchpad_edit",
             "scratchpad_list",
             "scratchpad_delete",
-            "skill",
+            "skill_read",
+            "skill_search",
+            "skill_write",
+            "skill_delete",
             "render_image",
             "agent_spawn",
             "load_tool",

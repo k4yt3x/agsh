@@ -51,6 +51,19 @@ pub struct ConfigFile {
 #[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     pub enabled: Option<bool>,
+    /// Whether the agent may author skills, adding `skill_write` and `skill_delete` to its
+    /// registry. Default `false`.
+    ///
+    /// Off by default because for the ordinary terminal session the human authors and curates
+    /// skills, and an agent rewriting that store is not something the user asked for. It earns its
+    /// keep in the opposite deployment: a long-running dispatcher that spawns workers, where a
+    /// skill is the only artifact that both outlives the session and can be handed to a sub-agent
+    /// as its task, so writing one is how the agent gets a refined worker brief to the next worker
+    /// without routing it through its own context window.
+    ///
+    /// Never granted to a sub-agent whatever this says; see the registration site in
+    /// [`crate::tools`].
+    pub agent_managed: Option<bool>,
 }
 
 /// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
@@ -883,9 +896,12 @@ pub struct ResolvedConfig {
     /// `[mcp]` default configured"; resolution falls through to the hardcoded Write.
     pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
-    /// Whether the `skill` tool is registered and the `[Skills]` index rendered. Defaults to
-    /// `true`; see [`SkillsConfig`].
+    /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
+    /// rendered. Defaults to `true`; see [`SkillsConfig`].
     pub skills_enabled: bool,
+    /// Whether `skill_write` / `skill_delete` are additionally registered. Defaults to `false`;
+    /// see [`SkillsConfig::agent_managed`].
+    pub skills_agent_managed: bool,
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
     pub memory_enabled: bool,
@@ -1712,11 +1728,18 @@ impl ResolvedConfig {
         let file_session = config_file.session.unwrap_or_default();
         let file_thinking = config_file.thinking.unwrap_or_default();
         let file_tools = config_file.tools.unwrap_or_default();
-        let skills_enabled = config_file
-            .skills
-            .unwrap_or_default()
-            .enabled
-            .unwrap_or(true);
+        let file_skills = config_file.skills.unwrap_or_default();
+        let skills_enabled = file_skills.enabled.unwrap_or(true);
+        let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
+        // The two keys read as independent but are not: `enabled = false` registers no skill tools
+        // at all, so the authoring pair never appears however this is set. Saying so beats leaving
+        // someone to conclude that `agent_managed` is broken.
+        if skills_agent_managed && !skills_enabled {
+            tracing::warn!(
+                "[skills] agent_managed is on but enabled is false, so no skill tools are \
+                 registered at all; set enabled = true to let the agent author skills"
+            );
+        }
         let memory_enabled = config_file
             .memory
             .unwrap_or_default()
@@ -1953,6 +1976,7 @@ impl ResolvedConfig {
             mcp_default_permission,
             user_instructions,
             skills_enabled,
+            skills_agent_managed,
             memory_enabled,
             schedule,
             background,
@@ -3177,6 +3201,31 @@ retention_days = 90
         let resolved = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
         resolved
+    }
+
+    /// The registry gating is tested in `crate::tools`, but nothing joined the two: a key that
+    /// never reaches `ResolvedConfig` leaves the tools correctly gated on a flag that is always
+    /// false, and every test on either side still passes.
+    #[test]
+    fn test_skills_agent_managed_resolves_from_the_config_file() {
+        let resolved = resolve_with_config("");
+        assert!(resolved.skills_enabled, "skills default on");
+        assert!(
+            !resolved.skills_agent_managed,
+            "authoring must be off unless asked for"
+        );
+
+        let resolved = resolve_with_config(
+            r#"
+[skills]
+agent_managed = true
+"#,
+        );
+        assert!(resolved.skills_agent_managed);
+        assert!(
+            resolved.skills_enabled,
+            "agent_managed alone must not disturb the enabled default"
+        );
     }
 
     /// `strict` is only a default for `required`; every consumer downstream reads the per-server

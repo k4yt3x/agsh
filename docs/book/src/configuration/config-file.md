@@ -1100,18 +1100,21 @@ The other half of the argument is that the config guardrail existed for a failur
 
 ## `[skills]`
 
-Controls the user-authored skill store. See the [Skills](../usage/skills.md) guide.
+Controls the skill store. See the [Skills](../usage/skills.md) guide.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | Register the `skill` tool and render the skills index |
+| `enabled` | bool | `true` | Register `skill_read` / `skill_search` and render the skills index |
+| `agent_managed` | bool | `false` | Additionally register `skill_write` / `skill_delete` |
 
 ```toml
 [skills]
 enabled = false
 ```
 
-Setting `enabled = false` keeps the `skill` tool's schema out of every request and renders no skills section. Files already in `~/.config/meka/skills/` are left untouched.
+Setting `enabled = false` keeps every skill tool's schema out of every request and renders no skills section. Files already in `~/.config/meka/skills/` are left untouched.
+
+`agent_managed = true` lets the agent author its own skills. It is off by default because you normally curate that store yourself; it exists for a long-running agent that dispatches sub-agents, where a skill is the only artifact that both survives the session and can be handed to a worker as its task. Sub-agents never receive the authoring tools whatever this is set to. See [Letting the Agent Manage Skills](../usage/skills.md#letting-the-agent-manage-skills).
 
 ## `[memory]`
 

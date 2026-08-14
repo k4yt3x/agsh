@@ -24,7 +24,10 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
-| [`skill`](./overview.md#skill) | Read | Load a named skill's instructions |
+| [`skill_read`](./overview.md#the-skill_-tools) | Read | Load a named skill's instructions |
+| [`skill_search`](./overview.md#the-skill_-tools) | Read | Regex over the full text of every skill |
+| [`skill_write`](./overview.md#the-skill_-tools) | Read | Create or update a skill |
+| [`skill_delete`](./overview.md#the-skill_-tools) | Read | Delete a skill and its directory |
 | [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
 | [`memory_read`](../usage/memory.md) | Read | Load one saved memory in full |
 | [`memory_search`](../usage/memory.md) | Read | Regex over the full text of every memory |
@@ -40,7 +43,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`task_list`](../usage/background.md) | Read | List this session's background tasks |
 | [`task_cancel`](../usage/background.md) | Read | Stop a running background task |
 
-The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-file.md#schedule) (on by default) and the `task_*` tools require [`[background] enabled`](../configuration/config-file.md#background) (off by default). A disabled subsystem registers no tools at all, rather than shipping schemas that could only fail.
+The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-file.md#schedule) (on by default) and the `task_*` tools require [`[background] enabled`](../configuration/config-file.md#background) (off by default). `skill_write` and `skill_delete` require [`[skills] agent_managed`](../configuration/config-file.md#skills) (off by default) and are never given to a sub-agent. A disabled subsystem registers no tools at all, rather than shipping schemas that could only fail.
 
 ## Permission Requirements
 
@@ -49,7 +52,9 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available in read, ask, and write modes):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `skill`, `render_image`
+- `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `render_image`
+- All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory, the
+  store is meka's own under its config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
 - All scratchpad tools
 - All memory tools. Writing a memory needs only read permission: the store is meka's own, under
@@ -185,9 +190,16 @@ Two things do *not* survive a follow-up, because they only ever lived in memory:
 
 One follow-up at a time per sub-agent. A second concurrent call on the same worker is refused rather than interleaved, since both would be appending to one conversation from a view of it that the other has already changed.
 
-## `skill`
+## The `skill_*` tools
 
-Loads a named skill's instructions. Skills are user-defined knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`. The per-turn context lists available skills with their description and when-to-use hint; the agent calls `skill({"name": "<skill-name>"})` to load the full body. See [Skills](../usage/skills.md) for how to author skills.
+Skills are knowledge packages stored in `~/.config/meka/skills/<name>/SKILL.md`. The per-turn context lists the installed ones with their descriptions; these tools open, search, and (when enabled) maintain them.
+
+- `skill_read({"name": "<skill-name>"})` returns the full body, prefixed with the skill's base directory.
+- `skill_search({"pattern": "<regex>"})` matches each line of every skill, bodies included. This is what reaches skills the capped index did not list, and what answers "which of my skills covers this" when the one-line descriptions do not.
+- `skill_write({"name": ..., "description": ..., "priority": ..., "body": ...})` creates or updates a skill. Omitting `body` keeps the existing one.
+- `skill_delete({"name": ...})` removes the skill's whole directory, bundled files included.
+
+The last two are registered only when [`[skills] agent_managed`](../configuration/config-file.md#skills) is on, and never for a sub-agent. See [Skills](../usage/skills.md) for how to author skills and [Letting the Agent Manage Skills](../usage/skills.md#letting-the-agent-manage-skills) for when to hand authoring to the agent.
 
 ## `render_image`
 

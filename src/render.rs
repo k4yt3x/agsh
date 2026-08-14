@@ -1698,7 +1698,10 @@ fn tool_display_name(name: &str) -> &str {
         "scratchpad_edit" => "ScratchpadEdit",
         "scratchpad_list" => "ScratchpadList",
         "scratchpad_delete" => "ScratchpadDelete",
-        "skill" => "Skill",
+        "skill_read" => "Skill",
+        "skill_search" => "Search skills",
+        "skill_write" => "Save skill",
+        "skill_delete" => "Delete skill",
         "render_image" => "RenderImage",
         "context_check" => "ContextCheck",
         "context_compact" => "ContextCompact",
@@ -1828,7 +1831,8 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "search_web" => "query",
         "agent_spawn" => "prompt",
         "scratchpad_write" | "scratchpad_read" | "scratchpad_edit" | "scratchpad_delete" => "name",
-        "skill" => "name",
+        "skill_read" | "skill_write" | "skill_delete" => "name",
+        "skill_search" => "pattern",
         _ => return None,
     };
     input.get(key).and_then(|v| v.as_str()).map(str::to_string)
@@ -2304,7 +2308,7 @@ mod tests {
         assert_eq!(tool_display_name("search_contents"), "SearchContents");
         assert_eq!(tool_display_name("fetch_url"), "FetchUrl");
         assert_eq!(tool_display_name("search_web"), "SearchWeb");
-        assert_eq!(tool_display_name("skill"), "Skill");
+        assert_eq!(tool_display_name("skill_read"), "Skill");
         assert_eq!(tool_display_name("render_image"), "RenderImage");
         assert_eq!(tool_display_name("custom_tool"), "custom_tool");
         // Every family member has a mapping; a missing one falls through to raw snake_case and
@@ -2323,7 +2327,7 @@ mod tests {
     fn test_builtin_primary_param_skill() {
         let input = serde_json::json!({"name": "setup-postgres"});
         assert_eq!(
-            builtin_primary_param("skill", &input).as_deref(),
+            builtin_primary_param("skill_read", &input).as_deref(),
             Some("setup-postgres")
         );
     }

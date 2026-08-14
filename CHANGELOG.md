@@ -9,15 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Compaction now runs a checkpoint turn first: the agent saves what must last and writes the summary.
+- Compaction runs a checkpoint turn first: the agent saves what must last and writes the summary.
 - `context_check` reports live context occupancy, headroom and compaction count on demand.
 - `context_compact` lets the agent request a compaction at the end of the current turn.
 - `keep_recent: false` compacts without keeping a verbatim tail, for turning the page cleanly.
 - `/compact <instructions>` says what to keep or drop, and reports the memories written.
 - `[session].compact_checkpoint` (default `true`) switches the checkpoint turn off.
+- `skill_search` greps the full text of every installed skill, bodies included.
+- `skill_write` and `skill_delete` let the agent author its own skills, off by default.
+- `[skills].agent_managed` (default `false`) registers the two skill-authoring tools.
+- Skills take an optional `priority` in frontmatter, ordering the `[Skills]` index like memory's.
+- `meka skill add --priority`, and priority and author columns in `meka skill list`.
 
 ### Changed
 
+- **Breaking:** the `skill` tool is now `skill_read`, one of a four-tool `skill_*` family.
+- `[tools]` and `[subagents]` entries naming `skill` go stale on upgrade and warn at startup.
+- The `[Skills]` index is capped at 200 entries and 8 KiB, then points at `skill_search`.
+- Skills are listed by priority, not name; existing installs re-render the index once.
+- An unknown tool name that prefixes a tool family now suggests it, e.g. `skill` to `skill_read`.
+- Stale `[tools]` entries suggest the built-in they probably meant instead of only reporting a miss.
 - The `[Context budget]` block reports the compaction count once a session has compacted twice.
 - The compaction summary gained a standing-commitments section, and honours per-run instructions.
 
@@ -29,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Checkpoint tool calls honour `ask` permission; they previously ran unprompted and unrendered.
+- `memory_write` / `memory_delete` refuse a symlinked path rather than writing outside meka's store.
 
 ## [0.41.0] - 2026-08-13
 

@@ -64,9 +64,9 @@ const MCP_RESOURCE_TOOLS: &[&str] = &[
 /// conversation the first time it moves; rendering it into the per-turn `<context>` block costs an
 /// append instead.
 ///
-/// Tools, skills, and MCP instructions are `BTreeMap`s, so a snapshot has one canonical form and
-/// equality is a real "did the model's picture change" test rather than an ordering accident.
-/// Memories are a `Vec` because their order is meaningful (see [`WorldSnapshot::memories`]) and
+/// Tools and MCP instructions are `BTreeMap`s, so a snapshot has one canonical form and equality is
+/// a real "did the model's picture change" test rather than an ordering accident. Skills and
+/// memories are `Vec`s because their order is meaningful (see [`WorldSnapshot::memories`]) and
 /// already canonical when it arrives.
 /// One memory's line in the `[Memory]` index. Carries `mtime` rather than a rendered age so the
 /// snapshot compares equal across a midnight boundary.
@@ -91,8 +91,12 @@ struct ScheduledIndexEntry {
 pub struct WorldSnapshot {
     /// Tool name → `(required permission, deferred, one-line summary)`.
     tools: std::collections::BTreeMap<String, (Permission, bool, String)>,
-    /// Skill name → description.
-    skills: std::collections::BTreeMap<String, String>,
+    /// `(skill name, description)`, in the `(priority, name)` order [`crate::skills`] produced.
+    ///
+    /// A `Vec`, not a map, for the same reason `memories` is one: the order is the ranking, and
+    /// the index budget cuts from the end. A `BTreeMap` here would silently re-sort by name
+    /// and undo the priority the user set.
+    skills: Vec<(String, String)>,
     /// Scheduled jobs for this session, soonest first.
     scheduled: Vec<ScheduledIndexEntry>,
     /// Memory name → index entry, in the order [`crate::memory::sort_for_index`] produced.
@@ -118,7 +122,7 @@ pub struct WorldSnapshot {
 
 /// The tool each store's index exists to drive. An index is a menu: without the tool that opens an
 /// entry, listing the entries is a promise the model cannot act on.
-const SKILL_INDEX_TOOL: &str = "skill";
+const SKILL_INDEX_TOOL: &str = "skill_read";
 const MEMORY_INDEX_TOOL: &str = "memory_read";
 const SCHEDULE_INDEX_TOOL: &str = "schedule_list";
 const TASK_INDEX_TOOL: &str = crate::tools::background::TASK_INDEX_TOOL;
@@ -152,7 +156,8 @@ impl WorldSnapshot {
     ///
     /// Each store's index is dropped when the tool that opens it is not registered. That happens
     /// through `[skills] enabled` / `[memory] enabled`, which also empty the caches, but equally
-    /// through `[tools] disabled_tools = ["skill"]`, which does not - and without this filter the
+    /// through `[tools] disabled_tools = ["skill_read"]`, which does not - and without this filter
+    /// the
     /// section would keep instructing the model to call a tool that no longer exists. Gating here
     /// rather than at render time means the snapshot records what the model was *told*, so the
     /// diff and the equality check stay honest.
@@ -588,14 +593,7 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
     }
 
     if !current.skills.is_empty() {
-        let mut out = String::from(
-            "[Skills]\nCall the `skill` tool with a skill name to load its full content. Only \
-             invoke a skill when the user's request matches its stated purpose.\n\n",
-        );
-        for (name, description) in &current.skills {
-            out.push_str(&format!("- **{}**: {}\n", name, description));
-        }
-        sections.push(out);
+        sections.push(render_skill_section(&current.skills));
     }
 
     // Skips alone are enough to render the section. A store whose every file fails to parse
@@ -694,6 +692,51 @@ fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
         out.push_str(&format!(
             "\n{} more not shown here; use `schedule_list` to see them.\n",
             hidden
+        ));
+    }
+    out
+}
+
+/// Byte and entry ceilings on the rendered `[Skills]` index. Same values and same reasoning as the
+/// `[Memory]` pair below: the content is the same shape (a name and a one-line description), so it
+/// gets the same budget.
+const SKILL_INDEX_MAX_BYTES: usize = 8_192;
+const SKILL_INDEX_MAX_ENTRIES: usize = 200;
+
+/// Render the `[Skills]` index: the entries that fit, then a count of those that did not.
+///
+/// `skills` arrives sorted by `(priority, name)` from [`crate::skills`], so the budget takes a
+/// prefix and what falls off is genuinely the least important rather than whatever sorted late
+/// alphabetically.
+///
+/// The priority itself is deliberately not rendered; see the field docs on
+/// [`crate::skills::Skill::priority`].
+fn render_skill_section(skills: &[(String, String)]) -> String {
+    let mut out = String::from(
+        "[Skills]\nCall the `skill_read` tool with a skill name to load its full content. Only \
+         invoke a skill when the user's request matches its stated purpose.\n\n",
+    );
+
+    let mut shown = 0;
+    for (name, description) in skills.iter().take(SKILL_INDEX_MAX_ENTRIES) {
+        let line = format!("- **{}**: {}\n", name, description);
+        // Always emit at least one entry, for the same reason `[Memory]` does: one pathological
+        // description longer than the whole budget should still be visible rather than collapsing
+        // the section to a bare count.
+        if shown > 0 && out.len() + line.len() > SKILL_INDEX_MAX_BYTES {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+
+    let hidden = skills.len().saturating_sub(shown);
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{} more skill{} not shown here; use `skill_search` to find {} by content.\n",
+            hidden,
+            if hidden == 1 { "" } else { "s" },
+            if hidden == 1 { "it" } else { "them" }
         ));
     }
     out
@@ -909,16 +952,32 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         lines.push(format!("- Redescribed: {}", restated.join("; ")));
     }
 
+    // Looked up by name rather than by position: the list is priority-ordered, so re-prioritising
+    // one skill shifts every skill after it, and a positional comparison would announce the whole
+    // store as changed when only its ordering did. The rank is not in the index anyway.
+    let previous_skills: std::collections::HashMap<&str, &str> = previous
+        .skills
+        .iter()
+        .map(|(name, description)| (name.as_str(), description.as_str()))
+        .collect();
     let added_skills: Vec<String> = current
         .skills
         .iter()
-        .filter(|(name, description)| previous.skills.get(*name) != Some(description))
+        .filter(|(name, description)| {
+            previous_skills.get(name.as_str()) != Some(&description.as_str())
+        })
         .map(|(name, description)| format!("{} ({})", name, description))
         .collect();
     let removed_skills: Vec<&String> = previous
         .skills
-        .keys()
-        .filter(|name| !current.skills.contains_key(*name))
+        .iter()
+        .filter(|(name, _)| {
+            !current
+                .skills
+                .iter()
+                .any(|(candidate, _)| candidate == name)
+        })
+        .map(|(name, _)| name)
         .collect();
     if !added_skills.is_empty() {
         lines.push(format!(
@@ -1912,8 +1971,126 @@ mod tests {
             version: None,
             author: None,
             source_url: None,
+            priority: crate::store::DEFAULT_PRIORITY,
             body_path: std::path::PathBuf::from("/tmp").join(name).join("SKILL.md"),
         }
+    }
+
+    /// The index is bounded like every other pushed index. Silently truncating it would read to
+    /// the model as "these are all the skills there are", so the remainder is stated and points at
+    /// the tool that can reach the rest.
+    #[test]
+    fn test_skill_section_caps_entry_count_and_names_the_escape_hatch() {
+        let skills: Vec<(String, String)> = (0..SKILL_INDEX_MAX_ENTRIES + 25)
+            .map(|index| (format!("s{index:04}"), "x".to_string()))
+            .collect();
+        let rendered = render_skill_section(&skills);
+
+        assert_eq!(rendered.matches("- **s").count(), SKILL_INDEX_MAX_ENTRIES);
+        assert!(
+            rendered.contains("25 more skills not shown here"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("skill_search"), "{rendered}");
+    }
+
+    #[test]
+    fn test_skill_section_caps_bytes() {
+        let long = "d".repeat(400);
+        let skills: Vec<(String, String)> = (0..100)
+            .map(|index| (format!("s{index:04}"), long.clone()))
+            .collect();
+        let rendered = render_skill_section(&skills);
+
+        assert!(
+            rendered.len() < SKILL_INDEX_MAX_BYTES + 500,
+            "{}",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("more skills not shown here"),
+            "{rendered}"
+        );
+    }
+
+    /// One description longer than the whole budget must still leave a visible entry rather than
+    /// collapsing the section to a bare count.
+    #[test]
+    fn test_skill_section_always_shows_at_least_one_entry() {
+        let skills = vec![(
+            "enormous".to_string(),
+            "z".repeat(SKILL_INDEX_MAX_BYTES * 2),
+        )];
+        let rendered = render_skill_section(&skills);
+        assert!(rendered.contains("- **enormous**"), "{rendered}");
+    }
+
+    /// The cap has to drop the *least important* skills, not whichever ones sorted late
+    /// alphabetically. That only works if the snapshot preserves discovery's `(priority, name)`
+    /// order, which a `BTreeMap` would silently undo.
+    #[test]
+    fn test_skill_index_preserves_priority_order_through_the_snapshot() {
+        let mut important = sample_skill("zzz-critical");
+        important.priority = 0;
+        let ordinary = sample_skill("aaa-ordinary");
+        // Hardcoded in the order discovery produces rather than re-sorted here. The claim under
+        // test is that the snapshot preserves the order it is handed, so re-running the production
+        // comparator inside the test would only prove that comparator equals itself.
+        // `discover_skills_in`'s own sort is tested in `crate::skills`.
+        let skills = vec![important, ordinary];
+
+        let snapshot = WorldSnapshot::new(
+            &catalogue_with(SKILL_INDEX_TOOL),
+            &skills,
+            &index_of(&[]),
+            &[],
+            &[],
+        );
+        let rendered = render_world_state(&snapshot, None);
+
+        let critical = rendered
+            .find("zzz-critical")
+            .expect("critical skill listed");
+        let ordinary = rendered
+            .find("aaa-ordinary")
+            .expect("ordinary skill listed");
+        assert!(
+            critical < ordinary,
+            "priority 0 must lead the index, got:\n{rendered}"
+        );
+    }
+
+    /// Re-prioritising one skill shifts every skill after it. The diff is keyed by name so that
+    /// reshuffle does not announce the whole store as changed, which would be pure noise: the rank
+    /// is not in the index the model reads.
+    #[test]
+    fn test_reordering_skills_is_not_reported_as_a_change() {
+        let catalogue = catalogue_with(SKILL_INDEX_TOOL);
+        let first = [sample_skill("alpha"), sample_skill("beta")];
+        let second = [sample_skill("beta"), sample_skill("alpha")];
+
+        let before = WorldSnapshot::new(&catalogue, &first, &index_of(&[]), &[], &[]);
+        let after = WorldSnapshot::new(&catalogue, &second, &index_of(&[]), &[], &[]);
+        assert!(
+            render_world_state_diff(&after, &before).is_empty(),
+            "reordering alone must produce no diff at all"
+        );
+
+        // The same reorder alongside a real change, so the silence above is the skill logic being
+        // correct rather than the differ returning nothing whatever it is given.
+        let with_server = WorldSnapshot::new(
+            &catalogue,
+            &second,
+            &index_of(&[]),
+            &[("new-server".to_string(), "just connected".to_string())],
+            &[],
+        );
+        let diff = render_world_state_diff(&with_server, &before);
+        assert!(!diff.is_empty(), "the differ must report the new server");
+        assert!(
+            !diff.contains("Skills"),
+            "reordering must not read as an added or removed skill, got:\n{diff}"
+        );
     }
 
     fn sample_todo(text: &str, status: todo::TodoStatus) -> todo::TodoItem {
@@ -2413,6 +2590,7 @@ mod tests {
             version: None,
             author: None,
             source_url: None,
+            priority: crate::store::DEFAULT_PRIORITY,
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         }];
         let instructions = vec![("fs".to_string(), "Read before write.".to_string())];
@@ -2504,6 +2682,7 @@ mod tests {
             version: None,
             author: None,
             source_url: None,
+            priority: crate::store::DEFAULT_PRIORITY,
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         }];
         let instructions = [("fs".to_string(), "Read before write.".to_string())];
@@ -2601,6 +2780,7 @@ mod tests {
             version: None,
             author: None,
             source_url: None,
+            priority: crate::store::DEFAULT_PRIORITY,
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         };
 

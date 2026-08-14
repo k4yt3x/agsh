@@ -30,6 +30,10 @@ use std::{
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+// Re-exported rather than referenced through `store` at each use site: priority is part of the
+// memory store's public vocabulary (`meka memory add --priority`, the `memory_write` schema),
+// and the constants moved to `store` only so `skills` could share the same scale.
+pub use crate::store::{DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY, normalize_description};
 use crate::store::{split_frontmatter, validate_entry_name, yaml_scalar};
 
 /// A single durable note. `description` is what the agent sees every turn; `body` is fetched on
@@ -98,13 +102,6 @@ struct Frontmatter {
     priority: Option<i64>,
 }
 
-/// Priority assigned when frontmatter omits the field. The midpoint of [`MIN_PRIORITY`] ..=
-/// [`MAX_PRIORITY`], so an unranked memory sorts below deliberate standing rules and above
-/// deliberate noise.
-pub const DEFAULT_PRIORITY: u8 = 5;
-pub const MIN_PRIORITY: u8 = 0;
-pub const MAX_PRIORITY: u8 = 9;
-
 /// Ceiling on how many files one discovery pass will parse. Bounds the per-turn cost of a memory
 /// directory that has grown without anyone pruning it; the index budget in [`crate::context`]
 /// trims further from there.
@@ -134,25 +131,10 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
     validate_entry_name(name, "memory")
 }
 
-/// Clamp a frontmatter `priority` into [`MIN_PRIORITY`] ..= [`MAX_PRIORITY`], defaulting to
-/// [`DEFAULT_PRIORITY`] when absent. Out-of-range values are clamped rather than rejected: a
-/// nonsense priority is not a reason to make the memory itself unreachable.
+/// Clamp a frontmatter `priority` for a memory. Thin wrapper over [`crate::store::parse_priority`]
+/// that supplies this store's noun, mirroring [`validate_memory_name`].
 pub fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
-    let Some(value) = raw else {
-        return DEFAULT_PRIORITY;
-    };
-    let clamped = value.clamp(MIN_PRIORITY as i64, MAX_PRIORITY as i64);
-    if clamped != value {
-        tracing::warn!(
-            "memory '{}' has priority {} outside {}..={}; clamped to {}",
-            name,
-            value,
-            MIN_PRIORITY,
-            MAX_PRIORITY,
-            clamped
-        );
-    }
-    clamped as u8
+    crate::store::parse_priority(raw, "memory", name)
 }
 
 /// Discover all valid memories in the user's memory directory. Returns an empty index if the
@@ -303,15 +285,6 @@ pub async fn load_memory_body(memory: &Memory) -> Result<String, String> {
         .unwrap_or(content))
 }
 
-/// Collapse a description to the single line it is contractually meant to be.
-///
-/// Without this a newline still *works* - `yaml_scalar` quotes it and YAML folds it back to a
-/// space on the next read - but the stored value would silently differ from what the caller asked
-/// for, decided by YAML's folding rules rather than by us.
-pub fn normalize_description(description: &str) -> String {
-    description.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// Render a memory file: frontmatter followed by the body. `priority` is emitted only when it
 /// differs from [`DEFAULT_PRIORITY`], so the common case stays a two-line header.
 pub fn render_memory(description: &str, priority: u8, body: &str) -> String {
@@ -373,6 +346,9 @@ pub fn write_memory(
     }
 
     let path = memory_file_in(root, name);
+    // A validated name cannot escape the root, but a symlink already sitting at that name
+    // redirects the write wherever it points. See [`crate::store::reject_symlinked_path`].
+    crate::store::reject_symlinked_path(&path, "memory")?;
     let body = match body {
         Some(body) => body.to_string(),
         None => existing_body(&path).unwrap_or_default(),
@@ -830,6 +806,30 @@ mod tests {
     /// A metadata-only write must not cost the note its contents. `body` has always been optional,
     /// so this is the call the API invites, and rendering the absence as an empty body made a
     /// priority change silently delete everything the memory said.
+    /// `validate_memory_name` stops a name from escaping the root, but it cannot see a symlink
+    /// already sitting at that name. Following one writes outside the store at *read* permission,
+    /// whose whole contract is that nothing in the user's tree changes. Archives preserve symlinks,
+    /// so unpacking something into the memory directory is enough to plant one.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_memory_refuses_a_symlinked_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("memory");
+        let victim = temp.path().join("victim.txt");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(&victim, "ORIGINAL").expect("victim");
+        std::os::unix::fs::symlink(&victim, root.join("evil.md")).expect("symlink");
+
+        let error = write_memory(&root, "evil", "d", 5, Some("PWNED"))
+            .expect_err("must refuse to write through a symlink");
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "ORIGINAL",
+            "the target must be untouched"
+        );
+    }
+
     #[test]
     fn test_write_memory_keeps_an_omitted_body() {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -17,6 +17,7 @@ const DESCRIPTION_TRUNCATE: usize = 40;
 pub struct AddArgs<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
+    pub priority: Option<u8>,
     pub version: Option<&'a str>,
     pub author: Option<&'a str>,
     pub source_url: Option<&'a str>,
@@ -44,7 +45,9 @@ fn print_list(skills: &[skills::Skill]) {
         .map(|skill| {
             vec![
                 skill.name.clone(),
+                skill.priority.to_string(),
                 skill.version.clone().unwrap_or_else(|| "-".to_string()),
+                skill.author.clone().unwrap_or_else(|| "-".to_string()),
                 truncate(&skill.description, DESCRIPTION_TRUNCATE),
                 skill.source_dir.display().to_string(),
             ]
@@ -53,7 +56,10 @@ fn print_list(skills: &[skills::Skill]) {
 
     print!(
         "{}",
-        crate::render::format_columns(&["Name", "Version", "Description", "Path"], &rows)
+        crate::render::format_columns(
+            &["Name", "Pri", "Version", "Author", "Description", "Path"],
+            &rows
+        )
     );
 }
 
@@ -67,6 +73,7 @@ pub async fn run_get(name: &str) -> Result<()> {
     println!("source_dir: {}", skill.source_dir.display());
     println!("body_path: {}", skill.body_path.display());
     println!("description: {}", skill.description);
+    println!("priority: {}", skill.priority);
     println!("version: {}", skill.version.as_deref().unwrap_or("(unset)"));
     println!("author: {}", skill.author.as_deref().unwrap_or("(unset)"));
     println!(
@@ -149,10 +156,26 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
 
 fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
     if let Some(path) = args.from_file {
+        // `--from-file` copies the file byte for byte, so every field that would go into rendered
+        // frontmatter is refused rather than accepted and dropped. Silently ignoring `--priority`
+        // here would leave the skill at the default with no indication the flag did nothing.
         if args.description.is_some() {
             return Err(MekaError::Config(
                 "--from-file is mutually exclusive with --description".to_string(),
             ));
+        }
+        for (flag, given) in [
+            ("--priority", args.priority.is_some()),
+            ("--version", args.version.is_some()),
+            ("--author", args.author.is_some()),
+            ("--source-url", args.source_url.is_some()),
+        ] {
+            if given {
+                return Err(MekaError::Config(format!(
+                    "--from-file is mutually exclusive with {}; set that key in the file instead",
+                    flag
+                )));
+            }
         }
         let content = std::fs::read_to_string(path).map_err(|error| {
             MekaError::Config(format!("failed to read {}: {}", path.display(), error))
@@ -164,9 +187,18 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
                 "--description is required (or pass --from-file to copy a template)".to_string(),
             )
         })?;
+        let priority = args.priority.unwrap_or(crate::store::DEFAULT_PRIORITY);
+        if priority > crate::store::MAX_PRIORITY {
+            return Err(MekaError::Config(format!(
+                "--priority must be between {} and {}",
+                crate::store::MIN_PRIORITY,
+                crate::store::MAX_PRIORITY
+            )));
+        }
         Ok(skills::render_template(
             args.name,
             description,
+            priority,
             args.version,
             args.author,
             args.source_url,
@@ -427,6 +459,7 @@ mod tests {
         AddArgs {
             name,
             description: Some(description),
+            priority: None,
             version: None,
             author: None,
             source_url: None,
@@ -512,6 +545,7 @@ mod tests {
         let args = AddArgs {
             name: "tpl",
             description: None,
+            priority: None,
             version: None,
             author: None,
             source_url: None,
@@ -537,6 +571,7 @@ mod tests {
         let args = AddArgs {
             name: "tpl",
             description: Some("collides"),
+            priority: None,
             version: None,
             author: None,
             source_url: None,
@@ -556,6 +591,7 @@ mod tests {
         let args = AddArgs {
             name: "needs",
             description: None,
+            priority: None,
             version: None,
             author: None,
             source_url: None,
@@ -638,6 +674,7 @@ mod tests {
             version: None,
             author: None,
             source_url: Some("http://example.com/SKILL.md".to_string()),
+            priority: crate::store::DEFAULT_PRIORITY,
             body_path: std::path::PathBuf::from("/tmp/insecure/SKILL.md"),
         };
         let err = fetch_and_replace_skill(&skill)

@@ -388,6 +388,15 @@ impl Tool for MemoryDeleteTool {
         })?;
 
         let path = memory::memory_file_in(&root, name);
+        // Before the `is_file` check below, which follows symlinks: a link pointing at a real file
+        // would pass it, and `remove_file` would then take the link and leave the target. Calling
+        // that a deleted memory misreports what happened, and the link was put there deliberately.
+        crate::store::reject_symlinked_path(&path, "memory").map_err(|message| {
+            MekaError::ToolExecution {
+                tool_name: "memory_delete".to_string(),
+                message,
+            }
+        })?;
         if !path.is_file() {
             return Err(MekaError::ToolExecution {
                 tool_name: "memory_delete".to_string(),
@@ -426,6 +435,53 @@ mod tests {
                 _ => String::new(),
             })
             .collect()
+    }
+
+    /// `is_file` follows symlinks, so a link pointing at a real file passed the existence check and
+    /// `remove_file` then took the link and left the target: a deleted memory that still exists.
+    /// Both tools refuse instead, keeping read permission's promise that nothing outside meka's own
+    /// store changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_and_delete_refuse_a_symlinked_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let victim = temp.path().join("victim.txt");
+        std::fs::write(&victim, "ORIGINAL").expect("victim");
+        std::os::unix::fs::symlink(&victim, temp.path().join("evil.md")).expect("symlink");
+
+        let write = MemoryWriteTool {
+            memories: cache_at(temp.path()),
+        };
+        let error = write
+            .execute(
+                serde_json::json!({"name": "evil", "description": "d", "body": "PWNED"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("must refuse to write through a symlink");
+        assert!(error.to_string().contains("symlink"), "{error}");
+
+        let delete = MemoryDeleteTool {
+            memories: cache_at(temp.path()),
+        };
+        let error = delete
+            .execute(
+                serde_json::json!({"name": "evil"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("must refuse to delete through a symlink");
+        assert!(error.to_string().contains("symlink"), "{error}");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "ORIGINAL",
+            "the target must survive both"
+        );
+        assert!(
+            temp.path().join("evil.md").is_symlink(),
+            "the link itself must survive too"
+        );
     }
 
     /// The reported failure, at the point it was felt: four files on disk and an agent told four
