@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - An unknown or stale tool name now suggests the built-in it probably meant.
+- `schedule_create` explains what makes a gate's output usable and names the `isolated` trade.
 - A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
 - `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.

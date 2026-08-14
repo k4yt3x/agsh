@@ -58,6 +58,16 @@ gate just ran.
 A gate's first evaluation always fires: with no previous output to compare against, "changed" is the
 honest answer, and it means a typo in the command surfaces immediately instead of lying quiet.
 
+**An `on-change` gate is only as good as the stability of its output.** The command should print
+something that changes when, and only when, the watched thing does, which is a stronger requirement
+than "read-only" and is where most gates go wrong. It fails in both directions. Output carrying
+something that moves on its own (a timestamp, an elapsed time, an unsorted list whose order varies)
+differs on every evaluation, so the gate fires every tick and costs more than the ungated job it
+replaced. Output that can return to an earlier value between polls (a bare count, where two events
+arrive and one is consumed) reads as unchanged, and the gate silently misses what happened in
+between. Pairing a count with a monotonic marker, as in `git rev-list --count HEAD` alongside the
+commit sha, avoids both.
+
 > **Gates need `write` permission.** A gate is a shell command that runs unattended, on a timer,
 > until someone cancels it: a longer-lived grant than `execute_command`, which at least ends with
 > the turn that called it. Ungated reminders work at `read`.
@@ -114,10 +124,16 @@ lose them. What happens to jobs whose time passed while meka was down depends on
 By default a job's turn joins the conversation that created it, so you come back to a session
 containing what happened while you were away.
 
-Pass `isolated: true` and the turn runs in a fresh session instead. Much cheaper for anything
-recurring, because the creating conversation's history is not replayed on every fire, but the
-result does not appear in that conversation. Isolated runs are ordinary sessions, so
-`meka session list` and `meka session export` can see them.
+Pass `isolated: true` and the turn runs in a fresh session instead. Isolated runs are ordinary
+sessions, so `meka session list` and `meka session export` can see them.
+
+The trade is cost against continuity, and neither side is the default answer. Isolation is cheaper
+for anything recurring, because the creating conversation's history is not replayed on every fire,
+and it keeps a job firing every two minutes from filling the conversation you actually talk in with
+its own results. But an isolated turn remembers nothing said in the parent, so a job whose value
+depends on that memory (a look-back at something the agent itself did, a watcher that should notice
+it has already reported this) is worse in isolation no matter how well the prompt is written. Reach
+for it when the job is self-contained, and leave it off when it is not.
 
 **Only `meka serve` honours `isolated`.** The REPL and ACP each drive one conversation per session,
 so a job that asked for isolation runs in that conversation instead, with a warning saying so.
@@ -170,10 +186,13 @@ keep working, so jobs left over from before the flag was flipped can still be li
 
 - Write the prompt for a reader who has no context. The conversation that created the job may be
   long over, and for an isolated job it was never there at all.
-- Prefer `isolated: true` for anything recurring; the token difference is large.
+- Reach for `isolated: true` when a recurring job is self-contained; the token difference is large.
+  Leave it off when the job needs to remember what happened in the conversation that created it.
 - Reach for a gate whenever the answer is usually "nothing happened".
 - Keep gate commands fast and read-only. They run on every tick, and a gate that changes something
   is a side effect on a timer.
+- Check what a gate's command prints across two runs where nothing happened. Identical output is the
+  whole mechanism, and anything varying inside it turns the gate into a timer.
 - If a schedule matters, check what `schedule_create` reports back: it states the resolved next fire
   in absolute local time, which is how you catch a cron expression that parsed fine and means
   something other than you intended.

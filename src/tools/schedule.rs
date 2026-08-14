@@ -115,7 +115,14 @@ impl Tool for ScheduleCreateTool {
                         "properties": {
                             "command": {
                                 "type": "string",
-                                "description": "Shell command. Should be a fast, read-only check."
+                                "description": "Shell command. A fast, read-only \
+                                                check whose output changes when, and \
+                                                only when, the watched thing does. \
+                                                Output that moves on its own (a \
+                                                timestamp) fires every tick; output \
+                                                that can return to an earlier value \
+                                                between polls (a bare count) hides \
+                                                the change in between."
                             },
                             "fire": {
                                 "type": "string",
@@ -131,10 +138,12 @@ impl Tool for ScheduleCreateTool {
                     "isolated": {
                         "type": "boolean",
                         "description": "Run in a fresh session instead of this conversation. \
-                                        Much cheaper for recurring jobs, since this \
-                                        conversation's history is not replayed on every fire, but \
-                                        the result does not appear here. Prefer true for anything \
-                                        with `every` or `cron`."
+                                        Cheaper for a recurring job, since this conversation's \
+                                        history is not replayed on every fire and the fires do \
+                                        not pile up in it. The trade is continuity: the turn \
+                                        recalls nothing said here and its result does not \
+                                        appear here. Leave it false when the job depends on \
+                                        that. Only `meka serve` honours it."
                     }
                 },
                 "required": ["prompt"]
