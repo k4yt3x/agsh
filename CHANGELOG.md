@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
+- `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
 
 ### Changed
 
@@ -32,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unknown or stale tool name now suggests the built-in it probably meant.
 - `schedule_create` explains what makes a gate's output usable and names the `isolated` trade.
 - Tool indicators are cyan rather than dark cyan, and their arguments blue under `tool_params`.
+- The `ask` prompt asks again on an unrecognised answer instead of reading it as a denial.
+- Every line meka renders from model output is budgeted whole, so none of them wraps by default.
+- A tool indicator keeps the whole tool name when space is short, dropping the argument instead.
+- A cut tool name, path or URL keeps both ends, so the filename survives instead of the directories.
+- Dropped rows keep the last one, so a trimmed argument still shows how it ends.
+- A fully-shown thinking block stops at a row ceiling instead of printing without bound.
 - A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
 - `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.
@@ -39,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An invisible character a terminal still paints is dropped, so it cannot push text off the row.
+- A skin-toned emoji no longer overflows the row meka measured it to fit.
+- A long run of combining marks in a tool call no longer freezes the terminal for minutes.
+- `meka provider add` with no terminal exits instead of looping on its own prompt forever.
 - The elided thinking preview fills its line instead of stopping at the reasoning's first newline.
 - Replayed history shows a built-in tool call's argument, which only the live indicator carried.
 - `/status` counts compaction tokens, which were spent but never reported against the session.
@@ -59,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- An `ask` prompt keeps the end of an argument too long to show, where a pipeline's effect lives.
+- Ctrl+D at an `ask` prompt denies; end of input was read as the Enter that approves it.
+- Ctrl+D during an MCP elicitation declines; it accepted a partial form or opened the server's URL.
+- An elicitation form with no fields is declined; meka consented to it without asking anything.
+- `background` is shown at the `ask` prompt; the argument that detaches a call was hidden.
+- The `ask` approval prompt shows every argument, not just the one that names the call's target.
 - The `ask` approval prompt strips escapes from the tool name and argument it asks you to approve.
 - Thinking blocks, todo lists and tool arguments are stripped of escapes, cursor moves and bidi.
 - `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.

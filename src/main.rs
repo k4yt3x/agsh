@@ -178,6 +178,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     if let Some(cli::Command::Serve { bind: Some(bind) }) = cli.command.as_ref() {
         config.serve_bind_override = Some(bind.clone());
     }
+    // Before anything renders. The renderers read this rather than taking it as a parameter because
+    // the approval prompt sits several call sites below `run_repl`, which takes flat scalars; the
+    // functions that compose a line still take an explicit width, so tests never touch it.
+    render::set_max_width(config.max_width);
     runtime.block_on(async_main(config, acp_mode, serve_mode))
 }
 

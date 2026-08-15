@@ -300,9 +300,41 @@ width.
 render_mode = "raw"
 ```
 
+### `display.max_width`
+
+Widest line meka composes from model output, in terminal columns.
+
+Default: unset, meaning the terminal's own width, so nothing ever wraps.
+
+Set it to pin the width instead:
+
+```toml
+[display]
+max_width = 120
+```
+
+A set value is honoured exactly rather than clamped to the terminal, because pinning it is how you
+get identical output across machines and a silent clamp would take that away on the narrow one. The
+cost is that a value wider than your terminal wraps, and a wrapped row starts at column zero, where
+meka's own output lives. Below 40 columns the value is clamped up and a warning is logged: every
+budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing.
+
+This covers meka's own output: tool indicators and their argument block, thinking previews, todo
+lists, and the `ask` approval prompt. Assistant markdown is not affected and keeps reflowing to the
+real terminal through [`display.render_mode`](#displayrender_mode). With output piped there is no
+terminal to measure, so an unset width falls back to 100 columns and a captured run stays byte-stable.
+
+A terminal narrower than 20 columns is treated as 20. That is not a legibility judgement: the
+thinking block's own prefix is twelve columns, so below roughly that meka's chrome no longer fits and
+the width stops meaning anything. Such a terminal wraps meka's output whatever the number says.
+
 ### `display.tool_params`
 
 How much of a tool call's input the `[tool ...]` indicator shows.
+
+This setting covers the indicator only. In `ask` permission mode the approval prompt always shows
+every argument, whatever this is set to: the indicator is a notification, the prompt is a decision,
+and setting `off` for a quiet scrollback must not leave you approving calls you cannot see.
 
 | Value | Description |
 |-------|-------------|
@@ -336,22 +368,32 @@ them together reads as a single call with too many parameters. Under `summary` t
 is what makes a run of them read as a list of steps.
 
 This is a reading format, not a data format: quotes are dropped, so `timeout: 300` doesn't say
-whether the model sent `300` or `"300"`. Three caps keep one call from filling the screen, and each
+whether the model sent `300` or `"300"`. Four caps keep one call from filling the screen, and each
 says what it hid:
 
 | Cap | Limit | Marker |
 |-----|-------|--------|
 | One argument's value | 30 lines | `... N more lines`, indented under that argument |
-| The block | 60 lines, checked at an argument boundary | `... N more arguments: name, name` |
-| One line | 200 terminal columns of value | `...` at the cut |
+| One argument's rows | 32 rows | `... N more rows`, indented under that argument |
+| The block | 60 rows, checked at an argument boundary | `... N more arguments: name, name` |
+| One line | [`display.max_width`](#displaymax_width) | `...` at the cut |
 
-The last two are approximate by design. The block is measured before an argument is added rather
-than after, so a call whose last argument is a long one can reach about 90 lines; the line budget
-covers the value, so the key and the indent sit on top of it.
+The first two caps look redundant and are not. A string value has lines to count, so it is trimmed
+by line and the marker counts lines. An array or an object has none: it fans out one row per element,
+so it needs a bound counted in rows, and the marker says rows rather than pretending they were lines.
 
-The block cap drops whole arguments and names them rather than cutting wherever line 60 lands.
-Knowing that `path` was passed but not shown beats seeing 60 lines of `content` and never learning
+The line cap is exact, brackets and indentation included. The block cap is not: it is checked before
+an argument is rendered rather than after, so the block reaches at most the block cap plus one
+argument's own budget plus the line naming what went — 93 rows.
+
+The block cap drops whole arguments and names them rather than cutting wherever row 60 lands.
+Knowing that `path` was passed but not shown beats seeing 60 rows of `content` and never learning
 which file it was written to.
+
+**A cut keeps the end.** Where a whole argument is dropped it is named; where rows are dropped the
+last one is kept, so a long array still shows its final element and a trimmed value still shows how
+it finishes. The reasoning is the same one that elides a long path from its middle rather than its
+tail: the end of a thing too big to show is usually the half that identifies it.
 
 When you need the exact JSON a tool was called with, `meka session export` has it, untruncated and
 unflattened.
@@ -367,18 +409,17 @@ Values are escape-stripped, their newlines and carriage returns flattened, and U
 characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
 your cursor, reorder what you read, or place text at column zero where meka's own output lives.
 
-Two residual caveats, both about what the block cannot control. A line long enough to wrap continues
-at column zero on the next row, so on a narrow terminal a very long argument can still produce a row
-that starts flush left. And the `... N more lines` and `... N more arguments` markers are ordinary
-text, so an argument whose content mimics one is indistinguishable from a real elision. Neither lets
-an argument run anything; both let it mislead a reader who is not expecting it.
+No line exceeds [`display.max_width`](#displaymax_width), so by default nothing wraps and no row ever
+begins with model text. Setting `max_width` wider than your terminal gives that up, which is the one
+case where a long argument can still produce a row starting flush left.
+
+One residual caveat: the `... N more lines`, `... N more rows` and `... N more arguments` markers are
+ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
+does not let an argument run anything, but it can mislead a reader who is not expecting it.
 
 Applies to the REPL, to one-shot runs (`meka -p`), and to replayed history (`/history`,
 `resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
 events already carry the raw input, so neither is affected.
-
-`off` suppresses arguments in the indicator only. In `ask` permission mode the approval prompt still
-names the argument you are being asked to approve, which is the whole point of that prompt.
 
 ```toml
 [display]
@@ -682,7 +723,7 @@ Default: `16000`
 
 ### `thinking.show_content`
 
-Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut at 80 characters, and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
+Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
 
 Default: `false`
 

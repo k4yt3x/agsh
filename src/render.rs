@@ -950,8 +950,90 @@ fn parse_table_row(line: &str) -> Vec<String> {
         .collect()
 }
 
-fn display_width(string: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(string)
+pub(crate) fn display_width(string: &str) -> usize {
+    // The larger of two measures, because a terminal may follow either and a budget must never be
+    // built on the smaller one. `unicode_width` merges an emoji and its skin-tone modifier into one
+    // two-column cluster; VTE -- gnome-terminal, Console, Tilix, Terminator -- paints them as two
+    // glyphs across four columns, so every skin-toned emoji in an argument was a two-times
+    // under-count. Summing per character catches that, and the whole-string measure catches
+    // sequences a sum would under-count instead. Taking the maximum shows less than might have fit,
+    // which is the direction to be wrong in.
+    unicode_width::UnicodeWidthStr::width(string).max(string.chars().map(char_width).sum())
+}
+
+/// Columns one character occupies, counting anything `unicode_width` will not score as zero.
+///
+/// `None` comes back for the control characters, which [`sanitize_to_line`] has already removed by
+/// the time any budget is computed.
+fn char_width(character: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
+/// `[display].max_width`, or `None` to follow the terminal. Set once at startup.
+static CONFIGURED_MAX_WIDTH: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// Columns used when there is no terminal to measure. Fixed rather than guessed so a piped or
+/// captured run produces the same bytes every time.
+const FALLBACK_OUTPUT_WIDTH: usize = 100;
+
+/// Narrowest width at which a line can be composed at all.
+///
+/// Not a legibility floor -- [`crate::config`] clamps a *configured* width to a much higher one for
+/// that. This is arithmetic. Every budget here subtracts fixed chrome first, and the widest such
+/// chrome is [`THINKING_PREFIX`]; below it the subtraction leaves nothing, and the promise the rest
+/// of the file is built on -- that no composed line exceeds the width it was handed -- stops being
+/// satisfiable at all. This leaves a few columns above that so each surface can still show a
+/// truncation marker rather than only its own prefix.
+///
+/// A terminal this narrow wraps meka's chrome whatever the width says, so composing at the
+/// narrowest width that still works costs nothing that was not already lost.
+pub(crate) const MIN_OUTPUT_WIDTH: usize = 20;
+
+/// Record the configured width. Called once from startup, before anything renders.
+///
+/// A second call is ignored rather than being an error: startup is the only caller, and a process
+/// that somehow reached here twice wants the width it began with rather than a panic. Tests never
+/// touch this -- every function that composes a line takes its width as an argument, which is why
+/// they can.
+pub fn set_max_width(configured: Option<usize>) {
+    if CONFIGURED_MAX_WIDTH.set(configured).is_err() {
+        tracing::debug!("max width already set; ignoring a second call");
+    }
+}
+
+/// The widest line meka may compose from model output.
+///
+/// A configured width wins outright rather than being clamped to the terminal: pinning it is how
+/// you get identical output across machines, and clamping would silently take that away on a narrow
+/// one. The cost is that a value wider than the terminal wraps, which is the user's choice to make
+/// and is documented at the setting.
+///
+/// Unset, this is the terminal's width, so nothing ever wraps. Gated on **stderr** because that is
+/// where every caller writes; [`StreamingRenderer`] gates the same check on stdout because
+/// assistant text goes there instead.
+///
+/// Both paths come back through [`resolve_output_width`], which is why every composition function
+/// may state its width bound without an exception for absurd terminals.
+pub(crate) fn output_width() -> usize {
+    resolve_output_width(
+        CONFIGURED_MAX_WIDTH.get().copied().flatten(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr())
+            .then(|| termimad::terminal_size().0 as usize),
+    )
+}
+
+/// The width arithmetic behind [`output_width`], with the two things it cannot test taken as
+/// arguments: what was configured, and what the terminal measured (`None` when there is no terminal
+/// to ask).
+///
+/// Split out because the floor is the precondition every other width bound in this file assumes,
+/// and a precondition applied on only one of two paths is exactly the kind of gap that survives
+/// review.
+fn resolve_output_width(configured: Option<usize>, measured: Option<usize>) -> usize {
+    configured
+        .or_else(|| measured.filter(|width| *width > 0))
+        .unwrap_or(FALLBACK_OUTPUT_WIDTH)
+        .max(MIN_OUTPUT_WIDTH)
 }
 
 fn format_table(lines: &[String]) -> Vec<String> {
@@ -1029,44 +1111,161 @@ const TAB_WIDTH: usize = 4;
 pub(crate) fn sanitize_to_line(text: &str, max_columns: usize) -> String {
     let flattened: String = sanitize_for_display(text)
         .chars()
-        // Unicode format characters are dropped, which `char::is_control` does not cover. Two
-        // reasons, and the first is the load-bearing one: `unicode_width` measures U+00AD SOFT
-        // HYPHEN as zero columns while a terminal following `wcwidth` draws one, so a run of them
-        // passes any column budget unmeasured and wraps for as many rows as the model likes.
-        // Second, this is the class that contains the bidi overrides, where the argument the user
-        // reads is not the argument that runs. The cost is that a ZWJ emoji sequence renders as its
-        // separate glyphs, which is a fair trade in a line meka composed.
-        .filter(|character| !crate::mcp::sanitize::is_format_char(*character as u32))
+        // Every character meka cannot measure is dropped, which `char::is_control` does not cover.
+        // The rule is one line below -- a character worth zero columns does not survive -- and it is
+        // deliberately wider than the classes that motivated it:
+        //
+        // `unicode_width` scores U+00AD SOFT HYPHEN and U+3164 HANGUL FILLER as zero columns while a
+        // terminal following `wcwidth` draws one and two. A run of either passes any column budget
+        // unmeasured, which is how a model pushes its own text onto a row meka believes is empty --
+        // and the filler draws blank, so the overrun is invisible padding.
+        //
+        // A variation selector (U+FE00-FE0F) changes the width of the character *before* it, so a
+        // budget measured before it is applied is wrong afterwards.
+        //
+        // This class also holds the bidi overrides, where the argument the user reads is not the
+        // argument that runs.
+        //
+        // Dropping by measured width rather than by category costs the combining marks: a decomposed
+        // `e` + U+0301 renders as `e`. Precomposed text, which is what NFC and almost every source
+        // of these strings produces, is untouched. That is the same trade the ZWJ case already
+        // makes, and it buys the property every budget here rests on -- that each surviving
+        // character advances the count by at least one, so a cut is always reached.
         .flat_map(|character| match character {
             '\t' => std::iter::repeat_n(' ', TAB_WIDTH),
             character if character.is_whitespace() => std::iter::repeat_n(' ', 1),
             character => std::iter::repeat_n(character, 1),
         })
+        // Applied after the whitespace above becomes spaces, so a newline still separates the words
+        // it separated rather than being dropped as the zero-width character it measures as.
+        .filter(|character| char_width(*character) > 0)
         .collect();
     truncate_to_width(&flattened, max_columns)
 }
+
+/// Marks a cut made by [`truncate_to_width`].
+const TRUNCATION_MARKER: &str = "...";
 
 /// Cut `text` to `max_columns` terminal columns, marking the cut.
 ///
 /// Measured with [`display_width`] rather than `chars().count()`, because a "200 character"
 /// argument of full-width characters occupies 400 columns and wraps into rows the cap exists to
 /// prevent.
+///
+/// The marker is inside the budget, not added on top of it. Callers compose a line out of several
+/// truncated parts against one total width, so a function that can return `max_columns + 3` makes
+/// that total unenforceable. Below the marker's own width there is no room to say a cut happened,
+/// so the text is simply cut.
 fn truncate_to_width(text: &str, max_columns: usize) -> String {
     if display_width(text) <= max_columns {
         return text.to_string();
     }
+    // A cut always says so, even when saying so is all there is room for. Emitting the text alone
+    // when the budget cannot fit a marker produced a string that reads as complete: at 37 columns
+    // `mcp__exa__web_search_exa` came out as `mc`, which is not a shortened name, it is a different
+    // name.
+    let marker = &TRUNCATION_MARKER[..TRUNCATION_MARKER.len().min(max_columns)];
+    let budget = max_columns - display_width(marker);
+    let mut kept = take_columns(text, budget);
+    kept.push_str(marker);
+    kept
+}
+
+/// The longest prefix of `text` that fits in `max_columns`.
+///
+/// Measured by re-measuring the whole prefix rather than by summing per-character widths, because
+/// the two are not the same number and the callers gate on the former. `unicode_width` scores
+/// `"1\u{fe0f}"` as two columns as a string and one as a sum, so a per-character fill packed twice
+/// what the gate believed fit and every budget in the file came out at double. Re-measuring is
+/// quadratic in the budget, which is bounded and small; being wrong is not.
+fn take_columns(text: &str, max_columns: usize) -> String {
     let mut kept = String::new();
-    let mut width = 0;
     for character in text.chars() {
-        let character_width = display_width(&character.to_string());
-        if width + character_width > max_columns {
+        kept.push(character);
+        if display_width(&kept) > max_columns {
+            kept.pop();
             break;
         }
-        kept.push(character);
-        width += character_width;
     }
-    format!("{}...", kept)
+    kept
 }
+
+/// Cut `text` to `max_columns`, keeping both ends.
+///
+/// For an *identifier*, where both ends carry meaning and the middle is filler. A tool name is
+/// back-loaded: `mcp__exa__web_search_exa` and `mcp__exa__web_fetch_exa` agree for fifteen
+/// characters and differ only at the end, so a tail cut throws away exactly what says which tool
+/// ran. A path behaves the same way, and it is the commoner case:
+/// `/home/you/projects/meka/docs/book/src/configuration/config-file.md` cut from the tail keeps
+/// six directories and loses the filename, which is the part you were reading it for.
+///
+/// Use [`truncate_to_width`] for a *line of content* instead -- a line of source, a wrapped body --
+/// where the text runs left to right and a hole in the middle would misrepresent it.
+pub(crate) fn elide_to_width(text: &str, max_columns: usize) -> String {
+    if display_width(text) <= max_columns {
+        return text.to_string();
+    }
+    let marker_width = display_width(TRUNCATION_MARKER);
+    // Too narrow to show both ends and say so; a tail cut at least stays readable.
+    if max_columns <= marker_width + 2 {
+        return truncate_to_width(text, max_columns);
+    }
+    let available = max_columns - marker_width;
+    // The tail gets the larger half when the split is odd: it carries the operation in a tool name
+    // and the filename in a path.
+    let head_width = available / 2;
+    let tail_width = available - head_width;
+    format!(
+        "{}{}{}",
+        take_columns(text, head_width),
+        TRUNCATION_MARKER,
+        tail_columns(text, tail_width)
+    )
+}
+
+/// The longest suffix of `text` that fits in `max_columns`, the mirror of [`take_columns`].
+///
+/// Measures the real suffix rather than reversing the string and taking a prefix, because width is
+/// **not** order-independent and the reversed measurement is not the one that gets printed:
+/// `display_width("\u{1F44D}\u{1F3FB}")` is 2 and `display_width("\u{1F3FB}\u{1F44D}")` is 4, so a
+/// tail of skin-toned emoji measured backwards came back a third under its budget and the composed
+/// line ran 100 columns wide where 80 was asked for.
+///
+/// [`display_width`] taking the larger of two measures also closes that case, since a per-character
+/// sum does not care about order. This does not lean on it: measuring what is printed is correct
+/// whatever the measure does next.
+fn tail_columns(text: &str, max_columns: usize) -> String {
+    let mut kept = "";
+    for (index, _) in text.char_indices().rev() {
+        let candidate = &text[index..];
+        if display_width(candidate) > max_columns {
+            break;
+        }
+        kept = candidate;
+    }
+    kept.to_string()
+}
+
+/// Columns a tool name may occupy before it is elided.
+///
+/// The name is served first because it is the part that identifies the call. A truncated argument
+/// still conveys its gist (`Jane Street first mon...` is recognisably a search); a truncated name
+/// frequently conveys nothing, since MCP names share long prefixes. The name is also mostly meka's
+/// own text rather than the model's: built-ins come from [`tool_display_name`] and an MCP name is
+/// normalised at registration. This bound exists for the remaining case, a hallucinated name, which
+/// is unvalidated at render time and otherwise unbounded. No genuine name approaches it: built-ins
+/// stop near 14 columns and `mcp__exa__web_search_exa` is 24.
+const TOOL_NAME_MAX_WIDTH: usize = 64;
+
+/// Below this many columns for the argument there is nothing worth showing, so the indicator drops
+/// the parenthetical instead of printing an ellipsis in backticks.
+const TOOL_ARGUMENT_FLOOR: usize = 8;
+
+/// Fixed chrome in `[tool NAME(`ARG`)]`.
+const TOOL_INDICATOR_CHROME: usize = "[tool (``)]".len();
+
+/// Fixed chrome in `[tool NAME]`.
+const TOOL_HEADER_CHROME: usize = "[tool ]".len();
 
 /// The bare `[tool X]` line, with no argument.
 ///
@@ -1074,10 +1273,14 @@ fn truncate_to_width(text: &str, max_columns: usize) -> String {
 /// stream, and while the registry is consulted just before the event is emitted, that lookup only
 /// fetches the schema: a name matching nothing still reaches here. (An MCP tool's name is
 /// separately normalised to `[A-Za-z0-9_-]` when its server is registered.)
-fn tool_header(name: &str) -> String {
+fn tool_header(name: &str, width: usize) -> String {
+    let display_name = sanitize_to_line(tool_display_name(name), usize::MAX);
     format!(
         "[tool {}]",
-        sanitize_to_line(tool_display_name(name), TOOL_PARAM_MAX_WIDTH)
+        elide_to_width(
+            &display_name,
+            TOOL_NAME_MAX_WIDTH.min(width.saturating_sub(TOOL_HEADER_CHROME))
+        )
     )
 }
 
@@ -1092,48 +1295,224 @@ fn tool_header(name: &str) -> String {
 /// `read_file` shows the path it showed live instead of a bare `[tool ReadFile]`. An MCP tool
 /// replayed from history does stay bare, which is the honest answer -- without its schema nothing
 /// says which of its arguments is the one worth showing.
+///
+/// The whole line is budgeted, not each part, so adjacent indicators that had to be cut end at the
+/// same column instead of wherever their own name happened to leave them. Within that budget the
+/// name is served first and the argument takes what is left; when what is left is not worth
+/// printing, the argument goes and the name stays whole.
 fn tool_indicator_line(
     name: &str,
     input: &serde_json::Value,
     display_summary: Option<&str>,
+    width: usize,
 ) -> String {
     let resolved = display_summary
         .map(str::to_string)
         .or_else(|| resolve_primary_param(name, input, None));
-    match resolved
+    let Some(value) = resolved
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        Some(value) => format!(
-            "[tool {}(`{}`)]",
-            sanitize_to_line(tool_display_name(name), TOOL_PARAM_MAX_WIDTH),
-            sanitize_to_line(value, 80)
-        ),
-        None => tool_header(name),
+    else {
+        return tool_header(name, width);
+    };
+
+    let available = width.saturating_sub(TOOL_INDICATOR_CHROME);
+    // Sanitise before measuring, then truncate: the display width of the raw name is not the width
+    // of what gets printed once escapes and format characters are gone.
+    let display_name = sanitize_to_line(tool_display_name(name), usize::MAX);
+    let display_name = elide_to_width(&display_name, TOOL_NAME_MAX_WIDTH.min(available));
+    let argument_budget = available.saturating_sub(display_width(&display_name));
+    if argument_budget < TOOL_ARGUMENT_FLOOR {
+        return tool_header(name, width);
     }
+    format!(
+        "[tool {}(`{}`)]",
+        display_name,
+        // Elided from the middle, not the tail: the primary parameter is an identifier -- a path,
+        // a URL, a command -- and its end carries the filename or the destination.
+        elide_to_width(&sanitize_to_line(value, usize::MAX), argument_budget)
+    )
 }
 
 /// One level of nesting in a [`ToolParams::Full`] block.
 const TOOL_PARAM_INDENT: &str = "  ";
 
-/// Lines shown under one argument's key before the rest is summarised as a count. A `write_file`
-/// carrying a whole source file has to be readable as "this happened" without evicting the turn
-/// from scrollback; the untruncated text is what `meka session export` is for.
-const TOOL_PARAM_MAX_LINES: usize = 30;
+/// Columns a value keeps however long its key is, mirroring [`TOOL_NAME_MAX_WIDTH`]'s reasoning in
+/// the other direction: here the key is the label and the value is the substance.
+const TOOL_VALUE_MIN_WIDTH: usize = 16;
 
-/// Lines shown for the whole block before the rest is summarised as a count.
+/// How much of a call an argument block may show.
 ///
-/// [`TOOL_PARAM_MAX_LINES`] alone does not bound a call: it guards one multi-line string, while an
-/// array or object fans out one line per element with no ceiling, and a call may carry several long
-/// arguments. Since the point of the cap is that a turn stays in scrollback, the block needs its
-/// own.
-const TOOL_PARAM_MAX_BLOCK_LINES: usize = 60;
+/// The same renderer serves two audiences with opposite needs. A tool indicator is a notification
+/// scrolling past, so it may trade completeness for brevity. An approval prompt is a decision, so
+/// it may not: what it hides is what you authorise unseen.
+#[derive(Debug, Clone, Copy)]
+struct BlockLimits {
+    /// Source lines shown under one argument's key before the rest is summarised as a count.
+    ///
+    /// Counted in the value's own lines, so the `... N more lines` marker means what it says. An
+    /// earlier version capped rendered rows and reported that as lines, which told the reader of a
+    /// 100-line file that 108 lines were hidden.
+    lines_per_argument: usize,
+    /// Rows one argument may occupy, however many lines or elements are under its key.
+    ///
+    /// [`lines_per_argument`](Self::lines_per_argument) does not bound this on its own. A
+    /// container has no lines to count and fans out one row per element; a wrapped string
+    /// turns one line into several. Without a separate bound the two caps composed by addition
+    /// and an argument could spend the whole block's budget by itself.
+    rows_per_argument: usize,
+    /// Rows the block may already hold before the remaining arguments are dropped and named.
+    ///
+    /// Checked before an argument is rendered, never in the middle of one, so a block reaches at
+    /// most this plus [`rows_per_argument`](Self::rows_per_argument) plus the line that names what
+    /// went. That sum is the real ceiling, and it is the number the docs quote.
+    ///
+    /// Both audiences need a ceiling: "show everything" with none lets two hundred decoy arguments
+    /// push the real one off the top, which is the same outcome dropping was supposed to be worse
+    /// than, minus the marker that would have warned anybody.
+    block_rows: usize,
+    /// Wrap a too-wide line onto the next row instead of cutting it.
+    wrap: bool,
+}
 
-/// Characters shown of one line before it is cut. Generous next to the 80 of a summary, because a
-/// long shell command is exactly what someone turns `full` on to read, but bounded so a minified
-/// blob in an MCP argument cannot wrap into a wall.
-const TOOL_PARAM_MAX_WIDTH: usize = 200;
+impl BlockLimits {
+    /// For `[display].tool_params = "full"`. A `write_file` carrying a whole source file has to be
+    /// readable as "this happened" without evicting the turn from scrollback; the untruncated text
+    /// is what `meka session export` is for.
+    ///
+    /// Worst case 93 rows: 59 already there, 33 for the argument that crossed the line, one naming
+    /// the rest.
+    fn indicator() -> Self {
+        Self {
+            lines_per_argument: 30,
+            // One over `lines_per_argument`, plus the key line: enough that a string value capped
+            // by its own line budget is never cut again by this one, and its `... N
+            // more lines` marker survives to be read.
+            rows_per_argument: 32,
+            block_rows: 60,
+            wrap: false,
+        }
+    }
+
+    /// For the `ask` approval prompt.
+    ///
+    /// Wrapping rather than cutting, since cutting a line hides the tail of the command being
+    /// approved. Twenty lines rather than thirty because a prompt blocks reading and wants to be
+    /// short.
+    ///
+    /// The block ceiling is generous but real, and worth 161 rows in the worst case. Dropping an
+    /// argument from a decision is bad, and it was tempting to allow none; but leaving the block
+    /// unbounded lets two hundred decoy arguments scroll the real tool name and the real payload
+    /// off the top, which is the same outcome with no marker to warn anybody. A named drop is
+    /// the lesser harm, and it is the signal to deny.
+    fn approval() -> Self {
+        Self {
+            lines_per_argument: 20,
+            // Three times the line budget, so wrapping has room to be worth having: a single-line
+            // `execute_command` -- the commonest approval there is -- gets all sixty rows to
+            // itself.
+            rows_per_argument: 60,
+            block_rows: 100,
+            wrap: true,
+        }
+    }
+}
+
+/// A width and the limits to render within it. They always travel together, so the `push_*` helpers
+/// take one value rather than two parameters.
+#[derive(Debug, Clone, Copy)]
+struct BlockContext {
+    width: usize,
+    limits: BlockLimits,
+}
+
+/// Break `text` into at most `max_rows` rows of at most `max_columns`, preferring a space.
+///
+/// For the approval prompt, where cutting a line hides the tail of what is being authorised. The
+/// caller prefixes every row with the block indent, so no row begins at column zero even though the
+/// value now spans several.
+///
+/// **When it does not fit, the last two rows are a count and the END of the text**, not wherever
+/// the budget ran out. This is [`elide_to_width`]'s reasoning one dimension up. Wrapping was chosen
+/// over cutting so the tail of a command could not be hidden from the line being approved, and a
+/// wrap that shows the first `max_rows` rows and stops hides exactly that: a 90 KB
+/// `execute_command` filled every row it was given and left `; rm -rf /important` off the end of
+/// the last one. The notification surface, which elides from the middle, showed that tail; the
+/// decision surface did not.
+fn wrap_to_width(text: &str, max_columns: usize, max_rows: usize) -> Vec<String> {
+    // A zero budget can show nothing. Returning the text would be worse than showing none of it:
+    // the caller has already spent the width on indent, and an unbounded row of model output is the
+    // one thing the budget exists to prevent.
+    if max_columns == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    if display_width(text) <= max_columns {
+        return vec![text.to_string()];
+    }
+    // Continuation rows keep the line's own leading whitespace, so wrapped code still reads at the
+    // depth it was written at instead of appearing to dedent.
+    let hanging = &text[..text.len() - text.trim_start_matches(' ').len()];
+    let hanging = take_columns(hanging, max_columns / 2);
+    // Two rows held back for the count and the end. Below three rows there is no room for that
+    // shape, so the whole budget goes to the head and the last row is cut where it lands.
+    let keeps_the_end = max_rows >= 3;
+    let head_rows = if keeps_the_end {
+        max_rows - 2
+    } else {
+        max_rows
+    };
+    let mut rows: Vec<String> = Vec::new();
+    let mut rest = text;
+    while rows.len() < head_rows {
+        let prefix = if rows.is_empty() {
+            ""
+        } else {
+            hanging.as_str()
+        };
+        let budget = max_columns.saturating_sub(display_width(prefix));
+        if budget == 0 || display_width(rest) <= budget {
+            break;
+        }
+        let head = take_columns(rest, budget);
+        if head.is_empty() {
+            // One character is wider than the whole budget, so no row can hold it. Taking it anyway
+            // was the way out of the loop and it overflowed the width by that character; falling
+            // through to the truncation below emits a marker, which fits any budget at all.
+            break;
+        }
+        // Break at the last space that fits, but never inside a leading run of them: breaking there
+        // emits a row that is empty once trimmed and silently drops the line's indentation.
+        let split = match head.rfind(' ') {
+            Some(index) if !head[..index].trim().is_empty() => index,
+            _ => head.len(),
+        };
+        rows.push(format!("{}{}", prefix, rest[..split].trim_end()));
+        rest = rest[split..].trim_start_matches(' ');
+        if rest.is_empty() {
+            return rows;
+        }
+    }
+    let prefix = if rows.is_empty() {
+        ""
+    } else {
+        hanging.as_str()
+    };
+    let budget = max_columns.saturating_sub(display_width(prefix));
+    if keeps_the_end && budget > 0 && display_width(rest) > budget {
+        let tail = tail_columns(rest, budget);
+        let dropped = rest.chars().count() - tail.chars().count();
+        rows.push(format!(
+            "{}{}",
+            prefix,
+            truncate_to_width(&format!("... {} more characters ...", dropped), budget)
+        ));
+        rows.push(format!("{}{}", prefix, tail));
+        return rows;
+    }
+    rows.push(format!("{}{}", prefix, truncate_to_width(rest, budget)));
+    rows
+}
 
 /// Render a tool call's whole input as an indented block, one line per element.
 ///
@@ -1143,7 +1522,8 @@ const TOOL_PARAM_MAX_WIDTH: usize = 200;
 /// its key, a value that does not gets an indented block under a bare `key:`, and nesting is
 /// carried by indentation with `-` for array elements. The cost is that the string/number
 /// distinction is gone, which is why the exact JSON stays available through `meka session export`.
-fn render_tool_params(input: &serde_json::Value) -> Vec<String> {
+fn render_tool_params(input: &serde_json::Value, width: usize, limits: BlockLimits) -> Vec<String> {
+    let context = BlockContext { width, limits };
     let serde_json::Value::Object(fields) = input else {
         // A tool whose input is not an object at all. Nothing sensible to key it by, so it renders
         // as a bare value rather than being dropped, which would read as "no arguments".
@@ -1151,12 +1531,15 @@ fn render_tool_params(input: &serde_json::Value) -> Vec<String> {
         match input {
             serde_json::Value::Array(items) => {
                 for item in items {
-                    push_item(&mut lines, 1, item);
+                    push_item(&mut lines, 1, item, context);
                 }
             }
-            other => push_value_body(&mut lines, 1, other),
+            other => push_value_body(&mut lines, 1, other, context),
         }
-        push_line_elision(&mut lines, 0, TOOL_PARAM_MAX_LINES, TOOL_PARAM_INDENT);
+        // There is no key here to hang a per-argument cap on, and the block ceiling below is only
+        // reached through the object path, so without this an array input printed every element it
+        // had.
+        cap_rows(&mut lines, limits.block_rows, TOOL_PARAM_INDENT, width);
         return lines;
     };
 
@@ -1164,78 +1547,143 @@ fn render_tool_params(input: &serde_json::Value) -> Vec<String> {
     let mut omitted: Vec<String> = Vec::new();
     for (key, value) in fields {
         // Whole arguments are dropped at their own boundary rather than the block being cut
-        // wherever line 60 happens to land. Cutting mid-argument loses that argument's own elision
-        // marker, and reports a count of rendered lines that bears no relation to how much was
-        // hidden. Dropping by argument lets the block say what is missing by name, which is what a
-        // reader needs: `path` disappearing entirely is worse than any amount of `content` being
-        // trimmed.
-        if !omitted.is_empty() || lines.len() >= TOOL_PARAM_MAX_BLOCK_LINES {
-            omitted.push(sanitize_to_line(key, TOOL_PARAM_MAX_WIDTH));
+        // wherever the last row happens to land. Cutting mid-argument loses that argument's own
+        // elision marker, and reports a count that bears no relation to how much was hidden.
+        // Dropping by argument lets the block say what is missing by name, which is what a reader
+        // needs: `path` disappearing entirely is worse than any amount of `content` being trimmed.
+        if !omitted.is_empty() || lines.len() >= limits.block_rows {
+            omitted.push(sanitize_to_line(key, width));
             continue;
         }
         let mut param = Vec::new();
-        push_param(&mut param, 1, key, value);
-        // The key line is never cut: an argument the reader can see the name of, trimmed, beats one
-        // that vanished. So the budget applies to what hangs off it.
-        push_line_elision(
+        push_param(&mut param, 1, key, value, context);
+        // `lines_per_argument` bounds a *string* value, counted in its own lines by
+        // `push_value_body`. A container has no lines to count: it fans out one row per element and
+        // needs a row bound of its own, or a single array argument outruns the block on its own.
+        // The key line is never cut -- an argument whose name you can read, trimmed, beats one that
+        // vanished -- so the ceiling applies to what hangs off it.
+        cap_rows(
             &mut param,
-            1,
-            TOOL_PARAM_MAX_LINES,
+            limits.rows_per_argument,
             &TOOL_PARAM_INDENT.repeat(2),
+            width,
         );
         lines.append(&mut param);
     }
     if !omitted.is_empty() {
-        lines.push(format!(
-            "{}... {} more argument{}: {}",
-            TOOL_PARAM_INDENT,
-            omitted.len(),
-            if omitted.len() == 1 { "" } else { "s" },
-            truncate_to_width(&omitted.join(", "), TOOL_PARAM_MAX_WIDTH)
+        // Budgeted as one string. Cutting only the names left the count and the words around it
+        // unmeasured, and `  ... 240 more arguments: ` is twenty-six columns before a single name
+        // is added, so at the narrow end this line alone broke the width every other line
+        // here keeps.
+        lines.push(truncate_to_width(
+            &format!(
+                "{}... {} more argument{}: {}",
+                TOOL_PARAM_INDENT,
+                omitted.len(),
+                if omitted.len() == 1 { "" } else { "s" },
+                omitted.join(", ")
+            ),
+            width,
         ));
     }
     lines
 }
 
-/// Keep the first `skip` lines whole, cut the rest to `keep`, and say how many went.
-fn push_line_elision(lines: &mut Vec<String>, skip: usize, keep: usize, indent: &str) {
-    let elided = lines.len().saturating_sub(skip + keep);
-    if elided == 0 {
+/// Cut `lines` to `max_rows`, saying how many rows went and **keeping the last one**.
+///
+/// Counted in rows rather than in the value's source lines, and the wording follows: this is the
+/// bound that keeps the block on the screen, and after wrapping a source line is not a row.
+///
+/// Keeping the last row is the same rule [`wrap_to_width`] and [`elide_to_width`] follow, for the
+/// same reason: what a reader most needs from a thing too big to show is its beginning and its end.
+/// Plain truncation also deleted whatever marker the row below had carried -- an argument that had
+/// already reported `... 480 more lines` lost that line to this cut, so the block ended up
+/// admitting to two dropped rows and nothing else.
+fn cap_rows(lines: &mut Vec<String>, max_rows: usize, indent: &str, width: usize) {
+    if lines.len() <= max_rows || max_rows < 2 {
+        lines.truncate(lines.len().min(max_rows));
         return;
     }
-    lines.truncate(skip + keep);
+    let Some(last) = lines.last().cloned() else {
+        return;
+    };
+    // The marker and the kept row are two of the `max_rows`, so the head keeps the rest.
+    let elided = lines.len() - (max_rows - 1);
+    lines.truncate(max_rows - 2);
     lines.push(format!(
-        "{}... {} more line{}",
+        "{}{}",
         indent,
-        elided,
-        if elided == 1 { "" } else { "s" }
+        truncate_to_width(
+            &format!(
+                "... {} more row{}",
+                elided,
+                if elided == 1 { "" } else { "s" }
+            ),
+            width.saturating_sub(display_width(indent))
+        )
     ));
+    lines.push(last);
 }
 
 /// Append one `key: value` pair at `depth`, recursing for containers.
-fn push_param(lines: &mut Vec<String>, depth: usize, key: &str, value: &serde_json::Value) {
-    let indent = TOOL_PARAM_INDENT.repeat(depth);
+fn push_param(
+    lines: &mut Vec<String>,
+    depth: usize,
+    key: &str,
+    value: &serde_json::Value,
+    context: BlockContext,
+) {
+    let indent = block_indent(depth, context.width);
+    let available = context.width.saturating_sub(display_width(&indent));
     // A key is model-supplied too: an MCP tool's arguments are whatever the model generated, and
-    // nothing checks them against the schema before they are rendered.
-    let key = sanitize_to_line(key, TOOL_PARAM_MAX_WIDTH);
+    // nothing checks them against the schema before they are rendered. Its budget reserves room for
+    // the value, for the reason on `TOOL_VALUE_MIN_WIDTH`.
+    // Floored: a key cut to nothing renders as a bare `:` with no sign anything was there, which
+    // is worse than a short name. `truncate_to_width` marks whatever it cuts.
+    let key = sanitize_to_line(
+        key,
+        available
+            .saturating_sub(TOOL_VALUE_MIN_WIDTH + ": ".len())
+            .max(TRUNCATION_MARKER.len() + 1),
+    );
     match value {
         serde_json::Value::Object(fields) if !fields.is_empty() => {
             lines.push(format!("{}{}:", indent, key));
             for (nested_key, nested) in fields {
-                push_param(lines, depth + 1, nested_key, nested);
+                push_param(lines, depth + 1, nested_key, nested, context);
             }
         }
         serde_json::Value::Array(items) if !items.is_empty() => {
             lines.push(format!("{}{}:", indent, key));
             for item in items {
-                push_item(lines, depth + 1, item);
+                push_item(lines, depth + 1, item, context);
             }
         }
         serde_json::Value::String(text) if is_multi_line(text) => {
             lines.push(format!("{}{}:", indent, key));
-            push_value_body(lines, depth + 1, value);
+            push_value_body(lines, depth + 1, value, context);
         }
-        _ => lines.push(format!("{}{}: {}", indent, key, scalar_text(value))),
+        _ => {
+            let value_budget = available.saturating_sub(display_width(&key) + ": ".len());
+            // When wrapping, a value too wide for the key line gets a block of its own rather than
+            // being cut on it. Otherwise the commonest approval of all -- a long `execute_command`
+            // pipeline, which is one line and so never reached `push_value_body` -- would have its
+            // tail hidden, which is the whole failure this mode exists to avoid.
+            // `wrap` first: rendering the value at full width to measure it is a whole
+            // sanitisation pass over a megabyte-sized argument, and the indicator never uses it.
+            if context.limits.wrap && display_width(&scalar_text(value, usize::MAX)) > value_budget
+            {
+                lines.push(format!("{}{}:", indent, key));
+                push_value_body(lines, depth + 1, value, context);
+            } else {
+                lines.push(format!(
+                    "{}{}: {}",
+                    indent,
+                    key,
+                    scalar_text(value, value_budget)
+                ));
+            }
+        }
     }
 }
 
@@ -1255,20 +1703,35 @@ fn is_multi_line(text: &str) -> bool {
 ///
 /// An element that is itself an object puts its first field on the bullet line and aligns the rest
 /// under it, so a list of records reads as records rather than as a run of bullets.
-fn push_item(lines: &mut Vec<String>, depth: usize, item: &serde_json::Value) {
-    let indent = TOOL_PARAM_INDENT.repeat(depth);
+fn push_item(
+    lines: &mut Vec<String>,
+    depth: usize,
+    item: &serde_json::Value,
+    context: BlockContext,
+) {
+    // Bounded like every other indent in the block. An array nests through this function rather
+    // than through `push_param`, so leaving it proportional to depth put a bullet at column 40
+    // of a 40-column line and pushed everything under it past the edge.
+    let indent = block_indent(depth, context.width);
     match item {
         serde_json::Value::Object(fields) if !fields.is_empty() => {
+            let nested_indent = block_indent(depth + 1, context.width);
+            // The bullet replaces exactly the one indent level that `depth + 1` added, so the field
+            // lands where it would have without the bullet and its siblings stay aligned with it.
+            // Past the indent ceiling there is no such level: `depth + 1` indents no further, the
+            // field was budgeted against that same indent, and hoisting it would widen its line by
+            // the bullet. So the bullet takes a row of its own there, as the arms below already do.
+            let hoisted = nested_indent.len() > indent.len();
+            if !hoisted {
+                lines.push(format!("{}-", indent));
+            }
             let first = lines.len();
             for (key, value) in fields {
-                push_param(lines, depth + 1, key, value);
+                push_param(lines, depth + 1, key, value, context);
             }
-            // The bullet replaces exactly the one indent level that `depth + 1` added, so the
-            // field lands where it would have without the bullet and its siblings stay aligned
-            // with it.
-            if let Some(line) = lines.get_mut(first) {
+            if hoisted && let Some(line) = lines.get_mut(first) {
                 let body = line
-                    .strip_prefix(&TOOL_PARAM_INDENT.repeat(depth + 1))
+                    .strip_prefix(&nested_indent)
                     .unwrap_or(line)
                     .to_string();
                 *line = format!("{}- {}", indent, body);
@@ -1277,7 +1740,7 @@ fn push_item(lines: &mut Vec<String>, depth: usize, item: &serde_json::Value) {
         serde_json::Value::Array(nested) if !nested.is_empty() => {
             lines.push(format!("{}-", indent));
             for value in nested {
-                push_item(lines, depth + 1, value);
+                push_item(lines, depth + 1, value, context);
             }
         }
         // Mirrors `push_param`'s multi-line arm. Without it a bulleted string kept its newlines and
@@ -1285,65 +1748,150 @@ fn push_item(lines: &mut Vec<String>, depth: usize, item: &serde_json::Value) {
         // forge a `[tool ...]` header outside the block.
         serde_json::Value::String(text) if is_multi_line(text) => {
             lines.push(format!("{}-", indent));
-            push_value_body(lines, depth + 1, item);
+            push_value_body(lines, depth + 1, item, context);
         }
-        _ => lines.push(format!("{}- {}", indent, scalar_text(item))),
+        _ => {
+            let budget = context
+                .width
+                .saturating_sub(display_width(&indent) + "- ".len());
+            // Same promotion `push_param` makes: under wrapping, a value too wide for its own row
+            // gets a block rather than losing its tail. An MCP tool taking `["bash", "-lc", "<long
+            // command>"]` is the shape this exists for, and ask mode gates MCP tools.
+            if context.limits.wrap && display_width(&scalar_text(item, usize::MAX)) > budget {
+                lines.push(format!("{}-", indent));
+                push_value_body(lines, depth + 1, item, context);
+            } else {
+                lines.push(format!("{}- {}", indent, scalar_text(item, budget)));
+            }
+        }
     }
 }
 
 /// Append a value with no key of its own: the body of a multi-line string, or a non-object input.
-fn push_value_body(lines: &mut Vec<String>, depth: usize, value: &serde_json::Value) {
-    let indent = TOOL_PARAM_INDENT.repeat(depth);
+fn push_value_body(
+    lines: &mut Vec<String>,
+    depth: usize,
+    value: &serde_json::Value,
+    context: BlockContext,
+) {
+    let indent = block_indent(depth, context.width);
+    let budget = context.width.saturating_sub(display_width(&indent));
     let text = match value {
         serde_json::Value::String(text) => text.clone(),
-        other => scalar_text(other),
+        other => scalar_text(other, budget),
     };
-    // `str::lines` splits on `\n` and strips a trailing `\r`, but a lone `\r` mid-line survives it;
-    // `sanitize_to_line` is what stops that returning the cursor over the indent.
-    // Uncapped here on purpose: the ceiling is applied once, per argument, by `render_tool_params`.
-    // Capping in both places would trim an already-trimmed list and print two elision markers for
-    // one value.
-    for line in text.lines() {
+    // Capped in the value's own lines, so the marker below counts what a reader would count.
+    let source_lines: Vec<&str> = text.lines().collect();
+    let shown = source_lines.len().min(context.limits.lines_per_argument);
+    // Rows are the other budget, and it has to be shared out here rather than left to the cap
+    // downstream. Handing every line the whole argument's budget let twenty lines claim twenty
+    // times it; the cap then cut the excess and, with it, this function's own `... N more
+    // lines` marker, so the block reported two dropped rows where a thousand had gone. One row
+    // is held back for that marker.
+    let rows_per_line = context
+        .limits
+        .rows_per_argument
+        .saturating_sub(1)
+        .checked_div(shown.max(1))
+        .unwrap_or(1)
+        .max(1);
+    for line in &source_lines[..shown] {
+        // `str::lines` splits on `\n` and strips a trailing `\r`, but a lone `\r` mid-line survives
+        // it; `sanitize_to_line` is what stops that returning the cursor over the indent. Flattened
+        // first either way, so wrapping only ever breaks text meka is choosing to spread over rows
+        // and a `\n` from the model never reaches the terminal.
+        let flattened = sanitize_to_line(line, usize::MAX);
+        if context.limits.wrap {
+            for row in wrap_to_width(&flattened, budget, rows_per_line) {
+                lines.push(format!("{}{}", indent, row));
+            }
+        } else {
+            lines.push(format!(
+                "{}{}",
+                indent,
+                truncate_to_width(&flattened, budget)
+            ));
+        }
+    }
+    let elided = source_lines.len() - shown;
+    if elided > 0 {
         lines.push(format!(
             "{}{}",
             indent,
-            sanitize_to_line(line, TOOL_PARAM_MAX_WIDTH)
+            truncate_to_width(
+                &format!(
+                    "... {} more line{}",
+                    elided,
+                    if elided == 1 { "" } else { "s" }
+                ),
+                budget
+            )
         ));
     }
+}
+
+/// The indent for a block at `depth`, bounded so it can never consume the whole width.
+///
+/// Nesting is unbounded up to serde_json's parse limit, so an indent proportional to depth reaches
+/// the width and leaves a zero budget, at which point keys render as bare `:` and values escape
+/// their cap entirely. Past the ceiling the block stops indenting rather than stops informing.
+fn block_indent(depth: usize, width: usize) -> String {
+    let max_depth = (width / 2) / TOOL_PARAM_INDENT.len();
+    TOOL_PARAM_INDENT.repeat(depth.min(max_depth.max(1)))
+}
+
+/// Fit one of meka's own stand-in words into the budget it was given.
+///
+/// `(no printable text)` is nineteen columns and used to be emitted whatever the budget, so a value
+/// with no room left still overflowed the line by the width of the word describing it.
+fn marker_text(marker: &str, budget: usize) -> String {
+    truncate_to_width(marker, budget)
 }
 
 /// One-line rendering of a value that needs no block: a scalar, or an empty container.
 ///
 /// An empty string is marked rather than left blank, because `key:` with nothing after it is
 /// indistinguishable from a key whose block failed to render.
-fn scalar_text(value: &serde_json::Value) -> String {
+fn scalar_text(value: &serde_json::Value, budget: usize) -> String {
     match value {
-        serde_json::Value::String(text) if text.is_empty() => "(empty)".to_string(),
+        serde_json::Value::String(text) if text.is_empty() => marker_text("(empty)", budget),
         // Whitespace-only is marked as such rather than as empty. A tab passed as a delimiter is an
         // ordinary argument, and reporting it as `(empty)` is not vague, it is wrong: it says the
         // model sent `""` when it did not. Decided before truncation, since a long run of spaces
         // would otherwise come back as a cut-off blank rather than as nothing at all.
-        serde_json::Value::String(text) if text.trim().is_empty() => "(whitespace)".to_string(),
+        serde_json::Value::String(text) if text.trim().is_empty() => {
+            marker_text("(whitespace)", budget)
+        }
         serde_json::Value::String(text) => {
             // Trailing whitespace is trimmed because flattening manufactures it: a value ending in
             // a newline would otherwise leave the key line with an invisible tail.
-            let line = sanitize_to_line(text, TOOL_PARAM_MAX_WIDTH)
+            let line = elide_to_width(&sanitize_to_line(text, usize::MAX), budget)
                 .trim_end()
                 .to_string();
             // A value made only of characters meka refuses to display (bidi controls, soft hyphens,
             // zero-width joiners) is not empty and is not whitespace, and leaving it blank would
             // read as a rendering fault rather than as the deliberate omission it is.
             if line.is_empty() {
-                "(no printable text)".to_string()
+                marker_text("(no printable text)", budget)
             } else {
                 line
             }
         }
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Object(fields) if fields.is_empty() => "(empty)".to_string(),
-        serde_json::Value::Array(items) if items.is_empty() => "(empty)".to_string(),
-        other => other.to_string(),
+        serde_json::Value::Null => marker_text("null", budget),
+        serde_json::Value::Object(fields) if fields.is_empty() => marker_text("(empty)", budget),
+        serde_json::Value::Array(items) if items.is_empty() => marker_text("(empty)", budget),
+        // A number or a bool, which cannot carry an escape but can still be long: serde will print
+        // every digit of a 100-digit integer.
+        other => truncate_to_width(&other.to_string(), budget),
     }
+}
+
+/// The argument block for an `ask` approval prompt: every argument, wrapped rather than cut.
+///
+/// Separate entry point from the indicator's so the two sets of limits are named at their call
+/// sites rather than passed in from the REPL, which has no business knowing them.
+pub(crate) fn render_approval_params(input: &serde_json::Value, width: usize) -> Vec<String> {
+    render_tool_params(input, width, BlockLimits::approval())
 }
 
 /// Split the indicator into its header line and its argument block, per `params`.
@@ -1355,16 +1903,20 @@ fn tool_indicator_parts(
     input: &serde_json::Value,
     display_summary: Option<&str>,
     params: ToolParams,
+    width: usize,
 ) -> (String, Vec<String>) {
     match params {
-        ToolParams::Off => (tool_header(name), Vec::new()),
+        ToolParams::Off => (tool_header(name, width), Vec::new()),
         ToolParams::Summary => (
-            tool_indicator_line(name, input, display_summary),
+            tool_indicator_line(name, input, display_summary, width),
             Vec::new(),
         ),
         // No `(arg)` on the header: the primary parameter is in the block two lines down, and
         // showing it twice is the noise this layout exists to avoid.
-        ToolParams::Full => (tool_header(name), render_tool_params(input)),
+        ToolParams::Full => (
+            tool_header(name, width),
+            render_tool_params(input, width, BlockLimits::indicator()),
+        ),
     }
 }
 
@@ -1375,7 +1927,8 @@ pub fn render_tool_indicator(
     display_summary: Option<&str>,
     params: ToolParams,
 ) {
-    let (header, block) = tool_indicator_parts(name, input, display_summary, params);
+    let (header, block) =
+        tool_indicator_parts(name, input, display_summary, params, output_width());
     eprintln!("{}", header.with(Color::Cyan));
     for line in block {
         // A different hue from the header rather than a dimmer shade of it. The normal and bright
@@ -1979,6 +2532,18 @@ pub fn render_thinking_indicator(estimated_tokens: Option<u64>) -> bool {
 /// otherwise the indicator is committed rather than erased, so the time the model spent stays on
 /// screen.
 pub fn clear_thinking_indicator() {
+    begin_own_line();
+}
+
+/// Discard whatever an in-place status line left on the current row, so the caller starts at column
+/// zero.
+///
+/// Two writers park the cursor mid-row without a newline: the thinking indicator, and the MCP
+/// progress line, which is `\r[mcp:server/tool] ...` and server-controlled. Anything printed next
+/// continues that row. For an approval prompt that is the whole ballgame -- `[ask] Shell` appended
+/// to a server's progress text reads as one line, and the rule the rest of this file is built on is
+/// that meka's own chrome starts at column zero.
+pub(crate) fn begin_own_line() {
     use std::io::IsTerminal;
     if !std::io::stderr().is_terminal() {
         return;
@@ -1988,14 +2553,29 @@ pub fn clear_thinking_indicator() {
         crossterm::cursor::MoveToColumn(0),
         crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
     ) {
-        // A broken pipe or closed terminal. Nothing to recover: the indicator is cosmetic and the
-        // caller has already dropped its state.
-        tracing::debug!("failed to clear the thinking indicator: {}", error);
+        // A broken pipe or closed terminal. Nothing to recover: the line is cosmetic and the caller
+        // has already dropped its state.
+        tracing::debug!("failed to clear the status line: {}", error);
     }
 }
 
-/// Width of the elided thinking preview, in characters.
-const THINKING_PREVIEW_CHARS: usize = 80;
+/// Rows one line of a fully-shown thinking block may wrap to before it is cut.
+///
+/// A bound rather than a promise of completeness: reasoning carrying a minified blob would
+/// otherwise spend a screen on one line.
+const THINKING_MAX_ROWS_PER_LINE: usize = 20;
+
+/// Rows a whole fully-shown thinking block may occupy.
+///
+/// Every other surface that prints model output has a block-level ceiling; this one was left
+/// without because its line count used to be its row count. Wrapping broke that: each line may now
+/// become twenty rows, so two thousand lines of reasoning became forty thousand rows of terminal.
+/// Generous, because `show_content = true` is a request to see the reasoning, and the cut keeps the
+/// end, where a conclusion lives.
+const THINKING_MAX_ROWS: usize = 400;
+
+/// Fixed chrome in `Thinking... <preview>`.
+const THINKING_PREFIX: &str = "Thinking... ";
 
 /// Flatten `text` onto one line, stopping once there is more than `max_chars` to show.
 ///
@@ -2004,8 +2584,12 @@ const THINKING_PREVIEW_CHARS: usize = 80;
 /// header, so words are pulled up across line breaks until the budget is full instead.
 ///
 /// The early exit is what keeps this from copying a block that can run to tens of kilobytes in
-/// order to show eighty characters of it. One character past the budget is enough, because that is
-/// all [`truncate_to_width`] needs to decide it must trim.
+/// order to show one line of it.
+///
+/// Deliberately counting *characters* while the real cut is by *column*: a character count is never
+/// greater than the column count of the same text, so stopping one character past the budget can
+/// never leave [`truncate_to_width`] short of material. Measuring columns here would mean widths
+/// per word for no gain.
 fn collapse_to_line(text: &str, max_chars: usize) -> String {
     let mut collapsed = String::new();
     for word in text.split_whitespace() {
@@ -2032,14 +2616,17 @@ fn collapse_to_line(text: &str, max_chars: usize) -> String {
 pub fn render_thinking_block(thinking: &str, show_full: bool) {
     eprintln!(
         "{}{}",
-        "Thinking... ".with(Color::DarkGrey),
-        thinking_block_text(thinking, show_full).with(Color::DarkGrey),
+        THINKING_PREFIX.with(Color::DarkGrey),
+        thinking_block_text(thinking, show_full, output_width()).with(Color::DarkGrey),
     );
 }
 
 /// The text [`render_thinking_block`] prints, separated from the printing so both branches can be
 /// held to the escape-stripping the doc comment above promises.
-fn thinking_block_text(thinking: &str, show_full: bool) -> String {
+fn thinking_block_text(thinking: &str, show_full: bool, width: usize) -> String {
+    // Only the first line carries `Thinking... `; the rest carry the indent added below.
+    let first_line_budget = width.saturating_sub(display_width(THINKING_PREFIX));
+    let rest_budget = width.saturating_sub(display_width(TOOL_PARAM_INDENT));
     if show_full {
         // Sanitised per line, and every line but the first is indented.
         //
@@ -2049,24 +2636,42 @@ fn thinking_block_text(thinking: &str, show_full: bool) -> String {
         // second line reading `Continuing session: <uuid>`. It renders byte-for-byte identically to
         // the real thing. The indent is the same boundary the argument block relies on: meka's own
         // chrome starts at column zero, so nothing quoted from the model may.
-        thinking
+        //
+        // Wrapped rather than cut. `show_content = true` means "print the block", and reasoning is
+        // prose whose end carries the conclusion, so truncating each line to the width would
+        // silently drop it. The argument block chose wrapping over cutting for the same reason.
+        let mut rows: Vec<String> = thinking
             .lines()
             .enumerate()
-            .map(|(index, line)| {
-                let line = sanitize_to_line(line, usize::MAX);
-                if index == 0 {
-                    line
+            .flat_map(|(index, line)| {
+                let flattened = sanitize_to_line(line, usize::MAX);
+                let budget = if index == 0 {
+                    first_line_budget
                 } else {
-                    format!("{}{}", TOOL_PARAM_INDENT, line)
-                }
+                    rest_budget
+                };
+                wrap_to_width(&flattened, budget, THINKING_MAX_ROWS_PER_LINE)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(row, text)| {
+                        // Only the very first row rides behind `Thinking... `. Everything else,
+                        // including a continuation of the first line, is indented.
+                        if index == 0 && row == 0 {
+                            text
+                        } else {
+                            format!("{}{}", TOOL_PARAM_INDENT, text)
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect();
+        cap_rows(&mut rows, THINKING_MAX_ROWS, TOOL_PARAM_INDENT, width);
+        rows.join("\n")
     } else {
         // No second truncation: `sanitize_to_line` ends in one, to the same budget.
         sanitize_to_line(
-            &collapse_to_line(thinking, THINKING_PREVIEW_CHARS),
-            THINKING_PREVIEW_CHARS,
+            &collapse_to_line(thinking, first_line_budget),
+            first_line_budget,
         )
     }
 }
@@ -2080,24 +2685,23 @@ pub fn render_todo_list(title: Option<&str>, items: &[crate::tools::todo::TodoIt
     if items.is_empty() {
         return false;
     }
+    let width = output_width();
     eprintln!();
 
-    eprintln!("{}", todo_heading(title).with(Color::White).bold());
+    eprintln!("{}", todo_heading(title, width).with(Color::White).bold());
     eprintln!();
 
     for (index, item) in items.iter().enumerate() {
-        let (marker, color) = match item.status {
-            TodoStatus::Completed => ("[x]", Color::Green),
-            TodoStatus::InProgress => ("[~]", Color::Yellow),
-            TodoStatus::Pending => ("[ ]", Color::DarkGrey),
-            TodoStatus::Cancelled => ("[-]", Color::DarkGrey),
+        let color = match item.status {
+            TodoStatus::Completed => Color::Green,
+            TodoStatus::InProgress => Color::Yellow,
+            TodoStatus::Pending | TodoStatus::Cancelled => Color::DarkGrey,
         };
-        eprintln!(
-            "- {} {} {}",
-            marker.with(color),
-            (index + 1).to_string().with(Color::White),
-            todo_item_text(item)
-        );
+        // Composed uncoloured first, then coloured, so the width a test measures is the width that
+        // prints. Colouring in place would put escape bytes in the middle of the string.
+        let row = todo_row(index, item, width);
+        let (marker, rest) = row.split_at(row.find(' ').map_or(0, |space| space + 1));
+        eprintln!("{}{}", marker, rest.with(color));
     }
 
     eprintln!();
@@ -2109,20 +2713,53 @@ pub fn render_todo_list(title: Option<&str>, items: &[crate::tools::todo::TodoIt
 /// Title and item text are both model-supplied, and this list prints at column zero, so a `\n` or a
 /// `\r` in either needs no trick at all to place a forged line among meka's own output. Separated
 /// from the printing so that is testable.
-fn todo_heading(title: Option<&str>) -> String {
+fn todo_heading(title: Option<&str>, width: usize) -> String {
+    const PREFIX: &str = "TODO: ";
     format!(
-        "TODO: {}",
-        sanitize_to_line(title.unwrap_or("Tasks"), TOOL_PARAM_MAX_WIDTH)
+        "{}{}",
+        PREFIX,
+        sanitize_to_line(
+            title.unwrap_or("Tasks"),
+            width.saturating_sub(display_width(PREFIX))
+        )
+    )
+}
+
+/// One task's whole row, chrome included, fitted to `width`.
+///
+/// The chrome is computed here rather than at the call site so a test can hold the real budget to
+/// the real width. Held apart, a test that recomputed the subtraction itself passed even with the
+/// caller's subtraction deleted.
+fn todo_row(index: usize, item: &crate::tools::todo::TodoItem, width: usize) -> String {
+    use crate::tools::todo::TodoStatus;
+
+    let marker = match item.status {
+        TodoStatus::Completed => "[x]",
+        TodoStatus::InProgress => "[~]",
+        TodoStatus::Pending => "[ ]",
+        TodoStatus::Cancelled => "[-]",
+    };
+    let number = (index + 1).to_string();
+    // `- `, the marker, a space, the task number and a space; none of it model-supplied.
+    let chrome = "- ".len() + marker.len() + 1 + number.len() + 1;
+    format!(
+        "- {} {} {}",
+        marker,
+        number,
+        todo_item_text(item, width.saturating_sub(chrome))
     )
 }
 
 /// One task's text, prefixed when cancelled. Sanitised for the reason on [`todo_heading`].
-fn todo_item_text(item: &crate::tools::todo::TodoItem) -> String {
-    let text = sanitize_to_line(&item.text, TOOL_PARAM_MAX_WIDTH);
+fn todo_item_text(item: &crate::tools::todo::TodoItem, budget: usize) -> String {
+    const CANCELLED: &str = "(cancelled) ";
     if item.status == crate::tools::todo::TodoStatus::Cancelled {
-        format!("(cancelled) {}", text)
+        let text = sanitize_to_line(&item.text, budget.saturating_sub(display_width(CANCELLED)));
+        // Truncated as one string, not just the part after the prefix: below twelve columns the
+        // subtraction above leaves nothing and the prefix alone is already over budget.
+        truncate_to_width(&format!("{}{}", CANCELLED, text), budget)
     } else {
-        text
+        sanitize_to_line(&item.text, budget)
     }
 }
 
@@ -2746,7 +3383,8 @@ mod tests {
 
     #[test]
     fn test_truncate_to_width_long() {
-        assert_eq!(truncate_to_width("hello world", 5), "hello...");
+        // Five columns total, marker included: two of text plus the three-column marker.
+        assert_eq!(truncate_to_width("hello world", 5), "he...");
     }
 
     #[test]
@@ -2782,7 +3420,7 @@ mod tests {
     fn test_collapse_to_line_stops_just_past_the_budget() {
         let collapsed = collapse_to_line("alpha beta gamma delta", 10);
         assert_eq!(collapsed, "alpha beta gamma");
-        assert_eq!(truncate_to_width(&collapsed, 10), "alpha beta...");
+        assert_eq!(truncate_to_width(&collapsed, 10), "alpha b...");
     }
 
     /// A block whose remainder is megabytes of reasoning must not be walked to render eighty
@@ -2807,7 +3445,7 @@ mod tests {
     #[test]
     fn test_a_thinking_preview_carries_no_escapes_from_below_the_first_line() {
         let reasoning = "Checking the file.\n\u{1b}[2J\u{1b}[1;1H[ask] Shell cat README (Y/n)";
-        let preview = super::thinking_block_text(reasoning, false);
+        let preview = super::thinking_block_text(reasoning, false, TEST_WIDTH);
         assert!(!preview.contains('\u{1b}'), "{:?}", preview);
         assert!(preview.starts_with("Checking the file."), "{:?}", preview);
     }
@@ -2816,7 +3454,7 @@ mod tests {
     /// branch needs the same stripping. Keeping its line structure is the one difference.
     #[test]
     fn test_a_full_thinking_block_is_stripped_but_keeps_its_lines() {
-        let body = super::thinking_block_text("one\n\u{1b}[2Jtwo\nthree", true);
+        let body = super::thinking_block_text("one\n\u{1b}[2Jtwo\nthree", true, TEST_WIDTH);
         assert_eq!(body, "one\n  two\n  three");
     }
 
@@ -2826,7 +3464,7 @@ mod tests {
     #[test]
     fn test_a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
         let forged = "Let me check.\nContinuing session: 550e8400-e29b-41d4-a716-446655440000";
-        let body = super::thinking_block_text(forged, true);
+        let body = super::thinking_block_text(forged, true, TEST_WIDTH);
         let chrome = "Continuing session: 550e8400-e29b-41d4-a716-446655440000";
         assert!(
             body.lines().skip(1).all(|line| line.starts_with("  ")),
@@ -2854,7 +3492,7 @@ mod tests {
     #[test]
     fn test_a_full_thinking_block_cannot_repaint_its_own_label() {
         let forged = "thought\rContinuing session: 4f1e0c2a-0000-4000-8000-deadbeefcafe";
-        let body = super::thinking_block_text(forged, true);
+        let body = super::thinking_block_text(forged, true, TEST_WIDTH);
         assert!(!body.contains('\r'), "{:?}", body);
         assert!(body.starts_with("thought "), "{:?}", body);
     }
@@ -2868,7 +3506,8 @@ mod tests {
             tool_indicator_line(
                 "read_file",
                 &serde_json::json!({"path": "/etc/hosts"}),
-                None
+                None,
+                TEST_WIDTH,
             ),
             "[tool ReadFile(`/etc/hosts`)]"
         );
@@ -2882,7 +3521,8 @@ mod tests {
             tool_indicator_line(
                 "read_file",
                 &serde_json::json!({"path": "/etc/hosts"}),
-                Some("/resolved/by/the/agent")
+                Some("/resolved/by/the/agent"),
+                TEST_WIDTH,
             ),
             "[tool ReadFile(`/resolved/by/the/agent`)]"
         );
@@ -2896,14 +3536,18 @@ mod tests {
             tool_indicator_line(
                 "mcp__ida__decompile",
                 &serde_json::json!({"address": "0x1400"}),
-                None
+                None,
+                TEST_WIDTH,
             ),
             "[tool mcp__ida__decompile]"
         );
     }
 
+    /// Wide enough that a test asserting exact output is not accidentally testing truncation.
+    const TEST_WIDTH: usize = 200;
+
     fn params(input: serde_json::Value) -> String {
-        super::render_tool_params(&input).join("\n")
+        super::render_tool_params(&input, TEST_WIDTH, super::BlockLimits::indicator()).join("\n")
     }
 
     /// A run of one-line indicators reads as a list of steps, and spacing them out would stretch a
@@ -3031,9 +3675,233 @@ mod tests {
         );
     }
 
+    /// `unicode_width` scores a string and the sum of its characters differently: `"1\u{fe0f}"` is
+    /// two columns as a string and one as a sum. Filling by the sum while gating on the string
+    /// packed twice what fit, and every budget in the file came out at double.
+    #[test]
+    fn test_take_columns_measures_the_prefix_not_the_sum_of_characters() {
+        let text = "1\u{fe0f}".repeat(50);
+        for budget in [1usize, 2, 5, 20, 60] {
+            let kept = super::take_columns(&text, budget);
+            assert!(
+                super::display_width(&kept) <= budget,
+                "budget {} kept {} columns",
+                budget,
+                super::display_width(&kept)
+            );
+            // The *longest* fitting prefix, not merely a fitting one: returning nothing would
+            // satisfy the bound above and satisfy nobody reading the output.
+            let one_more: String = text.chars().take(kept.chars().count() + 1).collect();
+            assert!(
+                super::display_width(&one_more) > budget,
+                "budget {} stopped early at {:?}",
+                budget,
+                kept
+            );
+        }
+    }
+
+    /// A variation selector changes the width of the character before it, so a budget measured
+    /// before it is applied is wrong after. `\u{2800}\u{fe0f}` is the sharp case: measured as one
+    /// column by every measure meka has, drawn as two blank cells.
+    #[test]
+    fn test_variation_selectors_are_stripped_before_anything_is_measured() {
+        for probe in ["1\u{fe0f}", "\u{2800}\u{fe0f}", "a\u{fe00}b"] {
+            let sanitized = super::sanitize_to_line(probe, usize::MAX);
+            assert!(
+                !sanitized
+                    .chars()
+                    .any(|c| (0xFE00..=0xFE0F).contains(&(c as u32))),
+                "{:?} survived as {:?}",
+                probe,
+                sanitized
+            );
+        }
+    }
+
+    /// The property the whole width budget exists for, checked in one place across every surface
+    /// that composes a line from model output.
+    ///
+    /// Individual budget tests each pin one number and none of them catches a line that overflows
+    /// because two capped parts were concatenated, or because chrome was added after the cut. Three
+    /// separate rounds of review found exactly that class of bug, so it gets a test that states the
+    /// invariant rather than an instance of it.
+    #[test]
+    fn test_no_composed_line_ever_exceeds_the_width_it_was_given() {
+        use crate::tools::todo::{TodoItem, TodoStatus};
+
+        let nasty = [
+            "plain",
+            &"x".repeat(500),
+            &"漢".repeat(300),
+            &"😀".repeat(200),
+            "tab\tseparated\tvalues",
+            "line one\nline two\nline three",
+            // A long *continuation* line: the first-line budget and the rest-of-block budget
+            // differ, and only a line past the width tells them apart.
+            "short first line\nand then a second line long enough to need more than one row of any \
+             terminal meka is willing to compose for, twice over, so the continuation budget is the \
+             one under test",
+            "carriage\rreturn",
+            "\u{1b}[2J\u{1b}[1;1Hescape",
+            "\u{00ad}\u{200b}\u{202e}\u{feff}",
+            "",
+            "   ",
+        ];
+        let long_key = "k".repeat(300);
+        // Deep nesting and variation selectors are the two shapes that broke the invariant while an
+        // earlier version of this test passed: it fed `nasty` only to the thinking and todo
+        // assertions, and its inputs stopped at three levels.
+        let mut deep = serde_json::json!("SECRET_PAYLOAD");
+        for level in 0..25 {
+            deep = serde_json::json!({ format!("k{}", level): deep });
+        }
+        // Arrays nest through `push_item`, a separate recursion from `push_param`'s, so nesting
+        // only objects leaves half the depth handling untested. Both innermost shapes
+        // matter: a record at the bottom takes the arm that hoists a field onto the bullet
+        // line, a bare string does not.
+        let mut deep_array = serde_json::json!("SECRET_PAYLOAD");
+        let mut deep_records = serde_json::json!({"k": "SECRET_PAYLOAD"});
+        for _ in 0..25 {
+            deep_array = serde_json::json!([deep_array]);
+            deep_records = serde_json::json!([deep_records]);
+        }
+        // Enough arguments to reach the `... N more arguments` line, which no other input here does
+        // -- and which was the one line in the block composed without a width budget.
+        let many_arguments = serde_json::Value::Object(
+            (0..300)
+                .map(|index| (format!("o{:03}", index), serde_json::json!("v")))
+                .collect(),
+        );
+        let inputs = [
+            deep,
+            many_arguments,
+            deep_array.clone(),
+            deep_records.clone(),
+            serde_json::json!({ "nest": deep_array }),
+            serde_json::json!({ "nest": deep_records }),
+            serde_json::json!({"vs": "1\u{fe0f}".repeat(300)}),
+            serde_json::json!({"keycap": "1\u{fe0f}\u{20e3}".repeat(200)}),
+            serde_json::json!({"invisible": "\u{2800}\u{fe0f}".repeat(200)}),
+            serde_json::json!({"tabbed": "\tif ok {\n\t\treturn VeryLongConstantWithoutSpaces\n\t}"}),
+            serde_json::json!({"nasty": nasty.map(serde_json::Value::from).to_vec()}),
+            serde_json::json!({}),
+            serde_json::json!({"path": "src/render.rs", "content": "a\nb\nc"}),
+            serde_json::json!({&long_key: "value", "second": "another"}),
+            serde_json::json!({"items": (0..200).map(|index| serde_json::json!({"id": index, "text": "漢".repeat(120)})).collect::<Vec<_>>()}),
+            serde_json::json!(["bare", "array", "\u{1b}[2Jelement"]),
+            serde_json::json!("a bare string input"),
+            serde_json::json!({"nested": {"deep": {"deeper": "漢".repeat(400)}}}),
+        ];
+        let names = [
+            "read_file",
+            "mcp__server__a_rather_long_tool_name",
+            &"n".repeat(400),
+        ];
+
+        // Down to the floor `output_width` enforces, because that floor is the whole reason this
+        // assertion needs no exception: below it the fixed chrome alone outruns the width.
+        for width in [MIN_OUTPUT_WIDTH, 21, 25, 40, 80, 100, 200] {
+            for name in names {
+                for input in &inputs {
+                    for style in [ToolParams::Off, ToolParams::Summary, ToolParams::Full] {
+                        let (header, block) =
+                            super::tool_indicator_parts(name, input, None, style, width);
+                        let mut lines = vec![header];
+                        lines.extend(block);
+                        for line in lines {
+                            assert!(
+                                super::display_width(&line) <= width,
+                                "indicator at width {}: {} columns in {:?}",
+                                width,
+                                super::display_width(&line),
+                                line
+                            );
+                        }
+                    }
+                }
+            }
+            for input in &inputs {
+                // The approval block wraps rather than cutting, which is the case where a row can
+                // exceed the width if the wrap arithmetic is wrong, and where a continuation row
+                // could land at column zero.
+                for line in super::render_approval_params(input, width) {
+                    assert!(
+                        super::display_width(&line) <= width,
+                        "approval at width {}: {} columns in {:?}",
+                        width,
+                        super::display_width(&line),
+                        line
+                    );
+                    assert!(
+                        line.starts_with(super::TOOL_PARAM_INDENT),
+                        "approval row at column zero: {:?}",
+                        line
+                    );
+                }
+            }
+            for text in nasty {
+                for show_full in [false, true] {
+                    let body = super::thinking_block_text(text, show_full, width);
+                    // The first line carries `Thinking... ` from the caller; the rest stand alone.
+                    for (index, line) in body.lines().enumerate() {
+                        let rendered = if index == 0 {
+                            super::display_width(super::THINKING_PREFIX)
+                                + super::display_width(line)
+                        } else {
+                            super::display_width(line)
+                        };
+                        assert!(
+                            rendered <= width,
+                            "thinking at width {}: {} columns in {:?}",
+                            width,
+                            rendered,
+                            line
+                        );
+                    }
+                }
+                let heading = super::todo_heading(Some(text), width);
+                assert!(
+                    super::display_width(&heading) <= width,
+                    "todo heading at width {}: {:?}",
+                    width,
+                    heading
+                );
+                for status in [TodoStatus::Pending, TodoStatus::Cancelled] {
+                    // Through `todo_row`, which is what computes the chrome. Calling
+                    // `todo_item_text` with a budget the test worked out itself passed even when
+                    // the caller's subtraction was deleted.
+                    let items: Vec<TodoItem> = (0..101)
+                        .map(|_| TodoItem {
+                            text: text.to_string(),
+                            status,
+                        })
+                        .collect();
+                    for (index, item) in items.iter().enumerate() {
+                        let rendered = super::todo_row(index, item, width);
+                        assert!(
+                            super::display_width(&rendered) <= width,
+                            "todo row {} at width {}: {:?}",
+                            index,
+                            width,
+                            rendered
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_a_tool_with_no_parameters_renders_no_block() {
-        assert!(super::render_tool_params(&serde_json::json!({})).is_empty());
+        assert!(
+            super::render_tool_params(
+                &serde_json::json!({}),
+                TEST_WIDTH,
+                super::BlockLimits::indicator()
+            )
+            .is_empty()
+        );
     }
 
     /// Indentation is the only thing separating model text from meka's own chrome, and
@@ -3086,14 +3954,419 @@ mod tests {
     fn test_an_arguments_container_is_capped_like_a_long_string() {
         let items: Vec<u32> = (0..5000).collect();
         let rendered = params(serde_json::json!({"xs": items}));
-        // The key line, the budget, and the count: never more, whatever the shape below the key.
-        assert_eq!(rendered.lines().count(), super::TOOL_PARAM_MAX_LINES + 2);
+        // A container has no source lines to count, so its ceiling is the per-argument row budget.
+        // Bounded, keyed, marked, and ending on the last element is the property; the exact row is
+        // the constant's business.
+        let limits = super::BlockLimits::indicator();
+        assert!(
+            rendered.lines().count() <= limits.rows_per_argument + 1,
+            "{} rows",
+            rendered.lines().count()
+        );
         assert!(rendered.starts_with("  xs:\n"), "{}", rendered);
         assert!(
-            rendered.ends_with("    ... 4970 more lines"),
+            rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("... ") && line.ends_with(" more rows")),
             "{}",
             rendered
         );
+        // The end of a container is as informative as its start, so the cut keeps it.
+        assert!(rendered.ends_with("- 4999"), "{}", rendered);
+    }
+
+    /// An input that is not an object at all takes a separate path, and it is the path with no key
+    /// to hang a per-argument cap on. It is also the one the object path's ceiling never sees, so
+    /// leaving it uncapped let five thousand array elements print in full.
+    /// Past the indent ceiling the block stops indenting rather than stops informing. The width
+    /// invariant covers the "does not run off the edge" half; this covers the half that matters to
+    /// a reader, that the value at the bottom is still on screen and still under a bullet.
+    #[test]
+    fn test_nesting_past_the_indent_ceiling_still_shows_the_value() {
+        let mut deep = serde_json::json!({"k": "PAYLOAD"});
+        for _ in 0..14 {
+            deep = serde_json::json!([deep]);
+        }
+        let width = 40;
+        let rendered = super::render_tool_params(
+            &serde_json::json!({"a": deep}),
+            width,
+            BlockLimits::indicator(),
+        );
+        let indents: Vec<usize> = rendered
+            .iter()
+            .map(|line| line.len() - line.trim_start_matches(' ').len())
+            .collect();
+        assert!(
+            indents.iter().all(|indent| *indent <= width / 2),
+            "indent grew past the ceiling: {:?}",
+            indents
+        );
+        assert!(
+            rendered.iter().any(|line| line.trim() == "-"),
+            "bullets vanished: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("k: PAYLOAD")),
+            "the value at the bottom was swallowed: {:?}",
+            rendered
+        );
+    }
+
+    /// The failure that made a decision surface show less than a notification: a 90 KB
+    /// `execute_command` filled every row the wrap was given and stopped, leaving the end of the
+    /// pipeline -- where `; rm -rf /` lives -- off the last row. The `full` indicator, which elides
+    /// from the middle, showed that tail. Whatever else is cut, an approval keeps the end.
+    #[test]
+    fn test_an_approval_keeps_the_end_of_a_command_too_long_to_show() {
+        let command = format!("echo start; {} ; rm -rf /important", "PAD".repeat(30000));
+        let rendered =
+            super::render_approval_params(&serde_json::json!({ "command": command }), 80);
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("rm -rf /important"),
+            "the end of the command was hidden: {:?}",
+            rendered.last()
+        );
+        assert!(joined.contains("echo start"), "the start went instead");
+        assert!(
+            rendered.iter().any(|row| row.contains("more characters")),
+            "nothing said how much was omitted: {:?}",
+            rendered
+        );
+    }
+
+    /// The line that names dropped arguments was the one line in the block composed without a
+    /// budget: `  ... 240 more arguments: ` is twenty-six columns before a single name is added, so
+    /// it broke the width at every width the resolver can produce below twenty-seven.
+    #[test]
+    fn test_the_line_naming_dropped_arguments_fits_the_width() {
+        let input = serde_json::Value::Object(
+            (0..300)
+                .map(|index| (format!("o{:03}", index), serde_json::json!("v")))
+                .collect(),
+        );
+        for width in [MIN_OUTPUT_WIDTH, 21, 25, 26, 27, 40, 80] {
+            for limits in [
+                super::BlockLimits::indicator(),
+                super::BlockLimits::approval(),
+            ] {
+                let rendered = super::render_tool_params(&input, width, limits);
+                let last = rendered.last().cloned().unwrap_or_default();
+                // At the narrow end the word itself is cut; the marker and the count survive, which
+                // is what tells a reader something was dropped. How many go depends on the limits,
+                // so the count is not pinned here.
+                assert!(last.trim_start().starts_with("... "), "{:?}", last);
+                assert!(
+                    last.chars().any(|character| character.is_ascii_digit()),
+                    "no count survived: {:?}",
+                    last
+                );
+                assert!(
+                    super::display_width(&last) <= width,
+                    "width {}: {} columns in {:?}",
+                    width,
+                    super::display_width(&last),
+                    last
+                );
+            }
+        }
+    }
+
+    /// `block_rows` is checked before an argument is rendered, so the block reaches it plus one
+    /// argument's own budget. That sum is the real ceiling and the number the docs quote; leaving
+    /// the per-argument cap sharing `block_rows` made it twice what the field claimed.
+    #[test]
+    fn test_a_block_stays_inside_the_ceiling_its_limits_add_up_to() {
+        for limits in [
+            super::BlockLimits::indicator(),
+            super::BlockLimits::approval(),
+        ] {
+            // The worst case needs the huge argument to be the one that *crosses* the line, so the
+            // block must be one row short of its gate when that argument is reached. Padding past
+            // the gate instead drops the huge one by name and never renders it, which is a block of
+            // `block_rows` and proves nothing -- as this test did until its own mutation check
+            // survived.
+            let mut fields = serde_json::Map::new();
+            for index in 0..limits.block_rows - 1 {
+                fields.insert(format!("a{:04}", index), serde_json::json!("v"));
+            }
+            // Sorts after every `a...`, so it is rendered last.
+            fields.insert(
+                "zzz".to_string(),
+                serde_json::Value::from((0..10_000).collect::<Vec<u32>>()),
+            );
+            let rendered =
+                super::render_tool_params(&serde_json::Value::Object(fields), 80, limits);
+            assert!(
+                rendered.iter().any(|row| row.contains("zzz")),
+                "the huge argument was dropped, so the sum is untested"
+            );
+            let ceiling = limits.block_rows + limits.rows_per_argument + 1;
+            assert!(
+                rendered.len() <= ceiling,
+                "{} rows against a ceiling of {}",
+                rendered.len(),
+                ceiling
+            );
+        }
+    }
+
+    /// An argument that has already reported `... 480 more lines` must not lose that line to the
+    /// row cap above it: the block then admitted to two dropped rows and said nothing about the
+    /// hundreds of lines that actually went.
+    #[test]
+    fn test_a_row_cut_does_not_delete_the_line_count_beneath_it() {
+        let body = (0..500)
+            .map(|index| format!("line {} {}", index, "x".repeat(280)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = super::render_approval_params(&serde_json::json!({ "content": body }), 80);
+        assert!(
+            rendered.iter().any(|row| row.contains("more lines")),
+            "the line count was cut away: {:?}",
+            rendered.last()
+        );
+    }
+
+    /// Every other surface that prints model output has a block ceiling. This one went without,
+    /// because its line count used to be its row count -- until wrapping turned two thousand lines
+    /// of reasoning into forty thousand rows of terminal.
+    #[test]
+    fn test_a_full_thinking_block_has_a_ceiling() {
+        let reasoning = (0..2000)
+            .map(|index| format!("reasoning line {} {}", index, "y".repeat(300)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = super::thinking_block_text(&reasoning, true, 80);
+        assert!(
+            body.lines().count() <= super::THINKING_MAX_ROWS,
+            "{} rows",
+            body.lines().count()
+        );
+        assert!(
+            body.lines().any(|line| line.contains("more rows")),
+            "the cut was silent"
+        );
+    }
+
+    /// meka's measure has to be at least what the terminal paints, or a budget is a promise it
+    /// cannot keep. `unicode_width` merges an emoji and its skin-tone modifier into one two-column
+    /// cluster; VTE paints two glyphs across four columns, so every skin-toned emoji in an argument
+    /// was a two-times under-count. This pins the direction of the disagreement rather than a
+    /// number: over-counting shows less than might have fit, under-counting runs off the row.
+    #[test]
+    fn test_the_measure_is_never_less_than_a_terminal_would_paint() {
+        assert_eq!(super::display_width("\u{1F44D}\u{1F3FB}"), 4);
+        assert_eq!(super::display_width("\u{1F44D}"), 2);
+        // Plain text is unaffected, which is what makes over-counting an acceptable trade.
+        assert_eq!(super::display_width("hello"), 5);
+        assert_eq!(super::display_width("\u{6F22}\u{5B57}"), 4);
+    }
+
+    /// Width is **not** order-independent, so a tail taken by reversing the string is measured in
+    /// an order that is never printed: `display_width` scores a thumbs-up followed by a
+    /// skin-tone modifier as one two-column cluster and the same two characters reversed as
+    /// four columns. An argument of reversed pairs came back a third over its budget, and the
+    /// composed indicator ran to 100 columns where 80 was asked for.
+    ///
+    /// Two changes close this and either would do it alone: measuring the suffix that is printed,
+    /// and taking the larger of the two width measures (a per-character sum does not care about
+    /// order, so the reversal stops mattering). They are kept together because the first is correct
+    /// without depending on a property of the second, and this test fails only if both go --
+    /// `test_the_measure_is_never_less_than_a_terminal_would_paint` pins the other on its own.
+    #[test]
+    fn test_a_tail_is_measured_in_the_order_it_is_printed() {
+        let payload = "\u{1F3FB}\u{1F44D}a".repeat(400);
+        for budget in [20usize, 40, 80, 160] {
+            let elided = super::elide_to_width(&payload, budget);
+            assert!(
+                super::display_width(&elided) <= budget,
+                "budget {} gave {} columns",
+                budget,
+                super::display_width(&elided)
+            );
+        }
+        let line = super::tool_indicator_line(
+            "execute_command",
+            &serde_json::json!({ "command": payload }),
+            None,
+            80,
+        );
+        assert!(
+            super::display_width(&line) <= 80,
+            "{} columns",
+            super::display_width(&line)
+        );
+    }
+
+    /// A character meka scores at zero columns and a terminal paints anyway is a way to push text
+    /// off a row while the budget says it fits -- and U+3164 paints *blank*, so the overrun is
+    /// invisible. The rule is by measured width rather than by category, so it needs no list of
+    /// which characters are currently known to behave this way.
+    #[test]
+    fn test_a_character_worth_no_columns_never_reaches_the_terminal() {
+        for probe in [
+            '\u{3164}',  // HANGUL FILLER: gc=Lo, not a control, not a format character.
+            '\u{FFA0}',  // HALFWIDTH HANGUL FILLER.
+            '\u{2065}',  // Unassigned default-ignorable.
+            '\u{0301}',  // COMBINING ACUTE: the cost of the rule, and the reason it is stated.
+            '\u{E0001}', // Deprecated language tag.
+            '\u{00ad}',  // SOFT HYPHEN, the case that started this.
+        ] {
+            let sanitized = super::sanitize_to_line(&probe.to_string().repeat(200), usize::MAX);
+            assert!(
+                sanitized.is_empty(),
+                "U+{:04X} survived as {} characters",
+                probe as u32,
+                sanitized.chars().count()
+            );
+        }
+        // A space still separates what it separated, because the rule runs after whitespace is
+        // flattened rather than before.
+        assert_eq!(super::sanitize_to_line("a\nb", usize::MAX), "a b");
+    }
+
+    /// Fitting text to a budget re-measures a growing prefix, so a character that never advances
+    /// the count made the loop walk the whole string and re-measure it every step. Forty
+    /// thousand combining marks in a tool name -- which is model-supplied, unvalidated, and
+    /// rendered in every `tool_params` mode including `off` -- froze the REPL for minutes.
+    #[test]
+    fn test_fitting_text_to_a_budget_is_bounded_by_the_budget() {
+        let zalgo = format!("{}{}", "\u{0301}".repeat(40_000), "A".repeat(300));
+        let started = std::time::Instant::now();
+        let fitted = super::sanitize_to_line(&zalgo, 60);
+        assert!(super::display_width(&fitted) <= 60);
+        let line = super::tool_indicator_line(&zalgo, &serde_json::json!({}), None, 80);
+        assert!(super::display_width(&line) <= 80);
+        // Generous by three orders of magnitude against the quadratic version, which took minutes
+        // in this build. A wall-clock assertion is crude, but the property *is* about time.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The property `elide_to_width` exists for, checked through the paths that call it rather than
+    /// on the helper alone. MCP names agree on their prefix, so a tail cut collapses two different
+    /// tools onto one string -- and the header, the indicator and the prompt each cut a name.
+    #[test]
+    fn test_two_mcp_names_stay_apart_through_every_path_that_cuts_one() {
+        // These agree for fourteen characters, so a budget that keeps fewer collapses them.
+        let search = "mcp__exa__web_search_exa";
+        let fetch = "mcp__exa__web_fetch_exa";
+        assert_ne!(
+            super::tool_header(search, 24),
+            super::tool_header(fetch, 24),
+            "the bare header collapsed two tools onto one string"
+        );
+
+        // The indicator only cuts a name when `TOOL_NAME_MAX_WIDTH` is what bites -- below that it
+        // drops the argument and defers to the header -- so this needs a hallucinated name past the
+        // cap, with room left over for an argument.
+        let long_search = format!("mcp__{}__web_search_exa", "x".repeat(60));
+        let long_fetch = format!("mcp__{}__web_fetch_exa", "x".repeat(60));
+        let argument = serde_json::json!({});
+        assert_ne!(
+            super::tool_indicator_line(&long_search, &argument, Some("query"), 100),
+            super::tool_indicator_line(&long_fetch, &argument, Some("query"), 100),
+            "the indicator collapsed two tools onto one string"
+        );
+
+        // And the cap that made the cut happen at all. A name is model-supplied and unvalidated at
+        // render time, so without a bound a hallucinated one takes the whole line and the argument
+        // never appears, however wide the terminal is.
+        let hallucinated = "n".repeat(400);
+        let line = super::tool_indicator_line(&hallucinated, &argument, Some("query"), 400);
+        assert!(
+            line.contains("query"),
+            "the argument was crowded out: {}",
+            line
+        );
+        let name_columns = super::display_width(&line) - super::display_width("[tool (`query`)]");
+        assert!(
+            name_columns <= super::TOOL_NAME_MAX_WIDTH,
+            "the name took {} columns",
+            name_columns
+        );
+    }
+
+    /// Wrapping a line of source has to keep it looking like source: continuation rows carry the
+    /// line's own leading whitespace, and a break never lands inside that whitespace, which would
+    /// emit a row that is empty once trimmed and silently dedent everything after it.
+    #[test]
+    fn test_a_wrapped_line_keeps_its_indentation_on_every_row() {
+        let source = format!("        {}", "let value = compute(argument); ".repeat(8));
+        let rows = super::wrap_to_width(&source, 40, 20);
+        assert!(rows.len() > 2, "expected wrapping: {:?}", rows);
+        for row in rows.iter().skip(1) {
+            assert!(
+                row.starts_with("        "),
+                "continuation lost the indent: {:?}",
+                row
+            );
+            assert!(!row.trim().is_empty(), "an all-whitespace row: {:?}", row);
+        }
+
+        // The other half: a line whose only space is the indent itself, so the last space that fits
+        // sits inside it. Breaking there emits a row that is empty once trimmed and drops the
+        // indentation of everything below.
+        let unbroken = format!("    {}", "X".repeat(200));
+        let rows = super::wrap_to_width(&unbroken, 40, 20);
+        assert!(
+            rows[0].starts_with("    X"),
+            "broke inside the indent: {:?}",
+            rows[0]
+        );
+        for row in &rows {
+            assert!(!row.trim().is_empty(), "an all-whitespace row: {:?}", rows);
+        }
+    }
+
+    /// The numbers the docs quote, asserted as numbers. Deriving a bound from the very limits under
+    /// test made `rows_per_argument` unfalsifiable: raising it tenfold still passed.
+    #[test]
+    fn test_the_block_ceilings_are_the_ones_the_docs_quote() {
+        let indicator = super::BlockLimits::indicator();
+        assert_eq!(indicator.lines_per_argument, 30);
+        assert_eq!(indicator.rows_per_argument, 32);
+        assert_eq!(indicator.block_rows, 60);
+        assert_eq!(
+            indicator.block_rows + indicator.rows_per_argument + 1,
+            93,
+            "config-file.md quotes 93 rows"
+        );
+        let approval = super::BlockLimits::approval();
+        assert_eq!(approval.lines_per_argument, 20);
+        assert_eq!(approval.rows_per_argument, 60);
+        assert_eq!(approval.block_rows, 100);
+        assert_eq!(
+            approval.block_rows + approval.rows_per_argument + 1,
+            161,
+            "permissions.md quotes 161 rows"
+        );
+    }
+
+    #[test]
+    fn test_a_bare_array_input_is_capped_like_any_other_block() {
+        let items: Vec<u32> = (0..5000).collect();
+        let rendered = params(serde_json::Value::from(items));
+        let limits = super::BlockLimits::indicator();
+        assert!(
+            rendered.lines().count() <= limits.block_rows + 1,
+            "{} rows",
+            rendered.lines().count()
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("... ") && line.ends_with(" more rows")),
+            "{}",
+            rendered
+        );
+        assert!(rendered.ends_with("- 4999"), "{}", rendered);
     }
 
     /// The block cap used to cut a flat line list wherever line 60 landed, which threw away the
@@ -3144,13 +4417,234 @@ mod tests {
         );
     }
 
+    /// The name identifies the call and the argument refines it, so when only one fits it is the
+    /// name that survives. Reserving for the argument first rendered
+    /// `mcp__exa__web_search_exa` as `mc`, which is not a shortened name but a different one.
     #[test]
-    fn test_a_key_and_a_value_are_both_width_capped() {
+    fn test_a_narrow_line_keeps_the_whole_name_and_drops_the_argument() {
+        let line = super::tool_indicator_line(
+            "mcp__exa__web_search_exa",
+            &serde_json::json!({}),
+            Some("Jane Street first mortgage-backed securities desk"),
+            37,
+        );
+        assert_eq!(line, "[tool mcp__exa__web_search_exa]");
+        assert!(super::display_width(&line) <= 37, "{}", line);
+    }
+
+    /// Given room for both, the argument still appears.
+    #[test]
+    fn test_a_wide_line_keeps_the_name_and_the_argument() {
+        let line = super::tool_indicator_line(
+            "mcp__exa__web_search_exa",
+            &serde_json::json!({}),
+            Some("Jane Street"),
+            80,
+        );
+        assert_eq!(line, "[tool mcp__exa__web_search_exa(`Jane Street`)]");
+    }
+
+    /// The floor is the precondition every width bound in this file rests on, so it has to hold on
+    /// both paths into the resolver: a configured width and a measured terminal. A configured width
+    /// otherwise wins outright, which is the whole point of setting one.
+    #[test]
+    fn test_the_resolved_width_is_never_below_what_can_be_composed() {
+        for measured in [None, Some(0), Some(1), Some(10), Some(200)] {
+            assert!(
+                super::resolve_output_width(None, measured) >= super::MIN_OUTPUT_WIDTH,
+                "measured {:?}",
+                measured
+            );
+            assert!(
+                super::resolve_output_width(Some(1), measured) >= super::MIN_OUTPUT_WIDTH,
+                "measured {:?}",
+                measured
+            );
+        }
+        assert_eq!(super::resolve_output_width(Some(120), Some(40)), 120);
+        assert_eq!(super::resolve_output_width(None, Some(40)), 40);
+        assert_eq!(
+            super::resolve_output_width(None, None),
+            super::FALLBACK_OUTPUT_WIDTH
+        );
+        // A terminal that reports nothing is not a terminal one column wide.
+        assert_eq!(
+            super::resolve_output_width(None, Some(0)),
+            super::FALLBACK_OUTPUT_WIDTH
+        );
+    }
+
+    /// The tail of an elision is taken by reversing the string, taking a prefix, and reversing
+    /// back. Combining marks and regional-indicator pairs are where that trick could measure
+    /// one thing and print another, and neither shape appears in the block-level inputs above.
+    #[test]
+    fn test_keeping_both_ends_never_exceeds_the_budget() {
+        let probes = [
+            "e\u{0301}".repeat(60),
+            "\u{1F1E6}\u{1F1E7}".repeat(40),
+            "a\u{0300}\u{0301}\u{0302}b".repeat(30),
+            "漢".repeat(60),
+            "😀".repeat(40),
+        ];
+        for probe in &probes {
+            for budget in 1..40usize {
+                let elided = super::elide_to_width(probe, budget);
+                assert!(
+                    super::display_width(&elided) <= budget,
+                    "budget {} gave {} columns",
+                    budget,
+                    super::display_width(&elided)
+                );
+            }
+        }
+        // The name's own promise, over the range where it is made: below a marker plus two columns
+        // there is no room for two ends and `elide_to_width` says so by falling back to a tail cut.
+        let path = "/home/you/projects/meka/docs/book/src/configuration/config-file.md";
+        for budget in 6..40usize {
+            let elided = super::elide_to_width(path, budget);
+            assert!(
+                elided.starts_with('/'),
+                "lost the head at {}: {}",
+                budget,
+                elided
+            );
+            assert!(
+                elided.ends_with(|last: char| last != '.'),
+                "lost the tail at {}: {}",
+                budget,
+                elided
+            );
+        }
+    }
+
+    /// A character wider than the whole budget has no row that can hold it. Taking it anyway was
+    /// the way out of the loop, and it put a two-column character on a one-column row; a marker
+    /// says the same thing and fits.
+    #[test]
+    fn test_a_wrapped_row_never_exceeds_its_budget() {
+        for budget in 1..12usize {
+            for rows in [1usize, 3, 10] {
+                for text in ["漢字漢字漢字", "  漢字漢字", "aaa bbb ccc", "😀😀😀", ""]
+                {
+                    for row in super::wrap_to_width(text, budget, rows) {
+                        assert!(
+                            super::display_width(&row) <= budget,
+                            "budget {} gave {:?}",
+                            budget,
+                            row
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cut that cannot fit its marker used to emit the bare prefix, which reads as a complete
+    /// name. Whatever the budget, the output has to say it was cut.
+    #[test]
+    fn test_a_cut_always_says_it_was_cut() {
+        for budget in 1..=4 {
+            let cut = super::truncate_to_width("mcp__exa__web_search_exa", budget);
+            // The marker, not merely a dot: the probe happens to contain none, so `contains('.')`
+            // would have passed on an implementation that emitted one from the text.
+            assert!(
+                cut.ends_with(
+                    &super::TRUNCATION_MARKER[..super::TRUNCATION_MARKER.len().min(budget)]
+                ),
+                "budget {} produced {:?}",
+                budget,
+                cut
+            );
+            assert!(
+                super::display_width(&cut) <= budget,
+                "budget {} produced {:?}",
+                budget,
+                cut
+            );
+        }
+    }
+
+    /// A path is back-loaded like an MCP name: cutting the tail keeps the directories and loses the
+    /// filename, which is what you were reading it for. This is the commonest argument shape there
+    /// is, and at 80 columns the old tail cut dropped the name of the file being read.
+    #[test]
+    fn test_a_long_path_argument_keeps_its_filename() {
+        let line = super::tool_indicator_line(
+            "read_file",
+            &serde_json::json!({}),
+            Some("/home/you/projects/meka/docs/book/src/configuration/config-file.md"),
+            80,
+        );
+        assert!(line.contains("config-file.md"), "{}", line);
+        assert!(line.starts_with("[tool ReadFile(`/home"), "{}", line);
+        assert!(super::display_width(&line) <= 80, "{}", line);
+    }
+
+    /// Same reasoning one level down: a value sitting on its key line is an identifier too, so a
+    /// `path:` in a `full` block keeps its filename rather than six directories.
+    #[test]
+    fn test_a_long_path_value_in_a_block_keeps_its_filename() {
+        // At a width that actually cuts. Rendered at `TEST_WIDTH` the 66-column path fits whole, so
+        // the assertions held for any implementation at all and the mutation survived.
+        let rendered = super::render_tool_params(
+            &serde_json::json!({
+                "path": "/home/you/projects/meka/docs/book/src/configuration/config-file.md"
+            }),
+            40,
+            super::BlockLimits::indicator(),
+        )
+        .join("\n");
+        assert!(rendered.contains("..."), "nothing was cut: {}", rendered);
+        assert!(rendered.contains("config-file.md"), "{}", rendered);
+        assert!(rendered.starts_with("  path: /home"), "{}", rendered);
+    }
+
+    /// A line of source runs left to right, so a hole in its middle would misrepresent it. Only
+    /// identifiers are elided from the middle.
+    #[test]
+    fn test_a_content_line_is_cut_from_the_tail_not_the_middle() {
+        let body = format!("fn main() {{\n{}\n}}", "    let x = compute(".repeat(20));
+        let rendered = params(serde_json::json!({ "content": body }));
+        let long = rendered
+            .lines()
+            .find(|line| line.contains("compute"))
+            .unwrap_or_default();
+        assert!(long.ends_with("..."), "{:?}", long);
+        assert!(
+            !long.contains("...l"),
+            "middle-elided a content line: {:?}",
+            long
+        );
+    }
+
+    /// MCP names agree on their prefix and differ at the end, so a tail cut collapses two different
+    /// tools onto the same string.
+    #[test]
+    fn test_two_mcp_names_stay_distinguishable_when_elided() {
+        let search = super::elide_to_width("mcp__exa__web_search_exa", 20);
+        let fetch = super::elide_to_width("mcp__exa__web_fetch_exa", 20);
+        assert_ne!(search, fetch, "elided to the same string");
+        assert!(search.starts_with("mcp__exa"), "{}", search);
+        assert!(search.ends_with("exa"), "{}", search);
+    }
+
+    /// The budget is the whole line, so a long key has to leave room for the value rather than
+    /// spending the width and letting it overflow.
+    #[test]
+    fn test_a_long_key_still_leaves_room_for_its_value() {
         let rendered = params(serde_json::json!({"k".repeat(5000): "v".repeat(5000)}));
-        // Indent, key, separator, value: each capped part carries its own "..." marker.
-        let ceiling = 2 * (super::TOOL_PARAM_MAX_WIDTH + "...".len()) + "  : ".len();
         assert_eq!(rendered.lines().count(), 1, "{}", rendered);
-        assert!(rendered.chars().count() <= ceiling, "{}", rendered.len());
+        assert!(
+            super::display_width(&rendered) <= TEST_WIDTH,
+            "{}",
+            rendered
+        );
+        let value = rendered.rsplit(": ").next().unwrap_or_default();
+        assert!(
+            super::display_width(value) >= super::TOOL_VALUE_MIN_WIDTH,
+            "value got {} columns",
+            super::display_width(value)
+        );
     }
 
     /// The name arrives verbatim off the provider stream and the indicator is emitted before the
@@ -3159,8 +4653,13 @@ mod tests {
     fn test_a_tool_name_is_sanitized_in_every_style() {
         let forged = "read_file\u{1b}[2J\u{1b}[1;1H";
         for style in [ToolParams::Off, ToolParams::Summary, ToolParams::Full] {
-            let (header, _) =
-                super::tool_indicator_parts(forged, &serde_json::json!({}), None, style);
+            let (header, _) = super::tool_indicator_parts(
+                forged,
+                &serde_json::json!({}),
+                None,
+                style,
+                TEST_WIDTH,
+            );
             assert!(!header.contains('\u{1b}'), "{}: {:?}", style, header);
             assert_eq!(header.lines().count(), 1, "{}: {:?}", style, header);
         }
@@ -3171,8 +4670,13 @@ mod tests {
     #[test]
     fn test_each_style_selects_the_output_it_names() {
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let (off, off_block) =
-            super::tool_indicator_parts("read_file", &input, Some("/etc/hosts"), ToolParams::Off);
+        let (off, off_block) = super::tool_indicator_parts(
+            "read_file",
+            &input,
+            Some("/etc/hosts"),
+            ToolParams::Off,
+            TEST_WIDTH,
+        );
         assert_eq!(off, "[tool ReadFile]");
         assert!(off_block.is_empty());
 
@@ -3181,12 +4685,18 @@ mod tests {
             &input,
             Some("/etc/hosts"),
             ToolParams::Summary,
+            TEST_WIDTH,
         );
         assert_eq!(summary, "[tool ReadFile(`/etc/hosts`)]");
         assert!(summary_block.is_empty());
 
-        let (full, full_block) =
-            super::tool_indicator_parts("read_file", &input, Some("/etc/hosts"), ToolParams::Full);
+        let (full, full_block) = super::tool_indicator_parts(
+            "read_file",
+            &input,
+            Some("/etc/hosts"),
+            ToolParams::Full,
+            TEST_WIDTH,
+        );
         assert_eq!(full, "[tool ReadFile]", "the header drops its argument");
         assert_eq!(full_block, vec!["  path: /etc/hosts".to_string()]);
     }
@@ -3205,14 +4715,14 @@ mod tests {
         use crate::tools::todo::{TodoItem, TodoStatus};
 
         assert_eq!(
-            super::todo_heading(Some("Plan\n[ask] Shell rm -rf / (Y/n) y")),
+            super::todo_heading(Some("Plan\n[ask] Shell rm -rf / (Y/n) y"), TEST_WIDTH),
             "TODO: Plan [ask] Shell rm -rf / (Y/n) y"
         );
         let item = TodoItem {
             text: "step\u{1b}[2J\rdone".to_string(),
             status: TodoStatus::Pending,
         };
-        let rendered = super::todo_item_text(&item);
+        let rendered = super::todo_item_text(&item, TEST_WIDTH);
         assert!(!rendered.contains('\u{1b}'), "{:?}", rendered);
         assert!(!rendered.contains('\r'), "{:?}", rendered);
         assert_eq!(rendered.lines().count(), 1, "{:?}", rendered);
@@ -3251,17 +4761,16 @@ mod tests {
     fn test_the_width_cap_counts_columns_not_characters() {
         let wide = "\u{ff21}".repeat(300);
         let rendered = params(serde_json::json!({"a": wide}));
-        let value = rendered.trim_start_matches("  a: ");
         assert!(
-            super::display_width(value.trim_end_matches("...")) <= super::TOOL_PARAM_MAX_WIDTH,
+            super::display_width(&rendered) <= TEST_WIDTH,
             "{} columns",
-            super::display_width(value)
+            super::display_width(&rendered)
         );
     }
 
     #[test]
     fn test_the_elision_count_is_singular_at_one() {
-        let body = (0..super::TOOL_PARAM_MAX_LINES + 1)
+        let body = (0..super::BlockLimits::indicator().lines_per_argument + 1)
             .map(|index| format!("line {}", index))
             .collect::<Vec<_>>()
             .join("\n");
@@ -3274,7 +4783,7 @@ mod tests {
     #[test]
     fn test_an_empty_summary_renders_bare_rather_than_as_empty_backticks() {
         assert_eq!(
-            tool_indicator_line("todo", &serde_json::json!({}), Some("   ")),
+            tool_indicator_line("todo", &serde_json::json!({}), Some("   "), TEST_WIDTH),
             "[tool Todo]"
         );
     }

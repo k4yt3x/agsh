@@ -326,8 +326,20 @@ pub struct PermissionRequest {
     pub tool_name: String,
     /// The most user-meaningful argument for display in the prompt (e.g. the file path for
     /// `read_file`, the command for `execute_command`). Resolved via
-    /// [`crate::render::resolve_primary_param`].
+    /// [`crate::render::resolve_primary_param`]. Still the right shape for a client that wants one
+    /// line: the ACP frontend builds its permission title from it.
     pub primary_param: Option<String>,
+    /// Every argument the tool was called with, plus `background` when the call would detach.
+    ///
+    /// `background` is meka's own parameter and is taken out before any tool sees it, but it
+    /// decides whether the call outlives the turn, so it is put back for the asking.
+    ///
+    /// `primary_param` alone is not enough to authorise a call. It resolves to the *destination*
+    /// for every write-shaped tool -- `path` for `write_file` and `edit_file`, `url` for
+    /// `fetch_url`, `name` for `scratchpad_write` -- so a prompt built from it asks the user
+    /// to approve a write without showing them what is being written. A frontend that gates on
+    /// human judgement should render this instead.
+    pub input: serde_json::Value,
     /// Per-turn cancellation token. ACP frontends race their `session/request_permission`
     /// round-trip against this so a `session/cancel` during an `Ask`-mode prompt resolves promptly
     /// instead of hanging until the client replies.
@@ -587,6 +599,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "read_file".to_string(),
                 primary_param: Some("/tmp/foo".to_string()),
+                input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;
@@ -650,6 +663,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "execute_command".to_string(),
                 primary_param: Some("rm -rf /".to_string()),
+                input: serde_json::json!({"command": "rm -rf /"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;
@@ -822,6 +836,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "write_file".into(),
                 primary_param: Some("/tmp/foo".into()),
+                input: serde_json::json!({"path": "/tmp/foo"}),
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;

@@ -698,6 +698,11 @@ pub struct DisplayConfig {
     /// How much of a tool call's input the `[tool X]` indicator shows: `off`, `summary` (default),
     /// or `full`.
     pub tool_params: Option<ToolParams>,
+    /// Widest line meka composes from model output, in terminal columns. Unset follows the
+    /// terminal, which is what keeps a line from ever wrapping; a set value is honoured exactly,
+    /// so one wider than the terminal will wrap. Covers meka's own output only: assistant
+    /// markdown reflows to the real terminal through `render_mode` either way.
+    pub max_width: Option<usize>,
     /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
     /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a colour name (`cyan`,
     /// `yellow`, …).
@@ -861,6 +866,45 @@ const DEFAULT_CONTEXT_MESSAGES: usize = 200;
 const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
+
+/// Narrowest `[display].max_width` that still leaves room for anything.
+///
+/// Every budget derived from it subtracts fixed chrome first (`[tool ` and its brackets, the
+/// `Thinking... ` prefix, a block's indent), so below roughly this the subtraction leaves nothing
+/// and output degrades to punctuation. Clamped rather than rejected: a too-narrow width is a
+/// preference stated badly, not a broken config, and refusing to start over it would be
+/// disproportionate.
+const MIN_CONFIGURED_WIDTH: usize = 40;
+
+/// Widest `[display].max_width` worth honouring.
+///
+/// Not a taste judgement about long lines. Fitting text to a column budget re-measures a growing
+/// prefix, so the work to compose one line grows with the square of the width: a stray `max_width =
+/// 100000` turns each elided line into billions of width computations and hangs the renderer. No
+/// terminal is this wide, so nothing legitimate is refused.
+const MAX_CONFIGURED_WIDTH: usize = 1000;
+
+fn clamp_max_width(configured: usize) -> usize {
+    if configured < MIN_CONFIGURED_WIDTH {
+        tracing::warn!(
+            "[display].max_width = {} is below the {}-column minimum; using {}",
+            configured,
+            MIN_CONFIGURED_WIDTH,
+            MIN_CONFIGURED_WIDTH
+        );
+        return MIN_CONFIGURED_WIDTH;
+    }
+    if configured > MAX_CONFIGURED_WIDTH {
+        tracing::warn!(
+            "[display].max_width = {} is above the {}-column maximum; using {}",
+            configured,
+            MAX_CONFIGURED_WIDTH,
+            MAX_CONFIGURED_WIDTH
+        );
+        return MAX_CONFIGURED_WIDTH;
+    }
+    configured
+}
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1050,6 +1094,8 @@ pub struct ResolvedConfig {
     pub backend_probe: crate::sandbox::BackendProbe,
     pub render_mode: RenderMode,
     pub tool_params: ToolParams,
+    /// Resolved `[display].max_width`. `None` - the default - follows the terminal.
+    pub max_width: Option<usize>,
     pub context_messages: Option<usize>,
     /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
     pub retention_days: Option<u64>,
@@ -2199,6 +2245,7 @@ impl ResolvedConfig {
                 .or(file_display.render_mode)
                 .unwrap_or_default(),
             tool_params: file_display.tool_params.unwrap_or_default(),
+            max_width: file_display.max_width.map(clamp_max_width),
             context_messages: file_session
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
@@ -2618,6 +2665,48 @@ mod tests {
     /// Deserializing `DisplayConfig` is not the same as the setting working: a key that parses but
     /// never reaches `ResolvedConfig` is a dead feature that every test on either side still
     /// passes. This is the one that fails if the resolution line is dropped.
+    ///
+    /// Unset means "follow the terminal", so the resolved value stays `None` rather than becoming a
+    /// number that would then be honoured exactly and pin output to a guess.
+    #[test]
+    fn test_display_max_width_reaches_the_resolved_config() {
+        assert_eq!(
+            resolve_with_config("[display]\nmax_width = 120\n").max_width,
+            Some(120)
+        );
+        assert_eq!(resolve_with_config("[display]\n").max_width, None);
+    }
+
+    /// Every budget subtracts fixed chrome first, so below the floor the subtraction leaves nothing
+    /// and output degrades to punctuation. Above the ceiling the cost of composing a line grows
+    /// quadratically and the renderer stalls. Clamped rather than rejected at both ends: a width
+    /// stated badly is a preference, not a broken config.
+    #[test]
+    fn test_display_max_width_is_clamped_to_what_can_be_rendered() {
+        assert_eq!(
+            resolve_with_config("[display]\nmax_width = 5\n").max_width,
+            Some(MIN_CONFIGURED_WIDTH)
+        );
+        assert_eq!(
+            resolve_with_config(&format!(
+                "[display]\nmax_width = {}\n",
+                MIN_CONFIGURED_WIDTH
+            ))
+            .max_width,
+            Some(MIN_CONFIGURED_WIDTH)
+        );
+        assert_eq!(
+            resolve_with_config("[display]\nmax_width = 100000\n").max_width,
+            Some(MAX_CONFIGURED_WIDTH)
+        );
+        assert_eq!(
+            resolve_with_config("[display]\nmax_width = 120\n").max_width,
+            Some(120)
+        );
+    }
+
+    /// The same resolution check for `tool_params`, whose default is a value rather than an
+    /// absence: unset must land on `summary`, not on whatever `ToolParams` derives.
     #[test]
     fn test_display_tool_params_reaches_the_resolved_config() {
         assert_eq!(

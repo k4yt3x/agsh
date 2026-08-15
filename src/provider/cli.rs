@@ -456,7 +456,15 @@ fn prompt_line(prompt: &str) -> io::Result<String> {
     eprint!("{}", prompt);
     io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    // `read_line` reports end of input as `Ok(0)` with an empty buffer, which is indistinguishable
+    // from a bare Enter unless the count is checked. A caller that re-prompts on a bad answer would
+    // otherwise spin forever against a closed stdin, which `prompt_backend` did.
+    if io::stdin().read_line(&mut input)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "no more input to read",
+        ));
+    }
     Ok(input.trim().to_string())
 }
 

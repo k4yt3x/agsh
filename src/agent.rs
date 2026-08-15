@@ -2124,7 +2124,7 @@ impl Agent {
         // round trip it would save.
         if permission == crate::permission::Permission::Ask
             && let Some(denial) = self
-                .request_approval(name, input, &schema, &cancellation)
+                .request_approval(name, input, detach, &schema, &cancellation)
                 .await
         {
             return denial;
@@ -2197,6 +2197,7 @@ impl Agent {
         &self,
         name: &str,
         input: &serde_json::Value,
+        detach: bool,
         schema: &serde_json::Value,
         cancellation: &CancellationToken,
     ) -> Option<crate::tools::ToolOutput> {
@@ -2206,6 +2207,7 @@ impl Agent {
             .request_permission(PermissionRequest {
                 tool_name: name.to_string(),
                 primary_param,
+                input: approval_input(input, detach),
                 cancellation: cancellation.clone(),
             })
             .await;
@@ -2831,6 +2833,8 @@ impl Agent {
                                 .request_approval(
                                     &name,
                                     &input,
+                                    // A checkpoint tool runs inline; nothing here detaches.
+                                    false,
                                     &tool.definition().parameters,
                                     &cancellation,
                                 )
@@ -6499,5 +6503,44 @@ mod tests {
                 2
             );
         }
+    }
+}
+
+/// The arguments an approval prompt is shown, which is not quite the arguments the tool receives.
+///
+/// `background` is meka's own parameter, spliced into every schema by the registry and taken out
+/// again before dispatch so no tool sees a key it never advertised. It is also the argument that
+/// decides whether the call detaches and outlives the turn, so a prompt that showed everything
+/// except that would be asking about a different call than the one about to run.
+fn approval_input(input: &serde_json::Value, detach: bool) -> serde_json::Value {
+    let mut shown = input.clone();
+    if detach && let Some(fields) = shown.as_object_mut() {
+        fields.insert("background".to_string(), serde_json::Value::Bool(true));
+    }
+    shown
+}
+
+#[cfg(test)]
+mod approval_input_tests {
+    /// The prompt claims to show every argument the call was made with. `background` is taken out
+    /// of the arguments before dispatch, so without this it was the one argument a user could
+    /// not see -- and it is the one that decides whether the call keeps running after the turn
+    /// ends.
+    #[test]
+    fn test_a_detaching_call_says_so_at_the_prompt() {
+        let input = serde_json::json!({"command": "sleep 600"});
+        assert_eq!(
+            super::approval_input(&input, true),
+            serde_json::json!({"command": "sleep 600", "background": true})
+        );
+        assert_eq!(super::approval_input(&input, false), input);
+    }
+
+    /// A non-object input has nowhere to put the flag, and inventing a shape for it would be worse
+    /// than leaving it alone.
+    #[test]
+    fn test_a_non_object_input_is_left_alone() {
+        let input = serde_json::json!("bare");
+        assert_eq!(super::approval_input(&input, true), input);
     }
 }

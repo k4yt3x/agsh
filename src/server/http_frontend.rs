@@ -713,6 +713,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "execute_command".into(),
                 primary_param: Some("rm /tmp/x".into()),
+                input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;
@@ -753,6 +754,7 @@ mod tests {
             frontend.request_permission(PermissionRequest {
                 tool_name: "execute_command".into(),
                 primary_param: Some("rm /tmp/x".into()),
+                input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
             }),
         )
@@ -797,6 +799,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "read_file".into(),
                 primary_param: None,
+                input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;
@@ -824,6 +827,7 @@ mod tests {
             .request_permission(PermissionRequest {
                 tool_name: "execute_command".into(),
                 primary_param: None,
+                input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
             })
             .await;
@@ -843,6 +847,7 @@ mod tests {
             let request = PermissionRequest {
                 tool_name: "write_file".into(),
                 primary_param: Some("/tmp/x".into()),
+                input: serde_json::Value::Null,
                 cancellation: tokio_util::sync::CancellationToken::new(),
             };
             let join =
@@ -949,6 +954,7 @@ mod tests {
                 .request_permission(PermissionRequest {
                     tool_name: "execute_command".into(),
                     primary_param: Some("echo hi".into()),
+                    input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
                 })
                 .await
@@ -1131,6 +1137,7 @@ mod tests {
                 .request_permission(PermissionRequest {
                     tool_name: "execute_command".into(),
                     primary_param: Some("echo hi".into()),
+                    input: serde_json::Value::Null,
                     cancellation: tokio_util::sync::CancellationToken::new(),
                 })
                 .await
