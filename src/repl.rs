@@ -1384,19 +1384,38 @@ fn handle_elicitation_prompt(
     let _ = responder.send(response);
 }
 
+/// Columns of the approval prompt given over to the tool name and its argument.
+///
+/// Chosen to fit `[ask] <name> <argument> (Y/n)` inside two rows of an 80-column terminal. It does
+/// not guarantee the `(Y/n)` stays on the same row as the command: a terminal narrower than this
+/// still wraps, and a long argument then separates the question from what it is asking about.
+/// Bounding it keeps that to a row or two rather than a screenful.
+const APPROVAL_SUMMARY_WIDTH: usize = 120;
+
+/// Compose the `[ask] <tool> <argument>` line.
+///
+/// Both halves are model-supplied, and this is the one line in meka where the user is being asked
+/// to authorise something, which makes it the highest-value line in the product to forge: an escape
+/// or a `\r` here repaints the command being approved after the user has read it. Sanitised with
+/// the same helper the tool indicator uses, and separated from the printing so that is testable.
+fn approval_prompt_line(tool_name: &str, primary_param: Option<&str>) -> String {
+    let display_name = crate::render::sanitize_to_line(
+        crate::render::tool_display_name_for_approval(tool_name),
+        APPROVAL_SUMMARY_WIDTH,
+    );
+    let summary = primary_param
+        .map(|param| crate::render::sanitize_to_line(param, APPROVAL_SUMMARY_WIDTH))
+        .unwrap_or_default();
+    format!("[ask] {} {}", display_name, summary)
+}
+
 fn handle_approval_request(request: ToolApprovalRequest) {
     use crossterm::style::Stylize;
 
-    let display_name = crate::render::tool_display_name_for_approval(&request.tool_name);
-    let summary = request
-        .primary_param
-        .as_deref()
-        .map(|s| s.replace('\n', " "))
-        .unwrap_or_default();
-
     eprint!(
         "{} ",
-        format!("[ask] {} {}", display_name, summary).with(crossterm::style::Color::Magenta)
+        approval_prompt_line(&request.tool_name, request.primary_param.as_deref())
+            .with(crossterm::style::Color::Magenta)
     );
     eprint!("{}", "(Y/n) ".with(crossterm::style::Color::DarkGrey));
 
@@ -1483,6 +1502,7 @@ pub struct ReplFrontendConfig {
     pub show_session_id_on_create: bool,
     pub show_token_usage: bool,
     pub thinking_show_content: bool,
+    pub tool_params: render::ToolParams,
     /// Sender for the REPL's `AgentToReplEvent` channel, used to forward approval requests to the
     /// blocking REPL thread.
     pub agent_event_sender: std::sync::mpsc::Sender<AgentToReplEvent>,
@@ -1729,10 +1749,15 @@ impl Frontend for ReplFrontend {
                 display_summary,
             } => {
                 Self::close_text_run(&mut state);
-                if state.spacing.before_tool_indicator() {
+                if state.spacing.before_tool_indicator(self.config.tool_params) {
                     eprintln!();
                 }
-                render::render_tool_indicator(&name, &input, display_summary.as_deref());
+                render::render_tool_indicator(
+                    &name,
+                    &input,
+                    display_summary.as_deref(),
+                    self.config.tool_params,
+                );
             }
             // The REPL renders tool results inline through the agent's own message-history path
             // (the next assistant turn). No additional UI is needed at completion time; the
@@ -1845,6 +1870,40 @@ impl Frontend for ReplFrontend {
 }
 
 #[cfg(test)]
+mod approval_prompt_tests {
+    /// The line the user reads before authorising a command, built from two model-supplied strings.
+    /// An escape or a `\r` here repaints it after they have read it, so this is the highest-value
+    /// line in meka to forge: the demonstrated attack showed a shell command being approved that
+    /// was never on screen.
+    #[test]
+    fn test_the_approval_prompt_cannot_be_repainted_by_its_own_argument() {
+        let forged = "safe.txt\u{1b}[2K\u{1b}[1G[ask] Shell rm -rf / (Y/n) y";
+        let line = super::approval_prompt_line("execute_command", Some(forged));
+        assert!(!line.contains('\u{1b}'), "{:?}", line);
+        assert!(!line.contains('\r'), "{:?}", line);
+        assert_eq!(line.lines().count(), 1, "{:?}", line);
+        assert!(line.starts_with("[ask] "), "{:?}", line);
+    }
+
+    /// The tool name is model-supplied too, and is not checked against the registry before it is
+    /// shown.
+    #[test]
+    fn test_the_approval_prompt_sanitizes_the_tool_name() {
+        let line = super::approval_prompt_line("shell\u{1b}[2J\rgit", Some("status"));
+        assert!(!line.contains('\u{1b}'), "{:?}", line);
+        assert!(!line.contains('\r'), "{:?}", line);
+    }
+
+    #[test]
+    fn test_the_approval_prompt_survives_a_tool_with_no_argument() {
+        assert_eq!(
+            super::approval_prompt_line("context_check", None),
+            "[ask] ContextCheck "
+        );
+    }
+}
+
+#[cfg(test)]
 mod frontend_tests {
     use super::*;
     use crate::frontend::{Frontend, FrontendEvent};
@@ -1858,6 +1917,7 @@ mod frontend_tests {
             show_session_id_on_create: false,
             show_token_usage: false,
             thinking_show_content: false,
+            tool_params: render::ToolParams::Summary,
             agent_event_sender: sender,
         })
     }

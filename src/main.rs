@@ -1068,6 +1068,7 @@ async fn run_oneshot(
             show_session_id_on_create: config.show_session_id_on_create,
             show_token_usage: config.show_token_usage,
             thinking_show_content: config.thinking_show_content,
+            tool_params: config.tool_params,
             agent_event_sender: noninteractive_sender,
         }));
     let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
@@ -1223,6 +1224,7 @@ async fn run_interactive(
             show_session_id_on_create: config.show_session_id_on_create,
             show_token_usage: config.show_token_usage,
             thinking_show_content: config.thinking_show_content,
+            tool_params: config.tool_params,
             agent_event_sender: agent_event_sender.clone(),
         }));
 
@@ -3367,6 +3369,7 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
     render::HistoryRenderOptions {
         render_mode: config.render_mode,
         show_thinking: config.thinking_show_content,
+        tool_params: config.tool_params,
         input_style: config.input_style,
         newline_before_prompt: config.newline_before_prompt,
         newline_after_prompt: config.newline_after_prompt,

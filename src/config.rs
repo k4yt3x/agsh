@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::Cli,
     permission::{EnabledPermissions, Permission},
-    render::RenderMode,
+    render::{RenderMode, ToolParams},
 };
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
@@ -695,6 +695,9 @@ pub struct DisplayConfig {
     pub show_context_in_prompt: Option<bool>,
     pub show_token_usage: Option<bool>,
     pub render_mode: Option<RenderMode>,
+    /// How much of a tool call's input the `[tool X]` indicator shows: `off`, `summary` (default),
+    /// or `full`.
+    pub tool_params: Option<ToolParams>,
     /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
     /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a colour name (`cyan`,
     /// `yellow`, …).
@@ -1046,6 +1049,7 @@ pub struct ResolvedConfig {
     /// hard-error path in `src/tools/shell.rs` when read-mode `execute_command` is invoked.
     pub backend_probe: crate::sandbox::BackendProbe,
     pub render_mode: RenderMode,
+    pub tool_params: ToolParams,
     pub context_messages: Option<usize>,
     /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
     pub retention_days: Option<u64>,
@@ -2194,6 +2198,7 @@ impl ResolvedConfig {
                 })
                 .or(file_display.render_mode)
                 .unwrap_or_default(),
+            tool_params: file_display.tool_params.unwrap_or_default(),
             context_messages: file_session
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
@@ -2585,6 +2590,44 @@ mod tests {
         ];
         apply_cli_eager_load_overrides(&raw, &mut servers);
         assert!(servers[0].eager_load_tools.is_none());
+    }
+
+    /// `DisplayConfig` denies unknown fields, so a name or spelling that does not match is a
+    /// startup error rather than a silently ignored line. Worth pinning both the key and the three
+    /// values, since the config file is the only way to reach this setting.
+    #[test]
+    fn test_display_tool_params_parses_each_value() {
+        for (written, expected) in [
+            ("off", ToolParams::Off),
+            ("summary", ToolParams::Summary),
+            ("full", ToolParams::Full),
+        ] {
+            let toml_str = format!("[display]\ntool_params = \"{}\"\n", written);
+            let config: ConfigFile = toml::from_str(&toml_str).expect("parse toml");
+            let display = config.display.expect("display present");
+            assert_eq!(display.tool_params, Some(expected));
+        }
+    }
+
+    /// Omitting it leaves today's one-line indicator, so an existing config keeps its output.
+    #[test]
+    fn test_display_tool_params_defaults_to_summary() {
+        assert_eq!(ToolParams::default(), ToolParams::Summary);
+    }
+
+    /// Deserializing `DisplayConfig` is not the same as the setting working: a key that parses but
+    /// never reaches `ResolvedConfig` is a dead feature that every test on either side still
+    /// passes. This is the one that fails if the resolution line is dropped.
+    #[test]
+    fn test_display_tool_params_reaches_the_resolved_config() {
+        assert_eq!(
+            resolve_with_config("[display]\ntool_params = \"full\"\n").tool_params,
+            ToolParams::Full
+        );
+        assert_eq!(
+            resolve_with_config("[display]\n").tool_params,
+            ToolParams::Summary
+        );
     }
 
     #[test]

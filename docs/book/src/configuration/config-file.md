@@ -300,6 +300,91 @@ width.
 render_mode = "raw"
 ```
 
+### `display.tool_params`
+
+How much of a tool call's input the `[tool ...]` indicator shows.
+
+| Value | Description |
+|-------|-------------|
+| `off` | Name only: `[tool Shell]`. No argument reaches your terminal |
+| `summary` | Name plus the one argument that identifies the call: ``[tool Shell(`cargo test`)]`` (default) |
+| `full` | Every argument, as an indented block under the name |
+
+Default: `summary`
+
+`full` writes each parameter on its own line. A value that fits on a line follows its key; one that
+does not gets an indented block under a bare `key:`, so a multi-line `edit_file` argument stays
+readable instead of collapsing into escaped newlines. Nesting is carried by indentation, with `-`
+for array elements:
+
+```
+[tool EditFile]
+  path: src/render.rs
+  old_string:
+    let first_line = thinking.lines().next().unwrap_or("");
+    let truncated = truncate_display(first_line, 80);
+
+[tool AgentSpawn]
+  prompt: Audit the scheduler for missed-occurrence bugs
+  tools:
+    - read_file
+    - search_contents
+```
+
+Consecutive calls are separated by a blank line under `full`, since each one is a block and running
+them together reads as a single call with too many parameters. Under `summary` they stay flush, which
+is what makes a run of them read as a list of steps.
+
+This is a reading format, not a data format: quotes are dropped, so `timeout: 300` doesn't say
+whether the model sent `300` or `"300"`. Three caps keep one call from filling the screen, and each
+says what it hid:
+
+| Cap | Limit | Marker |
+|-----|-------|--------|
+| One argument's value | 30 lines | `... N more lines`, indented under that argument |
+| The block | 60 lines, checked at an argument boundary | `... N more arguments: name, name` |
+| One line | 200 terminal columns of value | `...` at the cut |
+
+The last two are approximate by design. The block is measured before an argument is added rather
+than after, so a call whose last argument is a long one can reach about 90 lines; the line budget
+covers the value, so the key and the indent sit on top of it.
+
+The block cap drops whole arguments and names them rather than cutting wherever line 60 lands.
+Knowing that `path` was passed but not shown beats seeing 60 lines of `content` and never learning
+which file it was written to.
+
+When you need the exact JSON a tool was called with, `meka session export` has it, untruncated and
+unflattened.
+
+**`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
+that identifies a call (`write_file`'s path, `fetch_url`'s URL), so a request header carrying a token
+or a file body carrying a key stayed off screen. `full` shows all of them, and replayed history
+reprints them on every `/history` and every resume. meka never puts its own credentials into tool
+arguments, so what appears is what the model itself passed, but that is worth knowing before turning
+this on where somebody can read over your shoulder or your scrollback.
+
+Values are escape-stripped, their newlines and carriage returns flattened, and Unicode format
+characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
+your cursor, reorder what you read, or place text at column zero where meka's own output lives.
+
+Two residual caveats, both about what the block cannot control. A line long enough to wrap continues
+at column zero on the next row, so on a narrow terminal a very long argument can still produce a row
+that starts flush left. And the `... N more lines` and `... N more arguments` markers are ordinary
+text, so an argument whose content mimics one is indistinguishable from a real elision. Neither lets
+an argument run anything; both let it mislead a reader who is not expecting it.
+
+Applies to the REPL, to one-shot runs (`meka -p`), and to replayed history (`/history`,
+`resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
+events already carry the raw input, so neither is affected.
+
+`off` suppresses arguments in the indicator only. In `ask` permission mode the approval prompt still
+names the argument you are being asked to approve, which is the whole point of that prompt.
+
+```toml
+[display]
+tool_params = "full"
+```
+
 ### `display.show_session_id_on_create`
 
 Whether to display the session ID when a new session is created.
@@ -597,7 +682,7 @@ Default: `16000`
 
 ### `thinking.show_content`
 
-Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
+Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut at 80 characters, and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
 
 Default: `false`
 

@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: compaction is visible through a `revision` counter, a summary marker, and an SSE event.
 - HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
+- `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 
 ### Changed
 
@@ -30,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - An unknown or stale tool name now suggests the built-in it probably meant.
 - `schedule_create` explains what makes a gate's output usable and names the `isolated` trade.
+- Tool indicators are cyan rather than dark cyan, and their arguments blue under `tool_params`.
 - A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
 - `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.
@@ -37,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The elided thinking preview fills its line instead of stopping at the reasoning's first newline.
+- Replayed history shows a built-in tool call's argument, which only the live indicator carried.
 - `/status` counts compaction tokens, which were spent but never reported against the session.
 - Ctrl+C interrupts a compaction; it previously ran to completion with no way to stop it.
 - A turn that rewrote the conversation could panic on a later malformed-request repair.
@@ -55,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The `ask` approval prompt strips escapes from the tool name and argument it asks you to approve.
+- Thinking blocks, todo lists and tool arguments are stripped of escapes, cursor moves and bidi.
 - `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
 
 ## [0.41.0] - 2026-08-13

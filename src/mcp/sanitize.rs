@@ -56,7 +56,7 @@ fn is_safe_char(ch: char) -> bool {
 ///
 /// Enumerated from Unicode 15.1: only the ranges that exist; the bulk of the BMP has no Cf
 /// characters so this stays a short list.
-fn is_format_char(code: u32) -> bool {
+pub(crate) fn is_format_char(code: u32) -> bool {
     matches!(
         code,
         0x00AD                   // SOFT HYPHEN
