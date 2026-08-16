@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 - `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
+- `[schedule].max_consecutive_fires` splits one session's due backlog into groups, interleaving others.
 
 ### Changed
 
@@ -62,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DELETE` and `PATCH` are refused during a scheduled turn, which they could previously interrupt.
 - A scheduled job that fires during shutdown runs next time instead of being silently skipped.
 - One session's long turn no longer delays the scheduled jobs of every other session.
+- A recurring fire the provider never received withdraws its prompt instead of leaving it unanswered.
+- A job due while `meka serve` shuts down no longer leaves a prompt behind and then repeats it.
+- A gated job is no longer re-evaluated every tick while another process holds its session.
 - A restart mid-sweep no longer loses background outcomes the agent was never told about.
 - A recurring `isolated` scheduled job no longer leaks its tool registry on every fire.
 - Deleting or evicting a session no longer stalls other requests or locks out unrelated ones.

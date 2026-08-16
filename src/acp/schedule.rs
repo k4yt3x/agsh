@@ -32,13 +32,15 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
     // string form (every insertion site derives the key from `session_uuid.to_string()`), so this
     // needs no lock on any session's runtime.
     let sessions = Arc::clone(&state.sessions);
-    let scope = SchedulerScope::Sessions(Arc::new(move |session_uuid| {
+    // Every job, `isolated` included: ACP does not honour that flag (it warns and runs the job in
+    // the open conversation), so an isolated job still needs the editor to have that session open.
+    let scope = SchedulerScope::Jobs(Arc::new(move |job: &crate::schedule::ScheduledJob| {
         // `try_read` rather than `read`: the map is briefly write-locked on every `session/new` and
         // `session/close`, and blocking the sweep behind session setup would be worse than skipping
         // a tick. The job stays due either way.
         sessions
             .try_read()
-            .map(|open| open.contains_key(&session_uuid.to_string()))
+            .map(|open| open.contains_key(&job.session_id.to_string()))
             .unwrap_or(false)
     }));
 
@@ -188,12 +190,13 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
     let runtime_inner = &mut *runtime;
     let outcome = runtime_inner
         .agent
-        .run_turn(
+        .run_turn_retaining(
             &mut session_uuid,
             &mut runtime_inner.messages,
             wakeup.render_prompt(),
             Vec::new(),
             cancellation,
+            wakeup.job.prompt_retention(),
         )
         .await;
 

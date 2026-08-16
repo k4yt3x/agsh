@@ -995,6 +995,7 @@ async fn run_turn_interruptible(
     session_id: &mut Option<uuid::Uuid>,
     messages: &mut conversation::Conversation,
     input: String,
+    retention: agent::PromptRetention,
 ) -> error::Result<()> {
     let cancellation = CancellationToken::new();
     let signal_handle = {
@@ -1035,7 +1036,14 @@ async fn run_turn_interruptible(
         })
     };
     let result = agent
-        .run_turn(session_id, messages, input, Vec::new(), cancellation)
+        .run_turn_retaining(
+            session_id,
+            messages,
+            input,
+            Vec::new(),
+            cancellation,
+            retention,
+        )
         .await;
     signal_handle.abort();
     // REPL / `meka -p` callers don't surface a stop reason; they only care whether the turn
@@ -1101,7 +1109,15 @@ async fn run_oneshot(
     let (mut session_id, mut messages, _session_lock) =
         resolve_session_resume(&session_manager, &config).await?;
 
-    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt).await {
+    match run_turn_interruptible(
+        &agent,
+        &mut session_id,
+        &mut messages,
+        prompt,
+        agent::PromptRetention::Keep,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(error::MekaError::Interrupted) => {
             eprintln!("\nInterrupted.");
@@ -1482,8 +1498,14 @@ async fn run_interactive(
                 }
                 if !outcomes.is_empty() {
                     let prompt = crate::background::render_outcomes(&outcomes);
-                    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt)
-                        .await
+                    match run_turn_interruptible(
+                        &agent,
+                        &mut session_id,
+                        &mut messages,
+                        prompt,
+                        agent::PromptRetention::Keep,
+                    )
+                    .await
                     {
                         Ok(()) => {}
                         Err(error::MekaError::Interrupted) => {
@@ -1515,8 +1537,14 @@ async fn run_interactive(
                         );
                     }
                     let prompt = wakeup.render_prompt();
-                    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt)
-                        .await
+                    match run_turn_interruptible(
+                        &agent,
+                        &mut session_id,
+                        &mut messages,
+                        prompt,
+                        wakeup.job.prompt_retention(),
+                    )
+                    .await
                     {
                         Ok(()) => {}
                         Err(error::MekaError::Interrupted) => {
@@ -1542,7 +1570,15 @@ async fn run_interactive(
                 }
             }
             ReplEvent::UserInput(input) => {
-                match run_turn_interruptible(&agent, &mut session_id, &mut messages, input).await {
+                match run_turn_interruptible(
+                    &agent,
+                    &mut session_id,
+                    &mut messages,
+                    input,
+                    agent::PromptRetention::Keep,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(error::MekaError::Interrupted) => {
                         eprintln!("\nInterrupted.");
@@ -1822,6 +1858,7 @@ async fn run_interactive(
                                         &mut session_id,
                                         &mut messages,
                                         user_input,
+                                        agent::PromptRetention::Keep,
                                     )
                                     .await
                                     {
@@ -1957,8 +1994,14 @@ async fn run_interactive(
                         } else {
                             format!("{}\n\n{}", extra, body)
                         };
-                        match run_turn_interruptible(&agent, &mut session_id, &mut messages, body)
-                            .await
+                        match run_turn_interruptible(
+                            &agent,
+                            &mut session_id,
+                            &mut messages,
+                            body,
+                            agent::PromptRetention::Keep,
+                        )
+                        .await
                         {
                             Ok(()) => {}
                             Err(error::MekaError::Interrupted) => {

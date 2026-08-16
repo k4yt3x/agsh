@@ -84,7 +84,7 @@ rely on one:
 
 | Host | Fires | Notes |
 |------|-------|-------|
-| `meka serve` | Every job, always | Revives evicted sessions on demand. **The durable path.** |
+| `meka serve` | Every job, except on a session another process has locked | Revives evicted sessions on demand. **The durable path.** |
 | REPL | Only jobs for the session it has open | Best-effort; a job goes dormant if you next start a different session |
 | ACP | Only jobs for sessions the editor has open | The prompt appears in the transcript as the turn that triggered the reply |
 | `--oneshot` | Never | The process exits; jobs stay on disk for a later run |
@@ -95,9 +95,18 @@ picks up where you left off.
 
 Jobs all live in the same database, so a host that does not fire a job has not lost it. A job whose
 session nobody has open simply waits, and fires as soon as something that can run it picks it up:
-another host, or a `meka serve` daemon pointed at the same data directory. Two hosts sharing a
-session do not fight over its jobs either, because a host that cannot take one hands the occurrence
-back rather than spending it.
+another host, or a `meka serve` daemon pointed at the same data directory.
+
+Two hosts sharing a session do not fight over its jobs. A session is held by one process at a time,
+and `meka serve` leaves that session's jobs to whoever holds it rather than reaching for them and
+handing the occurrence back afterwards — which matters most for a gated job, since deciding late
+would mean running its shell command on every tick.
+
+The exception is an `isolated` job, which runs in a session of its own and so needs nothing from the
+one that created it. `meka serve` stays eligible for those whatever else holds the session, because
+it is the only host that honours the flag. If you have a REPL open on the same session at the same
+time, though, either host may take a given occurrence, and the REPL will run it in your conversation
+with a warning. Run isolated jobs under `meka serve` alone if you want the flag respected every time.
 
 Under ACP the editor is a live client, which changes one thing: `ask`-mode approvals genuinely
 round-trip, so a scheduled job can prompt you in the editor rather than being denied for want of
@@ -118,6 +127,30 @@ lose them. What happens to jobs whose time passed while meka was down depends on
 - **One-shot jobs fire if they are still relevant.** Past `[schedule] missed_grace` (24 hours by
   default) they are dropped instead. A reminder to join a standup, delivered five days late, is
   noise. One that does fire is told how late it is, so the agent can judge whether it still matters.
+
+That collapsing is per job. A session with several jobs all due at once still wakes to a turn each,
+and a sweep runs at most `[schedule] max_consecutive_fires` (5 by default) of any **one session's**
+jobs before moving on. The rest keep their occurrence and their gate baseline and are taken by the
+next sweep, most-overdue first, so nothing is lost and nothing starves. A job held over runs no gate,
+so holding one over is nearly free — the sweep still evaluates whether the job is one it can run.
+
+**What this does and does not do.** It bounds a *batch*, not a total: forty due jobs still produce
+forty turns, and they are not spaced out — a sweep that ran long leaves the next one already due.
+What changes is that they arrive in groups of five, so under `meka serve` another session's single
+due job is reached after five of the first session's rather than after all forty.
+
+If you want a large backlog not to land at all, that is not what this setting is for. Cancel the
+jobs (`meka schedule list`, then `meka schedule cancel <id>`) before starting a host that will fire
+them, or leave `[schedule] enabled = false` while you clear it.
+
+A **recurring** job that fires and then fails — most often because the provider is unreachable —
+leaves nothing behind in the conversation: its prompt is withdrawn, because the job produces it again
+on the next occurrence. Without that, an outage would deposit one unanswered message per fire for as
+long as it lasted. A **one-shot** keeps its prompt, because nothing will produce it again — its row
+is already gone by the time the turn runs, so that message is the last trace the reminder ever fired.
+A turn that got as far as running a tool keeps everything either way, since there is real work behind
+it. Failures are recorded regardless: `meka serve` logs them and sends a `schedule.fired` webhook
+with `status: "failed"`.
 
 ## Isolated jobs
 
@@ -172,7 +205,16 @@ poll_interval = "10s"   # how often due jobs are checked
 missed_grace = "24h"    # how late a one-shot may be and still fire
 gate_timeout = "30s"    # wall-clock budget for a gate command
 max_jobs = 50           # per-session ceiling, refused at schedule_create
+max_consecutive_fires = 5 # per-session ceiling on turns spent in one sweep
 ```
+
+`max_consecutive_fires` bounds a batch, not a total. A sweep contains its turns, so lowering it does
+not stop a backlog landing, nor slow it down — it splits it into smaller groups with other sessions
+interleaved between them. Raising it above the number of jobs one session can have due at once has
+no effect at all.
+
+With a long `poll_interval` and a small budget, a large backlog can take long enough to drain that a
+one-shot job ages past `missed_grace` and is dropped (with a warning) before its turn comes.
 
 `poll_interval` is the real resolution floor: a job with a shorter interval fires once per tick, not
 once per interval.

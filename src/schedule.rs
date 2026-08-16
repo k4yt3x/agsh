@@ -269,6 +269,23 @@ impl ScheduledJob {
     pub fn short_id(&self) -> &str {
         self.id.get(..8).unwrap_or(&self.id)
     }
+
+    /// What should become of this job's prompt if the turn it triggers fails before the model ever
+    /// sees it.
+    ///
+    /// Defined once here rather than at each host, because every host has to answer it and the rule
+    /// is not obvious enough to restate three times. A recurring job produces the prompt again on
+    /// its next occurrence, so a failure withdrawing it costs nothing and spares the conversation
+    /// one unanswered message per fire through an outage. A one-shot does not: [`prepare`] deletes
+    /// its row *before* the host runs the turn, so the unanswered message is the last trace that
+    /// the reminder ever fired, and withdrawing it would be the deletion the feature is
+    /// supposed to prevent.
+    pub fn prompt_retention(&self) -> crate::agent::PromptRetention {
+        match self.schedule.is_recurring() {
+            true => crate::agent::PromptRetention::WithdrawOnFailure,
+            false => crate::agent::PromptRetention::Keep,
+        }
+    }
 }
 
 /// Upper bound on the missed-occurrence count reported to the model. Counting is a courtesy ("you
@@ -491,40 +508,49 @@ pub enum FireOutcome {
 
 /// Which jobs a scheduler instance is responsible for.
 ///
-/// The distinction is what makes `meka serve` the durable host and the REPL a best-effort one: the
-/// server can revive any session on demand and so owns every job, while a REPL can only run turns
-/// against the conversation it has open.
+/// Every host answers a predicate rather than claiming a static set, because none of them can
+/// actually take every job: `meka serve` can revive any session but not one another process has
+/// locked, the REPL owns exactly the conversation it has open, and ACP owns whatever the editor
+/// currently has open.
+///
+/// Asked here rather than letting a host decline afterwards, and that placement is the whole point:
+/// `prepare` evaluates a job's *gate* before the host is offered the wakeup, so a scope that
+/// admitted everything would run every gated job's shell command on every tick for sessions it
+/// could never serve.
 #[derive(Clone)]
 pub enum SchedulerScope {
-    /// Every job in the database. `meka serve`, which can revive any session on demand.
-    AllSessions,
     /// Only jobs belonging to this session. The REPL, which has exactly one conversation open.
     OneSession(uuid::Uuid),
-    /// Jobs the predicate accepts, re-asked every sweep. ACP, whose set of open sessions changes
-    /// as the editor sends `session/new` and `session/close`.
+    /// Jobs the predicate accepts, re-asked every sweep, so a host whose set of runnable jobs moves
+    /// under it (ACP's open editors, serve's session locks) is never working from a snapshot.
     ///
-    /// Filtering here rather than letting the host decline afterwards is deliberate: `prepare`
-    /// evaluates a job's *gate* before the host sees it, so a scope that admitted everything would
-    /// run every gated job's shell command on every tick for sessions it could never serve.
-    Sessions(std::sync::Arc<dyn Fn(uuid::Uuid) -> bool + Send + Sync>),
+    /// Takes the whole job rather than its session id because "can this host run it" is not always
+    /// a question about the session: an `isolated` job runs in a fresh conversation and needs
+    /// nothing from the one that created it, including its lock.
+    Jobs(std::sync::Arc<dyn Fn(&ScheduledJob) -> bool + Send + Sync>),
 }
 
 impl std::fmt::Debug for SchedulerScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AllSessions => formatter.write_str("AllSessions"),
             Self::OneSession(id) => write!(formatter, "OneSession({})", id),
-            Self::Sessions(_) => formatter.write_str("Sessions(<predicate>)"),
+            Self::Jobs(_) => formatter.write_str("Jobs(<predicate>)"),
         }
     }
 }
 
 impl SchedulerScope {
+    /// Every job in the database, whoever it belongs to. Only the tests want this: a real host
+    /// always has some job it cannot take.
+    #[cfg(test)]
+    fn every_job() -> Self {
+        Self::Jobs(std::sync::Arc::new(|_| true))
+    }
+
     fn covers(&self, job: &ScheduledJob) -> bool {
         match self {
-            Self::AllSessions => true,
             Self::OneSession(id) => job.session_id == *id,
-            Self::Sessions(predicate) => predicate(job.session_id),
+            Self::Jobs(predicate) => predicate(job),
         }
     }
 }
@@ -548,6 +574,16 @@ where
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(config.poll_interval);
+        // A sweep contains its turns, so it routinely overruns `poll_interval` by minutes. Tokio's
+        // default `Burst` then resolves *every* tick missed during it, so a sweep that ran twelve
+        // periods long is followed by twelve immediate sweeps, eleven of which find nothing due.
+        // `Delay` collapses that to one.
+        //
+        // It does not create a gap, and nothing here does: `Delay` schedules the next tick a period
+        // after the miss is *recognised*, so the first `tick()` following a long sweep still
+        // returns at once. Batches are therefore adjacent, and `max_consecutive_fires`
+        // splits a backlog without spacing it out.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick resolves immediately; skip it so startup is not competing with provider
         // and MCP connection setup.
         ticker.tick().await;
@@ -562,11 +598,20 @@ where
     })
 }
 
-/// One sweep: evaluate every due job in scope and fire what survives.
+/// One sweep: evaluate every due job in scope and fire what survives, up to
+/// [`crate::config::ResolvedScheduleConfig::max_consecutive_fires`] turns per session.
 ///
 /// Public because the REPL drives it directly rather than from a timer. There, the agent loop owns
 /// the conversation and must be the one to run the turn, so a watcher only nudges reedline awake
 /// and this runs on the agent side. `meka serve` reaches it through [`spawn`] instead.
+///
+/// What the budget buys is a seam, not a ceiling. A sweep contains the turns it fires -- they are
+/// awaited here -- so forty due jobs still cost forty turns however small the budget is. What
+/// changes is that they arrive in groups, so another session's due job is reached after five of the
+/// first session's rather than after all forty. The groups are adjacent rather than spaced -- a
+/// sweep that overran `poll_interval` leaves its successor already due -- so this splits a backlog
+/// without slowing it. Bounding how much one conversation absorbs in total would mean holding jobs
+/// across sweeps, which this deliberately does not do.
 pub async fn run_due<Callback, Fired>(
     session_manager: &crate::session::SessionManager,
     config: &crate::config::ResolvedScheduleConfig,
@@ -579,20 +624,52 @@ where
 {
     let now = Utc::now();
     let due = session_manager.list_due_scheduled_jobs(now).await?;
+    let mut fired: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
+    let mut held_over = 0usize;
     for job in due {
         if !scope.covers(&job) {
+            continue;
+        }
+        // Checked *before* `prepare`, which is what makes holding a job over free: `prepare` is
+        // where a gate runs and where the schedule is advanced, so a job skipped here has done
+        // neither and is still due, unchanged, on the next sweep. Reaching `prepare` and then
+        // declining would pay a gate evaluation and a `restore_scheduled_job` round trip to arrive
+        // at the same place.
+        //
+        // `list_due_scheduled_jobs` orders by `next_fire_at`, so a held-over job is still the most
+        // overdue one next time and goes first. Nothing starves.
+        if fired.get(&job.session_id).copied().unwrap_or(0) >= config.max_consecutive_fires {
+            held_over += 1;
             continue;
         }
         // Cloned whole, before `prepare` claims it. Claiming a job rewrites its schedule, advances
         // its gate baseline, and for a one-shot deletes the row outright, so nothing short of the
         // original can put it back.
         let original = job.clone();
-        if let Some(wakeup) = prepare(session_manager, config, job, now).await?
-            && fire(wakeup).await == FireOutcome::Deferred
-        {
-            tracing::debug!("job {} deferred; restoring it", original.short_id());
-            session_manager.restore_scheduled_job(&original).await?;
+        if let Some(wakeup) = prepare(session_manager, config, job, now).await? {
+            if fire(wakeup).await == FireOutcome::Deferred {
+                tracing::debug!("job {} deferred; restoring it", original.short_id());
+                session_manager.restore_scheduled_job(&original).await?;
+            } else {
+                // Counted only once a turn has actually been spent. A job `prepare` retired (a
+                // declining gate, a one-shot past its grace period) and a job the host handed back
+                // both cost the conversation nothing, so neither may consume a session's budget --
+                // otherwise five quiet watchers would starve the sixth job that had something to
+                // say.
+                *fired.entry(original.session_id).or_default() += 1;
+            }
         }
+    }
+    // Said out loud: a cap that bounds coverage silently reads as "everything ran". `info!` rather
+    // than `warn!` because holding a job over is the budget working, not a fallback -- the jobs are
+    // intact and the next sweep takes them.
+    if held_over > 0 {
+        tracing::info!(
+            "held {} due job(s) over past the per-session budget of {}; they keep their occurrence \
+             and run on the next sweep",
+            held_over,
+            config.max_consecutive_fires
+        );
     }
     Ok(())
 }
@@ -970,6 +1047,14 @@ mod tests {
             }
         }
 
+        /// A second session in the same database, for the per-session budget tests.
+        async fn another_session(&self) -> uuid::Uuid {
+            self.manager
+                .create_session(None)
+                .await
+                .expect("create session")
+        }
+
         /// Insert a job already overdue by `overdue`.
         async fn overdue_job(
             &self,
@@ -977,10 +1062,22 @@ mod tests {
             gate: Option<Gate>,
             overdue: chrono::Duration,
         ) -> ScheduledJob {
+            self.overdue_job_in(self.session_id, schedule, gate, overdue)
+                .await
+        }
+
+        /// Same, against an explicit session.
+        async fn overdue_job_in(
+            &self,
+            session_id: uuid::Uuid,
+            schedule: Schedule,
+            gate: Option<Gate>,
+            overdue: chrono::Duration,
+        ) -> ScheduledJob {
             let now = Utc::now();
             let job = ScheduledJob {
                 id: uuid::Uuid::new_v4().to_string(),
-                session_id: self.session_id,
+                session_id,
                 schedule,
                 prompt: "do the thing".to_string(),
                 gate,
@@ -1001,7 +1098,7 @@ mod tests {
             run_due(
                 &self.manager,
                 &self.config,
-                &SchedulerScope::AllSessions,
+                &SchedulerScope::every_job(),
                 &move |wakeup: Wakeup| {
                     let fired = fired.clone();
                     async move {
@@ -1058,6 +1155,256 @@ mod tests {
         assert_eq!(
             fired[0].coalesced, 720,
             "the skipped occurrences are reported, not replayed"
+        );
+    }
+
+    /// Coalescing bounds one job's backlog; this bounds the whole sweep's. A session that
+    /// accumulated more watchers than the budget must not wake to a turn per job, and must not lose
+    /// any of them either.
+    #[tokio::test]
+    async fn test_the_fire_budget_holds_jobs_over_without_losing_them() {
+        let mut harness = SchedulerHarness::new().await;
+        harness.config.max_consecutive_fires = 5;
+        for _ in 0..8 {
+            harness
+                .overdue_job(
+                    Schedule::parse_every("1h").expect("parses"),
+                    None,
+                    chrono::Duration::hours(6),
+                )
+                .await;
+        }
+
+        harness.tick().await;
+        assert_eq!(harness.fired().len(), 5, "the budget bounds the burst");
+
+        harness.tick().await;
+        let fired = harness.fired();
+        assert_eq!(fired.len(), 8, "and the next sweep takes the rest");
+        let distinct: std::collections::HashSet<&str> =
+            fired.iter().map(|record| record.job_id.as_str()).collect();
+        assert_eq!(distinct.len(), 8, "every job fired exactly once");
+    }
+
+    /// Per session, not per sweep. A budget shared across sessions would let one conversation's
+    /// backlog delay another's due job, which under `meka serve` is somebody else's job entirely.
+    #[tokio::test]
+    async fn test_the_fire_budget_is_per_session_rather_than_global() {
+        let mut harness = SchedulerHarness::new().await;
+        harness.config.max_consecutive_fires = 5;
+        let other = harness.another_session().await;
+        // The backlog is older, so it sorts first and would exhaust a global budget before the
+        // quiet session's single job was ever reached.
+        for _ in 0..6 {
+            harness
+                .overdue_job(
+                    Schedule::parse_every("1h").expect("parses"),
+                    None,
+                    chrono::Duration::hours(6),
+                )
+                .await;
+        }
+        let lonely = harness
+            .overdue_job_in(
+                other,
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        let fired = harness.fired();
+        assert_eq!(
+            fired.len(),
+            6,
+            "five from the busy session, one from the other"
+        );
+        assert!(
+            fired.iter().any(|record| record.job_id == lonely.id),
+            "the quiet session's job was not held behind the busy one's backlog"
+        );
+    }
+
+    /// A job the gate retires spends no turn, so it must not spend budget either. Otherwise a
+    /// handful of quiet watchers would starve the one job that had something to report.
+    #[tokio::test]
+    async fn test_a_declining_gate_does_not_consume_the_fire_budget() {
+        let mut harness = SchedulerHarness::new().await;
+        harness.config.max_consecutive_fires = 2;
+        // More overdue, so both are evaluated before the ungated job below.
+        for _ in 0..2 {
+            harness
+                .overdue_job(
+                    Schedule::parse_every("1h").expect("parses"),
+                    Some(gate("exit 1", GateFire::OnSuccess, None)),
+                    chrono::Duration::hours(6),
+                )
+                .await;
+        }
+        let speaks = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        let fired = harness.fired();
+        assert_eq!(fired.len(), 1, "the two silent gates cost nothing");
+        assert_eq!(fired[0].job_id, speaks.id);
+    }
+
+    /// A host handing an occurrence back has not spent a turn on it, so the deferral must not spend
+    /// budget either. Otherwise a `meka serve` whose session is held by a REPL would burn its whole
+    /// per-sweep budget on jobs it never ran.
+    #[tokio::test]
+    async fn test_a_deferral_does_not_consume_the_fire_budget() {
+        let mut harness = SchedulerHarness::new().await;
+        harness.config.max_consecutive_fires = 1;
+        for _ in 0..2 {
+            harness
+                .overdue_job(
+                    Schedule::parse_every("1h").expect("parses"),
+                    None,
+                    chrono::Duration::hours(6),
+                )
+                .await;
+        }
+
+        let offered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_due(
+            &harness.manager,
+            &harness.config,
+            &SchedulerScope::every_job(),
+            &move |_wakeup: Wakeup| {
+                let offered = offered.clone();
+                async move {
+                    // The first is handed back; only the second spends a turn.
+                    match offered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                        0 => FireOutcome::Deferred,
+                        _ => FireOutcome::Ran,
+                    }
+                }
+            },
+        )
+        .await
+        .expect("sweep runs");
+
+        // Both jobs reached the host despite a budget of one, because the deferred one cost
+        // nothing. The second is the only one whose schedule advanced.
+        let still_due: Vec<_> = harness
+            .jobs()
+            .await
+            .into_iter()
+            .filter(|job| job.next_fire_at <= Utc::now())
+            .collect();
+        assert_eq!(
+            still_due.len(),
+            1,
+            "the deferred job kept its occurrence; the other one spent its turn"
+        );
+    }
+
+    /// The budget is checked before `prepare`, which is where a gate runs, so holding a job over
+    /// must cost nothing -- not even the shell command whose expense is half the reason gates
+    /// exist.
+    ///
+    /// Observed through a side effect on the filesystem rather than through the job's stored gate
+    /// baseline. Enforcing the budget *after* `prepare` and then restoring the job would run the
+    /// command and put the baseline back, leaving every column identical to a job that was never
+    /// touched. Only the command's own footprint tells the two apart.
+    #[tokio::test]
+    async fn test_a_held_over_job_does_not_run_its_gate() {
+        let mut harness = SchedulerHarness::new().await;
+        harness.config.max_consecutive_fires = 1;
+        // Removed on drop rather than at the end of the test, so a failing assertion does not leak
+        // it into the temp directory of whoever ran the suite.
+        struct Probe(std::path::PathBuf);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
+        let guard =
+            Probe(std::env::temp_dir().join(format!("meka-gate-probe-{}", uuid::Uuid::new_v4())));
+        let probe = guard.0.clone();
+        harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::hours(6),
+            )
+            .await;
+        let watcher = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate(
+                    &format!("touch '{}'", probe.display()),
+                    GateFire::OnChange,
+                    None,
+                )),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(
+            !probe.exists(),
+            "the held-over job's gate command never ran"
+        );
+        let held = harness
+            .jobs()
+            .await
+            .into_iter()
+            .find(|job| job.id == watcher.id)
+            .expect("the held-over job is still there");
+        assert_eq!(
+            held.next_fire_at, watcher.next_fire_at,
+            "and its schedule was not advanced, so it is still due"
+        );
+
+        // The probe is only evidence if it can fire at all: the next sweep has budget for it.
+        harness.tick().await;
+        assert!(probe.exists(), "and it runs once the budget has room");
+        std::fs::remove_file(&probe).expect("clean up the probe");
+    }
+
+    /// The rule every host defers to. Withdrawing a failed fire's prompt is only safe when the job
+    /// will produce it again; `prepare` deletes a one-shot's row *before* the turn runs, so for
+    /// those the unanswered message is the last trace the reminder ever fired.
+    #[test]
+    fn test_only_a_recurring_job_lets_a_failed_fire_withdraw_its_prompt() {
+        let recurring = |schedule: Schedule| ScheduledJob {
+            id: "7f3a1b2c".to_string(),
+            session_id: uuid::Uuid::nil(),
+            schedule,
+            prompt: "check the news".to_string(),
+            gate: None,
+            isolated: false,
+            created_at: at("2026-08-11T12:00:00Z"),
+            last_fired_at: None,
+            next_fire_at: at("2026-08-11T12:00:00Z"),
+        };
+
+        for schedule in [
+            Schedule::parse_every("1h").expect("parses"),
+            Schedule::parse_cron("0 9 * * 1-5").expect("parses"),
+        ] {
+            assert_eq!(
+                recurring(schedule).prompt_retention(),
+                crate::agent::PromptRetention::WithdrawOnFailure,
+                "a recurring job regenerates its prompt"
+            );
+        }
+        assert_eq!(
+            recurring(Schedule::At(at("2026-08-11T12:00:00Z"))).prompt_retention(),
+            crate::agent::PromptRetention::Keep,
+            "a one-shot's row is already gone; its prompt is all that is left"
         );
     }
 
@@ -1307,7 +1654,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            &SchedulerScope::AllSessions,
+            &SchedulerScope::every_job(),
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await
@@ -1351,7 +1698,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            &SchedulerScope::AllSessions,
+            &SchedulerScope::every_job(),
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await
@@ -1386,7 +1733,7 @@ mod tests {
         run_due(
             &harness.manager,
             &harness.config,
-            &SchedulerScope::AllSessions,
+            &SchedulerScope::every_job(),
             &|_wakeup: Wakeup| std::future::ready(FireOutcome::Deferred),
         )
         .await

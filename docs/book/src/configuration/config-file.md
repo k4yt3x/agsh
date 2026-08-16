@@ -1270,6 +1270,7 @@ Controls the wakeups the agent schedules for itself. See the [Scheduling](../usa
 | `missed_grace` | duration | `"24h"` | How late a one-shot job may be and still fire after downtime |
 | `gate_timeout` | duration | `"30s"` | Wall-clock budget for a gate command |
 | `max_jobs` | int | `50` | Per-session ceiling, refused at `schedule_create` |
+| `max_consecutive_fires` | int | `5` | Per-session ceiling on turns spent in one sweep |
 
 ```toml
 [schedule]
@@ -1278,11 +1279,14 @@ poll_interval = "10s"
 missed_grace = "24h"
 gate_timeout = "30s"
 max_jobs = 50
+max_consecutive_fires = 5
 ```
 
 `poll_interval` is the real resolution floor: a job whose interval is shorter than the tick fires once per tick, not once per interval.
 
 `missed_grace` applies only to one-shot jobs. Recurring jobs need no equivalent, because their occurrences are one period apart, so the most recent missed one is always less than a period old; the scheduler coalesces the rest into a single catch-up fire.
+
+`max_consecutive_fires` interleaves sessions: without it, one session's whole backlog runs to completion before another session's single due job is reached. Jobs past the budget keep their occurrence, run no gate, and are taken by the next sweep most-overdue first. It bounds a batch rather than a rate — sweeps do not overlap and the next starts as soon as the last ends, so a backlog still produces one turn per job, just in interleaved groups. `0` is rejected, since it would hold every job over forever; use `enabled = false` to turn scheduling off.
 
 Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing jobs on disk without firing.
 

@@ -19,6 +19,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{ContentBlock, Message, Role};
 
+/// Whether `message` is the one a turn opens with, rather than something appended inside one.
+///
+/// A tool round trip persists its results as a `User` message too, so role alone does not separate
+/// "somebody asked for something" from "the loop is still running". Shared by
+/// [`Conversation::rewind`], which counts turns backwards, and
+/// [`Conversation::ends_on_a_turn_opening`], which asks whether a turn produced anything at all --
+/// two callers that must agree on where a turn begins.
+fn opens_turn(message: &Message) -> bool {
+    message.role == Role::User
+        && !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
 /// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
 /// `messages` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +165,36 @@ impl Conversation {
 
     pub fn last(&self) -> Option<&Message> {
         self.materialized.last()
+    }
+
+    /// How many events the log holds.
+    ///
+    /// For a caller that appended something and wants to know whether *anything at all* has
+    /// happened since. Every mutation goes through the event log, so an unchanged count is a
+    /// much stronger statement than any inspection of the materialized tail: compaction, a
+    /// repair, a thinking-only nudge and a tool round all move it, including the ones that
+    /// leave a tail still shaped like a turn-opening prompt.
+    pub fn events_len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the log ends with an appended message that opened a turn, i.e. a turn got as far as
+    /// its prompt and no further -- no assistant reply, no tool results.
+    ///
+    /// `run_turn` uses this to decide whether a failure is safe to withdraw. Counting messages
+    /// would not do: both compaction paths and the `InvalidRequest` repair move `len()` under
+    /// the turn that is running.
+    ///
+    /// **Both halves are load-bearing, and the event half is the subtle one.** A compaction summary
+    /// is itself a plain `User` message, so [`Self::replace_for_compaction`] with an empty tail
+    /// leaves a materialized view whose last entry satisfies [`opens_turn`] -- and withdrawing
+    /// *that* would delete the summary standing in for the whole conversation. Requiring a trailing
+    /// [`Event::Append`] says "the message on the end is one somebody appended", which a summary
+    /// carried by a `CompactBoundary` is not. [`Self::pop_unsaved`] guards its own removal the same
+    /// way and for the same reason.
+    pub fn ends_on_a_turn_opening(&self) -> bool {
+        matches!(self.events.last(), Some(Event::Append(_)))
+            && self.materialized.last().is_some_and(opens_turn)
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, Message> {
@@ -291,13 +336,6 @@ impl Conversation {
         if turns == 0 {
             return None;
         }
-        let opens_turn = |message: &Message| {
-            message.role == Role::User
-                && !message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-        };
         let cut = self
             .materialized
             .iter()
@@ -687,6 +725,94 @@ mod tests {
                 is_error,
             }],
         }
+    }
+
+    /// A plain appended prompt is withdrawable; anything appended after it is not.
+    #[test]
+    fn test_a_turn_opening_is_recognised_only_while_it_is_the_tail() {
+        let mut conversation = Conversation::new();
+        assert!(
+            !conversation.ends_on_a_turn_opening(),
+            "an empty conversation has no prompt to withdraw"
+        );
+
+        conversation.append(Message::user("check the news"));
+        assert!(conversation.ends_on_a_turn_opening());
+
+        conversation.append(assistant_with_tool_use("call_1"));
+        assert!(!conversation.ends_on_a_turn_opening(), "the model replied");
+
+        conversation.append(user_with_tool_result("call_1"));
+        assert!(
+            !conversation.ends_on_a_turn_opening(),
+            "a tool result is a User message, but it did not open the turn"
+        );
+    }
+
+    /// The trap this guard exists for. A compaction summary is itself a plain `User` message, so a
+    /// compaction that keeps no tail leaves a materialized view whose last entry looks exactly like
+    /// a turn-opening prompt. Withdrawing it would delete the summary standing in for the entire
+    /// conversation, which is unrecoverable -- the events it replaced are below the view's logical
+    /// start. Only the shape of the event log tells the two apart.
+    #[test]
+    fn test_a_compaction_summary_is_not_mistaken_for_a_withdrawable_prompt() {
+        let mut conversation = Conversation::new();
+        conversation.append(Message::user("first"));
+        conversation.append(Message::assistant_text("reply"));
+        conversation.replace_for_compaction(
+            Message::user("[summary of everything above]"),
+            Vec::new(),
+            HashSet::new(),
+        );
+
+        assert!(
+            conversation
+                .last()
+                .is_some_and(|message| message.role == Role::User),
+            "the summary really does look like a prompt from the outside"
+        );
+        assert!(
+            !conversation.ends_on_a_turn_opening(),
+            "but it is carried by a boundary, not appended, so it is not withdrawable"
+        );
+
+        // The next real turn's prompt, appended on top of the summary, is withdrawable again.
+        conversation.append(Message::user("check the news"));
+        assert!(conversation.ends_on_a_turn_opening());
+    }
+
+    /// The interaction that makes `run_turn`'s withdrawal guard need *both* of its conditions.
+    ///
+    /// A compaction can legitimately keep the running turn's prompt as its tail, and then the tail
+    /// is once again an appended, turn-opening `User` message — indistinguishable from an untouched
+    /// prompt by inspection. Only the event count records that a whole compaction happened in
+    /// between, which is why `run_turn` compares it against the value taken at the append rather
+    /// than trusting the shape of the tail alone.
+    #[test]
+    fn test_a_compaction_that_keeps_the_prompt_still_moves_the_event_count() {
+        let mut conversation = Conversation::new();
+        conversation.append(Message::user("first"));
+        conversation.append(Message::assistant_text("reply"));
+        let prompt = Message::user("the turn's prompt");
+        conversation.append(prompt.clone());
+        let at_the_prompt = conversation.events_len();
+        assert!(conversation.ends_on_a_turn_opening());
+
+        conversation.replace_for_compaction(
+            Message::user("[summary of everything above]"),
+            vec![prompt],
+            HashSet::new(),
+        );
+
+        assert!(
+            conversation.ends_on_a_turn_opening(),
+            "the tail looks exactly as it did before the compaction"
+        );
+        assert_ne!(
+            conversation.events_len(),
+            at_the_prompt,
+            "but the log remembers, which is what stops the withdrawal"
+        );
     }
 
     /// The flag tracks "came off disk with something in it", which is the only condition under

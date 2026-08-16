@@ -29,6 +29,24 @@ pub enum TurnOutcome {
     Refusal(String),
 }
 
+/// What becomes of a turn's prompt when the turn fails before the model ever saw it.
+///
+/// The prompt is persisted eagerly, before the first provider call, so a crash mid-roundtrip cannot
+/// lose it. That is right when losing it would be losing something, and wrong when the prompt will
+/// simply be produced again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptRetention {
+    /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
+    /// else -- a background-task outcome, whose row is stamped `delivered` before the turn starts
+    /// and is never handed out again.
+    Keep,
+    /// Withdraw it. A scheduled job's prompt is regenerated from the job on its next occurrence,
+    /// and the fire that delivers it says how many were missed, so the failed copy carries
+    /// nothing. Left in place, a provider outage would deposit one unanswered user message per
+    /// fire for as long as the outage lasted.
+    WithdrawOnFailure,
+}
+
 /// Per-session working directory, shared by reference between the agent, every file-touching tool,
 /// the REPL prompt, the `/cd` slash command, and the per-turn environment-context block.
 /// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt can read
@@ -823,6 +841,7 @@ impl Agent {
         gate_on_required_servers(not_ready)
     }
 
+    /// One turn on behalf of whoever asked for it, keeping its prompt whatever happens.
     pub async fn run_turn(
         &self,
         session_id: &mut Option<Uuid>,
@@ -830,6 +849,31 @@ impl Agent {
         user_input: String,
         images: Vec<ImageSource>,
         cancellation: CancellationToken,
+    ) -> Result<TurnOutcome> {
+        self.run_turn_retaining(
+            session_id,
+            messages,
+            user_input,
+            images,
+            cancellation,
+            PromptRetention::Keep,
+        )
+        .await
+    }
+
+    /// One turn whose caller decides what a failure leaves behind.
+    ///
+    /// For a scheduled fire, that decision belongs to the job rather than the host: see
+    /// [`crate::schedule::ScheduledJob::prompt_retention`], which every host defers to so the rule
+    /// lives in one place instead of three.
+    pub async fn run_turn_retaining(
+        &self,
+        session_id: &mut Option<Uuid>,
+        messages: &mut Conversation,
+        user_input: String,
+        images: Vec<ImageSource>,
+        cancellation: CancellationToken,
+        retention: PromptRetention,
     ) -> Result<TurnOutcome> {
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
         // leaves no trace in the conversation.
@@ -1004,6 +1048,14 @@ impl Agent {
         // it.
         let mut suspect_floor = messages.len();
         messages.append(user_message.clone());
+        // The log's length with this turn's prompt on the end and nothing after it. A withdrawal is
+        // only safe while it still reads this, so it is captured here rather than reconstructed
+        // later: every way the turn can move on from its prompt -- an assistant reply, a tool
+        // round, either compaction, a repair, the thinking-only nudge -- goes through the
+        // event log and moves this number. Inspecting the materialized tail instead is not
+        // equivalent, because a compaction summary and a nudge are both plain `User`
+        // messages that look exactly like a prompt from the outside.
+        let prompt_only_events = messages.events_len();
         // Persist the user message eagerly, before the first provider call.  A crash
         // during the provider roundtrip would otherwise lose it from disk.  On transient
         // DB failure the lazy save path below retries; `user_eagerly_saved` suppresses
@@ -1575,6 +1627,61 @@ impl Agent {
         }
 
         match &result {
+            // A scheduled fire that produced nothing at all, however it ended. For a recurring job
+            // that prompt is regenerated on its next occurrence, so leaving it costs a conversation
+            // one unanswered message per fire through an outage and buys nothing.
+            //
+            // Two conditions, and the log-length one does the real work. `prompt_only_events` was
+            // taken with the prompt on the end and nothing after it, so an unchanged count means no
+            // assistant reply, no tool round, no compaction, no repair and no thinking-only nudge
+            // -- every one of which appends. Testing the materialized tail alone is not
+            // enough: a compaction summary and a nudge are both plain `User` messages
+            // carrying no tool result, so each looks exactly like a turn-opening
+            // prompt, and withdrawing a summary would delete the record standing in for
+            // the entire conversation. The tail check stays as the cheaper, more direct
+            // statement of what is being removed.
+            //
+            // Interruption is included rather than excluded, which is the opposite of the arm
+            // below. `meka serve` cancels its shutdown token *before* draining, and a
+            // scheduled turn's token is a child of it, so every job due during a
+            // shutdown returns `Interrupted` with its prompt already persisted -- and
+            // `run_wakeup` then hands the occurrence back, so the very same prompt is
+            // delivered again on the next run. That is precisely the case where keeping
+            // it guarantees a duplicate. The cost is that a REPL Ctrl+C on a scheduled
+            // turn now leaves no trace of the fire either; the occurrence is spent, and the job
+            // returns on its own schedule.
+            Err(_)
+                if retention == PromptRetention::WithdrawOnFailure
+                    && messages.events_len() == prompt_only_events
+                    && messages.ends_on_a_turn_opening() =>
+            {
+                if user_saved {
+                    // Appends an `Event::Repair` rather than deleting a row: the log stays
+                    // append-only, and the materialized view -- which is what a later turn actually
+                    // sends -- loses the orphan.
+                    let withdrawal = messages.replace_tail(1, Vec::new());
+                    if let Err(error) = self.session_manager.save_event(sid, &withdrawal).await {
+                        tracing::warn!(
+                            "failed to persist the withdrawal of a failed scheduled prompt; it will \
+                             reappear if this session is resumed: {}",
+                            error
+                        );
+                    }
+                } else {
+                    // The eager persist failed, so the prompt exists only in memory. It has to be
+                    // dropped rather than repaired, and the difference is not cosmetic: a `Repair`
+                    // is position-relative, so writing one for an `Append` that never reached disk
+                    // would, on reload, delete whatever message *does* sit at the end of the stored
+                    // log -- a turn from before this one.
+                    //
+                    // Reached only when a database write failed, which no test here can provoke.
+                    messages.pop_unsaved();
+                }
+                *self.last_rendered_world.write().await = world_state_rollback;
+                if resumed {
+                    messages.restore_resumed_notice();
+                }
+            }
             Err(MekaError::Interrupted) if !user_saved => {
                 let user_event = crate::conversation::Event::Append(user_message.clone());
                 if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
@@ -3512,7 +3619,7 @@ mod tests {
         (agent, frontend)
     }
 
-    async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
+    pub(super) async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
         test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
     }
 
@@ -6542,5 +6649,237 @@ mod approval_input_tests {
     fn test_a_non_object_input_is_left_alone() {
         let input = serde_json::json!("bare");
         assert_eq!(super::approval_input(&input, true), input);
+    }
+}
+
+/// What a failed turn leaves behind, which depends on who asked for it.
+#[cfg(test)]
+mod prompt_retention_tests {
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{PromptRetention, tests::test_agent};
+    use crate::{
+        conversation::Conversation,
+        provider::mock::{MockEvent, MockProvider},
+    };
+
+    fn unreachable_provider(rounds: usize) -> Arc<MockProvider> {
+        Arc::new(MockProvider::from_rounds(
+            (0..rounds)
+                .map(|_| {
+                    vec![MockEvent::Fail {
+                        message: "error sending request: connection refused".to_string(),
+                    }]
+                })
+                .collect(),
+        ))
+    }
+
+    /// The case that motivated this: meka up, provider unreachable, a job firing on its interval
+    /// for the length of the outage. Each fire persists its prompt before the call and then fails,
+    /// so without withdrawal the conversation collects one unanswered message per fire.
+    #[tokio::test]
+    async fn test_a_provider_outage_leaves_no_residue_from_scheduled_fires() {
+        let (agent, session_manager) = test_agent(unreachable_provider(12)).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+
+        for _ in 0..12 {
+            agent
+                .run_turn_retaining(
+                    &mut session_id,
+                    &mut messages,
+                    "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                    Vec::new(),
+                    CancellationToken::new(),
+                    PromptRetention::WithdrawOnFailure,
+                )
+                .await
+                .expect_err("the provider is unreachable");
+        }
+
+        assert!(
+            messages.is_empty(),
+            "a day of failed fires must not accumulate: {:?}",
+            messages.as_slice()
+        );
+        // And the withdrawal reached disk, so resuming the session does not bring them back.
+        let sid = session_id.expect("the first turn created the session");
+        let events = session_manager.load_events(sid).await.expect("load events");
+        assert!(
+            Conversation::from_events(events).is_empty(),
+            "the materialized view is empty after a reload too"
+        );
+    }
+
+    /// `meka serve` cancels its shutdown token before draining, and a scheduled turn's token is a
+    /// child of it, so a job due during a shutdown is interrupted with its prompt already on disk
+    /// -- and the occurrence is then handed back, so the identical prompt arrives again on the
+    /// next run. Keeping it would guarantee a duplicate, which is why interruption withdraws
+    /// too.
+    #[tokio::test]
+    async fn test_a_fire_interrupted_before_it_began_withdraws_its_prompt() {
+        let (agent, _session_manager) = test_agent(unreachable_provider(1)).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        let error = agent
+            .run_turn_retaining(
+                &mut session_id,
+                &mut messages,
+                "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                Vec::new(),
+                cancelled,
+                PromptRetention::WithdrawOnFailure,
+            )
+            .await
+            .expect_err("a cancelled token stops the turn before the provider is reached");
+        assert!(matches!(error, crate::error::MekaError::Interrupted));
+        assert!(
+            messages.is_empty(),
+            "the occurrence comes back, so the prompt must not linger: {:?}",
+            messages.as_slice()
+        );
+    }
+
+    /// The mirror image, and the reason this is not simply `run_turn`'s behaviour: a human can see
+    /// the error and retype, so their prompt stays exactly where it was.
+    #[tokio::test]
+    async fn test_a_typed_prompt_survives_the_same_failure() {
+        let (agent, _session_manager) = test_agent(unreachable_provider(1)).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "check the news".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the provider is unreachable");
+
+        assert_eq!(messages.len(), 1, "a typed prompt is never withdrawn");
+    }
+
+    /// A thinking-only reply is answered with a nudge, which is itself a plain `User` message
+    /// carrying no tool result -- so from the outside it looks exactly like a turn-opening prompt.
+    /// If the retry then fails, withdrawal must not take the nudge: doing so leaves the prompt (the
+    /// message the feature exists to remove) while retracting one meka had just committed.
+    #[tokio::test]
+    async fn test_a_failure_after_a_thinking_only_nudge_withdraws_nothing() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // A reply with a thinking block and no text: `run_turn` appends the nudge and retries.
+            vec![
+                MockEvent::ThinkingDelta {
+                    text: "hmm".to_string(),
+                },
+                MockEvent::ThinkingComplete { signature: None },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "error sending request: connection refused".to_string(),
+            }],
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn_retaining(
+                &mut session_id,
+                &mut messages,
+                "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+                PromptRetention::WithdrawOnFailure,
+            )
+            .await
+            .expect_err("the retry fails");
+
+        // Three messages went in (prompt, thinking-only assistant, nudge) and all three stay: the
+        // turn moved past its prompt, so there is no longer a lone prompt to withdraw.
+        assert_eq!(
+            messages.len(),
+            3,
+            "nothing is retracted once the turn has moved on: {:?}",
+            messages.as_slice()
+        );
+    }
+
+    /// Withdrawal is only for a turn that produced nothing. One that failed after a tool round has
+    /// real work behind it -- a command that ran, a file that was written -- and erasing the prompt
+    /// would orphan the record of it.
+    #[tokio::test]
+    async fn test_a_fire_that_got_as_far_as_a_tool_call_keeps_everything() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call_1".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "error sending request: connection refused".to_string(),
+            }],
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn_retaining(
+                &mut session_id,
+                &mut messages,
+                "[Scheduled job 7f3a1b2c fired] check the news".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+                PromptRetention::WithdrawOnFailure,
+            )
+            .await
+            .expect_err("the second round fails");
+
+        // Asserted on content, not on a message count. Withdrawal drops exactly the last message,
+        // and here that is the tool *result* -- so a count-based check still passes while the
+        // record of what the tool returned has been erased out from under its `tool_use`.
+        let blocks: Vec<_> = messages
+            .as_slice()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .collect();
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                crate::provider::ContentBlock::ToolUse { id, .. } if id == "call_1"
+            )),
+            "the call the model made is still on record: {:?}",
+            messages.as_slice()
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                crate::provider::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"
+            )),
+            "and so is what it returned, so the pair is not orphaned: {:?}",
+            messages.as_slice()
+        );
     }
 }

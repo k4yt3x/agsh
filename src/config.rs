@@ -94,6 +94,9 @@ pub struct ScheduleConfig {
     pub gate_timeout: Option<std::time::Duration>,
     /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
     pub max_jobs: Option<usize>,
+    /// How many of one session's jobs may spend a turn in a single sweep. Default 5. Jobs past it
+    /// keep their occurrence and fire on the next sweep.
+    pub max_consecutive_fires: Option<usize>,
 }
 
 /// [`ScheduleConfig`] with every default filled in.
@@ -104,10 +107,18 @@ pub struct ResolvedScheduleConfig {
     pub missed_grace: std::time::Duration,
     pub gate_timeout: std::time::Duration,
     pub max_jobs: usize,
+    pub max_consecutive_fires: usize,
 }
 
 impl ResolvedScheduleConfig {
     const DEFAULT_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Five is well above what a healthy session has due at once, since coalescing means one job
+    /// contributes one fire however long the outage was, so the budget only engages on a real
+    /// backlog. What it buys there is interleaving, not throttling: sweeps do not overlap and the
+    /// next begins as soon as the last ends, so a backlog produces the same number of turns either
+    /// way -- but another session's due job is reached after five of this one's rather than after
+    /// all of them.
+    const DEFAULT_MAX_CONSECUTIVE_FIRES: usize = 5;
     const DEFAULT_MAX_JOBS: usize = 50;
     /// A day. Long enough that an overnight outage still delivers this morning's reminder, short
     /// enough that a laptop closed for a week does not wake to a pile of stale ones.
@@ -124,6 +135,9 @@ impl ResolvedScheduleConfig {
             missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
             gate_timeout: raw.gate_timeout.unwrap_or(Self::DEFAULT_GATE_TIMEOUT),
             max_jobs: raw.max_jobs.unwrap_or(Self::DEFAULT_MAX_JOBS),
+            max_consecutive_fires: raw
+                .max_consecutive_fires
+                .unwrap_or(Self::DEFAULT_MAX_CONSECUTIVE_FIRES),
         }
     }
 }
@@ -2375,6 +2389,13 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
+        if self.schedule.max_consecutive_fires == 0 {
+            return Err(crate::error::MekaError::Config(
+                "[schedule].max_consecutive_fires = 0 would hold every due job over forever. Set \
+                 `[schedule] enabled = false` to turn scheduling off instead."
+                    .to_string(),
+            ));
+        }
         match self.provider_name.as_deref() {
             None => {
                 return Err(crate::error::MekaError::Config(
@@ -3374,6 +3395,7 @@ poll_interval = "5s"
 missed_grace = "2h"
 gate_timeout = "45s"
 max_jobs = 10
+max_consecutive_fires = 3
 "#,
         )
         .expect("failed to parse toml");
@@ -3383,6 +3405,7 @@ max_jobs = 10
         assert_eq!(schedule.missed_grace, std::time::Duration::from_secs(7200));
         assert_eq!(schedule.gate_timeout, std::time::Duration::from_secs(45));
         assert_eq!(schedule.max_jobs, 10);
+        assert_eq!(schedule.max_consecutive_fires, 3);
     }
 
     #[test]
@@ -3394,6 +3417,9 @@ max_jobs = 10
         assert!(!schedule.poll_interval.is_zero());
         assert!(!schedule.gate_timeout.is_zero());
         assert!(schedule.max_jobs > 0);
+        // Pinned to the value rather than to non-zero: both doc pages state 5, and drifting either
+        // way is silent -- large disables the interleaving, 1 serialises every session.
+        assert_eq!(schedule.max_consecutive_fires, 5);
     }
 
     #[test]
@@ -3722,6 +3748,7 @@ poll_interval = "0s"
         for (key, value, needle) in [
             ("gate_timeout", "\"0s\"", "gate_timeout"),
             ("max_jobs", "0", "max_jobs"),
+            ("max_consecutive_fires", "0", "max_consecutive_fires"),
         ] {
             let resolved = resolve_with_config(&format!(
                 r#"
