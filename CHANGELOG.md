@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
 - `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.
 - An unrecognised `[[serve.tokens]]` scope warns at startup instead of silently granting nothing.
+- reedline moved from a pinned Git rev to the 0.50.0 release that carries the `ExternalPrinter` fix.
+- Building meka needs Rust 1.95; `Cargo.toml` declares it, so an older toolchain is refused by name.
+- Upgrade `rmcp` to 3.1, `base64` to 0.23, `infer` to 0.22 and `termimad` to 0.35.
 
 ### Fixed
 

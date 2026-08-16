@@ -1443,6 +1443,18 @@ pub async fn list_prompts(entry: &Arc<ServerEntry>) -> Result<Vec<Prompt>> {
     }
 }
 
+// rmcp 3.1 deprecates `subscribe` / `unsubscribe` in favour of `Peer::listen`, but that is a
+// 2026-07-28 mechanism and meka negotiates 2025-11-25: it implements no `get_info`, so it takes
+// `ClientInfo::default()`, whose protocol version is rmcp's own `ProtocolVersion::LATEST`. rmcp
+// gates its 2026-07-28 features on the *server's* reported version being at least that, so at the
+// version meka actually speaks `resources/subscribe` is the mechanism rather than a fallback, and
+// reaching for `listen` here would ask servers for a method they never negotiated.
+//
+// Switching is not a local edit either: notifications routed to a `Subscription` are deliberately
+// not delivered through `ClientHandler`, so `on_resource_updated` would stop firing and the
+// updates `mcp_resource_poll` reads would need a per-server pump task feeding them instead. That
+// belongs with the move to 2026-07-28, not ahead of it.
+#[allow(deprecated)]
 pub async fn subscribe_resource(entry: &Arc<ServerEntry>, uri: String) -> Result<()> {
     let peer = entry.require_connected().await?;
     let params = rmcp::model::SubscribeRequestParams::new(uri.clone());
@@ -1454,6 +1466,7 @@ pub async fn subscribe_resource(entry: &Arc<ServerEntry>, uri: String) -> Result
         })
 }
 
+#[allow(deprecated)]
 pub async fn unsubscribe_resource(entry: &Arc<ServerEntry>, uri: String) -> Result<()> {
     let peer = entry.require_connected().await?;
     let params = rmcp::model::UnsubscribeRequestParams::new(uri.clone());

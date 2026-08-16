@@ -611,15 +611,15 @@ async fn authenticate_oauth_authorization_code(
     if let Some(id) = client_id {
         // We need to discover metadata first, then configure the client
         if let OAuthState::Unauthorized(ref mut manager) = oauth_state {
-            let metadata =
+            let resolution =
                 manager
-                    .discover_metadata()
+                    .resolve_metadata()
                     .await
                     .map_err(|error| MekaError::McpAuth {
                         server_name: server_name.to_string(),
                         message: format!("OAuth metadata discovery failed: {}", error),
                     })?;
-            manager.set_metadata(metadata);
+            manager.set_metadata(resolution.metadata);
 
             let mut oauth_client_config =
                 rmcp::transport::auth::OAuthClientConfig::new(id.to_string(), redirect_uri.clone());
@@ -662,9 +662,11 @@ async fn authenticate_oauth_authorization_code(
         }
     } else {
         // No client_id configured; use dynamic registration via start_authorization
-        let scope_refs: Vec<&str> = scope_strings.iter().map(|s| s.as_str()).collect();
+        let request = rmcp::transport::auth::AuthorizationRequest::new(redirect_uri.clone())
+            .with_scopes(scope_strings.clone())
+            .with_client_name("meka");
         oauth_state
-            .start_authorization(&scope_refs, &redirect_uri, Some("meka"))
+            .start_authorization(request)
             .await
             .map_err(|error| MekaError::McpAuth {
                 server_name: server_name.to_string(),

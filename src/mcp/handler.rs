@@ -15,7 +15,9 @@ use rmcp::{
     handler::client::ClientHandler,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-        ElicitRequestParams, ElicitResult, Meta, ProgressNotificationParam, ServerResult,
+        ConstString, CustomNotification, ElicitRequestParams, ElicitResult,
+        ElicitationResponseNotificationMethod, ProgressNotificationParam, RequestMetaObject,
+        ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
 };
@@ -156,20 +158,31 @@ impl ClientHandler for MekaClientHandler {
         }
     }
 
-    /// Notification (new in rmcp 2.1 / MCP URL elicitation) that a server-side URL elicitation the
-    /// user was sent to complete has finished. meka's [`Self::create_elicitation`] already returned
-    /// its response synchronously, so nothing needs to drive here; log it for observability.
-    fn on_url_elicitation_notification_complete(
+    /// Notification that a server-side URL elicitation the user was sent to complete has finished.
+    /// rmcp 3.1 removed the typed hook this used to have, so it now arrives as an unrecognised
+    /// method: the wire notification still exists, but the SDK no longer routes it anywhere
+    /// specific. meka's [`Self::create_elicitation`] already returned its response synchronously,
+    /// so nothing needs to drive here; log it for observability.
+    fn on_custom_notification(
         &self,
-        params: rmcp::model::ElicitationResponseNotificationParam,
+        notification: CustomNotification,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let server = Arc::clone(&self.server_name);
         async move {
+            if notification.method != ElicitationResponseNotificationMethod::VALUE {
+                return;
+            }
+            let elicitation_id = notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("elicitationId"))
+                .and_then(|id| id.as_str())
+                .unwrap_or("<unknown>");
             tracing::debug!(
                 "MCP server '{}' completed URL elicitation '{}'",
                 server,
-                params.elicitation_id
+                elicitation_id
             );
         }
     }
@@ -339,7 +352,7 @@ impl McpToolAdapter {
             tool_use_id.clone(),
             frontend_for_progress,
         );
-        let mut meta = Meta::new();
+        let mut meta = RequestMetaObject::new();
         meta.set_progress_token(progress_token);
         if let Some(id) = &tool_use_id {
             meta.0

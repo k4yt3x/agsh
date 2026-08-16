@@ -2,6 +2,7 @@
 name = "meka"
 version = "0.41.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
@@ -12,7 +13,7 @@ anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 croner = "3"
@@ -29,16 +30,16 @@ grep-searcher = "0.1"
 hmac = "0.13.0"
 humantime-serde = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
-infer = { version = "0.19", default-features = false }
+infer = { version = "0.22", default-features = false }
 nu-ansi-term = "0.50"
 open = "5"
 percent-encoding = "2"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10"
-reedline = { git = "https://github.com/nushell/reedline", rev = "e4fe8edfb28440614e58a8c9dba78d128783f70f", features = ["external_printer"] }
+reedline = { version = "0.50", features = ["external_printer"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
-rmcp = { version = "2.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
+rmcp = { version = "3.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -47,7 +48,7 @@ serde_norway = "0.9.42"
 sha2 = "0.11"
 subtle = "2"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "plist-load", "regex-fancy"] }
-termimad = "0.34"
+termimad = "0.35"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rusqlite = "0.7"

@@ -34,7 +34,7 @@ This builds the latest version from source and installs it to `~/.cargo/bin/`.
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) (edition 2024, requires Rust 1.85+)
+- [Rust](https://www.rust-lang.org/tools/install) 1.95 or newer, the version `Cargo.toml` declares
 - A C compiler (for the bundled SQLite)
 
 ### Build
