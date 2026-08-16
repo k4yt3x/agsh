@@ -93,7 +93,11 @@ pub(super) fn spawn_background_poller(
                     Ok(ready) if !ready.is_empty() => ready,
                     Ok(_) => continue,
                     Err(error) => {
-                        tracing::warn!("background poller failed for {}: {}", session_uuid, error);
+                        tracing::warn!(
+                            "failed to list undelivered background tasks for session {}: {}",
+                            session_uuid,
+                            error
+                        );
                         continue;
                     }
                 };
@@ -104,7 +108,10 @@ pub(super) fn spawn_background_poller(
                     .mark_background_tasks_delivered(&ids)
                     .await
                 {
-                    tracing::warn!("failed to stamp background outcomes delivered: {}", error);
+                    tracing::warn!(
+                        "failed to stamp background outcomes as delivered: {}",
+                        error
+                    );
                     continue;
                 }
                 deliver_outcomes(&entry, crate::background::render_outcomes(&ready)).await;

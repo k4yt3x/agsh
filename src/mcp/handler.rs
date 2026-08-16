@@ -58,7 +58,7 @@ impl ClientHandler for MekaClientHandler {
         let manager = self.context.manager().and_then(|weak| weak.upgrade());
 
         async move {
-            tracing::info!("MCP server '{}' sent tools/list_changed", server_name);
+            tracing::debug!("MCP server '{}' sent tools/list_changed", server_name);
             let Some(manager) = manager else {
                 tracing::debug!(
                     "tool list refresh skipped: manager not yet wired for '{}'",
@@ -242,14 +242,15 @@ impl ClientHandler for MekaClientHandler {
                 return Ok(ElicitationResponse::Decline.into_result());
             };
 
-            // 60-second user-response timeout so a distracted user can't stall an MCP tool call
-            // forever. Matches the elicitation deadline used for the ToolApprovalRequest channel in
-            // shell.rs. Elicitations are standard MCP *requests*, so a `Decline` response IS how
-            // the server learns the user didn't answer; no separate `notifications/cancelled` is
-            // appropriate here (cancellation notifications are for long-running requests we
-            // started, not for server-initiated elicitations).
+            // User-response timeout so a distracted user can't stall an MCP tool call forever.
+            // Matches `MID_TURN_REQUEST_TIMEOUT`, the deadline the HTTP frontend gives a pending
+            // permission request. Elicitations are standard MCP *requests*, so a `Decline`
+            // response IS how the server learns the user didn't answer; no separate
+            // `notifications/cancelled` is appropriate here (cancellation notifications are for
+            // long-running requests we started, not for server-initiated elicitations).
+            const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
             let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                ELICITATION_TIMEOUT,
                 frontend.handle_elicitation(prompt),
             )
             .await
@@ -257,8 +258,9 @@ impl ClientHandler for MekaClientHandler {
                 Ok(response) => response,
                 Err(_) => {
                     tracing::warn!(
-                        "MCP server '{}' elicitation timed out after 60s; declining",
-                        server
+                        "MCP server '{}' elicitation timed out after {}s; declining",
+                        server,
+                        ELICITATION_TIMEOUT.as_secs()
                     );
                     ElicitationResponse::Decline
                 }
@@ -511,28 +513,15 @@ impl Tool for McpToolAdapter {
                 }
             }
             Err(error) => {
-                // If the server rejected us with a 401/Unauthorized, persist the `needs-auth`
-                // verdict so the next startup skips the unauthenticated probe and goes straight to
-                // OAuth. The user must re-authenticate via `meka mcp login <name>`.
+                // Matched on the text because the transport surfaces the status inside the error
+                // rather than as a field, so a bare `Unauthorized` with no code still counts.
                 let text = error.to_string().to_ascii_lowercase();
-                if (text.contains("401") || text.contains("unauthorized"))
-                    && let Some(store) = self.entry.token_store()
-                {
-                    if let Err(cache_err) =
-                        store.save_auth_probe(self.entry.server_name(), true).await
-                    {
-                        tracing::debug!(
-                            "failed to save auth probe cache for '{}': {}",
-                            self.entry.server_name(),
-                            cache_err
-                        );
-                    } else {
-                        tracing::warn!(
-                            "MCP server '{}' returned 401; marked as needing auth. Run 'meka mcp login {}' to re-authenticate.",
-                            self.entry.server_name(),
-                            self.entry.server_name()
-                        );
-                    }
+                if text.contains("401") || text.contains("unauthorized") {
+                    tracing::warn!(
+                        "MCP server '{}' rejected the call as unauthorized; run `meka mcp login {}` to re-authenticate",
+                        self.entry.server_name(),
+                        self.entry.server_name()
+                    );
                 }
                 return Err(MekaError::McpToolExecution {
                     server_name: self.entry.server_name().to_string(),

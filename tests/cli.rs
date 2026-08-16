@@ -142,6 +142,34 @@ fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|err| panic!("failed to spawn meka {:?}: {}", args, err))
 }
 
+/// `Conversation::rewind(0)` returns `None` unconditionally, so without an explicit guard the
+/// caller reports it as the session having "fewer than 0 turn(s)". Rejected before the session is
+/// even looked up, which is why a nonexistent id still produces the argument error. The HTTP
+/// surface already answers 422 here (`rewind_rejects_zero_turns` in `tests/serve.rs`); this keeps
+/// the CLI in step.
+#[test]
+fn session_rewind_rejects_zero_turns_without_describing_the_conversation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = "00000000-0000-4000-8000-000000000000";
+    let output = run_isolated(dir.path(), &["session", "rewind", id, "-n", "0"]);
+    assert!(
+        !output.status.success(),
+        "-n 0 must fail, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("-n must be 1 or more"),
+        "expected the argument to be blamed, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("fewer than 0"),
+        "must not describe the conversation as having fewer than 0 turns: {}",
+        stderr
+    );
+}
+
 #[test]
 fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
     // Isolate the config dir so the host's real `~/.config/meka` doesn't leak into the test.
@@ -155,10 +183,18 @@ fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
+    // The empty case is a status note, not the data a script asked for, so it goes to stderr and
+    // stdout stays clean enough to pipe.
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("no MCP servers configured"),
-        "expected 'no MCP servers configured' in stdout, got: {}",
+        stderr.contains("No MCP servers configured."),
+        "expected 'No MCP servers configured.' on stderr, got: {}",
+        stderr
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout must carry no placeholder row, got: {}",
         stdout
     );
 }
@@ -356,7 +392,7 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut child = meka()
-        // `-v` so the `running OAuth authorisation` info log is visible; we use it as the
+        // `-v` so the `running OAuth authorization` info log is visible; we use it as the
         // "auto-login has started" signal before sending SIGINT.
         .args(["-v", "mcp", "add", "notion", "https://mcp.notion.com/mcp"])
         .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
@@ -371,7 +407,7 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
         .spawn()
         .expect("spawn meka mcp add");
 
-    // Wait until we've seen the "running OAuth authorisation" line so we know the child is past the
+    // Wait until we've seen the "running OAuth authorization" line so we know the child is past the
     // write + probe and is inside the SIGINT-covered post-persist section. The signpost now lives
     // on stderr (via tracing), not stdout. We drain into `captured` so the subsequent rollback log
     // lines are preserved across the SIGINT for the final assertion.
@@ -386,7 +422,7 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
             Ok(0) => break,
             Ok(_) => {
                 captured.push_str(&line);
-                if line.contains("running OAuth authorisation") {
+                if line.contains("running OAuth authorization") {
                     saw_running_line = true;
                     break;
                 }

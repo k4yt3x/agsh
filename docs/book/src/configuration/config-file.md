@@ -12,7 +12,7 @@ The config file is optional. If it does not exist, meka silently skips it.
 
 meka rejects unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
 
-The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable` and `meka provider remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "(no MCP servers configured)" over a file full of them is indistinguishable from the truth.
+The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable` and `meka provider remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers configured." over a file full of them is indistinguishable from the truth.
 
 Those editors only reach the keys they own, so a bad key anywhere else (`[session]`, `[permissions]`, a top-level typo, a raw syntax error) has to be fixed in an editor. The error names the file, line, column, and offending key.
 
@@ -955,14 +955,17 @@ Manage configured servers without editing `config.toml` by hand:
 
 #### Example: Notion
 
+These signposts are `info` logs, so they need `-v`; at the default `warn` level the command
+succeeds silently and the exit code carries the result. Timestamps and targets are elided here.
+
 ```console
-$ meka mcp add notion https://mcp.notion.com/mcp
-ok: added 'notion' to ~/.config/meka/config.toml
-probe: server requires OAuth.
-running OAuth authorisation for 'notion' (use --no-login to skip).
-no [auth] block for 'notion', assuming OAuth authorization_code.
+$ meka -v mcp add notion https://mcp.notion.com/mcp
+added 'notion' to ~/.config/meka/config.toml
+probe: 'notion' requires OAuth
+running OAuth authorization for 'notion' (use --no-login to skip)
+no [auth] block for 'notion'; assuming OAuth authorization_code
 …
-ok: authorized 'notion'
+authorized 'notion'
 ```
 
 `meka mcp add` on an HTTP endpoint:
@@ -990,17 +993,18 @@ The OAuth flow redirects the browser to `http://127.0.0.1:<port>/callback`. When
 - The browser's address bar still contains the full callback URL (including `code` and `state`) even when the connection fails. Copy it, paste it into the meka prompt, and press Enter.
 - Whichever completes first, the TCP callback or the pasted URL, wins.
 
+meka opens the browser silently and prints the URL exactly once, so the flow works the same whether
+or not a browser is reachable. The `authorized` line is an `info` log, shown here with `-v`.
+
 ```console
-$ meka mcp login notion
-server 'notion' has no [auth] block; assuming OAuth authorization_code.
-Opening browser for MCP server 'notion' OAuth authorization...
-If the browser didn't open, visit:
-  https://mcp.notion.com/authorize?response_type=code&…
-Waiting for OAuth callback (up to 120s).
-  If the browser can't reach this host (e.g. you're over SSH), paste the full
-  callback URL here and press Enter.
+$ meka -v mcp login notion
+open this URL in your browser to authorize:
+
+https://mcp.notion.com/authorize?response_type=code&…
+
+waiting up to 120s for the callback, or paste the callback URL here and press Enter:
 http://127.0.0.1:46437/callback?code=…&state=…     ← paste here
-ok: authorized 'notion'
+authorized 'notion'
 ```
 
 #### REPL parity

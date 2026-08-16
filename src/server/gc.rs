@@ -18,11 +18,11 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
     let idle_timeout = state.config.idle_timeout;
     let delete_on_idle = state.config.delete_on_idle;
     if idle_timeout.is_zero() {
-        tracing::info!("session GC disabled (idle_timeout = 0)");
+        tracing::info!("session GC disabled ([serve] idle_timeout = 0)");
         return tokio::spawn(async {});
     }
     tracing::info!(
-        "session GC enabled: idle_timeout={:?}, scan_interval={:?}, delete_on_idle={}",
+        "session GC enabled: idle_timeout={:?}, gc_scan_interval={:?}, delete_on_idle={}",
         idle_timeout,
         scan_interval,
         delete_on_idle

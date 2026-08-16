@@ -66,7 +66,7 @@ impl Drop for SessionRollback {
         // runtime may already be tearing down and an unguarded spawn would panic.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::debug!(
-                "session rollback for {} during shutdown; skipping orphan-row delete",
+                "session rollback: skipping orphan-row delete for {} during shutdown",
                 self.uuid
             );
             return;

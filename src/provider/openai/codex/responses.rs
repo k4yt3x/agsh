@@ -325,7 +325,10 @@ pub(super) fn process_event(
                     match serde_json::from_str(&arguments_str) {
                         Ok(value) => value,
                         Err(error) => {
-                            tracing::warn!("failed to parse tool arguments JSON: {}", error);
+                            tracing::warn!(
+                                "failed to parse tool arguments JSON; running the tool with empty arguments: {}",
+                                error
+                            );
                             serde_json::json!({})
                         }
                     }
@@ -435,7 +438,7 @@ fn parse_response_status(status: &str) -> StopReason {
         "incomplete" => StopReason::MaxTokens,
         other => {
             tracing::warn!(
-                "openai responses returned unrecognized status {other:?}; mapping to Unknown"
+                "Codex returned unrecognized response status {other:?}; mapping to Unknown"
             );
             StopReason::Unknown(other.to_string())
         }

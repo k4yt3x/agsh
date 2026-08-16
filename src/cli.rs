@@ -58,7 +58,7 @@ pub enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
-    /// Show OAuth account info (usage, identity) for scripting
+    /// Show account usage, identity, and history for scripting
     Account {
         #[command(subcommand)]
         action: AccountAction,
@@ -77,7 +77,7 @@ pub enum Command {
     /// under `[serve]` in config.toml.
     #[command(verbatim_doc_comment)]
     Serve {
-        /// Override the `[serve].bind` config value (e.g. `0.0.0.0:8080`).
+        /// Override `[serve].bind` (e.g. `0.0.0.0:8080`)
         #[arg(long)]
         bind: Option<String>,
     },
@@ -339,10 +339,11 @@ pub enum ScheduleAction {
 pub enum InstructionsAction {
     /// Print the resolved instructions and where they came from
     ///
-    /// Resolution order is `--instructions`, `MEKA_INSTRUCTIONS`,
-    /// `MEKA_INSTRUCTIONS_FILE`, then `instructions.md` (or `instructions/`)
-    /// in the config directory. The text goes to stdout and the source to
-    /// stderr, so `meka instructions show 2>/dev/null` pipes cleanly.
+    /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`,
+    /// then `instructions.md` (or `instructions/`) in the config directory.
+    /// `--instructions` belongs to a run, so it is not consulted here. The
+    /// text goes to stdout and the source to stderr, so
+    /// `meka instructions show 2>/dev/null` pipes cleanly.
     #[command(verbatim_doc_comment)]
     Show,
     /// Print the paths checked for instructions, and whether each exists
@@ -470,7 +471,7 @@ pub enum McpAction {
     List,
     /// Print the configuration for one server
     Get { name: String },
-    /// Connect once and print `ok` if the handshake succeeds
+    /// Connect once and exit non-zero if the handshake fails
     Reconnect { name: String },
     /// List a server's advertised tools with their resolved permissions
     Tools { name: String },
@@ -661,7 +662,7 @@ pub struct Cli {
     #[arg(long = "no-stream")]
     pub no_stream: bool,
 
-    /// Markdown render mode: termimad (default), syntect, or raw
+    /// Markdown render mode: termimad (default), syntect, raw, or silent
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
 

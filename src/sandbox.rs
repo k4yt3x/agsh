@@ -140,9 +140,9 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
             // backend might also be unavailable on this host (kernel without Landlock, bwrap not
             // installed, etc.).
             tracing::warn!(
-                "read-mode sandbox: {} (configured: {}). Read-mode shell commands will fail \
-                 until this is fixed. Set [shell].sandbox_backend in config.toml (or \
-                 MEKA_SANDBOX_BACKEND) to a usable backend, or disable sandboxing.",
+                "read-mode sandbox unavailable: {} (configured: {}); read-mode shell commands \
+                 will fail until [shell].sandbox_backend in config.toml (or \
+                 MEKA_SANDBOX_BACKEND) names a usable backend, or sandboxing is disabled",
                 reason,
                 state.backend,
             );
@@ -154,8 +154,8 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
             && matches!(state.backend, crate::config::SandboxBackend::Landlock)
         {
             tracing::warn!(
-                "using Landlock for sandbox; install Bubblewrap for stronger \
-                 protection, or pin `sandbox_backend = \"landlock\"` to suppress this warning."
+                "using Landlock for sandbox; install Bubblewrap for stronger protection, or pin \
+                 [shell].sandbox_backend = \"landlock\" to suppress this warning"
             );
         }
     }
@@ -331,7 +331,7 @@ fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) 
                         if let Err(error) = take.read_to_end(&mut bytes)
                             && error.kind() != std::io::ErrorKind::WouldBlock
                         {
-                            tracing::debug!("smoke test stderr read: {}", error);
+                            tracing::debug!("bwrap smoke test: stderr read failed: {}", error);
                         }
                         String::from_utf8_lossy(&bytes).into_owned()
                     }
@@ -1604,11 +1604,9 @@ mod windows_impl {
         }
 
         tracing::warn!(
-            "CreateProcessAsUserW denied (SE_INCREASE_QUOTA_NAME not held); \
-             falling back to CreateProcessWithTokenW. The child is still spawned \
-             under the Low-integrity token with the same scrubbed environment \
-             block; semantics differ slightly (no custom process/thread \
-             SECURITY_ATTRIBUTES)."
+            "CreateProcessAsUserW denied (SE_INCREASE_QUOTA_NAME not held); falling back to \
+             CreateProcessWithTokenW, which still spawns the child at Low integrity with the \
+             same scrubbed environment"
         );
 
         // Rebuild the command-line buffer; the previous call may have mutated it before failing

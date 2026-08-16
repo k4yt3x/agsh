@@ -484,7 +484,7 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
         // string is otherwise discarded once mapped to `Unknown`.
         other => {
             tracing::warn!(
-                "claude returned unrecognized stop_reason {other:?}; mapping to Unknown"
+                "Claude returned unrecognized stop_reason {other:?}; mapping to Unknown"
             );
             StopReason::Unknown(other.to_string())
         }
@@ -543,7 +543,7 @@ pub(super) fn parse_non_streaming_response(
                     })?
                     .to_string();
                 let input = block.get("input").cloned().unwrap_or_else(|| {
-                    tracing::warn!("missing 'input' in tool_use block");
+                    tracing::warn!("tool_use block missing 'input' field");
                     serde_json::json!({})
                 });
 
@@ -640,7 +640,7 @@ pub(super) async fn drive_claude_sse_stream(
                         let data: serde_json::Value = match serde_json::from_str(&event.data) {
                             Ok(data) => data,
                             Err(error) => {
-                                tracing::warn!("failed to parse SSE data: {}", error);
+                                tracing::warn!("failed to parse Claude SSE data: {}", error);
                                 continue;
                             }
                         };
@@ -811,7 +811,11 @@ pub(super) async fn drive_claude_sse_stream(
                                         match serde_json::from_str(&current_tool_input) {
                                             Ok(value) => value,
                                             Err(error) => {
-                                                tracing::warn!("failed to parse tool input JSON: {}", error);
+                                                tracing::warn!(
+                                                    "failed to parse tool input JSON; running \
+                                                     the tool with empty input: {}",
+                                                    error
+                                                );
                                                 serde_json::json!({})
                                             }
                                         }
@@ -1135,10 +1139,11 @@ where
 
     if body_json.len() > MAX_REQUEST_BYTES {
         return Err(MekaError::Provider(format!(
-            "request body is {} MiB after redacting old tool-result images; \
-             Anthropic's limit is 32 MiB. Run /compact, remove large attachments \
-             from the most recent turn, or split the work across smaller turns.",
+            "request body is {} MiB after redacting old tool-result images; meka's ceiling is \
+             {} MiB (Anthropic caps at 32 MiB). Run /compact, remove large attachments from the \
+             most recent turn, or split the work across smaller turns.",
             body_json.len() / 1_048_576,
+            MAX_REQUEST_BYTES / 1_048_576,
         )));
     }
 

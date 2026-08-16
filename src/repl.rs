@@ -804,24 +804,26 @@ fn print_help() {
         } else {
             format!("/{} {}", command.name, command.arg_hint)
         };
-        eprintln!("  {left:<31}  {}", command.help);
+        eprintln!("  {left:<33}  {}", command.help);
         if command.name == "mcp" {
             // The /mcp subcommands are arguments, not top-level commands, so they are absent from
-            // COMMANDS; list them here so help still documents the full grammar.
+            // COMMANDS; list them here so help still documents the full grammar. Keep this set in
+            // step with `parse_mcp_slash` and `MCP_SUBCOMMANDS`.
+            eprintln!("  {:<33}  List configured MCP servers", "/mcp list");
             eprintln!(
-                "  {:<31}  Reconnect smoke-test for one server",
+                "  {:<33}  Reconnect smoke-test for one server",
                 "/mcp reconnect <server>"
             );
             eprintln!(
-                "  {:<31}  Run the OAuth flow for a server",
+                "  {:<33}  Run the OAuth flow for a server",
                 "/mcp login <server>"
             );
             eprintln!(
-                "  {:<31}  Clear stored credentials for a server",
+                "  {:<33}  Clear stored credentials for a server",
                 "/mcp logout <server>"
             );
             eprintln!(
-                "  {:<31}  Render an MCP prompt as the next turn",
+                "  {:<33}  Render an MCP prompt as the next turn",
                 "/mcp <server>:<prompt> [args]"
             );
         }
@@ -1032,7 +1034,7 @@ pub fn run_repl(
                             )
                             .is_err()
                             {
-                                eprintln!("Failed to clear terminal");
+                                eprintln!("Failed to clear terminal.");
                             }
                             continue;
                         }
@@ -1054,16 +1056,16 @@ pub fn run_repl(
                                                     );
                                                 }
                                                 Err(_) => {
-                                                    eprintln!(
-                                                        "Error: '{}' is disabled in this config (enabled: {})",
+                                                    render::render_error(&format!(
+                                                        "'{}' is disabled in this config (enabled: {})",
                                                         permission,
                                                         format_enabled(shared_permission.enabled()),
-                                                    );
+                                                    ));
                                                 }
                                             }
                                         }
                                         Err(error) => {
-                                            eprintln!("Error: {}", error);
+                                            render::render_error(&error);
                                         }
                                     }
                                 }

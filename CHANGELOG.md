@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
+- `meka provider` reports success through the log, dropping the `ok:` prefix, matching `meka mcp`.
+- Log messages lost prefixes that repeat the module the subscriber already prints, and internal
+  Rust function names that meant nothing to a reader.
+- Provider log messages name their backend, so Claude and Codex lines are told apart.
+- A Claude or Codex tool call with unparseable arguments says it runs the tool with empty input.
+- Compaction, sandbox and MCP messages are shorter, and no longer log one event twice.
 - **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - An unknown or stale tool name now suggests the built-in it probably meant.
@@ -48,8 +55,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Building meka needs Rust 1.95; `Cargo.toml` declares it, so an older toolchain is refused by name.
 - Upgrade `rmcp` to 3.1, `base64` to 0.23, `infer` to 0.22 and `termimad` to 0.35.
 
+### Removed
+
+- The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
+
 ### Fixed
 
+- `/rewind 0` and `meka session rewind -n 0` blame the argument instead of reporting that the
+  conversation has "fewer than 0 turn(s)".
+- An MCP 401 always tells you to run `meka mcp login`; the advice was gated on an unrelated
+  cache write succeeding.
+- A tool annotation that fails to serialize now warns on the refresh and sub-agent paths too,
+  where a lost `readOnlyHint` was silently relaxing permission resolution.
+- A failed background-outcome turn logs its cause rather than a Rust variant name.
+- `meka mcp list` and `mcp get` no longer report `read` for a server whose permission is unset.
+- `meka mcp get` names the configured auth flow instead of printing `Discriminant(1)`.
+- `meka mcp get` no longer tells you to write `auth = oauth`, which does not parse; it is a table.
+- The Claude body-size error no longer claims a 32 MiB limit while rejecting at meka's 30 MiB.
+- The Landlock hint named a config key without its table, so pasting it broke the config.
+- The `--edit` flag warns when `$EDITOR` is unset instead of no-opping below the default log level.
+- `$EDITOR` failure reports the exit status rather than `Some(1)`.
+- Retention deletion says "not updated in N days", which is what it actually deletes.
+- The Ctrl+C hint pointed at `/tasks`, which only lists; it now names `/tasks cancel --all`.
+- `/help` lists `/mcp list`, and its columns line up again for `/permission`.
+- `-h` for `meka account` and `--render-mode` no longer omit a subcommand and a valid value.
+- `meka instructions show` no longer claims to consult `--instructions`, which it ignores.
+- `meka mcp reconnect` no longer promises to print `ok`, and no longer promises a background retry
+  that a CLI run cannot perform.
+- The MCP elicitation timeout is read from its constant instead of a hardcoded "60s".
+- The session-GC log named `scan_interval`; the key is `gc_scan_interval`.
+- The documented `meka mcp add` and `mcp login` transcripts match what meka prints.
 - A `base_url` with a trailing slash no longer doubles it into every request path.
 - A `claude-*` `base_url` ending in `/v1` now works instead of requesting `/v1/v1/messages`.
 - An invisible character a terminal still paints is dropped, so it cannot push text off the row.

@@ -125,7 +125,7 @@ async fn run_add(
         .await?;
     write_profile(name, &backend, model.as_str(), base_url.as_deref())?;
 
-    eprintln!("ok: added provider profile '{}'", name);
+    tracing::info!("added provider profile '{}'", name);
     Ok(())
 }
 
@@ -143,7 +143,7 @@ async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
     token_store
         .save_provider_credential(name, &credential)
         .await?;
-    eprintln!("ok: re-authenticated provider profile '{}'", name);
+    tracing::info!("re-authenticated provider profile '{}'", name);
     Ok(())
 }
 
@@ -177,10 +177,10 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     config::write_file_atomic(&path, &document.to_string())?;
 
     if has_profile {
-        eprintln!("ok: removed provider profile '{}'", name);
+        tracing::info!("removed provider profile '{}'", name);
     } else {
-        eprintln!(
-            "ok: deleted the stored credential for '{}'; no profile was configured",
+        tracing::info!(
+            "cleared the stored credential for '{}'; no profile was configured",
             name
         );
     }
@@ -197,7 +197,7 @@ fn run_use(name: &str) -> anyhow::Result<()> {
         );
     }
     set_default_provider(name)?;
-    eprintln!("ok: default provider set to '{}'", name);
+    tracing::info!("default provider set to '{}'", name);
     Ok(())
 }
 
@@ -208,7 +208,7 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
     let orphans = orphaned_profiles(token_store, &config_file).await?;
 
     if config_file.providers.is_empty() {
-        println!("(no provider profiles configured)");
+        eprintln!("No provider profiles configured.");
         report_orphaned_profiles(&orphans);
         return Ok(());
     }
@@ -623,8 +623,8 @@ async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> 
             Ok(listener) => Some(listener),
             Err(error) if paste_enabled => {
                 tracing::warn!(
-                    "failed to bind callback listener on 127.0.0.1:{}: {}. \
-                     Falling back to pasting the callback URL.",
+                    "failed to bind callback listener on 127.0.0.1:{}: {}; \
+                     falling back to pasting the callback URL",
                     CODEX_REDIRECT_PORT,
                     error
                 );
@@ -654,7 +654,7 @@ async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> 
     }
     if paste_enabled {
         eprintln!(
-            "Or, if your browser is on another machine, paste the full callback URL here and press Enter."
+            "If your browser is on another machine, paste the full callback URL here and press Enter."
         );
     }
 
@@ -745,7 +745,9 @@ async fn accept_codex_callback(
         }
         let (mut stream, _) = match tokio::time::timeout(remaining, listener.accept()).await {
             Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => anyhow::bail!("accept failed: {}", error),
+            Ok(Err(error)) => {
+                anyhow::bail!("failed to accept the OAuth callback connection: {}", error)
+            }
             Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
         };
 
@@ -766,7 +768,9 @@ async fn accept_codex_callback(
             match tokio::time::timeout(read_remaining, stream.read(&mut temp)).await {
                 Ok(Ok(0)) => break buffer.windows(4).any(|window| window == b"\r\n\r\n"),
                 Ok(Ok(n)) => buffer.extend_from_slice(&temp[..n]),
-                Ok(Err(error)) => anyhow::bail!("read failed: {}", error),
+                Ok(Err(error)) => {
+                    anyhow::bail!("failed to read the OAuth callback request: {}", error)
+                }
                 Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
             }
         };
@@ -1073,8 +1077,8 @@ mod tests {
         assert!(!contents.contains("default_provider"), "{contents}");
     }
 
-    /// Without this, `provider remove typo` printed `ok: removed provider profile 'typo'` and
-    /// exited 0 having done nothing at all.
+    /// Without this, `provider remove typo` reported `removed provider profile 'typo'` and exited
+    /// 0 having done nothing at all.
     #[tokio::test]
     async fn remove_refuses_a_name_with_neither_profile_nor_credential() {
         let dir = tempfile::tempdir().expect("tempdir");

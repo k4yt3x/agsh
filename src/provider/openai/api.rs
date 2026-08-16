@@ -446,7 +446,7 @@ impl Provider for OpenAiProvider {
                             let data: serde_json::Value = match serde_json::from_str(&event.data) {
                                 Ok(data) => data,
                                 Err(error) => {
-                                    tracing::warn!("failed to parse SSE data: {}", error);
+                                    tracing::warn!("failed to parse OpenAI SSE data: {}", error);
                                     continue;
                                 }
                             };
@@ -658,7 +658,7 @@ fn parse_openai_stop_reason(reason: &str) -> StopReason {
         "length" => StopReason::MaxTokens,
         other => {
             tracing::warn!(
-                "openai returned unrecognized finish_reason {other:?}; mapping to Unknown"
+                "OpenAI returned unrecognized finish_reason {other:?}; mapping to Unknown"
             );
             StopReason::Unknown(other.to_string())
         }

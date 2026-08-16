@@ -1405,8 +1405,8 @@ fn warn_if_world_readable(path: &std::path::Path) {
             let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 tracing::warn!(
-                    "token_file '{}' has permissions {:04o}; recommend chmod 0600 to prevent \
-                     other users from reading the bearer token",
+                    "[serve.tokens] token_file '{}' has permissions {:04o}; recommend chmod 0600 \
+                     to prevent other users from reading the bearer token",
                     path.display(),
                     mode,
                 );
@@ -1518,7 +1518,7 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
         other => {
             tracing::warn!(
                 "ignoring unknown [display].input_style '{}' (expected \
-                 default, none, reverse, bold, dim, italic, underline, or a colour name)",
+                 default, none, reverse, bold, dim, italic, underline, or a color name)",
                 other
             );
             default_input_style()
@@ -1686,7 +1686,7 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
 ///
 /// The line between failing and continuing is whether a command *consults* the parsed config. One
 /// that does can only answer from empty defaults, which reads as fact: `meka provider list`
-/// printing "(no provider profiles configured)" over a file full of them. Those callers use
+/// printing "No provider profiles configured." over a file full of them. Those callers use
 /// [`load_config_file_or_err`] / [`ResolvedConfig::require_readable_config`].
 ///
 /// Commands that instead edit the raw document through `toml_edit` are unaffected by an unknown key

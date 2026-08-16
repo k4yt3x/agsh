@@ -240,7 +240,10 @@ impl ClaudeOAuthProvider {
                 Ok(Some(latest)) => *credential = latest,
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!("failed to re-read OAuth token before refresh: {}", error);
+                    tracing::warn!(
+                        "failed to re-read Claude OAuth token before refresh: {}",
+                        error
+                    );
                 }
             }
         }
@@ -289,7 +292,7 @@ impl ClaudeOAuthProvider {
                 .save_provider_credential(&self.credential_key, &new_credential)
                 .await
         {
-            tracing::warn!("failed to persist refreshed OAuth token: {}", error);
+            tracing::warn!("failed to persist refreshed Claude OAuth token: {}", error);
         }
 
         *credential = new_credential;
@@ -301,7 +304,7 @@ impl ClaudeOAuthProvider {
         refresh_token: &str,
         prior_account_id: Option<String>,
     ) -> Result<AuthCredential> {
-        tracing::info!("refreshing OAuth token");
+        tracing::info!("refreshing Claude OAuth token");
 
         let response = self
             .client
@@ -323,7 +326,7 @@ impl ClaudeOAuthProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_else(|error| {
-                tracing::warn!("failed to read OAuth refresh error body: {}", error);
+                tracing::warn!("failed to read Claude OAuth refresh error body: {}", error);
                 String::new()
             });
             return Err(MekaError::Provider(format!(

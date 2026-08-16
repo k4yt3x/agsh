@@ -210,7 +210,7 @@ async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cau
         tracing::debug!("MCP server '{}' still unavailable: {}", server_name, cause);
     } else {
         tracing::warn!(
-            "failed to connect to MCP server '{}': {} (retrying in the background)",
+            "failed to connect to MCP server '{}': {}",
             server_name,
             cause
         );
@@ -571,32 +571,6 @@ pub(super) async fn connect_server(
                     server_name: server_name.to_string(),
                     message: "http transport requires 'url' field".to_string(),
                 })?;
-
-            // Consult the auth-probe cache: if a prior connect returned 401 recently and we have no
-            // stored creds, skip the unauthenticated probe and drive straight into the OAuth flow.
-            // The cache entry is cleared on a successful connect below.
-            if config.auth.is_some()
-                && let Some(store) = token_store
-            {
-                match store
-                    .load_auth_probe(server_name, super::MCP_AUTH_CACHE_TTL)
-                    .await
-                {
-                    Ok(Some(true)) => {
-                        tracing::info!(
-                            "MCP server '{}': cached 'needs-auth' verdict (<{:?} old), going straight to OAuth",
-                            server_name,
-                            super::MCP_AUTH_CACHE_TTL
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::debug!(
-                        "auth probe cache lookup for '{}' failed: {}",
-                        server_name,
-                        error
-                    ),
-                }
-            }
 
             let transport_config = build_http_transport_config(server_name, config)?;
 

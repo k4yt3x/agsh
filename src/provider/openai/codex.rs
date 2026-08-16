@@ -464,7 +464,7 @@ async fn aggregate_stream(
             StreamEvent::Usage(usage) => token_usage.merge_stream(&usage),
             StreamEvent::Notice(notice) => notices.push(notice),
             StreamEvent::Error(error) => {
-                tracing::error!("codex complete: stream error: {}", error);
+                tracing::error!("codex: stream error: {}", error);
             }
         }
     }

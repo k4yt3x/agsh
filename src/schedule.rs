@@ -665,8 +665,8 @@ where
     // intact and the next sweep takes them.
     if held_over > 0 {
         tracing::info!(
-            "held {} due job(s) over past the per-session budget of {}; they keep their occurrence \
-             and run on the next sweep",
+            "held over {} due job(s) past [schedule].max_consecutive_fires ({}); they keep their \
+             occurrence and run on the next sweep",
             held_over,
             config.max_consecutive_fires
         );

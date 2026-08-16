@@ -26,8 +26,8 @@ pub struct AddArgs<'a> {
     pub edit: bool,
 }
 
-/// `meka skill list`: print a tab-separated table of every installed skill. Empty case prints `(no
-/// skills installed)` so scripts grepping the output don't get a confusing zero-byte result.
+/// `meka skill list`: print a tab-separated table of every installed skill. The empty case is a
+/// status note on stderr, not data, so a caller piping this gets a clean empty stdout.
 pub async fn run_list() -> Result<()> {
     let skills = skills::discover_skills();
     print_list(&skills);
@@ -36,7 +36,7 @@ pub async fn run_list() -> Result<()> {
 
 fn print_list(skills: &[skills::Skill]) {
     if skills.is_empty() {
-        println!("(no skills installed)");
+        eprintln!("No skills installed.");
         return;
     }
 
@@ -130,7 +130,7 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
         MekaError::Config(format!("failed to write {}: {}", skill_md.display(), error))
     })?;
 
-    tracing::info!("created skill '{}' at {}", args.name, skill_md.display());
+    tracing::info!("created skill '{}'", args.name);
     println!("{}", skill_md.display());
 
     if args.edit {
@@ -144,10 +144,10 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
                     MekaError::Config(format!("failed to launch $EDITOR: {}", error))
                 })?;
             if !status.success() {
-                tracing::warn!("$EDITOR exited with non-zero status: {:?}", status.code());
+                tracing::warn!("$EDITOR exited abnormally: {}", status);
             }
         } else {
-            tracing::info!("--edit was requested but $EDITOR is unset; skipping");
+            tracing::warn!("--edit was requested but $EDITOR is unset; skipping");
         }
     }
 
@@ -284,7 +284,7 @@ async fn update_all(yes: bool) -> Result<()> {
         .collect();
 
     if updatable.is_empty() {
-        println!("(no skills declare a source_url)");
+        eprintln!("No skills declare a source_url.");
         return Ok(());
     }
 

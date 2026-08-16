@@ -140,7 +140,7 @@ impl WebhookDispatcher {
             let payload = match serde_json::to_vec(&body) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    tracing::error!("failed to serialise webhook payload: {}", error);
+                    tracing::error!("failed to serialize webhook payload: {}", error);
                     continue;
                 }
             };

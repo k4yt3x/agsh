@@ -303,7 +303,7 @@ fn search_file(
             Ok(results.len() <= max_results)
         }),
     ) {
-        tracing::debug!("search_path failed for {}: {}", path.display(), error);
+        tracing::debug!("could not search {}: {}", path.display(), error);
     }
 
     Ok(())

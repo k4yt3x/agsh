@@ -2280,10 +2280,12 @@ pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);
 }
 
-/// Print the "no provider configured" hint shown when the agent fails to initialize. Centralized so
-/// the wording stays in sync everywhere.
+/// Print the provider-setup hint shown when the agent fails to initialize. Centralized so the
+/// wording stays in sync everywhere.
+///
+/// Deliberately says nothing about *why* setup failed: both call sites print the error first, and
+/// it is as often a configured profile missing its credential as no profile at all.
 pub fn render_provider_setup_hint() {
-    eprintln!("Configure a provider to use meka.");
     eprintln!("Example: meka provider add work --type claude-oauth --model claude-opus-5");
     eprintln!("Run `meka provider list` to see configured profiles.");
 }

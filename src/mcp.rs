@@ -51,11 +51,6 @@ pub const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub const ALLOWED_IMAGE_MIME_TYPES: &[&str] =
     &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Cache TTL for MCP "needs auth" probe verdicts. A value of 15 min matches Claude Code's
-/// `MCP_AUTH_CACHE_TTL_MS` and keeps a restart after a failed auth flow from re-probing servers in
-/// a tight loop.
-pub const MCP_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-
 pub(crate) type McpRunningService =
     rmcp::service::RunningService<RoleClient, handler::MekaClientHandler>;
 
@@ -240,10 +235,6 @@ impl ServerEntry {
     pub(crate) fn server_name(&self) -> &str {
         &self.server_name
     }
-
-    pub(crate) fn token_store(&self) -> Option<&TokenStore> {
-        self.token_store.as_ref()
-    }
 }
 
 impl ServerEntry {
@@ -295,7 +286,7 @@ impl ServerEntry {
         }
 
         tracing::warn!(
-            "MCP server '{}' transport closed, attempting reconnect",
+            "MCP server '{}' transport closed; attempting reconnect",
             self.server_name
         );
 
@@ -455,7 +446,7 @@ impl McpClientManager {
                 return Err(MekaError::McpConnection {
                     server_name: config.name.clone(),
                     message: format!(
-                        "server name contains characters not allowed in tool prefixes (would normalise to '{}')",
+                        "server name contains characters not allowed in tool prefixes (would normalize to '{}')",
                         normalised
                     ),
                 });
@@ -478,10 +469,7 @@ impl McpClientManager {
 
             let is_disabled = config.disabled;
             if is_disabled {
-                tracing::info!(
-                    "MCP server '{}' is disabled in config, skipping",
-                    config.name
-                );
+                tracing::info!("MCP server '{}' is disabled in config", config.name);
             }
 
             let entry = Arc::new(ServerEntry {
@@ -778,14 +766,39 @@ impl McpClientManager {
                 self.mcp_default_permission,
             )?;
 
+            // Annotations carry permission hints (`readOnlyHint`, `destructiveHint`); silently
+            // dropping them on a serialization failure could quietly relax permission resolution.
+            // Matches `connector::build_mcp_adapters`, which this path duplicates: a hint lost
+            // during a `tools/list_changed` refresh or a sub-agent spawn is exactly as
+            // consequential as one lost at startup.
             let annotations = tool
                 .annotations
                 .as_ref()
-                .and_then(|ann| serde_json::to_value(ann).ok());
+                .and_then(|ann| match serde_json::to_value(ann) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        tracing::warn!(
+                            "failed to serialize annotations for tool '{}': {}",
+                            namespaced_name,
+                            error
+                        );
+                        None
+                    }
+                });
             let meta = tool
                 .meta
                 .as_ref()
-                .and_then(|m| serde_json::to_value(m).ok());
+                .and_then(|m| match serde_json::to_value(m) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        tracing::warn!(
+                            "failed to serialize meta for tool '{}': {}",
+                            namespaced_name,
+                            error
+                        );
+                        None
+                    }
+                });
             let title = tool
                 .title
                 .as_ref()
@@ -834,7 +847,7 @@ impl McpClientManager {
             // server should not even be listed, and `list_all_tools` on a server the sub-agent
             // cannot use is latency the spawn pays for nothing.
             if registry.denials().denies_server(&name) {
-                tracing::info!("mcp: sub-agent registry denied server '{}'", name);
+                tracing::info!("MCP server '{}' denied for sub-agent registry", name);
                 continue;
             }
             let adapters = match self.discover_tools_for_server(&name).await {
@@ -844,7 +857,7 @@ impl McpClientManager {
                     // normal, not worth a warn. The sub-agent just won't see this server's tools
                     // until it next runs (and the parent's connector finishes the handshake).
                     tracing::debug!(
-                        "mcp: sub-agent registry skipped server '{}': {}",
+                        "MCP server '{}' skipped for sub-agent registry: {}",
                         name,
                         error
                     );
@@ -1031,7 +1044,9 @@ impl McpClientManager {
         match Arc::try_unwrap(self) {
             Ok(manager) => manager.shutdown().await,
             Err(_shared) => {
-                tracing::debug!("mcp manager still referenced; relying on drop guards");
+                tracing::debug!(
+                    "MCP manager still referenced at shutdown; relying on drop guards for cleanup"
+                );
             }
         }
     }
@@ -1433,12 +1448,12 @@ pub async fn list_prompts(entry: &Arc<ServerEntry>) -> Result<Vec<Prompt>> {
                 .await
                 .map_err(|error| MekaError::McpConnection {
                     server_name: entry.server_name.clone(),
-                    message: format!("list_prompts failed: {}", error),
+                    message: format!("could not list prompts: {}", error),
                 })
         }
         Err(error) => Err(MekaError::McpConnection {
             server_name: entry.server_name.clone(),
-            message: format!("list_prompts failed: {}", error),
+            message: format!("could not list prompts: {}", error),
         }),
     }
 }
@@ -1496,12 +1511,12 @@ pub async fn get_prompt(
                 .await
                 .map_err(|error| MekaError::McpConnection {
                     server_name: entry.server_name.clone(),
-                    message: format!("get_prompt({}) failed: {}", name, error),
+                    message: format!("could not render prompt '{}': {}", name, error),
                 })
         }
         Err(error) => Err(MekaError::McpConnection {
             server_name: entry.server_name.clone(),
-            message: format!("get_prompt({}) failed: {}", name, error),
+            message: format!("could not render prompt '{}': {}", name, error),
         }),
     }
 }

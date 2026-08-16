@@ -362,8 +362,7 @@ async fn commit_idempotency(
     if skip_cache {
         tracing::debug!(
             session_id = %session_id,
-            "skipping idempotency cache commit for a 5xx or pre-attempt turn-in-flight \
-             response; ticket Drop clears the Pending entry so retries re-execute"
+            "not caching this turn against its Idempotency-Key; a retry will re-execute"
         );
         return;
     }
@@ -872,7 +871,7 @@ fn terminal_event_parts(
             )
         }
         Err(panic) => {
-            tracing::error!("turn task panicked: {:?}", panic);
+            tracing::error!("streaming turn task panicked: {:?}", panic);
             (
                 crate::server::sse::SseEventType::TurnFailed,
                 serde_json::json!({

@@ -42,10 +42,10 @@ pub enum ListDetail {
 pub async fn run_list(detail: ListDetail) -> Result<()> {
     let index = memory::discover_memories();
     if index.memories.is_empty() {
-        println!("(no memories saved)");
+        eprintln!("No memories saved.");
         // Deliberately after the "none saved" line rather than instead of it. A store whose files
         // all fail to parse is exactly the case worth reporting, and an early return here would
-        // print "no memories saved" over the top of four unreadable ones.
+        // print "No memories saved." over the top of four unreadable ones.
         report_unreadable(&index);
         return Ok(());
     }

@@ -579,9 +579,9 @@ impl Tool for AgentSpawnTool {
                 message: format!("failed to create sub-agent session: {}", error),
             })?;
         tracing::info!(
-            "spawning sub-agent: parent={} child={}",
-            parent_sid,
-            sub_session_id
+            "spawning sub-agent {} for parent {}",
+            sub_session_id,
+            parent_sid
         );
 
         let sub_roots_snapshot =

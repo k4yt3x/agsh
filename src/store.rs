@@ -60,12 +60,13 @@ pub(crate) fn reject_symlinked_path(path: &std::path::Path, noun: &str) -> Resul
             // config directory is something the person running it should hear about once, since
             // they did not put it there by using meka.
             tracing::warn!(
-                "refusing to write through symlinked {} path {}; it points outside the store",
+                "refusing to write through symlinked {} path {}; a symlink can redirect the write \
+                 out of the store",
                 noun,
                 path.display()
             );
             Err(format!(
-                "{} path {} is a symlink; refusing to write through it, because it would leave \
+                "{} path {} is a symlink; refusing to write through it, because it could leave \
                  the store meka owns",
                 noun,
                 path.display()

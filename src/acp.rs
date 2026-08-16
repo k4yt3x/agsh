@@ -864,7 +864,7 @@ impl Frontend for AcpFrontend {
         if !supported {
             tracing::warn!(
                 "MCP elicitation from '{}' ({}) declined: the client does not support this \
-                 elicitation mode: {}",
+                 elicitation mode; prompt was '{}'",
                 prompt.server_name,
                 kind,
                 prompt.message,
@@ -875,7 +875,7 @@ impl Frontend for AcpFrontend {
         let Some(request) = elicitation::to_acp_request(&prompt, &self.session_id) else {
             tracing::warn!(
                 "MCP elicitation from '{}' declined: its schema uses a field type ACP cannot \
-                 express, so the client could not render the form: {}",
+                 express, so the client could not render the form; prompt was '{}'",
                 prompt.server_name,
                 prompt.message,
             );
@@ -1944,7 +1944,10 @@ async fn acp_shutdown_signal() {
                 }
             }
             Err(error) => {
-                tracing::debug!("failed to install SIGTERM handler ({error}); using Ctrl-C only");
+                tracing::warn!(
+                    "failed to install SIGTERM handler: {}; relying on Ctrl+C only",
+                    error
+                );
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
@@ -2153,7 +2156,10 @@ pub async fn run_acp(
                         .update_session_roots(session_uuid, &req.additional_directories)
                         .await
                     {
-                        tracing::warn!("failed to persist additional roots: {}", error);
+                        tracing::warn!(
+                            "session/new: failed to persist additional roots: {}",
+                            error
+                        );
                     }
 
                     // Take the OS file lock on the newly created session row so a second `meka acp`
@@ -2706,7 +2712,10 @@ async fn handle_load_session(
         .update_session_roots(session_uuid, &req.additional_directories)
         .await
     {
-        tracing::warn!("failed to persist additional roots: {}", error);
+        tracing::warn!(
+            "session/load: failed to persist additional roots: {}",
+            error
+        );
     }
 
     let runtime = match build_session_runtime(
@@ -2907,7 +2916,7 @@ async fn handle_resume_session(
     let dropped = conversation.sanitize_orphans();
     if !dropped.is_empty() {
         tracing::warn!(
-            "dropped {} orphaned assistant message(s) with unmatched tool calls while loading session {}",
+            "dropped {} orphaned assistant message(s) with unmatched tool calls while resuming session {}",
             dropped.len(),
             session_uuid,
         );
@@ -2921,7 +2930,10 @@ async fn handle_resume_session(
         .update_session_roots(session_uuid, &req.additional_directories)
         .await
     {
-        tracing::warn!("failed to persist additional roots: {}", error);
+        tracing::warn!(
+            "session/resume: failed to persist additional roots: {}",
+            error
+        );
     }
 
     let runtime = match build_session_runtime(

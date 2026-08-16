@@ -278,7 +278,7 @@ async fn async_main(
             .await?;
         if deleted > 0 {
             tracing::warn!(
-                "deleted {} session(s) older than {} days ([session].retention_days)",
+                "deleted {} session(s) not updated in {} days ([session].retention_days)",
                 deleted,
                 retention_days
             );
@@ -908,7 +908,7 @@ async fn report_background_survivors(agent: &Agent) {
     if running > 0 {
         eprintln!(
             "{} background task(s) still running. Press Ctrl+C again during a turn to stop them, \
-             or use /tasks.",
+             or run /tasks cancel --all.",
             running
         );
     }
@@ -1651,7 +1651,15 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Rewind(turns) => {
                         let turns = turns.unwrap_or(1);
-                        match (session_id, messages.rewind(turns)) {
+                        // `rewind(0)` returns `None` unconditionally, so without this the `None`
+                        // arm below would report "fewer than 0 turn(s)". The count is what's
+                        // wrong, not the conversation.
+                        let rewound = if turns == 0 {
+                            None
+                        } else {
+                            messages.rewind(turns)
+                        };
+                        match (session_id, rewound) {
                             (Some(id), Some(event)) => {
                                 if let Err(error) = session_manager.save_event(id, &event).await {
                                     // Put the turns back rather than leave memory and disk
@@ -1673,6 +1681,11 @@ async fn run_interactive(
                             (None, Some(_)) => {
                                 agent.reset_conversation_markers().await;
                                 render::render_hint(&format!("Rewound {} turn(s).", turns));
+                            }
+                            (_, None) if turns == 0 => {
+                                eprintln!(
+                                    "Nothing to rewind: /rewind takes a turn count of 1 or more."
+                                );
                             }
                             (_, None) => {
                                 eprintln!(
@@ -1783,7 +1796,7 @@ async fn run_interactive(
                         args,
                     } => 'prompt: {
                         let Some(manager) = mcp_manager.as_ref() else {
-                            eprintln!("no MCP servers configured");
+                            eprintln!("No MCP servers configured.");
                             break 'prompt;
                         };
                         let entry = manager.server_entry(&server);
@@ -1793,9 +1806,9 @@ async fn run_interactive(
                             // leaving the REPL thread parked in `wait_for_agent` with no
                             // prompt, for good. Same reason as `SkillInvoke`'s `'invoke`.
                             eprintln!(
-                                "unknown MCP server '{}'; configured: {:?}",
+                                "Unknown MCP server '{}' (configured: {}).",
                                 server,
-                                manager.server_names()
+                                manager.server_names().join(", ")
                             );
                             break 'prompt;
                         };
@@ -1809,7 +1822,9 @@ async fn run_interactive(
                                 .map(|args| args.into_iter().map(|a| a.name).collect::<Vec<_>>())
                                 .unwrap_or_default(),
                             Err(error) => {
-                                eprintln!("list_prompts failed: {}", error);
+                                // The `McpConnection` error already names the server and the
+                                // operation, so wrapping it here would say both twice.
+                                render::render_error(&error);
                                 Vec::new()
                             }
                         };
@@ -1871,7 +1886,7 @@ async fn run_interactive(
                                 }
                             }
                             Err(error) => {
-                                eprintln!("get_prompt failed: {}", error);
+                                render::render_error(&error);
                             }
                         }
                     }
@@ -1904,7 +1919,6 @@ async fn run_interactive(
                         Some(session) => {
                             match session_manager.cancel_scheduled_job(session, &id).await {
                                 Ok(Some(cancelled)) => {
-                                    tracing::info!("cancelled scheduled job {}", cancelled);
                                     eprintln!(
                                         "Cancelled job {}.",
                                         &cancelled[..8.min(cancelled.len())]
@@ -2507,7 +2521,7 @@ async fn run_mcp_subcommand(
     // `validate()` never runs here, so an unparseable config has to be handled per action. The four
     // that edit `config.toml` through `toml_edit` never read `config.mcp_servers` and are how the
     // file gets repaired, so they run on a broken one; the rest would answer out of an empty server
-    // list and state it as fact ("(no MCP servers configured)", "no MCP server named 'x'").
+    // list and state it as fact ("No MCP servers configured.", "no MCP server named 'x'").
     if matches!(
         action,
         cli::McpAction::Add { .. }
@@ -2958,7 +2972,7 @@ async fn run_account_subcommand(
             let identity = match identity {
                 Ok(identity) => identity,
                 Err(error) => {
-                    eprintln!("warning: could not fetch identity: {}", error);
+                    tracing::warn!("could not fetch identity: {}", error);
                     None
                 }
             };
@@ -3118,6 +3132,11 @@ async fn rewind_session_command(
     session_id: uuid::Uuid,
     turns: usize,
 ) -> anyhow::Result<()> {
+    // Rejected before anything else: `Conversation::rewind(0)` returns `None` unconditionally, so
+    // the error below would otherwise say the session has "fewer than 0 turn(s)".
+    if turns == 0 {
+        anyhow::bail!("-n must be 1 or more");
+    }
     // Held for the whole read-modify-write. A REPL, `meka serve`, or `meka acp` holding this
     // session has its own in-memory conversation that would overwrite the rewind on its next turn.
     if !session_manager.session_exists(session_id).await? {
@@ -3158,7 +3177,7 @@ async fn run_history_subcommand(
         cli::HistoryAction::List { limit } => {
             let entries = history.recent(*limit as usize)?;
             if entries.is_empty() {
-                println!("No input history.");
+                eprintln!("No input history.");
             } else {
                 for entry in entries {
                     println!("{}", entry);
@@ -3168,7 +3187,7 @@ async fn run_history_subcommand(
         cli::HistoryAction::Clear => {
             let removed = history.clear_all()?;
             let noun = if removed == 1 { "entry" } else { "entries" };
-            println!("Cleared {} input history {}.", removed, noun);
+            tracing::info!("cleared {} input history {}", removed, noun);
         }
     }
     Ok(())
@@ -3184,7 +3203,7 @@ async fn list_sessions(
         .await?;
 
     if sessions.is_empty() {
-        println!("No sessions found.");
+        eprintln!("No sessions found.");
         return Ok(());
     }
 

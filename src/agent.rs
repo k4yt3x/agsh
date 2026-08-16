@@ -907,12 +907,11 @@ impl Agent {
             let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if last_tokens > threshold && messages.len() > 1 {
                 tracing::info!(
-                    "auto-compacting: {} input tokens exceeds {}% of {} context window",
+                    "auto-compacting: {} tokens in context exceeds {}% of the {} window",
                     last_tokens,
                     AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.options.context_window
                 );
-                tracing::info!("auto-compacting conversation");
                 if let Err(error) = self
                     .compact_session(
                         session_id,
@@ -1093,7 +1092,7 @@ impl Agent {
             let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if projected > threshold {
                 tracing::info!(
-                    "proactive compaction: projected {} input tokens exceeds {}% of {} window",
+                    "proactive compaction: projected {} input tokens exceeds {}% of the {} window",
                     projected,
                     AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.options.context_window
@@ -2576,7 +2575,7 @@ impl Agent {
                     // below can always do the job, so a checkpoint that fails
                     // costs fidelity and nothing else.
                     Err(error) => {
-                        tracing::warn!("checkpoint turn failed, summarizing instead: {}", error);
+                        tracing::warn!("checkpoint turn failed; summarizing instead: {}", error);
                         None
                     }
                 }

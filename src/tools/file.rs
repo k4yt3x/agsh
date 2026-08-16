@@ -1027,7 +1027,8 @@ impl Tool for WriteFileTool {
             // to it; only the diff's `old_text` is degraded, and that is informational.
             Some(Err(error)) => {
                 tracing::debug!(
-                    "write_file: pre-read of '{}' failed ({}); diff metadata will omit old_text",
+                    "write_file: client pre-read of '{}' failed ({}); falling back to a local \
+                     read for the diff",
                     target.display(),
                     error,
                 );

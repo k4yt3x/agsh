@@ -29,7 +29,7 @@ pub async fn run_list(
     let orphans = orphaned_credentials(servers, token_store).await?;
 
     if servers.is_empty() {
-        println!("(no MCP servers configured)");
+        eprintln!("No MCP servers configured.");
         report_orphaned_credentials(&orphans);
         return Ok(());
     }
@@ -76,7 +76,7 @@ pub async fn run_list(
                 McpTransport::Stdio => "stdio",
                 McpTransport::Http => "http",
             };
-            let perm_label = config.permission.as_deref().unwrap_or("read");
+            let perm_label = config.permission.as_deref().unwrap_or("(unset)");
 
             // `required` is settled during config resolution, so `None` only shows up for a
             // config assembled outside that path; it means the same thing as false. A disabled
@@ -187,7 +187,7 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
     }
     println!(
         "permission:  {}",
-        config.permission.as_deref().unwrap_or("read")
+        config.permission.as_deref().unwrap_or("(unset)")
     );
     if let Some(command) = &config.command {
         println!("command:     {}", command);
@@ -211,7 +211,14 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
         println!("auth_token:  (set)");
     }
     if let Some(auth) = &config.auth {
-        println!("auth:        {:?}", std::mem::discriminant(auth));
+        // The `type` value as written in config.toml, not `Debug` on a discriminant: that prints
+        // an opaque `Discriminant(1)` and tells the reader nothing about which flow is configured.
+        let auth_label = match auth {
+            McpAuthConfig::ClientCredentials { .. } => "client_credentials",
+            McpAuthConfig::ClientCredentialsJwt { .. } => "client_credentials_jwt",
+            McpAuthConfig::OAuth { .. } => "oauth",
+        };
+        println!("auth:        {}", auth_label);
     }
     if let Some(allowed) = config.allowed_tools.as_deref() {
         println!("allowed_tools: {}", allowed.join(", "));
@@ -283,7 +290,7 @@ pub async fn run_tools(
     manager.shutdown_arc().await;
 
     if tools.is_empty() {
-        println!("(server '{}' advertises no tools)", config.name);
+        eprintln!("Server '{}' advertises no tools.", config.name);
         return Ok(());
     }
 
@@ -421,7 +428,6 @@ pub async fn run_logout(
     }
 
     token_store.clear_mcp_credentials(name).await?;
-    token_store.clear_auth_probe(name).await?;
     tracing::info!("cleared credentials for '{}'", name);
     Ok(())
 }
@@ -457,7 +463,7 @@ pub async fn run_login(
                     redirect_port: None,
                 });
                 tracing::info!(
-                    "no [auth] block for '{}'; assuming OAuth authorization_code.",
+                    "no [auth] block for '{}'; assuming OAuth authorization_code",
                     name
                 );
                 (assumed, true)
@@ -472,7 +478,6 @@ pub async fn run_login(
     };
 
     token_store.clear_mcp_credentials(name).await?;
-    token_store.clear_auth_probe(name).await?;
 
     let context = McpClientContext::new();
     // `login` is also out-of-band from the main agent loop; see the note in `run_reconnect` for why
@@ -511,7 +516,8 @@ pub async fn run_login(
         // Login worked. Don't fail the whole command if we can't write the config back; just
         // surface the issue so the user can decide whether to hand-edit.
         tracing::warn!(
-            "'{}' is authorised, but failed to write 'auth = oauth' back to config.toml: {}",
+            "'{}' is authorized, but adding `type = \"oauth\"` under its [auth] table in \
+             config.toml failed: {}",
             name,
             error
         );
@@ -657,7 +663,7 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     let normalized = normalize_server_name(&args.name);
     if normalized != args.name {
         return Err(config_err(format!(
-            "server name '{}' contains invalid characters (would normalise to '{}')",
+            "server name '{}' contains invalid characters (would normalize to '{}')",
             args.name, normalized
         )));
     }
@@ -747,17 +753,17 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     if let Err(error) = result {
         match &error {
             MekaError::Interrupted => {
-                tracing::warn!("interrupted; rolling back '{}'.", resolved.name);
+                tracing::warn!("interrupted; rolling back '{}'", resolved.name);
             }
             other => tracing::warn!(
-                "authorisation failed for '{}': {}; rolling back the config entry.",
+                "authorization failed for '{}': {}; rolling back the config entry",
                 resolved.name,
                 other
             ),
         }
         if let Err(purge_err) = purge_server(&resolved.name, token_store).await {
             tracing::warn!(
-                "rollback of '{}' also failed: {}; you may need to edit config.toml by hand.",
+                "rollback of '{}' also failed: {}; you may need to edit config.toml by hand",
                 resolved.name,
                 purge_err
             );
@@ -793,7 +799,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     }
     if resolved.no_login {
         tracing::info!(
-            "skipping auto-login (--no-login). Run `meka mcp login {}` when ready.",
+            "skipping auto-login (--no-login); run `meka mcp login {}` when ready",
             resolved.name
         );
         return Ok(());
@@ -803,7 +809,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     // without round-tripping through disk.
     let server_config = resolved_to_server_config(resolved);
     tracing::info!(
-        "running OAuth authorisation for '{}' (use --no-login to skip).",
+        "running OAuth authorization for '{}' (use --no-login to skip)",
         resolved.name
     );
     run_login(
@@ -831,11 +837,11 @@ async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
 
     match crate::mcp::auth::probe_http_auth(url).await {
         McpAuthProbe::Open => {
-            tracing::info!("probe: '{}' reachable and does not require auth.", name);
+            tracing::info!("probe: '{}' reachable and does not require auth", name);
             ProbeOutcome::Open
         }
         McpAuthProbe::AuthRequired { resource_metadata } => {
-            tracing::info!("probe: '{}' requires OAuth.", name);
+            tracing::info!("probe: '{}' requires OAuth", name);
             if let Some(meta) = resource_metadata {
                 tracing::debug!("resource_metadata advertised by '{}': {}", name, meta);
             }
@@ -843,14 +849,14 @@ async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
         }
         McpAuthProbe::Unexpected { status } => {
             tracing::warn!(
-                "probe: '{}' answered HTTP {}; couldn't infer auth state.",
+                "probe: '{}' answered HTTP {}; couldn't infer auth state",
                 name,
                 status
             );
             ProbeOutcome::Inconclusive
         }
         McpAuthProbe::Unreachable { message } => {
-            tracing::warn!("probe: couldn't reach '{}' ({}).", url, message);
+            tracing::warn!("probe: couldn't reach '{}' ({})", url, message);
             ProbeOutcome::Inconclusive
         }
     }
@@ -1459,7 +1465,6 @@ async fn clear_server_state(name: &str, token_store: &TokenStore) -> Result<()> 
     }
 
     token_store.clear_mcp_credentials(name).await?;
-    token_store.clear_auth_probe(name).await?;
     crate::mcp::resource_updates::clear_for_server(name);
     Ok(())
 }

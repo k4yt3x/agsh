@@ -768,8 +768,8 @@ pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
                 // and before the meta-tools were listed in `BUILTIN_TOOL_NAMES` at all this
                 // case at least warned as unrecognised.
                 tracing::warn!(
-                    "[tools].allowed_tools entry '{}' has no effect: the MCP meta-tools are not \
-                     subject to the allow-list. Use disabled_tools to remove one.",
+                    "[tools].allowed_tools entry '{}' has no effect; the MCP meta-tools bypass \
+                     the allow-list, so use [tools].disabled_tools to remove one",
                     name
                 );
             }
@@ -1087,7 +1087,10 @@ impl ToolRegistry {
     /// come through here too.
     pub(crate) fn admits(&self, name: &str) -> bool {
         if !self.builtin_filter.admits(name) {
-            tracing::info!("skipping tool '{}' (disabled by [tools] config)", name);
+            tracing::info!(
+                "skipping tool '{}' (excluded by [tools].allowed_tools/disabled_tools)",
+                name
+            );
             return false;
         }
         self.not_denied(name)
@@ -1099,7 +1102,10 @@ impl ToolRegistry {
     /// [`BuiltinToolFilter::denies`] for why widening it now would break working configs.
     pub(crate) fn admits_infrastructure(&self, name: &str) -> bool {
         if self.builtin_filter.denies(name) {
-            tracing::info!("skipping tool '{}' (disabled by [tools] config)", name);
+            tracing::info!(
+                "skipping tool '{}' (disabled by [tools].disabled_tools)",
+                name
+            );
             return false;
         }
         self.not_denied(name)

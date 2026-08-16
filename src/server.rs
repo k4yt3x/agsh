@@ -128,7 +128,7 @@ pub async fn run_serve(
             provider: mock,
             ..(*shared).clone()
         };
-        tracing::info!("MEKA_ACP_MOCK_PROVIDER=1, using scripted mock provider");
+        tracing::info!("MEKA_ACP_MOCK_PROVIDER=1: using scripted mock provider");
         Arc::new(new_inner)
     } else {
         shared
@@ -167,7 +167,7 @@ pub async fn run_serve(
         .await
         .map_err(|error| anyhow::anyhow!("failed to bind {}: {}", bind_addr, error))?;
     let local = listener.local_addr()?;
-    tracing::info!("meka serve: listening on {}", local);
+    tracing::info!("listening on {}", local);
 
     // The timeout wraps only the post-signal drain, not the entire serve future.
     // Wrapping the whole future would start the timer at construction, causing the
@@ -183,7 +183,6 @@ pub async fn run_serve(
     let serve_handle = tokio::spawn(serve_future);
 
     shutdown_signal().await;
-    tracing::info!("meka serve: drain begin");
     state.shutdown.cancel();
     drain_active_sessions(&state).await;
     let _ = drain_tx.send(());
@@ -196,9 +195,9 @@ pub async fn run_serve(
     // Flush the SQLite WAL before exit so a quick restart doesn't pay WAL-replay cost.
     // Best-effort, SQLite recovers from an unflushed WAL automatically.
     if let Err(error) = state.shared.session_manager.checkpoint().await {
-        tracing::warn!("meka serve: WAL checkpoint on shutdown failed: {}", error);
+        tracing::warn!("WAL checkpoint on shutdown failed: {}", error);
     } else {
-        tracing::info!("meka serve: WAL checkpoint complete");
+        tracing::info!("WAL checkpoint complete");
     }
     match drain_result {
         Ok(join_result) => join_result
@@ -206,7 +205,7 @@ pub async fn run_serve(
             .map_err(|error| anyhow::anyhow!("server error: {}", error))?,
         Err(_elapsed) => {
             tracing::warn!(
-                "meka serve: drain exceeded {}s, forcing exit",
+                "drain exceeded {}s, forcing exit",
                 shutdown_drain_timeout.as_secs()
             );
             // Non-zero exit so systemd / container orchestrators can distinguish forced
@@ -414,7 +413,7 @@ async fn inject_problem_instance(
     let bytes = match axum::body::to_bytes(body, PROBLEM_DETAIL_BUFFER_LIMIT).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            tracing::warn!("inject_problem_instance: failed to buffer body: {}", error);
+            tracing::warn!("failed to buffer a problem detail response body: {}", error);
             return axum::response::Response::from_parts(parts, axum::body::Body::empty());
         }
     };
@@ -435,7 +434,7 @@ async fn inject_problem_instance(
         Ok(bytes) => axum::body::Body::from(bytes),
         Err(error) => {
             tracing::warn!(
-                "inject_problem_instance: failed to re-serialize body: {}",
+                "failed to re-serialize a problem detail response body: {}",
                 error
             );
             axum::body::Body::from(bytes)

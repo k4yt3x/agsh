@@ -100,7 +100,7 @@ fn runnable_here(
                 // about reads as "everything ran".
                 Err(error) => {
                     tracing::warn!(
-                        "cannot take the session lock for job {}, so it will not fire here: {}",
+                        "cannot take the session lock for job {}: {}; it will not fire here",
                         job.short_id(),
                         error
                     );
@@ -214,7 +214,11 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                     Ok(ready) if !ready.is_empty() => ready,
                     Ok(_) => continue,
                     Err(error) => {
-                        tracing::warn!("background poller failed for {}: {}", session_id, error);
+                        tracing::warn!(
+                            "failed to list undelivered background tasks for session {}: {}",
+                            session_id,
+                            error
+                        );
                         continue;
                     }
                 };
@@ -227,7 +231,10 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                     .mark_background_tasks_delivered(&ids)
                     .await
                 {
-                    tracing::warn!("failed to stamp background outcomes delivered: {}", error);
+                    tracing::warn!(
+                        "failed to stamp background outcomes as delivered: {}",
+                        error
+                    );
                     continue;
                 }
                 // Fired before the delivery turn rather than after it: the fact a task finished
@@ -258,7 +265,7 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                 .await
                 {
                     tracing::warn!(
-                        "background outcome turn for {} failed: {:?}",
+                        "background outcome turn for session {} failed: {}",
                         session_id,
                         error
                     );
@@ -337,6 +344,19 @@ async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
 enum RunError {
     SessionBusyElsewhere,
     Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Named as a condition rather than a failure: the job is intact and will run wherever
+            // the session is resident, which is what an operator reading this needs to know.
+            Self::SessionBusyElsewhere => {
+                write!(formatter, "its session is held by another process")
+            }
+            Self::Failed(error) => write!(formatter, "{}", error),
+        }
+    }
 }
 
 impl From<anyhow::Error> for RunError {
