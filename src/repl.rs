@@ -1885,6 +1885,10 @@ impl Frontend for ReplFrontend {
                 }
                 render::render_thinking_block(&content, self.config.thinking_show_content);
             }
+            // The indicator is drawn at `ToolCallStarted`, where the arguments exist to draw it
+            // from. Announcing the bare name first would print every call twice, and the wait it
+            // marks is one the terminal already shows as the cursor sitting still.
+            FrontendEvent::ToolCallComposing { .. } => {}
             FrontendEvent::ToolCallStarted {
                 id: _,
                 name,
@@ -2576,6 +2580,13 @@ mod tests {
             ),
             (
                 E::AssistantTextDelta("hi".to_string()),
+                IndicatorAction::Commit,
+            ),
+            (
+                E::ToolCallComposing {
+                    id: "1".to_string(),
+                    name: "read_file".to_string(),
+                },
                 IndicatorAction::Commit,
             ),
             (

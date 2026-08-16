@@ -1112,6 +1112,9 @@ fn assemble_response(
             }
             // Remaining lifecycle / UI-chrome variants (TurnStarted/Finished, TodoListUpdated,
             // McpProgress, SessionStarted) aren't part of the blocking JSON envelope.
+            // ToolCallComposing does reach here -- `stream: false` picks the response shape, not
+            // whether meka streams from the provider -- and is dropped: a body assembled after the
+            // turn is over has nothing to mark the beginning of a wait on.
             _ => {}
         }
     }

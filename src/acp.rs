@@ -508,6 +508,11 @@ impl Frontend for AcpFrontend {
                     agent_client_protocol::schema::v1::TextContent::new(content),
                 )))
             }
+            // ACP has a `pending` status this could drive, but a call is announced to the client
+            // exactly once, and that announcement carries the title, locations and arguments an
+            // editor renders -- none of which exist yet here. Sending a name-only call first would
+            // mean two `session/update: tool_call` notifications for one id.
+            FrontendEvent::ToolCallComposing { .. } => return,
             FrontendEvent::ToolCallStarted {
                 id,
                 name,

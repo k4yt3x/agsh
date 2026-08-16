@@ -1893,6 +1893,16 @@ impl Agent {
                             text: std::mem::take(&mut current_text),
                         });
                     }
+                    // Deliberately does not set `content_started`, for the same reason
+                    // `ThinkingProgress` doesn't: a call whose arguments never finish produced no
+                    // output, and the flag is what decides whether a mid-stream failure is still
+                    // safe to retry.
+                    self.frontend
+                        .emit(FrontendEvent::ToolCallComposing {
+                            id: id.clone(),
+                            name: name.clone(),
+                        })
+                        .await;
                     current_tool_id = id;
                     current_tool_name = name;
                     current_tool_input_json.clear();
@@ -4265,6 +4275,73 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, FrontendEvent::ThinkingEnded)),
             "the block event already closes the indicator: {events:?}",
+        );
+    }
+
+    /// The window a client can draw "writing a message" over: it opens when the tool's name
+    /// arrives and closes when its arguments are complete.
+    ///
+    /// The dispatch event alone puts the whole of that window on the wrong side of the signal,
+    /// because by the time it fires the arguments -- the message, for a tool that sends one -- are
+    /// already written.
+    #[tokio::test]
+    async fn test_a_tool_call_announces_composition_before_dispatch() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "tu_1".to_string(),
+                    name: "read_file".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"path": "/tmp/a.txt"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, frontend) = test_agent_recording(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "read it".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let events = frontend.events();
+        let composing = events
+            .iter()
+            .position(|event| {
+                matches!(event, FrontendEvent::ToolCallComposing { id, name }
+                    if id == "tu_1" && name == "read_file")
+            })
+            .expect("the call names itself while its arguments are still streaming");
+        let dispatched = events
+            .iter()
+            .position(
+                |event| matches!(event, FrontendEvent::ToolCallStarted { id, .. } if id == "tu_1"),
+            )
+            .expect("the call is dispatched");
+        assert!(
+            composing < dispatched,
+            "composition has to open before the dispatch that ends it: {events:?}",
         );
     }
 

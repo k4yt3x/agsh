@@ -34,6 +34,7 @@ pub struct SseEvent {
 pub enum SseEventType {
     AssistantTextDelta,
     ThinkingDelta,
+    ToolCallComposing,
     ToolCallExecuting,
     ToolCallCompleted,
     Notice,
@@ -61,6 +62,7 @@ impl SseEventType {
         match self {
             Self::AssistantTextDelta => "assistant_text.delta",
             Self::ThinkingDelta => "thinking.delta",
+            Self::ToolCallComposing => "tool_call.composing",
             Self::ToolCallExecuting => "tool_call.executing",
             Self::ToolCallCompleted => "tool_call.completed",
             Self::Notice => "notice",
@@ -166,6 +168,14 @@ pub fn translate(
                 serde_json::json!({ "text": content }),
             )
         }
+        // The only event that separates "the model is writing a message" from any other work in a
+        // turn: assistant text is usually narration around a call, and `tool_call.executing`
+        // arrives once the arguments are already written. A client rendering a typing indicator
+        // holds it between this and the matching `tool_call.executing`.
+        FrontendEvent::ToolCallComposing { id, name } => (
+            SseEventType::ToolCallComposing,
+            serde_json::json!({ "id": id, "name": name }),
+        ),
         FrontendEvent::ToolCallStarted {
             id,
             name,
@@ -271,6 +281,22 @@ mod tests {
             translate(event, SessionCapabilities::default()).expect("translates");
         assert_eq!(event_type, SseEventType::AssistantTextDelta);
         assert_eq!(data["text"], "hello");
+    }
+
+    /// The composing event carries the name and nothing else, because nothing else has streamed
+    /// yet. A client pairs it with the `tool_call.executing` on the same id.
+    #[test]
+    fn translate_tool_call_composing() {
+        let event = FrontendEvent::ToolCallComposing {
+            id: "tu_1".into(),
+            name: "read_file".into(),
+        };
+        let (event_type, data) =
+            translate(event, SessionCapabilities::default()).expect("translates");
+        assert_eq!(event_type, SseEventType::ToolCallComposing);
+        assert_eq!(event_type.as_str(), "tool_call.composing");
+        assert_eq!(data["id"], "tu_1");
+        assert_eq!(data["name"], "read_file");
     }
 
     #[test]

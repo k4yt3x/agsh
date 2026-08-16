@@ -76,12 +76,16 @@ event: assistant_text.delta
 id: 2
 data: {"text":"a Rust workspace that..."}
 
-event: tool_call.executing
+event: tool_call.composing
 id: 3
+data: {"id":"tu_1","name":"read_file"}
+
+event: tool_call.executing
+id: 4
 data: {"id":"tu_1","name":"read_file","input":{"path":"src/main.rs"},"display_summary":"src/main.rs"}
 
 event: tool_call.completed
-id: 4
+id: 5
 data: {"id":"tu_1","is_error":false,"content":[{"type":"text","text":"fn main() { ... }"}]}
 
 event: turn.finished
@@ -315,8 +319,13 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 
 | Event | Payload | When |
 |-------|---------|------|
+| `tool_call.composing` | `id`, `name` | The model started writing the call's arguments |
 | `tool_call.executing` | `id`, `name`, `input`, `display_summary` | Tool call starts |
 | `tool_call.completed` | `id`, `is_error`, `content` | Tool call finishes |
+
+The arguments are written between `tool_call.composing` and `tool_call.executing` on the same `id`, which makes that interval the only thing on the stream that separates the agent *writing a message* from the agent doing anything else. Assistant text is usually narration around a call rather than the reply itself, and by `tool_call.executing` the arguments are already finished. A client drawing a typing indicator for a tool like an MCP `send_message` raises it on the first and drops it on the second. The payload is the id and the name because nothing else has streamed yet: which conversation a message is for is not known until `tool_call.executing`.
+
+Three limits. The event exists only when meka streams from its provider, so a server started with `--no-stream` receives each call whole and emits `tool_call.executing` with nothing before it. The pairing is not guaranteed, because a turn that fails or is cancelled mid-call emits `tool_call.composing` with nothing after it, so close per-`id` state on the terminal event as well. And the interval is only wide on backends that stream a call as it is written (`claude-api`, `claude-oauth`, `openai-codex`); `openai-api` resolves each call's name and arguments together when the stream ends, so there the two events arrive back to back.
 
 #### Notices and pauses
 

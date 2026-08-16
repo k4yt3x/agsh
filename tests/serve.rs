@@ -1836,6 +1836,60 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
     );
 }
 
+/// `tool_call.composing` opens the window a client can draw "the agent is writing" over, and
+/// `tool_call.executing` closes it. The order is the whole point: the arguments -- for a tool that
+/// sends a message, the message -- are written between the two, so an indicator raised on the
+/// dispatch alone would appear only after there was nothing left to wait for.
+#[test]
+fn streaming_tool_call_announces_composition_before_it_executes() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "kind": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "listed" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let body = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "list it", "stream": true}))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+
+    let composing = body
+        .find("event: tool_call.composing")
+        .unwrap_or_else(|| panic!("stream must emit tool_call.composing; body was:\n{}", body));
+    let executing = body
+        .find("event: tool_call.executing")
+        .unwrap_or_else(|| panic!("stream must emit tool_call.executing; body was:\n{}", body));
+    assert!(
+        composing < executing,
+        "composition must be announced before the dispatch; body was:\n{}",
+        body,
+    );
+    assert!(
+        body[composing..executing].contains("{\"id\":\"tu_1\",\"name\":\"list_directory\"}"),
+        "tool_call.composing carries the id to pair on and the name, and nothing else has \
+         streamed yet; body was:\n{}",
+        body,
+    );
+}
+
 /// Every mutating endpoint must return 404 (not 500) for an unknown session id, with a
 /// `session-not-found` Problem Detail.
 #[test]

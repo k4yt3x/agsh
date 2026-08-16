@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: manage scheduled jobs and background tasks.
 - HTTP: full CRUD for skills and memory, behind new `skills:w`, `memory:r` and `memory:w` scopes.
 - HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
+- HTTP: `tool_call.composing` marks when the model starts writing a tool call's arguments.
 - HTTP: rejoin a turn's SSE stream with `Last-Event-ID` after a dropped connection.
 - HTTP: compaction is visible through a `revision` counter, a summary marker, and an SSE event.
 - HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.

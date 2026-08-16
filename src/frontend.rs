@@ -203,6 +203,21 @@ pub enum FrontendEvent {
         #[allow(dead_code)]
         signature: Option<String>,
     },
+    /// The model has started composing a tool call: the name has arrived, the arguments have not.
+    ///
+    /// Pairs with [`Self::ToolCallStarted`] on the same `id`, which marks the end of composition
+    /// and carries the arguments. The interval between the two is the time the model spent
+    /// generating them, and for a tool whose argument *is* the user-visible text -- a chat
+    /// bridge's `send_message`, say -- it is the only signal on the stream that a reply is
+    /// being written rather than more work being done. Nothing else distinguishes the two:
+    /// assistant text is usually narration *around* a call, and `ToolCallStarted` fires once
+    /// the text is already finished.
+    ///
+    /// Streamed turns only, and unpaired if the turn dies. Under `--no-stream` the provider hands
+    /// back each call whole, so there is no composition to report and this never fires; and a turn
+    /// that fails or is cancelled mid-block emits this with no `ToolCallStarted` after it, so a
+    /// consumer holding state per `id` has to close it on the turn's terminal event as well.
+    ToolCallComposing { id: String, name: String },
     /// A tool call is about to be dispatched. `id` is the `tool_use_id` assigned by the provider;
     /// frontends use it to correlate this announcement with the matching
     /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
@@ -453,10 +468,13 @@ impl Frontend for PermissionForwardingFrontend {
             // Everything else (text deltas, thinking, tool results, todos, token usage, session
             // lifecycle) is sub-agent chrome the user shouldn't see.
             //
-            // [`FrontendEvent::ToolCallOutputDelta`] must stay in here rather than being forwarded.
-            // It is keyed by the sub-agent's own `tool_use_id`, which names no tool call the client
-            // has been told about, so a frontend that buffers deltas per call would accumulate an
-            // entry that nothing ever completes and frees.
+            // [`FrontendEvent::ToolCallOutputDelta`] and [`FrontendEvent::ToolCallComposing`] must
+            // stay in here rather than being forwarded. Both are keyed by the sub-agent's own
+            // `tool_use_id`, which names no tool call the client has been told about, so a frontend
+            // that holds state per call would accumulate an entry that nothing ever completes and
+            // frees. Composing is the worse of the two: the event that closes it is this level's
+            // `ToolCallStarted`, which the arm above turns into a `SubAgentActivity` -- so the id
+            // would never be heard from again, and an indicator opened on it would never come down.
             _ => {}
         }
     }
@@ -796,6 +814,33 @@ mod tests {
             .emit(FrontendEvent::SubAgentActivity {
                 tool_call_id: "toolu_nested".into(),
                 summary: "read_file: /deep".into(),
+            })
+            .await;
+
+        assert!(recorder.events().is_empty());
+    }
+
+    /// The two events keyed by the sub-agent's own `tool_use_id` must not reach the parent's
+    /// client, which has never been told that id exists. Composing is the sharper case: the
+    /// `ToolCallStarted` that would close it is rolled up into a `SubAgentActivity` against the
+    /// parent's call, so a client pairing the two would hold an indicator open on an id it never
+    /// hears about again.
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_drops_events_keyed_by_sub_agent_call_id() {
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
+
+        forwarder
+            .emit(FrontendEvent::ToolCallComposing {
+                id: "toolu_child".into(),
+                name: "read_file".into(),
+            })
+            .await;
+        forwarder
+            .emit(FrontendEvent::ToolCallOutputDelta {
+                id: "toolu_child".into(),
+                chunk: "building...".into(),
             })
             .await;
 
