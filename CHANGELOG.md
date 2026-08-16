@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `base_url` with a trailing slash no longer doubles it into every request path.
+- A `claude-*` `base_url` ending in `/v1` now works instead of requesting `/v1/v1/messages`.
 - An invisible character a terminal still paints is dropped, so it cannot push text off the row.
 - A skin-toned emoji no longer overflows the row meka measured it to fit.
 - A long run of combining marks in a tool call no longer freezes the terminal for minutes.

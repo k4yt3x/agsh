@@ -104,7 +104,9 @@ impl OpenAiCodexProvider {
         Ok(Self {
             client,
             credential: tokio::sync::RwLock::new(credential),
-            base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            base_url: crate::provider::normalize_base_url(
+                base_url.as_deref().unwrap_or(DEFAULT_BASE_URL),
+            ),
             model,
             client_id: client_id.unwrap_or_else(|| DEFAULT_OPENAI_CODEX_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url.unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string()),
@@ -135,45 +137,44 @@ impl OpenAiCodexProvider {
     /// explicit so users pointing `--base-url` at a custom proxy don't need to know the rewrite
     /// rule.
     fn responses_url(&self) -> String {
-        let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.contains("/backend-api") || trimmed.contains("/codex") {
-            format!("{}/responses", trimmed)
+        let base = &self.base_url;
+        if base.contains("/backend-api") || base.contains("/codex") {
+            format!("{}/responses", base)
         } else {
-            format!("{}/backend-api/codex/responses", trimmed)
+            format!("{}/backend-api/codex/responses", base)
         }
     }
 
     /// URL of the ChatGPT-backend usage endpoint (`/wham/usage`), which lives under `/backend-api`
     /// alongside the responses endpoint.
     fn usage_url(&self) -> String {
-        let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.contains("/backend-api") {
-            format!("{}/wham/usage", trimmed)
+        let base = &self.base_url;
+        if base.contains("/backend-api") {
+            format!("{}/wham/usage", base)
         } else {
-            format!("{}/backend-api/wham/usage", trimmed)
+            format!("{}/backend-api/wham/usage", base)
         }
     }
 
     /// URL of the ChatGPT-backend token-usage-profile endpoint (`/wham/profiles/me`).
     fn profiles_url(&self) -> String {
-        let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.contains("/backend-api") {
-            format!("{}/wham/profiles/me", trimmed)
+        let base = &self.base_url;
+        if base.contains("/backend-api") {
+            format!("{}/wham/profiles/me", base)
         } else {
-            format!("{}/backend-api/wham/profiles/me", trimmed)
+            format!("{}/backend-api/wham/profiles/me", base)
         }
     }
 
     /// URL of the ChatGPT-backend models endpoint (`/backend-api/codex/models`), which lists each
     /// model's `context_window`. The `client_version` query mirrors the first-party Codex CLI.
     fn models_url(&self) -> String {
-        let trimmed = self.base_url.trim_end_matches('/');
-        let base = if trimmed.contains("/backend-api") {
-            format!("{}/codex/models", trimmed)
+        let path = if self.base_url.contains("/backend-api") {
+            format!("{}/codex/models", self.base_url)
         } else {
-            format!("{}/backend-api/codex/models", trimmed)
+            format!("{}/backend-api/codex/models", self.base_url)
         };
-        format!("{}?client_version={}", base, env!("CARGO_PKG_VERSION"))
+        format!("{}?client_version={}", path, env!("CARGO_PKG_VERSION"))
     }
 
     /// GET `/wham/usage` and parse it. Shared by `fetch_usage` (rate-limit windows) and

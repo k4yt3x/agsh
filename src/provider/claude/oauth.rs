@@ -101,7 +101,9 @@ impl ClaudeOAuthProvider {
         Self {
             client: reqwest::Client::new(),
             credential: tokio::sync::RwLock::new(credential),
-            base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+            base_url: super::shared::normalize_claude_base_url(
+                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+            ),
             model,
             client_id: client_id.unwrap_or_else(|| DEFAULT_CLAUDE_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url
@@ -1417,6 +1419,34 @@ mod tests {
         assert_eq!(usage.windows[2].label, "Weekly (Opus)");
         assert_eq!(usage.windows[2].used_percent, 42.0);
         assert_eq!(usage.windows[0].resets_at, None);
+    }
+
+    #[test]
+    fn test_a_claude_oauth_base_url_keeps_the_root_the_oauth_endpoints_hang_off() {
+        let provider = ClaudeOAuthProvider::new(
+            AuthCredential::OAuthToken {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: None,
+            },
+            "claude-opus-4-8".to_string(),
+            Some("https://gateway.example.com/anthropic/v1/".to_string()),
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            10000,
+            "a".repeat(64),
+            None,
+            false,
+            None,
+            None,
+        );
+        // This provider reaches `/v1/messages` *and* `/api/oauth/usage` off the same root, so the
+        // base has to stay the root: a stored `.../v1` would put the OAuth endpoints out of reach.
+        assert_eq!(provider.base_url, "https://gateway.example.com/anthropic");
     }
 
     #[test]

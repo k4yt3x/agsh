@@ -38,7 +38,9 @@ impl OpenAiProvider {
         Self {
             client: reqwest::Client::new(),
             api_key,
-            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            base_url: crate::provider::normalize_base_url(
+                base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
+            ),
             model,
             resolved_effort,
             max_output_tokens,
@@ -800,6 +802,30 @@ mod tests {
         assert_eq!(accumulator.id, "call_abc");
         assert_eq!(accumulator.name, "execute_command");
         assert_eq!(accumulator.arguments, "{\"command\": \"pwd\"}");
+    }
+
+    #[test]
+    fn test_an_openai_base_url_is_normalized_at_construction() {
+        let provider = OpenAiProvider::new(
+            "test-key".to_string(),
+            "gpt-4o".to_string(),
+            Some("https://openrouter.ai/api/v1/".to_string()),
+            None,
+            None,
+        );
+        // Without this the request path would carry a doubled separator, since the endpoint is
+        // appended as `{base}/chat/completions`.
+        assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
+
+        // The version segment belongs in an OpenAI-family base and must survive.
+        let default = OpenAiProvider::new(
+            "test-key".to_string(),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(default.base_url, "https://api.openai.com/v1");
     }
 
     #[test]

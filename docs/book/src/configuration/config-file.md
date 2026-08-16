@@ -99,6 +99,26 @@ If not set, defaults to:
 
 Override per-run with `--base-url`.
 
+**The two API families end their base URL in different places, and that is not meka's choice.** An
+OpenAI-compatible base includes the version segment, which is why every provider documents one
+ending in `/v1` and why meka appends only `/chat/completions`. A Claude base is the host *root*,
+because meka reaches two different roots off it: `/v1/messages` for the turn, and `/api/oauth/...`
+for the subscription usage and profile endpoints. A base ending at `/v1` could not reach the second
+set. The official SDKs draw the line the same way.
+
+A gateway that fronts both APIs therefore publishes two URLs, and its Anthropic one is often written
+with the `/v1` its OpenAI sibling needs (`https://api.synthetic.new/anthropic/v1`). Paste it as-is:
+for a `claude-api` or `claude-oauth` profile meka drops a trailing `/v1`, since it re-adds that
+segment on every request and the alternative is a request to `/v1/v1/messages`. Only a trailing one
+goes, so a base whose path legitimately contains `/v1` earlier
+(`https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/anthropic`) is left alone. Trailing
+slashes are trimmed for every backend.
+
+The reverse is not inferred: an `openai-api` base is used exactly as written, because a gateway
+serving `/chat/completions` at its root is legitimate and meka cannot tell that apart from a missing
+`/v1`. If an OpenAI-compatible endpoint 404s, check that the base carries the version segment its
+documentation shows.
+
 ### `oauth_token_url`
 
 Custom OAuth token refresh endpoint. Defaults:

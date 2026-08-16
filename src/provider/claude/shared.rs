@@ -18,6 +18,39 @@ use crate::{
     },
 };
 
+/// Normalize a Claude-family base URL: trailing slashes, then one trailing `/v1`.
+///
+/// A Claude base URL is the *host root*, not the versioned prefix. `ClaudeApiProvider` appends
+/// `/v1/messages` and `/v1/models/{id}`; `ClaudeOAuthProvider` appends those and also
+/// `/api/oauth/usage`, `/api/oauth/profile` and `/api/oauth/claude_cli/roles`, which sit under a
+/// different root entirely. Baking `/v1` into the base would put that second set out of reach, so
+/// the root is the only prefix both can share. The OpenAI family has the opposite convention (`/v1`
+/// belongs in the base), which is what makes this worth normalizing rather than merely documenting:
+/// a gateway serving both APIs publishes one URL per family, and its Anthropic one is routinely
+/// written with the `/v1` its OpenAI sibling needs.
+///
+/// Left alone, that pastes through to `/v1/v1/messages`, which no gateway routes. Stripping it is
+/// safe precisely because there is no reading under which it could have been meant: the segment is
+/// re-added on every request. Only a *trailing* `/v1` goes, so a base whose path legitimately
+/// contains one mid-way (`https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/anthropic`)
+/// survives intact.
+pub(crate) fn normalize_claude_base_url(url: &str) -> String {
+    let trimmed = crate::provider::normalize_base_url(url);
+    match trimmed.strip_suffix("/v1") {
+        Some(without_version) => {
+            // Reports `trimmed`, not `url`: when both steps apply, the slash-trim has already
+            // logged `url` -> `trimmed`, so quoting the original again would read as two unrelated
+            // rewrites of the same string rather than one chain.
+            tracing::debug!(
+                "dropped the trailing '/v1' from Claude base URL '{}'; meka appends it per request",
+                trimmed
+            );
+            without_version.to_string()
+        }
+        None => trimmed,
+    }
+}
+
 /// Subset of the Anthropic `GET /v1/models/{id}` body carrying the model's context window.
 /// Anthropic exposes no reasoning-effort levels here, so [`ModelInfo::effort_levels`] is always
 /// `None` for Claude and effort falls to the name-based predicates.
@@ -1130,6 +1163,59 @@ where
 mod tests {
     use super::*;
     use crate::provider::ImageSource;
+
+    #[test]
+    fn test_a_claude_base_url_drops_a_trailing_version_segment() {
+        // The shape a gateway publishes for its Anthropic endpoint when it mirrors the OpenAI one.
+        assert_eq!(
+            normalize_claude_base_url("https://api.synthetic.new/anthropic/v1"),
+            "https://api.synthetic.new/anthropic"
+        );
+        // Trailing slashes go first, so the version segment is still recognised behind them.
+        assert_eq!(
+            normalize_claude_base_url("https://api.synthetic.new/anthropic/v1/"),
+            "https://api.synthetic.new/anthropic"
+        );
+        assert_eq!(
+            normalize_claude_base_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn test_a_claude_base_url_already_in_the_canonical_shape_is_untouched() {
+        assert_eq!(
+            normalize_claude_base_url("https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            normalize_claude_base_url("https://api.synthetic.new/anthropic/"),
+            "https://api.synthetic.new/anthropic"
+        );
+    }
+
+    #[test]
+    fn test_only_a_trailing_version_segment_is_dropped_from_a_claude_base_url() {
+        // Cloudflare's AI Gateway puts the version early and the vendor last. Stripping a `/v1`
+        // anywhere but the end would silently route to the wrong account.
+        assert_eq!(
+            normalize_claude_base_url(
+                "https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic"
+            ),
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic"
+        );
+        // Exactly one segment: a doubled one is pathological either way, but stripping to the host
+        // would discard a path the user did write.
+        assert_eq!(
+            normalize_claude_base_url("https://api.anthropic.com/v1/v1"),
+            "https://api.anthropic.com/v1"
+        );
+        // `/v1` must be a whole segment, not a suffix of one.
+        assert_eq!(
+            normalize_claude_base_url("https://example.com/openaiv1"),
+            "https://example.com/openaiv1"
+        );
+    }
 
     #[test]
     fn test_model_info_from_claude_model() {

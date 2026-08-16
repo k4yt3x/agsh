@@ -57,7 +57,9 @@ impl ClaudeApiProvider {
         Self {
             client: reqwest::Client::new(),
             api_key,
-            base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+            base_url: shared::normalize_claude_base_url(
+                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+            ),
             model,
             thinking_enabled,
             thinking_budget_tokens,
@@ -303,16 +305,45 @@ mod tests {
     }
 
     fn provider(model: &str, effort: Option<&str>) -> ClaudeApiProvider {
+        provider_with_base(model, effort, None)
+    }
+
+    fn provider_with_base(
+        model: &str,
+        effort: Option<&str>,
+        base_url: Option<&str>,
+    ) -> ClaudeApiProvider {
         ClaudeApiProvider::new(
             "test-key".to_string(),
             model.to_string(),
-            None,
+            base_url.map(str::to_string),
             false,
             10000,
             effort.map(str::to_string),
             None,
             None,
         )
+    }
+
+    #[test]
+    fn test_a_claude_base_url_is_normalized_at_construction() {
+        // The shape a gateway publishes for its Anthropic endpoint; meka appends `/v1/messages`
+        // itself, so leaving this would request `/v1/v1/messages`.
+        let versioned = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some("https://api.synthetic.new/anthropic/v1"),
+        );
+        assert_eq!(versioned.base_url, "https://api.synthetic.new/anthropic");
+
+        let trailing = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some("https://api.anthropic.com/"),
+        );
+        assert_eq!(trailing.base_url, "https://api.anthropic.com");
+
+        assert_eq!(test_provider().base_url, "https://api.anthropic.com");
     }
 
     #[test]

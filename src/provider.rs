@@ -60,6 +60,20 @@ pub(crate) async fn scope_subagent<F: std::future::Future>(future: F) -> F::Outp
     IS_SUBAGENT.scope(true, future).await
 }
 
+/// Strip trailing slashes so a provider can append its own path with a leading `/`.
+///
+/// Every backend builds request URLs as `format!("{base}/some/path")`, so a base the user pasted
+/// with a trailing slash would otherwise produce a doubled separator (`https://host//v1/messages`).
+/// Servers are not obliged to treat that as the same route, and the ones that don't return a 404
+/// that names nothing.
+pub(crate) fn normalize_base_url(url: &str) -> String {
+    let normalized = url.trim().trim_end_matches('/');
+    if normalized != url {
+        tracing::debug!("normalized provider base URL '{}' to '{}'", url, normalized);
+    }
+    normalized.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthCredential {
     ApiKey(String),
@@ -1020,6 +1034,41 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_base_url_keeps_its_path_and_loses_only_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://openrouter.ai/api/v1///"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url("  https://openrouter.ai/api/v1  "),
+            "https://openrouter.ai/api/v1"
+        );
+        // Already clean: byte-identical, so the common path rewrites nothing.
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn test_the_generic_normalizer_leaves_the_version_segment_alone() {
+        // The OpenAI family carries `/v1` in the base by convention, so stripping it here would
+        // break every profile pasted from a provider's own documentation.
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.synthetic.new/openai/v1/"),
+            "https://api.synthetic.new/openai/v1"
+        );
+    }
 
     #[test]
     fn test_resolve_effort_with_catalog() {
