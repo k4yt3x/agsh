@@ -172,107 +172,131 @@ pub fn spawn_background_poller(state: ServerState) -> tokio::task::JoinHandle<()
                 _ = state.shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            // Snapshot the ids and drop the lock before any await: holding the sessions map
-            // across a turn would block every request that needs to look a session up.
-            let resident: Vec<uuid::Uuid> = {
-                let sessions = state.sessions.read().await;
-                sessions.keys().copied().collect()
-            };
-            for session_id in resident {
-                // Re-checked per session, not just per tick. Each iteration stamps its outcomes
-                // delivered *before* awaiting a turn that can take minutes, which is right for a
-                // turn that wedges but fatal across a shutdown: the sessions later in this loop
-                // would be stamped and then never processed, and
-                // `list_undelivered_background_tasks` never returns a stamped row again, so the
-                // model would never learn its task finished.
-                if state.shutdown.is_cancelled() {
-                    return;
-                }
-                // Skipped rather than queued behind. This sweep is serial, so waiting on one busy
-                // session delays every later session's outcomes in the same tick. Checked *before
-                // anything is stamped*, so the next tick picks this session up unchanged -- which
-                // is why the delivery below can afford to wait if a turn starts in the gap.
-                // A session that has left the map since the snapshot counts as un-takeable too,
-                // not as idle: falling through would stamp its outcomes and then have
-                // `ensure_session_loaded` rebuild the whole runtime and pin the file lock, which
-                // is exactly the revival this poller documents itself as never doing.
-                if state
-                    .sessions
-                    .read()
-                    .await
-                    .get(&session_id)
-                    .is_none_or(|entry| entry.runtime.try_lock().is_err())
-                {
-                    continue;
-                }
-                let ready = match state
-                    .shared
-                    .session_manager
-                    .list_undelivered_background_tasks(session_id)
-                    .await
-                {
-                    Ok(ready) if !ready.is_empty() => ready,
-                    Ok(_) => continue,
-                    Err(error) => {
-                        tracing::warn!(
-                            "failed to list undelivered background tasks for session {}: {}",
-                            session_id,
-                            error
-                        );
-                        continue;
-                    }
-                };
-                let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-                // Stamped before the turn, like `stamp_scheduled_job_fired`: an outcome that wedges
-                // the process must not be redelivered on every restart.
-                if let Err(error) = state
-                    .shared
-                    .session_manager
-                    .mark_background_tasks_delivered(&ids)
-                    .await
-                {
-                    tracing::warn!(
-                        "failed to stamp background outcomes as delivered: {}",
-                        error
-                    );
-                    continue;
-                }
-                // Fired before the delivery turn rather than after it: the fact a task finished
-                // is the news, and it should not wait on a model call that may itself fail.
-                for task in &ready {
-                    state.webhooks.send(
-                        crate::server::webhook::WebhookEvent::TaskFinished,
-                        // No `label`. It is the tool's primary argument, which for
-                        // `execute_command` is the shell command line -- the highest-entropy
-                        // field in the system and the one most likely to carry a credential
-                        // someone pasted into a `curl`. A subscriber that wants it reads
-                        // `GET /v1/sessions/{id}/tasks` with its own token, which is the whole
-                        // reason deliveries carry identifiers rather than content.
-                        serde_json::json!({
-                            "task_id": task.id,
-                            "session_id": task.session_id,
-                            "tool_name": task.tool_name,
-                            "status": task.status.as_str(),
-                        }),
-                    );
-                }
-                if let Err(error) = run_prompt_in_session(
-                    &state,
-                    session_id,
-                    crate::background::render_outcomes(&ready),
-                    OutOfBand::BackgroundOutcome,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "background outcome turn for session {} failed: {}",
-                        session_id,
-                        error
-                    );
-                }
+            // Supervised for the same reason the scheduler is: this sweep runs a whole agent turn,
+            // so anything in the tool loop can panic, and losing the task would stop every
+            // background outcome from ever being delivered -- silently, since nothing joins this
+            // handle. A task that finished would then sit `delivered_at`-stamped and unreported
+            // forever, which is exactly the promise `background.rs` opens by making.
+            let sweep = std::panic::AssertUnwindSafe(deliver_ready_outcomes(&state));
+            match futures::FutureExt::catch_unwind(sweep).await {
+                Ok(std::ops::ControlFlow::Break(())) => return,
+                Ok(std::ops::ControlFlow::Continue(())) => {}
+                Err(panic) => tracing::error!(
+                    "background outcome sweep panicked ({}); continuing",
+                    crate::error::panic_message(&*panic)
+                ),
             }
         }
     })
+}
+
+/// One pass over the resident sessions, delivering whatever outcomes are ready.
+///
+/// Split out of the loop so it can be caught: a `return` for shutdown inside the loop body cannot
+/// survive being wrapped, so the two exits became [`std::ops::ControlFlow`].
+async fn deliver_ready_outcomes(state: &ServerState) -> std::ops::ControlFlow<()> {
+    // Snapshot the ids and drop the lock before any await: holding the sessions map
+    // across a turn would block every request that needs to look a session up.
+    let resident: Vec<uuid::Uuid> = {
+        let sessions = state.sessions.read().await;
+        sessions.keys().copied().collect()
+    };
+    for session_id in resident {
+        // Re-checked per session, not just per tick. Each iteration stamps its outcomes
+        // delivered *before* awaiting a turn that can take minutes, which is right for a
+        // turn that wedges but fatal across a shutdown: the sessions later in this loop
+        // would be stamped and then never processed, and
+        // `list_undelivered_background_tasks` never returns a stamped row again, so the
+        // model would never learn its task finished.
+        if state.shutdown.is_cancelled() {
+            return std::ops::ControlFlow::Break(());
+        }
+        // Skipped rather than queued behind. This sweep is serial, so waiting on one busy
+        // session delays every later session's outcomes in the same tick. Checked *before
+        // anything is stamped*, so the next tick picks this session up unchanged -- which
+        // is why the delivery below can afford to wait if a turn starts in the gap.
+        // A session that has left the map since the snapshot counts as un-takeable too,
+        // not as idle: falling through would stamp its outcomes and then have
+        // `ensure_session_loaded` rebuild the whole runtime and pin the file lock, which
+        // is exactly the revival this poller documents itself as never doing.
+        if state
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .is_none_or(|entry| entry.runtime.try_lock().is_err())
+        {
+            continue;
+        }
+        let ready = match state
+            .shared
+            .session_manager
+            .background_store()
+            .list_undelivered_background_tasks(session_id)
+            .await
+        {
+            Ok(ready) if !ready.is_empty() => ready,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to list undelivered background tasks for session {}: {}",
+                    session_id,
+                    error
+                );
+                continue;
+            }
+        };
+        let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+        // Stamped before the turn, like `stamp_scheduled_job_fired`: an outcome that wedges
+        // the process must not be redelivered on every restart.
+        if let Err(error) = state
+            .shared
+            .session_manager
+            .background_store()
+            .mark_background_tasks_delivered(&ids)
+            .await
+        {
+            tracing::warn!(
+                "failed to stamp background outcomes as delivered: {}",
+                error
+            );
+            continue;
+        }
+        // Fired before the delivery turn rather than after it: the fact a task finished
+        // is the news, and it should not wait on a model call that may itself fail.
+        for task in &ready {
+            state.webhooks.send(
+                crate::server::webhook::WebhookEvent::TaskFinished,
+                // No `label`. It is the tool's primary argument, which for
+                // `execute_command` is the shell command line -- the highest-entropy
+                // field in the system and the one most likely to carry a credential
+                // someone pasted into a `curl`. A subscriber that wants it reads
+                // `GET /v1/sessions/{id}/tasks` with its own token, which is the whole
+                // reason deliveries carry identifiers rather than content.
+                serde_json::json!({
+                    "task_id": task.id,
+                    "session_id": task.session_id,
+                    "tool_name": task.tool_name,
+                    "status": task.status.as_str(),
+                }),
+            );
+        }
+        if let Err(error) = run_prompt_in_session(
+            state,
+            session_id,
+            crate::background::render_outcomes(&ready),
+            OutOfBand::BackgroundOutcome,
+        )
+        .await
+        {
+            tracing::warn!(
+                "background outcome turn for session {} failed: {}",
+                session_id,
+                error
+            );
+        }
+    }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Run one fired job. Errors are logged rather than propagated: the scheduler must survive a job
@@ -539,14 +563,23 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
     // The creating session's directory, for the same reason as its permission: an isolated run is
     // the same job with a cheaper context. Falling through to the process cwd would put the shell
     // and file tools wherever the `meka serve` unit was launched from, which under systemd is `/`.
-    let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
         summary
             .cwd
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
     ));
-    let roots: crate::agent::SharedRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let roots: crate::workspace::SharedRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
+    // Counted as an in-flight turn for the whole of the fire.
+    //
+    // `wait_for_turns_to_unwind` polls `state.concurrent_turns` and each session entry's
+    // `in_flight`; an isolated fire creates a session that is never in `state.sessions` and took no
+    // guard, so the drain saw an idle process and aborted this turn mid-flight -- undoing the
+    // shutdown fix for precisely the unattended work it was written to protect.
+    let _drain_guard =
+        crate::server::state::TurnGuard::mark_process_busy(Arc::clone(&state.concurrent_turns));
+
     let (agent, registry) = crate::build_session_agent(
         &state.shared,
         permission,

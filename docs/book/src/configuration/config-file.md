@@ -55,6 +55,17 @@ If none of these resolve (no profiles configured, or more than one with no `defa
 environment-variable tier for provider selection; the config file (plus the per-run CLI flag) is the
 source of truth.
 
+### Timeouts
+
+Every backend connects with a 30-second handshake deadline and fails a stream that produces nothing
+for five minutes, which surfaces as a retryable error rather than a hung turn.
+
+Neither is a limit on the turn. There is deliberately no cap on how long a turn may run, how many
+tool calls it may make, or how many tokens it may spend: those ceilings belong to your API key and
+your provider plan, not to the harness. What these bound is *silence*. A model that is still
+thinking is still sending, so a stream that goes quiet for five minutes has died, and waiting on it
+forever is not patience.
+
 ## `default_provider`
 
 Top-level field naming the profile to use when `--provider` isn't passed. Set it with
@@ -308,6 +319,7 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 | `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
 | `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colours as `syntect`, and code blocks are highlighted by it. Alias: `rich` (default) |
 | `raw` | Raw markdown printed verbatim with aligned tables |
+| `silent` | No assistant output at all. For a run whose only product is its side effects |
 
 Default: `termimad`
 
@@ -337,7 +349,9 @@ A set value is honoured exactly rather than clamped to the terminal, because pin
 get identical output across machines and a silent clamp would take that away on the narrow one. The
 cost is that a value wider than your terminal wraps, and a wrapped row starts at column zero, where
 meka's own output lives. Below 40 columns the value is clamped up and a warning is logged: every
-budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing.
+budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing. Above
+1000 it is clamped down, also with a warning, since no terminal is that wide and the value is far
+more likely to be a typo than a request.
 
 This covers meka's own output: tool indicators and their argument block, thinking previews, todo
 lists, and the `ask` approval prompt. Assistant markdown is not affected and keeps reflowing to the
@@ -616,11 +630,14 @@ The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#sh
 Linux-only choice between `"landlock"` and `"bubblewrap"`:
 
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`"landlock"`) uses the Landlock LSM (kernel 5.13+) to block filesystem writes. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Below kernel 7.1 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods. Kept as the lighter-weight fallback for hosts without Bubblewrap.
+- **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v3 (kernel 6.2+)**: below that `truncate(2)` is unmediated, so a read-mode command could still empty a file, and meka reports the backend unusable instead. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Between v3 and v9 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods; meka warns at startup naming what the running ABI lacks. Kept as the lighter-weight fallback for hosts without Bubblewrap.
 
 When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. `meka provider add` does not write this field; leave it unset to keep auto-detection.
 
 If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` in read mode hard-errors with a message naming the configured backend and the specific failure reason. Read mode is not blocked for other tools; only `execute_command` requires a usable sandbox.
+
+Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
+environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
 
 Default: unset (auto-detect). Ignored on macOS and Windows.
 
@@ -655,7 +672,9 @@ Settings for session history retention and context window management.
 
 Maximum number of messages to send to the LLM API per request. Older messages are truncated from the beginning while preserving tool call chain integrity. The full history remains stored in SQLite; only the API payload is limited.
 
-Default: `200`
+The cap is applied to every request in a turn, not just the first, so a long tool loop cannot grow the payload past it mid-turn. It is a maximum rather than a target: the cut lands on the first message that is safe to start from, which means dropping a whole `tool_use` → `tool_result` pair rather than splitting one, and a request can end up under the limit as a result. A turn whose entire tail is one unbroken tool chain is the exception; there the payload runs over rather than be rejected by the provider.
+
+Default: `200`. `0` is rejected at startup.
 
 ```toml
 [session]
@@ -782,7 +801,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `transport` | Yes | Transport type: `"stdio"` (spawn subprocess) or `"http"` (streamable HTTP). |
 | `command` | Stdio only | Path or name of the executable to spawn. On Windows, `npx` / `.cmd` / `.bat` / `.ps1` are auto-wrapped in `cmd /c`. |
 | `args` | No | Arguments to pass to the command. |
-| `env` | No | Environment variables to set for the spawned process (stdio only). |
+| `env` | No | Environment variables to set for the spawned process (stdio only). The child does **not** inherit meka's environment; see below. |
 | `url` | HTTP only | URL of the MCP server endpoint. |
 | `auth_token` | No | Bearer token for HTTP authentication (sent as `Authorization: Bearer <token>`). |
 | `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with `auth_token`. |
@@ -793,6 +812,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
 | `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
+| `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `write` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honoured either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Defaults to `false`. |
 | `required` | No | When `true`, a turn is rejected while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). When `false`, the session runs without it and its tools are simply absent. Defaults to `[mcp].strict` (itself `false`), so servers are optional unless they opt in. |
 
@@ -820,17 +840,62 @@ Every MCP tool's required permission is resolved through a five-step chain; the 
 
 1. **`server.tool_permissions[<raw-tool>]`**: explicit per-tool override.
 2. **`server.permission`**: explicit server-level override. Applies to every tool on that server regardless of what the server advertises.
-3. **`tool.annotations.readOnlyHint`** from the server: `true` → `Read`, `false` → `Write`.
-4. **`[mcp].default_permission`**: global fallback.
+3. **`tool.annotations.readOnlyHint`** from the server: `true` → `Read`, `false` → `Write`. The `true` half is skipped when the server sets `trust_read_only_hint = false`, and a hint skipped that way also bypasses step 4, landing on step 5.
+4. **`[mcp].default_permission`**: global fallback. Not consulted for a hint that step 3 refused.
 5. **Hardcoded `Write`**: strict ultimate fallback.
 
 User-supplied config (1, 2, 4) always beats the server's self-classification; if a server lies about a tool, you can override. But when no user config says anything, the server's hint is trusted for that specific tool so `readOnlyHint = false` destructive tools don't silently become Read-accessible just because the user opted into a lenient global default.
 
-**Hint spoofing**: a compromised server could claim `readOnlyHint = true` on a destructive tool. Defend by setting `server.permission = "write"` on suspect servers (step 2 wins) or by listing the destructive tools explicitly in `tool_permissions` / `disabled_tools`.
+**Hint spoofing**: `readOnlyHint` is asserted by the server and not verified by meka, and MCP tools run in the server's own process with **no sandbox**. A server that claims `readOnlyHint = true` for a tool that in fact writes therefore gets to write your tree while meka sits at `read`: MCP tools are outside the read-mode filesystem boundary that covers meka's built-ins (see [Permissions](../usage/permissions.md#mcp-tools-are-the-exception)).
+
+Three defences, in increasing order of bluntness:
+
+- `tool_permissions` on the specific tools you want pinned (step 1 wins).
+- `trust_read_only_hint = false` on the server, which makes its hints advisory for display only. A refused hint drops straight to the strict `write` fallback, deliberately skipping `[mcp].default_permission`: that key is a global default, and letting it answer would mean `default_permission = "read"` silently re-granting exactly what the per-server flag refused. None of that server's hinted tools is reachable at `read` without an explicit override.
+- `server.permission = "write"` on the whole server (step 2 wins), or `disabled_tools` to remove the tool entirely.
+
+The hint is trusted by default because most servers annotate honestly and requiring per-tool config for every server would make read mode impractical. `trust_read_only_hint` is the switch for a server you have not audited.
 
 **Stale config**: entries in `allowed_tools` / `disabled_tools` / `eager_load_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool. A name that appears in both `eager_load_tools` and `disabled_tools` also warns: the disabled filter wins, so eager-loading the disabled tool is a no-op.
 
 **Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
+
+#### The stdio server's environment
+
+A stdio server is a child process that talks to the network, and it does **not** inherit meka's
+environment. It receives the same curated base a read-mode shell gets (`PATH` so it can resolve its
+own binaries, `HOME`, locale, `TMPDIR`), plus whatever the server's own `env` table sets.
+
+Configuring a server is a decision to run its code, not a decision to hand it every credential on
+the machine: without this, `ANTHROPIC_API_KEY`, `AWS_*` and `GITHUB_TOKEN` all rode along into every
+server you had ever added.
+
+The base also carries the machine's network configuration (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS` and the usual siblings), because a server
+that cannot see them connects to nothing behind a corporate proxy and fails every call with an
+error naming none of the cause. Those say where to go and whom to trust; they grant nothing.
+
+Three families are deliberately left out and have to be requested per server: `SSH_AUTH_SOCK`, which
+is a live credential agent; `NODE_OPTIONS`, which takes `--require` and therefore arbitrary code;
+and the import paths `PYTHONPATH` / `NODE_PATH` / `VIRTUAL_ENV`, which change what a program loads.
+A server that genuinely needs one takes it explicitly:
+
+```toml
+[mcp.servers.tooling.env]
+PYTHONPATH = "${PYTHONPATH}"
+```
+
+A server that genuinely needs a secret asks for it by name, and `${VAR}` still reads meka's
+environment at connect time:
+
+```toml
+[[mcp.servers]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+```
 
 #### Examples
 
@@ -930,7 +995,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `meka mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |
 | `meka mcp tools <name>` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. |
 | `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. |
-| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear stored credentials + auth-probe cache. |
+| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear the stored credentials. |
 
 #### `meka mcp add` flags
 
@@ -940,7 +1005,9 @@ Manage configured servers without editing `config.toml` by hand:
 | `--env KEY=VALUE` | Environment variable for stdio (repeatable). |
 | `--header KEY=VALUE` | HTTP header (repeatable). |
 | `--auth <oauth\|client-credentials\|client-credentials-jwt>` | Configure the `[auth]` block. |
-| `--auth-token <TOKEN>` | Static bearer token. Mutually exclusive with `--auth`. |
+| `--auth-token <TOKEN>` | Static bearer token. Mutually exclusive with `--auth`. Passing a secret as an argument puts it in `ps` output and your shell history; prefer `--auth-token-stdin`, or the `'${VAR}'` form, which is expanded from the environment at connect time. |
+| `--auth-token-stdin` | Read the static bearer token from stdin instead of the command line. Conflicts with `--auth-token`. |
+| `--client-secret-stdin` | Read the OAuth client secret from stdin instead of the command line. Conflicts with `--client-secret`. |
 | `--client-id`, `--client-secret` | OAuth / client-credentials client identifiers. |
 | `--signing-key <PATH>`, `--signing-algorithm <ALG>` | JWT signing material (`client-credentials-jwt` only). |
 | `--scope <SCOPE>` | OAuth scope (repeatable). |
@@ -979,7 +1046,7 @@ authorized 'notion'
 
 2. **Auto-login**: if the probe says OAuth is required (or `--auth oauth` was explicitly set), the OAuth authorization_code flow runs immediately as though the user had chained `meka mcp login <name>` themselves. The synthesised `[auth] = oauth` block is written back to `config.toml` on success.
 
-3. **Rollback on failure**: if the OAuth flow errors out, the entry we just wrote is purged from `config.toml` (alongside any partial credentials + probe cache), leaving the user's config clean. The command exits non-zero.
+3. **Rollback on failure**: if the OAuth flow errors out, the entry we just wrote is purged from `config.toml` (alongside any partial credentials), leaving the user's config clean. The command exits non-zero.
 
 4. **`--no-login`**: skips step 2. The entry is still persisted and the probe's hint is still printed; run `meka mcp login <name>` when ready. Useful for scripted setup or when you expect to edit `[auth]` by hand.
 
@@ -1041,7 +1108,6 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 - **Call identity**: `tools/call` carries two extra keys in `_meta` alongside the progress token. `meka/sessionId` is the UUID of the session the call came from, letting a server scope per-session state (a cache, a workspace, an audit trail) to one conversation; a sub-agent reports its own child session id. `meka/toolUseId` is the provider's tool-use id for the call. Both are absent for calls made outside a session, such as connection-time handshakes.
 - **Server instructions**: `InitializeResult.instructions` is captured once per connection and delivered in the per-turn context (sanitised + truncated to 2048 chars) under `[MCP server instructions]`. A server that connects late, or reconnects with different instructions, is announced as a change rather than rewriting anything already sent.
 - **stdio server logs**: a stdio server's own stderr (many servers log there) is captured, not inherited, so it never corrupts the REPL display. Each line is re-emitted on meka's `tracing` stream at `debug` level tagged with the server name, so it stays silent at default verbosity and surfaces under `-v` / `RUST_LOG`.
-- **Auth-probe cache**: 401 responses are cached for 15 minutes so a restart after a failed auth flow skips the unauthenticated probe and goes straight to OAuth. Cleared by `meka mcp logout`.
 - `resources/list_changed`, `prompts/list_changed`, and `resources/updated` notifications are logged at `info`/`debug` level.
 
 ### Server-to-client features
@@ -1191,7 +1257,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 
 | Key | Purpose |
 |---|---|
-| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register. Use `meka tools list` to see the canonical names. |
+| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tools list` to see the canonical names. |
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `ask`, `write`. |
 
@@ -1366,9 +1432,27 @@ Maximum request body size in bytes. Requests exceeding this limit are rejected w
 |------|---------|
 | `integer` | `10485760` (10 MiB) |
 
+### `serve.docs`
+
+Whether to serve the Swagger UI at `/v1/docs` and the OpenAPI document at `/v1/openapi.json`.
+
+Off by default. These are the only routes on the surface that take no bearer token *and* describe
+the deployment rather than report on it: what they publish is the shape of every endpoint you
+expose. That is exactly what you want while building a client against a local `meka serve`, and
+exactly what you do not want reachable from anywhere else. Turn it on deliberately.
+
+```toml
+[serve]
+docs = true
+```
+
+| Type | Default |
+|------|---------|
+| `boolean` | `false` |
+
 ### `serve.max_concurrent_turns`
 
-Process-wide cap on in-flight turns across all sessions. When the cap is reached, new turn submissions return `429 Too Many Requests` with a `Retry-After` header. Unset or `0` means no limit.
+Process-wide cap on in-flight turns across all sessions. When the cap is reached, new turn submissions return `429 Too Many Requests` with a `Retry-After` header. Leave it **unset** for no limit; `0` is rejected at startup, because a cap of zero would 429 every turn rather than mean "unlimited".
 
 | Type | Default |
 |------|---------|

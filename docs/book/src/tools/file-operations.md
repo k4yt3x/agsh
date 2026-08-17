@@ -12,14 +12,17 @@ Read the contents of a file at a given path. Supports text files and images.
 |------|------|----------|-------------|
 | `path` | string | yes | The file path to read |
 | `offset` | integer | no | Line number to start reading from (0-based) |
-| `limit` | integer | no | Maximum number of lines to read |
+| `limit` | integer | no | Maximum number of lines to read (default: 2000) |
 | `regex` | string | no | Return matching lines (capped, exact value advertised in the tool's parameter schema) instead of a line range. Skipped for image files. |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
-- When `offset` and `limit` are both omitted, defaults to the first 2000 lines. If the file has more, a truncation notice is appended.
+- `limit` defaults to 2000 lines. Whenever the read stops short of the end of the file, whether because of the default or an explicit `limit`, a notice naming the range shown and the total line count is appended. A definitive answer drawn from a silent truncation is worse than an error.
 - Use `offset`/`limit` to page through large files.
+- A single read holds at most 16 MiB in memory. Asking for the whole of a file larger than that is refused, because there is no bounded way to return it; asking for a *window* of one is not, and streams past everything outside the window. So a command-output capture larger than the ceiling stays readable a page at a time, which is what [`execute_command`](shell.md) promises when it spills one to a file.
+- A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalises line endings to `\n`; if a later `edit_file` misses for that reason it says so.
+- Under [ACP](../usage/acp.md) the editor is asked for the whole document and the window is applied here, so both the truncation notice and the freshness fingerprint describe the document rather than the slice.
 - `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
 
 ### Image files
@@ -112,9 +115,11 @@ Create or overwrite a file with the given content.
 |------|------|----------|-------------|
 | `path` | string | yes | The file path to write |
 | `content` | string | yes | The content to write to the file |
+| `force` | boolean | no | Overwrite a file that changed since it was read (default: false) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
 - Creates parent directories if they do not exist.
 - Overwrites the file if it already exists.
+- Overwriting an **existing** file is subject to the same staleness check as `edit_file`: if the file was read and has changed since, the write is refused with the message shown above and `force` is the way past it. A whole-file rewrite is the more destructive of the two, so it is not the more permissive one. Creating a new file needs no prior read.

@@ -146,11 +146,15 @@ The full mode picker is advertised on every session-creation response (`NewSessi
 When the active mode is `ask`, write-gated tools trigger a `session/request_permission` round-trip. Clients render four options:
 
 - **Allow**: run this call only.
-- **Always allow**: run this call and skip the prompt for the same tool for the rest of the session.
+- **Always allow any `<tool>`**: run this call and skip the prompt for that tool for the rest of the session.
 - **Deny**: refuse this call only.
-- **Always deny**: refuse this call and every subsequent call to the same tool.
+- **Always deny any `<tool>`**: refuse this call and every subsequent call to that tool.
+
+The sticky options name the tool because that is exactly their scope: the decision is keyed on the tool name and takes no account of arguments. The prompt's title is `<tool> <primary argument>`, so for `execute_command` you are reading one specific command line while the sticky option covers *every* shell command the agent runs afterwards. If you want per-command control, use **Allow** and keep answering.
 
 Sticky decisions live in meka's process memory; they reset on session close.
+
+A prompt left unanswered for 30 minutes is denied, and the turn carries on. This is a backstop against a client that is connected but will never reply (an editor whose UI thread has wedged, or a harness that speaks ACP without implementing prompts), not a deadline on you: `session/cancel` already resolves a prompt the moment you stop the turn, and without the backstop a client that does neither holds the session's runtime mutex indefinitely, blocking `session/close` and `session/set_mode` behind it. Denying rather than allowing on expiry is deliberate: an unanswered prompt is not consent.
 
 ## Slash commands
 

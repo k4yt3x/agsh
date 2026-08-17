@@ -245,11 +245,25 @@ impl From<&MekaError> for ProblemDetail {
             // Both are upstream refusals rather than anything the HTTP caller got wrong: by the
             // time a request is malformed enough for the provider to reject it, the agent loop has
             // already tried to repair it.
+            //
+            // Logged rather than relayed. `MekaError::Provider` can carry the upstream's verbatim
+            // response body, which is not meka's to publish to an HTTP caller: it has held an
+            // account identifier, a rate-limit posture, and on one backend a fragment of the
+            // request that triggered it.
+            //
+            // A length bound was the first attempt and did not work, for a reason worth recording:
+            // it keeps the *start* of the body, and every one of those lives at the start of a JSON
+            // error object. Most provider errors are also shorter than any sensible bound, so the
+            // common case was relayed whole and the cut fired only on the long ones. The policy
+            // here is the one `webhook.rs` already states for outbound deliveries -- identifiers
+            // and status travel, content does not -- and the log is where an operator reads the
+            // rest.
             MekaError::Provider(message) | MekaError::InvalidRequest(message) => {
+                tracing::warn!("provider error: {}", message);
                 ProblemDetail::new(
                     ErrorKind::Provider,
                     StatusCode::BAD_GATEWAY,
-                    message.clone(),
+                    "the provider rejected or failed this turn; its response is in the server log",
                 )
             }
             MekaError::Interrupted => ProblemDetail::new(
@@ -307,6 +321,36 @@ mod tests {
         let problem = ProblemDetail::from(&error);
         assert_eq!(problem.status, 502);
         assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
+    }
+
+    /// A 502 must not carry the provider's own response text.
+    ///
+    /// That body has held an account identifier, a rate-limit posture and a fragment of the
+    /// request; whoever holds a `sessions:w` token is not necessarily whoever holds the provider
+    /// account. Truncating it was the first attempt and kept the start, which is where all three
+    /// live in a JSON error object.
+    #[test]
+    fn a_provider_failure_does_not_relay_the_upstream_body() {
+        let leaky = "{\"error\":{\"account_uuid\":\"acct-0f3c\",\"type\":\"rate_limit_error\",\
+                     \"message\":\"organization has exceeded its quota\"}}";
+        for error in [
+            MekaError::Provider(leaky.to_string()),
+            MekaError::InvalidRequest(leaky.to_string()),
+        ] {
+            let detail = ProblemDetail::from(&error).detail.unwrap_or_default();
+            assert!(
+                !detail.contains("acct-0f3c"),
+                "the upstream body reached the caller: {detail}",
+            );
+            assert!(
+                !detail.contains("exceeded its quota"),
+                "the upstream body reached the caller: {detail}",
+            );
+            assert!(
+                detail.contains("server log"),
+                "and the caller must be told where the detail went: {detail}",
+            );
+        }
     }
 
     /// A malformed-request rejection reaches the HTTP caller only after the agent loop has already

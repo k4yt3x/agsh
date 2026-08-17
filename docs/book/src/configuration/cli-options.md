@@ -154,17 +154,20 @@ meka --render-mode raw
 
 Can also be set permanently via `display.render_mode` in the config file.
 
-### `--thinking`
+### `--thinking <BOOL>`
 
-Enable extended thinking (`claude-api` and `claude-oauth` providers).
+Enable or disable extended thinking (`claude-api` and `claude-oauth` providers). Takes a value; it
+is not a bare flag, because it has to be able to turn thinking *off* for a run, and thinking is on
+by default.
 
 ```bash
-meka --thinking
+meka --thinking false
 ```
 
 ### `--thinking-budget <TOKENS>`
 
-Set the extended thinking token budget. Implies `--thinking`.
+Set the extended thinking token budget. Independent of `--thinking`: it sets the budget and does
+not turn thinking on, so `--thinking false --thinking-budget 20000` leaves thinking off.
 
 ```bash
 meka --thinking-budget 20000
@@ -200,7 +203,7 @@ meka --oneshot --skill deploy "to staging"
 
 ### `--eager-load-tool <SERVER:TOOL>`
 
-Eager-load a specific MCP tool for this session, bypassing the `load_tool` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcp-servers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
+Eager-load a specific MCP tool for this session, bypassing the `load_tool` round-trip. The tool's schema ships in the cacheable tools-array prefix from turn 1 instead of being deferred. Mirrors the per-server [`eager_load_tools`](./config-file.md#mcpservers) config field: repeatable, raw tool names (the server-advertised form, not `mcp__<server>__<tool>`).
 
 Particularly useful for scripted runs that know up front which tools they'll need. The flag *appends to* whatever `eager_load_tools` lists in `config.toml` for that server; it doesn't replace existing entries. Unknown server names log a warning and are skipped.
 

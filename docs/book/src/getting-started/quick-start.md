@@ -67,10 +67,11 @@ meka [w] > create a file called hello.txt with the text "hello world"
 For quick tasks without entering the interactive shell:
 
 ```bash
-meka "what is my current working directory?"
+meka --oneshot "what is my current working directory?"
 ```
 
-The process exits after the agent responds.
+The process exits after the agent responds. Without `--oneshot` the same prompt runs as the first
+turn and then drops you into the interactive shell.
 
 ## 6. Continue a Previous Session
 

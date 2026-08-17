@@ -17,7 +17,7 @@
 
 pub mod cli;
 
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
 use croner::Cron;
@@ -25,15 +25,12 @@ use croner::Cron;
 // how `crate::config` gets at it. One duration syntax, one copy of the parser.
 use humantime_serde::re::humantime;
 
+use crate::error::MekaError;
+
 /// Smallest interval a recurring job may use. Not a policy limit -- a zero or sub-second interval
 /// makes `next_after` return an instant that is already in the past by the time it is stored, so
 /// the job fires every poll tick forever.
 const MIN_EVERY: Duration = Duration::from_secs(1);
-
-/// How far ahead [`Schedule::next_after`] will search for a cron match before giving up. A pattern
-/// like `0 0 30 2 *` (February 30th) matches no calendar date, and without a bound the search walks
-/// forward indefinitely.
-const CRON_SEARCH_HORIZON_DAYS: i64 = 366;
 
 /// When a job fires.
 ///
@@ -95,18 +92,27 @@ impl Schedule {
 
     /// Parse a 5-field cron pattern, evaluated in the host's local time.
     ///
-    /// Rejects patterns that match no date within [`CRON_SEARCH_HORIZON_DAYS`], which is the only
-    /// way to catch a well-formed but unsatisfiable pattern like `0 0 30 2 *` at creation instead
-    /// of leaving a job that silently never fires.
+    /// Rejects a well-formed but unsatisfiable pattern like `0 0 30 2 *` (February 30th) at
+    /// creation, which is the only way to catch it instead of leaving a job that silently never
+    /// fires. croner reports its own search-limit error for those, so this only has to ask it for
+    /// one occurrence.
     pub fn parse_cron(input: &str) -> Result<Self, String> {
         let input = input.trim();
-        let cron = Cron::from_str(input)
+        // Five fields, explicitly. `Cron::from_str` defaults to `Seconds::Optional`, so a six-field
+        // pattern parsed with the *first* field as seconds -- and `*/10 * * * * *`, written by a
+        // model meaning "every 10 minutes" in the Quartz shape, became every 10 seconds instead.
+        // The `MIN_EVERY` floor that stops `every` firing on each poll tick does not apply to
+        // `cron`, so nothing else caught it, and the confirmation echoed the pattern back verbatim.
+        let cron = croner::parser::CronParser::builder()
+            .seconds(croner::parser::Seconds::Disallowed)
+            .build()
+            .parse(input)
             .map_err(|error| format!("'{}' is not a valid cron expression: {}", input, error))?;
         let schedule = Self::Cron(Box::new(cron));
         if schedule.next_after(Utc::now()).is_none() {
             return Err(format!(
-                "cron expression '{}' matches no date within the next {} days",
-                input, CRON_SEARCH_HORIZON_DAYS
+                "cron expression '{}' matches no calendar date",
+                input
             ));
         }
         Ok(schedule)
@@ -120,8 +126,14 @@ impl Schedule {
                 .map(|absolute| Self::At(absolute.with_timezone(&Utc)))
                 .map_err(|error| format!("stored 'at' spec '{}' is not RFC 3339: {}", spec, error)),
             "every" => Self::parse_every(spec),
-            "cron" => Cron::from_str(spec)
-                .map(|cron| Self::Cron(Box::new(cron)))
+            // Rehydrates through `parse_cron`, not `Cron::from_str`, so a stored spec is read with
+            // the same five-field grammar it was created under. Using the permissive parser here
+            // meant the seconds-field fix only ever applied to *new* jobs: every six-field row
+            // already on disk -- the entire affected population -- kept firing every ten seconds,
+            // with no migration and no warning, and `restore_scheduled_job` re-persisted it after
+            // each deferral. A row that no longer parses is surfaced as an error rather than
+            // silently reinterpreted.
+            "cron" => Self::parse_cron(spec)
                 .map_err(|error| format!("stored cron spec '{}' is invalid: {}", spec, error)),
             other => Err(format!("unknown schedule kind '{}'", other)),
         }
@@ -170,11 +182,14 @@ impl Schedule {
                 // lives, so the search runs in local time and the result converts back to the UTC
                 // meka stores.
                 let local_anchor = anchor.with_timezone(&Local);
+                // croner bounds its own forward search and reports a search-limit error for a
+                // pattern that matches no calendar date, so its verdict is the whole answer. An
+                // extra horizon here would be indistinguishable from that verdict at the call site,
+                // and `prepare` retires a job whose schedule has no next occurrence: a 366-day one
+                // deleted `0 0 29 2 *` the first time it fired, because the next February 29th is
+                // up to four years out.
                 let next = cron.find_next_occurrence(&local_anchor, false).ok()?;
-                let next = next.with_timezone(&Utc);
-                let horizon =
-                    anchor.checked_add_signed(chrono::Duration::days(CRON_SEARCH_HORIZON_DAYS))?;
-                (next <= horizon).then_some(next)
+                Some(next.with_timezone(&Utc))
             }
         }
     }
@@ -237,6 +252,16 @@ pub struct Gate {
     /// which point the job fires: with nothing to compare against, "changed" is the honest answer,
     /// and it also proves the gate works rather than leaving it silently untested.
     pub last_output: Option<String>,
+    /// The permission level the creating session held when this gate was authorised.
+    ///
+    /// A gate is a shell command that runs unattended, unsandboxed, on a timer, in whatever
+    /// process happens to pick the job up. Creation requires
+    /// [`crate::permission::Permission::Write`], but creation is a moment and the row outlives
+    /// it: the session drops to `read`, or `meka serve --permission read` restarts and
+    /// inherits the job, and without this field nothing downstream can tell that the authority
+    /// behind the command is gone. Carrying the level on the row is what lets [`prepare`]
+    /// re-check it at fire time instead of trusting a decision made days ago.
+    pub permission: crate::permission::Permission,
 }
 
 /// A persisted wakeup.
@@ -371,8 +396,29 @@ pub struct GateOutcome {
 /// The command runs unsandboxed. Authoring a gate already requires `write` permission, which is the
 /// same level at which `execute_command` runs arbitrary unsandboxed commands, so a sandbox here
 /// would block the ordinary cases (`gh`, `curl`) without raising the bar the agent must clear.
-pub async fn evaluate_gate(gate: &Gate, timeout: Duration) -> Result<GateOutcome, String> {
+pub async fn evaluate_gate(
+    gate: &Gate,
+    timeout: Duration,
+    cwd: Option<&std::path::Path>,
+) -> Result<GateOutcome, String> {
     let mut builder = gate_command_builder(&gate.command);
+    // The creating session's directory, not the host process's. A gate is almost always written by
+    // the model right after verifying the same command through `execute_command`, which runs in the
+    // session's cwd -- so a gate that runs anywhere else silently stops matching the command the
+    // model tested. Under a `meka serve` systemd unit the process cwd is `/`, where a repo-relative
+    // `gh pr checks` exits non-zero with empty stdout, and an `on-change` gate then latches onto
+    // that empty baseline and never fires again.
+    if let Some(directory) = cwd {
+        if directory.is_dir() {
+            builder.current_dir(directory);
+        } else {
+            tracing::warn!(
+                "gate's session directory '{}' no longer exists; running it in the current \
+                 directory instead",
+                directory.display(),
+            );
+        }
+    }
     builder
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -399,6 +445,32 @@ pub async fn evaluate_gate(gate: &Gate, timeout: Duration) -> Result<GateOutcome
     };
 
     let stdout = truncate_gate_output(&String::from_utf8_lossy(&output.stdout));
+
+    // A non-zero exit from an `on-change` gate is reported, not refused.
+    //
+    // The failure this exists for is a watcher that breaks silently: an expired token has `gh` exit
+    // non-zero with empty stdout, the first evaluation stores `""` as the baseline, and every
+    // evaluation after compares `"" == ""` and stays quiet forever. A log line makes that visible.
+    //
+    // Refusing to fire would not: for a large class of perfectly good gates, a non-zero exit *is*
+    // the signal. `diff -q a b` and `git diff --exit-code` exit 1 exactly when there is a
+    // difference; `grep ERROR log` exits 1 through the whole quiet period it is watching; `curl -f`
+    // exits non-zero until the endpoint comes back. Treating any of those as broken would silence
+    // the gate permanently, which is the bug this was meant to fix, pointed the other way.
+    if matches!(gate.fire, GateFire::OnChange) && !output.status.success() {
+        let stderr = truncate_gate_output(&String::from_utf8_lossy(&output.stderr));
+        tracing::warn!(
+            "on-change gate exited with {}{}; comparing its output anyway, since a non-zero exit \
+             is how several common gates signal a change",
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr)
+            }
+        );
+    }
+
     let fired = match gate.fire {
         // A first evaluation has no baseline, so "changed" is the honest answer. It also means a
         // freshly created watcher proves itself immediately instead of staying silent until
@@ -589,10 +661,22 @@ where
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(error) = run_due(&session_manager, &config, &scope, &fire).await {
+            // A panic must not end the loop either, and here that matters more than for the GC
+            // scanner this pattern comes from: under `meka serve` the callback runs a whole agent
+            // turn, so the surface that can panic is the entire tool loop. Losing the task would
+            // stop every scheduled job for the life of the process, and stop it silently -- nothing
+            // joins this handle, so the only symptom is jobs that quietly never fire again.
+            let sweep =
+                std::panic::AssertUnwindSafe(run_due(&session_manager, &config, &scope, &fire));
+            match futures::FutureExt::catch_unwind(sweep).await {
                 // A failed sweep must not end the loop: a transient database error would otherwise
                 // silently disable every scheduled job for the life of the process.
-                tracing::warn!("scheduler tick failed: {}", error);
+                Ok(Err(error)) => tracing::warn!("scheduler tick failed: {}", error),
+                Err(panic) => tracing::error!(
+                    "scheduler tick panicked ({}); continuing",
+                    crate::error::panic_message(&*panic)
+                ),
+                Ok(Ok(())) => {}
             }
         }
     })
@@ -623,7 +707,8 @@ where
     Fired: std::future::Future<Output = FireOutcome>,
 {
     let now = Utc::now();
-    let due = session_manager.list_due_scheduled_jobs(now).await?;
+    let store = session_manager.schedule_store();
+    let due = store.list_due_scheduled_jobs(now).await?;
     let mut fired: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
     let mut held_over = 0usize;
     for job in due {
@@ -649,7 +734,7 @@ where
         if let Some(wakeup) = prepare(session_manager, config, job, now).await? {
             if fire(wakeup).await == FireOutcome::Deferred {
                 tracing::debug!("job {} deferred; restoring it", original.short_id());
-                session_manager.restore_scheduled_job(&original).await?;
+                store.restore_scheduled_job(&original).await?;
             } else {
                 // Counted only once a turn has actually been spent. A job `prepare` retired (a
                 // declining gate, a one-shot past its grace period) and a job the host handed back
@@ -674,6 +759,31 @@ where
     Ok(())
 }
 
+/// Jobs currently held back because their gate's authority was withdrawn.
+///
+/// Exists only to keep the explanation to once per episode. The check runs on every sweep, and the
+/// state it reports does not change between them, so warning per evaluation turns one fact into a
+/// line a minute for as long as the session stays below write.
+static PERMISSION_DECLINED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// True the first time a job is held back for permission, false while it stays held back.
+fn declined_for_permission_first_time(job_id: &str) -> bool {
+    match PERMISSION_DECLINED.lock() {
+        Ok(mut held) => held.insert(job_id.to_string()),
+        Err(poisoned) => poisoned.into_inner().insert(job_id.to_string()),
+    }
+}
+
+/// Forget a job's held-back state, so the next withdrawal is announced again.
+fn clear_permission_decline(job_id: &str) {
+    match PERMISSION_DECLINED.lock() {
+        Ok(mut held) => held.remove(job_id),
+        Err(poisoned) => poisoned.into_inner().remove(job_id),
+    };
+}
+
 /// Decide what to do with one due job: retire it, reschedule it quietly, or produce the [`Wakeup`]
 /// that spends a turn.
 async fn prepare(
@@ -682,6 +792,7 @@ async fn prepare(
     job: ScheduledJob,
     now: DateTime<Utc>,
 ) -> crate::error::Result<Option<Wakeup>> {
+    let store = session_manager.schedule_store();
     let late_by = now - job.next_fire_at;
     let recurring = job.schedule.is_recurring();
 
@@ -698,7 +809,7 @@ async fn prepare(
             job.short_id(),
             format_late(late_by)
         );
-        session_manager.delete_scheduled_job(&job.id).await?;
+        store.delete_scheduled_job(&job.id).await?;
         return Ok(None);
     }
 
@@ -712,55 +823,131 @@ async fn prepare(
     // write below then has nothing to update.
     let next_fire_at = job.schedule.next_after(now).filter(|_| recurring);
     match next_fire_at {
-        Some(next) => {
-            session_manager
-                .reschedule_scheduled_job(&job.id, next)
-                .await?
-        }
-        None => session_manager.delete_scheduled_job(&job.id).await?,
+        Some(next) => store.reschedule_scheduled_job(&job.id, next).await?,
+        None => store.delete_scheduled_job(&job.id).await?,
     }
+
+    // Looked up only when there is a gate to run, so an ungated job costs no query. One lookup
+    // serves both the working directory and the live permission the re-check below needs.
+    let gate_session = match &job.gate {
+        None => None,
+        Some(_) => match session_manager.session_info(job.session_id).await {
+            Ok(info) => info,
+            Err(error) => {
+                // Not silently "no session". A failed lookup means the level cannot be confirmed,
+                // and the re-check below has to fail closed on that rather than fall back to the
+                // recorded value.
+                tracing::warn!(
+                    "could not read session {} while preparing job {}: {}",
+                    job.session_id,
+                    job.short_id(),
+                    error
+                );
+                None
+            }
+        },
+    };
+    let gate_cwd = gate_session.as_ref().and_then(|info| info.cwd.clone());
+
+    // What the session's permission is *now*, as opposed to what it was when the gate was authored.
+    //
+    // `None` means the row carries no per-session level, which is the REPL and ACP case: those
+    // derive permission from process config rather than the row, so the host's own level is the
+    // live answer. A session row that exists but cannot be read leaves this `None` and the
+    // host level decides, which is why the lookup failure above warns rather than passing silently.
+    let live_permission = gate_session
+        .as_ref()
+        .and_then(|info| info.permission.as_deref())
+        .and_then(|level| level.parse::<crate::permission::Permission>().ok())
+        .unwrap_or(config.host_permission);
 
     let gate_output = match &job.gate {
         None => None,
-        Some(gate) => match evaluate_gate(gate, config.gate_timeout).await {
-            Ok(outcome) => {
-                // Persist the new baseline even when it did not fire; that is exactly how an
-                // `on-change` gate stops firing once it has seen the new value. A retired job has
-                // no row left to write to, and needs none -- it will not be evaluated again.
-                if next_fire_at.is_some()
-                    && let Err(error) = session_manager
-                        .update_scheduled_job_gate_output(&job.id, &outcome.output)
-                        .await
-                {
-                    tracing::warn!(
-                        "failed to record gate output for {}: {}",
-                        job.short_id(),
-                        error
-                    );
+        // Both the recorded level and the live one must still say `Write`.
+        //
+        // Checking only the recorded value was a tautology: `schedule_create` and the HTTP handler
+        // each demand `Write` before writing the row, and nothing ever updates the column, so
+        // `recorded == Write` for every job that exists. The comparison could not fail, and the
+        // case it was written for -- the session cycles down to `read`, or a
+        // `meka serve --permission read` restarts and inherits the row -- went unnoticed. The live
+        // level is what makes the withdrawal real; the recorded one still matters because a row
+        // predating the column decodes as `Permission::None` and must stay refused.
+        //
+        // The occurrence is declined, exactly as a gate that ran and said no is declined. A gate
+        // is the condition on the job, so a gate that could not be evaluated has not passed, and
+        // firing anyway converts a conditional job into an unconditional one. The shape that
+        // makes this concrete is `every = "1m"` with an `on-change` gate: on a row predating the
+        // `gate_permission` column it went from near-silent to a turn a minute, which is the
+        // opposite of what the row asks for and expensive besides.
+        Some(gate)
+            if !matches!(gate.permission, crate::permission::Permission::Write)
+                || !matches!(live_permission, crate::permission::Permission::Write) =>
+        {
+            // Said once per downgrade, not once per evaluation. The condition is a standing state
+            // rather than an event: a session left below write with an `every = "1m"` job wrote
+            // this line every minute for as long as it stayed there, which buries the log it is
+            // supposed to be the signal in. The id is cleared the moment the gate is authorised
+            // again, so a later downgrade is announced afresh.
+            if declined_for_permission_first_time(&job.id) {
+                tracing::warn!(
+                    "job {} not fired: its gate was authorised at {} and the session is currently \
+                     {}, and an unattended shell command needs write at both. Raise the session \
+                     back to write permission to restore it",
+                    job.short_id(),
+                    gate.permission,
+                    live_permission,
+                );
+            } else {
+                tracing::debug!(
+                    "job {} still not fired: the session remains at {}",
+                    job.short_id(),
+                    live_permission,
+                );
+            }
+            return Ok(None);
+        }
+        Some(gate) => {
+            // Authorised again, so the next withdrawal is announced rather than swallowed.
+            clear_permission_decline(&job.id);
+            match evaluate_gate(gate, config.gate_timeout, gate_cwd.as_deref()).await {
+                Ok(outcome) => {
+                    // Persist the new baseline even when it did not fire; that is exactly how an
+                    // `on-change` gate stops firing once it has seen the new value. A retired job
+                    // has no row left to write to, and needs none -- it will
+                    // not be evaluated again.
+                    if next_fire_at.is_some()
+                        && let Err(error) = store
+                            .update_scheduled_job_gate_output(&job.id, &outcome.output)
+                            .await
+                    {
+                        tracing::warn!(
+                            "failed to record gate output for {}: {}",
+                            job.short_id(),
+                            error
+                        );
+                    }
+                    if !outcome.fired {
+                        tracing::debug!("gate for job {} declined to fire", job.short_id());
+                        return Ok(None);
+                    }
+                    Some(outcome.output)
                 }
-                if !outcome.fired {
-                    tracing::debug!("gate for job {} declined to fire", job.short_id());
+                Err(error) => {
+                    // Loud on purpose. A watcher whose command breaks produces the same silence as
+                    // a watcher with nothing to report, and that is the failure
+                    // most likely to go unnoticed for weeks.
+                    tracing::warn!("gate for job {} failed: {}", job.short_id(), error);
                     return Ok(None);
                 }
-                Some(outcome.output)
             }
-            Err(error) => {
-                // Loud on purpose. A watcher whose command breaks produces the same silence as a
-                // watcher with nothing to report, and that is the failure most likely to go
-                // unnoticed for weeks.
-                tracing::warn!("gate for job {} failed: {}", job.short_id(), error);
-                return Ok(None);
-            }
-        },
+        }
     };
 
     // Only a surviving job has an anchor worth recording. Recomputing the next fire here rather
     // than reusing `next_fire_at` would be the same value today, but it is the kind of duplicated
     // derivation that drifts: the reschedule above is the single writer of that column.
     if let Some(next) = next_fire_at {
-        session_manager
-            .stamp_scheduled_job_fired(&job.id, now, next)
-            .await?;
+        store.stamp_scheduled_job_fired(&job.id, now, next).await?;
     }
 
     tracing::info!(
@@ -784,6 +971,419 @@ async fn prepare(
 /// work (`1.5h` and `1h 30m` are the same duration).
 fn parse_duration(input: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(input)
+}
+
+/// Scheduling's slice of the session database, handed out by
+/// [`crate::session::SessionManager::schedule_store`].
+#[derive(Clone)]
+pub struct ScheduleStore {
+    connection: std::sync::Arc<tokio_rusqlite::Connection>,
+}
+
+impl ScheduleStore {
+    pub(crate) fn new(connection: std::sync::Arc<tokio_rusqlite::Connection>) -> Self {
+        Self { connection }
+    }
+
+    /// Persist a new scheduled job. The caller owns computing `next_fire_at` from the job's anchor
+    /// (see [`ScheduledJob::anchor`]).
+    pub async fn create_scheduled_job(&self, job: &ScheduledJob) -> crate::error::Result<()> {
+        let id = job.id.clone();
+        let session_id = job.session_id.to_string();
+        let kind = job.schedule.kind_str().to_string();
+        let spec = job.schedule.spec();
+        let prompt = job.prompt.clone();
+        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
+        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
+        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
+        let gate_permission = job.gate.as_ref().map(|gate| gate.permission.to_string());
+        let isolated = i64::from(job.isolated);
+        let created_at = job.created_at.to_rfc3339();
+        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
+        let next_fire_at = job.next_fire_at.to_rfc3339();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_command, \
+                     gate_fire, gate_last_output, gate_permission, isolated, created_at, \
+                     last_fired_at, next_fire_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        id,
+                        session_id,
+                        kind,
+                        spec,
+                        prompt,
+                        gate_command,
+                        gate_fire,
+                        gate_last_output,
+                        gate_permission,
+                        isolated,
+                        created_at,
+                        last_fired_at,
+                        next_fire_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to create scheduled job: {}", error))
+            })
+    }
+
+    /// Every job belonging to one session, soonest first.
+    pub async fn list_scheduled_jobs(
+        &self,
+        session_id: uuid::Uuid,
+    ) -> crate::error::Result<Vec<ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, gate_permission, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs WHERE session_id = ?1 ORDER BY next_fire_at ASC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// Every job in the database, soonest first. Backs `meka schedule list` and `meka schedule
+    /// cancel`, which work from a job id and so cannot ask the caller which session to look in.
+    pub async fn list_all_scheduled_jobs(&self) -> crate::error::Result<Vec<ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, gate_permission, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs ORDER BY next_fire_at ASC",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Every job across all sessions whose `next_fire_at` has passed, soonest first. The
+    /// scheduler's per-tick query; served by `idx_scheduled_jobs_next_fire`.
+    pub async fn list_due_scheduled_jobs(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<Vec<ScheduledJob>> {
+        self.query_scheduled_jobs(
+            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
+             gate_last_output, gate_permission, isolated, created_at, last_fired_at, next_fire_at \
+             FROM scheduled_jobs WHERE next_fire_at <= ?1 ORDER BY next_fire_at ASC",
+            vec![now.to_rfc3339()],
+        )
+        .await
+    }
+
+    /// Shared row decoder. A row that fails to decode (hand-edited spec, a `kind` from a future
+    /// version) is skipped with a warning rather than failing the whole query: one bad row must not
+    /// stop every other job in the database from firing.
+    async fn query_scheduled_jobs(
+        &self,
+        sql: &'static str,
+        params: Vec<String>,
+    ) -> crate::error::Result<Vec<ScheduledJob>> {
+        let rows: Vec<ScheduledJobRow> = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok(ScheduledJobRow {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            kind: row.get(2)?,
+                            spec: row.get(3)?,
+                            prompt: row.get(4)?,
+                            gate_command: row.get(5)?,
+                            gate_fire: row.get(6)?,
+                            gate_last_output: row.get(7)?,
+                            gate_permission: row.get(8)?,
+                            isolated: row.get::<_, i64>(9)? != 0,
+                            created_at: row.get(10)?,
+                            last_fired_at: row.get(11)?,
+                            next_fire_at: row.get(12)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load scheduled jobs: {}", error))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row.id.clone();
+                row.decode()
+                    .inspect_err(|error| {
+                        tracing::warn!("skipping unreadable scheduled job {}: {}", id, error);
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+
+    /// Delete a job by full or unique-prefix id. Returns the id actually removed, or `None` when
+    /// nothing matched.
+    ///
+    /// An ambiguous prefix is an error rather than an arbitrary pick, and a `Config` rather than a
+    /// `Database` one. Nothing went wrong with the database; the caller's prefix is
+    /// under-specified, and `Config` is the variant that carries that to HTTP as a 422 rather than
+    /// a 500. `BackgroundStore::resolve_background_task` says the same thing about the same
+    /// condition and already used `Config`, so the two `serve` endpoints answered different
+    /// statuses for one mistake. The variant name fits neither of them well; its mapping does, and
+    /// a new variant for one condition is not worth the churn through every match.
+    pub async fn cancel_scheduled_job(
+        &self,
+        session_id: uuid::Uuid,
+        id_prefix: &str,
+    ) -> crate::error::Result<Option<String>> {
+        let jobs = self.list_scheduled_jobs(session_id).await?;
+        let matches: Vec<&ScheduledJob> = jobs
+            .iter()
+            .filter(|job| job.id.starts_with(id_prefix))
+            .collect();
+        let id = match matches.as_slice() {
+            [] => return Ok(None),
+            [job] => job.id.clone(),
+            several => {
+                return Err(MekaError::Config(format!(
+                    "'{}' matches {} jobs; use a longer id",
+                    id_prefix,
+                    several.len()
+                )));
+            }
+        };
+
+        let id_for_db = id.clone();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM scheduled_jobs WHERE id = ?1",
+                    rusqlite::params![id_for_db],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to cancel scheduled job: {}", error))
+            })?;
+        Ok(Some(id))
+    }
+
+    /// Delete a job by exact id, without the prefix resolution [`Self::cancel_scheduled_job`] does.
+    /// Used by the scheduler to retire a fired one-shot.
+    pub async fn delete_scheduled_job(&self, id: &str) -> crate::error::Result<()> {
+        let id = id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM scheduled_jobs WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to delete scheduled job: {}", error))
+            })
+    }
+
+    /// Record that a job fired and when it is next due.
+    ///
+    /// Written *before* the turn runs, not after: a prompt that reliably crashes or hangs the
+    /// process would otherwise re-fire on every restart, turning one bad job into a boot loop in
+    /// the daemon that is supposed to stay up. Stamping first costs one missed occurrence instead.
+    pub async fn stamp_scheduled_job_fired(
+        &self,
+        id: &str,
+        fired_at: chrono::DateTime<chrono::Utc>,
+        next_fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let fired_at = fired_at.to_rfc3339();
+        let next_fire_at = next_fire_at.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET last_fired_at = ?2, next_fire_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, fired_at, next_fire_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to stamp scheduled job: {}", error))
+            })
+    }
+
+    /// Move a job's next due time without claiming it fired.
+    ///
+    /// Separate from [`Self::stamp_scheduled_job_fired`] because a gated job that evaluates to "no change" has been *considered* but not fired, and recording it as fired would both mislead `schedule list` and, for an interval schedule, silently re-anchor the cadence on evaluations rather than on fires.
+    pub async fn reschedule_scheduled_job(
+        &self,
+        id: &str,
+        next_fire_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let next_fire_at = next_fire_at.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET next_fire_at = ?2 WHERE id = ?1",
+                    rusqlite::params![id, next_fire_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to reschedule job: {}", error)))
+    }
+
+    /// Put a job back exactly as it was, for a host that turned out to be unable to run it after
+    /// the scheduler had already claimed the occurrence.
+    ///
+    /// An upsert of the whole row rather than an update of the columns that moved, because claiming
+    /// a job can *delete* it: a one-shot has no next occurrence, so it is retired the moment it
+    /// comes due, and an `UPDATE` would then match nothing while still reporting success -- losing
+    /// the reminder outright. Restoring every column also puts back `gate_last_output`, without
+    /// which a deferred `on-change` watcher would have already absorbed the very change it exists
+    /// to report.
+    pub async fn restore_scheduled_job(&self, job: &ScheduledJob) -> crate::error::Result<()> {
+        let id = job.id.clone();
+        let session_id = job.session_id.to_string();
+        let kind = job.schedule.kind_str().to_string();
+        let spec = job.schedule.spec();
+        let prompt = job.prompt.clone();
+        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
+        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
+        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
+        let gate_permission = job.gate.as_ref().map(|gate| gate.permission.to_string());
+        let isolated = i64::from(job.isolated);
+        let created_at = job.created_at.to_rfc3339();
+        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
+        let next_fire_at = job.next_fire_at.to_rfc3339();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT OR REPLACE INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
+                     gate_command, gate_fire, gate_last_output, gate_permission, isolated, \
+                     created_at, last_fired_at, next_fire_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        id,
+                        session_id,
+                        kind,
+                        spec,
+                        prompt,
+                        gate_command,
+                        gate_fire,
+                        gate_last_output,
+                        gate_permission,
+                        isolated,
+                        created_at,
+                        last_fired_at,
+                        next_fire_at
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to restore scheduled job: {}", error))
+            })
+    }
+
+    /// Persist the gate's latest stdout so the next `on-change` evaluation has something to compare
+    /// against.
+    pub async fn update_scheduled_job_gate_output(
+        &self,
+        id: &str,
+        output: &str,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let output = output.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE scheduled_jobs SET gate_last_output = ?2 WHERE id = ?1",
+                    rusqlite::params![id, output],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to record gate output: {}", error))
+            })
+    }
+}
+
+/// Raw `scheduled_jobs` row, decoded into a [`ScheduledJob`] outside the database closure so parse
+/// failures can be logged and skipped individually.
+struct ScheduledJobRow {
+    id: String,
+    session_id: String,
+    kind: String,
+    spec: String,
+    prompt: String,
+    gate_command: Option<String>,
+    gate_fire: Option<String>,
+    gate_last_output: Option<String>,
+    gate_permission: Option<String>,
+    isolated: bool,
+    created_at: String,
+    last_fired_at: Option<String>,
+    next_fire_at: String,
+}
+
+impl ScheduledJobRow {
+    fn decode(self) -> std::result::Result<ScheduledJob, String> {
+        let parse_time =
+            |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .map(|at| at.with_timezone(&chrono::Utc))
+                    .map_err(|error| format!("bad timestamp '{}': {}", text, error))
+            };
+
+        let gate = match (self.gate_command, self.gate_fire) {
+            (Some(command), Some(fire)) => Some(Gate {
+                command,
+                fire: GateFire::parse(&fire)?,
+                last_output: self.gate_last_output,
+                // A row written before `gate_permission` existed carries no level. Reading that as
+                // `Write` would restore exactly the behaviour this column was added to stop, so an
+                // absent level resolves to `None` -- the gate is refused at fire time and the user
+                // is told to recreate the job. Failing closed on a pre-migration row costs one
+                // re-creation; failing open costs the guarantee.
+                permission: self
+                    .gate_permission
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<crate::permission::Permission>().ok())
+                    .unwrap_or(crate::permission::Permission::None),
+            }),
+            // A half-written gate is a corrupt row, not a job without a gate: silently dropping the
+            // condition would turn a watcher into an unconditional timer.
+            (Some(_), None) | (None, Some(_)) => {
+                return Err("gate_command and gate_fire must both be set or both be null".into());
+            }
+            (None, None) => None,
+        };
+
+        Ok(ScheduledJob {
+            id: self.id,
+            session_id: uuid::Uuid::parse_str(&self.session_id)
+                .map_err(|error| format!("bad session id '{}': {}", self.session_id, error))?,
+            schedule: Schedule::from_stored(&self.kind, &self.spec)?,
+            prompt: self.prompt,
+            gate,
+            isolated: self.isolated,
+            created_at: parse_time(&self.created_at)?,
+            last_fired_at: self.last_fired_at.as_deref().map(parse_time).transpose()?,
+            next_fire_at: parse_time(&self.next_fire_at)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -863,11 +1463,48 @@ mod tests {
         assert!(Schedule::parse_cron("*/5 * * * *").is_ok());
     }
 
+    /// The fix has to reach the rows already on disk, which is the only population it matters for.
+    /// Creation was closed first and rehydration was left on the permissive parser, so a six-field
+    /// row kept its every-ten-seconds reading forever.
+    #[test]
+    fn a_stored_cron_spec_is_read_with_the_same_grammar_it_was_created_under() {
+        assert!(
+            Schedule::parse_cron("*/10 * * * * *").is_err(),
+            "six fields are refused at creation"
+        );
+        assert!(
+            Schedule::from_stored("cron", "*/10 * * * * *").is_err(),
+            "and refused on the way back out of the database"
+        );
+
+        // A legitimate five-field row still round-trips.
+        let stored = Schedule::from_stored("cron", "0 9 * * 1-5").expect("five fields still load");
+        assert_eq!(stored.spec(), "0 9 * * 1-5");
+    }
+
     #[test]
     fn test_parse_cron_rejects_unsatisfiable_pattern() {
         // Well-formed but matches no calendar date; caught at creation rather than leaving a job
         // that silently never fires.
         assert!(Schedule::parse_cron("0 0 30 2 *").is_err());
+    }
+
+    /// A pattern whose next occurrence is years away is satisfiable, and `prepare` retires a job
+    /// whose schedule has no next occurrence, so `next_after` must not confuse "far off" with
+    /// "never". February 29th is the shortest such case at up to four years.
+    #[test]
+    fn a_schedule_whose_next_occurrence_is_years_away_still_has_one() {
+        use chrono::TimeZone;
+
+        let schedule = Schedule::parse_cron("0 0 29 2 *").expect("Feb 29 is a real date");
+        let anchor = Utc
+            .with_ymd_and_hms(2026, 8, 16, 12, 0, 0)
+            .single()
+            .expect("anchor");
+        let next = schedule
+            .next_after(anchor)
+            .expect("a leap day must not read as an unschedulable pattern");
+        assert!(next > anchor + chrono::Duration::days(366), "{next}");
     }
 
     #[test]
@@ -932,6 +1569,9 @@ mod tests {
             command: command.to_string(),
             fire,
             last_output: last_output.map(str::to_string),
+            // The level every gate is created at. Tests that exercise a gate *running* need it; the
+            // one that exercises a withdrawn authority overrides it explicitly.
+            permission: crate::permission::Permission::Write,
         }
     }
 
@@ -939,14 +1579,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_success_gate_follows_the_exit_code() {
-        let passing = evaluate_gate(&gate("exit 0", GateFire::OnSuccess, None), GATE_BUDGET)
-            .await
-            .expect("gate ran");
+        let passing = evaluate_gate(
+            &gate("exit 0", GateFire::OnSuccess, None),
+            GATE_BUDGET,
+            None,
+        )
+        .await
+        .expect("gate ran");
         assert!(passing.fired);
 
-        let failing = evaluate_gate(&gate("exit 1", GateFire::OnSuccess, None), GATE_BUDGET)
-            .await
-            .expect("gate ran");
+        let failing = evaluate_gate(
+            &gate("exit 1", GateFire::OnSuccess, None),
+            GATE_BUDGET,
+            None,
+        )
+        .await
+        .expect("gate ran");
         assert!(
             !failing.fired,
             "a false condition is not an error, it is just no fire"
@@ -957,11 +1605,84 @@ mod tests {
     async fn test_on_change_gate_fires_on_its_first_evaluation() {
         // No baseline means the watcher has never run. Firing proves the command works instead of
         // leaving a typo undiscovered until the thing being watched finally changes.
-        let outcome = evaluate_gate(&gate("echo ready", GateFire::OnChange, None), GATE_BUDGET)
-            .await
-            .expect("gate ran");
+        let outcome = evaluate_gate(
+            &gate("echo ready", GateFire::OnChange, None),
+            GATE_BUDGET,
+            None,
+        )
+        .await
+        .expect("gate ran");
         assert!(outcome.fired);
         assert_eq!(outcome.output, "ready");
+    }
+
+    /// A gate runs in its session's directory, not the host process's.
+    ///
+    /// The model almost always authors a gate right after verifying the same command through
+    /// `execute_command`, which runs in the session cwd. Under a `meka serve` unit the host process
+    /// sits somewhere else entirely (`/`, or wherever systemd put it), so a gate that ignores the
+    /// session cwd silently stops matching the command the user watched succeed. Nothing caught
+    /// this: the `cwd` argument threads all the way through `prepare` with no assertion on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_runs_in_its_sessions_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Resolved because macOS hands out `/var/...` symlinked to `/private/var/...`, and `pwd`
+        // in the child reports the resolved form.
+        let directory = temp.path().canonicalize().expect("canonicalize");
+
+        let outcome = evaluate_gate(
+            &gate("pwd", GateFire::OnChange, None),
+            GATE_BUDGET,
+            Some(&directory),
+        )
+        .await
+        .expect("gate ran");
+
+        assert_eq!(
+            outcome.output,
+            directory.to_string_lossy(),
+            "the gate ran in the host's directory instead of the session's"
+        );
+    }
+
+    /// A non-zero exit is how several perfectly good on-change gates signal a change: `diff -q`
+    /// and `git diff --exit-code` exit 1 exactly when there is a difference. Refusing to fire on a
+    /// non-zero exit silenced those permanently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_on_change_gate_that_signals_through_its_exit_code_still_fires() {
+        let gate = Gate {
+            command: "echo 'Files a and b differ'; exit 1".to_string(),
+            fire: GateFire::OnChange,
+            last_output: Some("".to_string()),
+            permission: crate::permission::Permission::Write,
+        };
+        let outcome = evaluate_gate(&gate, GATE_BUDGET, None)
+            .await
+            .expect("a non-zero exit is a signal, not a broken gate");
+        assert!(
+            outcome.fired,
+            "output differs from the baseline, so the gate must fire"
+        );
+        assert_eq!(outcome.output, "Files a and b differ");
+    }
+
+    /// The other half: a watcher in its quiet period exits non-zero with nothing on stdout, every
+    /// time, and must stay quiet rather than erroring. `grep PATTERN log` is the canonical shape.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_on_change_gate_quiet_period_is_not_an_error() {
+        let gate = Gate {
+            command: "exit 1".to_string(),
+            fire: GateFire::OnChange,
+            last_output: Some("".to_string()),
+            permission: crate::permission::Permission::Write,
+        };
+        let outcome = evaluate_gate(&gate, GATE_BUDGET, None)
+            .await
+            .expect("a quiet watcher is not a broken one");
+        assert!(!outcome.fired, "nothing changed, so nothing fires");
     }
 
     #[tokio::test]
@@ -969,6 +1690,7 @@ mod tests {
         let unchanged = evaluate_gate(
             &gate("echo steady", GateFire::OnChange, Some("steady")),
             GATE_BUDGET,
+            None,
         )
         .await
         .expect("gate ran");
@@ -977,6 +1699,7 @@ mod tests {
         let changed = evaluate_gate(
             &gate("echo moved", GateFire::OnChange, Some("steady")),
             GATE_BUDGET,
+            None,
         )
         .await
         .expect("gate ran");
@@ -997,6 +1720,7 @@ mod tests {
         let error = evaluate_gate(
             &gate(command, GateFire::OnChange, None),
             Duration::from_millis(150),
+            None,
         )
         .await
         .expect_err("an overrunning gate must not report success");
@@ -1007,9 +1731,13 @@ mod tests {
     async fn test_gate_output_is_trimmed_so_trailing_newlines_do_not_flap() {
         // `echo` appends a newline. Comparing untrimmed, a gate whose command varied its trailing
         // whitespace would fire forever.
-        let outcome = evaluate_gate(&gate("echo spaced", GateFire::OnChange, None), GATE_BUDGET)
-            .await
-            .expect("gate ran");
+        let outcome = evaluate_gate(
+            &gate("echo spaced", GateFire::OnChange, None),
+            GATE_BUDGET,
+            None,
+        )
+        .await
+        .expect("gate ran");
         assert_eq!(outcome.output, "spaced");
     }
 
@@ -1033,6 +1761,14 @@ mod tests {
 
     impl SchedulerHarness {
         async fn new() -> Self {
+            Self::at_host_permission(crate::permission::Permission::Write).await
+        }
+
+        /// A harness whose *host* runs at `host_permission`, which is what a
+        /// `meka serve --permission read` inheriting someone else's job looks like. `new` uses
+        /// `Write` because that is the ordinary case every other test needs; `Default` deliberately
+        /// gives `None`, so the level has to be stated here rather than inherited by accident.
+        async fn at_host_permission(host_permission: crate::permission::Permission) -> Self {
             let manager = std::sync::Arc::new(
                 crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
                     .await
@@ -1042,7 +1778,10 @@ mod tests {
             Self {
                 manager,
                 session_id,
-                config: crate::config::ResolvedScheduleConfig::default(),
+                config: crate::config::ResolvedScheduleConfig {
+                    host_permission,
+                    ..Default::default()
+                },
                 fired: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
@@ -1087,6 +1826,7 @@ mod tests {
                 next_fire_at: now - overdue,
             };
             self.manager
+                .schedule_store()
                 .create_scheduled_job(&job)
                 .await
                 .expect("create job");
@@ -1127,6 +1867,7 @@ mod tests {
 
         async fn jobs(&self) -> Vec<ScheduledJob> {
             self.manager
+                .schedule_store()
                 .list_scheduled_jobs(self.session_id)
                 .await
                 .expect("list jobs")
@@ -1540,6 +2281,257 @@ mod tests {
         assert!(jobs.first().expect("job survives").last_fired_at.is_none());
     }
 
+    /// A gate is authorised once, at `write`, and then persists as a row that any process executes
+    /// on a timer. Nothing about the creating session's later downgrade -- Shift+Tab to `read`, or
+    /// a `meka serve --permission read` restart inheriting the job -- can reach back to
+    /// withdraw it, so the level travels on the row and is re-checked here. Asserted through a
+    /// real filesystem side effect rather than through the returned outcome, because "did not
+    /// fire" and "did not *run*" are different claims and only the second one is the security
+    /// property.
+    /// The scenario the feature exists for, driven the way production produces it: the gate carries
+    /// the `Write` it was legitimately created with, and the *host* has since dropped to `read`.
+    ///
+    /// The sibling below hand-sets `gate.permission` to `Read`, which no creation path can produce
+    /// -- both `schedule_create` and the HTTP handler demand `Write` before writing the row, and
+    /// nothing updates the column afterwards. So that test proved the mechanism worked on an input
+    /// reality never supplies, and the check it guarded was `Write == Write` for every real job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_is_not_executed_once_the_host_drops_below_write() {
+        let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&marker);
+
+        let harness =
+            SchedulerHarness::at_host_permission(crate::permission::Permission::Read).await;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                // Recorded `Write`, exactly as `schedule_create` would have written it.
+                Some(gate(
+                    &format!("touch {}", marker.display()),
+                    GateFire::OnSuccess,
+                    None,
+                )),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(
+            !marker.exists(),
+            "the gate command must not run at all once the host is below write"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A panic in one fire must not stop the scheduler.
+    ///
+    /// Under `meka serve` the callback runs a whole agent turn, so everything the tool loop can do
+    /// is inside the surface that can panic. Nothing joins this task, so losing it produced no
+    /// error anywhere: scheduled jobs simply stopped firing, for the life of the process, and the
+    /// first sign was a reminder that never arrived.
+    #[tokio::test]
+    async fn a_panicking_fire_does_not_stop_the_scheduler() {
+        let harness =
+            SchedulerHarness::at_host_permission(crate::permission::Permission::Write).await;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1s").expect("parses"),
+                None,
+                chrono::Duration::seconds(30),
+            )
+            .await;
+
+        let fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = crate::config::ResolvedScheduleConfig {
+            poll_interval: std::time::Duration::from_millis(20),
+            ..harness.config.clone()
+        };
+        let handle = spawn(
+            std::sync::Arc::clone(&harness.manager),
+            config,
+            SchedulerScope::every_job(),
+            {
+                let fires = std::sync::Arc::clone(&fires);
+                move |_wakeup| {
+                    let fires = std::sync::Arc::clone(&fires);
+                    async move {
+                        fires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        panic!("the turn blew up");
+                    }
+                }
+            },
+        );
+
+        // Two fires means the loop survived the first panic, which is the whole claim.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fires.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scheduler stopped after {} fire(s)",
+                fires.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        handle.abort();
+    }
+
+    /// The other half of a withdrawn gate: the job does not fire either.
+    ///
+    /// "Did not run" and "did not fire" are separate claims and both matter. A gate is the
+    /// condition on the job, so a gate that cannot be evaluated has not passed, and delivering the
+    /// prompt regardless turns a conditional job into an unconditional one. Delivering it was the
+    /// first shape of this fix, and on an `every = "1m"` watcher it meant a turn a minute for as
+    /// long as the session stayed below `write`.
+    #[tokio::test]
+    async fn a_job_whose_gate_cannot_be_run_does_not_fire_regardless() {
+        let harness =
+            SchedulerHarness::at_host_permission(crate::permission::Permission::Read).await;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1m").expect("parses"),
+                Some(gate("true", GateFire::OnSuccess, None)),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(
+            harness.fired().is_empty(),
+            "an unevaluated gate is not a passed gate",
+        );
+        let jobs = harness.jobs().await;
+        let job = jobs.first().expect("the job survives for the next sweep");
+        assert!(
+            job.last_fired_at.is_none(),
+            "and it must not be recorded as having fired",
+        );
+        assert!(
+            job.next_fire_at > Utc::now(),
+            "the occurrence is spent, so a restored session does not get a backlog",
+        );
+    }
+
+    /// The companion: the same job, same recorded level, on a host that still holds `write`, runs.
+    /// Without this the test above would pass just as well if gates never ran at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_is_executed_while_the_host_still_holds_write() {
+        let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&marker);
+
+        let harness = SchedulerHarness::new().await;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate(
+                    &format!("touch {}", marker.display()),
+                    GateFire::OnSuccess,
+                    None,
+                )),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(marker.exists(), "a fully authorised gate must still run");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// The held-back explanation is a fact about a standing state, so it is said once.
+    ///
+    /// The sweep re-evaluates every due job, and a session parked below write does not change
+    /// between sweeps. An `every = "1m"` job wrote the full explanation every minute for as long as
+    /// it stayed there, which turns the one line an operator needs to see into the noise they stop
+    /// reading. Restoring the authority arms it again, so the next withdrawal is not swallowed.
+    #[test]
+    fn a_job_held_back_for_permission_explains_itself_once_per_downgrade() {
+        let job = format!("job-{}", uuid::Uuid::new_v4());
+
+        assert!(
+            declined_for_permission_first_time(&job),
+            "the first sweep of a downgrade has to say why"
+        );
+        assert!(
+            !declined_for_permission_first_time(&job),
+            "and the ones after it must not repeat"
+        );
+        assert!(
+            !declined_for_permission_first_time(&job),
+            "however many there are"
+        );
+
+        clear_permission_decline(&job);
+        assert!(
+            declined_for_permission_first_time(&job),
+            "a later withdrawal is a new fact and is announced again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_whose_authority_was_withdrawn_is_not_executed() {
+        let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&marker);
+
+        let harness = SchedulerHarness::new().await;
+        let mut withdrawn = gate(
+            &format!("touch {}", marker.display()),
+            GateFire::OnSuccess,
+            None,
+        );
+        withdrawn.permission = crate::permission::Permission::Read;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(withdrawn),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(
+            !marker.exists(),
+            "a gate authorised at read must never reach the shell"
+        );
+        // And the occurrence is declined rather than delivered ungated; see
+        // `a_job_whose_gate_cannot_be_run_does_not_fire_regardless` for why.
+        assert!(harness.fired().is_empty());
+
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// The companion to the above: at `write` the same gate does run, so the refusal is about the
+    /// recorded authority and not about gates having quietly stopped working.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gate_that_still_holds_write_is_executed() {
+        let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&marker);
+
+        let harness = SchedulerHarness::new().await;
+        harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate(
+                    &format!("touch {}", marker.display()),
+                    GateFire::OnSuccess,
+                    None,
+                )),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        harness.tick().await;
+
+        assert!(marker.exists(), "a gate at write permission must run");
+        let _ = std::fs::remove_file(&marker);
+    }
+
     /// A one-shot is retired the moment it comes due, before its gate is consulted: its moment has
     /// passed either way. The writes that follow a fire must therefore tolerate the row being gone,
     /// which is what this pins -- an earlier version issued them unconditionally and relied on the
@@ -1675,6 +2667,7 @@ mod tests {
         assert_eq!(
             harness
                 .manager
+                .schedule_store()
                 .list_due_scheduled_jobs(Utc::now())
                 .await
                 .expect("list due")

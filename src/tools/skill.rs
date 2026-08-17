@@ -354,18 +354,34 @@ impl Tool for SkillWriteTool {
         // confirmation would claim to have kept the body of a skill that had none.
         let kept_existing_body = body.is_none() && installed.iter().any(|s| s.name == name);
 
-        let path = skills::write_skill(
-            &root,
-            &name,
-            &description,
-            priority,
-            Some(AGENT_AUTHOR),
-            body,
-        )
-        .map_err(|message| MekaError::ToolExecution {
-            tool_name: "skill_write".to_string(),
-            message,
-        })?;
+        // On the blocking pool, for the same reason `memory_write` is: the write goes through
+        // `write_file_atomic`, which `fsync`s, and a `fsync` parks the calling thread for as long
+        // as the filesystem takes. On a runtime worker that is every other session's turn waiting.
+        let path = {
+            let root = root.clone();
+            let name = name.clone();
+            let description = description.clone();
+            let body = body.map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                skills::write_skill(
+                    &root,
+                    &name,
+                    &description,
+                    priority,
+                    Some(AGENT_AUTHOR),
+                    body.as_deref(),
+                )
+            })
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "skill_write".to_string(),
+                message: format!("write task failed: {}", error),
+            })?
+            .map_err(|message| MekaError::ToolExecution {
+                tool_name: "skill_write".to_string(),
+                message,
+            })?
+        };
         // The write is only visible to the next `current()` if the cache notices it, and a
         // `(mtime, size)` snapshot cannot see a same-tick rewrite of the same length. That is
         // not hypothetical here: the dispatcher flow writes a skill and hands it to

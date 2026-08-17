@@ -51,7 +51,7 @@ const MAX_ADVISED_PARAMETERS: usize = 5;
 
 /// The universal output-redirection parameter every tool accepts, handled by the agent loop rather
 /// than by the tool itself. See [`crate::tools::scratchpad::save_explicit_scratchpad_results`].
-const SCRATCHPAD_PARAMETER: &str = "scratchpad";
+pub(crate) const SCRATCHPAD_PARAMETER: &str = "scratchpad";
 
 /// The universal detach parameter, consumed by the agent loop. Where `scratchpad` changes *where* a
 /// tool's output goes, this changes *when* it arrives. See [`crate::background`].
@@ -1438,8 +1438,8 @@ impl ToolRegistry {
         sandbox_capability: crate::sandbox::SandboxCapability,
         sandbox_backend: crate::config::SandboxBackend,
         backend_probe: crate::sandbox::BackendProbe,
-        cwd: crate::agent::SharedCwd,
-        roots: crate::agent::SharedRoots,
+        cwd: crate::workspace::SharedCwd,
+        roots: crate::workspace::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<()> {
         let read_tracker = self.read_tracker.clone();
@@ -1523,7 +1523,7 @@ impl ToolRegistry {
         memory_access: crate::config::MemoryAccess,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
-        cwd: crate::agent::SharedCwd,
+        cwd: crate::workspace::SharedCwd,
         // `None` for sub-agents. A sub-agent's session is ephemeral, so a job keyed to it would
         // outlive the only conversation able to run it -- the same reason Claude Code refuses
         // durable crons for its teammates.
@@ -1752,8 +1752,8 @@ impl ToolRegistry {
         skills_managed: bool,
         memories: Arc<crate::memory::MemoryCache>,
         builtin_filter: BuiltinToolFilter,
-        cwd: crate::agent::SharedCwd,
-        roots: crate::agent::SharedRoots,
+        cwd: crate::workspace::SharedCwd,
+        roots: crate::workspace::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
         schedule: crate::config::ResolvedScheduleConfig,
         background: (
@@ -1831,8 +1831,8 @@ impl ToolRegistry {
         memory_access: crate::config::MemoryAccess,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
-        cwd: crate::agent::SharedCwd,
-        roots: crate::agent::SharedRoots,
+        cwd: crate::workspace::SharedCwd,
+        roots: crate::workspace::SharedRoots,
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter_and_denials(builtin_filter, denials);
@@ -1978,8 +1978,8 @@ pub(crate) mod tests {
             skills_managed,
             crate::memory::MemoryCache::for_root(None),
             filter,
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -2837,8 +2837,8 @@ pub(crate) mod tests {
             false,
             crate::memory::MemoryCache::disabled(),
             BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -3367,8 +3367,8 @@ pub(crate) mod tests {
             crate::config::MemoryAccess::Write,
             None,
             Vec::new(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
@@ -3433,8 +3433,8 @@ pub(crate) mod tests {
             memory_access,
             None,
             Vec::new(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("subagent registry should build")

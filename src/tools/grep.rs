@@ -1,5 +1,10 @@
-//! `search_contents` tool: ripgrep-style content search powered by the `grep-*` crates. Honors
-//! `.gitignore` and supports glob filtering.
+//! `search_contents` tool: ripgrep-style content search powered by the `grep-*` crates, with glob
+//! filtering.
+//!
+//! It does **not** honour `.gitignore`, despite the name suggesting ripgrep's behaviour: the walk
+//! here is a hand-rolled `read_dir` traversal whose only exclusions are dotfiles, `target` and
+//! `node_modules`, and the `ignore` crate is not a dependency. Only the matcher comes from the
+//! `grep-*` family.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -19,10 +24,10 @@ use crate::{
 const MAX_INLINE_MATCHES: usize = 100;
 
 pub(super) struct SearchContentsTool {
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
     /// multi-root ACP session.
-    pub roots: crate::agent::SharedRoots,
+    pub roots: crate::workspace::SharedRoots,
 }
 
 #[async_trait]
@@ -84,8 +89,8 @@ impl Tool for SearchContentsTool {
         // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
         // `cwd` silently misses whole folders the user can see in their editor.
         let search_paths: Vec<String> = match input["path"].as_str() {
-            Some(raw) => vec![crate::agent::resolve_against_cwd(&self.cwd, raw)],
-            None => crate::agent::search_roots(&self.cwd, &self.roots),
+            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
+            None => crate::workspace::search_roots(&self.cwd, &self.roots),
         }
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -169,6 +174,7 @@ fn search_with_grep(
     // busy cwd would otherwise starve every other root and report only "truncated", which reads as
     // "the other folders had nothing" -- the exact failure multi-root support exists to prevent.
     let mut unsearched_roots = 0usize;
+    let mut unreadable = 0usize;
 
     for search_path in search_paths {
         // Checked per root as well as inside `walk_directory`: a root that is a plain file, or that
@@ -219,6 +225,7 @@ fn search_with_grep(
                 &mut results,
                 max_results,
                 budget,
+                &mut unreadable,
             )? {
                 timed_out = true;
                 break;
@@ -263,6 +270,13 @@ fn search_with_grep(
             "search was still running after {}s and was stopped, so these results are \
              incomplete: narrow `path` to a smaller subtree or add a tighter `glob`",
             budget.budget_secs(),
+        ));
+    }
+    if unreadable > 0 {
+        notes.push(format!(
+            "{} director(ies) could not be read and were skipped, so a match inside them would \
+             not appear here",
+            unreadable,
         ));
     }
 
@@ -318,6 +332,11 @@ fn walk_directory(
     results: &mut Vec<String>,
     max_results: usize,
     budget: &WalkBudget,
+    // Directories the walk could not open, counted so the caller can say so. A silent skip turns
+    // `search_contents` over a tree with an unreadable subdirectory into a confident "No matches
+    // found.", which is the definitive-sounding wrong answer the truncation and timeout notices
+    // already exist to prevent. `find_files` has reported this all along.
+    unreadable: &mut usize,
 ) -> Result<bool> {
     // Iterative traversal via an explicit work-stack: a recursive walk would overflow the call
     // stack on a pathologically deep directory tree.
@@ -335,7 +354,15 @@ fn walk_directory(
 
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(error) => {
+                tracing::debug!(
+                    "search_contents: cannot read '{}': {}",
+                    dir.display(),
+                    error
+                );
+                *unreadable += 1;
+                continue;
+            }
         };
 
         for entry in entries {
@@ -396,8 +423,8 @@ mod tests {
         .expect("failed");
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -466,8 +493,8 @@ mod tests {
         std::fs::write(deep.join("buried.txt"), "needle here\n").expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -492,8 +519,8 @@ mod tests {
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -515,8 +542,8 @@ mod tests {
         std::fs::write(temp_dir.path().join("a.txt"), "match").expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let err = tool
             .execute(
@@ -544,8 +571,8 @@ mod tests {
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -582,8 +609,8 @@ mod tests {
         }
 
         let tool = SearchContentsTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -598,6 +625,51 @@ mod tests {
             .await
             .expect_err("a cancelled turn must not run the search to completion");
         assert!(matches!(error, MekaError::Interrupted), "got: {}", error);
+    }
+
+    /// A subdirectory the walk cannot open is not "no matches here", it is a part of the tree
+    /// nobody looked at. Folding the two together turns a permissions error into a confident
+    /// negative the model then answers from, which is the failure every other disclosure in this
+    /// tool exists to prevent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_read_is_disclosed_not_counted_as_no_match() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let sealed = temp_dir.path().join("sealed");
+        std::fs::create_dir(&sealed).expect("mkdir");
+        std::fs::write(sealed.join("hit.txt"), "needle\n").expect("write");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("seal");
+        if std::fs::read_dir(&sealed).is_ok() {
+            // Running as root, where the mode is advisory. Nothing to assert.
+            return;
+        }
+
+        let tool = SearchContentsTool {
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        // Restore the mode so the temp dir can be torn down.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).expect("unseal");
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("could not be read"),
+            "the unreadable directory must be named as unsearched, got: {}",
+            text
+        );
     }
 
     /// cwd is always root #1, so a busy cwd filling the cap would otherwise starve every other

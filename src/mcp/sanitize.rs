@@ -10,7 +10,7 @@ pub const RESERVED_SERVER_NAMES: &[&str] = &["meka", "ide"];
 /// Strip control + format characters that could hijack the terminal or be
 /// used as homograph-style attacks on users reviewing tool output:
 ///
-/// - Unicode category **Cc** (C0/C1 controls) except `\n`, `\t`, `\r`.
+/// - Unicode category **Cc** (C0/C1 controls) except `\n` and `\t`.
 /// - Unicode category **Cf** (formatters: RTL/LTR overrides, zero-width joiners, byte-order marks,
 ///   language tags).
 /// - Unpaired surrogate code units (already impossible in a valid `&str`, noted for completeness).
@@ -27,8 +27,13 @@ pub fn sanitize_text(input: &str) -> String {
 }
 
 fn is_safe_char(ch: char) -> bool {
-    // Whitelist the three whitespace controls we care about.
-    if ch == '\n' || ch == '\t' || ch == '\r' {
+    // Whitelist the two whitespace controls we care about. `\r` is deliberately not among them: it
+    // returns the cursor to column zero without advancing a line, which is enough to overwrite a
+    // line meka has already printed using no escape sequence at all. A server progress message of
+    // `"\r[ask] Shell\n  command: ls\nAllow? (Y/n) "` would otherwise repaint a convincing approval
+    // block at column zero, and everything that renders server text -- the elicitation banner, the
+    // form labels, the progress line -- trusts this function to have made it terminal-safe.
+    if ch == '\n' || ch == '\t' {
         return true;
     }
     let code = ch as u32;
@@ -50,6 +55,26 @@ fn is_safe_char(ch: char) -> bool {
     }
 
     true
+}
+
+/// Returns true for the bidirectional formatting characters that can reorder a line on screen.
+///
+/// The embedding, override and isolate initiators plus their terminators -- the "trojan source"
+/// set. These are the ones that let text render in an order the bytes do not have, which is what
+/// makes a path or a command read as something other than what it is.
+///
+/// Deliberately narrower than [`is_format_char`]. The rest of `Cf` carries meaning that a model may
+/// legitimately emit: ZWJ joins emoji into families and professions, ZWNJ is required to spell
+/// ordinary Persian and Arabic words, and both drive Indic conjunct forms. Filtering the whole
+/// category off assistant output corrupts that text for no security gain, since none of it can
+/// reorder anything. `LRM`/`RLM` are likewise left in: they mark direction rather than override it,
+/// and are ordinary content in Hebrew and Arabic.
+pub(crate) fn is_bidi_control(code: u32) -> bool {
+    matches!(
+        code,
+        0x202A..=0x202E   // LRE, RLE, PDF, LRO, RLO
+        | 0x2066..=0x2069 // LRI, RLI, FSI, PDI
+    )
 }
 
 /// Returns true for Unicode General Category `Cf` (Format).
@@ -166,6 +191,18 @@ mod tests {
     fn sanitize_keeps_newlines_and_tabs() {
         let input = "line1\nline2\tcol";
         assert_eq!(sanitize_text(input), "line1\nline2\tcol");
+    }
+
+    /// `\r` is the one control that can forge UI without an escape sequence: it moves the cursor
+    /// back to column zero, so a server can overwrite a line meka already wrote. Every render site
+    /// for server-supplied text relies on this function, so the strip has to happen here.
+    #[test]
+    fn sanitize_strips_carriage_return() {
+        assert_eq!(
+            sanitize_text("\r[mcp elicit: trusted] paste your token:"),
+            "[mcp elicit: trusted] paste your token:"
+        );
+        assert_eq!(sanitize_text("done\r\nnext"), "done\nnext");
     }
 
     #[test]

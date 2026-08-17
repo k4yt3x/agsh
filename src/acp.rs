@@ -74,7 +74,7 @@ use tokio_util::{
 };
 
 use crate::{
-    agent::{Agent, SharedCwd, SharedRoots, resolve_against_cwd},
+    agent::Agent,
     config::ResolvedConfig,
     conversation::Conversation,
     error::MekaError,
@@ -88,6 +88,7 @@ use crate::{
     session::SessionManager,
     skills::SkillCache,
     tools::todo::{TodoItem, TodoStatus},
+    workspace::{SharedCwd, SharedRoots, resolve_against_cwd},
 };
 
 /// Build a JSON-RPC `InvalidParams` error (`-32602`) with a free-form human-readable message in the
@@ -225,6 +226,11 @@ pub struct AcpFrontend {
     /// running total has to be kept somewhere; the emitter sends deltas, and this is where
     /// they are added up. Entries are dropped when the call completes.
     live_output: std::sync::Mutex<std::collections::HashMap<String, LiveOutput>>,
+    /// The same cell [`SessionEntry::cancellation`] holds, so a client round-trip started by this
+    /// frontend can be abandoned when `session/cancel` fires. Shared rather than copied: the
+    /// prompt handler rewrites the token at every turn start, and a frontend holding a stale
+    /// clone would race against a token nobody signals.
+    cancellation: Arc<std::sync::RwLock<CancellationToken>>,
 }
 
 /// How a running command's output is shown to this client.
@@ -362,6 +368,7 @@ impl AcpFrontend {
         client_state: SharedClientState,
         transport_dead: Arc<std::sync::atomic::AtomicBool>,
         context_tokens: Arc<std::sync::atomic::AtomicU64>,
+        cancellation: Arc<std::sync::RwLock<CancellationToken>>,
     ) -> Self {
         Self {
             connection,
@@ -374,7 +381,52 @@ impl AcpFrontend {
             context_tokens,
             context_window: std::sync::atomic::AtomicU64::new(0),
             live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
+            cancellation,
         }
+    }
+
+    /// The cell itself, so the owning [`SessionEntry`] shares it rather than minting a second one.
+    /// Both sides must see the token the prompt handler installs, or `session/cancel` signals one
+    /// cell while the frontend waits on another.
+    fn cancellation_cell(&self) -> Arc<std::sync::RwLock<CancellationToken>> {
+        Arc::clone(&self.cancellation)
+    }
+
+    /// The current turn's cancellation token, cloned out of the cell the prompt handler rewrites at
+    /// each turn start.
+    fn current_cancellation(&self) -> CancellationToken {
+        // A detached call's own token wins over the session's. See
+        // `crate::frontend::scope_call_cancellation`: without this, cancelling any later turn
+        // abandoned a background task's `fs/*` round-trip mid-flight.
+        if let Some(call) = crate::frontend::current_call_cancellation() {
+            return call;
+        }
+        match self.cancellation.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Await a client round-trip, giving up if the turn is cancelled.
+    ///
+    /// `session/cancel` is the user pressing stop, and a client is entitled to drop an outstanding
+    /// `fs/*` or elicitation request rather than answer it once it has cancelled. Without this race
+    /// the future never resolves: the prompt returns no `stopReason` at all and every later prompt
+    /// on that session is rejected as "already has a prompt in flight", so one stop wedges the
+    /// session for the life of the process. `request_permission` has always done this; these paths
+    /// were the asymmetry.
+    ///
+    /// The cancelled arm is a [`FrontendError`] rather than a `None` on purpose. Both callers
+    /// return `Option<Result<_, FrontendError>>`, where `None` already means "this frontend has no
+    /// delegate, do it locally" -- so a `?` on an `Option` here turned pressing stop into a local
+    /// write, computing the edit from on-disk bytes and overwriting whatever the editor still held
+    /// unsaved. Returning a `Result` makes that `?` a type error instead of a silent one.
+    async fn until_cancelled<T>(
+        &self,
+        what: &str,
+        work: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, FrontendError> {
+        race_against_cancellation(what, &self.current_cancellation(), work).await
     }
 
     /// Record the resolved context-window size for this session's model, used as the `size` of the
@@ -537,7 +589,7 @@ impl Frontend for AcpFrontend {
                     // `cwd` is optional in the frame but worth sending: the client labels the
                     // terminal with it, and meka's per-session cwd (which `/cd` moves) is not
                     // something the client could otherwise know.
-                    let cwd = crate::agent::cwd_snapshot(&self.cwd);
+                    let cwd = crate::workspace::cwd_snapshot(&self.cwd);
                     call = call
                         .content(vec![ToolCallContent::Terminal(
                             agent_client_protocol::schema::v1::Terminal::new(id.clone()),
@@ -735,17 +787,24 @@ impl Frontend for AcpFrontend {
         let connection = self.connection.clone();
         let session_id = self.session_id.clone();
 
+        // The sticky options name the *tool*, because that is their scope: the decision is keyed on
+        // the tool name alone and applies to every later call to it, whatever its arguments. The
+        // prompt's title beside them is `<tool> <primary_param>` -- for `execute_command` that is
+        // the specific command line -- so a bare "Always allow" reads as approving the command the
+        // user just read, when it actually approves every shell command for the rest of the
+        // session. Spelling the tool out is what makes the affordance and the semantics
+        // agree.
         let options = vec![
             PermissionOption::new(OPTION_ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
             PermissionOption::new(
                 OPTION_ALLOW_ALWAYS,
-                "Always allow",
+                sticky_option_label("allow", &request.tool_name),
                 PermissionOptionKind::AllowAlways,
             ),
             PermissionOption::new(OPTION_REJECT_ONCE, "Deny", PermissionOptionKind::RejectOnce),
             PermissionOption::new(
                 OPTION_REJECT_ALWAYS,
-                "Always deny",
+                sticky_option_label("deny", &request.tool_name),
                 PermissionOptionKind::RejectAlways,
             ),
         ];
@@ -772,6 +831,20 @@ impl Frontend for AcpFrontend {
             biased;
             _ = request.cancellation.cancelled() => {
                 return PermissionOutcome::Cancelled;
+            }
+            // The backstop the cancellation race alone does not provide. A client that is
+            // *connected* but never answers -- an editor whose UI thread is wedged, a headless
+            // harness that speaks ACP but implements no prompt -- fires no cancellation, so the
+            // race above waits on it forever and the turn holds the runtime mutex with it. Deny on
+            // expiry rather than allow: an unanswered prompt is not consent.
+            _ = tokio::time::sleep(PERMISSION_PROMPT_TIMEOUT) => {
+                tracing::warn!(
+                    "the client did not answer the permission prompt for '{}' within {:?}; \
+                     denying it",
+                    request.tool_name,
+                    PERMISSION_PROMPT_TIMEOUT,
+                );
+                return PermissionOutcome::Deny;
             }
             result = connection.send_request(req).block_task() => match result {
                 Ok(resp) => resp,
@@ -820,7 +893,17 @@ impl Frontend for AcpFrontend {
         if let Some(limit) = limit {
             request = request.limit(limit);
         }
-        Some(match connection.send_request(request).block_task().await {
+        let outcome = match self
+            .until_cancelled(
+                "fs/read_text_file",
+                connection.send_request(request).block_task(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(cancelled) => return Some(Err(cancelled)),
+        };
+        Some(match outcome {
             Ok(response) => Ok(response.content),
             Err(error) => Err(classify_fs_error("fs/read_text_file", &error)),
         })
@@ -839,7 +922,17 @@ impl Frontend for AcpFrontend {
         let session_id = self.session_id.clone();
         let request =
             WriteTextFileRequest::new(session_id, path.to_path_buf(), content.to_string());
-        Some(match connection.send_request(request).block_task().await {
+        let outcome = match self
+            .until_cancelled(
+                "fs/write_text_file",
+                connection.send_request(request).block_task(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(cancelled) => return Some(Err(cancelled)),
+        };
+        Some(match outcome {
             Ok(_) => Ok(()),
             Err(error) => Err(classify_fs_error("fs/write_text_file", &error)),
         })
@@ -887,13 +980,33 @@ impl Frontend for AcpFrontend {
             return ElicitationResponse::Decline;
         };
 
-        match self
-            .connection
-            .clone()
-            .send_request(request)
-            .block_task()
+        // Raced against the turn's cancellation, like every other client round-trip on this
+        // frontend. A bare await here was the last one left: an MCP `call_tool` is blocked on this
+        // answer, so a client that drops the request rather than answering it -- which it is
+        // entitled to do once the user has pressed stop -- left the tool call, the turn, and every
+        // later prompt on that session waiting for the life of the process.
+        //
+        // Declining on cancellation rather than propagating it, because the return type has no
+        // third state and the MCP server needs an answer either way. The turn is stopping; what the
+        // server does with the refusal no longer changes what the user sees.
+        let outcome = match self
+            .until_cancelled(
+                "elicitation/create",
+                self.connection.clone().send_request(request).block_task(),
+            )
             .await
         {
+            Ok(outcome) => outcome,
+            Err(_cancelled) => {
+                tracing::debug!(
+                    "MCP elicitation from '{}' ({}) declined: the turn was cancelled",
+                    prompt.server_name,
+                    kind,
+                );
+                return ElicitationResponse::Decline;
+            }
+        };
+        match outcome {
             Ok(response) => elicitation::from_acp_action(response.action),
             Err(error) => {
                 tracing::warn!(
@@ -914,6 +1027,38 @@ const OPTION_ALLOW_ONCE: &str = "allow_once";
 const OPTION_ALLOW_ALWAYS: &str = "allow_always";
 const OPTION_REJECT_ONCE: &str = "reject_once";
 const OPTION_REJECT_ALWAYS: &str = "reject_always";
+
+/// Label for a sticky (`*Always`) permission option, naming the tool the decision actually covers.
+///
+/// A function rather than two `format!`s at the call site so the wording is assertable. The sticky
+/// options are keyed on the tool name alone, and the prompt beside them shows one specific
+/// invocation, so a bare "Always allow" reads as approving the command on screen when it approves
+/// every call to that tool for the session. The tool name is the part that must not go missing.
+fn sticky_option_label(verb: &str, tool_name: &str) -> String {
+    format!("Always {} any {}", verb, tool_name)
+}
+
+/// The cancellation race itself, taking the token rather than reading it off an `AcpFrontend`, so
+/// it can be exercised without standing up a connection to a client.
+///
+/// `biased` matters: a turn cancelled while the request is already outstanding must lose the race
+/// deterministically, not half the time. The client owes no answer to a request the user withdrew,
+/// and before this every `fs/*` round trip and every elicitation could outlive the stop button
+/// indefinitely.
+async fn race_against_cancellation<T>(
+    what: &str,
+    cancellation: &CancellationToken,
+    work: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, FrontendError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            tracing::debug!("{} abandoned: the turn was cancelled", what);
+            Err(FrontendError::cancelled(what))
+        }
+        result = work => Ok(result),
+    }
+}
 
 /// Indicates which sticky bucket the user just opted into, so the caller can update its set.
 /// Internal to the permission flow.
@@ -1567,8 +1712,15 @@ async fn build_usage_text(runtime: &SessionRuntime) -> String {
     }
 }
 
-/// Plain-text `/status` output, mirroring the REPL's `render_session_status` plus the model and
-/// mode an ACP client may not otherwise surface.
+/// Plain-text `/status` output: the REPL's numbers in a narrower envelope, plus the permission mode
+/// an ACP client may not otherwise surface.
+///
+/// Deliberately not [`crate::render::format_session_status`], though that now exists for exactly
+/// this kind of caller. This block is read inside an editor pane rather than a terminal, so it uses
+/// shorter labels and drops the fields an ACP client already shows in its own chrome (provider,
+/// thinking, redactions). Sharing the formatter would change what every ACP client displays, which
+/// is a product decision rather than a refactor. If the two should converge, converge them on
+/// purpose; the shared formatter is there when that call is made.
 fn build_status_text(runtime: &SessionRuntime, shared: &crate::SharedDeps) -> String {
     use std::fmt::Write as _;
     let snap = runtime.agent.session_stats_snapshot();
@@ -1801,6 +1953,15 @@ struct SessionEntry {
     /// session row. Without this, a second `meka` process could attach to the same id.
     #[allow(dead_code)]
     session_lock: Arc<crate::session::SessionLock>,
+    /// When this session was last used, for the idle sweep.
+    ///
+    /// `session/close` is optional in ACP, and an editor is entitled never to send one. Every
+    /// session it opens therefore keeps an `Agent`, a `ToolRegistry` the MCP manager holds a
+    /// strong clone of, and an open file lock, for as long as the connection lives -- so an
+    /// editor that opens one session per file it looks at eventually runs the process out of
+    /// descriptors, and the session cannot be reopened elsewhere meanwhile. Monotonic, so a
+    /// wall-clock adjustment cannot make a live session look ancient.
+    last_activity: Arc<std::sync::RwLock<std::time::Instant>>,
 }
 
 impl SessionEntry {
@@ -1813,6 +1974,45 @@ impl SessionEntry {
             Err(poisoned) => *poisoned.into_inner() = token,
         }
     }
+
+    /// Mark this session as used, so the idle sweep leaves it alone.
+    fn touch(&self) {
+        let now = std::time::Instant::now();
+        match self.last_activity.write() {
+            Ok(mut slot) => *slot = now,
+            Err(poisoned) => *poisoned.into_inner() = now,
+        }
+    }
+
+    /// Whether nothing has touched this session for `timeout` *and* no turn is running.
+    ///
+    /// The runtime lock is the liveness check: the prompt handler holds it for the whole turn, so a
+    /// long turn on a session whose `last_activity` predates it cannot be evicted out from under
+    /// itself.
+    fn is_idle(&self, timeout: std::time::Duration) -> bool {
+        session_is_idle(&self.runtime, &self.last_activity, timeout)
+    }
+}
+
+/// The idle test itself, generic over what the runtime mutex guards so it can be exercised without
+/// standing up an `Agent`.
+///
+/// The busy check comes first and is not an optimisation: a session mid-turn has a `last_activity`
+/// from before the turn started, so on a long turn the timestamp alone says "idle" while the agent
+/// is working. Evicting there would drop the entry out from under a running turn.
+fn session_is_idle<T>(
+    runtime: &Mutex<T>,
+    last_activity: &std::sync::RwLock<std::time::Instant>,
+    timeout: std::time::Duration,
+) -> bool {
+    if runtime.try_lock().is_err() {
+        return false;
+    }
+    let last = last_activity
+        .read()
+        .map(|slot| *slot)
+        .unwrap_or_else(|poisoned| *poisoned.into_inner());
+    last.elapsed() >= timeout
 }
 
 /// Per-session state held under `SessionEntry.runtime`. Held inside a `Mutex` because
@@ -1894,7 +2094,113 @@ async fn acp_run_until_disconnect(
     {
         tracing::warn!("ACP shutdown drain timed out; abandoning in-flight turn(s)");
     }
+
+    // Reclaim every session the client never closed.
+    //
+    // `session/close` is an *optional* capability, so a client that simply exits leaves each entry
+    // resident: an `Agent`, a `ToolRegistry` the MCP manager holds a strong clone of, and an open
+    // file lock. Dropping the map here releases the flock -- which is what lets the same session be
+    // reopened by the next `meka` without a `SessionLocked` error -- and lets the registry go, so
+    // `tools/list_changed` stops fanning out to sessions that no longer exist.
+    let abandoned = {
+        let mut sessions = state.sessions.write().await;
+        std::mem::take(&mut *sessions)
+    };
+    if !abandoned.is_empty() {
+        if let Some(manager) = &state.shared.mcp_manager {
+            for entry in abandoned.values() {
+                // `try_lock`: an in-flight turn that outlived the drain timeout still holds the
+                // runtime, and blocking here would trade a leaked registry for a hung shutdown.
+                if let Ok(runtime) = entry.runtime.try_lock() {
+                    manager.detach_registry(&runtime.tool_registry).await;
+                }
+            }
+        }
+        tracing::info!(
+            "released {} session(s) the client did not close",
+            abandoned.len()
+        );
+    }
+    drop(abandoned);
+
     Ok(())
+}
+
+/// How long to wait for a client to answer a permission prompt before denying it.
+///
+/// Generous, because the thing being waited on is a human reading a prompt and deciding: this is a
+/// backstop against a client that will never answer at all, not a deadline on the user. A prompt
+/// still on screen after this long has been abandoned, and the turn holding a runtime mutex open
+/// for it blocks `session/close` and `session/set_mode` behind it.
+const PERMISSION_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long an ACP session may sit untouched before it is released.
+///
+/// Matches `[serve].idle_timeout`'s default. Not configurable, deliberately: a day is long past the
+/// point where an editor still means to use a session, and a knob here would be a setting nobody
+/// sets for a mechanism nobody should notice.
+const ACP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How often the idle sweep runs. Matches `[serve].gc_scan_interval`'s default.
+const ACP_IDLE_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Release sessions the editor opened and stopped using.
+///
+/// `session/close` is an *optional* ACP capability, so an editor is entitled never to send one, and
+/// several do not. Each session it opens holds an `Agent`, a `ToolRegistry` the MCP manager keeps a
+/// strong clone of, and an open file lock; over a long editing session that is a descriptor per
+/// file the user glanced at, none of them released, and the session cannot be reopened from
+/// anywhere else meanwhile.
+///
+/// Only the in-memory entry goes. The row stays, so `session/load` brings the conversation back
+/// exactly as it does for a session from a previous run -- which is the same trade `meka serve`
+/// makes with `delete_on_idle = false`.
+fn spawn_idle_session_sweep(state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(ACP_IDLE_SCAN_INTERVAL);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            // Collected under the read lock and evicted under the write lock, with the liveness
+            // check inside `is_idle` rather than out here: a turn that starts between the two
+            // re-takes the runtime mutex, and the second `is_idle` below sees it.
+            let candidates: Vec<String> = {
+                let sessions = state.sessions.read().await;
+                sessions
+                    .iter()
+                    .filter(|(_, entry)| entry.is_idle(ACP_SESSION_IDLE_TIMEOUT))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            for id in candidates {
+                let evicted = {
+                    let mut sessions = state.sessions.write().await;
+                    match sessions.get(&id) {
+                        Some(entry) if entry.is_idle(ACP_SESSION_IDLE_TIMEOUT) => {
+                            sessions.remove(&id)
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(entry) = evicted else { continue };
+                // Same teardown `session/close` does, and for the same reason: without it the
+                // manager keeps fanning `tools/list_changed` out to a registry nobody reads.
+                let registry = {
+                    let runtime = entry.runtime.lock().await;
+                    runtime.tool_registry.clone()
+                };
+                if let Some(manager) = &state.shared.mcp_manager {
+                    manager.detach_registry(&registry).await;
+                }
+                tracing::info!(
+                    "released idle ACP session {} after {:?}; `session/load` reopens it",
+                    id,
+                    ACP_SESSION_IDLE_TIMEOUT
+                );
+                drop(entry);
+            }
+        }
+    })
 }
 
 /// Cancel every active session's in-flight turn. Mirrors `crate::server`'s drain. Clones each token
@@ -2031,6 +2337,10 @@ pub async fn run_acp(
     // terms and with the same abort-on-drop lifetime.
     let background_handle = schedule::spawn_background_poller(Arc::clone(&state));
     let _background_guard = AbortOnDrop(background_handle);
+
+    // Releases sessions the editor opened and never closed; see `spawn_idle_session_sweep`.
+    let idle_handle = spawn_idle_session_sweep(Arc::clone(&state));
+    let _idle_guard = AbortOnDrop(idle_handle);
 
     // Observe stdin EOF so the connection shuts down when the client disconnects (or the parent
     // dies). The connection future does not resolve on idle EOF by itself, so wrap the incoming
@@ -2211,14 +2521,16 @@ pub async fn run_acp(
 
                     let permission = runtime.permission.clone();
                     let frontend = Arc::clone(&runtime.frontend);
+                    let cancellation = runtime.frontend.cancellation_cell();
                     let entry = SessionEntry {
                         runtime: Arc::new(Mutex::new(runtime)),
-                        cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+                        cancellation,
                         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         title_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         permission: permission.clone(),
                         frontend,
                         session_lock,
+                        last_activity: Arc::new(std::sync::RwLock::new(std::time::Instant::now())),
                     };
                     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -2293,8 +2605,21 @@ pub async fn run_acp(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: CloseSessionRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_close_session(Arc::clone(&state), req, responder).await
+                async move |req: CloseSessionRequest, responder, cx: ConnectionTo<Client>| {
+                    // Spawned, exactly like the prompt handler above, because this one waits on a
+                    // lock an in-flight turn holds.
+                    //
+                    // Handler callbacks run on the SDK's dispatch loop, and that loop is also what
+                    // routes *responses to meka's own outgoing requests*. A turn blocked on
+                    // `fs/read_text_file` cannot release the runtime mutex until its response
+                    // arrives, and the response cannot arrive while the loop is parked inside this
+                    // handler waiting for that same mutex. Running inline deadlocked every session
+                    // in the process, recoverable only by killing the client.
+                    let state_for_spawn = Arc::clone(&state);
+                    cx.spawn(async move {
+                        handle_close_session(state_for_spawn, req, responder).await
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2413,6 +2738,15 @@ async fn run_prompt_turn(
         }
     }
 
+    // Same rejection the HTTP surface applies at `handlers::turn`: a prompt of nothing but
+    // whitespace costs a provider round-trip to produce nothing, and a client that dropped its
+    // content on the floor should hear about it rather than get an empty answer back.
+    if prompt_text.trim().is_empty() && images.is_empty() {
+        return responder.respond_with_error(invalid_params_error(
+            "`prompt` must contain non-empty text, or at least one image",
+        ));
+    }
+
     // Look up the target session by id under the outer read lock, clone the entry (cheap, two
     // `Arc`s), drop the outer guard. From here on, only the per-session runtime mutex is held; the
     // sibling cancellation cell is accessible to the cancel handler throughout the turn.
@@ -2420,7 +2754,10 @@ async fn run_prompt_turn(
     let entry = {
         let sessions = state.sessions.read().await;
         match sessions.get(&session_id_str) {
-            Some(entry) => entry.clone(),
+            Some(entry) => {
+                entry.touch();
+                entry.clone()
+            }
             None => {
                 return responder.respond_with_error(invalid_params_error(format!(
                     "unknown sessionId: {}",
@@ -2750,19 +3087,45 @@ async fn handle_load_session(
     replay_session_updates(&cx, &session_id, &runtime.cwd, &runtime.messages);
 
     let permission = runtime.permission.clone();
+
+    // Restore the level this session was last set to, not the one this process starts at.
+    //
+    // `build_session_runtime` seeds from `shared.config.permission`, which is right for
+    // `session/new` and wrong here: the row carries what the user last chose via
+    // `session/set_mode`. Leaving it out is not merely a lost preference. The scheduler's live gate
+    // re-check reads the row, so a session whose row said `write` while its live cell sat at the
+    // config default would have its gates evaluated against authority the session is not running
+    // at -- the same fail-open the re-check exists to prevent, reached from the other side.
+    //
+    // `try_set` validates against the enabled set, so a row naming a mode this configuration no
+    // longer enables cannot escalate the session: it is refused and the default stands.
+    if let Some(persisted) = summary
+        .permission
+        .as_deref()
+        .and_then(|level| level.parse::<crate::permission::Permission>().ok())
+        && let Err(disabled) = permission.try_set(persisted)
+    {
+        tracing::debug!(
+            "session was last set to '{}', which this configuration no longer enables; keeping the \
+             default",
+            disabled.0
+        );
+    }
     let frontend = Arc::clone(&runtime.frontend);
     // History already carries the first user message, so the title is known; push it once now,
     // sharing the flag with the entry so a later prompt won't re-emit it.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
+    let cancellation = runtime.frontend.cancellation_cell();
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
-        cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+        cancellation,
         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         title_sent,
         permission: permission.clone(),
         frontend,
         session_lock,
+        last_activity: Arc::new(std::sync::RwLock::new(std::time::Instant::now())),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -2964,19 +3327,45 @@ async fn handle_resume_session(
     };
 
     let permission = runtime.permission.clone();
+
+    // Restore the level this session was last set to, not the one this process starts at.
+    //
+    // `build_session_runtime` seeds from `shared.config.permission`, which is right for
+    // `session/new` and wrong here: the row carries what the user last chose via
+    // `session/set_mode`. Leaving it out is not merely a lost preference. The scheduler's live gate
+    // re-check reads the row, so a session whose row said `write` while its live cell sat at the
+    // config default would have its gates evaluated against authority the session is not running
+    // at -- the same fail-open the re-check exists to prevent, reached from the other side.
+    //
+    // `try_set` validates against the enabled set, so a row naming a mode this configuration no
+    // longer enables cannot escalate the session: it is refused and the default stands.
+    if let Some(persisted) = summary
+        .permission
+        .as_deref()
+        .and_then(|level| level.parse::<crate::permission::Permission>().ok())
+        && let Err(disabled) = permission.try_set(persisted)
+    {
+        tracing::debug!(
+            "session was last set to '{}', which this configuration no longer enables; keeping the \
+             default",
+            disabled.0
+        );
+    }
     let frontend = Arc::clone(&runtime.frontend);
     // History already carries the first user message, so the title is known; push it once now,
     // sharing the flag with the entry so a later prompt won't re-emit it.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
+    let cancellation = runtime.frontend.cancellation_cell();
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
-        cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+        cancellation,
         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         title_sent,
         permission: permission.clone(),
         frontend,
         session_lock,
+        last_activity: Arc::new(std::sync::RwLock::new(std::time::Instant::now())),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -3146,14 +3535,16 @@ async fn handle_fork_session(
     // The copied history already carries the first user message, so the title is known now.
     let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
+    let cancellation = runtime.frontend.cancellation_cell();
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
-        cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+        cancellation,
         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         title_sent,
         permission: permission.clone(),
         frontend,
         session_lock,
+        last_activity: Arc::new(std::sync::RwLock::new(std::time::Instant::now())),
     };
     state.sessions.write().await.insert(session_id_str, entry);
 
@@ -3187,8 +3578,13 @@ async fn handle_close_session(
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
     token.cancel();
     // Detach the session's tool registry from the MCP manager so tools/list_changed updates stop
-    // targeting it. Briefly lock the runtime to read the registry handle; the in-flight prompt (if
-    // any) was just cancelled and will release the lock shortly.
+    // targeting it.
+    //
+    // This waits on the runtime mutex, which an in-flight prompt holds for the whole turn. That is
+    // safe only because the handler is `cx.spawn`ed: on the dispatch loop it would starve the very
+    // response the turn is waiting for. The cancel above does not make the wait short either --
+    // `read_file` and the `fs/*` delegates do not observe the token -- so this genuinely blocks
+    // until the turn ends, off the loop, which is the correct place to do it.
     let registry = {
         let runtime = entry.runtime.lock().await;
         runtime.tool_registry.clone()
@@ -3215,7 +3611,10 @@ async fn handle_set_session_mode(
     let entry = {
         let sessions = state.sessions.read().await;
         match sessions.get(&session_id_str) {
-            Some(entry) => entry.clone(),
+            Some(entry) => {
+                entry.touch();
+                entry.clone()
+            }
             None => {
                 return responder.respond_with_error(invalid_params_error("no such session"));
             }
@@ -3238,6 +3637,44 @@ async fn handle_set_session_mode(
             "mode '{}' is not enabled in this configuration",
             disabled.0
         )));
+    }
+    // Persist alongside the in-memory cell, the way `PATCH /v1/sessions/{id}` already does.
+    //
+    // The scheduler's live gate re-check reads the session *row*, falling back to the process's
+    // startup level when the column is null (see `ResolvedScheduleConfig::host_permission`). An ACP
+    // session that only ever moved its in-memory cell left that column null forever, so cycling to
+    // `write` in the editor and authoring a gate left the gate refused, and cycling back down to
+    // `read` did not withdraw one already written. The row is also what `session/list` reports, so
+    // it was misreporting the mode for the same reason.
+    //
+    // In-memory first and best-effort here: the mode change the user asked for has already taken
+    // effect on the next tool call, and failing the whole request over a database write would be a
+    // worse answer than a stale row plus a warning.
+    // Parsed from the request id rather than read off `entry.runtime`: that mutex is held for the
+    // whole of an in-flight prompt, and blocking the dispatch loop on it is the deadlock
+    // `session/close` documents at length.
+    match uuid::Uuid::parse_str(&session_id_str) {
+        Ok(session_uuid) => {
+            if let Err(error) = state
+                .shared
+                .session_manager
+                .update_session_permission(session_uuid, &permission.to_string())
+                .await
+            {
+                tracing::warn!(
+                    "could not persist the new permission for session {}: {}",
+                    session_uuid,
+                    error
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "session id '{}' is not a UUID, so the new permission was not persisted: {}",
+                session_id_str,
+                error
+            );
+        }
     }
     send_session_update(
         &entry.frontend.connection,
@@ -3276,6 +3713,9 @@ async fn build_session_runtime(
     // Shared with the agent (adopted inside `build_session_agent`) so the frontend can read the
     // current context occupancy when emitting `usage_update`.
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
+    // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
+    let cancellation = Arc::new(std::sync::RwLock::new(CancellationToken::new()));
     let acp_frontend = Arc::new(AcpFrontend::new(
         connection,
         session_id,
@@ -3283,6 +3723,7 @@ async fn build_session_runtime(
         client_state.clone(),
         Arc::clone(transport_dead),
         Arc::clone(&context_tokens),
+        cancellation,
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
@@ -3354,6 +3795,115 @@ mod tests {
     // `AcpFrontend` itself can't be unit-tested (requires a live `ConnectionTo<Client>`);
     // per-session behaviour is covered end-to-end in `tests/acp.rs`. The pure helpers below are
     // what this unit-test module owns.
+
+    /// A request the user has already stopped must not wait on the client's answer.
+    ///
+    /// Every `fs/read_text_file`, `fs/write_text_file` and elicitation is a round trip to an editor
+    /// that owes no reply once the turn is cancelled, so without the race the stop button left the
+    /// turn parked on a request nobody was going to answer.
+    #[tokio::test]
+    async fn a_cancelled_turn_abandons_a_request_the_client_has_not_answered() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        // Bounded so a lost race fails the test rather than hanging it: the work below models a
+        // client that never answers, so without the race there is nothing to wait for.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            race_against_cancellation(
+                "fs/read_text_file",
+                &cancellation,
+                std::future::pending::<()>(),
+            ),
+        )
+        .await
+        .expect("a cancelled turn must not wait on the client");
+
+        let error = outcome.expect_err("a cancelled turn must not wait on the client");
+        assert!(
+            error.is_cancelled(),
+            "the caller has to be able to tell a stop from a failure: {error}"
+        );
+    }
+
+    /// The other half: an uncancelled turn must still get its answer, or the race would make every
+    /// client round trip fail.
+    #[tokio::test]
+    async fn a_live_turn_receives_the_clients_answer() {
+        let cancellation = CancellationToken::new();
+
+        let outcome =
+            race_against_cancellation("fs/read_text_file", &cancellation, async { "contents" })
+                .await;
+
+        assert_eq!(
+            outcome.expect("a live turn must get its answer"),
+            "contents"
+        );
+    }
+
+    /// A sticky permission option must name the tool it actually covers.
+    ///
+    /// This ships as a `**Breaking:**` changelog line and had no test: the whole point of the
+    /// relabel is that the option is keyed on the tool name and applies for the rest of the
+    /// session, while the prompt beside it names one specific command. Reverting to a bare "Always
+    /// allow" left every suite green, which is exactly how an affordance drifts back out of step
+    /// with its semantics.
+    #[test]
+    fn a_sticky_permission_option_names_the_tool_it_covers() {
+        assert_eq!(
+            sticky_option_label("allow", "execute_command"),
+            "Always allow any execute_command"
+        );
+        assert_eq!(
+            sticky_option_label("deny", "write_file"),
+            "Always deny any write_file"
+        );
+        for verb in ["allow", "deny"] {
+            assert!(
+                sticky_option_label(verb, "execute_command").contains("execute_command"),
+                "dropping the tool name makes the option read as approving the one call on screen"
+            );
+        }
+    }
+
+    /// A session running a turn is never idle, whatever its timestamp says.
+    ///
+    /// `last_activity` is stamped when a request arrives, so a turn that runs for an hour leaves it
+    /// an hour old while the agent is still working. Testing the timestamp alone would evict the
+    /// entry out from under the turn -- dropping its `Agent`, its registry and its file lock
+    /// mid-tool-call -- which is why the busy check comes first rather than second.
+    #[test]
+    fn a_session_running_a_turn_is_not_idle_however_old_its_timestamp() {
+        let runtime = Mutex::new(());
+        let ancient = std::sync::RwLock::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(60 * 60),
+        );
+        let timeout = std::time::Duration::from_secs(1);
+
+        assert!(
+            session_is_idle(&runtime, &ancient, timeout),
+            "untouched for an hour and nothing running: evictable",
+        );
+
+        let _turn = runtime.try_lock().expect("nothing holds it yet");
+        assert!(
+            !session_is_idle(&runtime, &ancient, timeout),
+            "a turn holds the runtime lock, so the session is in use",
+        );
+    }
+
+    /// And a session used recently stays, so the sweep does not evict the one the editor is on.
+    #[test]
+    fn a_recently_touched_session_is_not_idle() {
+        let runtime = Mutex::new(());
+        let just_now = std::sync::RwLock::new(std::time::Instant::now());
+        assert!(!session_is_idle(
+            &runtime,
+            &just_now,
+            std::time::Duration::from_secs(60 * 60)
+        ));
+    }
 
     #[test]
     fn test_tool_kind_for_covers_builtins() {

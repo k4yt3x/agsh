@@ -13,6 +13,10 @@ use crate::{
 /// Ceiling on the rendered schedule column. `format_columns` widens a column to its longest cell,
 /// so an unbounded value here would push every following column off the terminal.
 const SCHEDULE_TRUNCATE: usize = 24;
+/// Same, for the gate's shell command. Wide enough that the interesting part of a real check
+/// (`gh pr checks 123 --json state`) is legible, since the point of showing it is that an operator
+/// can recognise what runs unattended.
+const GATE_COMMAND_TRUNCATE: usize = 40;
 /// Same, for the trailing prompt. Last column, so it is never padded, but a paragraph-long prompt
 /// would still wrap the row into unreadability.
 const PROMPT_TRUNCATE: usize = 60;
@@ -30,7 +34,12 @@ pub async fn run_list_for_session(
     session_manager: &SessionManager,
     session: uuid::Uuid,
 ) -> Result<()> {
-    render(session_manager.list_scheduled_jobs(session).await?)
+    render(
+        session_manager
+            .schedule_store()
+            .list_scheduled_jobs(session)
+            .await?,
+    )
 }
 
 async fn list(session_manager: &SessionManager, session: Option<&str>) -> Result<()> {
@@ -38,9 +47,17 @@ async fn list(session_manager: &SessionManager, session: Option<&str>) -> Result
         Some(raw) => {
             let id = uuid::Uuid::parse_str(raw)
                 .map_err(|error| MekaError::Config(format!("invalid session id: {}", error)))?;
-            session_manager.list_scheduled_jobs(id).await?
+            session_manager
+                .schedule_store()
+                .list_scheduled_jobs(id)
+                .await?
         }
-        None => session_manager.list_all_scheduled_jobs().await?,
+        None => {
+            session_manager
+                .schedule_store()
+                .list_all_scheduled_jobs()
+                .await?
+        }
     };
 
     render(jobs)
@@ -68,6 +85,17 @@ fn render(jobs: Vec<crate::schedule::ScheduledJob>) -> Result<()> {
                     Some(gate) => gate.fire.as_str().to_string(),
                     None => "-".to_string(),
                 },
+                // The command itself, not just the fire mode. This is the only listing meka ships
+                // for "what runs unattended on this machine", and rendering only `on-change` left
+                // an operator auditing a box unable to see what was executing
+                // without opening SQLite. Sanitised because it reaches a terminal
+                // and its author is the model.
+                match &job.gate {
+                    Some(gate) => {
+                        crate::render::sanitize_to_line(&gate.command, GATE_COMMAND_TRUNCATE)
+                    }
+                    None => "-".to_string(),
+                },
                 truncate(
                     &job.prompt.split_whitespace().collect::<Vec<_>>().join(" "),
                     PROMPT_TRUNCATE,
@@ -78,7 +106,10 @@ fn render(jobs: Vec<crate::schedule::ScheduledJob>) -> Result<()> {
 
     print!(
         "{}",
-        crate::render::format_columns(&["ID", "Schedule", "Next fire", "Gate", "Prompt"], &rows)
+        crate::render::format_columns(
+            &["ID", "Schedule", "Next fire", "Gate", "Command", "Prompt"],
+            &rows
+        )
     );
     Ok(())
 }
@@ -86,7 +117,10 @@ fn render(jobs: Vec<crate::schedule::ScheduledJob>) -> Result<()> {
 async fn cancel(session_manager: &SessionManager, id_prefix: &str) -> Result<()> {
     // Scan every session: the operator has an id, not a session, and requiring them to find the
     // session first would make the id useless on its own.
-    let jobs = session_manager.list_all_scheduled_jobs().await?;
+    let jobs = session_manager
+        .schedule_store()
+        .list_all_scheduled_jobs()
+        .await?;
     let matches: Vec<_> = jobs
         .iter()
         .filter(|job| job.id.starts_with(id_prefix))
@@ -98,7 +132,10 @@ async fn cancel(session_manager: &SessionManager, id_prefix: &str) -> Result<()>
             id_prefix
         ))),
         [job] => {
-            session_manager.delete_scheduled_job(&job.id).await?;
+            session_manager
+                .schedule_store()
+                .delete_scheduled_job(&job.id)
+                .await?;
             tracing::info!("cancelled scheduled job {}", job.id);
             Ok(())
         }

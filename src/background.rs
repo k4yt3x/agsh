@@ -23,6 +23,8 @@ use chrono::{DateTime, Local, Utc};
 use humantime_serde::re::humantime;
 use uuid::Uuid;
 
+use crate::error::MekaError;
+
 /// How a task ended, or that it hasn't.
 ///
 /// The four terminal states deliver identically and differ only in their rendered header. Keeping
@@ -128,6 +130,7 @@ impl BackgroundTask {
 /// Non-fatal: a session that cannot sweep must still open.
 pub async fn claim_session(session_manager: &crate::session::SessionManager, session_id: Uuid) {
     match session_manager
+        .background_store()
         .sweep_interrupted_background_tasks(session_id)
         .await
     {
@@ -278,6 +281,32 @@ impl BackgroundTasks {
         signalled
     }
 
+    /// Wait for every task this process is running, for a host that is about to exit.
+    ///
+    /// [`Self::cancel_all`] only fires the tokens, and firing a token is not the same as the task
+    /// acting on it. A task parked at an await is dropped without ever being polled again when the
+    /// runtime goes, so it reaches neither `kill_child_tree` -- leaving the `setsid()`-ed child
+    /// running with no meka process tracking it -- nor `finish_background_task`, leaving the row
+    /// `running` for the next session open to sweep to `interrupted`. Those two are precisely what
+    /// cancelling it was for, so the wait is what makes the cancel mean anything.
+    ///
+    /// Callers should bound this: cancelling asks, and a task that does not answer must not hold
+    /// the terminal.
+    pub async fn wait_all(&self) {
+        let joins: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = self.inner.lock().await;
+            let ids: Vec<String> = guard.keys().cloned().collect();
+            ids.into_iter()
+                .filter_map(|id| guard.remove(&id).and_then(|handle| handle.join))
+                .collect()
+        };
+        for join in joins {
+            if let Err(error) = join.await {
+                tracing::warn!("background task ended abnormally: {}", error);
+            }
+        }
+    }
+
     /// Wait for this session's tasks to finish, for a host with nowhere to deliver an outcome
     /// later. `--oneshot` is the case: the process exits with the turn, so a background call there
     /// has to degrade into a slow synchronous one rather than a promise nothing will keep.
@@ -306,6 +335,15 @@ impl BackgroundTasks {
 /// Ceiling on outcome text carried inline in the delivered turn. Past this the full output goes to
 /// a scratchpad entry and the turn carries the head plus the entry name: a twenty-minute build log
 /// would otherwise land in the conversation permanently, for a result that mattered once.
+///
+/// Interacts with `tools::shell`'s `OUTPUT_WINDOW_BYTES`, which is eight times larger and
+/// keeps **both ends** of an overflowing stream. `split_outcome` keeps only the head, so a
+/// *backgrounded* `execute_command` that overflowed loses the tail the shell tool went to trouble
+/// to preserve. That is deliberate -- an outcome arrives unbidden, mid-conversation, so it should
+/// cost less window than a result the model asked for -- but the two numbers are coupled, and
+/// raising this one without reading that one produces a delivered turn wider than the tool's own
+/// result. Nothing is lost either way: the entry name reaches the model and the scratchpad holds
+/// all of it.
 pub const OUTCOME_INLINE_LIMIT: usize = 4 * 1024;
 
 /// Longest task label shown in the `[Background]` index and in delivered headers.
@@ -340,7 +378,13 @@ pub fn render_outcomes(tasks: &[BackgroundTask]) -> String {
         rendered.push_str(&format!(
             "\n---\n\n**{}** ({}) {} after {}.\n",
             task.short_id(),
-            elide(&task.label, LABEL_MAX_CHARS),
+            // Sanitised like the outcome below. The label is derived from the tool's primary
+            // argument, which for `execute_command` is a shell command line the *model* wrote, so
+            // it is no more trusted than the output it names.
+            elide(
+                &crate::mcp::sanitize::sanitize_text(&task.label),
+                LABEL_MAX_CHARS
+            ),
             task.status.headline(),
             format_elapsed(task.elapsed()),
         ));
@@ -416,6 +460,306 @@ fn elide(text: &str, limit: usize) -> String {
         None => clipped.as_str(),
     };
     format!("{}…", trimmed.trim_end())
+}
+
+/// Background work's slice of the session database, handed out by
+/// [`crate::session::SessionManager::background_store`].
+#[derive(Clone)]
+pub struct BackgroundStore {
+    connection: std::sync::Arc<tokio_rusqlite::Connection>,
+}
+
+impl BackgroundStore {
+    pub(crate) fn new(connection: std::sync::Arc<tokio_rusqlite::Connection>) -> Self {
+        Self { connection }
+    }
+
+    /// Record a task as started. Written before the work is spawned, so a process that dies between
+    /// the two leaves a `running` row the sweep will retire rather than a task nobody knows about.
+    pub async fn start_background_task(&self, task: &BackgroundTask) -> crate::error::Result<()> {
+        let id = task.id.clone();
+        let session_id = task.session_id.to_string();
+        let tool_name = task.tool_name.clone();
+        let label = task.label.clone();
+        let status = task.status.as_str().to_string();
+        let started_at = task.started_at.to_rfc3339();
+
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, started_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![id, session_id, tool_name, label, status, started_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to start background task: {}", error))
+            })
+    }
+
+    /// Record a terminal outcome.
+    ///
+    /// Guarded on `status = 'running'` so a task that was cancelled, or swept to `interrupted`,
+    /// cannot be overwritten by its own work finishing a moment later. The first terminal write
+    /// wins, which is what keeps a cancelled task from reporting success.
+    pub async fn finish_background_task(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        outcome: Option<String>,
+        scratchpad_name: Option<String>,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let status = status.as_str().to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE background_tasks \
+                     SET status = ?2, outcome = ?3, scratchpad_name = ?4, finished_at = ?5 \
+                     WHERE id = ?1 AND status = 'running'",
+                    rusqlite::params![id, status, outcome, scratchpad_name, finished_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to finish background task: {}", error))
+            })
+    }
+
+    /// Every task belonging to one session, newest first.
+    pub async fn list_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        self.query_background_tasks(
+            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+             started_at, finished_at, delivered_at FROM background_tasks \
+             WHERE session_id = ?1 ORDER BY started_at DESC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// A session's tasks still running, oldest first. Backs the `[Background]` index and the Ctrl+C
+    /// survivor line.
+    pub async fn list_running_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        self.query_background_tasks(
+            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+             started_at, finished_at, delivered_at FROM background_tasks \
+             WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// A session's finished-but-unreported tasks, oldest first. The delivery poll's query; served
+    /// by `idx_background_tasks_session_status`.
+    pub async fn list_undelivered_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        self.query_background_tasks(
+            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+             started_at, finished_at, delivered_at FROM background_tasks \
+             WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
+             ORDER BY finished_at ASC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// Stamp outcomes as delivered.
+    ///
+    /// Called *before* the turn runs, matching
+    /// [`crate::schedule::ScheduleStore::stamp_scheduled_job_fired`] and for the same reason: an
+    /// outcome that reliably wedges the process would otherwise be redelivered on every restart,
+    /// turning one bad result into a boot loop. Losing one report is the cheaper failure.
+    pub async fn mark_background_tasks_delivered(
+        &self,
+        ids: &[String],
+    ) -> crate::error::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = ids.to_vec();
+        let delivered_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                // One transaction, so a failure part-way cannot leave half a batch stamped. The
+                // caller renders every one of these into a single turn, and stamping only some of
+                // them would repeat the rest alongside it on the next tick.
+                let txn = connection.transaction()?;
+                {
+                    let mut statement =
+                        txn.prepare("UPDATE background_tasks SET delivered_at = ?2 WHERE id = ?1")?;
+                    for id in &ids {
+                        statement.execute(rusqlite::params![id, delivered_at])?;
+                    }
+                }
+                txn.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to mark tasks delivered: {}", error))
+            })
+    }
+
+    /// Retire every `running` task in this session as [`TaskStatus::Interrupted`], returning how
+    /// many were swept.
+    ///
+    /// Called when a process takes ownership of a session. The session lock
+    /// ([`crate::session::SessionManager::lock_session`]) is the lease: holding it means no other
+    /// process can still be running this session's tasks, so any row that still says `running`
+    /// belongs to a process that is gone. Without this a task in flight at shutdown would leave the
+    /// agent waiting on a report that can never arrive, having very likely already promised one.
+    pub async fn sweep_interrupted_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<usize> {
+        let session_id = session_id.to_string();
+        let status = TaskStatus::Interrupted.as_str().to_string();
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let swept = connection.execute(
+                    "UPDATE background_tasks SET status = ?2, finished_at = ?3 \
+                     WHERE session_id = ?1 AND status = 'running'",
+                    rusqlite::params![session_id, status, finished_at],
+                )?;
+                Ok(swept)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to sweep background tasks: {}", error))
+            })
+    }
+
+    /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
+    /// rather than an arbitrary pick, matching
+    /// [`crate::schedule::ScheduleStore::cancel_scheduled_job`] in behaviour and in error variant.
+    /// That one returned `Database` for the identical condition, so the two `serve` endpoints
+    /// answered different HTTP statuses for the same mistake; both now use `Config`, which reaches
+    /// the caller as a 422.
+    pub async fn resolve_background_task(
+        &self,
+        session_id: Uuid,
+        id_prefix: &str,
+    ) -> crate::error::Result<Option<BackgroundTask>> {
+        let tasks = self.list_background_tasks(session_id).await?;
+        let matches: Vec<BackgroundTask> = tasks
+            .into_iter()
+            .filter(|task| task.id.starts_with(id_prefix))
+            .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(MekaError::Config(format!(
+                "task id '{}' is ambiguous; it matches {} tasks",
+                id_prefix,
+                matches.len()
+            ))),
+        }
+    }
+
+    /// Shared row decoder, mirroring `ScheduleStore::query_scheduled_jobs`: one unreadable row is
+    /// skipped with a warning rather than failing every other task in the query.
+    async fn query_background_tasks(
+        &self,
+        sql: &'static str,
+        params: Vec<String>,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        let rows: Vec<BackgroundTaskRow> = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok(BackgroundTaskRow {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            tool_name: row.get(2)?,
+                            label: row.get(3)?,
+                            status: row.get(4)?,
+                            outcome: row.get(5)?,
+                            scratchpad_name: row.get(6)?,
+                            started_at: row.get(7)?,
+                            finished_at: row.get(8)?,
+                            delivered_at: row.get(9)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load background tasks: {}", error))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row.id.clone();
+                row.decode()
+                    .inspect_err(|error| {
+                        tracing::warn!("skipping unreadable background task {}: {}", id, error);
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+}
+
+/// Raw `background_tasks` row, decoded outside the database closure so a parse failure can be
+/// logged and skipped individually.
+struct BackgroundTaskRow {
+    id: String,
+    session_id: String,
+    tool_name: String,
+    label: String,
+    status: String,
+    outcome: Option<String>,
+    scratchpad_name: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+    delivered_at: Option<String>,
+}
+
+impl BackgroundTaskRow {
+    fn decode(self) -> std::result::Result<BackgroundTask, String> {
+        let parse_time =
+            |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .map(|at| at.with_timezone(&chrono::Utc))
+                    .map_err(|error| format!("bad timestamp '{}': {}", text, error))
+            };
+        let parse_optional = |text: Option<String>| -> std::result::Result<_, String> {
+            text.as_deref().map(parse_time).transpose()
+        };
+
+        Ok(BackgroundTask {
+            id: self.id,
+            session_id: Uuid::parse_str(&self.session_id)
+                .map_err(|error| format!("bad session id: {}", error))?,
+            tool_name: self.tool_name,
+            label: self.label,
+            status: TaskStatus::parse(&self.status)
+                .ok_or_else(|| format!("unknown status '{}'", self.status))?,
+            outcome: self.outcome,
+            scratchpad_name: self.scratchpad_name,
+            started_at: parse_time(&self.started_at)?,
+            finished_at: parse_optional(self.finished_at)?,
+            delivered_at: parse_optional(self.delivered_at)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +842,49 @@ mod tests {
             tasks
                 .try_reserve("b".to_string(), session_id, token(), 1)
                 .await
+        );
+    }
+
+    /// Cancelling and leaving is not enough: the task has to be given the chance to act on it.
+    ///
+    /// `/exit` returns straight into `Runtime::shutdown_background`, which drops every task where
+    /// it stands. A task parked at an await is then never polled again, so the cleanup that follows
+    /// its cancellation check -- killing its process group, writing its terminal row -- simply
+    /// never happens, which is everything the cancel was for. The task here records the same way:
+    /// it observes the token, then does one more await before setting the flag.
+    #[tokio::test]
+    async fn cancelling_every_task_and_waiting_lets_them_run_their_cleanup() {
+        let tasks = BackgroundTasks::default();
+        let session_id = Uuid::new_v4();
+        let token = tokio_util::sync::CancellationToken::new();
+        let cleaned_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        assert!(
+            tasks
+                .try_reserve("a".to_string(), session_id, token.clone(), 4)
+                .await
+        );
+        let join = tokio::spawn({
+            let cleaned_up = std::sync::Arc::clone(&cleaned_up);
+            async move {
+                token.cancelled().await;
+                tokio::task::yield_now().await;
+                cleaned_up.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+        tasks.attach("a", join).await;
+
+        assert_eq!(tasks.cancel_all().await, 1);
+        tasks.wait_all().await;
+
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::Acquire),
+            "the task must have reached its cleanup before the wait returned",
+        );
+        assert_eq!(
+            tasks.running_count_all().await,
+            0,
+            "and the registry must be empty afterwards",
         );
     }
 

@@ -59,14 +59,24 @@ impl Slot {
     }
 }
 
-/// Process-wide idempotency cache. The key is `(token_id, idempotency_key)`; the value is a
+/// What identifies one idempotent request: the token that sent it, what it acts on, and the
+/// client's key. Named because it appears in five signatures and reads as three anonymous strings
+/// otherwise.
+type CacheKey = (String, String, String);
+
+/// Process-wide idempotency cache. The key is `(token_id, scope, idempotency_key)`; the value is a
 /// `Slot` describing whether the first request is pending or completed.
+///
+/// `scope` is what the request acts on, which for a turn is the session id (empty when the turn
+/// creates one). Without it, one client reusing an `Idempotency-Key` across two sessions -- the
+/// natural thing to do when the key identifies *the client's* unit of work -- got the first
+/// session's transcript back for the second session, and the second turn never ran.
 ///
 /// `RwLock` over `Mutex` so read-only diagnostic queries can take a shared lock without
 /// blocking writers.
 #[derive(Clone)]
 pub struct IdempotencyCache {
-    inner: Arc<RwLock<HashMap<(String, String), Slot>>>,
+    inner: Arc<RwLock<HashMap<CacheKey, Slot>>>,
     /// TTL for `Cached` entries, Stripe's documented 24h.
     ttl: Duration,
     /// TTL for `Pending` entries, much shorter. If a handler holds a ticket longer than this
@@ -84,6 +94,13 @@ pub struct IdempotencyCache {
     /// `Pending`s. The full cap is per-token rather than global so a single misbehaving
     /// token can't push other tokens' entries out of the cache.
     max_entries_per_token: usize,
+    /// Ceiling on the bytes one token's cached envelopes may occupy. The entry count alone did not
+    /// bound memory: an envelope is a whole turn response, so a thousand of them at a few
+    /// megabytes each is gigabytes held for the 24-hour TTL. When a commit would take a token
+    /// past this, its oldest cached envelopes are dropped until it fits; a single envelope
+    /// larger than the budget is not cached at all, and its retry re-executes, which is the
+    /// correct outcome for a response nobody can afford to keep.
+    max_bytes_per_token: usize,
 }
 
 impl IdempotencyCache {
@@ -97,6 +114,9 @@ impl IdempotencyCache {
             // 1000 entries per token covers any realistic retry pattern (Stripe-style clients
             // re-use keys for hours; 1000 unique keys in 24h is already an aggressive cadence).
             max_entries_per_token: 1000,
+            // 64 MiB per token: room for a normal retry window of full transcripts, far below what
+            // a thousand large envelopes would have held.
+            max_bytes_per_token: 64 * 1024 * 1024,
         }
     }
 
@@ -121,10 +141,11 @@ impl IdempotencyCache {
     pub async fn lookup_and_mark(
         &self,
         token_id: &str,
+        scope: &str,
         key: &str,
         body_hash: &[u8; 32],
     ) -> LookupOutcome {
-        let composite_key = (token_id.to_string(), key.to_string());
+        let composite_key = (token_id.to_string(), scope.to_string(), key.to_string());
         let mut inner = self.inner.write().await;
         // Take the slot (if any) for in-place inspection.
         match inner.get(&composite_key) {
@@ -152,7 +173,7 @@ impl IdempotencyCache {
         // Enforce per-token cap: evict the oldest `Cached` to make room. `Pending` entries are
         // never evicted: they're owed to the in-flight ticket holder. The common path (under
         // the cap) only counts; the scan-and-evict pass runs solely when the cap is hit.
-        let token_count = inner.keys().filter(|(tid, _)| tid == token_id).count();
+        let token_count = inner.keys().filter(|(tid, ..)| tid == token_id).count();
         if token_count >= self.max_entries_per_token {
             let victim = inner
                 .iter()
@@ -190,8 +211,49 @@ impl IdempotencyCache {
 
     /// Replace the `Pending` slot at `key` with a `Cached` envelope. Called by
     /// `IdempotencyTicket::commit`. Not public: callers acquire a ticket via `lookup_and_mark`.
-    async fn commit(&self, key: (String, String), body_hash: [u8; 32], status: u16, body: Vec<u8>) {
+    async fn commit(&self, key: CacheKey, body_hash: [u8; 32], status: u16, body: Vec<u8>) {
         let mut inner = self.inner.write().await;
+        if body.len() > self.max_bytes_per_token {
+            tracing::debug!(
+                "idempotency envelope of {} bytes exceeds the {} byte per-token budget; not \
+                 caching it, so a retry re-executes",
+                body.len(),
+                self.max_bytes_per_token
+            );
+            inner.remove(&key);
+            return;
+        }
+
+        // Make room before inserting, oldest first. Only `Cached` entries are evictable: a
+        // `Pending` is a contract with an in-flight ticket holder.
+        let token_id = key.0.clone();
+        let mut used: usize = inner
+            .iter()
+            .filter(|(other, _)| other.0 == token_id)
+            .filter_map(|(_, slot)| match slot {
+                Slot::Cached(entry) => Some(entry.body.len()),
+                Slot::Pending { .. } => None,
+            })
+            .sum();
+        while used + body.len() > self.max_bytes_per_token {
+            let oldest = inner
+                .iter()
+                .filter(|(other, _)| other.0 == token_id && **other != key)
+                .filter_map(|(other, slot)| match slot {
+                    Slot::Cached(entry) => Some((entry.stored_at, other.clone(), entry.body.len())),
+                    Slot::Pending { .. } => None,
+                })
+                .min_by_key(|(stored_at, ..)| *stored_at);
+            match oldest {
+                Some((_, victim, freed)) => {
+                    inner.remove(&victim);
+                    used = used.saturating_sub(freed);
+                }
+                // Nothing left to evict, which means this token holds only pending entries.
+                None => break,
+            }
+        }
+
         inner.insert(
             key,
             Slot::Cached(CachedResponse {
@@ -206,7 +268,7 @@ impl IdempotencyCache {
     /// Remove the `Pending` slot at `key` without recording a cached envelope. Called by
     /// `IdempotencyTicket::drop` when the handler returned without committing, typically
     /// because of a panic or an early abort. Removing the entry lets retries proceed.
-    async fn rollback(&self, key: (String, String)) {
+    async fn rollback(&self, key: CacheKey) {
         let mut inner = self.inner.write().await;
         if let Some(Slot::Pending { .. }) = inner.get(&key) {
             inner.remove(&key);
@@ -227,12 +289,25 @@ impl IdempotencyCache {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let mut guard = inner.write().await;
-                let before = guard.len();
-                guard.retain(|_, slot| !slot.is_expired(ttl, pending_ttl));
-                let pruned = before.saturating_sub(guard.len());
-                if pruned > 0 {
-                    tracing::debug!("idempotency cache: pruned {} expired entries", pruned);
+                // Supervised like the other resident loops. A panic here is unlikely -- the body is
+                // a `retain` over owned data -- but the consequence is the same shape as the
+                // others: the task dies, nothing joins it, and the cache grows without bound for
+                // the life of the process with no symptom until the memory shows.
+                let prune = std::panic::AssertUnwindSafe(async {
+                    let mut guard = inner.write().await;
+                    let before = guard.len();
+                    guard.retain(|_, slot| !slot.is_expired(ttl, pending_ttl));
+                    before.saturating_sub(guard.len())
+                });
+                match futures::FutureExt::catch_unwind(prune).await {
+                    Ok(pruned) if pruned > 0 => {
+                        tracing::debug!("idempotency cache: pruned {} expired entries", pruned);
+                    }
+                    Ok(_) => {}
+                    Err(panic) => tracing::error!(
+                        "idempotency cache prune panicked ({}); continuing",
+                        crate::error::panic_message(&*panic)
+                    ),
                 }
             }
         })
@@ -249,7 +324,7 @@ impl IdempotencyCache {
 /// cache map: no user-observable effect.
 pub struct IdempotencyTicket {
     cache: IdempotencyCache,
-    key: (String, String),
+    key: CacheKey,
     body_hash: [u8; 32],
     committed: bool,
 }
@@ -321,17 +396,85 @@ pub fn hash_body(body: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    /// An `Idempotency-Key` names the client's unit of work, so reusing one across two sessions is
+    /// the natural thing to do. Without the session in the key, the second request replayed the
+    /// first session's transcript and its turn never ran.
+    #[tokio::test]
+    async fn the_same_key_against_two_sessions_does_not_cross_answer() {
+        let cache = IdempotencyCache::new(Duration::from_secs(60));
+        let hash = hash_body(b"same body");
+
+        let ticket = match cache
+            .lookup_and_mark("token", "session-a", "k", &hash)
+            .await
+        {
+            LookupOutcome::Miss(ticket) => ticket,
+            other => panic!("expected a miss, got {:?}", other),
+        };
+        ticket.commit(200, b"session-a transcript".to_vec()).await;
+
+        // The other session must run its own turn, not be handed session A's answer.
+        match cache
+            .lookup_and_mark("token", "session-b", "k", &hash)
+            .await
+        {
+            LookupOutcome::Miss(_) => {}
+            other => panic!("expected a miss for the second session, got {:?}", other),
+        }
+
+        // A genuine replay against the same session still hits.
+        match cache
+            .lookup_and_mark("token", "session-a", "k", &hash)
+            .await
+        {
+            LookupOutcome::Hit(entry) => {
+                assert_eq!(entry.body, b"session-a transcript");
+            }
+            other => panic!("expected a hit for the same session, got {:?}", other),
+        }
+    }
+
+    /// An envelope is a whole turn response, so a thousand of them is memory the count cap alone
+    /// never bounded.
+    #[tokio::test]
+    async fn a_token_cannot_hold_more_than_its_byte_budget() {
+        let mut cache = IdempotencyCache::new(Duration::from_secs(60));
+        cache.max_bytes_per_token = 1000;
+
+        for index in 0..5 {
+            let key = format!("k{index}");
+            let hash = hash_body(key.as_bytes());
+            let ticket = match cache.lookup_and_mark("token", "s", &key, &hash).await {
+                LookupOutcome::Miss(ticket) => ticket,
+                other => panic!("expected a miss, got {:?}", other),
+            };
+            ticket.commit(200, vec![b'x'; 400]).await;
+        }
+
+        let held: usize = cache
+            .inner
+            .read()
+            .await
+            .values()
+            .filter_map(|slot| match slot {
+                Slot::Cached(entry) => Some(entry.body.len()),
+                Slot::Pending { .. } => None,
+            })
+            .sum();
+        assert!(held <= 1000, "{held} bytes held, budget is 1000");
+    }
+
     #[tokio::test]
     async fn hit_returns_cached_response_after_commit() {
         let cache = IdempotencyCache::standard();
         let body = b"{\"message\":\"hi\"}";
         let hash = hash_body(body);
-        let ticket = match cache.lookup_and_mark("token1", "key-a", &hash).await {
+        let ticket = match cache.lookup_and_mark("token1", "", "key-a", &hash).await {
             LookupOutcome::Miss(t) => t,
             other => panic!("expected Miss, got {:?}", other),
         };
         ticket.commit(200, b"response".to_vec()).await;
-        match cache.lookup_and_mark("token1", "key-a", &hash).await {
+        match cache.lookup_and_mark("token1", "", "key-a", &hash).await {
             LookupOutcome::Hit(entry) => {
                 assert_eq!(entry.status, 200);
                 assert_eq!(entry.body, b"response");
@@ -345,13 +488,18 @@ mod tests {
         let cache = IdempotencyCache::standard();
         let original = hash_body(b"original");
         let different = hash_body(b"different");
-        let ticket = match cache.lookup_and_mark("token1", "key-a", &original).await {
+        let ticket = match cache
+            .lookup_and_mark("token1", "", "key-a", &original)
+            .await
+        {
             LookupOutcome::Miss(t) => t,
             _ => panic!("expected Miss"),
         };
         ticket.commit(200, b"response".to_vec()).await;
         assert!(matches!(
-            cache.lookup_and_mark("token1", "key-a", &different).await,
+            cache
+                .lookup_and_mark("token1", "", "key-a", &different)
+                .await,
             LookupOutcome::Conflict
         ));
     }
@@ -360,13 +508,13 @@ mod tests {
     async fn concurrent_same_key_returns_in_flight() {
         let cache = IdempotencyCache::standard();
         let hash = hash_body(b"body");
-        let _ticket = match cache.lookup_and_mark("token1", "key", &hash).await {
+        let _ticket = match cache.lookup_and_mark("token1", "", "key", &hash).await {
             LookupOutcome::Miss(t) => t,
             _ => panic!("expected Miss"),
         };
         // Second concurrent call with the same key + same body sees Pending, returns InFlight.
         assert!(matches!(
-            cache.lookup_and_mark("token1", "key", &hash).await,
+            cache.lookup_and_mark("token1", "", "key", &hash).await,
             LookupOutcome::InFlight
         ));
     }
@@ -375,7 +523,7 @@ mod tests {
     async fn concurrent_same_key_different_body_returns_conflict() {
         let cache = IdempotencyCache::standard();
         let _ticket = match cache
-            .lookup_and_mark("token1", "key", &hash_body(b"a"))
+            .lookup_and_mark("token1", "", "key", &hash_body(b"a"))
             .await
         {
             LookupOutcome::Miss(t) => t,
@@ -383,7 +531,7 @@ mod tests {
         };
         assert!(matches!(
             cache
-                .lookup_and_mark("token1", "key", &hash_body(b"b"))
+                .lookup_and_mark("token1", "", "key", &hash_body(b"b"))
                 .await,
             LookupOutcome::Conflict
         ));
@@ -393,7 +541,7 @@ mod tests {
     async fn ticket_drop_without_commit_unblocks_retries() {
         let cache = IdempotencyCache::standard();
         let hash = hash_body(b"body");
-        let ticket = match cache.lookup_and_mark("token1", "key", &hash).await {
+        let ticket = match cache.lookup_and_mark("token1", "", "key", &hash).await {
             LookupOutcome::Miss(t) => t,
             _ => panic!("expected Miss"),
         };
@@ -401,7 +549,7 @@ mod tests {
         drop(ticket);
         // The drop spawns a cleanup task; yield to give it a chance to run.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        match cache.lookup_and_mark("token1", "key", &hash).await {
+        match cache.lookup_and_mark("token1", "", "key", &hash).await {
             LookupOutcome::Miss(t) => {
                 // Retry succeeds: `Pending` was cleared by the drop.
                 drop(t);
@@ -414,14 +562,14 @@ mod tests {
     async fn per_token_namespacing() {
         let cache = IdempotencyCache::standard();
         let hash = hash_body(b"body");
-        let ticket = match cache.lookup_and_mark("token1", "key", &hash).await {
+        let ticket = match cache.lookup_and_mark("token1", "", "key", &hash).await {
             LookupOutcome::Miss(t) => t,
             _ => panic!("expected Miss"),
         };
         ticket.commit(200, b"a".to_vec()).await;
         // token2 sees no entry: distinct namespaces.
         assert!(matches!(
-            cache.lookup_and_mark("token2", "key", &hash).await,
+            cache.lookup_and_mark("token2", "", "key", &hash).await,
             LookupOutcome::Miss(_),
         ));
     }
@@ -435,7 +583,7 @@ mod tests {
         for i in 0..3 {
             let key = format!("k{}", i);
             let hash = hash_body(format!("body-{}", i).as_bytes());
-            let ticket = match cache.lookup_and_mark("token", &key, &hash).await {
+            let ticket = match cache.lookup_and_mark("token", "", &key, &hash).await {
                 LookupOutcome::Miss(t) => t,
                 _ => panic!("expected Miss for fresh key {}", i),
             };
@@ -448,7 +596,7 @@ mod tests {
 
         // Fourth insert should succeed and evict `k0` (oldest).
         let hash = hash_body(b"body-3");
-        let ticket = match cache.lookup_and_mark("token", "k3", &hash).await {
+        let ticket = match cache.lookup_and_mark("token", "", "k3", &hash).await {
             LookupOutcome::Miss(t) => t,
             other => panic!("expected Miss after eviction, got {:?}", other),
         };
@@ -457,7 +605,7 @@ mod tests {
         // `k0` is gone; `k1`, `k2`, `k3` remain.
         let h0 = hash_body(b"body-0");
         assert!(matches!(
-            cache.lookup_and_mark("token", "k0", &h0).await,
+            cache.lookup_and_mark("token", "", "k0", &h0).await,
             LookupOutcome::Miss(_),
         ));
     }
@@ -466,17 +614,25 @@ mod tests {
     async fn per_token_cap_refuses_when_all_pending() {
         let mut cache = IdempotencyCache::standard();
         cache.max_entries_per_token = 2;
-        let _t1 = match cache.lookup_and_mark("token", "k1", &hash_body(b"a")).await {
+        let _t1 = match cache
+            .lookup_and_mark("token", "", "k1", &hash_body(b"a"))
+            .await
+        {
             LookupOutcome::Miss(t) => t,
             _ => panic!("k1 should miss"),
         };
-        let _t2 = match cache.lookup_and_mark("token", "k2", &hash_body(b"b")).await {
+        let _t2 = match cache
+            .lookup_and_mark("token", "", "k2", &hash_body(b"b"))
+            .await
+        {
             LookupOutcome::Miss(t) => t,
             _ => panic!("k2 should miss"),
         };
         // Both tickets held → both slots Pending. Third request should be refused.
         assert!(matches!(
-            cache.lookup_and_mark("token", "k3", &hash_body(b"c")).await,
+            cache
+                .lookup_and_mark("token", "", "k3", &hash_body(b"c"))
+                .await,
             LookupOutcome::CapExceeded,
         ));
     }
@@ -485,14 +641,14 @@ mod tests {
     async fn expired_cached_entry_is_a_miss() {
         let cache = IdempotencyCache::new(Duration::from_millis(1));
         let hash = hash_body(b"body");
-        let ticket = match cache.lookup_and_mark("token1", "key", &hash).await {
+        let ticket = match cache.lookup_and_mark("token1", "", "key", &hash).await {
             LookupOutcome::Miss(t) => t,
             _ => panic!("expected Miss"),
         };
         ticket.commit(200, b"a".to_vec()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(
-            cache.lookup_and_mark("token1", "key", &hash).await,
+            cache.lookup_and_mark("token1", "", "key", &hash).await,
             LookupOutcome::Miss(_),
         ));
     }

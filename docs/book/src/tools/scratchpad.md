@@ -66,6 +66,24 @@ Delete a scratchpad entry by name.
 |------|------|----------|-------------|
 | `name` | string | yes | The entry name to delete |
 
+## Handing entries to a sub-agent
+
+`agent_spawn`'s `inherit_scratchpad` takes a list of the parent's entry names and grants the
+sub-agent read-only access to exactly those:
+
+```text
+agent_spawn(prompt: "summarise the failures", inherit_scratchpad: ["build_log"])
+```
+
+The sub-agent's `scratchpad_read` falls back to the parent for an inherited name, and its
+`scratchpad_list` shows the entry with origin `inherited`. `scratchpad_write`, `scratchpad_edit` and
+`scratchpad_delete` targeting one return an error, so a worker cannot rewrite what it was lent.
+
+This is how a large captured output reaches a sub-agent without being re-inlined into the prompt.
+When you expect to delegate a result later, name it at the source with the `scratchpad` parameter
+(`execute_command({command: "...", scratchpad: "build_log"})`) so there is a semantic name to pass
+through.
+
 ## Lifecycle
 
 - Entries are scoped to the session and persist across turns.

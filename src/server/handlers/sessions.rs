@@ -16,7 +16,6 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    agent::SharedCwd,
     conversation::Conversation,
     permission::{EnabledPermissions, Permission, SharedPermission},
     server::{
@@ -28,6 +27,7 @@ use crate::{
         state::{ServerState, SessionEntry, SessionRuntime},
     },
     session::SessionManager,
+    workspace::SharedCwd,
 };
 
 /// RAII guard that deletes a freshly-created session DB row when an in-flight create handler
@@ -411,6 +411,7 @@ pub async fn create_session(
         capabilities,
         frontend: http_frontend,
         cancellation: Arc::new(RwLock::new(tokio_util::sync::CancellationToken::new())),
+        cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         session_lock: Arc::new(session_lock),
         in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -581,7 +582,7 @@ pub async fn fork_session(
             created_at: forked.created_at.clone(),
             updated_at: forked.created_at,
             last_turn_at: None,
-            cwd: Some(crate::agent::cwd_snapshot(&entry.cwd)),
+            cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
             title,
             capabilities: entry.capabilities,
@@ -735,7 +736,7 @@ pub async fn get_session(
             created_at: entry.created_at.to_rfc3339(),
             updated_at,
             last_turn_at,
-            cwd: Some(crate::agent::cwd_snapshot(&entry.cwd)),
+            cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
             title,
             capabilities: entry.capabilities,
@@ -860,7 +861,7 @@ pub async fn patch_session(
     let permission_change: Option<Permission> =
         new_permission.filter(|parsed| entry.permission.get() != *parsed);
     let cwd_change: Option<std::path::PathBuf> =
-        new_cwd.filter(|path| crate::agent::cwd_snapshot(&entry.cwd) != *path);
+        new_cwd.filter(|path| crate::workspace::cwd_snapshot(&entry.cwd) != *path);
     let mutated = permission_change.is_some() || cwd_change.is_some();
     if mutated {
         state
@@ -903,7 +904,7 @@ pub async fn patch_session(
     if mutated && let Ok(mut guard) = entry.updated_at.write() {
         *guard = chrono::Utc::now();
     }
-    let cwd_snapshot = crate::agent::cwd_snapshot(&entry.cwd);
+    let cwd_snapshot = crate::workspace::cwd_snapshot(&entry.cwd);
     let updated_at = entry
         .updated_at
         .read()

@@ -313,7 +313,22 @@ pub(crate) async fn connect_one(
 
     // Discover + register tools. Any error here doesn't undo the Connected state. The server is
     // reachable, just its tool list failed. Surface it as a warn and leave tool set empty.
-    match discover_and_register_tools(&entry, mcp_default_permission, &manager).await {
+    //
+    // Bounded by the same `connect_timeout` as the connect itself: `tools/list` is a request to the
+    // server just made, and a server that accepts the connection and then never answers used to
+    // hold this task open for the life of the process.
+    let discovery = tokio::time::timeout(
+        connect_timeout,
+        discover_and_register_tools(&entry, mcp_default_permission, &manager),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| {
+        Err(MekaError::McpConnection {
+            server_name: server_name.clone(),
+            message: format!("tool discovery timed out after {:?}", connect_timeout),
+        })
+    });
+    match discovery {
         Ok(count) => {
             tracing::info!("MCP server '{}' registered {} tool(s)", server_name, count);
         }
@@ -369,14 +384,12 @@ async fn build_mcp_adapters(
 ) -> Result<Vec<McpToolAdapter>> {
     let server_name = entry.server_name.clone();
     let server_config = &entry.config;
-    let peer = entry.require_connected().await?;
-    let tools = peer
-        .list_all_tools()
-        .await
-        .map_err(|error| MekaError::McpConnection {
-            server_name: server_name.clone(),
-            message: format!("list_tools failed: {}", error),
-        })?;
+    // Bounded like every other `tools/list`. This one already sat inside the connect timeout, but
+    // the tool *count* is unbounded there too, and the cap belongs to meka rather than to the
+    // server's pagination.
+    let tools = entry
+        .list_tools_bounded(super::DEFAULT_MCP_REQUEST_TIMEOUT)
+        .await?;
 
     let advertised: std::collections::HashSet<&str> =
         tools.iter().map(|t| t.name.as_ref()).collect();
@@ -476,35 +489,69 @@ async fn build_mcp_adapters(
     Ok(adapters)
 }
 
-/// Connect to an MCP server, dispatching to the auth or no-auth path. This function is only called
-/// from top-level startup code (e.g. `connect_all`) where a `Send` future isn't required: the
 /// Drain a stdio MCP child's stderr line by line into meka's tracing stream. Many MCP servers log
 /// diagnostics to stderr; with rmcp's default inherited stderr those lines land directly on meka's
 /// terminal and corrupt the REPL. Emitting at `debug!` keeps them off the terminal at default
 /// verbosity while still surfacing under `-v` / `RUST_LOG`, tagged with the server name. The task
 /// is detached: it ends on its own when the child exits and stderr reaches EOF.
 fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncReadExt;
+
+    // Split into lines by hand rather than with `BufReader::lines`, which grows one `String` until
+    // it finds a newline: a child that emits none hands meka an unbounded allocation fed by a pipe
+    // it controls. Splitting here caps what one line may cost without capping how much the child
+    // may log over its life, which a `take` on the whole stream would have done -- and a full pipe
+    // blocks the child rather than meka.
+    const MAX_STDERR_LINE_BYTES: usize = 4096;
+
+    fn emit(server_name: &str, line: &[u8], overlong: bool) {
+        // The text is the child's, so it can carry escapes that would repaint the terminal of
+        // anyone running with `-v`.
+        let text = crate::mcp::sanitize::sanitize_text(&String::from_utf8_lossy(line));
+        if overlong {
+            tracing::debug!(server = %server_name, "{}... (line truncated)", text);
+        } else {
+            tracing::debug!(server = %server_name, "{}", text);
+        }
+    }
 
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut stderr = stderr;
+        let mut buffer = [0u8; 8192];
+        let mut line: Vec<u8> = Vec::new();
+        let mut overlong = false;
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => tracing::debug!(server = %server_name, "{}", line),
-                Ok(None) => break,
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
                 Err(error) => {
                     tracing::debug!(server = %server_name, "stderr read error: {}", error);
                     break;
                 }
+            };
+            for &byte in &buffer[..read] {
+                if byte == b'\n' {
+                    emit(&server_name, &line, overlong);
+                    line.clear();
+                    overlong = false;
+                } else if line.len() < MAX_STDERR_LINE_BYTES {
+                    line.push(byte);
+                } else {
+                    overlong = true;
+                }
             }
+        }
+        if !line.is_empty() {
+            emit(&server_name, &line, overlong);
         }
     });
 }
 
-/// OAuth path pulls in an rmcp auth future that is `!Send`. Connect to an MCP server. The returned
-/// future is `!Send` when the server config uses OAuth (rmcp 1.5's auth module holds a `!Sync`
-/// closure across an await). Callers that need a `Send` future (e.g. `Tool::execute` during
-/// reconnect) drive this on a `spawn_blocking` thread via [`ServerEntry::reconnect`].
+/// Connect to an MCP server, dispatching to the auth or no-auth path.
+///
+/// The returned future is `!Send` when the server config uses OAuth, because rmcp's auth module
+/// holds a `!Sync` closure across an await. Callers that need a `Send` future (e.g. `Tool::execute`
+/// during reconnect) drive this on a `spawn_blocking` thread via [`ServerEntry::reconnect`].
 pub(super) async fn connect_server(
     server_name: &str,
     config: &McpServerConfig,
@@ -529,10 +576,37 @@ pub(super) async fn connect_server(
             let args_vec: Vec<String> = config.args.clone().unwrap_or_default();
             let command = build_stdio_command(command_str, &args_vec);
             let mut command = command;
+            // Scrub the environment before layering the server's own `env` on top.
+            //
+            // A stdio MCP server is a child process that talks to the network, and it used to
+            // inherit every variable meka was started with: `ANTHROPIC_API_KEY`, `AWS_*`,
+            // `GITHUB_TOKEN`, the lot. Configuring a server is a decision to run its code, not a
+            // decision to hand it every credential on the machine. What survives is the same
+            // curated base a read-mode shell gets (`PATH`, `HOME`, locale), so servers still
+            // resolve their own binaries; a server that genuinely needs a secret asks for it by
+            // name, and `${VAR}` in the `env` table still reads it from meka's environment.
+            command.env_clear();
+            command.envs(crate::sandbox::sandbox_child_env());
             if let Some(env) = &config.env {
                 command.envs(env);
             }
 
+            // No bound on an incoming line, and rmcp 3.1 offers no way to set one here.
+            //
+            // `TokioChildProcess` builds an `AsyncRwTransport` internally with no seam to
+            // configure, and that transport's `receive` does its own `read_until(b'\n')` into an
+            // unbounded `Vec` -- it never consults `JsonRpcMessageCodec::max_length`, which is the
+            // only length knob the crate exposes and applies to the *write* side. So a stdio server
+            // that emits no newline grows one buffer until the process dies.
+            //
+            // Left as is deliberately. Bounding it means spawning the child and constructing the
+            // transport here, which also means reimplementing `ChildWithCleanup` -- the drop guard
+            // that kills the child rather than leaving a zombie. Getting that wrong is a worse
+            // failure than the one being fixed, and the exposure is narrow: a stdio server is a
+            // program the user configured and chose to run, already executing arbitrary code, so
+            // this bounds a *buggy* server rather than a hostile one. Revisit when rmcp exposes the
+            // read length.
+            //
             // rmcp's `TokioChildProcess::new` leaves the child's stderr inherited, so an MCP server
             // that logs to stderr (many `tracing`/`log`-based servers do) writes straight onto
             // meka's terminal and corrupts the REPL display. Pipe it and drain it into our own
@@ -656,6 +730,8 @@ mod tests {
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
             instructions: std::sync::OnceLock::new(),
+            request_timeout: std::sync::OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -676,6 +752,7 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
+            trust_read_only_hint: None,
             disabled: false,
             required: None,
         }
@@ -703,6 +780,8 @@ mod tests {
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
             instructions: std::sync::OnceLock::new(),
+            request_timeout: std::sync::OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
             .await
@@ -744,6 +823,8 @@ mod tests {
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
             instructions: OnceLock::new(),
+            request_timeout: OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
 
         // The test never reaches tool discovery (the connect itself times out), so the manager
@@ -794,6 +875,8 @@ mod tests {
             }),
             reconnect_lock: Mutex::new(()),
             instructions: OnceLock::new(),
+            request_timeout: OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
         let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
             .await

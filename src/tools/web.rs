@@ -315,47 +315,12 @@ impl Tool for FetchUrlTool {
             .unwrap_or("")
             .to_string();
 
-        // Enforce a byte cap on the decompressed body so a small gzip/brotli payload can't expand
-        // into gigabytes and exhaust host memory (a classic "zip bomb" vector now that reqwest is
-        // built with gzip, deflate, and brotli enabled). We stream rather than buffer with `text()`
-        // so the cap is checked incrementally.
-        const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-        if let Some(len) = response.content_length()
-            && len as usize > MAX_RESPONSE_BYTES
-        {
-            return Err(MekaError::ToolExecution {
-                tool_name: "fetch_url".to_string(),
-                message: format!(
-                    "response Content-Length {} exceeds cap {} bytes",
-                    len, MAX_RESPONSE_BYTES
-                ),
-            });
-        }
-
         // Capture the document's final (post-redirect) URL to resolve relative links against. Taken
-        // before `bytes_stream` consumes the response; re-parsed through our own `url` crate so the
-        // type matches `html_to_markdown` regardless of reqwest's `url` re-export.
+        // before `read_body_capped` consumes the response; re-parsed through our own `url` crate so
+        // the type matches `html_to_markdown` regardless of reqwest's `url` re-export.
         let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
 
-        let mut body_bytes: Vec<u8> = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| MekaError::ToolExecution {
-                tool_name: "fetch_url".to_string(),
-                message: format!("failed to read response body: {}", error),
-            })?;
-            if body_bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(MekaError::ToolExecution {
-                    tool_name: "fetch_url".to_string(),
-                    message: format!(
-                        "response body exceeded {} bytes during streaming \
-                         (possible decompression bomb)",
-                        MAX_RESPONSE_BYTES
-                    ),
-                });
-            }
-            body_bytes.extend_from_slice(&chunk);
-        }
+        let body_bytes = read_body_capped(response, "fetch_url").await?;
 
         // A response the server labelled as an image becomes a multimodal Image block rather than
         // going through html2md. `Content-Type` only gates whether to try: the media type comes
@@ -369,17 +334,39 @@ impl Tool for FetchUrlTool {
             let sniffed = crate::image::classify_bytes(&body_bytes);
             if !matches!(sniffed, ImageHandling::Unsupported) {
                 let marker = format!("Image fetched from {}", url);
-                return Ok(build_image_tool_output(&marker, sniffed, &body_bytes));
+                // Off the runtime, for the reason `read_file` documents at src/tools/file.rs:
+                // decoding and re-encoding a multi-megapixel image is tens of milliseconds of pure
+                // CPU, and on the runtime it blocks every other task on that worker -- a `serve`
+                // process stalls unrelated sessions' streams behind one agent's image fetch. This
+                // is the sibling that did not get it.
+                let marker = marker.clone();
+                return tokio::task::spawn_blocking(move || {
+                    build_image_tool_output(&marker, sniffed, &body_bytes)
+                })
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "fetch_url".to_string(),
+                    message: format!("image decode task failed: {}", error),
+                });
             }
         }
 
         let html = String::from_utf8_lossy(&body_bytes).into_owned();
 
         let raw = input["raw"].as_bool().unwrap_or(false);
+        // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
+        // blocks every other task on that worker: under `serve` one agent's fetch stalled unrelated
+        // sessions' streams.
         let body = if raw {
             html
         } else {
-            html_to_markdown(&html, &document_url)
+            let document_url = document_url.clone();
+            tokio::task::spawn_blocking(move || html_to_markdown(&html, &document_url))
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "fetch_url".to_string(),
+                    message: format!("HTML conversion task failed: {}", error),
+                })?
         };
 
         // When the caller redirects to the scratchpad we produce full content regardless of
@@ -393,30 +380,86 @@ impl Tool for FetchUrlTool {
                 .unwrap_or(DEFAULT_MAX_LENGTH)
         };
 
-        let content = if max_length > 0 && body.len() > max_length {
+        // The regex runs against the whole document, before any truncation.
+        //
+        // Running it after meant `max_length` silently decided which matches existed: a pattern
+        // whose only hit sat past the cut returned "No matches found", which reads as a fact about
+        // the page rather than about the window. The truncation notice was discarded along with it,
+        // so nothing said a cut had happened at all. The cap then applies to the match list, which
+        // is what the caller asked to be shown.
+        let matched = match input.get("regex").and_then(|value| value.as_str()) {
+            Some(pattern) => {
+                let re = compile_user_regex(pattern, "fetch_url")?;
+                let matches: Vec<&str> = re.find_iter(&body).map(|found| found.as_str()).collect();
+                if matches.is_empty() {
+                    return Ok(ToolOutput::text(
+                        "No matches found for the given regex pattern.".to_string(),
+                        false,
+                    ));
+                }
+                Some(matches.join("\n"))
+            }
+            None => None,
+        };
+        let content = matched.unwrap_or(body);
+
+        let content = if max_length > 0 && content.len() > max_length {
             format!(
                 "{}\n\n... (truncated, showing first {} characters)",
-                &body[..body.floor_char_boundary(max_length)],
+                &content[..content.floor_char_boundary(max_length)],
                 max_length
             )
-        } else {
-            body
-        };
-
-        let content = if let Some(pattern) = input.get("regex").and_then(|v| v.as_str()) {
-            let re = compile_user_regex(pattern, "fetch_url")?;
-            let matches: Vec<&str> = re.find_iter(&content).map(|m| m.as_str()).collect();
-            if matches.is_empty() {
-                "No matches found for the given regex pattern.".to_string()
-            } else {
-                matches.join("\n")
-            }
         } else {
             content
         };
 
         Ok(ToolOutput::text(content, false))
     }
+}
+
+/// The most a single HTTP response body may occupy in memory, decompressed.
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Read a response body into memory, refusing to grow past [`MAX_RESPONSE_BYTES`].
+///
+/// Streamed rather than buffered through `text()` so the cap is checked incrementally: reqwest is
+/// built with gzip, deflate and brotli, so a small compressed payload can expand into gigabytes,
+/// and `text()` would have allocated all of it before anything could object. `Content-Length` is
+/// checked first when the server offers one, which turns the common case into one refusal instead
+/// of ten megabytes of reading.
+async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && len as usize > MAX_RESPONSE_BYTES
+    {
+        return Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!(
+                "response Content-Length {} exceeds cap {} bytes",
+                len, MAX_RESPONSE_BYTES
+            ),
+        });
+    }
+
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("failed to read response body: {}", error),
+        })?;
+        if body_bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(MekaError::ToolExecution {
+                tool_name: tool_name.to_string(),
+                message: format!(
+                    "response body exceeded {} bytes during streaming \
+                     (possible decompression bomb)",
+                    MAX_RESPONSE_BYTES
+                ),
+            });
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+    Ok(body_bytes)
 }
 
 pub(super) struct WebSearchTool {
@@ -482,15 +525,28 @@ impl Tool for WebSearchTool {
                 ),
             })?;
 
-        let html = response
-            .text()
+        // A rate-limit or block page is a 4xx/5xx that still carries HTML, and parsing it found no
+        // result rows, so the agent was told "No search results found." -- a statement about the
+        // query rather than about being turned away. Reject it before parsing so the difference is
+        // visible.
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MekaError::ToolExecution {
+                tool_name: "search_web".to_string(),
+                message: format!("search request returned HTTP {}", status),
+            });
+        }
+
+        let html_bytes = read_body_capped(response, "search_web").await?;
+        let html = String::from_utf8_lossy(&html_bytes).into_owned();
+
+        let parsed = tokio::task::spawn_blocking(move || parse_duckduckgo_results(&html))
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "search_web".to_string(),
-                message: format!("failed to read search response: {}", error),
+                message: format!("result parsing task failed: {}", error),
             })?;
-
-        match parse_duckduckgo_results(&html) {
+        match parsed {
             DdgOutcome::Results(text) => Ok(ToolOutput::text(text, false)),
             DdgOutcome::Empty => Ok(ToolOutput::text(
                 "No search results found.".to_string(),
@@ -1319,16 +1375,12 @@ mod tests {
         assert!(props.get("raw").is_some());
     }
 
-    /// Smoke test for the size-cap logic. We don't stand up a real HTTP server here (that would
-    /// require an async test runtime and a dep on hyper), but we can unit-test that the cap
-    /// constant is reasonable and that the `response.content_length() > cap` pre-check is wired.
-    /// Full end-to-end coverage is left to the manual verification step.
+    /// A canary on the response cap, which both `fetch_url` and `search_web` read through. It
+    /// catches an accidental bump in either direction; end-to-end coverage of the streaming check
+    /// itself needs a real server and lives in the manual verification step.
     #[test]
     fn test_fetch_url_size_cap_is_10_mib() {
-        // The constant is private; this test is a canary that catches an accidental bump up or down
-        // without a reviewer noticing.
-        const EXPECTED: usize = 10 * 1024 * 1024;
-        assert_eq!(EXPECTED, 10_485_760);
+        assert_eq!(MAX_RESPONSE_BYTES, 10_485_760);
     }
 
     #[test]

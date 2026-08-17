@@ -118,6 +118,45 @@ pub enum DelegateFailure {
     /// well own this file and hold unsaved changes for it, so falling back to the local filesystem
     /// could read stale bytes or overwrite the user's unsaved work.
     Transient,
+    /// The user stopped the turn while the round-trip was outstanding, so no answer is coming.
+    ///
+    /// Routes like [`Self::Transient`] -- the local filesystem is not a substitute for an answer
+    /// the frontend never gave -- but reads differently to a caller: nothing failed, and the tool
+    /// should end as an interruption rather than report the client broken.
+    Cancelled,
+}
+
+tokio::task_local! {
+    /// The cancellation token of the *call* running on this task, when that is not the session's
+    /// current turn.
+    ///
+    /// A frontend that races client round-trips against cancellation has only one token to hand:
+    /// the session's, rewritten at every turn start. That is right for a tool call inside the turn
+    /// and wrong for one the agent detached with `background: true`, which owns a token of its own
+    /// and is documented to outlive the turn that started it. Reading the session cell made a
+    /// `session/cancel` on any *later* turn abandon a detached call's `fs/*` request without
+    /// sending it, so the task failed with "interrupted" -- the opposite of the promise in
+    /// `docs/book/src/usage/background.md`.
+    ///
+    /// A task-local rather than a parameter because the frontend is a shared `Arc` behind a trait
+    /// whose delegation methods take no token, and threading one through would touch every impl and
+    /// call site to serve one caller. Mirrors [`crate::provider::scope_subagent`], which solves the
+    /// same "which unit of work is this task" problem the same way.
+    static CALL_CANCELLATION: tokio_util::sync::CancellationToken;
+}
+
+/// Run `future` with `token` as the cancellation any frontend delegation on this task should
+/// honour.
+pub async fn scope_call_cancellation<F: std::future::Future>(
+    token: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output {
+    CALL_CANCELLATION.scope(token, future).await
+}
+
+/// The detached call's token, if this task is running one.
+pub fn current_call_cancellation() -> Option<tokio_util::sync::CancellationToken> {
+    CALL_CANCELLATION.try_with(Clone::clone).ok()
 }
 
 /// Error from a frontend-delegated operation ([`Frontend::delegate_fs_read`],
@@ -149,10 +188,26 @@ impl FrontendError {
         }
     }
 
+    /// Construct a [`DelegateFailure::Cancelled`] error. `what` names the round-trip that was
+    /// abandoned, e.g. `"fs/read_text_file"`.
+    pub fn cancelled(what: &str) -> Self {
+        Self {
+            message: format!("{} was abandoned: the turn was cancelled", what),
+            failure: DelegateFailure::Cancelled,
+        }
+    }
+
     /// Whether the local filesystem is a safe route for this path: true only when the frontend
     /// said it cannot serve the path at all.
     pub fn is_unservable_path(&self) -> bool {
         self.failure == DelegateFailure::UnservablePath
+    }
+
+    /// Whether this is the turn being stopped rather than a delegation failing. Callers turn it
+    /// into [`crate::error::MekaError::Interrupted`] instead of a tool error, so stopping a turn
+    /// mid-`fs/*` reads as a stop and not as a broken client.
+    pub fn is_cancelled(&self) -> bool {
+        self.failure == DelegateFailure::Cancelled
     }
 }
 
@@ -845,6 +900,38 @@ mod tests {
             .await;
 
         assert!(recorder.events().is_empty());
+    }
+
+    /// A detached call's token is what frontend delegation must honour on that task.
+    ///
+    /// `AcpFrontend::until_cancelled` reads this before falling back to the session's cell. Without
+    /// it, a `session/cancel` on any later turn abandoned a background task's `fs/*` request
+    /// without sending it, contradicting `docs/book/src/usage/background.md`.
+    #[tokio::test]
+    async fn a_scoped_call_token_overrides_the_ambient_one() {
+        assert!(
+            current_call_cancellation().is_none(),
+            "an ordinary turn has no per-call token, so the frontend falls back to the session's"
+        );
+
+        let call = tokio_util::sync::CancellationToken::new();
+        let seen = scope_call_cancellation(call.clone(), async {
+            let inside =
+                current_call_cancellation().expect("the detached call publishes its token");
+            assert!(!inside.is_cancelled());
+            call.cancel();
+            inside.is_cancelled()
+        })
+        .await;
+        assert!(
+            seen,
+            "the token seen inside the scope must be the call's own"
+        );
+
+        assert!(
+            current_call_cancellation().is_none(),
+            "the scope must not leak past the call"
+        );
     }
 
     /// Notices are the one event that *does* forward through `PermissionForwardingFrontend`. Image

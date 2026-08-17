@@ -1,6 +1,10 @@
 //! `execute_command` tool. Spawns a shell process, optionally constrained by the platform sandbox
-//! (Landlock/sandbox-exec) when permissions are read-only, and streams stdout/stderr back to the
-//! agent.
+//! when permissions are read-only, and streams stdout/stderr back to the agent as it arrives.
+//!
+//! The sandbox is Landlock or Bubblewrap on Linux (see [`crate::sandbox`] for which is preferred),
+//! `sandbox-exec` on macOS, and a low-integrity token on Windows, which is spawned through
+//! `CreateProcessAsUserW` rather than `tokio::process` because the standard library offers no hook
+//! for injecting one.
 
 use std::sync::Arc;
 
@@ -31,7 +35,7 @@ pub(super) struct ExecuteCommandTool {
     pub backend_probe: crate::sandbox::BackendProbe,
     pub shared_permission: crate::permission::SharedPermission,
     pub sandbox_enabled: bool,
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// Sink for [`crate::frontend::FrontendEvent::ToolCallOutputDelta`], so a frontend can show
     /// output as the command produces it rather than only once it exits.
     pub frontend: Arc<dyn crate::frontend::Frontend>,
@@ -280,7 +284,7 @@ impl Tool for ExecuteCommandTool {
 
         // Resolve commands against the agent's per-session cwd, not the process cwd. `/cd` mutates
         // the agent's cwd; this is how it actually reaches the child.
-        command_builder.current_dir(crate::agent::cwd_snapshot(&self.cwd));
+        command_builder.current_dir(crate::workspace::cwd_snapshot(&self.cwd));
 
         let mut child = command_builder
             .stdin(std::process::Stdio::null())
@@ -438,28 +442,231 @@ impl OutputRelay {
     }
 }
 
+/// How much of one stream meka will hold in the turn's memory before moving it to a file.
+///
+/// There is no cap on how much a command may print, and there should not be: `execute_command` was
+/// deliberately changed to stop truncating at 30 KB. But the drain used to accumulate one
+/// unbounded `Vec<u8>`, and a command that writes faster than the turn ends (measured at 2.2 GB/s
+/// for `cat /dev/zero`) took the process with it. Past this point the bytes go to disk and the
+/// result names the file, so the output is still complete and still reachable, just not resident.
+const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of each end of an overflowing stream stays in the result inline. Enough that the model
+/// can see how the command started and how it ended without opening the capture.
+///
+/// Read alongside [`crate::background::OUTCOME_INLINE_LIMIT`], which is eight times smaller and
+/// keeps only the head. A backgrounded command's *delivered outcome* therefore shows less than its
+/// tool result would have, and shows a different part of it. See that constant for why the
+/// asymmetry is intended and what it costs.
+const OUTPUT_WINDOW_BYTES: usize = 32 * 1024;
+
+/// Where an overflowing stream's bytes are going.
+///
+/// Three states rather than an `Option`, because "not needed yet" and "tried and failed" call for
+/// opposite responses at the next chunk and an `Option` collapsed them into one. A failure read as
+/// "not capturing yet", so the ceiling was re-crossed 8 MiB later and the whole opening sequence
+/// ran again: a second file, and `head` overwritten with a slice from the middle of the stream that
+/// the result then presented as the beginning.
+enum Capture {
+    /// The stream still fits inline. The only state from which capture can begin.
+    NotNeeded,
+    Writing(std::path::PathBuf, tokio::fs::File),
+    /// Capture was attempted and could not be relied on. Terminal: the notice discloses the loss
+    /// rather than naming a file, and no second attempt is made.
+    Failed,
+}
+
+/// Keep only the last `limit` bytes, dropping from the front. Returns how many were dropped.
+///
+/// The count is what keeps the relay cursor aligned. `relayed` is an index into this buffer, so a
+/// trim has to shift it by exactly what was removed. Clamping it to the new length instead marked
+/// the carried incomplete-UTF-8 bytes as already sent; the next chunk then began on continuation
+/// bytes, `valid_up_to()` returned 0, and a whole read vanished from the live stream. It
+/// self-corrected only when a read happened to end on a character boundary, so ASCII output never
+/// showed it.
+fn trim_front_to(buffer: &mut Vec<u8>, limit: usize) -> usize {
+    if buffer.len() > limit {
+        let dropped = buffer.len() - limit;
+        buffer.drain(..dropped);
+        dropped
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook making the capture-failure arms reachable.
+    ///
+    /// There is no other way in. Both directories `capture_path` can pick fall back to each other
+    /// by design, so no environment a test could arrange reliably fails the open, and those arms
+    /// are exactly where the state machine used to go wrong. Thread-local rather than a static so a
+    /// test that sets it cannot disturb the capture tests running beside it; `#[tokio::test]` is
+    /// single-threaded, so the value is visible across the awaits below.
+    static FORCE_CAPTURE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long a command-output capture survives before the next overflow sweeps it.
+const CAPTURE_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Delete captures older than [`CAPTURE_RETENTION`].
+///
+/// Runs on the overflow path rather than on a timer: an overflow is rare, so this costs a directory
+/// read on the one occasion something is about to be written anyway, and a meka that never
+/// overflows never needs the sweep. Every failure is ignored -- a capture that cannot be removed is
+/// not a reason to fail the command whose output is about to be written beside it.
+///
+/// Matches only meka's own names, so a file someone else left in a shared temp directory is not
+/// meka's to delete.
+fn sweep_stale_captures(directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                (name.starts_with("command-output-") || name.starts_with("meka-command-output-"))
+                    && name.ends_with(".log")
+            });
+        if !is_ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION))
+            .unwrap_or(false);
+        if stale && let Err(error) = std::fs::remove_file(&path) {
+            tracing::debug!(
+                "could not remove stale capture '{}': {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
+/// Where an overflowing stream is captured. One file per stream per command, named unguessably so
+/// two concurrent commands cannot collide and a predictable name cannot be pre-created by something
+/// else.
+///
+/// The cache directory rather than `std::env::temp_dir()`, because on most Linux systems `/tmp` is
+/// a tmpfs: capturing there would move the bytes out of the heap and straight back into RAM, which
+/// is the thing the capture exists to avoid.
+///
+/// Sweeps captures older than [`CAPTURE_RETENTION`] on the way past. These files are named in a
+/// tool result the model has already read, so deleting one is deleting something a resumed session
+/// may still refer to -- but they are 8 MiB or more each and nothing else ever removes them, so a
+/// machine that runs long builds accumulates them until the disk notices. A day is well past the
+/// point where the conversation that produced one is still acting on it.
+fn capture_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    if FORCE_CAPTURE_FAILURE.with(std::cell::Cell::get) {
+        // A parent that does not exist, so `File::create` fails on every platform.
+        return std::env::temp_dir()
+            .join(format!("meka-absent-{}", uuid::Uuid::new_v4()))
+            .join("capture.log");
+    }
+
+    // `MEKA_DATA_DIR` first, so a run isolated to a scratch directory keeps its captures there too
+    // rather than dropping them in the real user's cache.
+    //
+    // Empty and relative values are rejected here rather than assumed away. The comment that used
+    // to sit here claimed `default_database_path` guarantees absoluteness; it does not -- it
+    // *warns* and falls back to the platform data dir (src/session.rs), so meka starts normally
+    // with its database in the right place while a relative or empty value reached this join
+    // and scattered capture files, holding whole command outputs, under whatever directory meka
+    // happened to start in. Same guard, same reason, applied to the sibling that missed it.
+    let directory = std::env::var_os("MEKA_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| {
+            if path.as_os_str().is_empty() || !path.is_absolute() {
+                tracing::warn!(
+                    "MEKA_DATA_DIR '{}' is not an absolute path; keeping command-output captures \
+                     in the cache directory instead",
+                    path.display()
+                );
+                return false;
+            }
+            true
+        })
+        .map(|path| path.join("command-output"))
+        .or_else(|| dirs::cache_dir().map(|directory| directory.join("meka")))
+        .unwrap_or_else(std::env::temp_dir);
+    sweep_stale_captures(&directory);
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        tracing::debug!(
+            "could not create '{}' for command output capture ({}); using the temp directory",
+            directory.display(),
+            error
+        );
+        return std::env::temp_dir()
+            .join(format!("meka-command-output-{}.log", uuid::Uuid::new_v4()));
+    }
+    directory.join(format!("command-output-{}.log", uuid::Uuid::new_v4()))
+}
+
+/// Create a capture file readable only by its owner.
+///
+/// A command's output is as sensitive as the command: `env`, a `curl -v` with an `Authorization`
+/// header, a database dump. meka is careful to write its database at 0600 and its directories at
+/// 0700; this file was created at whatever the umask allowed, in a directory shared with every
+/// other user on the host on some configurations. Set before the first write, so the bytes are
+/// never briefly visible at a looser mode.
+async fn create_capture_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .await
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows ACLs inherit from the parent directory, which is the user's own cache directory.
+        tokio::fs::File::create(path).await
+    }
+}
+
 /// Read a child pipe to EOF, relaying each chunk as it arrives.
 ///
 /// Reads bytes rather than `read_to_string` because a chunk boundary can fall inside a multi-byte
 /// character: the trailing incomplete sequence is carried over to the next read instead of being
-/// relayed as replacement characters. The returned string still covers the whole stream, so the
-/// model-facing result is unaffected by how the reads happened to split.
+/// relayed as replacement characters. What is relayed still covers the whole stream, so the live
+/// view is unaffected by how the reads happened to split.
+///
+/// The returned string is the whole stream unless it outgrew [`MAX_RESIDENT_OUTPUT_BYTES`], in
+/// which case it is the two ends plus a line naming the file holding all of it.
 async fn read_to_string_best_effort<R>(reader: Option<R>, relay: Option<OutputRelay>) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Some(mut reader) = reader else {
         return String::new();
     };
+
+    // `content` holds the whole stream until it outgrows the ceiling. After that it holds only the
+    // trailing window, `head` holds the leading one, and `capture` has every byte.
     let mut content: Vec<u8> = Vec::new();
+    let mut head: Vec<u8> = Vec::new();
+    let mut capture = Capture::NotNeeded;
+    let mut total: usize = 0;
     let mut relayed = 0usize;
     let mut buffer = [0u8; 8192];
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                content.extend_from_slice(&buffer[..read]);
+                let chunk = &buffer[..read];
+                total += read;
+                content.extend_from_slice(chunk);
+
                 if let Some(relay) = &relay {
                     // Relay only the prefix that is complete UTF-8; whatever trails an incomplete
                     // sequence stays behind for the next read to finish.
@@ -471,10 +678,83 @@ where
                     if valid > 0 {
                         // `valid` is the length of a verified-UTF-8 prefix, so the lossy decode
                         // never actually substitutes anything; it is just the panic-free spelling.
-                        let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
                         relayed += valid;
-                        relay.send(chunk).await;
+                        relay.send(text).await;
                     }
+                }
+
+                match &mut capture {
+                    // Already capturing: the chunk goes to the file and `content` keeps only the
+                    // trailing window. A write failure stops the capture rather than the command;
+                    // the result then reports the truncation honestly instead of naming a file that
+                    // does not hold what it claims.
+                    Capture::Writing(path, file) => {
+                        if let Some(error) = file.write_all(chunk).await.err() {
+                            let path = path.clone();
+                            tracing::warn!(
+                                "failed to write command output capture '{}': {}",
+                                path.display(),
+                                error
+                            );
+                            capture = Capture::Failed;
+                            // The notice below stops naming this file, so nothing would ever come
+                            // back for it, and what it holds is a prefix of a stream that kept
+                            // going. Leaving up to `MAX_RESIDENT_OUTPUT_BYTES` of it in the cache
+                            // directory after a write failure -- most often a full disk -- is the
+                            // wrong moment to be untidy.
+                            if let Err(error) = tokio::fs::remove_file(&path).await {
+                                tracing::debug!(
+                                    "could not remove the partial capture '{}': {}",
+                                    path.display(),
+                                    error
+                                );
+                            }
+                        }
+                        relayed = relayed
+                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
+                    }
+                    // Capture is off for the rest of the stream. Keep trimming anyway: the point of
+                    // the ceiling is the residency bound, which holds whether or not the bytes are
+                    // reaching a file.
+                    Capture::Failed => {
+                        relayed = relayed
+                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
+                    }
+                    // The one crossing of the ceiling. `head` is taken here, before anything can
+                    // fail, because this is the last moment `content` still starts at byte zero --
+                    // and taking it here is what makes it *the* head. Re-entering this arm later
+                    // (which a `None`-on-failure capture allowed, 8 MiB at a time) overwrote it
+                    // with a mid-stream slice, and a capture that opened on the second attempt then
+                    // held only the bytes from that point on while the notice called it complete.
+                    Capture::NotNeeded if content.len() > MAX_RESIDENT_OUTPUT_BYTES => {
+                        head = content[..OUTPUT_WINDOW_BYTES.min(content.len())].to_vec();
+                        let path = capture_path();
+                        capture = match create_capture_file(&path).await {
+                            Ok(mut file) => match file.write_all(&content).await {
+                                Ok(()) => Capture::Writing(path, file),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "failed to write command output capture '{}': {}",
+                                        path.display(),
+                                        error
+                                    );
+                                    Capture::Failed
+                                }
+                            },
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed to create command output capture '{}': {}",
+                                    path.display(),
+                                    error
+                                );
+                                Capture::Failed
+                            }
+                        };
+                        relayed = relayed
+                            .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
+                    }
+                    Capture::NotNeeded => {}
                 }
             }
             Err(error) => {
@@ -483,10 +763,54 @@ where
             }
         }
     }
+
+    // `tokio::fs::File` hands writes to the blocking pool and does not flush when it is dropped, so
+    // without this the tail of the capture is lost and the file does not hold what the notice below
+    // says it does.
+    if let Capture::Writing(path, file) = &mut capture
+        && let Err(error) = file.flush().await
+    {
+        let path = path.clone();
+        tracing::warn!(
+            "failed to flush command output capture '{}': {}",
+            path.display(),
+            error
+        );
+        capture = Capture::Failed;
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            tracing::debug!(
+                "could not remove the unflushed capture '{}': {}",
+                path.display(),
+                error
+            );
+        }
+    }
+
     // Lossy rather than a hard error: a command that emits a stray non-UTF-8 byte (a progress bar
     // in a foreign encoding, a binary blob on stderr) should still hand the model everything else
     // it printed.
-    String::from_utf8_lossy(&content).into_owned()
+    if head.is_empty() {
+        return String::from_utf8_lossy(&content).into_owned();
+    }
+
+    let elided = total.saturating_sub(head.len() + content.len());
+    let middle = match &capture {
+        Capture::Writing(path, _) => format!(
+            "\n\n... ({} bytes elided; the complete output is at {}) ...\n\n",
+            elided,
+            path.display()
+        ),
+        Capture::Failed | Capture::NotNeeded => format!(
+            "\n\n... ({} bytes elided; capturing them to a file failed, see the log) ...\n\n",
+            elided
+        ),
+    };
+    format!(
+        "{}{}{}",
+        String::from_utf8_lossy(&head),
+        middle,
+        String::from_utf8_lossy(&content)
+    )
 }
 
 /// Structured exit status for frontends that render a terminal. `ExitStatus::code()` is `None`
@@ -769,7 +1093,7 @@ mod tests {
             backend_probe,
             shared_permission,
             sandbox_enabled,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         }
     }
@@ -885,6 +1209,230 @@ mod tests {
         );
     }
 
+    /// The relay must survive the stream outgrowing the ceiling.
+    ///
+    /// `relayed` is an index into the same buffer the capture trims, and the trim used to clamp it
+    /// to the new length rather than shift it by what was dropped. That marked the carried
+    /// incomplete-UTF-8 bytes as sent, so the next read began mid-character, `valid_up_to()`
+    /// returned 0, and its whole 8 KB vanished from the live stream while still reaching the
+    /// capture. Only multi-byte output shows it, and only once past the ceiling: the two conditions
+    /// this test puts together, which is why neither existing test caught it.
+    #[tokio::test]
+    async fn the_relay_loses_nothing_when_the_stream_outgrows_the_ceiling() {
+        #[derive(Default)]
+        struct ChunkRecorder {
+            chunks: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl crate::frontend::Frontend for ChunkRecorder {
+            async fn emit(&self, event: crate::frontend::FrontendEvent) {
+                if let crate::frontend::FrontendEvent::ToolCallOutputDelta { chunk, .. } = event
+                    && let Ok(mut chunks) = self.chunks.lock()
+                {
+                    chunks.push(chunk);
+                }
+            }
+
+            async fn request_permission(
+                &self,
+                _request: crate::frontend::PermissionRequest,
+            ) -> crate::frontend::PermissionOutcome {
+                crate::frontend::PermissionOutcome::Deny
+            }
+        }
+
+        // A 3-byte character repeated, so no power-of-two read size can land on a boundary and
+        // every read carries a partial character into the next.
+        let unit = "日";
+        let source = unit.repeat(MAX_RESIDENT_OUTPUT_BYTES / unit.len() + 4096);
+        assert!(source.len() > MAX_RESIDENT_OUTPUT_BYTES, "must overflow");
+
+        let recorder = Arc::new(ChunkRecorder::default());
+        let frontend: Arc<dyn crate::frontend::Frontend> = recorder.clone();
+        let relay = Some(OutputRelay {
+            frontend,
+            tool_call_id: "call_1".to_string(),
+        });
+
+        let collected = read_to_string_best_effort(
+            Some(std::io::Cursor::new(source.clone().into_bytes())),
+            relay,
+        )
+        .await;
+
+        let chunks = recorder.chunks.lock().expect("lock").clone();
+        assert_eq!(
+            chunks.concat(),
+            source,
+            "every byte printed must reach the client, capture or no capture",
+        );
+        assert!(
+            !chunks.iter().any(|chunk| chunk.contains('\u{fffd}')),
+            "and no chunk may be cut mid-character",
+        );
+
+        // Clean up the capture the overflow created.
+        if let Some(start) = collected.find("the complete output is at ") {
+            let start = start + "the complete output is at ".len();
+            if let Some(end) = collected[start..].find(')') {
+                let _ = std::fs::remove_file(std::path::Path::new(&collected[start..start + end]));
+            }
+        }
+    }
+
+    /// A command that outruns the turn must not take the process with it, and must not lose what
+    /// it printed either. Past the ceiling the stream goes to a file and the result carries both
+    /// ends plus the path, so the model sees the shape and can read the rest.
+    #[tokio::test]
+    async fn an_oversized_stream_is_captured_to_a_file_rather_than_held_in_memory() {
+        // One byte more than the ceiling, with distinct ends so both are identifiable.
+        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES + 64);
+        source.extend_from_slice(b"FIRST-LINE\n");
+        source.resize(MAX_RESIDENT_OUTPUT_BYTES + 32, b'x');
+        source.extend_from_slice(b"\nLAST-LINE\n");
+        let total = source.len();
+
+        let collected =
+            read_to_string_best_effort(Some(std::io::Cursor::new(source.clone())), None).await;
+
+        assert!(
+            collected.len() < total,
+            "the result must not carry the whole stream inline"
+        );
+        assert!(
+            collected.starts_with("FIRST-LINE\n"),
+            "the head must survive"
+        );
+        assert!(collected.ends_with("LAST-LINE\n"), "the tail must survive");
+        assert!(
+            collected.contains("bytes elided"),
+            "the cut must be disclosed: {}",
+            &collected[..collected.len().min(200)]
+        );
+
+        // Nothing is lost: the notice names a file holding every byte.
+        let marker = "the complete output is at ";
+        let start = collected.find(marker).expect("capture path") + marker.len();
+        let end = collected[start..].find(')').expect("capture path end") + start;
+        let path = std::path::PathBuf::from(&collected[start..end]);
+        let captured = std::fs::read(&path).expect("read capture");
+        std::fs::remove_file(&path).expect("clean up capture");
+        assert_eq!(
+            captured.len(),
+            source.len(),
+            "the capture must hold the whole stream"
+        );
+        assert_eq!(captured, source, "the capture must hold the whole stream");
+    }
+
+    /// Captures are 8 MiB or more each, and nothing else ever removes them: a machine that runs
+    /// long builds accumulates one per overflow until the disk notices. The sweep runs on the
+    /// overflow path, so it costs a directory read only when something is about to be written
+    /// anyway, and it touches only meka's own names.
+    #[test]
+    fn stale_captures_are_swept_and_other_files_are_left_alone() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let old =
+            std::time::SystemTime::now() - (CAPTURE_RETENTION + std::time::Duration::from_secs(60));
+
+        let stale = directory.path().join("command-output-abc.log");
+        let fresh = directory.path().join("command-output-def.log");
+        let theirs = directory.path().join("someone-elses.log");
+        for path in [&stale, &fresh, &theirs] {
+            std::fs::write(path, b"x").expect("seed");
+        }
+        for path in [&stale, &theirs] {
+            filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old))
+                .expect("age the file");
+        }
+
+        sweep_stale_captures(directory.path());
+
+        assert!(!stale.exists(), "an old capture must go");
+        assert!(
+            fresh.exists(),
+            "a recent one is still referenced by a live conversation"
+        );
+        assert!(
+            theirs.exists(),
+            "a file meka did not write is not meka's to delete, however old",
+        );
+    }
+
+    /// A capture file holds a command's whole output, which is as sensitive as the command: `env`,
+    /// a `curl -v` carrying an `Authorization` header, a database dump. It was created at whatever
+    /// the umask allowed, in a cache directory that on some setups is world-traversable, while meka
+    /// takes care to write its database at 0600 and its directories at 0700.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capture_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES + 64);
+        source.extend_from_slice(b"FIRST-LINE\n");
+        source.resize(MAX_RESIDENT_OUTPUT_BYTES + 32, b'x');
+        source.extend_from_slice(b"\nLAST-LINE\n");
+
+        let collected = read_to_string_best_effort(Some(std::io::Cursor::new(source)), None).await;
+
+        let marker = "the complete output is at ";
+        let start = collected.find(marker).expect("capture path") + marker.len();
+        let end = collected[start..].find(')').expect("capture path end") + start;
+        let path = std::path::PathBuf::from(&collected[start..end]);
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat capture")
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::remove_file(&path).expect("clean up capture");
+        assert_eq!(mode, 0o600, "got {mode:o}");
+    }
+
+    /// When the capture cannot be opened, the head still has to be the head.
+    ///
+    /// A failed capture used to leave the state as "not capturing yet", so crossing the ceiling a
+    /// second time 8 MiB later ran the whole opening sequence again and overwrote `head` with a
+    /// slice from the middle of the stream -- which the result then printed as the beginning, under
+    /// a notice that named the elision but not the lie. The same re-entry could also open a capture
+    /// on the second attempt, holding only the bytes from that point on while the notice called it
+    /// the complete output.
+    #[tokio::test]
+    async fn a_failed_capture_keeps_the_real_head_and_does_not_retry() {
+        FORCE_CAPTURE_FAILURE.with(|forced| forced.set(true));
+
+        // Past the ceiling twice, so the arm that opens the capture is reached more than once.
+        let mut source = Vec::with_capacity(MAX_RESIDENT_OUTPUT_BYTES * 2 + 64);
+        source.extend_from_slice(b"FIRST-LINE\n");
+        source.resize(MAX_RESIDENT_OUTPUT_BYTES * 2 + 32, b'x');
+        source.extend_from_slice(b"\nLAST-LINE\n");
+
+        let collected = read_to_string_best_effort(Some(std::io::Cursor::new(source)), None).await;
+        FORCE_CAPTURE_FAILURE.with(|forced| forced.set(false));
+
+        assert!(
+            collected.starts_with("FIRST-LINE\n"),
+            "the head must still be the start of the stream, got: {}",
+            &collected[..collected.len().min(80)],
+        );
+        assert!(collected.ends_with("LAST-LINE\n"), "the tail must survive");
+        assert!(
+            collected.contains("capturing them to a file failed"),
+            "and the notice must say the bytes are gone rather than name a file: {}",
+            &collected[..collected.len().min(200)],
+        );
+    }
+
+    /// The common case must be untouched: no file, no notice, byte-for-byte what was printed.
+    #[tokio::test]
+    async fn an_ordinary_stream_is_returned_whole_with_no_capture() {
+        let source = b"just a normal amount of output\n".to_vec();
+        let collected =
+            read_to_string_best_effort(Some(std::io::Cursor::new(source.clone())), None).await;
+        assert_eq!(collected.as_bytes(), source.as_slice());
+    }
+
     /// Reader that hands out at most one byte per `poll_read`, so every multi-byte character in
     /// the source is guaranteed to span a read boundary.
     struct OneByteAtATime<R>(R);
@@ -998,7 +1546,7 @@ mod tests {
             },
             shared_permission: read_only_perm,
             sandbox_enabled: true,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1047,7 +1595,7 @@ mod tests {
             },
             shared_permission: write_perm,
             sandbox_enabled: true,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1154,7 +1702,7 @@ mod tests {
                 backend_probe,
                 shared_permission,
                 sandbox_enabled: true,
-                cwd: crate::agent::test_cwd(),
+                cwd: crate::workspace::test_cwd(),
                 frontend: Arc::new(crate::frontend::SilentFrontend),
             }
         }

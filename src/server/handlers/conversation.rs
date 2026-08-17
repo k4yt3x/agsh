@@ -618,7 +618,7 @@ pub async fn export(
                 })?
                 .into_iter()
                 .collect();
-            let body = crate::format_session_as_markdown(id, &events, &tool_outputs);
+            let body = crate::session::cli::format_session_as_markdown(id, &events, &tool_outputs);
             Ok((
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
                 body,
@@ -626,7 +626,7 @@ pub async fn export(
                 .into_response())
         }
         "json" => {
-            let export = crate::build_session_export(manager, id)
+            let export = crate::session::cli::build_session_export(manager, id)
                 .await
                 .map_err(|error| {
                     ProblemDetail::internal_sanitized("failed to build session export", error)
@@ -664,7 +664,7 @@ fn store_too_large(count: usize) -> ProblemDetail {
             "session export contains {} sessions, more than the {} this server imports in one \
              request; import it with `meka session import`, which has no such limit",
             count,
-            crate::MAX_IMPORT_SESSIONS
+            crate::session::cli::MAX_IMPORT_SESSIONS
         ),
     )
 }
@@ -691,19 +691,20 @@ pub async fn import(
 ) -> Result<(StatusCode, Json<ImportResponse>), ProblemDetail> {
     scope::require(&principal, "sessions:w")?;
 
-    let export: crate::SessionExport = serde_json::from_slice(&raw_body).map_err(|error| {
-        ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid session export JSON: {}", error),
-        )
-    })?;
-    if export.sessions.len() > crate::MAX_IMPORT_SESSIONS {
+    let export: crate::session::cli::SessionExport =
+        serde_json::from_slice(&raw_body).map_err(|error| {
+            ProblemDetail::new(
+                ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid session export JSON: {}", error),
+            )
+        })?;
+    if export.sessions.len() > crate::session::cli::MAX_IMPORT_SESSIONS {
         return Err(store_too_large(export.sessions.len()));
     }
     // Version mismatch and an empty session list both surface here, as 422 rather than 500: the
     // envelope is the caller's, so a rejection is a statement about their input.
-    let (records, root_new_id) = crate::plan_import(export).map_err(|error| {
+    let (records, root_new_id) = crate::session::cli::plan_import(export).map_err(|error| {
         ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,

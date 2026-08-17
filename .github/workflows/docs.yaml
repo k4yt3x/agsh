@@ -28,10 +28,9 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install mdBook
-        run: |
-          version="$(curl -s https://api.github.com/repos/rust-lang/mdBook/releases/latest | jq -r '.tag_name')"
-          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/$version/mdbook-$version-x86_64-unknown-linux-musl.tar.gz" | tar -xz
-          sudo mv mdbook /usr/local/bin/
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        with:
+          tool: mdbook@0.5.4
 
       - name: Build Docs
         run: mdbook build docs/book

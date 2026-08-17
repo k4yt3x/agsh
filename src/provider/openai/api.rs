@@ -33,10 +33,10 @@ impl OpenAiProvider {
         base_url: Option<String>,
         reasoning_effort: Option<String>,
         max_output_tokens: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_effort = super::resolve_reasoning_effort(reasoning_effort.as_deref(), &model);
-        Self {
-            client: reqwest::Client::new(),
+        Ok(Self {
+            client: crate::provider::build_http_client("openai-api", |builder| builder)?,
             api_key,
             base_url: crate::provider::normalize_base_url(
                 base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
@@ -44,7 +44,7 @@ impl OpenAiProvider {
             model,
             resolved_effort,
             max_output_tokens,
-        }
+        })
     }
 
     /// The settled reasoning-effort to send as `reasoning_effort` (see [`Self::resolved_effort`]).
@@ -426,13 +426,38 @@ impl Provider for OpenAiProvider {
         // trailing usage chunk (emitted by `stream_options.include_usage`) is captured;
         // finalisation and the single MessageEnd run once the stream ends, below the loop.
         let mut final_stop: Option<StopReason> = None;
+        // See the terminal-event check after the loop.
+        let mut saw_terminal_event = false;
 
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
                     return Err(MekaError::Interrupted);
                 }
-                event = event_stream.next() => {
+                event = tokio::time::timeout(
+                    crate::provider::STREAM_IDLE_TIMEOUT,
+                    event_stream.next(),
+                ) => {
+                    // Bounds silence, not the turn: every delta resets it. Without it a connection
+                    // that died without an RST left the turn parked on a socket that would never
+                    // speak again, for as long as the process ran.
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(_elapsed) => {
+                            let message = format!(
+                                "idle timeout waiting for OpenAI SSE event after {}s",
+                                crate::provider::STREAM_IDLE_TIMEOUT.as_secs()
+                            );
+                            if event_sender
+                                .send(StreamEvent::Error(message.clone()))
+                                .await
+                                .is_err()
+                            {
+            tracing::trace!("stream event receiver dropped");
+                            }
+                            return Err(MekaError::StreamError(message));
+                        }
+                    };
                     let Some(event) = event else {
                         break;
                     };
@@ -440,6 +465,7 @@ impl Provider for OpenAiProvider {
                     match event {
                         Ok(event) => {
                             if event.data == "[DONE]" {
+                                saw_terminal_event = true;
                                 break;
                             }
 
@@ -479,9 +505,26 @@ impl Provider for OpenAiProvider {
             }
         }
 
-        // The stream ended (`[DONE]` or the connection closed). Finalise any pending tool calls and
-        // emit the single MessageEnd, preferring the finish_reason we recorded; fall back to
-        // tool-presence when no finish_reason arrived.
+        // A stream that stopped without saying so is a failure, not a short turn.
+        //
+        // `next()` returning `None` -- a proxy closing the chunked response, a dropped connection
+        // -- is indistinguishable here from the `[DONE]` above unless it is tracked, and
+        // treating the two alike committed a truncated message as a finished one:
+        // `final_stop` is `None`, so the fallback below stamps `EndTurn` and the partial
+        // answer is persisted as complete with no retry. The Claude and Codex drivers
+        // already return `StreamError` in this case (src/provider/claude/shared.rs,
+        // src/provider/openai/codex/responses.rs); this is the sibling that did not get it.
+        // `StreamError` is retryable, so the existing retry path applies.
+        // No `receiver_gone` companion here, unlike the Claude driver: every send-failure site in
+        // this loop returns immediately, so a dropped receiver never reaches this check.
+        if !saw_terminal_event {
+            let message = "OpenAI stream ended before a terminal event".to_string();
+            tracing::warn!("{}", message);
+            return Err(MekaError::StreamError(message));
+        }
+
+        // Finalise any pending tool calls and emit the single MessageEnd, preferring the
+        // finish_reason we recorded; fall back to tool-presence when no finish_reason arrived.
         let has_tools =
             finalize_tool_call_accumulators(&mut tool_call_accumulators, &event_sender).await;
         let stop_reason = final_stop.unwrap_or(if has_tools {
@@ -812,7 +855,8 @@ mod tests {
             Some("https://openrouter.ai/api/v1/".to_string()),
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         // Without this the request path would carry a doubled separator, since the endpoint is
         // appended as `{base}/chat/completions`.
         assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
@@ -824,7 +868,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         assert_eq!(default.base_url, "https://api.openai.com/v1");
     }
 
@@ -836,7 +881,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let messages = vec![Message::user("hello")];
         let body = provider.build_request_body("system prompt", &messages, &[], false);
@@ -862,7 +908,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let message =
             Message::user_with_images("what is this", vec![crate::provider::ImageSource {
                 source_type: "base64".to_string(),
@@ -888,7 +935,8 @@ mod tests {
             None,
             None,
             Some(8_000),
-        );
+        )
+        .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["max_completion_tokens"], 8_000);
     }
@@ -902,7 +950,8 @@ mod tests {
             None,
             Some("high".to_string()),
             Some(120_000),
-        );
+        )
+        .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["max_completion_tokens"], 120_000);
         assert_eq!(body["reasoning_effort"], "high");
@@ -916,7 +965,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(body.get("max_completion_tokens").is_none());
     }
@@ -930,7 +980,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["reasoning_effort"], "xhigh");
         // An unrecognized (local) model omits the field even with effort unset.
@@ -940,7 +991,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let body = local.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(body.get("reasoning_effort").is_none());
     }
@@ -953,7 +1005,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
             "read_file".to_string(),
@@ -982,7 +1035,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let messages = vec![
             Message::user("read /tmp/test.txt"),
@@ -1026,7 +1080,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1054,7 +1109,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1099,7 +1155,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1147,7 +1204,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1167,7 +1225,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1198,7 +1257,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1229,7 +1289,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1272,7 +1333,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let response = serde_json::json!({
             "choices": [{
@@ -1301,7 +1363,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
             "write_file".to_string(),

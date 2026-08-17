@@ -34,7 +34,17 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            evict_idle(&state, idle_timeout, delete_on_idle).await;
+            // One panicking scan used to end eviction for the life of the process, silently: the
+            // task died, nothing joined it, and sessions accumulated until the operator noticed the
+            // memory. Log it and take the next tick instead.
+            let scan =
+                std::panic::AssertUnwindSafe(evict_idle(&state, idle_timeout, delete_on_idle));
+            if let Err(panic) = futures::FutureExt::catch_unwind(scan).await {
+                tracing::error!(
+                    "session GC scan panicked ({}); continuing",
+                    crate::error::panic_message(&*panic)
+                );
+            }
         }
     })
 }

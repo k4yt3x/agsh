@@ -151,6 +151,22 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         .map(Duration::from_secs)
 }
 
+/// Read a caught panic's payload as text.
+///
+/// `catch_unwind` hands back a `Box<dyn Any>` whose only useful shapes are the two the standard
+/// panic machinery boxes: a `&'static str` for a literal message and a `String` for a formatted
+/// one. Everything else is a payload from a hand-rolled `panic_any`, which nothing here does.
+///
+/// Shared because every supervised loop needs the same three lines, and a loop that catches a panic
+/// and then cannot say what it was is barely better than one that dies.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 /// Format a [`reqwest::Error`] together with its full source chain.
 ///
 /// reqwest's outer Display string ("error sending request for url …") usually hides the actual

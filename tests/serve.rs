@@ -6,7 +6,7 @@
 //! a tempdir and a scripted mock provider, then drives it over HTTP via `reqwest`.
 
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -731,9 +731,29 @@ fn patch_session_updates_permission_and_cwd() {
     assert_eq!(body["cwd"], new_cwd.to_string_lossy().as_ref());
 }
 
+/// The docs routes are the only unauthenticated ones that describe the deployment rather than
+/// report on it, so they are opt-in. Anyone who can reach the port could otherwise read the shape
+/// of every endpoint without presenting a token.
+#[test]
+fn the_docs_routes_are_off_unless_asked_for() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    for path in ["/v1/openapi.json", "/v1/docs/"] {
+        let response = harness
+            .client
+            .get(format!("{}{}", harness.base_url, path))
+            .send()
+            .expect("send");
+        assert_eq!(
+            response.status(),
+            404,
+            "{path} must not be served unless `[serve].docs` is set"
+        );
+    }
+}
+
 #[test]
 fn openapi_json_is_served_without_auth_and_documents_routes() {
-    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let harness = ServeTestHarness::spawn("docs = true\n", mock_simple_turn());
     let response = harness
         .client
         .get(format!("{}/v1/openapi.json", harness.base_url))
@@ -772,7 +792,7 @@ fn openapi_json_is_served_without_auth_and_documents_routes() {
 
 #[test]
 fn swagger_ui_is_served_without_auth() {
-    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let harness = ServeTestHarness::spawn("docs = true\n", mock_simple_turn());
     let response = harness
         .client
         .get(format!("{}/v1/docs/", harness.base_url))
@@ -1236,6 +1256,41 @@ fn oversize_body_returns_413() {
     );
 }
 
+/// A path segment axum's `Path<Uuid>` extractor rejects must still answer RFC 9457.
+///
+/// The rejection happens before any handler runs, so it used to escape the error taxonomy entirely
+/// and answer `400 text/plain` -- one response shape a client parsing `application/problem+json`
+/// could not read, for the most ordinary mistake there is.
+#[test]
+fn a_malformed_path_parameter_is_a_problem_detail() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/sessions/not-a-uuid")
+        .send()
+        .expect("send");
+
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+        "a rejected path parameter must serialize as Problem Detail, not plain text",
+    );
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["status"], 400);
+    assert!(body["type"].is_string(), "{body}");
+    // The rejection text names what failed, which is the whole value of surfacing it.
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "{body}"
+    );
+    assert_eq!(body["instance"], "/v1/sessions/not-a-uuid");
+}
+
 /// `GET /v1/info`, `/v1/skills`, `/v1/mcp` smoke. All authenticated, all should succeed
 /// against a default deployment with no MCP servers + no skills configured.
 #[test]
@@ -1652,6 +1707,92 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
         body.contains("\"reason\":\"server_shutdown\""),
         "cancellation reason must be 'server_shutdown' on SIGTERM; body was:\n{}",
         body,
+    );
+}
+
+/// Graceful shutdown waits for a detached turn to unwind instead of exiting out from under it.
+///
+/// A streaming turn's handler returns its SSE response as soon as the stream is installed and
+/// leaves the turn running on a spawned task, so once the client is gone axum's own graceful
+/// shutdown has no in-flight request to wait for. That is the case `stream_reattach_grace` exists
+/// to keep alive, and it was also the case shutdown abandoned: the accept loop was the only thing
+/// the drain timeout wrapped.
+///
+/// `stall` rather than `sleep` because cancellation is the point. The drain fires every session's
+/// token first, so a `sleep` would end right there and leave nothing to wait for. A real turn's
+/// tail behaves like `stall`: the token stops the agent at its next check, and the commit of what
+/// the round already produced runs after that.
+///
+/// Unix-only for the same reason as the test above.
+#[cfg(unix)]
+#[test]
+fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
+    const STALL_MS: u64 = 4000;
+    // The leading text is a starting gun. `turn_in_flight` flips at admission, before the task
+    // that runs the turn has been polled once, and a signal delivered in that window cancels the
+    // turn before it ever reaches the provider -- so the stall never starts and there is nothing
+    // for the drain to wait for. Reading this event back proves the stream is live.
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "turn-has-started" },
+            { "kind": "stall", "ms": STALL_MS },
+            { "kind": "text", "text": "finished after the signal" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Start the turn, read until the agent is demonstrably streaming, then hang up. Dropping the
+    // response closes the socket, which is what leaves the turn genuinely unattended rather than
+    // merely slow to read.
+    let mut response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "stall me", "stream": true}))
+        .send()
+        .expect("stream send");
+    assert!(response.status().is_success(), "turn should be accepted");
+    let mut seen = String::new();
+    let mut chunk = [0u8; 512];
+    while !seen.contains("turn-has-started") {
+        let read = response.read(&mut chunk).expect("read sse");
+        assert!(read > 0, "stream closed before the turn produced anything");
+        seen.push_str(&String::from_utf8_lossy(&chunk[..read]));
+    }
+    drop(response);
+
+    harness.wait_until_in_flight(&id);
+
+    let signalled = Instant::now();
+    let kill_status = Command::new("kill")
+        .arg("-TERM")
+        .arg(harness.child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill should succeed");
+
+    let status = harness.child.wait().expect("wait for exit");
+    let elapsed = signalled.elapsed();
+    assert!(
+        status.success(),
+        "a drain that completes exits 0; got {:?} after {:?}",
+        status,
+        elapsed,
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "shutdown must wait for the detached turn: the process exited {:?} after SIGTERM while \
+         the turn still had most of its {}ms left to run",
+        elapsed,
+        STALL_MS,
     );
 }
 
@@ -3719,7 +3860,7 @@ fn orphan_tool_call_marked_as_interrupted_in_blocking_response() {
 /// and `delete_session` no longer documents 404 (it returns 204 idempotently).
 #[test]
 fn openapi_spec_documents_403_409_and_no_stale_404_on_delete() {
-    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let harness = ServeTestHarness::spawn("docs = true\n", mock_simple_turn());
     let response = harness
         .client
         .get(format!("{}/v1/openapi.json", harness.base_url))
@@ -6001,10 +6142,26 @@ fn a_rate_limited_webhook_is_retried() {
         first.delivery_id, second.delivery_id,
         "a retry must keep the delivery id so a receiver can deduplicate it"
     );
-    assert_eq!(
+
+    // The timestamp is stamped and signed per attempt, not once per delivery. Receivers reject a
+    // signature whose timestamp falls outside a replay window, and the backoff can put a late retry
+    // minutes past the first attempt: re-sending the original stamp got the retry rejected as a
+    // replay of itself. Deduplication is the delivery id's job, which is why that one is constant.
+    assert_ne!(
         first.timestamp, second.timestamp,
-        "the signed timestamp identifies the delivery, not the attempt"
+        "each attempt must carry its own timestamp"
     );
+    for delivery in [&first, &second] {
+        let signature = delivery
+            .signature
+            .as_deref()
+            .expect("a configured secret must produce a signature");
+        assert_eq!(
+            signature,
+            expected_signature("s", &delivery.timestamp, &delivery.body),
+            "each attempt must be signed over its own timestamp"
+        );
+    }
 }
 
 /// The other half of the policy: a receiver saying the request itself is malformed is telling meka
@@ -6968,5 +7125,346 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
         Some("turn.finished"),
         "the event must land before the terminal, not after: {}",
         body
+    );
+}
+
+/// A malformed body is answered as malformed, even while the session is busy.
+///
+/// `TurnGuard::acquire` used to run before the body was validated, so a request meka was going to
+/// refuse anyway was admitted first -- and on a session already running a turn, `acquire` fails,
+/// so the caller was told 409 `turn-in-flight` about a request whose real problem was that it had
+/// no message in it. Retrying that (which is what a 409 invites) reproduces it forever.
+///
+/// Asserted against a *running* turn deliberately. A sequential version of this test passes either
+/// way: the guard is RAII, so a rejected request that took one released it again before the next
+/// request could observe it. Only contention makes the ordering visible.
+#[test]
+fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
+    let script = serde_json::json!([
+        [
+            { "kind": "sleep", "ms": 1500 },
+            { "kind": "text", "text": "done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let running_id = id.clone();
+    let running = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, running_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "the real turn"}))
+            .send()
+            .expect("send")
+    });
+
+    harness.wait_until_in_flight(&id);
+    let rejected = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "   "}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        rejected.status(),
+        422,
+        "an empty message is a body problem, and stays one while the session is busy"
+    );
+    let body: serde_json::Value = rejected.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
+
+    running.join().expect("join").error_for_status().ok();
+}
+
+/// Two requests arriving together for a session this process has evicted must both be served.
+///
+/// Reconstruction takes the session's cross-process `fd_lock`, so without serialisation the loser
+/// raced the winner for it and got a `session-locked` 409 whose documented remedy ("retry against
+/// the process that holds it") pointed at this very process. `lock_session_reconstruction` makes
+/// the loser wait and then find the winner's entry.
+///
+/// Driven through the real re-attach path rather than the lock helper, which already has a unit
+/// test: that test passes with the helper wired to nothing, because it calls the helper directly.
+/// A short `idle_timeout` plus a fast scan interval gets the GC to evict the session so the next
+/// request has to rebuild it.
+///
+/// `PATCH` rather than `GET`, deliberately: a read is not permitted to take the session's lock, so
+/// it answers an evicted session from the database and never reaches `ensure_session_loaded` at
+/// all. Only a write reconstructs, which is the path the lock protects.
+#[test]
+fn two_requests_for_an_evicted_session_are_both_served() {
+    let harness = ServeTestHarness::spawn(
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n",
+        mock_simple_turn(),
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Outlast `idle_timeout` plus a scan, so the session is dropped from the in-memory map and the
+    // requests below have to go through `ensure_session_loaded`.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let base_url = harness.base_url.clone();
+        let token = harness.token.clone();
+        let id = id.clone();
+        handles.push(std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("client");
+            client
+                .patch(format!("{}/v1/sessions/{}", base_url, id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&serde_json::json!({"permission": "read"}))
+                .send()
+                .expect("send")
+                .status()
+        }));
+    }
+
+    let statuses: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .collect();
+    assert!(
+        statuses.iter().all(|status| status.is_success()),
+        "both requests must be served; one lost the race to rebuild the session: {:?}",
+        statuses
+    );
+}
+
+/// A cancelled turn is not cached against its `Idempotency-Key`, and the cancel actually lands.
+///
+/// Two properties in one run, because they were entangled. The key exists so a client whose
+/// connection died can retry; cancellation is the case that most invites a retry, and caching it
+/// answered every retry "cancelled" for the full 24h TTL. But an earlier version of this test was
+/// flaky at about one run in four, and the cause was a second defect rather than the test: the
+/// turn's cancellation token is published *after* `TurnGuard::acquire`, so a `POST /cancel` landing
+/// in that window cancelled the previous turn's token, answered 204, and left this turn running to
+/// completion. Poll `turn_in_flight` then cancel -- what this test does, and what the HTTP docs
+/// describe -- walked straight into it. `SessionEntry::cancel_epoch` closes the window, and this is
+/// the test that exercises the wiring rather than the helper.
+#[test]
+fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
+    let script = serde_json::json!([
+        [
+            { "kind": "sleep", "ms": 4000 },
+            { "kind": "text", "text": "should never reach client" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "the retry actually ran" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let key = "cancelled-then-retried";
+    let body = serde_json::json!({"message": "long", "stream": false});
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_clone = id.clone();
+    let body_clone = body.clone();
+    let first = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Idempotency-Key", key)
+            .json(&body_clone)
+            .send()
+            .expect("first send")
+    });
+
+    harness.wait_until_in_flight(&id);
+    let cancel = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/cancel", id),
+        )
+        .send()
+        .expect("cancel");
+    assert_eq!(cancel.status(), 204);
+
+    let cancelled = first.join().expect("join");
+    let cancelled_status = cancelled.status();
+    let cancelled_body = cancelled.text().expect("text");
+    assert!(
+        !cancelled_status.is_success(),
+        "the 204 said the turn was cancelled, but it ran to completion: \
+         {cancelled_status} {cancelled_body}"
+    );
+
+    // Same key, same body. A cached cancellation would replay verbatim and the mock's second round
+    // would never be consumed.
+    let retry = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .header("Idempotency-Key", key)
+        .json(&body)
+        .send()
+        .expect("retry send");
+    assert_eq!(
+        retry.status(),
+        200,
+        "the retry must run rather than replay the cancellation"
+    );
+    // Deliberately not asserting *which* mock round the retry consumes. Whether the cancelled turn
+    // consumed round one depends on how far it got before the token fired, so pinning the retry to
+    // round two's text made this fail about one full-suite run in three -- a property of the mock's
+    // round counter, not of the behaviour under test. What distinguishes "ran" from "replayed the
+    // cache" is that a cached cancellation is a non-2xx problem document: it has no `stop_reason`
+    // and carries the cancellation type URI.
+    let retry_body = retry.text().expect("text");
+    let parsed: serde_json::Value = serde_json::from_str(&retry_body).expect("json");
+    assert_eq!(
+        parsed["stop_reason"], "end_turn",
+        "the retry did not run a turn: {retry_body}"
+    );
+    assert!(
+        !retry_body.contains("turn-cancelled"),
+        "the retry replayed the cached cancellation instead of running: {retry_body}"
+    );
+}
+
+/// A `DELETE` of an invalid skill name is refused on the name, before the filesystem is touched.
+///
+/// Probing first made the endpoint answer "does this directory exist" for any string a caller sent,
+/// including one the name rules would have rejected outright: a filesystem oracle reachable with
+/// nothing but `skills:w`. `delete_memory` already validated first; this half did not. Reordering
+/// the two statements back left all four suites green, which is why this exists.
+///
+/// The distinguishing signal is the *kind* of refusal, not merely that it refuses. A name that is
+/// invalid must fail validation (422) whether or not anything is on disk under it, where a probe
+/// would have answered 404 for the same string.
+#[test]
+fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
+    let harness =
+        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+
+    // Names that survive routing as a single path segment but fail the `[A-Za-z0-9_-]` rules.
+    // `..` is deliberately not among them: axum normalises it away before the handler sees it, so
+    // it tests the router rather than this endpoint.
+    for name in ["not.a.skill", "bad~name", "has%20space", "tab%09name"] {
+        let response = harness
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .send()
+            .expect("send");
+        let status = response.status();
+        let body: serde_json::Value = response.json().expect("parse");
+        assert_ne!(
+            status, 404,
+            "'{name}' was answered by a filesystem probe rather than the name rules, which leaks \
+             whether the path exists: {body}"
+        );
+        assert_eq!(
+            body["type"], "https://meka.so/errors/invalid-body",
+            "'{name}' must be refused as an invalid name: {status} {body}"
+        );
+    }
+}
+
+/// One `Idempotency-Key` reused against two sessions must run both turns.
+///
+/// The key was scoped to `(token_id, key)` alone, so the second session's request hit the first
+/// session's cached envelope: it was answered with the *other session's* transcript and its turn
+/// never ran. A key is a client's retry token, not a global name, and a client that reuses one
+/// across sessions is doing something ordinary. This is the plan's own end-to-end check for the
+/// fix, and dropping the session from the scope left all four suites green.
+#[test]
+fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "first session speaking" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "second session speaking" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+
+    let create = |harness: &ServeTestHarness| {
+        harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .send()
+            .expect("create")
+            .json::<serde_json::Value>()
+            .expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    };
+    let first_id = create(&harness);
+    let second_id = create(&harness);
+
+    let key = "shared-across-sessions";
+    let body = serde_json::json!({"message": "go", "stream": false});
+
+    let turn = |id: &str| -> serde_json::Value {
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .header("Idempotency-Key", key)
+            .json(&body)
+            .send()
+            .expect("turn");
+        assert_eq!(response.status(), 200, "turn on {id} must run");
+        response.json().expect("parse")
+    };
+
+    let first = turn(&first_id);
+    let second = turn(&second_id);
+
+    assert_eq!(
+        first["session_id"].as_str(),
+        Some(first_id.as_str()),
+        "first turn answered for the wrong session: {first}"
+    );
+    assert_eq!(
+        second["session_id"].as_str(),
+        Some(second_id.as_str()),
+        "the second session was answered with the first session's cached envelope: {second}"
+    );
+    assert_ne!(
+        first["turn_id"], second["turn_id"],
+        "the second session replayed the first turn rather than running its own"
     );
 }

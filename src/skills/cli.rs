@@ -117,6 +117,23 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
 
     let body = build_skill_body(&args)?;
 
+    // The same case-collision refusal `write_skill` and `write_memory` perform. On a
+    // case-insensitive filesystem `Deploy` and `deploy` are one directory, so creating the second
+    // silently edits the first; on a case-sensitive one they are two skills the model cannot tell
+    // apart in its index. `meka memory add` routes through `write_memory` and so already had this;
+    // `meka skill add` writes the directory itself and did not.
+    if let Some(root) = crate::skills::skills_dir()
+        && let Ok(entries) = std::fs::read_dir(&root)
+    {
+        let names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .collect();
+        crate::store::check_case_collision(args.name, names.iter().map(String::as_str), "skill")
+            .map_err(MekaError::Config)?;
+    }
+
     tokio::fs::create_dir_all(&dir).await.map_err(|error| {
         MekaError::Config(format!(
             "failed to create skill dir {}: {}",

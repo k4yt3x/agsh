@@ -1,0 +1,44 @@
+name: Security audit
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  push:
+    branches:
+      - master
+    paths:
+      - "Cargo.lock"
+      - ".github/workflows/audit.yaml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - ".github/workflows/audit.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        with:
+          tool: cargo-audit
+
+      # Vulnerabilities fail on their own; unsound and yanked are denied explicitly because
+      # `cargo audit` exits zero on them. `unmaintained` stays a warning: it has no fixed release to
+      # move to, so denying it would mean carrying an ignore file.
+      - name: Audit dependencies for known advisories
+        run: cargo audit -D unsound -D yanked

@@ -22,7 +22,12 @@ pub async fn run_list_for_session(
     session_manager: &SessionManager,
     session: uuid::Uuid,
 ) -> Result<()> {
-    render(session_manager.list_background_tasks(session).await?)
+    render(
+        session_manager
+            .background_store()
+            .list_background_tasks(session)
+            .await?,
+    )
 }
 
 fn render(tasks: Vec<crate::background::BackgroundTask>) -> Result<()> {
@@ -72,14 +77,15 @@ pub async fn cancel(
     id_prefix: Option<&str>,
 ) -> Result<Vec<String>> {
     let Some(id_prefix) = id_prefix else {
-        let running: Vec<String> = session_manager
+        let store = session_manager.background_store();
+        let running: Vec<String> = store
             .list_running_background_tasks(session)
             .await?
             .into_iter()
             .map(|task| task.id)
             .collect();
         for id in &running {
-            session_manager
+            store
                 .finish_background_task(id, TaskStatus::Cancelled, None, None)
                 .await?;
         }
@@ -87,6 +93,7 @@ pub async fn cancel(
     };
 
     let Some(task) = session_manager
+        .background_store()
         .resolve_background_task(session, id_prefix)
         .await?
     else {
@@ -103,6 +110,7 @@ pub async fn cancel(
         )));
     }
     session_manager
+        .background_store()
         .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
         .await?;
     Ok(vec![task.id])
@@ -151,6 +159,7 @@ mod tests {
             delivered_at: None,
         };
         manager
+            .background_store()
             .start_background_task(&task)
             .await
             .expect("start task");
@@ -168,6 +177,7 @@ mod tests {
         assert_eq!(cancelled, vec![task.id.clone()]);
 
         let undelivered = manager
+            .background_store()
             .list_undelivered_background_tasks(session)
             .await
             .expect("list");
@@ -185,6 +195,7 @@ mod tests {
         assert_eq!(cancelled.len(), 2);
         assert!(
             manager
+                .background_store()
                 .list_running_background_tasks(session)
                 .await
                 .expect("list")
@@ -203,6 +214,7 @@ mod tests {
         let (manager, session) = manager_with_session().await;
         let task = seed(&manager, session, "make").await;
         manager
+            .background_store()
             .finish_background_task(&task.id, TaskStatus::Completed, None, None)
             .await
             .expect("finish");

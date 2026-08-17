@@ -68,14 +68,12 @@ pub enum Command {
     /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients (Zed, JetBrains, Neovim, VS
     /// Code via the ACP extension, etc.) can drive meka turns directly. Diagnostic output stays on
     /// stderr; stdout is reserved for the protocol.
-    #[command(verbatim_doc_comment)]
     Acp,
     /// Run meka as a long-lived HTTP service
     ///
     /// Exposes the agent over HTTP+JSON for programmatic clients (bots, scripts, web UIs).
     /// See the HTTP API docs for the full spec. Auth, session GC, and SSE streaming are configured
     /// under `[serve]` in config.toml.
-    #[command(verbatim_doc_comment)]
     Serve {
         /// Override `[serve].bind` (e.g. `0.0.0.0:8080`)
         #[arg(long)]
@@ -484,7 +482,8 @@ pub enum McpAction {
     /// Examples:
     ///   meka mcp add pg npx -y @modelcontextprotocol/server-postgres
     ///   meka mcp add notion https://mcp.notion.com/mcp
-    ///   meka mcp add api https://api.example.com/mcp --auth-token $API_TOKEN
+    ///   meka mcp add api https://api.example.com/mcp --auth-token-stdin
+    ///   meka mcp add api https://api.example.com/mcp --auth-token '${API_TOKEN}'
     ///   meka mcp add notion https://mcp.notion.com/mcp --auth oauth
     // `rustdoc::bare_urls` normally turns URLs like https://example into auto-links, but these doc
     // lines are ALSO the text clap prints for `meka mcp add --help`. Angle-brackets would leak into
@@ -519,16 +518,27 @@ pub enum McpAction {
         auth: Option<McpAuthKind>,
 
         /// Static bearer token for HTTP (mutually exclusive with --auth)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "auth_token_stdin")]
         auth_token: Option<String>,
+
+        /// Read the bearer token from stdin instead of the command line.
+        ///
+        /// A token passed as an argument is visible in `ps` output and in the shell history of
+        /// every user on the machine.
+        #[arg(long = "auth-token-stdin")]
+        auth_token_stdin: bool,
 
         /// OAuth / client-credentials client ID
         #[arg(long)]
         client_id: Option<String>,
 
         /// OAuth / client-credentials client secret
-        #[arg(long)]
+        #[arg(long, conflicts_with = "client_secret_stdin")]
         client_secret: Option<String>,
+
+        /// Read the client secret from stdin instead of the command line.
+        #[arg(long = "client-secret-stdin")]
+        client_secret_stdin: bool,
 
         /// JWT signing key path (for client-credentials-jwt)
         #[arg(long)]
@@ -627,7 +637,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Run a one-shot prompt and exit
+    /// Prompt for the first turn; add --oneshot to exit after it
     pub prompt: Option<String>,
 
     /// Continue the most recent session
@@ -674,7 +684,7 @@ pub struct Cli {
     #[arg(long = "thinking-budget")]
     pub thinking_budget: Option<u64>,
 
-    /// Override `[prompt].instructions` for this run (replaces config value).
+    /// Standing instructions for this run, replacing the discovered ones
     #[arg(long = "instructions", value_name = "STRING")]
     pub instructions: Option<String>,
 

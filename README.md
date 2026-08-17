@@ -29,6 +29,8 @@ Download a pre-built binary from [GitHub Releases](https://github.com/k4yt3x/mek
 cargo install --locked --git https://github.com/k4yt3x/meka.git
 ```
 
+Building from source needs Rust 1.95 or newer and a C toolchain, which `rusqlite` uses to compile the bundled SQLite.
+
 ## Quick Start
 
 Add a provider profile with `meka provider add`. It runs the OAuth login (or prompts for an API key), stores the secret in the database, and writes the profile to `~/.config/meka/config.toml`:
@@ -65,20 +67,27 @@ The same agent core is available through several interfaces:
 
 The agent has access to the following built-in tools:
 
-- **Shell**: execute commands and read their output
-- **ReadFile / WriteFile / EditFile**: read, create, and modify files
-- **FindFiles**: find files by name or glob pattern
-- **SearchContents**: search file contents with regex (powered by ripgrep)
-- **FetchUrl**: fetch and read web page content
-- **WebSearch**: search the web for up-to-date information
-- **Scratchpad**: session-scoped working memory for intermediate results
-- **Todo**: structured task tracking for multi-step work, with live progress display
-- **SpawnAgent**: delegate research tasks to a read-only sub-agent
-- **Skill**: load reusable prompt templates on demand
-- **RenderImage**: render an image into the conversation for vision-capable models
-- **MCP resources / prompts**: read or render content from configured MCP servers
+- `execute_command`: run commands and read their output
+- `read_file` / `write_file` / `edit_file`: read, create, and modify files
+- `find_files`: find files by name or glob pattern
+- `search_contents`: search file contents with regex, powered by ripgrep
+- `fetch_url`: fetch a web page as markdown
+- `search_web`: search the web for current information
+- `scratchpad_*`: session-scoped working memory for intermediate results
+- `todo`: structured task tracking, with live progress display
+- `memory_*`: notes that survive the session, loaded into every later one
+- `conversation_read` / `conversation_search`: re-read this session's history
+- `context_check` / `context_compact`: read the remaining window, or compact on purpose
+- `agent_*`: delegate to a sub-agent, which never exceeds your permission level
+- `skill_*`: load, search, and optionally author reusable prompt templates
+- `schedule_*`: run a prompt later, once or on a cron
+- `task_list` / `task_cancel`: manage work the agent detached to the background
+- `render_image`: render an image into the conversation for vision models
+- `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
 
-Long-output tools support an optional `scratchpad` parameter to save output directly to the scratchpad.
+Run `meka tools list` for the current set with descriptions.
+
+Long-output tools take an optional `scratchpad` parameter to save their output there instead.
 
 ## Permissions
 
@@ -94,7 +103,7 @@ The prompt indicator shows the current permission mode. Press **Shift+Tab** to c
 Conversations are persisted in a local SQLite database and can be resumed:
 
 - `meka -c` continues the last session
-- `meka -c <UUID>` resumes a specific session by ID
+- `meka -r <UUID>` resumes a specific session by UUID, or by a leading prefix of one
 - `meka session list` lists past sessions
 - `meka session delete <UUID>` deletes sessions
 - `meka session export <UUID>` exports a session as Markdown
@@ -105,7 +114,7 @@ Conversations are persisted in a local SQLite database and can be resumed:
 ## Features
 
 - **Extended/adaptive thinking**: enabled by default for Claude models that support it
-- **Syntax-highlighted output**: bat-powered markdown rendering with code block highlighting
+- **Syntax-highlighted output**: markdown rendering with syntect-highlighted code blocks, using bat's Monokai Extended theme
 - **Auto-compact**: automatically compacts the conversation when approaching the context limit
 - **MCP support**: extend the agent with tools from external MCP servers
 - **Skills**: load reusable prompt templates from `~/.config/meka/skills/`

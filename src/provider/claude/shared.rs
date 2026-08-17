@@ -622,6 +622,17 @@ pub(super) async fn drive_claude_sse_stream(
 
     let mut current_tool_input = String::new();
     let mut in_tool_use = false;
+    // Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
+    // rather than silently run with `{}`.
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    // Whether the message reached its end rather than the byte stream simply stopping.
+    let mut saw_terminal_event = false;
+    // Whether the loop exited because nobody is listening any more. Distinct from a truncated
+    // message: the receiver going away is the *caller* leaving, and reporting it as a stream error
+    // sent the turn back through the retry path to re-issue a provider call whose result already
+    // has nowhere to go.
+    let mut receiver_gone = false;
     let mut in_thinking = false;
     let mut current_thinking_signature: Option<String> = None;
 
@@ -630,7 +641,30 @@ pub(super) async fn drive_claude_sse_stream(
             _ = cancellation.cancelled() => {
                 return Err(MekaError::Interrupted);
             }
-            event = event_stream.next() => {
+            event = tokio::time::timeout(
+                crate::provider::STREAM_IDLE_TIMEOUT,
+                event_stream.next(),
+            ) => {
+                // Bounds silence, not the turn: a model still emitting deltas resets this on every
+                // one. Without it a connection that died without an RST left the turn parked on a
+                // socket that would never speak again, for as long as the process ran.
+                let event = match event {
+                    Ok(event) => event,
+                    Err(_elapsed) => {
+                        let message = format!(
+                            "idle timeout waiting for Claude SSE event after {}s",
+                            crate::provider::STREAM_IDLE_TIMEOUT.as_secs()
+                        );
+                        if event_sender
+                            .send(StreamEvent::Error(message.clone()))
+                            .await
+                            .is_err()
+                        {
+                                        tracing::trace!("stream event receiver dropped");
+                        }
+                        return Err(MekaError::StreamError(message));
+                    }
+                };
                 let Some(event) = event else {
                     break;
                 };
@@ -668,6 +702,7 @@ pub(super) async fn drive_claude_sse_stream(
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -683,6 +718,7 @@ pub(super) async fn drive_claude_sse_stream(
                                             .await
                                             .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -709,11 +745,14 @@ pub(super) async fn drive_claude_sse_stream(
 
                                     current_tool_input.clear();
                                     in_tool_use = true;
+                                    current_tool_id = id.clone();
+                                    current_tool_name = name.clone();
                                     if event_sender
                                         .send(StreamEvent::ToolUseStart { id, name })
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -744,7 +783,8 @@ pub(super) async fn drive_claude_sse_stream(
                                                     estimated_tokens: Some(estimated),
                                                 },
                                             ).await.is_err() {
-                                                tracing::trace!("stream event receiver dropped");
+                                                receiver_gone = true;
+                                        tracing::trace!("stream event receiver dropped");
                                                 break;
                                             }
                                         if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str())
@@ -752,7 +792,8 @@ pub(super) async fn drive_claude_sse_stream(
                                                 && event_sender.send(
                                                     StreamEvent::ThinkingDelta(thinking.to_string()),
                                                 ).await.is_err() {
-                                                    tracing::trace!("stream event receiver dropped");
+                                                    receiver_gone = true;
+                                        tracing::trace!("stream event receiver dropped");
                                                     break;
                                                 }
                                     }
@@ -762,7 +803,8 @@ pub(super) async fn drive_claude_sse_stream(
                                                 && event_sender.send(
                                                     StreamEvent::TextDelta(text.to_string()),
                                                 ).await.is_err() {
-                                                    tracing::trace!("stream event receiver dropped");
+                                                    receiver_gone = true;
+                                        tracing::trace!("stream event receiver dropped");
                                                     break;
                                                 }
                                     }
@@ -784,7 +826,8 @@ pub(super) async fn drive_claude_sse_stream(
                                                     partial_json.to_string(),
                                                 ),
                                             ).await.is_err() {
-                                                tracing::trace!("stream event receiver dropped");
+                                                receiver_gone = true;
+                                        tracing::trace!("stream event receiver dropped");
                                                 break;
                                             }
                                         }
@@ -801,30 +844,49 @@ pub(super) async fn drive_claude_sse_stream(
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
                                 } else if in_tool_use {
-                                    let input = if current_tool_input.is_empty() {
-                                        serde_json::json!({})
+                                    // An empty accumulator is a legitimate zero-argument call and
+                                    // becomes `{}`. Arguments that arrived but do not parse are a
+                                    // different thing entirely, and are rejected rather than
+                                    // replaced.
+                                    //
+                                    // Running the tool with `{}` discards what the model asked for
+                                    // and substitutes something else: for a tool whose parameters
+                                    // are all optional -- `context_compact`, `task_list`, most MCP
+                                    // tools -- `{}` is a *valid* call, so it performs a default
+                                    // action nobody requested and neither the user nor the model is
+                                    // told the arguments were dropped. Truncated argument JSON is
+                                    // the ordinary shape of a `max_tokens` cutoff mid-call, so this
+                                    // is not an exotic path. `finalize_tool_call_accumulators` has
+                                    // rejected it since the same bug was fixed on the Chat
+                                    // Completions side; this brings Claude in line.
+                                    let parsed = if current_tool_input.is_empty() {
+                                        Ok(serde_json::json!({}))
                                     } else {
-                                        match serde_json::from_str(&current_tool_input) {
-                                            Ok(value) => value,
-                                            Err(error) => {
-                                                tracing::warn!(
-                                                    "failed to parse tool input JSON; running \
-                                                     the tool with empty input: {}",
-                                                    error
-                                                );
-                                                serde_json::json!({})
+                                        serde_json::from_str(&current_tool_input)
+                                    };
+                                    let event = match parsed {
+                                        Ok(input) => StreamEvent::ToolUseEnd { input },
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                tool = %current_tool_name,
+                                                "rejecting tool call with unparseable JSON \
+                                                 arguments: {}",
+                                                error
+                                            );
+                                            StreamEvent::ToolCallRejected {
+                                                id: current_tool_id.clone(),
+                                                name: current_tool_name.clone(),
+                                                reason: format!("invalid JSON arguments: {}", error),
                                             }
                                         }
                                     };
-                                    if event_sender
-                                        .send(StreamEvent::ToolUseEnd { input })
-                                        .await
-                                        .is_err()
-                                    {
+                                    if event_sender.send(event).await.is_err() {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -843,6 +905,7 @@ pub(super) async fn drive_claude_sse_stream(
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -850,18 +913,28 @@ pub(super) async fn drive_claude_sse_stream(
                                 if let Some(stop_reason_str) =
                                     delta.get("stop_reason").and_then(|reason| reason.as_str())
                                 {
+                                    // The stop reason is what ends a message; `message_stop` is
+                                    // the framing around it. Requiring the frame made meka
+                                    // strictly less tolerant than the wire format needs: a gateway
+                                    // named by `base_url` that forwards the deltas and closes
+                                    // without the final event delivered a complete answer, and
+                                    // every turn through it failed. What the check is actually for
+                                    // -- a cut mid-`content_block_delta` -- never gets this far.
+                                    saw_terminal_event = true;
                                     let stop_reason = parse_claude_stop_reason(stop_reason_str);
                                     if event_sender
                                         .send(StreamEvent::MessageEnd { stop_reason })
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
                                 }
                             }
                             "message_stop" => {
+                                saw_terminal_event = true;
                                 break;
                             }
                             "message_start" => {
@@ -874,6 +947,7 @@ pub(super) async fn drive_claude_sse_stream(
                                         .await
                                         .is_err()
                                     {
+                                        receiver_gone = true;
                                         tracing::trace!("stream event receiver dropped");
                                         break;
                                     }
@@ -905,7 +979,7 @@ pub(super) async fn drive_claude_sse_stream(
                                     .await
                                     .is_err()
                                 {
-                                    tracing::trace!("stream event receiver dropped");
+                                        tracing::trace!("stream event receiver dropped");
                                 }
                                 return Err(if is_retryable_claude_error_type(&error_type) {
                                     MekaError::RetryableProvider {
@@ -927,13 +1001,38 @@ pub(super) async fn drive_claude_sse_stream(
                             .await
                             .is_err()
                         {
-                            tracing::trace!("stream event receiver dropped");
+                                        tracing::trace!("stream event receiver dropped");
                         }
                         return Err(MekaError::StreamError(error.to_string()));
                     }
                 }
             }
         }
+    }
+
+    // The byte stream ending is not the same as the message ending.
+    //
+    // An intermediary -- a gateway named by `base_url`, a CDN edge, a load balancer closing an idle
+    // connection -- can terminate a chunked response cleanly mid-message. Treating that as success
+    // handed the agent a half-written answer with `stop_reason` left at its `EndTurn` default: no
+    // error, so no retry, and nothing to distinguish a truncated reply from a complete one. Worse
+    // mid-tool-call, where the accumulated call is dropped entirely because `ToolUseEnd` never
+    // arrives. Reporting it as a `StreamError` routes it to the same retry path a dropped
+    // connection already takes.
+    //
+    // Skipped when the receiver has gone: the loop then exited because the caller left, not because
+    // the message was cut, and there is no half-written answer for anyone to act on. Sending it
+    // back through the retry path re-issued the provider call for a turn that had been abandoned.
+    if !saw_terminal_event && !receiver_gone {
+        let error = "stream ended before a stop reason".to_string();
+        if event_sender
+            .send(StreamEvent::Error(error.clone()))
+            .await
+            .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+        }
+        return Err(MekaError::StreamError(error));
     }
 
     Ok(())
@@ -1016,6 +1115,70 @@ pub(super) fn redact_oldest_images(
 /// helper is intentionally not applied to non-Claude providers. Decode/resize cost is incurred per
 /// turn for each oversized image, but typical sessions have few oversized images, and the cheap
 /// [`crate::image::read_image_dimensions`] header read short-circuits the common case.
+/// Downscaled payloads, keyed by a hash of the base64 they were made from.
+///
+/// The same oversized image rides in the conversation on *every* turn, and without this each turn
+/// decoded it, resized it and re-encoded a PNG again -- identical work for an identical result,
+/// inside the request-building path. A 4000x3000 screenshot costs tens of milliseconds a turn that
+/// way, and a session that pasted three of them pays it three times over for as long as they stay
+/// in the window.
+///
+/// Hashed rather than keyed on the string itself so the map does not hold a second copy of every
+/// original. A hash collision would serve the wrong image, which is why the stored entry keeps the
+/// source length as a cheap discriminator; `DefaultHasher` is not a security boundary and is not
+/// being asked to be one, since both inputs are already in this process's memory.
+///
+/// Cleared wholesale when full rather than evicted one at a time: the working set is the images in
+/// one conversation, so either they all fit or the conversation has moved on.
+/// Two independently-salted hashes plus the source length. See [`downscale_cache_key`].
+type DownscaleCacheKey = (u64, u64, usize);
+
+static DOWNSCALE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<DownscaleCacheKey, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Entries the downscale cache holds before it is cleared. Each is one base64 PNG, so this bounds
+/// residency by roughly this many downscaled images.
+const DOWNSCALE_CACHE_ENTRIES: usize = 16;
+
+fn downscale_cache_key(source_base64: &str) -> DownscaleCacheKey {
+    use std::hash::{Hash, Hasher};
+    // Two independently-seeded hashes plus the length. A single 64-bit hash keyed a *whole image*
+    // on one collision: two different screenshots landing on the same bucket would have served the
+    // wrong one to the model, silently, with the right length. 128 bits of discriminator puts that
+    // past the point where it can happen by accident, which is the only way it can happen here --
+    // both inputs are already in this process's memory, so there is no attacker to defend against.
+    // The salt must be a constant, not a fresh `RandomState`: the key has to be reproducible
+    // between the `put` and the `get` that follows it, and a per-call seed makes every lookup miss.
+    const SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_base64.hash(&mut hasher);
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    SALT.hash(&mut second);
+    source_base64.hash(&mut second);
+    (hasher.finish(), second.finish(), source_base64.len())
+}
+
+fn downscale_cache_get(source_base64: &str) -> Option<String> {
+    let cache = DOWNSCALE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.get(&downscale_cache_key(source_base64)).cloned()
+}
+
+fn downscale_cache_put(source_base64: &str, downscaled_base64: &str) {
+    let mut cache = DOWNSCALE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= DOWNSCALE_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        downscale_cache_key(source_base64),
+        downscaled_base64.to_string(),
+    );
+}
+
 pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Message]> {
     use base64::Engine;
     use image::ImageFormat;
@@ -1038,11 +1201,17 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     }
 
     // Re-encode `source` to a within-cap PNG in place; no-op if it can't be decoded or already
-    // fits.
+    // fits. Served from the cache when this exact payload has been downscaled before.
     fn downscale_in_place(source: &mut crate::provider::ImageSource) {
         let Some(format) = parse_format(&source.media_type) else {
             return;
         };
+        if let Some(cached) = downscale_cache_get(&source.data) {
+            source.media_type = "image/png".to_string();
+            source.data = cached;
+            return;
+        }
+        let original = source.data.clone();
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data) else {
             return;
         };
@@ -1054,8 +1223,10 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
         }
         match crate::image::downscale_to_dim_cap(&bytes, format, MAX_IMAGE_DIMENSION_PX) {
             Ok(png) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+                downscale_cache_put(&original, &encoded);
                 source.media_type = "image/png".to_string();
-                source.data = base64::engine::general_purpose::STANDARD.encode(&png);
+                source.data = encoded;
             }
             Err(error) => {
                 tracing::warn!(
@@ -1168,6 +1339,114 @@ where
 mod tests {
     use super::*;
     use crate::provider::ImageSource;
+
+    /// Drive the SSE decoder over a canned body, returning what it emitted and how it ended.
+    ///
+    /// Built from an `http::Response` rather than a socket: these are decoder properties, and the
+    /// audit's standing complaint about this module was that every test sat above the
+    /// `StreamEvent` boundary and so could not see them at all.
+    async fn decode_sse(body: &str) -> (Vec<StreamEvent>, Result<()>) {
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(body.to_string())
+            .expect("build response")
+            .into();
+        let (sender, mut receiver) = mpsc::channel(64);
+        let outcome = drive_claude_sse_stream(response, sender, CancellationToken::new()).await;
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        (events, outcome)
+    }
+
+    /// A gateway that forwards every delta and closes without Anthropic's final framing event has
+    /// delivered a complete message: `message_delta` already carried the stop reason.
+    ///
+    /// Requiring `message_stop` itself made meka stricter than the format needs and broke every
+    /// turn through such a shim, for a check whose actual subject -- a response cut mid-content --
+    /// never reaches a stop reason at all.
+    #[tokio::test]
+    async fn a_stream_that_stops_after_its_stop_reason_is_complete() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. })),
+            "and the stop reason must still reach the agent: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error(_))),
+            "no error may be reported: {events:?}",
+        );
+    }
+
+    /// Unparseable tool arguments are the model's intent, mangled. Running the tool with `{}`
+    /// instead executes something the model never asked for -- `write_file` with no path, a shell
+    /// command with no command -- and reports success for it. Rejecting hands the model back a
+    /// result it can act on.
+    #[tokio::test]
+    async fn a_tool_call_with_unparseable_arguments_is_rejected_not_run_empty() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"write_file\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        ))
+        .await;
+        outcome.expect("a rejected tool call is not a stream failure");
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallRejected { name, .. } if name == "write_file"
+            )),
+            "the call must be rejected: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolUseEnd { .. })),
+            "and must not also be dispatched: {events:?}",
+        );
+    }
+
+    /// The case the check exists for: the bytes stop partway through the content, so no stop reason
+    /// ever arrives and the agent would otherwise commit a half-written answer as a complete one.
+    #[tokio::test]
+    async fn a_stream_cut_before_its_stop_reason_is_an_error() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"half an ans\"}}\n\n",
+        ))
+        .await;
+
+        assert!(
+            matches!(outcome, Err(MekaError::StreamError(_))),
+            "a truncated stream must reach the retry path, got {outcome:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error(_))),
+            "and say so on the stream: {events:?}",
+        );
+    }
 
     #[test]
     fn test_a_claude_base_url_drops_a_trailing_version_segment() {
@@ -1904,6 +2183,53 @@ mod tests {
             downscale_oversized_images(&messages),
             Cow::Borrowed(_)
         ));
+    }
+
+    /// The same oversized image is downscaled once, not once per turn.
+    ///
+    /// It rides in the conversation for as long as it is in the window, and the request-building
+    /// path ran a decode, a resize and a PNG encode over it on every turn -- identical work for an
+    /// identical result. Asserted by counting the encodes: a cached hit must produce byte-identical
+    /// output *and* not have gone through the encoder to get it, which is the part a naive
+    /// equality check cannot see.
+    #[test]
+    fn a_repeated_image_is_downscaled_once_and_then_served_from_the_cache() {
+        let big = synthesize_png_base64(2400, 1200);
+        let message = |data: &str| {
+            vec![crate::provider::Message::user_with_images("look", vec![
+                crate::provider::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: data.to_string(),
+                },
+            ])]
+        };
+
+        let first = downscale_oversized_images(&message(&big)).into_owned();
+        assert!(
+            downscale_cache_get(&big).is_some(),
+            "the first pass must populate the cache",
+        );
+
+        let second = downscale_oversized_images(&message(&big)).into_owned();
+        let bytes_of = |messages: &[Message]| match &messages[0].content[1] {
+            ContentBlock::Image { source } => source.data.clone(),
+            other => panic!("expected a downscaled image; got {other:?}"),
+        };
+        assert_eq!(
+            bytes_of(&first),
+            bytes_of(&second),
+            "a cached hit must be the same payload",
+        );
+
+        // And a *different* image is not served the first one's result.
+        let other = synthesize_png_base64(2400, 1600);
+        let third = downscale_oversized_images(&message(&other)).into_owned();
+        assert_ne!(
+            bytes_of(&first),
+            bytes_of(&third),
+            "the key must distinguish two different sources",
+        );
     }
 
     #[test]

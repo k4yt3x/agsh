@@ -40,6 +40,7 @@ mod stats;
 mod store;
 mod tokens;
 mod tools;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -118,7 +119,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     provider::cli::run(action, &token_store).await
                 }
                 cli::Command::Session { action } => {
-                    run_session_subcommand(&session_manager, action).await
+                    crate::session::cli::run_session_subcommand(&session_manager, action).await
                 }
                 cli::Command::History { action } => {
                     run_history_subcommand(&session_manager, action).await
@@ -134,7 +135,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     crate::schedule::cli::run(&session_manager, action).await
                 }
                 cli::Command::Account { action } => {
-                    run_account_subcommand(&session_manager, action).await
+                    provider::cli::run_account_subcommand(&session_manager, action).await
                 }
                 cli::Command::Acp | cli::Command::Serve { .. } => {
                     unreachable!("Acp / Serve route through async_main above");
@@ -561,8 +562,8 @@ async fn assemble_agent(
     bundle: AgentAssembly<'_>,
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
-    cwd: crate::agent::SharedCwd,
-    roots: crate::agent::SharedRoots,
+    cwd: crate::workspace::SharedCwd,
+    roots: crate::workspace::SharedRoots,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
     let todo_list: crate::tools::todo::SharedTodoList = std::sync::Arc::new(
         tokio::sync::RwLock::new(crate::tools::todo::TodoState::default()),
@@ -708,8 +709,8 @@ pub async fn build_session_agent(
     shared: &SharedDeps,
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
-    cwd: crate::agent::SharedCwd,
-    roots: crate::agent::SharedRoots,
+    cwd: crate::workspace::SharedCwd,
+    roots: crate::workspace::SharedRoots,
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
     // `context_overhead` is a parameter for the same reason `context_tokens` is: a caller that
     // wants to read the gauge without holding the session's runtime mutex has to own the handle,
@@ -754,7 +755,7 @@ async fn create_agent_from_config(
     credential: AuthCredential,
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
     frontend: Arc<dyn frontend::Frontend>,
-    cwd: crate::agent::SharedCwd,
+    cwd: crate::workspace::SharedCwd,
     session_stats: Arc<stats::SessionStats>,
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<Agent> {
@@ -930,6 +931,7 @@ async fn collect_background_outcomes(
         return Vec::new();
     };
     let ready = match session_manager
+        .background_store()
         .list_undelivered_background_tasks(session_id)
         .await
     {
@@ -943,7 +945,11 @@ async fn collect_background_outcomes(
         return ready;
     }
     let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-    if let Err(error) = session_manager.mark_background_tasks_delivered(&ids).await {
+    if let Err(error) = session_manager
+        .background_store()
+        .mark_background_tasks_delivered(&ids)
+        .await
+    {
         tracing::warn!(
             "failed to stamp background outcomes as delivered: {}",
             error
@@ -960,9 +966,173 @@ async fn collect_background_outcomes(
 ///
 /// Compaction is not a turn, but it makes provider calls and - at `ask` permission - can block on
 /// an approval prompt, so it needs a signal source for exactly the reason
-/// [`run_turn_interruptible`] documents: a bare token silently swallows Ctrl+C. Simpler than that
-/// function because a compaction spawns no background tasks, so there is no second-press
-/// escalation to handle.
+/// [`run_turn_interruptible`] documents: a bare token silently swallows Ctrl+C. It has no
+/// background tasks to reap, so it skips that function's second press and escalates straight from
+/// cancel to exit.
+/// The scheduler config to evaluate this REPL sweep against, with `host_permission` replaced by the
+/// level the session is running at *now*.
+///
+/// [`crate::config::ResolvedScheduleConfig::host_permission`] is resolved once at startup, and a
+/// REPL session carries no per-session level on its row, so a gate's live re-check would otherwise
+/// compare against the level the process was launched with. Shift+Tab and `/permission` move only
+/// the [`SharedPermission`] cell, so that snapshot is wrong from the first cycle onward, and wrong
+/// in both directions: cycling up from the default `read` to author a gate left it refused forever,
+/// and cycling down from `write` left an already-written gate firing, which is exactly the
+/// withdrawal the re-check exists to perform.
+///
+/// A function rather than two lines at the call site so the substitution is assertable; the wiring
+/// is the whole fix, and there is no REPL harness that could reach it otherwise.
+fn schedule_config_at_live_permission(
+    configured: &crate::config::ResolvedScheduleConfig,
+    live: &SharedPermission,
+) -> crate::config::ResolvedScheduleConfig {
+    crate::config::ResolvedScheduleConfig {
+        host_permission: live.get(),
+        ..configured.clone()
+    }
+}
+
+/// The process's Ctrl+C handling: one long-lived listener, not one per turn.
+///
+/// tokio installs its SIGINT handler on first use and never removes it, so a per-turn listener that
+/// is aborted when the turn ends leaves that handler in place with nothing awaiting it. Every later
+/// press is then captured and dropped, and a turn whose tool ignores cancellation -- a stuck child,
+/// an MCP call that never returns -- became unkillable from its own terminal. A task that never
+/// stops awaiting cannot drop one.
+///
+/// Escalation counts per *turn*, not per process: publishing a turn's token resets the count, so
+/// the second press of the fifth turn means what the second press of the first one did.
+///
+/// Nothing here competes with the prompt. reedline reads Ctrl+C as a key event in raw mode, where
+/// the terminal generates no SIGINT at all, so this listener only ever sees a press made while a
+/// turn is running -- which is the only window it is about.
+struct InterruptRelay {
+    /// The running turn's token, or `None` between turns.
+    current: std::sync::RwLock<Option<CancellationToken>>,
+    presses: std::sync::atomic::AtomicUsize,
+    /// Woken on every press, for the one caller that waits outside a turn.
+    ///
+    /// A second `tokio::signal::ctrl_c()` elsewhere in the process would be a second *handler*:
+    /// tokio delivers each press to every awaiter, so one keystroke ran the escalation ladder here
+    /// and printed an unrelated message there, racing each other's output and the outcome
+    /// collection between them. Waiters listen to this instead, so the ladder stays the only
+    /// reader of the signal.
+    pressed: tokio::sync::Notify,
+}
+
+static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
+    std::sync::LazyLock::new(|| InterruptRelay {
+        current: std::sync::RwLock::new(None),
+        presses: std::sync::atomic::AtomicUsize::new(0),
+        pressed: tokio::sync::Notify::new(),
+    });
+
+/// Grace given to background tasks on the press that leaves. Long enough for a child to die and its
+/// row to be written, short enough that a user who has pressed Ctrl+C three times is not made to
+/// wait: the alternative was `exit` on the spot, which orphaned the process group and left the row
+/// reading `running` forever -- the exact loss the REPL's own exit drain was added to prevent.
+const INTERRUPT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl InterruptRelay {
+    /// Hand the relay the token of the turn about to run, and reset the escalation count.
+    fn publish(token: CancellationToken) {
+        match INTERRUPT_RELAY.current.write() {
+            Ok(mut slot) => *slot = Some(token),
+            Err(poisoned) => *poisoned.into_inner() = Some(token),
+        }
+        INTERRUPT_RELAY
+            .presses
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Called when the turn ends. A press after this has no turn to cancel and falls through to the
+    /// escalation, which is what makes a wedged *tool* still interruptible after its turn returns.
+    fn clear() {
+        match INTERRUPT_RELAY.current.write() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+    }
+
+    fn current() -> Option<CancellationToken> {
+        match INTERRUPT_RELAY.current.read() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// Start the process's single SIGINT listener. Idempotent; every turn path calls it, and only the
+/// first call spawns.
+fn install_interrupt_handler(agent: &Agent) {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if INSTALLED.set(()).is_err() {
+        return;
+    }
+
+    let tasks = agent.background_tasks();
+    let session_manager = agent.session_manager();
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            INTERRUPT_RELAY.pressed.notify_waiters();
+            let press = INTERRUPT_RELAY
+                .presses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+
+            match press {
+                // The shell's contract: the first SIGINT reaches the foreground job only.
+                // Background work survives, because losing a twenty-minute build to a Ctrl+C aimed
+                // at the answer on screen is unrecoverable and is not what the keystroke meant.
+                1 => {
+                    if let Some(token) = InterruptRelay::current() {
+                        token.cancel();
+                    }
+                }
+                2 => {
+                    // Recorded before signalling, so what the agent hears is "you stopped it"
+                    // rather than the `failed` its own interruption would otherwise write.
+                    for id in tasks.task_ids().await {
+                        if let Err(error) = session_manager
+                            .background_store()
+                            .finish_background_task(
+                                &id,
+                                crate::background::TaskStatus::Cancelled,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!("could not record task {} as cancelled: {}", id, error);
+                        }
+                    }
+                    let signalled = tasks.cancel_all().await;
+                    if signalled > 0 {
+                        eprintln!("\nStopping {} background task(s).", signalled);
+                    }
+                }
+                // Leave -- but let what was already cancelled finish unwinding first.
+                _ => {
+                    eprintln!("\nInterrupted.");
+                    if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "background tasks did not unwind within {:?}; exiting anyway",
+                            INTERRUPT_DRAIN_GRACE
+                        );
+                    }
+                    std::process::exit(130);
+                }
+            }
+        }
+    });
+}
+
 async fn compact_interruptible(
     agent: &Agent,
     session_id: &mut Option<uuid::Uuid>,
@@ -970,26 +1140,19 @@ async fn compact_interruptible(
     request: crate::agent::CompactRequest,
 ) -> error::Result<crate::agent::CompactOutcome> {
     let cancellation = CancellationToken::new();
-    let signal_handle = {
-        let cancellation = cancellation.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancellation.cancel();
-            }
-        })
-    };
+    install_interrupt_handler(agent);
+    InterruptRelay::publish(cancellation.clone());
     let result = agent
         .compact_session(session_id, messages, request, cancellation)
         .await;
-    signal_handle.abort();
+    InterruptRelay::clear();
     result
 }
 
-/// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Spawns a `ctrl_c()` listener
-/// for the turn's duration and aborts it afterward, so a SIGINT during the turn cancels it (and
-/// every tool and sub-agent it spawned), while a SIGINT between turns is not consumed by a leaked
-/// listener. Every `run_turn` callsite in the REPL / CLI path must go through here; a bare
-/// `CancellationToken` with no signal source silently swallows Ctrl+C.
+/// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Hands the token to
+/// [`InterruptRelay`] for the turn's duration, so a SIGINT during the turn cancels it and every
+/// tool and sub-agent it spawned. Every `run_turn` callsite in the REPL / CLI path must go through
+/// here; a bare `CancellationToken` with no signal source silently swallows Ctrl+C.
 async fn run_turn_interruptible(
     agent: &Agent,
     session_id: &mut Option<uuid::Uuid>,
@@ -998,43 +1161,8 @@ async fn run_turn_interruptible(
     retention: agent::PromptRetention,
 ) -> error::Result<()> {
     let cancellation = CancellationToken::new();
-    let signal_handle = {
-        let cancellation = cancellation.clone();
-        let tasks = agent.background_tasks();
-        let signal_session_manager = agent.session_manager();
-        tokio::spawn(async move {
-            // The shell's contract: the first SIGINT reaches the foreground job only. Background
-            // work survives, because losing a twenty-minute build to a Ctrl+C aimed at the answer
-            // on screen is unrecoverable and is not what the keystroke meant.
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
-            cancellation.cancel();
-            // A second press within the same turn escalates. Between turns, `/tasks cancel --all`
-            // is the route; this listener is aborted the moment the turn ends.
-            if tokio::signal::ctrl_c().await.is_ok() {
-                // Recorded before signalling, so what the agent hears is "you stopped it" rather
-                // than the `failed` its own interruption would otherwise write.
-                for id in tasks.task_ids().await {
-                    if let Err(error) = signal_session_manager
-                        .finish_background_task(
-                            &id,
-                            crate::background::TaskStatus::Cancelled,
-                            None,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!("could not record task {} as cancelled: {}", id, error);
-                    }
-                }
-                let signalled = tasks.cancel_all().await;
-                if signalled > 0 {
-                    eprintln!("\nStopping {} background task(s).", signalled);
-                }
-            }
-        })
-    };
+    install_interrupt_handler(agent);
+    InterruptRelay::publish(cancellation.clone());
     let result = agent
         .run_turn_retaining(
             session_id,
@@ -1045,7 +1173,7 @@ async fn run_turn_interruptible(
             retention,
         )
         .await;
-    signal_handle.abort();
+    InterruptRelay::clear();
     // REPL / `meka -p` callers don't surface a stop reason; they only care whether the turn
     // succeeded. Drop the `TurnOutcome`.
     result.map(|_| ())
@@ -1058,6 +1186,22 @@ async fn run_oneshot(
     prompt: String,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
+    // Same rejection the HTTP surface applies, for the same reason: an empty turn costs a provider
+    // round-trip to produce nothing, and the model has no way to tell it apart from a prompt whose
+    // content went missing somewhere upstream.
+    if prompt.trim().is_empty() {
+        anyhow::bail!("the prompt must be a non-empty string");
+    }
+    // `ask` has nowhere to ask from here: `oneshot_frontend` is built on a channel whose receiver
+    // is dropped, so every approval request fails to send and the tool is refused. Say so once,
+    // up front, rather than letting the run look like the model simply chose not to use its
+    // tools.
+    if config.permission == crate::permission::Permission::Ask {
+        tracing::warn!(
+            "permission is 'ask' but one-shot mode has no interactive prompt: every tool that \
+             needs approval will be denied. Use --permission read or write, or drop --oneshot."
+        );
+    }
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
     if config.permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
@@ -1083,7 +1227,7 @@ async fn run_oneshot(
             tool_params: config.tool_params,
             agent_event_sender: noninteractive_sender,
         }));
-    let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
         std::env::current_dir().unwrap_or_else(|error| {
             tracing::warn!("could not read process cwd at startup: {}", error);
             std::path::PathBuf::from(".")
@@ -1139,7 +1283,19 @@ async fn run_oneshot(
                  turn to report them in",
                 outstanding
             );
-            agent.background_tasks().wait_for_session(id).await;
+            // Interruptible. A one-shot has no REPL loop and no per-turn signal listener by this
+            // point, so an unbounded await here made the process ignore Ctrl+C entirely whenever a
+            // background task never finished. Racing the signal keeps the documented "wait for
+            // outstanding work" behaviour while leaving the user a way out; the outcomes collected
+            // just below still report whatever did finish.
+            let tasks = agent.background_tasks();
+            install_interrupt_handler(&agent);
+            tokio::select! {
+                _ = tasks.wait_for_session(id) => {}
+                _ = INTERRUPT_RELAY.pressed.notified() => {
+                    eprintln!("\nStopped waiting for background tasks.");
+                }
+            }
         }
         // Collected unconditionally, not only when this process started something. Resuming a
         // session sweeps whatever the *last* process left running into `interrupted`, and without
@@ -1177,7 +1333,7 @@ async fn run_interactive(
     // Per-session working directory, initialised from process cwd at startup. Shared by reference
     // between the REPL (prompt + `/cd`) and the agent (file/shell/find/grep tools +
     // environment-context block). Process cwd is no longer mutated.
-    let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
         std::env::current_dir().unwrap_or_else(|error| {
             tracing::warn!("could not read process cwd at startup: {}", error);
             std::path::PathBuf::from(".")
@@ -1343,6 +1499,9 @@ async fn run_interactive(
         },
         None => Arc::new(stats::SessionStats::default()),
     };
+    // Kept back from the move below so the scheduler can read the *current* level rather than the
+    // one this process started at. See the `run_due` call in the `Wake` arm.
+    let scheduler_permission = shared_permission.clone();
     let mut agent = match create_agent_from_config(
         &config,
         session_manager.clone(),
@@ -1401,6 +1560,7 @@ async fn run_interactive(
                 };
                 if schedule_enabled {
                     match session_manager
+                        .schedule_store()
                         .list_due_scheduled_jobs(chrono::Utc::now())
                         .await
                     {
@@ -1413,6 +1573,7 @@ async fn run_interactive(
                 }
                 if background_enabled {
                     match session_manager
+                        .background_store()
                         .list_undelivered_background_tasks(current)
                         .await
                     {
@@ -1453,10 +1614,21 @@ async fn run_interactive(
                 // arm is now also reached by a finished background task setting the same wake flag.
                 // Without this, turning scheduling off while background calls are on would still
                 // fire the jobs already in the database.
+                // `host_permission` is resolved once from config, so under the REPL it is the level
+                // this process *started* at, and a REPL session carries no per-session level on its
+                // row (`ResolvedScheduleConfig::host_permission` documents that fallback). The
+                // gate's live re-check therefore read a snapshot that Shift+Tab and `/permission`
+                // never touch, and it failed in both directions: starting at the default `read` and
+                // cycling up to `write` to author a gate left it refused forever, while starting at
+                // `write` and cycling down to `read` kept firing it -- which is the withdrawal the
+                // re-check exists for. Overriding it here is the whole fix; `run_due` reads this
+                // clone, not the process-wide one.
+                let schedule_config =
+                    schedule_config_at_live_permission(&config.schedule, &scheduler_permission);
                 if config.schedule.enabled
                     && let Err(error) = crate::schedule::run_due(
                         &session_manager,
-                        &config.schedule,
+                        &schedule_config,
                         &scope,
                         &|wakeup: crate::schedule::Wakeup| {
                             if let Ok(mut collected) = fired.lock() {
@@ -1697,7 +1869,7 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Export => match &session_id {
                         Some(id) => {
-                            match export_session(
+                            match crate::session::cli::export_session(
                                 &session_manager,
                                 *id,
                                 None,
@@ -1725,24 +1897,27 @@ async fn run_interactive(
                         None => eprintln!("No active session to export."),
                     },
                     repl::SlashCommand::Fork => match session_id {
-                        Some(id) => match fork_and_lock(&session_manager, id).await {
-                            Ok(ForkHandoff::Switched { id, lock }) => {
+                        Some(id) => match crate::session::cli::fork_and_lock(&session_manager, id)
+                            .await
+                        {
+                            Ok(crate::session::cli::ForkHandoff::Switched { id, lock }) => {
                                 // Assigning over `session_lock` drops the original guard only now
-                                // that the new one is held; see `fork_and_lock`.
+                                // that the new one is held; see
+                                // `crate::session::cli::fork_and_lock`.
                                 session_lock = Some(lock);
                                 session_id = Some(id);
                                 // `messages` is deliberately untouched, so the branch happens at
                                 // the current head and the next turn continues in the copy.
                                 render::render_session_id("Forked session", &id.to_string());
                             }
-                            Ok(ForkHandoff::LockFailed { id, error }) => {
+                            Ok(crate::session::cli::ForkHandoff::LockFailed { id, error }) => {
                                 render::render_error(&error);
                                 render::render_hint(&format!(
                                     "Staying in the original. The copy exists: {}",
                                     id
                                 ));
                             }
-                            Ok(ForkHandoff::SourceGone) => {
+                            Ok(crate::session::cli::ForkHandoff::SourceGone) => {
                                 eprintln!("Session no longer exists: {}", id);
                             }
                             Err(error) => eprintln!("Failed to fork session: {}", error),
@@ -1814,7 +1989,12 @@ async fn run_interactive(
                         };
                         // Map positional args to declared prompt argument names (lookup via
                         // prompts/list).
-                        let arg_names = match mcp::list_prompts(&entry).await {
+                        let arg_names = match mcp::list_prompts(
+                            &entry,
+                            &tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        {
                             Ok(prompts) => prompts
                                 .into_iter()
                                 .find(|p| p.name == prompt_name)
@@ -1842,7 +2022,14 @@ async fn run_interactive(
                             }
                             arguments = Some(map);
                         }
-                        match mcp::get_prompt(&entry, prompt_name.clone(), arguments).await {
+                        match mcp::get_prompt(
+                            &entry,
+                            prompt_name.clone(),
+                            arguments,
+                            &tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 // Render the prompt messages as a single user turn, same shape
                                 // as the `mcp_prompt_get` tool output.
@@ -1917,7 +2104,11 @@ async fn run_interactive(
                     },
                     repl::SlashCommand::ScheduleCancel { id } => match session_id {
                         Some(session) => {
-                            match session_manager.cancel_scheduled_job(session, &id).await {
+                            match session_manager
+                                .schedule_store()
+                                .cancel_scheduled_job(session, &id)
+                                .await
+                            {
                                 Ok(Some(cancelled)) => {
                                     eprintln!(
                                         "Cancelled job {}.",
@@ -2108,6 +2299,45 @@ async fn run_interactive(
     // releases the underlying flock when the FD closes.
     drop(session_lock);
 
+    // Stop this process's background tasks on the way out.
+    //
+    // Nothing did before: `/exit` broke the loop and returned, and `BackgroundTasks` has no `Drop`,
+    // so a detached `execute_command` kept running -- `setsid()`-ed, so not even a terminal hangup
+    // reaches it -- with no meka process tracking it. Its row stayed `running` and the next session
+    // open swept it to `interrupted`, telling the model work had died that was in fact still going,
+    // possibly still writing to the workspace. The HTTP `DELETE /v1/sessions/{id}` handler already
+    // does this, and its comment claimed "The REPL does the same thing on its way out", which is
+    // what this makes true.
+    let stopped = agent.background_tasks().cancel_all().await;
+    if stopped > 0 {
+        eprintln!("Stopping {} background task(s)...", stopped);
+        // Waited for, not just signalled. `run_on_runtime` returns into `shutdown_background`
+        // immediately after this, which drops every task where it stands: a task parked at an
+        // await is never polled again, so it runs neither `kill_child_tree` nor
+        // `finish_background_task` and the cancel achieves exactly nothing. Bounded, because
+        // cancelling only asks -- a task that does not answer must not hold the terminal, and its
+        // row is swept to `interrupted` on the next open, which is what that sweep is for.
+        if tokio::time::timeout(BACKGROUND_EXIT_GRACE, agent.background_tasks().wait_all())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "background task(s) still running after {}s; leaving them to the next session open",
+                BACKGROUND_EXIT_GRACE.as_secs()
+            );
+        }
+    }
+
+    // Release the agent before shutting the MCP manager down. `shutdown_mcp_manager` can only close
+    // the servers if it is the last owner of the `Arc`, and the agent's `ToolRegistry` holds six
+    // strong clones of it (one per `mcp_resource_*` / `mcp_prompt_*` tool, see
+    // `mcp_resources::register_all`). Without this the `try_unwrap` failed on every launch that had
+    // any MCP server configured -- which is every launch that has anything to shut down -- and the
+    // graceful path was dead code: no `close_with_timeout`, no in-flight grace, no `close`
+    // handshake. Cleanup fell to rmcp's drop guard, which spawns a kill task onto a runtime that is
+    // already tearing down and may never poll it, leaving the stdio child alive after meka exits.
+    drop(agent);
+
     if let Some(manager) = mcp_manager {
         shutdown_mcp_manager(manager).await;
     }
@@ -2121,395 +2351,47 @@ async fn run_interactive(
 async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
     match Arc::try_unwrap(manager) {
         Ok(manager) => manager.shutdown().await,
-        Err(_arc) => {
-            tracing::debug!(
-                "MCP manager still referenced at shutdown; relying on drop guards for cleanup"
+        Err(arc) => {
+            // Promoted from `debug!` because reaching it means the graceful path did not run and
+            // stdio children may outlive the process. It was previously the *only* outcome whenever
+            // an MCP server was configured, which made it look routine; with the agent dropped
+            // first, an owner still holding on is a real leak worth seeing at default verbosity.
+            tracing::warn!(
+                "MCP manager still has {} owner(s) at shutdown; servers were not closed \
+                 gracefully and a stdio child may outlive this process",
+                Arc::strong_count(&arc),
             );
         }
     }
 }
 
-/// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
-/// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
-/// session import` rejects versions it doesn't recognize.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 1;
-
-/// Sessions one `POST /v1/sessions/import` will accept.
+/// How long leaving the REPL waits for its cancelled background tasks to unwind.
 ///
-/// Enforced by the HTTP handler, not by [`plan_import`], because the reason for it is
-/// contention-specific: `import_sessions` runs the whole tree in one closure on the process's
-/// single SQLite connection, so every other in-flight request queues behind it. A one-shot
-/// `meka session import` restoring its own backup has nothing to contend with, and refusing it
-/// would mean a tree that exported fine cannot be restored.
-pub(crate) const MAX_IMPORT_SESSIONS: usize = 1_000;
+/// Long enough for the work a cancelled task actually has left -- signal its process group, write
+/// one row -- and short enough that a task ignoring its token cannot hold the terminal. Whatever
+/// overruns it is swept to `interrupted` when the session is next opened.
+const BACKGROUND_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Root envelope for a JSON session export. Carries the session plus any sub-agent descendants as a
-/// flat, root-first list; parent links are by original id and get remapped on import. Deliberately
-/// secret-free: credentials live in separate global tables and the `token_id` fingerprint is
-/// omitted.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct SessionExport {
-    format_version: u32,
-    meka_version: String,
-    exported_at: String,
-    root_session_id: String,
-    sessions: Vec<ExportedSession>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ExportedSession {
-    id: String,
-    parent_id: Option<String>,
-    created_at: String,
-    updated_at: String,
-    cwd: Option<String>,
-    permission: Option<String>,
-    capabilities_json: Option<String>,
-    /// Workspace roots beyond `cwd`. `#[serde(default)]` rather than a `format_version` bump:
-    /// [`plan_import`] rejects any version it doesn't equal exactly, so bumping would make every
-    /// export written before this field unimportable, while an absent field already means the
-    /// single-root sessions those exports describe.
-    #[serde(default)]
-    additional_roots: Vec<std::path::PathBuf>,
-    /// A sub-agent's spawn terms. `#[serde(default)]` for the same reason as `additional_roots`:
-    /// an archive written before the field existed is still importable, and its sub-agents simply
-    /// come back unfollowable rather than unimportable.
-    #[serde(default)]
-    subagent_spec_json: Option<String>,
-    stats: crate::stats::SessionStatsSnapshot,
-    events: Vec<ExportedEvent>,
-    tool_outputs: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ExportedEvent {
-    /// RFC 3339 timestamp the event row was persisted; preserved across import.
-    at: String,
-    event: crate::conversation::Event,
-}
-
-/// Returns the file the export landed in, or `None` when the body went to stdout.
+/// Resolve a secret that may have come from an argument or from stdin.
 ///
-/// The path is returned rather than only logged because `/export` in the REPL writes to a generated
-/// name in the working directory: the CLI can leave "quiet on success" to the shell, but a REPL
-/// user who is not told the name has no way to find the file.
-async fn export_session(
-    session_manager: &SessionManager,
-    session_id: uuid::Uuid,
-    output: Option<&str>,
-    format: cli::SessionExportFormat,
-) -> anyhow::Result<Option<std::path::PathBuf>> {
-    if !session_manager.session_exists(session_id).await? {
-        anyhow::bail!("session not found: {}", session_id);
+/// Errors when both were given rather than picking one, and when stdin held nothing: a caller that
+/// asked for a token and got an empty one should hear about it here, not from the server later.
+fn read_optional_secret_from_stdin(
+    argument: Option<String>,
+    from_stdin: bool,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    if !from_stdin {
+        return Ok(argument);
     }
-
-    let (body, default_ext) = match format {
-        cli::SessionExportFormat::Markdown => {
-            // Export the full event log so pre-compaction turns are included. Compaction only hides
-            // older turns from the model (it appends a boundary, never deletes), so the export
-            // walks the raw log and renders every turn plus a marker at each compaction point.
-            let events = session_manager.load_events(session_id).await?;
-            let tool_outputs: std::collections::HashMap<String, String> = session_manager
-                .load_all_tool_outputs(session_id)
-                .await?
-                .into_iter()
-                .collect();
-            (
-                format_session_as_markdown(session_id, &events, &tool_outputs),
-                "md",
-            )
-        }
-        cli::SessionExportFormat::Json => {
-            let export = build_session_export(session_manager, session_id).await?;
-            (serde_json::to_string_pretty(&export)?, "json")
-        }
-    };
-
-    match output {
-        Some("-") => {
-            print!("{}", body);
-            Ok(None)
-        }
-        Some(path) => {
-            std::fs::write(path, &body)?;
-            tracing::info!("exported session to {}", path);
-            Ok(Some(std::path::PathBuf::from(path)))
-        }
-        None => {
-            let path = std::path::PathBuf::from(format!("session-{}.{}", session_id, default_ext));
-            std::fs::write(&path, &body)?;
-            tracing::info!("exported session to {}", path.display());
-            Ok(Some(path))
-        }
+    use std::io::Read as _;
+    let mut buffer = String::new();
+    std::io::stdin().read_to_string(&mut buffer)?;
+    let secret = buffer.trim().to_string();
+    if secret.is_empty() {
+        anyhow::bail!("no {} was read from stdin", label);
     }
-}
-
-/// Assemble the structured JSON export envelope for a session and every sub-agent descendant.
-/// Per-event timestamps and cumulative stats are preserved; `token_id` is intentionally excluded.
-pub(crate) async fn build_session_export(
-    session_manager: &SessionManager,
-    root: uuid::Uuid,
-) -> anyhow::Result<SessionExport> {
-    let tree = session_manager.load_session_tree(root).await?;
-    let mut sessions = Vec::with_capacity(tree.len());
-    for meta in tree {
-        let events = session_manager
-            .load_events_with_timestamps(meta.id)
-            .await?
-            .into_iter()
-            .map(|(at, event)| ExportedEvent { at, event })
-            .collect();
-        let tool_outputs = session_manager
-            .load_all_tool_outputs(meta.id)
-            .await?
-            .into_iter()
-            .collect();
-        let stats = session_manager.load_session_stats(meta.id).await?;
-        sessions.push(ExportedSession {
-            id: meta.id.to_string(),
-            parent_id: meta.parent_id.map(|id| id.to_string()),
-            created_at: meta.created_at,
-            updated_at: meta.updated_at,
-            cwd: meta.cwd,
-            permission: meta.permission,
-            capabilities_json: meta.capabilities_json,
-            additional_roots: meta.additional_roots,
-            subagent_spec_json: meta.subagent_spec_json,
-            stats,
-            events,
-            tool_outputs,
-        });
-    }
-    Ok(SessionExport {
-        format_version: SESSION_EXPORT_FORMAT_VERSION,
-        meka_version: env!("CARGO_PKG_VERSION").to_string(),
-        exported_at: chrono::Utc::now().to_rfc3339(),
-        root_session_id: root.to_string(),
-        sessions,
-    })
-}
-
-/// Import a session (and any sub-agent children) from a JSON export produced by
-/// `meka session export --format json`. Reads `input` (a file path, or `-` for stdin), mints fresh
-/// IDs for every session, rewires parent links, and persists the whole tree in one transaction.
-/// Prints the new root session ID to stdout.
-async fn import_session(session_manager: &SessionManager, input: &str) -> anyhow::Result<()> {
-    let raw = if input == "-" {
-        use std::io::Read as _;
-        let mut buffer = String::new();
-        std::io::stdin().read_to_string(&mut buffer)?;
-        buffer
-    } else {
-        std::fs::read_to_string(input)
-            .map_err(|error| anyhow::anyhow!("failed to read '{}': {}", input, error))?
-    };
-
-    let export: SessionExport = serde_json::from_str(&raw)
-        .map_err(|error| anyhow::anyhow!("invalid session export JSON: {}", error))?;
-    let (records, root_new_id) = plan_import(export)?;
-
-    let count = records.len();
-    session_manager.import_sessions(records).await?;
-    tracing::info!("imported {} session(s) from {}", count, input);
-    // Human-facing confirmation and resume guidance go to stderr; the bare root ID stays on stdout
-    // so `id=$(meka session import ...)` and piping keep working. Plain (unstyled) to match the
-    // other one-shot CLI messages; `render_hint`'s dark-grey styling is for the REPL.
-    if count > 1 {
-        eprintln!(
-            "Imported session with {} sub-agent(s). Resume with: meka -r {}",
-            count - 1,
-            root_new_id
-        );
-    } else {
-        eprintln!("Imported session. Resume with: meka -r {}", root_new_id);
-    }
-    println!("{}", root_new_id);
-    Ok(())
-}
-
-/// Result of the REPL's `/fork`, which has to hand the on-disk session lock from the session it is
-/// leaving to the copy it is entering.
-enum ForkHandoff {
-    /// The copy exists and its lock is held. The caller assigns this over its current lock, which
-    /// releases the original only once the new one is owned.
-    Switched {
-        id: uuid::Uuid,
-        lock: crate::session::SessionLock,
-    },
-    /// The copy exists but its lock could not be taken, so the caller stays where it is. The id is
-    /// carried so the user can still be told where the copy went.
-    LockFailed {
-        id: uuid::Uuid,
-        error: crate::error::MekaError,
-    },
-    /// The session being forked no longer exists.
-    SourceGone,
-}
-
-/// Fork `source` and take the copy's lock, in that order and without touching the caller's own.
-///
-/// The ordering is the point. Releasing the current lock first and then failing to acquire the new
-/// one would leave the REPL running against an unlocked session that a second `meka` process could
-/// open and interleave events into. Acquiring first means the failure path is simply "stay put",
-/// and the caller drops its old lock only by overwriting it with the new one.
-async fn fork_and_lock(
-    session_manager: &SessionManager,
-    source: uuid::Uuid,
-) -> anyhow::Result<ForkHandoff> {
-    let Some(forked) = session_manager
-        .fork_session(source, crate::session::ForkOverrides::default())
-        .await?
-    else {
-        return Ok(ForkHandoff::SourceGone);
-    };
-    match session_manager.lock_session(forked.id) {
-        Ok(lock) => Ok(ForkHandoff::Switched {
-            id: forked.id,
-            lock,
-        }),
-        Err(error) => Ok(ForkHandoff::LockFailed {
-            id: forked.id,
-            error,
-        }),
-    }
-}
-
-/// `meka session fork <id>`: copy a session's conversation into a new one and print the new ID.
-///
-/// Output split mirrors [`import_session`]: the bare ID on stdout so `id=$(meka session fork …)`
-/// works, the resume hint on stderr.
-async fn fork_session_command(
-    session_manager: &SessionManager,
-    session_id: uuid::Uuid,
-) -> anyhow::Result<()> {
-    let forked = session_manager
-        .fork_session(session_id, crate::session::ForkOverrides::default())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
-
-    tracing::info!("forked session {} into {}", session_id, forked.id);
-    eprintln!("Forked session. Resume with: meka -r {}", forked.id);
-    println!("{}", forked.id);
-    Ok(())
-}
-
-/// Turn a deserialized [`SessionExport`] into the parents-first
-/// [`crate::session::ImportSessionRecord`] list to persist, plus the freshly-minted root session
-/// ID. Validates the format version, mints a new ID per session, and remaps parent links (a parent
-/// pointing outside the exported set collapses to `None`, importing that session as a new top-level
-/// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
-pub(crate) fn plan_import(
-    export: SessionExport,
-) -> anyhow::Result<(Vec<crate::session::ImportSessionRecord>, uuid::Uuid)> {
-    if export.format_version != SESSION_EXPORT_FORMAT_VERSION {
-        anyhow::bail!(
-            "unsupported session export format_version {} (this build supports {})",
-            export.format_version,
-            SESSION_EXPORT_FORMAT_VERSION
-        );
-    }
-    if export.sessions.is_empty() {
-        anyhow::bail!("session export contains no sessions");
-    }
-    // Caught here rather than at the `sessions.id` primary key, which would surface a caller's
-    // malformed envelope as an internal error.
-    let mut seen = std::collections::HashSet::with_capacity(export.sessions.len());
-    for session in &export.sessions {
-        if !seen.insert(session.id.clone()) {
-            anyhow::bail!("session export contains duplicate id '{}'", session.id);
-        }
-    }
-
-    let remap: std::collections::HashMap<String, uuid::Uuid> = export
-        .sessions
-        .iter()
-        .map(|session| (session.id.clone(), uuid::Uuid::new_v4()))
-        .collect();
-    let root_new_id = remap
-        .get(&export.root_session_id)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("root_session_id is not present in the sessions list"))?;
-
-    let nodes: Vec<(String, Option<String>)> = export
-        .sessions
-        .iter()
-        .map(|session| (session.id.clone(), session.parent_id.clone()))
-        .collect();
-    let order = parents_first_order(&nodes)?;
-
-    let mut slots: Vec<Option<ExportedSession>> = export.sessions.into_iter().map(Some).collect();
-    let mut records = Vec::with_capacity(order.len());
-    for index in order {
-        let session = slots[index]
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("duplicate session index while ordering import"))?;
-        let new_id = remap
-            .get(&session.id)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("internal error: session id missing from ID remap"))?;
-        let new_parent_id = session
-            .parent_id
-            .as_ref()
-            .and_then(|parent| remap.get(parent).copied());
-        records.push(crate::session::ImportSessionRecord {
-            new_id,
-            new_parent_id,
-            created_at: session.created_at,
-            cwd: session.cwd,
-            permission: session.permission,
-            capabilities_json: session.capabilities_json,
-            additional_roots: session.additional_roots,
-            subagent_spec_json: session.subagent_spec_json,
-            stats: session.stats,
-            events: session
-                .events
-                .into_iter()
-                .map(|event| (event.at, event.event))
-                .collect(),
-            tool_outputs: session.tool_outputs.into_iter().collect(),
-        });
-    }
-
-    Ok((records, root_new_id))
-}
-
-/// Order sessions parents-first (a topological sort over `parent_id` edges, considering only
-/// parents present in the set) so an importer can insert each session after its parent and satisfy
-/// the `parent_session_id` foreign key. Returns indices into `nodes`. Errors on a cyclic
-/// relationship. Sessions whose parent is absent from the set are treated as roots.
-fn parents_first_order(nodes: &[(String, Option<String>)]) -> anyhow::Result<Vec<usize>> {
-    use std::collections::{HashMap, VecDeque};
-
-    let index_of: HashMap<&str, usize> = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, (id, _))| (id.as_str(), index))
-        .collect();
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-    let mut indegree = vec![0usize; nodes.len()];
-    for (index, (_, parent)) in nodes.iter().enumerate() {
-        if let Some(parent) = parent
-            && let Some(&parent_index) = index_of.get(parent.as_str())
-        {
-            children[parent_index].push(index);
-            indegree[index] += 1;
-        }
-    }
-    let mut queue: VecDeque<usize> = (0..nodes.len()).filter(|&i| indegree[i] == 0).collect();
-    let mut order = Vec::with_capacity(nodes.len());
-    while let Some(node) = queue.pop_front() {
-        order.push(node);
-        for &child in &children[node] {
-            indegree[child] -= 1;
-            if indegree[child] == 0 {
-                queue.push_back(child);
-            }
-        }
-    }
-    if order.len() != nodes.len() {
-        anyhow::bail!("session export has a cyclic parent relationship");
-    }
-    Ok(order)
+    Ok(Some(secret))
 }
 
 async fn run_mcp_subcommand(
@@ -2564,8 +2446,10 @@ async fn run_mcp_subcommand(
             header,
             auth,
             auth_token,
+            auth_token_stdin,
             client_id,
             client_secret,
+            client_secret_stdin,
             signing_key,
             signing_algorithm,
             scope,
@@ -2588,9 +2472,20 @@ async fn run_mcp_subcommand(
                     env: env.clone(),
                     header: header.clone(),
                     auth: auth.clone(),
-                    auth_token: auth_token.clone(),
+                    // A secret read from stdin never appears in `ps` or shell history. Both are
+                    // read here rather than in `run_add` so the two stdin flags cannot both consume
+                    // the same stream and silently take each other's value.
+                    auth_token: read_optional_secret_from_stdin(
+                        auth_token.clone(),
+                        *auth_token_stdin,
+                        "auth token",
+                    )?,
                     client_id: client_id.clone(),
-                    client_secret: client_secret.clone(),
+                    client_secret: read_optional_secret_from_stdin(
+                        client_secret.clone(),
+                        *client_secret_stdin,
+                        "client secret",
+                    )?,
                     signing_key: signing_key.clone(),
                     signing_algorithm: signing_algorithm.clone(),
                     scope: scope.clone(),
@@ -2682,6 +2577,23 @@ async fn run_tools_subcommand(
                 ),
             )?;
 
+            // The `context_*` family is registered by the `Agent`, not by `build_default`, because
+            // its counters belong to a live conversation. This listing is what the docs point
+            // people at to discover tool names, so it registers them here with idle handles: the
+            // names, levels and descriptions are what a real session would show.
+            reference.register_context_tools(
+                crate::tools::context::ContextGauge {
+                    used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    overhead: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    window: 0,
+                    compact_at_percent: None,
+                },
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                config.compact_checkpoint,
+                SessionManager::open(None).await?,
+                std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            );
+
             let catalogue = reference.tool_catalogue();
             // `format_columns`, like every other listing meka prints. The fixed `{:<20}` this used
             // to hand-roll silently ran its columns together for any name longer than the width,
@@ -2722,6 +2634,14 @@ async fn run_tools_subcommand(
                     &["Name", "Required", "Source", "Visibility", "Description"],
                     &rows
                 )
+            );
+            // The one family this listing cannot build. `agent_spawn` carries a live provider, and
+            // constructing one would make listing tool names require a working credential. Named
+            // rather than silently absent: this listing is what the docs point people at.
+            eprintln!(
+                "\nThe agent_* family (agent_spawn, agent_list, agent_followup, agent_delete) is \
+                 registered per session and needs a provider, so it is not shown here. It is \
+                 available at every permission level unless [subagents] or [tools] denies it."
             );
         }
     }
@@ -2841,331 +2761,6 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Local (no-network) auth status for a stored credential: is the token valid, and when does it
-/// expire. Serialized as the `auth` block of `meka account whoami --format json`.
-#[derive(serde::Serialize)]
-struct AuthStatus {
-    valid: bool,
-    /// Token expiry as Unix seconds (`None` for API keys / no expiry).
-    expires_at: Option<i64>,
-    /// Seconds until expiry (negative if already expired).
-    expires_in_seconds: Option<i64>,
-}
-
-impl AuthStatus {
-    fn from_credential(credential: &AuthCredential) -> Self {
-        match credential {
-            AuthCredential::OAuthToken { expires_at, .. } => {
-                // `expires_at` is stored as epoch milliseconds.
-                let expires_at = expires_at.map(|millis| millis / 1000);
-                let expires_in_seconds =
-                    expires_at.map(|secs| secs - chrono::Utc::now().timestamp());
-                AuthStatus {
-                    valid: expires_in_seconds.is_none_or(|remaining| remaining > 0),
-                    expires_at,
-                    expires_in_seconds,
-                }
-            }
-            AuthCredential::ApiKey(_) => AuthStatus {
-                valid: true,
-                expires_at: None,
-                expires_in_seconds: None,
-            },
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct UsageOutput<'a> {
-    provider: &'a str,
-    #[serde(flatten)]
-    usage: &'a crate::provider::AccountUsage,
-}
-
-#[derive(serde::Serialize)]
-struct WhoamiOutput<'a> {
-    provider: &'a str,
-    backend: &'a str,
-    auth: AuthStatus,
-    identity: Option<crate::provider::AccountIdentity>,
-}
-
-/// `meka account { usage, whoami }`: resolve a profile, build just that provider (no agent/MCP/
-/// session), fetch the requested info, and print it (plain to stdout, or JSON). Requested data goes
-/// to stdout; the "not available" / error notes go to stderr, so `… 2>/dev/null | jq` stays clean.
-async fn run_account_subcommand(
-    session_manager: &SessionManager,
-    action: &cli::AccountAction,
-) -> anyhow::Result<()> {
-    let (profile_arg, format) = match action {
-        cli::AccountAction::Usage { profile, format } => (profile.clone(), *format),
-        cli::AccountAction::Whoami { profile, format } => (profile.clone(), *format),
-        cli::AccountAction::Stats { profile, format } => (profile.clone(), *format),
-    };
-
-    let token_store = session_manager.token_store();
-    let config_file = config::load_config_file_or_err()?;
-    let requested = profile_arg.or_else(|| config_file.default_provider.clone());
-    let (name, error) = config::select_active_profile(requested, &config_file.providers);
-    let name = name.ok_or_else(|| {
-        anyhow::anyhow!(error.unwrap_or_else(|| "no provider configured".to_string()))
-    })?;
-    let profile = config_file
-        .providers
-        .get(&name)
-        .ok_or_else(|| anyhow::anyhow!("provider profile '{}' not found", name))?;
-    let credential = token_store
-        .load_provider_credential(&name)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no stored credential for profile '{}'. Run `meka provider login {}`.",
-                name,
-                name
-            )
-        })?;
-
-    let provider = ProviderBuilder::new(
-        profile.backend.clone(),
-        credential.clone(),
-        profile.model.clone().unwrap_or_default(),
-    )
-    .base_url(profile.base_url.clone())
-    .client_id(profile.client_id.clone())
-    .oauth_token_url(profile.oauth_token_url.clone())
-    .credential_key(Some(name.clone()))
-    .token_store(Some(std::sync::Arc::new(session_manager.token_store())))
-    .build()?;
-
-    match action {
-        cli::AccountAction::Usage { .. } => match provider.fetch_usage().await? {
-            Some(usage) => match format {
-                cli::OutputFormat::Plain => {
-                    print!("{}", render::format_account_usage(&usage));
-                }
-                cli::OutputFormat::Json => {
-                    let out = UsageOutput {
-                        provider: &name,
-                        usage: &usage,
-                    };
-                    println!("{}", serde_json::to_string_pretty(&out)?);
-                }
-            },
-            None => {
-                eprintln!("Account usage isn't available for provider '{}'.", name);
-                std::process::exit(1);
-            }
-        },
-        cli::AccountAction::Whoami { .. } => {
-            // The identity call may refresh + rotate the token; re-read afterwards so the auth
-            // block reflects the current expiry. A failed identity fetch (e.g. re-login needed)
-            // still prints the local auth status so scripts can detect it.
-            let identity = provider.fetch_identity().await;
-            let fresh = session_manager
-                .token_store()
-                .load_provider_credential(&name)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(credential);
-            let auth = AuthStatus::from_credential(&fresh);
-            let identity = match identity {
-                Ok(identity) => identity,
-                Err(error) => {
-                    tracing::warn!("could not fetch identity: {}", error);
-                    None
-                }
-            };
-            let out = WhoamiOutput {
-                provider: &name,
-                backend: &profile.backend,
-                auth,
-                identity,
-            };
-            match format {
-                cli::OutputFormat::Plain => print!("{}", format_whoami_plain(&out)),
-                cli::OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&out)?),
-            }
-            if !out.auth.valid {
-                std::process::exit(1);
-            }
-        }
-        cli::AccountAction::Stats { .. } => match provider.fetch_history().await? {
-            Some(history) => {
-                let out = StatsOutput {
-                    provider: &name,
-                    history: &history,
-                };
-                match format {
-                    cli::OutputFormat::Plain => print!("{}", format_stats_plain(&out)),
-                    cli::OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&out)?)
-                    }
-                }
-            }
-            None => {
-                eprintln!("Account history isn't available for provider '{}'.", name);
-                std::process::exit(1);
-            }
-        },
-    }
-    Ok(())
-}
-
-#[derive(serde::Serialize)]
-struct StatsOutput<'a> {
-    provider: &'a str,
-    #[serde(flatten)]
-    history: &'a crate::provider::UsageHistory,
-}
-
-/// Plain-text (ANSI-free) rendering of `meka account stats`.
-fn format_stats_plain(out: &StatsOutput<'_>) -> String {
-    use std::fmt::Write as _;
-    let history = out.history;
-    let mut text = format!("Account history: {}\n", out.provider);
-    let row_tokens = |text: &mut String, label: &str, value: Option<i64>| {
-        if let Some(value) = value {
-            let _ = writeln!(
-                text,
-                "  {label:<18} {}",
-                render::format_token_count(value.max(0) as u64)
-            );
-        }
-    };
-    let row_days = |text: &mut String, label: &str, value: Option<i64>| {
-        if let Some(value) = value {
-            let _ = writeln!(text, "  {label:<18} {value} days");
-        }
-    };
-    if let Some(first) = &history.first_used {
-        // Trim an RFC 3339 timestamp to just the date for the human view.
-        let date = first.split('T').next().unwrap_or(first);
-        let _ = writeln!(text, "  {:<18} {date}", "First used:");
-    }
-    row_tokens(&mut text, "Lifetime tokens:", history.lifetime_tokens);
-    row_tokens(&mut text, "Peak daily:", history.peak_daily_tokens);
-    row_days(&mut text, "Current streak:", history.current_streak_days);
-    row_days(&mut text, "Longest streak:", history.longest_streak_days);
-    if !history.daily.is_empty() {
-        let _ = writeln!(text, "  Recent:");
-        for day in history.daily.iter().rev().take(7) {
-            let _ = writeln!(
-                text,
-                "    {}  {}",
-                day.date,
-                render::format_token_count(day.tokens.max(0) as u64)
-            );
-        }
-    }
-    text
-}
-
-/// Plain-text (ANSI-free) rendering of `meka account whoami`.
-fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
-    use std::fmt::Write as _;
-    let mut text = format!("Account: {} ({})\n", out.provider, out.backend);
-    let auth = match (out.auth.valid, out.auth.expires_in_seconds) {
-        (true, Some(secs)) => format!("valid ({})", render::format_duration_short(secs.max(0))),
-        (true, None) => "valid".to_string(),
-        (false, _) => "EXPIRED: run `meka provider login`".to_string(),
-    };
-    let _ = writeln!(text, "  Auth:          {auth}");
-    if let Some(identity) = &out.identity {
-        let row = |text: &mut String, label: &str, value: &Option<String>| {
-            if let Some(value) = value {
-                let _ = writeln!(text, "  {label:<14} {value}");
-            }
-        };
-        row(&mut text, "Name:", &identity.display_name);
-        row(&mut text, "Email:", &identity.email);
-        row(&mut text, "Plan:", &identity.plan);
-        row(&mut text, "Tier:", &identity.tier);
-        row(&mut text, "Subscription:", &identity.subscription_status);
-        row(&mut text, "Organization:", &identity.organization);
-        row(&mut text, "Role:", &identity.role);
-    }
-    text
-}
-
-async fn run_session_subcommand(
-    session_manager: &SessionManager,
-    action: &cli::SessionAction,
-) -> anyhow::Result<()> {
-    match action {
-        cli::SessionAction::List {
-            limit,
-            include_children,
-        } => list_sessions(session_manager, *limit, *include_children).await,
-        cli::SessionAction::Export {
-            session_id,
-            output,
-            format,
-        } => {
-            // The written path is only interesting to the REPL; out here the shell (and the `-o`
-            // the user typed) already knows where it went.
-            export_session(session_manager, *session_id, output.as_deref(), *format).await?;
-            Ok(())
-        }
-        cli::SessionAction::Delete {
-            session_ids,
-            all,
-            older_than_days,
-        } => delete_sessions(session_manager, session_ids, *all, *older_than_days).await,
-        cli::SessionAction::Import { input } => import_session(session_manager, input).await,
-        cli::SessionAction::Fork { session_id } => {
-            fork_session_command(session_manager, *session_id).await
-        }
-        cli::SessionAction::Rewind { session_id, turns } => {
-            rewind_session_command(session_manager, *session_id, *turns).await
-        }
-    }
-}
-
-/// `meka session rewind`: drop the last `turns` turns from a session that isn't currently open.
-///
-/// The escape hatch for content `Agent::run_turn` can't repair itself, namely anything the provider
-/// refuses that was committed before the current turn. Appends an `Event::Repair` with an empty
-/// replacement, so nothing is deleted and `meka session export` still shows the dropped turns.
-async fn rewind_session_command(
-    session_manager: &SessionManager,
-    session_id: uuid::Uuid,
-    turns: usize,
-) -> anyhow::Result<()> {
-    // Rejected before anything else: `Conversation::rewind(0)` returns `None` unconditionally, so
-    // the error below would otherwise say the session has "fewer than 0 turn(s)".
-    if turns == 0 {
-        anyhow::bail!("-n must be 1 or more");
-    }
-    // Held for the whole read-modify-write. A REPL, `meka serve`, or `meka acp` holding this
-    // session has its own in-memory conversation that would overwrite the rewind on its next turn.
-    if !session_manager.session_exists(session_id).await? {
-        anyhow::bail!("session not found: {}", session_id);
-    }
-    let _lock = session_manager.lock_session(session_id)?;
-
-    let events = session_manager.load_events(session_id).await?;
-    let mut conversation = conversation::Conversation::from_events(events);
-
-    let Some(event) = conversation.rewind(turns) else {
-        anyhow::bail!(
-            "nothing to rewind: session {} has fewer than {} turn(s)",
-            session_id,
-            turns
-        );
-    };
-    session_manager.save_event(session_id, &event).await?;
-
-    tracing::info!("rewound {} turn(s) from session {}", turns, session_id);
-    eprintln!(
-        "Rewound {} turn(s); {} message(s) remain. The full history is still in \
-         `meka session export`.",
-        turns,
-        conversation.len(),
-    );
-    Ok(())
-}
-
 async fn run_history_subcommand(
     session_manager: &SessionManager,
     action: &cli::HistoryAction,
@@ -3191,241 +2786,6 @@ async fn run_history_subcommand(
         }
     }
     Ok(())
-}
-
-async fn list_sessions(
-    session_manager: &SessionManager,
-    limit: u32,
-    include_children: bool,
-) -> anyhow::Result<()> {
-    let (sessions, _next_cursor) = session_manager
-        .list_sessions(limit, include_children, None, None)
-        .await?;
-
-    if sessions.is_empty() {
-        eprintln!("No sessions found.");
-        return Ok(());
-    }
-
-    let rows: Vec<Vec<String>> = sessions
-        .iter()
-        .map(|session| {
-            vec![
-                session.id.to_string(),
-                format_timestamp(&session.updated_at),
-                session.preview.clone(),
-            ]
-        })
-        .collect();
-    print!(
-        "{}",
-        render::format_columns(&["ID", "Updated", "Preview"], &rows)
-    );
-
-    Ok(())
-}
-
-async fn delete_sessions(
-    session_manager: &SessionManager,
-    session_ids: &[uuid::Uuid],
-    all: bool,
-    older_than_days: Option<u64>,
-) -> anyhow::Result<()> {
-    if all {
-        let deleted = session_manager.delete_all_sessions().await?;
-        tracing::info!("deleted {} session(s)", deleted);
-        return Ok(());
-    }
-
-    // The manual counterpart to `[session].retention_days`, now that nothing prunes on its own.
-    // Reports the count through `info!` like the `--all` and by-id branches below: the user ran
-    // this to delete, not to obtain a number, and the exit code already carries success.
-    if let Some(days) = older_than_days {
-        // Zero would sweep everything, which is `--all` by another name and far too easy to type
-        // by accident when you meant "today's".
-        if days == 0 {
-            anyhow::bail!(
-                "--older-than-days 0 would delete every session; use --all if you mean that"
-            );
-        }
-        let deleted = session_manager.delete_expired_sessions(days).await?;
-        tracing::info!(
-            "deleted {} session(s) not updated in {} days",
-            deleted,
-            days
-        );
-        return Ok(());
-    }
-
-    if session_ids.is_empty() {
-        anyhow::bail!("specify one or more session IDs, --older-than-days <DAYS>, or --all");
-    }
-
-    let mut deleted = 0u64;
-    for session_id in session_ids {
-        if session_manager.delete_session(*session_id).await? {
-            deleted += 1;
-        } else {
-            // User-facing error: they asked to delete a specific ID and we couldn't find it, so
-            // stderr (not silent) is right.
-            eprintln!("Session not found: {}", session_id);
-        }
-    }
-
-    tracing::info!("deleted {} session(s)", deleted);
-    Ok(())
-}
-
-fn format_timestamp(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|_| rfc3339.to_string())
-}
-
-pub(crate) fn format_session_as_markdown(
-    session_id: uuid::Uuid,
-    events: &[conversation::Event],
-    tool_outputs: &std::collections::HashMap<String, String>,
-) -> String {
-    use std::fmt::Write;
-
-    let mut output = String::new();
-    writeln!(output, "# Session {}\n", session_id).ok();
-
-    // Walk the raw event log so the full conversation is exported, including turns a compaction
-    // later hid from the model. Each `CompactBoundary` becomes a marker; the turns it summarized
-    // stay above it (the kept tail is re-appended after it, so the recent turns appear on both
-    // sides of the marker, as stored).
-    for event in events {
-        match event {
-            conversation::Event::Append(message) => {
-                write_message_markdown(&mut output, message, tool_outputs);
-            }
-            conversation::Event::CompactBoundary { summary, .. } => {
-                writeln!(output, "---\n").ok();
-                writeln!(output, "<details>").ok();
-                writeln!(
-                    output,
-                    "<summary>Session compaction (summary the model saw in place of the turns above)</summary>\n"
-                )
-                .ok();
-                writeln!(output, "{}\n", summary.text_content()).ok();
-                writeln!(output, "</details>\n").ok();
-            }
-            // Same treatment as a boundary: mark what happened and render the replacement, leaving
-            // the superseded messages above it. An export is the record of the session, and a
-            // repair (or a rewind, which is a repair with nothing to put back) is the one place
-            // where what the model saw and what actually happened diverge.
-            conversation::Event::Repair {
-                replaced_count,
-                messages,
-            } => {
-                writeln!(output, "---\n").ok();
-                writeln!(output, "<details>").ok();
-                writeln!(
-                    output,
-                    "<summary>{} message(s) above replaced with {} (rejected by the provider, or rewound)</summary>\n",
-                    replaced_count,
-                    if messages.is_empty() {
-                        "nothing".to_string()
-                    } else {
-                        format!("{} message(s)", messages.len())
-                    },
-                )
-                .ok();
-                for message in messages {
-                    write_message_markdown(&mut output, message, tool_outputs);
-                }
-                writeln!(output, "</details>\n").ok();
-            }
-        }
-    }
-
-    output
-}
-
-fn write_message_markdown(
-    output: &mut String,
-    message: &provider::Message,
-    tool_outputs: &std::collections::HashMap<String, String>,
-) {
-    use std::fmt::Write;
-
-    match message.role {
-        provider::Role::User => {
-            // A "user" message can be either a plain user turn or a tool_results envelope.
-            // Inspect content blocks rather than role to decide.
-            let has_tool_results = message
-                .content
-                .iter()
-                .any(|block| matches!(block, provider::ContentBlock::ToolResult { .. }));
-            if has_tool_results {
-                for block in &message.content {
-                    if let provider::ContentBlock::ToolResult {
-                        content, is_error, ..
-                    } = block
-                    {
-                        let label = if *is_error {
-                            "Tool result (error)"
-                        } else {
-                            "Tool result"
-                        };
-                        writeln!(output, "<details>").ok();
-                        writeln!(output, "<summary>{}</summary>\n", label).ok();
-                        let text = provider::ContentBlock::tool_result_text_content(content);
-                        let text = resolve_large_output_tags(&text, tool_outputs);
-                        writeln!(output, "```\n{}\n```\n", text).ok();
-                        writeln!(output, "</details>\n").ok();
-                    }
-                }
-            } else {
-                writeln!(output, "## User\n").ok();
-                writeln!(output, "{}\n", message.text_content()).ok();
-            }
-        }
-        provider::Role::Assistant => {
-            writeln!(output, "## Assistant\n").ok();
-            for block in &message.content {
-                match block {
-                    provider::ContentBlock::Text { text } => {
-                        writeln!(output, "{}\n", text).ok();
-                    }
-                    provider::ContentBlock::ToolUse { name, input, .. } => {
-                        let input_pretty = serde_json::to_string_pretty(input)
-                            .unwrap_or_else(|_| input.to_string());
-                        writeln!(output, "<details>").ok();
-                        writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
-                        writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
-                        writeln!(output, "</details>\n").ok();
-                    }
-                    provider::ContentBlock::ToolResult { .. }
-                    | provider::ContentBlock::Thinking { .. }
-                    | provider::ContentBlock::RedactedThinking { .. }
-                    | provider::ContentBlock::Image { .. } => {}
-                }
-            }
-        }
-    }
-}
-
-fn resolve_large_output_tags(
-    text: &str,
-    tool_outputs: &std::collections::HashMap<String, String>,
-) -> String {
-    let re = match regex::Regex::new(r#"<large-output name="([^"]+)"[^>]*>[\s\S]*?</large-output>"#)
-    {
-        Ok(re) => re,
-        Err(_) => return text.to_string(),
-    };
-
-    re.replace_all(text, |caps: &regex::Captures| {
-        let name = &caps[1];
-        match tool_outputs.get(name) {
-            Some(content) => content.clone(),
-            None => caps[0].to_string(),
-        }
-    })
-    .into_owned()
 }
 
 /// Translate the live-REPL display config into the options that [`render::render_message_history`]
@@ -3621,6 +2981,61 @@ async fn load_session_messages(
 mod tests {
     use super::*;
 
+    /// A REPL sweep is evaluated against the level the session is at now, not the one it launched
+    /// with.
+    ///
+    /// This is the wiring half of the scheduled-gate fix, and it is the half that was wrong: the
+    /// refusal logic in `schedule.rs` is well covered at both `read` and `write`, but every one of
+    /// those tests *supplies* the host permission. Nothing checked that the REPL supplies a live
+    /// one, so the gate compared against a startup snapshot that `Shift+Tab` never touches.
+    #[test]
+    fn a_repl_sweep_reads_the_permission_the_session_is_at_now() {
+        let configured = crate::config::ResolvedScheduleConfig {
+            enabled: true,
+            host_permission: crate::permission::Permission::Read,
+            poll_interval: std::time::Duration::from_secs(10),
+            missed_grace: std::time::Duration::from_secs(60),
+            gate_timeout: std::time::Duration::from_secs(30),
+            max_jobs: 50,
+            max_consecutive_fires: 5,
+        };
+        let live = SharedPermission::new(
+            crate::permission::Permission::Read,
+            crate::permission::EnabledPermissions::from_modes([
+                crate::permission::Permission::Read,
+                crate::permission::Permission::Write,
+            ])
+            .expect("a non-empty mode set"),
+        );
+
+        // Cycling up is what lets a gate authored now ever fire.
+        live.try_set(crate::permission::Permission::Write)
+            .expect("write is enabled");
+        assert_eq!(
+            schedule_config_at_live_permission(&configured, &live).host_permission,
+            crate::permission::Permission::Write,
+            "a gate authored after cycling up to write would be refused forever"
+        );
+
+        // And cycling down is what withdraws one already written, which is the security half.
+        live.try_set(crate::permission::Permission::Read)
+            .expect("read is enabled");
+        assert_eq!(
+            schedule_config_at_live_permission(&configured, &live).host_permission,
+            crate::permission::Permission::Read,
+            "an unattended shell command kept running after the authority behind it was withdrawn"
+        );
+
+        // Everything else is carried through untouched; only the permission is substituted.
+        let derived = schedule_config_at_live_permission(&configured, &live);
+        assert_eq!(derived.poll_interval, configured.poll_interval);
+        assert_eq!(
+            derived.max_consecutive_fires,
+            configured.max_consecutive_fires
+        );
+        assert_eq!(derived.enabled, configured.enabled);
+    }
+
     /// Zero days means "not updated since this instant", i.e. everything. Easy to type when you
     /// meant "today's", and unrecoverable, so it is refused rather than run.
     #[tokio::test]
@@ -3628,7 +3043,7 @@ mod tests {
         let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
             .await
             .expect("in-memory db");
-        let error = delete_sessions(&manager, &[], false, Some(0))
+        let error = crate::session::cli::delete_sessions(&manager, &[], false, Some(0))
             .await
             .expect_err("zero must be refused");
         assert!(error.to_string().contains("--all"), "{error}");
@@ -3649,7 +3064,7 @@ mod tests {
             .await
             .expect("backdate");
 
-        delete_sessions(&manager, &[], false, Some(30))
+        crate::session::cli::delete_sessions(&manager, &[], false, Some(30))
             .await
             .expect("sweep");
 
@@ -3663,7 +3078,7 @@ mod tests {
         let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
             .await
             .expect("in-memory db");
-        let error = delete_sessions(&manager, &[], false, None)
+        let error = crate::session::cli::delete_sessions(&manager, &[], false, None)
             .await
             .expect_err("no selector must be an error");
         let text = error.to_string();
@@ -3699,7 +3114,7 @@ mod tests {
             ("a".to_string(), None),
             ("b".to_string(), Some("a".to_string())),
         ];
-        let order = parents_first_order(&nodes).expect("order");
+        let order = crate::session::cli::parents_first_order(&nodes).expect("order");
         let position = |id: &str| order.iter().position(|&i| nodes[i].0 == id).unwrap();
         assert!(position("a") < position("b"));
         assert!(position("b") < position("c"));
@@ -3710,16 +3125,10 @@ mod tests {
         // A parent absent from the set (e.g. the exported root was itself a sub-agent) is not an
         // error; the node is ordered as a root.
         let nodes = vec![("only".to_string(), Some("outside".to_string()))];
-        assert_eq!(parents_first_order(&nodes).expect("order"), vec![0]);
-    }
-
-    #[test]
-    fn test_parents_first_order_rejects_cycle() {
-        let nodes = vec![
-            ("a".to_string(), Some("b".to_string())),
-            ("b".to_string(), Some("a".to_string())),
-        ];
-        assert!(parents_first_order(&nodes).is_err());
+        assert_eq!(
+            crate::session::cli::parents_first_order(&nodes).expect("order"),
+            vec![0]
+        );
     }
 
     /// `meka -c <uuid>` was the documented way to resume a specific session before `-c` became a
@@ -3737,386 +3146,6 @@ mod tests {
         assert!(!looks_like_session_id("why?"));
         // Too short to be a useful prefix, so treated as a prompt.
         assert!(!looks_like_session_id("550e"));
-    }
-
-    #[test]
-    fn test_plan_import_rejects_unknown_format_version() {
-        let export = SessionExport {
-            format_version: SESSION_EXPORT_FORMAT_VERSION + 1,
-            meka_version: "test".into(),
-            exported_at: "now".into(),
-            root_session_id: "r".into(),
-            sessions: Vec::new(),
-        };
-        assert!(plan_import(export).is_err());
-    }
-
-    #[tokio::test]
-    async fn test_session_export_import_round_trip() {
-        use std::path::Path;
-
-        use crate::{
-            conversation::Event,
-            provider::{ContentBlock, ImageSource, Message, Role, ToolResultContent},
-        };
-
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("open");
-
-        // Root session with a representative mix of events: plain text, an input image, a
-        // tool_use/tool_result pair, and a compaction boundary.
-        let root = manager.create_session(None).await.expect("root");
-        let image = ImageSource {
-            source_type: "base64".to_string(),
-            media_type: "image/png".to_string(),
-            data: "aGk=".to_string(),
-        };
-        let root_events = vec![
-            Event::Append(Message::user("hello")),
-            Event::Append(Message::user_with_images("look", vec![image])),
-            Event::Append(Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "u1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({"path": "/x"}),
-                }],
-            }),
-            Event::Append(Message {
-                role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "u1".to_string(),
-                    content: vec![ToolResultContent::Text {
-                        text: "ok".to_string(),
-                    }],
-                    is_error: false,
-                }],
-            }),
-            Event::CompactBoundary {
-                summary: Message::user("[summary]"),
-                replaced_count: 2,
-                loaded_tools_snapshot: Default::default(),
-            },
-        ];
-        for event in &root_events {
-            manager
-                .save_event(root, event)
-                .await
-                .expect("save root event");
-        }
-        manager
-            .save_tool_output(root, "tool_1_output", "big output")
-            .await
-            .expect("tool output");
-        let stats = crate::stats::SessionStatsSnapshot {
-            turns: 3,
-            input_tokens: 1000,
-            ..Default::default()
-        };
-        manager
-            .save_session_stats(root, &stats)
-            .await
-            .expect("stats");
-
-        // A sub-agent child of the root, with the spawn terms `agent_followup` reconstructs from.
-        // An archive that drops these imports a worker nobody can resume.
-        let child_spec = r#"{"permission":"read","enabled_permissions":["read"],"denied_servers":["mekabridge"],"denied_tools":[],"memory":"none","inherited_scratchpad":[],"remaining_depth":0,"absolute_depth":1}"#;
-        let child = manager
-            .create_child_session(root, None, Some(child_spec.to_string()))
-            .await
-            .expect("child");
-        for event in [
-            Event::Append(Message::user("sub task")),
-            Event::Append(Message::assistant_text("sub done")),
-        ] {
-            manager.save_event(child, &event).await.expect("save child");
-        }
-
-        // Export -> JSON -> back.
-        let export = build_session_export(&manager, root).await.expect("export");
-        assert_eq!(export.sessions.len(), 2, "root + child");
-        assert_eq!(export.sessions[0].id, root.to_string(), "root first");
-        let json = serde_json::to_string_pretty(&export).expect("serialize");
-        assert!(
-            !json.contains("token_id"),
-            "the fingerprint must not be exported"
-        );
-        let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
-
-        // Import under fresh IDs.
-        let (records, root_new_id) = plan_import(reparsed).expect("plan");
-        assert_ne!(root_new_id, root, "import mints a new id");
-        manager.import_sessions(records).await.expect("import");
-
-        // The tree came back: root + child, with the child's parent rewired to the new root.
-        let tree = manager.load_session_tree(root_new_id).await.expect("tree");
-        assert_eq!(tree.len(), 2);
-        let child_new = tree
-            .iter()
-            .find(|meta| meta.id != root_new_id)
-            .expect("child present");
-        assert_eq!(child_new.parent_id, Some(root_new_id));
-        // The spawn terms survived export -> JSON -> import. This is also the column-alignment
-        // check on `import_sessions`' 17-parameter INSERT: reading the spec back verbatim off a
-        // different column would surface here as a mismatch rather than silently.
-        assert_eq!(
-            manager
-                .load_subagent_spec(child_new.id)
-                .await
-                .expect("load spec"),
-            Some(child_spec.to_string()),
-        );
-        assert_eq!(
-            manager
-                .load_subagent_spec(root_new_id)
-                .await
-                .expect("load root spec"),
-            None,
-            "a top-level session has no spawn terms",
-        );
-        assert_eq!(
-            child_new.cwd, None,
-            "and neighbouring columns are undisturbed"
-        );
-        assert_eq!(child_new.permission, None);
-
-        // The event log round-trips byte-for-byte against the untouched original.
-        let imported = manager
-            .load_events(root_new_id)
-            .await
-            .expect("load imported");
-        let original = manager.load_events(root).await.expect("load original");
-        assert_eq!(
-            serde_json::to_string(&imported).unwrap(),
-            serde_json::to_string(&original).unwrap(),
-        );
-        assert!(
-            imported.iter().any(|event| match event {
-                Event::Append(message) => message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Image { .. })),
-                _ => false,
-            }),
-            "the input image must survive the round trip",
-        );
-
-        // Child events, stats, and tool_outputs are preserved.
-        assert_eq!(
-            manager
-                .load_events(child_new.id)
-                .await
-                .expect("load child events")
-                .len(),
-            2,
-        );
-        let imported_stats = manager
-            .load_session_stats(root_new_id)
-            .await
-            .expect("load stats");
-        assert_eq!(imported_stats.turns, 3);
-        assert_eq!(imported_stats.input_tokens, 1000);
-        assert_eq!(
-            manager
-                .load_all_tool_outputs(root_new_id)
-                .await
-                .expect("load outputs"),
-            vec![("tool_1_output".to_string(), "big output".to_string())],
-        );
-    }
-
-    /// `/fork` must own the copy's lock before the REPL lets go of the one it is holding. That
-    /// ordering is now structural rather than tested: [`fork_and_lock`] is handed no lock, so it
-    /// has no way to release the caller's, and the caller can only give its up by assigning the
-    /// returned one over it.
-    ///
-    /// What this pins is the pair of facts that make the structure sound: the returned lock is
-    /// genuinely held on the copy (not a stale handle the REPL would rely on), and the source's
-    /// lock is untouched, so the failure path really is "stay put".
-    #[tokio::test]
-    async fn test_fork_and_lock_holds_both_locks_at_the_handoff() {
-        use std::path::Path;
-
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("open");
-        let source = manager.create_session(None).await.expect("create");
-        let source_lock = manager.lock_session(source).expect("lock source");
-
-        let handoff = fork_and_lock(&manager, source).await.expect("fork");
-        let ForkHandoff::Switched { id, lock } = handoff else {
-            panic!("expected a switch");
-        };
-
-        assert!(
-            manager.lock_session(id).is_err(),
-            "the returned lock must actually be held on the copy"
-        );
-        assert!(
-            manager.lock_session(source).is_err(),
-            "and the source's lock must still be held: releasing it first is the bug"
-        );
-
-        // Only once the caller drops the old guard does the source become available again.
-        drop(source_lock);
-        manager.lock_session(source).expect("source is free again");
-        drop(lock);
-    }
-
-    #[tokio::test]
-    async fn test_fork_and_lock_reports_a_missing_source() {
-        use std::path::Path;
-
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("open");
-        assert!(matches!(
-            fork_and_lock(&manager, uuid::Uuid::new_v4())
-                .await
-                .expect("fork"),
-            ForkHandoff::SourceGone,
-        ));
-    }
-
-    /// Multi-root sessions used to come back from an export as single-root: the column existed but
-    /// no export/import struct carried it.
-    #[tokio::test]
-    async fn test_session_export_preserves_additional_roots() {
-        use std::path::{Path, PathBuf};
-
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("open");
-        let root = manager
-            .create_session(Some(PathBuf::from("/work/main")))
-            .await
-            .expect("root");
-        let roots = vec![PathBuf::from("/work/shared"), PathBuf::from("/work/docs")];
-        manager
-            .update_session_roots(root, &roots)
-            .await
-            .expect("roots");
-
-        let export = build_session_export(&manager, root).await.expect("export");
-        let json = serde_json::to_string(&export).expect("serialize");
-        let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
-        let (records, new_id) = plan_import(reparsed).expect("plan");
-        manager.import_sessions(records).await.expect("import");
-
-        assert_eq!(
-            manager
-                .session_info(new_id)
-                .await
-                .expect("info")
-                .expect("row")
-                .additional_roots,
-            roots,
-        );
-    }
-
-    /// An export written before `additional_roots` existed must still import. This is why the field
-    /// is `#[serde(default)]` instead of a `format_version` bump, which `plan_import` would reject.
-    #[test]
-    fn test_plan_import_accepts_an_export_without_additional_roots() {
-        let json = serde_json::json!({
-            "format_version": SESSION_EXPORT_FORMAT_VERSION,
-            "meka_version": "0.0.0",
-            "exported_at": "2020-01-01T00:00:00Z",
-            "root_session_id": "11111111-1111-4111-8111-111111111111",
-            "sessions": [{
-                "id": "11111111-1111-4111-8111-111111111111",
-                "parent_id": null,
-                "created_at": "2020-01-01T00:00:00Z",
-                "updated_at": "2020-01-01T00:00:00Z",
-                "cwd": null,
-                "permission": null,
-                "capabilities_json": null,
-                "stats": crate::stats::SessionStatsSnapshot::default(),
-                "events": [],
-                "tool_outputs": {},
-            }],
-        });
-        let export: SessionExport = serde_json::from_value(json).expect("deserialize");
-        let (records, _) = plan_import(export).expect("plan");
-        assert!(records[0].additional_roots.is_empty());
-    }
-
-    /// Regression: import restored the export's `updated_at`, and retention GC deletes by that
-    /// column when `[session].retention_days` is set, so restoring an archive older than that was
-    /// undone by the next launch before anyone could resume it.
-    #[tokio::test]
-    async fn test_import_survives_retention_gc() {
-        use std::path::Path;
-
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("open");
-        let stale = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
-        let records = vec![crate::session::ImportSessionRecord {
-            new_id: uuid::Uuid::new_v4(),
-            new_parent_id: None,
-            created_at: stale.clone(),
-            cwd: None,
-            permission: None,
-            capabilities_json: None,
-            additional_roots: Vec::new(),
-            subagent_spec_json: None,
-            stats: crate::stats::SessionStatsSnapshot::default(),
-            events: Vec::new(),
-            tool_outputs: Vec::new(),
-        }];
-        let imported_id = records[0].new_id;
-        manager.import_sessions(records).await.expect("import");
-
-        assert_eq!(
-            manager
-                .delete_expired_sessions(90)
-                .await
-                .expect("retention sweep"),
-            0,
-            "a freshly imported archive must not be swept on the next launch"
-        );
-        assert!(manager.session_exists(imported_id).await.expect("exists"));
-
-        // `created_at` still carries the original for provenance.
-        assert_eq!(
-            manager
-                .session_info(imported_id)
-                .await
-                .expect("info")
-                .expect("row")
-                .created_at,
-            stale,
-        );
-    }
-
-    #[test]
-    fn test_auth_status_from_credential() {
-        let future = AuthCredential::OAuthToken {
-            access_token: "t".into(),
-            refresh_token: None,
-            // 1 hour out, in epoch millis.
-            expires_at: Some((chrono::Utc::now().timestamp() + 3600) * 1000),
-            account_id: None,
-        };
-        let status = AuthStatus::from_credential(&future);
-        assert!(status.valid);
-        assert!(status.expires_in_seconds.unwrap() > 3000);
-
-        let expired = AuthCredential::OAuthToken {
-            access_token: "t".into(),
-            refresh_token: None,
-            expires_at: Some((chrono::Utc::now().timestamp() - 60) * 1000),
-            account_id: None,
-        };
-        assert!(!AuthStatus::from_credential(&expired).valid);
-
-        // API keys never expire.
-        let api = AuthCredential::ApiKey("k".into());
-        let status = AuthStatus::from_credential(&api);
-        assert!(status.valid);
-        assert_eq!(status.expires_at, None);
     }
 
     fn user_msg(text: &str) -> provider::Message {
@@ -4269,50 +3298,11 @@ mod tests {
     }
 
     #[test]
-    fn full_export_includes_pre_compaction_turns() {
-        // A compacted session: the early turns are hidden from the model behind a CompactBoundary,
-        // but `meka session export` must still render them. Build the same event log compaction
-        // produces and assert the export contains both the summarized turns and a boundary marker.
-        let mut log = conversation::Conversation::new();
-        log.append(user_msg("first question"));
-        log.append(assistant_text("first answer"));
-        log.append(user_msg("second question"));
-        log.append(assistant_text("second answer"));
-        log.replace_for_compaction(
-            user_msg("[Conversation summary from session compaction]\n\nYou discussed things."),
-            vec![assistant_text("kept tail answer")],
-            std::collections::HashSet::new(),
-        );
-
-        let markdown = format_session_as_markdown(
-            uuid::Uuid::nil(),
-            log.events(),
-            &std::collections::HashMap::new(),
-        );
-
-        // Pre-compaction turns survive in the export even though the model no longer sees them.
-        assert!(
-            markdown.contains("first question") && markdown.contains("second answer"),
-            "full export must include pre-compaction turns:\n{markdown}"
-        );
-        // The boundary is marked, and its summary is available (collapsed).
-        assert!(
-            markdown.contains("Session compaction") && markdown.contains("You discussed things."),
-            "full export must mark the compaction boundary:\n{markdown}"
-        );
-        // The retained tail (re-appended after the boundary) is present.
-        assert!(
-            markdown.contains("kept tail answer"),
-            "full export must include the retained tail:\n{markdown}"
-        );
-    }
-
-    #[test]
     fn export_without_compaction_renders_plain_turns() {
         let mut log = conversation::Conversation::new();
         log.append(user_msg("hello"));
         log.append(assistant_text("hi there"));
-        let markdown = format_session_as_markdown(
+        let markdown = crate::session::cli::format_session_as_markdown(
             uuid::Uuid::nil(),
             log.events(),
             &std::collections::HashMap::new(),

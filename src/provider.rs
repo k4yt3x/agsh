@@ -15,7 +15,7 @@ pub(crate) mod openai;
 /// Backoff policy for retrying [`crate::error::MekaError::RetryableProvider`] failures.
 pub(crate) mod retry;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 pub(crate) use claude::model_supports_adaptive_thinking;
@@ -38,6 +38,84 @@ pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7
 
 pub const SUPPORTED_PROVIDERS: &[&str] =
     &["openai-api", "openai-codex", "claude-api", "claude-oauth"];
+
+/// How long a provider stream may go without producing anything before it is treated as dead.
+///
+/// This bounds *silence*, never a turn. A model thinking hard, or a request queued behind a busy
+/// endpoint, keeps sending: reasoning deltas, text deltas, ping events. Nothing here caps how long
+/// a turn may legitimately run, how many tool calls it may make, or how many tokens it may spend.
+///
+/// Measured in decodable SSE *events*, not bytes. All three drivers wrap `event_stream.next()`, and
+/// `eventsource-stream` discards comment lines and refuses to dispatch a data-empty event, so a
+/// keepalive that is only `: ping` does not reset this clock -- an endpoint sending nothing else
+/// for five minutes is treated as silent, which is the intended reading of it but not what "without
+/// a byte" would mean. Bounding actual bytes would mean timing the response body underneath the SSE
+/// decoder in all three drivers, for a shape no provider meka targets produces; the wording is
+/// corrected instead. Every provider in use sends `ping` / `keep-alive` events with a data field,
+/// which do reset it.
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait for the TCP + TLS handshake before giving up on a provider endpoint.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client every provider backend uses.
+///
+/// Deliberately sets `connect_timeout` and `read_timeout` and *not* `timeout`. A whole-request
+/// deadline would kill a legitimate long turn, which is the one thing the harness must not do;
+/// `read_timeout` resets on every successful read, so it fires only when the connection has gone
+/// quiet. Without either, a dropped route left the turn waiting on a socket that would never
+/// produce another byte, with no error and no retry.
+pub(crate) fn build_http_client(
+    backend: &str,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client> {
+    configure(
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(STREAM_IDLE_TIMEOUT),
+    )
+    .build()
+    .map_err(|error| MekaError::Provider(format!("failed to build {backend} HTTP client: {error}")))
+}
+
+/// How long before an access token's stated expiry to refresh it, so a token cannot expire between
+/// the header being built and the request arriving.
+const OAUTH_REFRESH_SKEW_MILLIS: i64 = 300_000;
+
+/// How long a refreshed access token is assumed to last when its issuer states no expiry.
+///
+/// An *unlabelled stored* credential being due is right: refreshing it is how it becomes labelled.
+/// An unlabelled credential coming back *from that refresh* is a different thing -- the issuer
+/// answered and still said nothing -- and treating it the same way put every subsequent request
+/// back on the slow path: the credential write lock, a database re-read, and a full OAuth round
+/// trip that rotates the refresh token, all serialised behind one another. Assuming a short life
+/// bounds the staleness without the storm, and a token that dies sooner is corrected by its 401.
+const OAUTH_ASSUMED_LIFETIME_MILLIS: i64 = 3_600_000;
+
+/// Expiry to record for a refreshed token whose issuer named none.
+pub(crate) fn oauth_assumed_expiry(now_millis: i64) -> i64 {
+    now_millis.saturating_add(OAUTH_ASSUMED_LIFETIME_MILLIS)
+}
+
+/// Whether an OAuth access token should be refreshed before the next request.
+///
+/// `expires_at: None` means the issuer did not say when the token expires, which is not a promise
+/// that it never will. Reading it that way turned an unlabelled token into a 401 on every request
+/// with no refresh ever attempted. It is treated as due, but only when there is a refresh token to
+/// act on: without one, the only thing left is to send it and let the 401 speak.
+///
+/// The refresh paths stamp [`oauth_assumed_expiry`] rather than handing `None` straight back, so
+/// "due" here stays a one-shot rather than a per-request loop.
+pub(crate) fn oauth_needs_refresh(
+    expires_at: Option<i64>,
+    has_refresh_token: bool,
+    now_millis: i64,
+) -> bool {
+    match expires_at {
+        Some(expiry) => now_millis.saturating_add(OAUTH_REFRESH_SKEW_MILLIS) >= expiry,
+        None => has_refresh_token,
+    }
+}
 
 tokio::task_local! {
     /// True while a sub-agent's turn is running. The Claude OAuth provider is shared across the
@@ -74,7 +152,7 @@ pub(crate) fn normalize_base_url(url: &str) -> String {
     normalized.to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AuthCredential {
     ApiKey(String),
     OAuthToken {
@@ -86,6 +164,42 @@ pub enum AuthCredential {
         /// JWT, sent on every request as `ChatGPT-Account-ID`. Claude OAuth leaves it `None`.
         account_id: Option<String>,
     },
+}
+
+/// Hand-written so a credential cannot reach a log through a `{:?}` on any struct that holds one.
+///
+/// The derived impl printed the bearer token verbatim, and a provider struct is exactly the kind of
+/// thing that ends up inside a `tracing::debug!` or an error's `{:?}` during a bad afternoon.
+/// Lengths are kept because they are what a "wrong key pasted" diagnosis actually needs.
+impl std::fmt::Debug for AuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(key) => f
+                .debug_tuple("ApiKey")
+                .field(&format_args!("[REDACTED len={}]", key.len()))
+                .finish(),
+            Self::OAuthToken {
+                access_token,
+                refresh_token,
+                expires_at,
+                account_id,
+            } => f
+                .debug_struct("OAuthToken")
+                .field(
+                    "access_token",
+                    &format_args!("[REDACTED len={}]", access_token.len()),
+                )
+                .field(
+                    "refresh_token",
+                    &refresh_token
+                        .as_ref()
+                        .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
+                )
+                .field("expires_at", expires_at)
+                .field("account_id", account_id)
+                .finish(),
+        }
+    }
 }
 
 impl AuthCredential {
@@ -779,7 +893,19 @@ async fn finalize_tool_call_accumulators(
                 tracing::trace!("stream event receiver dropped");
                 return has_tools;
             }
-            match serde_json::from_str::<serde_json::Value>(&accumulator.arguments) {
+            // A zero-argument tool call legitimately streams `"arguments": ""`, and
+            // `handle_stream_chunk` only appends non-empty argument fragments, so the accumulator
+            // for such a call is an empty string rather than `"{}"`. Parsing that as JSON fails,
+            // and rejecting it would refuse a call the model made correctly -- exactly the
+            // "agent's intent discarded" failure the rejection path exists to prevent, inverted.
+            // The Claude driver has carried this carve-out since the rejection was introduced;
+            // this is the sibling that did not get it.
+            let arguments = if accumulator.arguments.trim().is_empty() {
+                "{}"
+            } else {
+                accumulator.arguments.as_str()
+            };
+            match serde_json::from_str::<serde_json::Value>(arguments) {
                 Ok(value) => {
                     if event_sender
                         .send(StreamEvent::ToolUseEnd { input: value })
@@ -951,7 +1077,7 @@ impl ProviderBuilder {
                     self.base_url,
                     self.effort,
                     self.max_output_tokens,
-                )))
+                )?))
             }
             "claude-api" => {
                 let api_key = match self.credential {
@@ -973,7 +1099,7 @@ impl ProviderBuilder {
                     self.effort,
                     self.max_output_tokens,
                     self.session_stats,
-                )))
+                )?))
             }
             "claude-oauth" => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
@@ -999,7 +1125,7 @@ impl ProviderBuilder {
                     self.redact_thinking,
                     self.max_output_tokens,
                     self.session_stats,
-                )))
+                )?))
             }
             "openai-codex" => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
@@ -1034,6 +1160,71 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AuthCredential` derived `Debug` over its plaintext, and a provider struct holding one is
+    /// exactly the kind of thing that lands in a `{:?}` during a bad afternoon.
+    #[test]
+    fn a_credential_never_reaches_a_debug_rendering() {
+        let rendered = format!(
+            "{:?}",
+            AuthCredential::ApiKey("sk-APIKEYSECRET".to_string())
+        );
+        assert!(!rendered.contains("APIKEYSECRET"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+
+        let rendered = format!("{:?}", AuthCredential::OAuthToken {
+            access_token: "ACCESSSECRET".to_string(),
+            refresh_token: Some("REFRESHSECRET".to_string()),
+            expires_at: Some(42),
+            account_id: Some("acct-visible".to_string()),
+        });
+        assert!(!rendered.contains("ACCESSSECRET"), "{rendered}");
+        assert!(!rendered.contains("REFRESHSECRET"), "{rendered}");
+        // The non-secret identity stays: it is what a wrong-account diagnosis needs.
+        assert!(rendered.contains("acct-visible"), "{rendered}");
+    }
+
+    /// An issuer that omits `expires_in` is not promising the token is eternal. Reading `None` as
+    /// "valid forever" meant the refresh path was never entered, so the credential 401'd on every
+    /// request for the life of the process with nothing naming why.
+    #[test]
+    fn an_unlabelled_expiry_is_refreshed_rather_than_trusted_forever() {
+        let now = 1_700_000_000_000;
+        assert!(oauth_needs_refresh(None, true, now));
+
+        // With no refresh token there is nothing to act on, so send it and let the 401 speak.
+        assert!(!oauth_needs_refresh(None, false, now));
+
+        // A stated expiry is still honoured, skew included, and still refuses to refresh early.
+        assert!(oauth_needs_refresh(Some(now + 60_000), true, now));
+        assert!(!oauth_needs_refresh(Some(now + 600_000), true, now));
+
+        // A `now` near the top of the range must not wrap into "not yet due".
+        assert!(oauth_needs_refresh(Some(i64::MAX), true, i64::MAX));
+    }
+
+    /// And "due" has to stay a one-shot.
+    ///
+    /// Handing `None` straight back out of a refresh whose issuer stated no expiry made the token
+    /// due again the instant it arrived, so every request re-entered the slow path -- credential
+    /// write lock, database re-read, full OAuth round trip -- serialised, rotating the refresh
+    /// token on each pass. The refresh paths stamp an assumed expiry instead.
+    #[test]
+    fn a_refresh_that_states_no_expiry_is_not_due_again_immediately() {
+        let now = 1_700_000_000_000;
+        assert!(
+            !oauth_needs_refresh(Some(oauth_assumed_expiry(now)), true, now),
+            "a token that just arrived must not already be due",
+        );
+        assert!(
+            oauth_needs_refresh(
+                Some(oauth_assumed_expiry(now)),
+                true,
+                now + OAUTH_ASSUMED_LIFETIME_MILLIS
+            ),
+            "but the assumption expires: it bounds staleness, it does not trust the token forever",
+        );
+    }
 
     #[test]
     fn test_a_base_url_keeps_its_path_and_loses_only_trailing_slashes() {

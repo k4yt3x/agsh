@@ -462,7 +462,7 @@ impl Tool for McpToolAdapter {
         input: serde_json::Value,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        let arguments = input.as_object().cloned();
+        let arguments = forwarded_arguments(&input, &self.parameters);
 
         let params = {
             let mut p = CallToolRequestParams::new(self.remote_tool_name.clone());
@@ -575,8 +575,34 @@ fn convert_tool_result_content(
 ) -> Vec<crate::provider::ToolResultContent> {
     use crate::provider::{ImageSource, ToolResultContent};
 
+    // The one unbounded thing a server controls in a tool result. Images have had a ceiling since
+    // they were added; text was appended until the server stopped sending, and every byte then went
+    // into the session and back to the provider on every subsequent turn. Generous enough that no
+    // real result reaches it: four megabytes is roughly a million tokens.
+    //
+    // Past it the excess is *dropped*, not spilled, which is a knowingly weaker guarantee than the
+    // one `tools::shell` gives: an overflowing command writes every byte to a file and hands the
+    // model its path. Two things stand in the way of matching it here. This function is a pure
+    // transform over content blocks with no session to spill into, and
+    // `scratchpad::persist_oversized_results` -- which would preserve the rest -- runs on the
+    // `ToolOutput` *after* `execute` returns, so it never sees what was cut. Closing the gap means
+    // threading the scratchpad through the conversion, and is worth doing when a real server is
+    // observed hitting four megabytes; none has been. The loss is disclosed either way, which is
+    // the property that actually matters: the model is told the result was cut rather than
+    // answering from a silent truncation.
+    const MAX_MCP_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
     let mut blocks: Vec<ToolResultContent> = Vec::new();
     let mut text_buf = String::new();
+    let mut text_dropped: usize = 0;
+    // Counted across the whole result, not per buffer.
+    //
+    // The ceiling used to be compared against `text_buf.len()` alone, and the accepted-image arm
+    // calls `flush_text`, which `mem::take`s the buffer. A result shaped `[4 MiB text][small
+    // PNG][4 MiB text][PNG]...` therefore passed the guard on every round and the cap bounded
+    // nothing: the resident total is the sum of the flushed blocks, which is what the model is
+    // sent.
+    let mut text_kept: usize = 0;
 
     let flush_text = |buf: &mut String, out: &mut Vec<ToolResultContent>| {
         if !buf.is_empty() {
@@ -589,10 +615,24 @@ fn convert_tool_result_content(
     for item in items {
         match item {
             rmcp::model::ContentBlock::Text(text_content) => {
+                if text_kept >= MAX_MCP_TEXT_BYTES {
+                    text_dropped += text_content.text.len();
+                    continue;
+                }
                 if !text_buf.is_empty() {
                     text_buf.push('\n');
+                    text_kept += 1;
                 }
-                text_buf.push_str(&text_content.text);
+                let room = MAX_MCP_TEXT_BYTES - text_kept;
+                if text_content.text.len() <= room {
+                    text_buf.push_str(&text_content.text);
+                    text_kept += text_content.text.len();
+                } else {
+                    let cut = text_content.text.floor_char_boundary(room);
+                    text_buf.push_str(&text_content.text[..cut]);
+                    text_kept += cut;
+                    text_dropped += text_content.text.len() - cut;
+                }
             }
             rmcp::model::ContentBlock::Image(image) => {
                 // The server's declared `mime_type` is a hint; what gets forwarded is decided by
@@ -710,6 +750,16 @@ fn convert_tool_result_content(
         }
     }
 
+    if text_dropped > 0 {
+        if !text_buf.is_empty() {
+            text_buf.push('\n');
+        }
+        text_buf.push_str(&format!(
+            "\n... ({} further bytes of text were dropped; this server's result exceeded the {} \
+             byte ceiling)",
+            text_dropped, MAX_MCP_TEXT_BYTES
+        ));
+    }
     flush_text(&mut text_buf, &mut blocks);
     if blocks.is_empty() {
         blocks.push(ToolResultContent::Text {
@@ -719,11 +769,123 @@ fn convert_tool_result_content(
     blocks
 }
 
+/// The arguments an MCP call actually carries: everything the model sent, minus meka's own.
+///
+/// `scratchpad` and `background` are accepted on every tool and consumed by the agent loop, so a
+/// remote server never declared them. Forwarding them sends a property the server did not ask for,
+/// which a strict schema validator on the far side rejects outright -- failing a call whose only
+/// fault was that the model used a meka feature. The tool documentation already said this happened;
+/// it did not.
+///
+/// `schema` is the tool's own advertised `input_schema`, and a name it declares belongs to *it*.
+/// `offer_background` in `src/tools.rs` already refuses to splice `background` onto a tool that
+/// advertises the name, precisely so a server owning it keeps its meaning -- but this side stripped
+/// unconditionally, so the value the model sent for the *server's* parameter was deleted on the way
+/// out and the call arrived missing an argument it had asked for. Both halves have to consult the
+/// schema or the pair is incoherent.
+fn forwarded_arguments(
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let declares = |name: &str| {
+        schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|properties| properties.contains_key(name))
+    };
+    let strip_scratchpad = !declares(crate::tools::SCRATCHPAD_PARAMETER);
+    let strip_background = !declares(crate::tools::BACKGROUND_PARAMETER);
+    input.as_object().map(|object| {
+        object
+            .iter()
+            .filter(|(key, _)| {
+                !((strip_scratchpad && key.as_str() == crate::tools::SCRATCHPAD_PARAMETER)
+                    || (strip_background && key.as_str() == crate::tools::BACKGROUND_PARAMETER))
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine as _;
 
     use super::*;
+
+    /// A remote server sees the model's arguments and nothing of meka's.
+    ///
+    /// `scratchpad` and `background` are accepted on every tool and consumed here, so no server
+    /// declares them; sending one is an undeclared property, and a server validating its schema
+    /// strictly refuses the call over it. `tools/overview.md` documented this stripping before the
+    /// code did it.
+    /// A server that declares `background` or `scratchpad` itself owns the name, and the value the
+    /// model sent for it must reach the server.
+    ///
+    /// `offer_background` (src/tools.rs) already declines to splice `background` onto a tool that
+    /// advertises it, exactly so the server keeps the name. This side stripped unconditionally, so
+    /// the pair disagreed: meka left the server's own parameter in the schema the model reads, then
+    /// deleted the model's answer on the way out, and the call arrived missing a required argument.
+    #[test]
+    fn a_parameter_the_server_declares_is_forwarded_not_stripped() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "prompt": {}, "background": { "type": "string" } }
+        });
+        let arguments = forwarded_arguments(
+            &serde_json::json!({
+                "prompt": "a cat",
+                "background": "transparent",
+                "scratchpad": "out",
+            }),
+            &schema,
+        )
+        .expect("an object of arguments");
+
+        assert_eq!(
+            arguments.get("background").and_then(|v| v.as_str()),
+            Some("transparent"),
+            "the server declared `background`, so it is the server's parameter"
+        );
+        assert!(
+            !arguments.contains_key("scratchpad"),
+            "`scratchpad` is still meka's here, and is still stripped"
+        );
+    }
+
+    #[test]
+    fn meka_only_parameters_are_not_forwarded_to_the_server() {
+        let arguments = forwarded_arguments(
+            &serde_json::json!({
+                "query": "rust",
+                "limit": 10,
+                "scratchpad": "results",
+                "background": true,
+            }),
+            // A schema declaring neither name: the ordinary case, where both are meka's.
+            &serde_json::json!({"type": "object", "properties": {"query": {}, "limit": {}}}),
+        )
+        .expect("an object of arguments");
+
+        assert!(!arguments.contains_key("scratchpad"));
+        assert!(!arguments.contains_key("background"));
+        assert_eq!(arguments.get("query"), Some(&serde_json::json!("rust")));
+        assert_eq!(arguments.get("limit"), Some(&serde_json::json!(10)));
+    }
+
+    /// A tool taking no arguments still sends `{}` rather than nothing, and a non-object input is
+    /// passed through as "no arguments" the way it always was.
+    #[test]
+    fn stripping_leaves_an_argumentless_call_intact() {
+        assert_eq!(
+            forwarded_arguments(&serde_json::json!({}), &serde_json::json!({})),
+            Some(serde_json::Map::new()),
+        );
+        assert_eq!(
+            forwarded_arguments(&serde_json::Value::Null, &serde_json::json!({})),
+            None
+        );
+    }
 
     /// Base64 of a real 4x4 image in `format`. The handler classifies from the bytes now, so a
     /// placeholder string is no longer a usable fixture for the accept path.

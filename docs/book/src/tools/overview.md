@@ -63,7 +63,7 @@ Tools are grouped by the minimum permission level required:
 **Write permission** (only available in write mode):
 - `edit_file`, `write_file`, `execute_command` (unsandboxed)
 
-In **ask** mode, all tools are available but each call requires user confirmation.
+In **ask** mode, all tools are available but each call requires user confirmation. `execute_command` still runs in the read-only sandbox there: approving a call says the command may run, not that it may write. Switch to write mode for a command that has to modify the tree.
 
 In **none** mode, no tools are available. The agent can only respond with text.
 
@@ -73,7 +73,7 @@ Any built-in can be allow-listed, blocked, or have its required permission overr
 
 ## MCP Tools
 
-When [MCP servers](../configuration/config-file.md#mcp-servers-mcp) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalogue alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
+When [MCP servers](../configuration/config-file.md#mcpservers) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the per-turn context catalogue alongside the built-ins, with their resolved permission level annotated inline, and are called the same way.
 
 meka also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default; call `load_tool` with the exact name to make the schema available on the next turn:
 
@@ -104,7 +104,7 @@ Two behaviours exist so this never turns into a silent wrong answer:
 load_tool({"name": ["mcp__notion__search", "mcp__notion__fetch"]})
 ```
 
-Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#mcp-servers) skip all of this: their schemas ship from turn 1. Use it for tools whose optional parameters matter and that the agent reaches for constantly.
+Tools listed in a server's [`eager_load_tools`](../configuration/config-file.md#mcpservers) skip all of this: their schemas ship from turn 1. Use it for tools whose optional parameters matter and that the agent reaches for constantly.
 
 **When writing a tool description for a server meka will consume**, put whatever a caller must know to use the tool correctly in the first two sentences. That may be all anyone ever sees.
 
@@ -279,4 +279,4 @@ There is a third tool, `context_replace`, that exists only inside a checkpoint t
 
 ## Redirecting output to the scratchpad
 
-Several tools (`execute_command`, `find_files`, `search_contents`, `fetch_url`, `agent_spawn`) accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 200, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.
+Several tools (`execute_command`, `find_files`, `search_contents`, `fetch_url`, `agent_spawn`) accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 500, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.

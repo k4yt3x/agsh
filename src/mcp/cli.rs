@@ -287,6 +287,15 @@ pub async fn run_tools(
     }
 
     let tools = manager.list_advertised_tools(&config.name).await?;
+    // Read before the shutdown consumes the manager.
+    let dropped = manager
+        .server_entry(&config.name)
+        .map(|entry| {
+            entry
+                .dropped_tools
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .unwrap_or(0);
     manager.shutdown_arc().await;
 
     if tools.is_empty() {
@@ -300,7 +309,17 @@ pub async fn run_tools(
             vec![
                 tool.raw_name.clone(),
                 tool.resolved_permission.to_string(),
-                tool.permission_source.as_str().to_string(),
+                // A declined hint has to say so here, because this table is where a user checks
+                // what `trust_read_only_hint = false` moved, and the winning source alone cannot
+                // tell "the server offered nothing" from "the server offered and meka refused".
+                if tool.read_only_hint_declined {
+                    format!(
+                        "{} (readOnlyHint declined)",
+                        tool.permission_source.as_str()
+                    )
+                } else {
+                    tool.permission_source.as_str().to_string()
+                },
                 if tool.allowed { "allowed" } else { "blocked" }.to_string(),
                 describe_one_line(&tool.description),
             ]
@@ -314,16 +333,35 @@ pub async fn run_tools(
         )
     );
 
+    // The count is commentary on the table, not part of it, so it goes to stderr with the rest of
+    // the UI feedback. On stdout it appended a blank line and an English sentence to the data a
+    // caller piped -- in the same function whose "no tools" line was deliberately moved to stderr
+    // so `meka mcp tools x 2>/dev/null | awk ...` would work.
     let total = tools.len();
-    let allowed = tools.iter().filter(|t| t.allowed).count();
-    println!();
-    println!(
+    let allowed = tools.iter().filter(|tool| tool.allowed).count();
+    eprintln!();
+    eprintln!(
         "{} tool{} total, {} allowed, {} blocked",
         total,
         if total == 1 { "" } else { "s" },
         allowed,
         total - allowed
     );
+
+    // A tool meka dropped to stay under the per-server ceiling is, from here, indistinguishable
+    // from one the server never offered. Say so: this table is where someone goes to find out why
+    // the model cannot call something the server's own docs advertise, and a `tracing::warn!` at
+    // connect time is not where they will be looking.
+    if dropped > 0 {
+        eprintln!(
+            "{} further tool{} advertised by this server {} not registered: the per-server ceiling \
+             is {}",
+            dropped,
+            if dropped == 1 { "" } else { "s" },
+            if dropped == 1 { "was" } else { "were" },
+            crate::mcp::MAX_MCP_TOOLS_PER_SERVER,
+        );
+    }
     Ok(())
 }
 
@@ -407,8 +445,7 @@ pub async fn run_reconnect(
     }
 }
 
-/// Run `meka mcp logout <name>`: clear any stored OAuth credentials for the given server, and
-/// clear the auth-probe cache entry (if any).
+/// Run `meka mcp logout <name>`: clear any stored OAuth credentials for the given server.
 pub async fn run_logout(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
@@ -531,6 +568,10 @@ pub async fn run_login(
 /// an `auth` key. Used by [`run_login`] to make the "assumed OAuth" path a one-time thing rather
 /// than silently reapplying the assumption on every future run.
 fn persist_auth_block_for(name: &str) -> Result<()> {
+    // Held to the end of the function, so this read and the write below cannot interleave with
+    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    let _config_lock = crate::config::lock_config_file()
+        .map_err(|error| config_err(format!("failed to lock config: {}", error)))?;
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
     let existing = std::fs::read_to_string(&path)
@@ -675,6 +716,10 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     }
     let resolved = resolve_add_args(args)?;
 
+    // Held to the end of the function, so this read and the write below cannot interleave with
+    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    let _config_lock = crate::config::lock_config_file()
+        .map_err(|error| config_err(format!("failed to lock config: {}", error)))?;
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
 
@@ -1218,6 +1263,10 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         disabled_tools: resolved.disabled_tools.clone(),
         eager_load_tools: resolved.eager_load_tools.clone(),
         tool_permissions: resolved.tool_permissions.clone(),
+        // No `meka mcp add` flag drives this: declining a server's `readOnlyHint` is a standing
+        // policy decision about a server you already distrust, not something to pick while adding
+        // one. `None` means the default (trust it), and the knob is edited in `config.toml`.
+        trust_read_only_hint: None,
         disabled: resolved.disabled,
         required: resolved.required.then_some(true),
     }
@@ -1404,8 +1453,8 @@ enum Purged {
 }
 
 /// Wipe every trace of `name`: the `[[mcp.servers]]` entry in `config.toml`, any stored OAuth
-/// credentials (revoked server-side via RFC 7009 first, best-effort), the auth-probe cache row, and
-/// any resource-update ledger entries. Silent: callers print their own user-facing line. Used by
+/// credentials (revoked server-side via RFC 7009 first, best-effort), and any resource-update
+/// ledger entries. Silent: callers print their own user-facing line. Used by
 /// both `run_remove` (user-invoked) and `run_add`'s auto-login rollback path (on OAuth failure
 /// after the config entry has already been written).
 ///
@@ -1415,6 +1464,10 @@ enum Purged {
 /// deleted by hand: no surface would clear it, and until `mcp list` learned to report it, none
 /// would even name it.
 async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
+    // Held to the end of the function, so this read and the write below cannot interleave with
+    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    let _config_lock = crate::config::lock_config_file()
+        .map_err(|error| config_err(format!("failed to lock config: {}", error)))?;
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
     let existing = std::fs::read_to_string(&path)
@@ -1450,9 +1503,9 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
 }
 
 /// Drop everything meka stores about `name` outside `config.toml`: the OAuth bundle (revoked
-/// server-side via RFC 7009 first, best-effort), the auth-probe cache row, and the resource-update
-/// ledger. Shared by both of [`purge_server`]'s exits so a leftover credential is cleaned as
-/// thoroughly as one attached to a real server.
+/// server-side via RFC 7009 first, best-effort) and the resource-update ledger. Shared by both of
+/// [`purge_server`]'s exits so a leftover credential is cleaned as thoroughly as one attached to a
+/// real server.
 async fn clear_server_state(name: &str, token_store: &TokenStore) -> Result<()> {
     // If the caller is rolling back a never-succeeded login there won't be any credentials;
     // `revoke_stored_token` early-returns in that case so the call is safe regardless.
@@ -1486,6 +1539,10 @@ pub async fn run_remove(name: &str, token_store: &TokenStore) -> Result<()> {
 /// formatting. Backs `meka mcp disable|enable`. Writes atomically via
 /// [`crate::config::write_file_atomic`].
 async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf> {
+    // Held to the end of the function, so this read and the write below cannot interleave with
+    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    let _config_lock = crate::config::lock_config_file()
+        .map_err(|error| config_err(format!("failed to lock config: {}", error)))?;
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
     let existing = std::fs::read_to_string(&path)

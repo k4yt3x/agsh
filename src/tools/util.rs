@@ -166,12 +166,14 @@ pub(super) fn search_lines(content: &str, pattern: &str, tool_name: &str) -> Res
     }
 
     let total_matches = if matches.len() >= MAX_SEARCH_MATCHES {
-        let remaining: usize = content
-            .lines()
-            .skip(matches.len())
-            .filter(|line| re.is_match(line))
-            .count();
-        matches.len() + remaining
+        // Count the whole document rather than resuming after the cap.
+        //
+        // The previous form skipped `matches.len()` *lines* to account for `matches.len()`
+        // *matches*, so every match on a line past that index was counted twice: a 200-line file
+        // with a hit on every even line reported "showing first 100 of 150" when all 100 matches
+        // were already shown. The model then believed half the hits were hidden. Counting from the
+        // start is O(n) either way and cannot double-count.
+        content.lines().filter(|line| re.is_match(line)).count()
     } else {
         matches.len()
     };

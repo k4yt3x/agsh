@@ -719,7 +719,11 @@ fn render_skill_section(skills: &[(String, String)]) -> String {
 
     let mut shown = 0;
     for (name, description) in skills.iter().take(SKILL_INDEX_MAX_ENTRIES) {
-        let line = format!("- **{}**: {}\n", name, description);
+        let line = format!(
+            "- **{}**: {}\n",
+            name,
+            crate::store::elide_description_for_index(description)
+        );
         // Always emit at least one entry, for the same reason `[Memory]` does: one pathological
         // description longer than the whole budget should still be visible rather than collapsing
         // the section to a bare count.
@@ -790,7 +794,7 @@ fn render_memory_section(
             entry.name,
             entry.priority,
             crate::memory::render_age(entry.mtime, now),
-            entry.description
+            crate::store::elide_description_for_index(&entry.description)
         );
         // Always emit at least one entry: a single pathological description longer than the whole
         // budget should still be visible rather than collapsing the section to a bare count.

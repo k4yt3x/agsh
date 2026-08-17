@@ -1,11 +1,19 @@
 //! Filesystem sandboxing for read-only command execution.
 //!
-//! On Linux, uses Landlock LSM (kernel 5.13+) to restrict child processes to read-only filesystem
-//! access. On macOS, uses `sandbox-exec`. On Windows, spawns the child with a duplicated primary
-//! token dropped to Low integrity via `SetTokenInformation(TokenIntegrityLevel, …)`; this blocks
-//! writes to anything outside the documented Low-integrity surface (the user's home directory,
-//! `%APPDATA%`, Program Files, system dirs, etc.). On unsupported platforms, sandboxing is
-//! unavailable and shell execution is gated by the permission level alone.
+//! On Linux there are two backends. Bubblewrap (`bwrap --ro-bind /` plus tmpfs masks) is preferred
+//! whenever it is installed and its user-namespace smoke test passes; Landlock LSM is the fallback,
+//! and requires ABI v3 (kernel 6.2+) because `truncate(2)` is unmediated below it (see
+//! [`MIN_LANDLOCK_ABI`]). On macOS, uses `sandbox-exec`. On Windows, spawns the child with a
+//! duplicated primary token dropped to Low integrity via
+//! `SetTokenInformation(TokenIntegrityLevel, …)`; this blocks writes to anything outside the
+//! documented Low-integrity surface (the user's home directory, `%APPDATA%`, Program Files, system
+//! dirs, etc.). Where no backend is usable, sandboxing is unavailable and read-mode shell execution
+//! hard-errors rather than running unconfined.
+//!
+//! **What every backend does not restrict**: reads. A sandboxed child can read any file the user
+//! can, including credential files, and the network is deliberately left open on all of them. The
+//! boundary these enforce is "this command cannot change the machine", not "this command cannot see
+//! or send anything".
 
 /// What kind of read-mode sandbox is available on this platform. Resolved once at config time and
 /// threaded into `tools::shell::ExecuteCommandTool` so the spawn path knows which argv shape and
@@ -158,6 +166,32 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
                  [shell].sandbox_backend = \"landlock\" to suppress this warning"
             );
         }
+
+        // Warn 3: the ABI clears `MIN_LANDLOCK_ABI` so the filesystem is genuinely write-protected,
+        // but the mitigations added after v3 are absent. Each is a real hole a read-mode command
+        // can walk through (a D-Bus or `systemd-run --user` call reaches a privileged
+        // daemon that will happily write on its behalf), and none of them is visible to the
+        // user otherwise, so the gap is named rather than left to the kernel version.
+        if context == WarnContext::Startup
+            && let BackendProbe::Ok(SandboxCapability::Landlock { abi_version }) = &state.probe
+            && *abi_version < 9
+        {
+            let mut missing: Vec<&str> = Vec::new();
+            if *abi_version < 5 {
+                missing.push("device ioctls (v5)");
+            }
+            if *abi_version < 6 {
+                missing.push("abstract Unix sockets and cross-domain signals (v6)");
+            }
+            missing.push("pathname Unix sockets (v9)");
+            tracing::warn!(
+                "Landlock ABI v{} write-protects the filesystem but does not restrict {}; a \
+                 read-mode command can still reach a local service over those channels. Install \
+                 Bubblewrap, or run a newer kernel, to close them",
+                abi_version,
+                missing.join(", "),
+            );
+        }
     }
 }
 
@@ -198,8 +232,26 @@ pub fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
 
 #[cfg(target_os = "linux")]
 fn probe_landlock() -> BackendProbe {
-    match detect_landlock() {
-        Some(abi_version) => BackendProbe::Ok(SandboxCapability::Landlock { abi_version }),
+    landlock_probe_from_abi(landlock_abi())
+}
+
+/// The [`MIN_LANDLOCK_ABI`] policy, split from the syscall so it can be exercised at ABI values
+/// this host does not have. Kernels below v3 are the ones that matter and are exactly the ones a
+/// developer machine running a current kernel cannot reproduce.
+#[cfg(target_os = "linux")]
+fn landlock_probe_from_abi(abi: Option<i32>) -> BackendProbe {
+    match abi {
+        Some(abi_version) if abi_version >= MIN_LANDLOCK_ABI => {
+            BackendProbe::Ok(SandboxCapability::Landlock { abi_version })
+        }
+        Some(abi_version) => BackendProbe::Missing {
+            reason: format!(
+                "Landlock ABI v{} is too old to write-protect the filesystem: truncate(2) is \
+                 unmediated below v{} (needs Linux 6.2+), so a read-mode command could still empty \
+                 an existing file",
+                abi_version, MIN_LANDLOCK_ABI,
+            ),
+        },
         None => BackendProbe::Missing {
             reason: "Landlock LSM not supported by this kernel (needs Linux 5.13+)".to_string(),
         },
@@ -400,10 +452,12 @@ fn reap_smoke_test_child(child: &mut std::process::Child) {
 pub fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
     {
-        if let Some(version) = detect_landlock() {
-            return SandboxCapability::Landlock {
-                abi_version: version,
-            };
+        // Routed through the probe rather than the raw syscall so the `MIN_LANDLOCK_ABI` policy is
+        // applied in exactly one place: a test asking "what sandbox does this host have?" must get
+        // the same answer production would act on, or it would happily exercise an ABI meka
+        // refuses.
+        if let BackendProbe::Ok(capability) = probe_landlock() {
+            return capability;
         }
     }
 
@@ -425,8 +479,26 @@ pub fn detect() -> SandboxCapability {
     SandboxCapability::Unavailable
 }
 
+/// Lowest Landlock ABI meka will sandbox with.
+///
+/// v3 (Linux 6.2) is where `LANDLOCK_ACCESS_FS_TRUNCATE` arrives. Below it `truncate(2)` is
+/// unmediated, so a "read-only" child can still open an existing file for truncation and empty it:
+/// `os.truncate(path, 0)` succeeds at v1 even though `open(O_WRONLY)` is denied. That is a write,
+/// and meka documents read mode as write-protecting the filesystem, so accepting v1/v2 would be
+/// promising a boundary the kernel is not enforcing.
+///
+/// Failing closed costs read-mode shell on kernels 5.13-6.1 (Ubuntu 22.04, Debian 12) that lack
+/// Bubblewrap. That is the intended trade: Bubblewrap is auto-preferred whenever `bwrap` is on
+/// `PATH` and is unaffected, and a refusal the user can act on beats a guarantee that quietly does
+/// not hold.
 #[cfg(target_os = "linux")]
-fn detect_landlock() -> Option<i32> {
+const MIN_LANDLOCK_ABI: i32 = 3;
+
+/// Raw kernel ABI probe. Reports what the kernel supports, not what meka will accept: the
+/// [`MIN_LANDLOCK_ABI`] policy lives in [`probe_landlock`] so the "too old" case can be reported
+/// differently from "no Landlock at all".
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> Option<i32> {
     let version = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -916,12 +988,38 @@ fn keep_sandbox_env_var(name: &str) -> bool {
         "TMP",
         "TEMP",
     ];
+    // How the machine reaches the network at all, on a host that does not route directly. A child
+    // that cannot see these connects to nothing and reports a TLS or DNS failure that names none of
+    // the real cause, which for an MCP server means it starts, registers its tools, and then fails
+    // every call. None of them grants authority: they say where to go and whom to trust, and the
+    // child was going to make the request either way.
+    //
+    // Deliberately not extended to `SSH_AUTH_SOCK` (a live credential agent), `NODE_OPTIONS` (which
+    // takes `--require`, i.e. arbitrary code), or the import-path family `PYTHONPATH` / `NODE_PATH`
+    // / `VIRTUAL_ENV`, which redirect what a program loads. A server that needs one of those takes
+    // it explicitly through `${VAR}` in its own `[[mcp.servers]] env` table, where the user has
+    // said so.
+    const ALLOW_NETWORK: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    ];
     // Prefix allow-list keeps the LC_* / XDG_* families future-proof without enumerating each var.
     // Locale (`LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, …) and XDG paths (`XDG_RUNTIME_DIR`,
     // `XDG_CONFIG_HOME`, …) are both legitimately broad.
     const ALLOW_PREFIX: &[&str] = &["LC_", "XDG_"];
 
-    if ALLOW_EXACT.contains(&name) {
+    if ALLOW_EXACT.contains(&name) || ALLOW_NETWORK.contains(&name) {
         return true;
     }
     if ALLOW_PREFIX.iter().any(|prefix| name.starts_with(prefix)) {
@@ -1772,6 +1870,157 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
+    /// Between ABI 3 and 9 the filesystem is genuinely write-protected but the later mitigations
+    /// are absent, and the warning naming them is the only way a user learns which.
+    ///
+    /// Nothing asserted it: delete the whole block and every suite stayed green, leaving a host
+    /// that believes read mode restricts more than the running kernel actually does. Driven through
+    /// a subscriber pinned to `WARN` because that is the default floor, so this also fails if the
+    /// level is dropped to `info` where `-v` would be needed to see it.
+    ///
+    /// Linux-gated because [`super::SandboxCapability::Landlock`] is: without this the test breaks
+    /// the macOS and Windows halves of CI's lint and test matrix, which is exactly the
+    /// platform-only compile error that matrix exists to catch and that cannot be reproduced on a
+    /// Linux workstation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landlock_abi_below_9_names_the_mitigations_it_does_not_provide() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // v3 clears the floor, so this is the "protected, but not fully" band the warning owns.
+        for (abi, expected) in [
+            (3, vec![
+                "device ioctls",
+                "abstract Unix sockets",
+                "pathname Unix sockets",
+            ]),
+            (6, vec!["pathname Unix sockets"]),
+        ] {
+            let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+            let buffer = Arc::clone(&capture.0);
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture)
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+
+            let state = super::SandboxState {
+                enabled: true,
+                backend: crate::config::SandboxBackend::Landlock,
+                auto_resolved: false,
+                probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock {
+                    abi_version: abi,
+                }),
+            };
+            tracing::subscriber::with_default(subscriber, || {
+                super::warn_if_sandbox_issues(&state, super::WarnContext::Startup);
+            });
+
+            let logged = String::from_utf8(
+                buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+            .expect("log output is utf-8");
+            for gap in expected {
+                assert!(
+                    logged.contains(gap),
+                    "ABI v{abi} must name '{gap}' as unrestricted: {logged:?}"
+                );
+            }
+        }
+
+        // v9 has them all, so there is nothing to warn about and a warning would be noise.
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let buffer = Arc::clone(&capture.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let state = super::SandboxState {
+            enabled: true,
+            backend: crate::config::SandboxBackend::Landlock,
+            auto_resolved: false,
+            probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock { abi_version: 9 }),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            super::warn_if_sandbox_issues(&state, super::WarnContext::Startup);
+        });
+        let logged = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("log output is utf-8");
+        assert!(
+            !logged.contains("does not restrict"),
+            "v9 restricts all of them; warning anyway trains the user to ignore it: {logged:?}"
+        );
+    }
+
+    /// A child that cannot see the machine's proxy or CA configuration reaches nothing, and says so
+    /// in terms that name none of the cause. For an MCP server that means it connects, registers
+    /// its tools, and then fails every call. Neither kind of variable grants authority: they say
+    /// where to go and whom to trust, and the child was making the request either way.
+    ///
+    /// The three families below are refused on purpose, so a widening of the list has to argue with
+    /// this test rather than slip past it.
+    #[cfg(unix)]
+    #[test]
+    fn network_configuration_reaches_a_sandboxed_child_but_credentials_do_not() {
+        for allowed in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+        ] {
+            assert!(
+                super::keep_sandbox_env_var(allowed),
+                "{allowed} is how the child reaches the network",
+            );
+        }
+        for refused in [
+            "SSH_AUTH_SOCK",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "NODE_PATH",
+            "VIRTUAL_ENV",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(
+                !super::keep_sandbox_env_var(refused),
+                "{refused} carries either a credential or a way to run code",
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2044,6 +2293,56 @@ mod tests {
     fn test_handled_access_takes_resolve_unix_only_from_abi_v9() {
         assert!(handled_access_for_abi(8) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX == 0);
         assert!(handled_access_for_abi(9) & LANDLOCK_ACCESS_FS_RESOLVE_UNIX != 0);
+    }
+
+    /// Below ABI v3 the ruleset does not handle `LANDLOCK_ACCESS_FS_TRUNCATE`, so a sandboxed child
+    /// can still empty an existing file even though every open-for-write is denied. meka documents
+    /// read mode as write-protecting the filesystem, so the only honest answer on such a kernel is
+    /// to report the backend unusable and let the shell tool hard-error, rather than to sandbox
+    /// with a ruleset that does not enforce what was promised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landlock_abi_below_the_truncate_floor_is_reported_unusable() {
+        for abi in [1, 2] {
+            let probe = landlock_probe_from_abi(Some(abi));
+            let reason = backend_unavailable_reason(&probe)
+                .unwrap_or_else(|| panic!("ABI v{} must not be accepted", abi));
+            assert!(
+                reason.contains("truncate(2)"),
+                "the reason must name what is unenforced, got: {}",
+                reason
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landlock_abi_at_or_above_the_floor_is_accepted() {
+        for abi in [MIN_LANDLOCK_ABI, 6, 9] {
+            assert!(
+                matches!(
+                    landlock_probe_from_abi(Some(abi)),
+                    BackendProbe::Ok(SandboxCapability::Landlock { abi_version }) if abi_version == abi
+                ),
+                "ABI v{} should be accepted",
+                abi
+            );
+        }
+    }
+
+    /// A kernel with no Landlock at all and one whose Landlock is too old are both unusable, but a
+    /// user can only act on the difference: the first needs a newer kernel or Bubblewrap, the
+    /// second is specifically about `truncate(2)`. Keep the two messages distinct.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_landlock_and_too_old_landlock_report_different_reasons() {
+        let absent = backend_unavailable_reason(&landlock_probe_from_abi(None))
+            .expect("no Landlock must be unusable");
+        let too_old = backend_unavailable_reason(&landlock_probe_from_abi(Some(1)))
+            .expect("ABI v1 must be unusable");
+        assert_ne!(absent, too_old);
+        assert!(absent.contains("5.13"), "got: {}", absent);
+        assert!(too_old.contains("6.2"), "got: {}", too_old);
     }
 
     #[test]

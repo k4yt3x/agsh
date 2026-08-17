@@ -15,7 +15,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 croner = "3"
 crossterm = "0.29"
 dirs = "6"
@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 url = "2"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -73,6 +73,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
@@ -85,6 +86,9 @@ winres = "0.1"
 filetime = "0.2.29"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"
+# `test-util` for the paused clock, so a test can assert a 30-second timeout without waiting one.
+# Edition 2024 resolves dev-dependency features separately, so the shipped binary does not get it.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 await_holding_lock = "deny"

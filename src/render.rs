@@ -97,7 +97,13 @@ pub enum RenderMode {
     /// anything the model formats as a table all wrap inside their box here and run off the right
     /// edge under `syntect`. Reading rendered prose is also the common case; wanting to see the
     /// markers is the exception, and `syntect` is one config line away.
+    ///
+    /// `rich` is accepted as an alias in all three tiers. `FromStr` took it from the day the mode
+    /// was named, so `--render-mode rich` and `MEKA_RENDER_MODE=rich` worked while the identical
+    /// value in `config.toml` was rejected by serde with an error naming variants the user had just
+    /// read an alias for.
     #[default]
+    #[serde(alias = "rich")]
     Termimad,
     Raw,
     /// Emits no output to stdout/stderr. Used by sub-agents and any other in-process
@@ -205,6 +211,18 @@ impl StreamingRenderer {
         if matches!(self.mode, RenderMode::Silent) {
             return Ok(());
         }
+
+        // Streamed assistant text is the largest model-controlled surface meka prints, and it was
+        // the only one arriving unfiltered: the tool indicator, thinking block, todo list and
+        // approval prompt all sanitise, and each has a regression test for the forgery it prevents.
+        // The markdown renderer is not a defence -- termimad emits a `Compound`'s bytes verbatim
+        // and syntect writes the source slice through -- so a model that has read attacker
+        // text could clear the screen and repaint a convincing `[ask]` block, then let the
+        // real prompt scroll past invisibly behind a leaked `\x1b[8m`. Sanitising here
+        // covers every render mode and every caller, rather than at each of the three mode
+        // arms below.
+        let sanitized = sanitize_stream_text(delta);
+        let delta = sanitized.as_str();
 
         let delta = if self.started {
             delta
@@ -1966,6 +1984,39 @@ pub fn sanitize_for_display(text: &str) -> String {
         .collect()
 }
 
+/// Same as [`sanitize_for_display`], but also drops `\r`. For multi-line prose that will be
+/// rendered as markdown: streamed assistant text.
+///
+/// `\r` is excluded because it is the forgery primitive that needs no escape sequence at all. It
+/// returns the cursor to column zero without advancing a line, so a model that has read attacker
+/// text can overwrite a line meka already printed -- including the tail of an approval prompt --
+/// using nothing but ordinary characters. `\n` and `\t` stay: they are structural in markdown and
+/// can only move the cursor forward.
+///
+/// Applying this per delta is sound even though a CSI sequence can straddle a chunk boundary,
+/// because the `is_control` filter removes every `\x1b` regardless of what follows it. With no
+/// `ESC` reaching the terminal no escape sequence can form, whatever the chunking. The regex is
+/// there to remove a *whole* sequence cleanly rather than leaving `[2J` visible in the prose.
+///
+/// Bidi controls go too, because a bidi override reorders a rendered line without changing a byte
+/// of it: an assistant that has read attacker text could make a path or a command read as something
+/// else entirely. `char` boundaries are safe per delta because these are single scalars.
+///
+/// Only the bidi set, unlike [`sanitize_to_line`] and `mcp::sanitize::sanitize_text`, which drop
+/// the whole `Cf` category. Those two render *server*-controlled strings into one row of meka's own
+/// chrome, where nothing in `Cf` has a legitimate use. This is prose the model wrote for the user,
+/// and most of `Cf` is ordinary content there: ZWJ builds emoji families and profession sequences,
+/// ZWNJ spells ordinary Persian and Arabic words, and both drive Indic conjuncts. Stripping the
+/// category here mangled all of it, and bought nothing, since none of those can reorder a line.
+pub fn sanitize_stream_text(text: &str) -> String {
+    let stripped = CSI_PATTERN.replace_all(text, "");
+    stripped
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .filter(|c| !crate::mcp::sanitize::is_bidi_control(*c as u32))
+        .collect()
+}
+
 pub fn render_session_id(label: &str, id: &str) {
     eprintln!("{}", format!("{}: {}", label, id).with(Color::DarkGrey));
 }
@@ -2078,40 +2129,51 @@ pub struct ModelStatus<'a> {
     pub thinking: bool,
 }
 
-/// Multi-line cumulative session report shown by the `/status` slash command. Goes to stderr
-/// (matches the rest of REPL UI feedback).
-pub fn render_session_status(
+/// The body of the session-status block, without ANSI and without the header line.
+///
+/// Split out because every non-REPL frontend needs the same numbers in a different envelope, and
+/// the only way to get them used to be to re-implement the formatting: ACP did, and the two
+/// drifted. Pairs with [`render_session_status`], which is this plus the coloured header, printed.
+/// The same shape as [`format_account_usage`] / [`render_account_usage`], for the same reason.
+pub fn format_session_status(
     snap: &crate::stats::SessionStatsSnapshot,
     model: &ModelStatus,
     message_count: usize,
     context_tokens: u64,
     context_window: u64,
-) {
+) -> String {
+    use std::fmt::Write as _;
+
     let total_in = snap.total_input_tokens();
-    let header = "Session status".with(Color::Cyan);
-    eprintln!("{}", header);
+    let mut out = String::new();
     if let Some(name) = model.model {
-        eprintln!("  Model:           {}", name);
+        let _ = writeln!(out, "  Model:           {}", name);
     }
     match (model.profile, model.backend) {
-        (Some(profile), Some(backend)) => eprintln!("  Provider:        {} ({})", profile, backend),
-        (None, Some(backend)) => eprintln!("  Provider:        {}", backend),
+        (Some(profile), Some(backend)) => {
+            let _ = writeln!(out, "  Provider:        {} ({})", profile, backend);
+        }
+        (None, Some(backend)) => {
+            let _ = writeln!(out, "  Provider:        {}", backend);
+        }
         _ => {}
     }
     if let Some(effort) = model.effort {
-        eprintln!("  Effort:          {}", effort);
+        let _ = writeln!(out, "  Effort:          {}", effort);
     }
-    eprintln!(
+    let _ = writeln!(
+        out,
         "  Thinking:        {}",
         if model.thinking { "on" } else { "off" }
     );
-    eprintln!("  Turns:           {}", snap.turns);
+    let _ = writeln!(out, "  Turns:           {}", snap.turns);
     // Live context occupancy: how full the window was on the last request. Distinct from the
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
     if context_window > 0 && context_tokens > 0 {
         let pct = ((context_tokens as f64 / context_window as f64) * 100.0).round() as u64;
         let remaining = context_window.saturating_sub(context_tokens);
-        eprintln!(
+        let _ = writeln!(
+            out,
             "  Context:         {} / {} ({}% used, {} left)",
             format_token_count(context_tokens),
             format_token_count(context_window),
@@ -2119,17 +2181,20 @@ pub fn render_session_status(
             format_token_count(remaining),
         );
     }
-    eprintln!(
+    let _ = writeln!(
+        out,
         "  Input tokens:    {}  (cache hit: {}%)",
         format_token_count(total_in),
         snap.cache_hit_pct()
     );
-    eprintln!(
+    let _ = writeln!(
+        out,
         "  Output tokens:   {}",
         format_token_count(snap.output_tokens)
     );
     if snap.redactions > 0 {
-        eprintln!(
+        let _ = writeln!(
+            out,
             "  Redactions:      {} ({} image{}, ~{} MiB freed)",
             snap.redactions,
             snap.redacted_images,
@@ -2137,9 +2202,25 @@ pub fn render_session_status(
             snap.redacted_bytes / 1_048_576,
         );
     } else {
-        eprintln!("  Redactions:      0");
+        let _ = writeln!(out, "  Redactions:      0");
     }
-    eprintln!("  Messages:        {}", message_count);
+    let _ = writeln!(out, "  Messages:        {}", message_count);
+    out
+}
+
+/// Print the session-status block to stderr, header included. See [`format_session_status`].
+pub fn render_session_status(
+    snap: &crate::stats::SessionStatsSnapshot,
+    model: &ModelStatus,
+    message_count: usize,
+    context_tokens: u64,
+    context_window: u64,
+) {
+    eprintln!("{}", "Session status".with(Color::Cyan));
+    eprint!(
+        "{}",
+        format_session_status(snap, model, message_count, context_tokens, context_window)
+    );
 }
 
 /// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the REPL/ACP `/usage`
@@ -2473,7 +2554,15 @@ fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_befo
         eprintln!();
     }
     for line in trimmed.lines() {
-        eprintln!("{} {}", ">".with(Color::Cyan), input_style.paint(line));
+        // Sanitised like the assistant text a few lines above. "User" here names the *role*, not
+        // necessarily a person at this terminal: an ACP or HTTP client wrote it, or a `--skill`
+        // body did, and a replayed session shows whatever the row holds. Leaving it raw made the
+        // one message class meka replays without filtering the one an attacker controls end to end.
+        eprintln!(
+            "{} {}",
+            ">".with(Color::Cyan),
+            input_style.paint(sanitize_stream_text(line))
+        );
     }
     true
 }
@@ -2550,15 +2639,30 @@ pub(crate) fn begin_own_line() {
     if !std::io::stderr().is_terminal() {
         return;
     }
-    if let Err(error) = crossterm::execute!(
-        std::io::stderr(),
-        crossterm::cursor::MoveToColumn(0),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
-    ) {
+    if let Err(error) = write_own_line_prelude(&mut std::io::stderr()) {
         // A broken pipe or closed terminal. Nothing to recover: the line is cosmetic and the caller
         // has already dropped its state.
         tracing::debug!("failed to clear the status line: {}", error);
     }
+}
+
+/// The sequence [`begin_own_line`] writes. Split out so a test can read it: the function itself
+/// returns early off a tty, which is every test process.
+fn write_own_line_prelude(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::queue!(
+        out,
+        // Attributes first, and load-bearing rather than tidy. `Clear(UntilNewLine)` is `ESC[K`,
+        // which erases *using the current attributes*, so a model-controlled `ESC[8m` (conceal)
+        // that reached the terminal survives the clear and everything meka prints next is
+        // invisible -- including the `[ask]` prompt this is called to make legible.
+        // crossterm's `PrintStyledContent` does not close the gap either: it resets only
+        // the foreground.
+        crossterm::style::ResetColor,
+        crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
+        crossterm::cursor::MoveToColumn(0),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
+    )?;
+    out.flush()
 }
 
 /// Rows one line of a fully-shown thinking block may wrap to before it is cut.
@@ -2610,11 +2714,12 @@ fn collapse_to_line(text: &str, max_chars: usize) -> String {
 ///
 /// Reasoning is model output and gets the same escape-stripping as a tool argument. It is not
 /// merely defensive: a model that has read attacker-controlled text (a fetched page, a tool result)
-/// can be steered into emitting escapes, and a thinking block is the one place where a long span of
-/// model prose reaches the terminal with no markdown renderer between. The preview sanitises after
-/// collapsing rather than before, so the early exit in [`collapse_to_line`] still bounds the work
-/// on a block that can run to tens of kilobytes; collapsing only concatenates, so nothing an escape
-/// could hide behind survives the later pass.
+/// can be steered into emitting escapes. Streamed assistant text is sanitised for the same reason,
+/// in [`StreamingRenderer::push_delta`] -- passing through the markdown renderer is not a defence,
+/// since termimad writes a `Compound`'s bytes verbatim and syntect passes the source slice through.
+/// The preview sanitises after collapsing rather than before, so the early exit in
+/// [`collapse_to_line`] still bounds the work on a block that can run to tens of kilobytes;
+/// collapsing only concatenates, so nothing an escape could hide behind survives the later pass.
 pub fn render_thinking_block(thinking: &str, show_full: bool) {
     eprintln!(
         "{}{}",
@@ -2988,6 +3093,36 @@ fn coerce_display_value(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Everything meka prints on its own line has to start from a known attribute state.
+    ///
+    /// `ESC[K` erases *using the current attributes*, so clearing the row does not undo a
+    /// model-controlled `ESC[8m` that reached the terminal -- it re-applies it to the cleared
+    /// cells. Everything printed after, including the `[ask]` prompt this call exists to make
+    /// legible, then renders concealed. The reset has to lead, and this asserts the order rather
+    /// than merely its presence.
+    ///
+    /// Not on Windows, where crossterm may take the console-API path instead of emitting ANSI.
+    #[cfg(not(windows))]
+    #[test]
+    fn own_line_resets_attributes_before_it_clears_the_row() {
+        let mut written = Vec::new();
+        super::write_own_line_prelude(&mut written).expect("write to a Vec cannot fail");
+        let sequence = String::from_utf8(written).expect("crossterm emits ASCII");
+
+        let reset = sequence
+            .find("\u{1b}[0m")
+            .expect("an explicit reset must be emitted");
+        let clear = sequence
+            .find("\u{1b}[K")
+            .expect("the row clear must be emitted");
+        assert!(
+            reset < clear,
+            "the reset must precede the clear, or the clear re-applies the attribute it was \
+             meant to escape; got {:?}",
+            sequence,
+        );
+    }
+
     /// The `/compact` line has to name what the checkpoint wrote, because a memory is durable and
     /// instance-scoped: notes accumulating unmentioned under a command called "compact" is the
     /// surprise this reporting exists to prevent.
@@ -5070,6 +5205,99 @@ mod tests {
         renderer.finish().unwrap();
     }
 
+    /// A bidi override reorders a line without changing a byte of it, so stripping escapes is not
+    /// enough on the one surface a model writes freely. `sanitize_to_line` and the MCP sanitiser
+    /// have always dropped Unicode `Cf`; this was the one that did not, and it guards the biggest
+    /// surface of the three.
+    #[test]
+    fn streamed_assistant_text_cannot_carry_bidi_overrides() {
+        // RLO between a harmless prefix and a path, which renders the path reversed.
+        let attack = "run \u{202e}txt.esriver\u{202c} now";
+        let sanitised = sanitize_stream_text(attack);
+        assert!(
+            !sanitised.contains('\u{202e}') && !sanitised.contains('\u{202c}'),
+            "format characters must not reach the terminal: {sanitised:?}",
+        );
+        // Ordinary text is untouched, including scripts that need no overrides to render.
+        assert_eq!(sanitize_stream_text("日本語 ok"), "日本語 ok");
+    }
+
+    /// The sanitiser guards against reordering, not against invisible characters as such, and most
+    /// of `Cf` is ordinary content in model prose. Filtering the whole category broke every one of
+    /// these: the family renders as three separate people, the Persian word runs its letters
+    /// together, and the Devanagari loses its conjunct form.
+    #[test]
+    fn streamed_assistant_text_keeps_the_joiners_real_words_are_spelled_with() {
+        // ZWJ: a family emoji is one glyph only while the joiners survive.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_stream_text(family), family);
+
+        // ZWNJ: Persian "می‌خواهم" is misspelled without it.
+        let persian = "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}";
+        assert_eq!(sanitize_stream_text(persian), persian);
+
+        // ZWJ again, this time forcing a Devanagari conjunct.
+        let devanagari = "\u{915}\u{94D}\u{200D}\u{937}";
+        assert_eq!(sanitize_stream_text(devanagari), devanagari);
+
+        // And the direction *marks*, which state a direction rather than override one, are
+        // ordinary content in Hebrew and Arabic.
+        assert_eq!(sanitize_stream_text("\u{200E}abc"), "\u{200E}abc");
+    }
+
+    /// Streamed assistant text is the largest model-controlled surface meka prints, and the
+    /// markdown renderer is not a filter: termimad writes a compound's bytes verbatim. A model
+    /// that has read attacker text could otherwise clear the screen and repaint a convincing
+    /// approval prompt. Asserted on the buffer rather than through the terminal, so removing
+    /// the sanitise call in `push_delta` fails this rather than merely changing what a human
+    /// would have seen.
+    #[test]
+    fn streamed_assistant_text_cannot_carry_terminal_escapes() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
+        renderer
+            .push_delta("before \u{1b}[2J\u{1b}[1;1H\u{1b}]0;pwned\u{7}\u{1b}[8mafter")
+            .unwrap();
+
+        assert!(
+            !renderer.buffer.contains('\u{1b}'),
+            "no ESC may reach the terminal: {:?}",
+            renderer.buffer
+        );
+        assert!(
+            renderer.buffer.contains("before") && renderer.buffer.contains("after"),
+            "the prose itself must survive: {:?}",
+            renderer.buffer
+        );
+    }
+
+    /// A CSI sequence can straddle a chunk boundary, so the regex alone would miss it. The control
+    /// filter is what actually closes this: with every ESC dropped, no sequence can form however
+    /// the provider happens to split the stream.
+    #[test]
+    fn an_escape_split_across_two_deltas_cannot_reconstitute() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Termimad);
+        renderer.push_delta("safe \u{1b}").unwrap();
+        renderer.push_delta("[2Jrest").unwrap();
+
+        assert!(!renderer.buffer.contains('\u{1b}'), "{:?}", renderer.buffer);
+    }
+
+    /// `\r` needs no escape sequence to forge UI: it returns the cursor to column zero, so a model
+    /// can overwrite a line meka already printed. `\n` and `\t` are structural in markdown and only
+    /// ever move the cursor forward, so they stay.
+    ///
+    /// Asserted on the helper rather than on the renderer's buffer: `push_delta` flushes as soon as
+    /// it can, so a buffer-based version of this passes whether or not the sanitiser runs.
+    #[test]
+    fn streamed_assistant_text_drops_carriage_returns_but_keeps_layout() {
+        assert_eq!(sanitize_stream_text("a\r\nb\tc"), "a\nb\tc");
+        assert_eq!(
+            sanitize_stream_text("\rAllow? (Y/n) y"),
+            "Allow? (Y/n) y",
+            "a lone CR must not survive to reposition the cursor"
+        );
+    }
+
     fn termimad_render(markdown: &str) -> String {
         let mut renderer = StreamingRenderer::new(RenderMode::Termimad).with_width(76);
         renderer.started = true;
@@ -5615,6 +5843,16 @@ mod tests {
     fn test_render_mode_parses_syntect_only() {
         assert_eq!("syntect".parse(), Ok(RenderMode::Syntect));
         assert_eq!("rich".parse(), Ok(RenderMode::Termimad));
+        // The same value has to parse out of `config.toml` too. It did not: `FromStr` took the
+        // alias and serde did not, so a documented alias worked on the flag and errored in the
+        // file.
+        #[derive(serde::Deserialize)]
+        struct Display {
+            render_mode: RenderMode,
+        }
+        let parsed: Display = toml::from_str("render_mode = \"rich\"")
+            .expect("serde must take the alias the flag and the env var already took");
+        assert_eq!(parsed.render_mode, RenderMode::Termimad);
         assert_eq!(RenderMode::Syntect.to_string(), "syntect");
         // `bat` is no longer accepted (the alias was removed).
         assert!("bat".parse::<RenderMode>().is_err());

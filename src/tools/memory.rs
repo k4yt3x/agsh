@@ -144,13 +144,29 @@ impl Tool for MemoryWriteTool {
         // call that created it.
         let kept_existing_body = body.is_none() && memory::memory_file_in(&root, name).is_file();
 
-        let path =
-            memory::write_memory(&root, name, description, priority, body).map_err(|message| {
-                MekaError::ToolExecution {
-                    tool_name: "memory_write".to_string(),
-                    message,
-                }
-            })?;
+        // On the blocking pool, like the other file-walking tools. `write_memory` reads the
+        // existing entry, serialises frontmatter, and writes through `write_file_atomic`, which
+        // `fsync`s -- a syscall that parks the calling thread for as long as the filesystem takes.
+        // On the runtime that is a worker thread that cannot poll anything else meanwhile, which
+        // under `serve` means every other session's turn waits on one memory write.
+        let path = {
+            let root = root.clone();
+            let name = name.to_string();
+            let description = description.to_string();
+            let body = body.map(str::to_string);
+            tokio::task::spawn_blocking(move || {
+                memory::write_memory(&root, &name, &description, priority, body.as_deref())
+            })
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "memory_write".to_string(),
+                message: format!("write task failed: {}", error),
+            })?
+            .map_err(|message| MekaError::ToolExecution {
+                tool_name: "memory_write".to_string(),
+                message,
+            })?
+        };
         // The memory snapshot keys on mtime alone, so *any* second write inside one clock tick is
         // invisible to it. Without this the agent's own note would not be in the index it reads
         // back on the very next turn.

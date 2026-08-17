@@ -8,7 +8,7 @@
 //!   HTTP API docs § SSE events). Lifecycle events are 0-based and monotonic per turn.
 //!
 //! Both modes share an idempotency cache (Stripe-style, `Idempotency-Key` header). The cache
-//! key is `(token_id, key)` and stores the *blocking* JSON envelope, so a replay of a
+//! key is `(token_id, session_id, key)` and stores the *blocking* JSON envelope, so a replay of a
 //! previously-streaming request returns the cached blocking body. Mid-turn permission gates
 //! are handled out-of-band via `POST /v1/responses/{request_id}` on a side channel; the
 //! streaming client sees a `permission_required` event and resolves via that endpoint without
@@ -202,12 +202,16 @@ pub async fn submit_turn(
     // ticket; concurrent same-keyed requests see `InFlight` and 409.  The ticket commits on
     // completion via the rollback-on-Drop pattern so a panic doesn't block retries forever.
     let body_hash = hash_body(&raw_body);
+    // The session this turn acts on is part of the key. An `Idempotency-Key` names the *client's*
+    // unit of work, so reusing one across two sessions is the natural thing to do, and without the
+    // scope the second request replayed the first session's transcript and never ran its turn.
+    let idempotency_scope = session_id.to_string();
     let cacheable_key = if body.stream { None } else { idempotency_key };
     let idempotency_ticket: Option<crate::server::idempotency::IdempotencyTicket> =
         if let Some(key) = cacheable_key.as_deref() {
             match state
                 .idempotency
-                .lookup_and_mark(&principal.token_id, key, &body_hash)
+                .lookup_and_mark(&principal.token_id, &idempotency_scope, key, &body_hash)
                 .await
             {
                 LookupOutcome::Hit(entry) => {
@@ -254,30 +258,6 @@ pub async fn submit_turn(
             None
         };
 
-    // Hold the sessions read-lock across both the map lookup and `TurnGuard::acquire` to
-    // close the TOCTOU gap: DELETE's write-lock blocks behind any reader, so by the time
-    // it fires we've already bumped `in_flight > 0` and DELETE's re-check returns 409.
-    let (entry, turn_guard) = {
-        let map = state.sessions.read().await;
-        if let Some(entry) = map.get(&session_id).cloned() {
-            let guard = TurnGuard::acquire(
-                Arc::clone(&state.concurrent_turns),
-                Arc::clone(&entry.in_flight),
-                state.config.max_concurrent_turns,
-            )?;
-            (entry, guard)
-        } else {
-            drop(map);
-            let entry = ensure_session_loaded(&state, session_id).await?;
-            let guard = TurnGuard::acquire(
-                Arc::clone(&state.concurrent_turns),
-                Arc::clone(&entry.in_flight),
-                state.config.max_concurrent_turns,
-            )?;
-            (entry, guard)
-        }
-    };
-
     // Reject a turn with nothing in it before hitting the provider. An image with no text is
     // allowed: against prior context "look at this" is a complete request, and ACP permits the
     // same (`run_prompt_turn` has no empty-text check).
@@ -315,6 +295,37 @@ pub async fn submit_turn(
         body.message
     };
 
+    // Taken only once the request is known to be one meka will act on. The guard marks the
+    // session as busy, and a request rejected below never runs a turn, so acquiring first made a
+    // malformed body answer 409 on the session's own PATCH, DELETE, compact and rewind for as long
+    // as the guard lived -- a false "turn in flight" caused by a turn that never started.
+    //
+    // Hold the sessions read-lock across both the map lookup and `TurnGuard::acquire` to
+    // close the TOCTOU gap: DELETE's write-lock blocks behind any reader, so by the time
+    // it fires we've already bumped `in_flight > 0` and DELETE's re-check returns 409.
+    let (entry, turn_guard) = {
+        let map = state.sessions.read().await;
+        if let Some(entry) = map.get(&session_id).cloned() {
+            let guard = TurnGuard::acquire(
+                Arc::clone(&state.concurrent_turns),
+                Arc::clone(&entry.in_flight),
+                state.config.max_concurrent_turns,
+                &entry.cancel_epoch,
+            )?;
+            (entry, guard)
+        } else {
+            drop(map);
+            let entry = ensure_session_loaded(&state, session_id).await?;
+            let guard = TurnGuard::acquire(
+                Arc::clone(&state.concurrent_turns),
+                Arc::clone(&entry.in_flight),
+                state.config.max_concurrent_turns,
+                &entry.cancel_epoch,
+            )?;
+            (entry, guard)
+        }
+    };
+
     if body.stream {
         // SSE responses are streamed live and aren't a single envelope we can cache.
         run_streaming_turn(state, entry, session_id, message, images, turn_guard).await
@@ -339,13 +350,72 @@ pub async fn submit_turn(
     }
 }
 
+/// Cancel `cancellation` if a `POST /cancel` landed while this turn was being admitted.
+///
+/// `epoch_at_admission` is sampled immediately after `TurnGuard::acquire`, which is the instant the
+/// session starts reporting `turn_in_flight: true`. Any cancel after that point is aimed at this
+/// turn, but until the token below is published `/cancel` is still reading the previous turn's --
+/// cancelling something already finished, answering 204, and leaving this turn untouched. Comparing
+/// the counter closes that window: the caller was told the turn was cancelled, so it is.
+///
+/// See [`crate::server::state::SessionEntry::cancel_epoch`] for why the sample is taken after the
+/// guard rather than before.
+fn honour_a_cancel_from_the_admission_window(
+    cancel_epoch: &std::sync::atomic::AtomicU64,
+    epoch_at_admission: u64,
+    cancellation: &CancellationToken,
+) {
+    if cancel_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch_at_admission {
+        tracing::debug!(
+            "a cancel arrived while this turn was being admitted; honouring it before the turn runs"
+        );
+        cancellation.cancel();
+    }
+}
+
+/// Cancel the turn when the consumer that just lagged was the only one reading it.
+///
+/// Turn events are broadcast, so a re-attached client or a second consumer is a separate receiver.
+/// Cancelling unconditionally took the turn away from clients that were keeping up, on the say-so
+/// of one slow reader.
+///
+/// The lagging receiver is still live when this runs -- it is the local binding the `Lagged` arm
+/// was reached through -- so it counts itself. That is why the threshold is `<= 1` rather than
+/// `== 0`: one means "the lagger and nobody else". Do not "fix" this to exclude it without moving
+/// the threshold in the same commit, or the decision inverts in both directions.
+///
+/// A named function rather than three lines inline: the call site sits inside an SSE generator's
+/// `Lagged` arm, which no test can reach without forcing a broadcast overflow against two live
+/// consumers. Inline, the decision was untestable and a mutation removing it left the suite green.
+/// Returns whether the turn was cancelled, which decides what the caller may truthfully tell the
+/// client: a turn that is still running for someone else has not failed, and saying it has sends
+/// this client to retry into a 409 `turn-in-flight`.
+fn cancel_if_nobody_else_is_reading(
+    frontend: &crate::server::http_frontend::HttpFrontend,
+    cancellation: &CancellationToken,
+) -> bool {
+    let remaining = frontend.subscriber_count();
+    if remaining <= 1 {
+        cancellation.cancel();
+        true
+    } else {
+        tracing::debug!(
+            "not cancelling the turn: {} other SSE consumer(s) are still reading",
+            remaining.saturating_sub(1)
+        );
+        false
+    }
+}
+
 /// Record a finished blocking turn against its `Idempotency-Key`, if it had one.
 ///
 /// Caches success (2xx) and client-error (4xx) envelopes. Server-side errors (5xx) and
 /// `TurnInFlight` are skipped: a transient provider 502 would otherwise be replayed for the full
-/// 24h TTL, defeating the point of an idempotent retry, and `TurnInFlight` means the turn was
-/// never attempted at all. In both cases the ticket's `Drop` clears the `Pending` entry so a retry
-/// re-executes.
+/// 24h TTL, defeating the point of an idempotent retry; `TurnInFlight` means the turn was never
+/// attempted at all; and `TurnCancelled` means it was interrupted, which is a fact about one
+/// attempt rather than about the request. Caching that one pinned "cancelled" as the answer for the
+/// next 24 hours, so the retry the cancellation invites could never run. In all three cases the
+/// ticket's `Drop` clears the `Pending` entry so a retry re-executes.
 async fn commit_idempotency(
     ticket: Option<crate::server::idempotency::IdempotencyTicket>,
     session_id: Uuid,
@@ -358,6 +428,7 @@ async fn commit_idempotency(
         response,
         Err(problem) if problem.status >= 500
             || problem.type_uri == ErrorKind::TurnInFlight.type_uri()
+            || problem.type_uri == ErrorKind::TurnCancelled.type_uri()
     );
     if skip_cache {
         tracing::debug!(
@@ -554,6 +625,11 @@ async fn run_blocking_turn(
         );
         *guard = cancellation.clone();
     }
+    honour_a_cancel_from_the_admission_window(
+        &entry.cancel_epoch,
+        turn_guard.epoch_at_admission,
+        &cancellation,
+    );
     let turn_id = uuid::Uuid::new_v4();
 
     let join = tokio::spawn(async move {
@@ -670,6 +746,11 @@ async fn run_streaming_turn(
         );
         *guard = cancellation.clone();
     }
+    honour_a_cancel_from_the_admission_window(
+        &entry.cancel_epoch,
+        turn_guard.epoch_at_admission,
+        &cancellation,
+    );
 
     let entry_for_task = entry.clone();
     let cancel_for_task = cancellation.clone();
@@ -720,7 +801,15 @@ async fn run_streaming_turn(
     // watches either token itself: the drain fires every session's cancellation token directly
     // (`server::drain_active_sessions`), and the task reads the shutdown token to decide whether
     // its terminal says `server_shutdown` or `client`.
-    let stream = build_sse_stream(turn_id, session_id, receiver, join, cancellation, ids);
+    let stream = build_sse_stream(
+        turn_id,
+        session_id,
+        receiver,
+        join,
+        cancellation,
+        ids,
+        Arc::clone(&entry.frontend),
+    );
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(20))
@@ -748,6 +837,7 @@ fn build_sse_stream(
     join: tokio::task::JoinHandle<crate::server::sse::SseEvent>,
     cancellation: CancellationToken,
     ids: Arc<crate::server::sse::EventIdGenerator>,
+    frontend: Arc<crate::server::http_frontend::HttpFrontend>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
         // Per spec §SSE production-concerns: hint clients to reconnect after 3s on disconnect.
@@ -782,28 +872,64 @@ fn build_sse_stream(
                                 "SSE consumer lagged, skipped {} events; terminating stream",
                                 skipped
                             );
-                            // Cancel the turn so the agent doesn't keep burning provider
-                            // tokens for a consumer that's lost data and will need to retry.
-                            cancellation.cancel();
-                            yield Ok(Event::default()
-                                .id(ids.next().to_string())
-                                .event("turn.failed")
-                                .json_data(serde_json::json!({
-                                    "turn_id": turn_id.to_string(),
-                                    "session_id": session_id.to_string(),
-                                    "error": {
-                                        "type": "https://meka.so/errors/sse-lag",
-                                        "title": "SSE consumer lagged",
-                                        "status": 500,
-                                        "detail": format!(
-                                            "SSE consumer fell behind; {} event(s) were dropped. \
-                                             The stream is terminated to prevent an incomplete \
-                                             transcript. Retry the turn.",
+                            // Stop burning provider tokens for a consumer that has lost data and
+                            // will need to retry -- but only when nobody else is still reading.
+                            let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+                            // Two different facts, and conflating them is how this told a client
+                            // to do the one thing guaranteed to fail. When the turn was cancelled
+                            // it really did fail, and a retry is the remedy. When it was not, the
+                            // turn is still running for the consumer that kept up: `turn.failed`
+                            // would be a lie, and the retry it invites returns 409
+                            // `turn-in-flight`. Re-attaching with `Last-Event-ID` is the remedy
+                            // there, and it recovers the dropped events rather than redoing them.
+                            yield Ok(if cancelled {
+                                Event::default()
+                                    .id(ids.next().to_string())
+                                    .event(crate::server::sse::SseEventType::TurnFailed.as_str())
+                                    .json_data(serde_json::json!({
+                                        "turn_id": turn_id.to_string(),
+                                        "session_id": session_id.to_string(),
+                                        "error": {
+                                            "type": "https://meka.so/errors/sse-lag",
+                                            "title": "SSE consumer lagged",
+                                            "status": 500,
+                                            "detail": format!(
+                                                "SSE consumer fell behind; {} event(s) were \
+                                                 dropped. Nobody else was reading, so the turn was \
+                                                 cancelled. Retry the turn.",
+                                                skipped
+                                            ),
+                                        },
+                                    }))
+                                    .unwrap_or_else(|_| Event::default().comment("lag-failed serialize-failed"))
+                            } else {
+                                // Deliberately carries no `id`.
+                                //
+                                // Event ids are session-wide and monotonic, so an id here would be
+                                // strictly greater than every event this consumer just lost. A
+                                // client doing the obvious thing -- remember the last id, re-attach
+                                // with it -- would then ask to resume *after* the gap, get an empty
+                                // backlog and `gap: false`, and carry on missing exactly the events
+                                // this notice exists to tell it about. Per the SSE spec an event
+                                // with no `id:` field leaves the client's last-event-id buffer
+                                // alone, so it re-attaches from the last event it actually received
+                                // and the backlog replays the gap.
+                                Event::default()
+                                    .event(crate::server::sse::SseEventType::Notice.as_str())
+                                    .json_data(serde_json::json!({
+                                        "turn_id": turn_id.to_string(),
+                                        "session_id": session_id.to_string(),
+                                        "notice": format!(
+                                            "SSE consumer fell behind; {} event(s) were dropped \
+                                             and this stream is closing to avoid serving an \
+                                             incomplete transcript. The turn is still running for \
+                                             another consumer: re-attach with Last-Event-ID to \
+                                             collect what was missed rather than retrying.",
                                             skipped
                                         ),
-                                    },
-                                }))
-                                .unwrap_or_else(|_| Event::default().comment("lag-failed serialize-failed")));
+                                    }))
+                                    .unwrap_or_else(|_| Event::default().comment("lag-notice serialize-failed"))
+                            });
                             break;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1224,6 +1350,12 @@ pub async fn cancel_turn(
     let entry = state.sessions.read().await.get(&session_id).cloned();
 
     if let Some(entry) = entry {
+        // Bump before cancelling, so a turn still being admitted cannot read the pre-bump value
+        // after we have already cancelled the token it is about to replace. See
+        // `SessionEntry::cancel_epoch`.
+        entry
+            .cancel_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let token =
             crate::server::poisoned::read(&entry.cancellation, "cancel::read_token").clone();
         token.cancel();
@@ -1236,6 +1368,118 @@ pub async fn cancel_turn(
 mod tests {
     use super::*;
     use crate::{frontend::FrontendEvent, provider::Notice};
+
+    /// A cancel that lands while a turn is being admitted must still stop it.
+    ///
+    /// The token is published after `TurnGuard::acquire`, and the guard is what makes
+    /// `turn_in_flight` report `true`. Between those two points `POST /cancel` reads the *previous*
+    /// turn's token, cancels something already finished, answers 204, and leaves the turn that is
+    /// starting untouched -- so the API says "cancelled" while the turn runs to completion. Poll
+    /// `turn_in_flight` then cancel is the flow the HTTP docs describe, and an integration test
+    /// written against it reproduced this about one run in four.
+    #[test]
+    fn a_cancel_during_admission_still_stops_the_turn() {
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Sampled the instant the guard is taken, exactly as `submit_turn` does.
+        let epoch_at_admission = epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        // ...the cancel lands here, before the turn has published its token: it bumps the counter
+        // and cancels whatever token the entry still holds, which is not this turn's.
+        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let cancellation = CancellationToken::new();
+        honour_a_cancel_from_the_admission_window(&epoch, epoch_at_admission, &cancellation);
+        assert!(
+            cancellation.is_cancelled(),
+            "a cancel the caller was told succeeded left the turn running"
+        );
+    }
+
+    /// The other half: no cancel means no cancellation. Without this the fix could be "always
+    /// cancel", which passes the test above and breaks every turn.
+    #[test]
+    fn a_turn_admitted_with_no_cancel_pending_is_left_alone() {
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let epoch_at_admission = epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        let cancellation = CancellationToken::new();
+        honour_a_cancel_from_the_admission_window(&epoch, epoch_at_admission, &cancellation);
+        assert!(!cancellation.is_cancelled());
+    }
+
+    /// One consumer falling behind must not end the turn for a second one that is keeping up.
+    /// The lagging receiver is already dropped by the time the decision runs, so the count it
+    /// sees is of the *other* readers.
+    #[tokio::test]
+    async fn a_lagging_consumer_does_not_cancel_a_turn_someone_else_is_reading() {
+        let frontend = crate::server::http_frontend::HttpFrontend::new();
+        let (_turn_consumer, _ids) = frontend.install_stream(
+            16,
+            16,
+            std::time::Duration::from_secs(1),
+            Uuid::from_u128(0xfeed),
+        );
+        let _reattached = frontend
+            .attach_stream(None)
+            .expect("a live stream accepts a re-attach");
+
+        let cancellation = CancellationToken::new();
+        let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+        assert!(
+            !cancellation.is_cancelled(),
+            "the turn was cancelled out from under a consumer that was keeping up"
+        );
+        assert!(
+            !cancelled,
+            "and the caller must be told so, or it reports a turn.failed for a turn still running"
+        );
+    }
+
+    /// The other half: when the consumer that lagged was the only one, there is nobody left to
+    /// deliver to, so the turn should stop rather than keep spending provider tokens.
+    #[tokio::test]
+    async fn a_lagging_consumer_that_was_the_only_reader_cancels_the_turn() {
+        let frontend = crate::server::http_frontend::HttpFrontend::new();
+        let (_turn_consumer, _ids) = frontend.install_stream(
+            16,
+            16,
+            std::time::Duration::from_secs(1),
+            Uuid::from_u128(0xfeed),
+        );
+
+        let cancellation = CancellationToken::new();
+        let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+        assert!(
+            cancellation.is_cancelled(),
+            "nobody is reading, so the turn should not keep running"
+        );
+        assert!(
+            cancelled,
+            "and the caller must be told so, or it withholds the turn.failed the client needs"
+        );
+    }
+
+    /// A cancel aimed at an *earlier* turn must not abort the one just submitted.
+    ///
+    /// This is why the sample is taken after `TurnGuard::acquire` rather than before it: reading
+    /// the counter earlier would fold a cancel that arrived while no turn was in flight into this
+    /// turn's window, and cancelling a turn nobody asked to cancel is the worse of the two
+    /// failures.
+    #[test]
+    fn a_cancel_from_before_admission_does_not_abort_the_next_turn() {
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The client cancels while nothing is running; 204, idempotent, a no-op.
+        epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Only *then* does the next turn get admitted.
+        let epoch_at_admission = epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        let cancellation = CancellationToken::new();
+        honour_a_cancel_from_the_admission_window(&epoch, epoch_at_admission, &cancellation);
+        assert!(
+            !cancellation.is_cancelled(),
+            "a stale cancel aborted a turn submitted after it"
+        );
+    }
 
     #[test]
     fn assemble_response_concatenates_text_deltas() {

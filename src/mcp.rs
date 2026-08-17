@@ -28,6 +28,7 @@ use rmcp::{
     service::ServiceError,
 };
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{McpServerConfig, McpTransport},
@@ -45,6 +46,41 @@ pub const MAX_MCP_DESCRIPTION_LENGTH: usize = 2048;
 /// would otherwise be cloned verbatim, forwarded to the provider, billed against the user's API
 /// quota, and risk OOM. Mirrors the 10 MiB body cap on `fetch_url`.
 pub const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Tools one MCP server may advertise before the list is cut.
+///
+/// `list_all_tools` pages until the server stops offering a cursor, so a server that keeps offering
+/// one keeps meka reading -- and every tool it returns costs a `ToolDefinition` resident for the
+/// session plus a line in the catalogue the model reads on every turn. The cap is far above any
+/// real server (the largest published ones advertise dozens) and exists so the ceiling belongs to
+/// meka rather than to whatever is on the other end of the socket.
+pub const MAX_MCP_TOOLS_PER_SERVER: usize = 512;
+
+/// Keep at most [`MAX_MCP_TOOLS_PER_SERVER`] of what a server advertised, warning when it bites.
+///
+/// A free function rather than an inline block so the bound is assertable: reaching it through
+/// `list_tools_bounded` needs a live server, so raising the constant to `usize::MAX` left every
+/// suite green. The tool list is held per session and re-sent in every request's tools array, so
+/// an unbounded one is resident cost on every turn, not just at connect.
+fn cap_advertised_tools<T>(listed: Vec<T>, server_name: &str) -> Vec<T> {
+    if listed.len() > MAX_MCP_TOOLS_PER_SERVER {
+        tracing::warn!(
+            "MCP server '{}' advertised {} tools; keeping the first {}",
+            server_name,
+            listed.len(),
+            MAX_MCP_TOOLS_PER_SERVER
+        );
+        return listed.into_iter().take(MAX_MCP_TOOLS_PER_SERVER).collect();
+    }
+    listed
+}
+
+/// Bound on an MCP request made outside the connector, when no configured timeout is available.
+///
+/// Matches `[mcp].connect_timeout_seconds`'s own default, so a manager that never started a
+/// connector behaves like one that did rather than waiting forever.
+pub(crate) const DEFAULT_MCP_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Allow-list of image MIME types passed straight through to the provider. Anything else (notably
 /// `image/svg+xml`, which can embed script/link elements) is converted to a text placeholder.
@@ -144,6 +180,11 @@ pub struct McpClientManager {
     /// startup) and detach at `session/close`. Updates from the connector or notification handler
     /// propagate to every entry.
     attached_registries: tokio::sync::RwLock<Vec<crate::tools::ToolRegistry>>,
+    /// `[mcp].connect_timeout_seconds`, kept so the request paths that run *after* the connector
+    /// (a `tools/list_changed` refresh, `meka mcp tools`) can bound themselves by the same value
+    /// the connect did. Set by [`Self::start_connector`]; a manager that never started one
+    /// (tests) falls back to [`DEFAULT_MCP_REQUEST_TIMEOUT`].
+    connect_timeout: OnceLock<std::time::Duration>,
 }
 
 /// Lifecycle state of a single MCP server. Transitions:
@@ -217,9 +258,28 @@ pub struct ServerEntry {
     /// Immutable for the lifetime of the connection per the MCP spec, so reconnects don't reset
     /// it.
     pub(crate) instructions: OnceLock<Option<String>>,
+    /// `[mcp].connect_timeout_seconds`, copied here so the request helpers that run outside the
+    /// manager can honour it. Without it [`bounded`] fell back to its own constant and a
+    /// configured timeout applied to `tools/list` but silently not to `resources/read` or
+    /// `prompts/get`.
+    pub(crate) request_timeout: OnceLock<std::time::Duration>,
+    /// How many tools the last `tools/list` dropped to stay under [`MAX_MCP_TOOLS_PER_SERVER`].
+    /// Recorded so the cap is *disclosed* rather than only logged: a tool that vanished between
+    /// what the server offers and what meka registered is indistinguishable, from the outside,
+    /// from a tool the server never had.
+    pub(crate) dropped_tools: std::sync::atomic::AtomicUsize,
 }
 
 impl ServerEntry {
+    /// The configured per-request bound, or [`DEFAULT_MCP_REQUEST_TIMEOUT`] before the connector
+    /// has started (tests, and the window before `start_connector`).
+    pub(crate) fn request_timeout(&self) -> std::time::Duration {
+        self.request_timeout
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT)
+    }
+
     /// Returns the server's `InitializeResult.instructions` (sanitised + truncated to
     /// [`MAX_MCP_DESCRIPTION_LENGTH`]) if the server advertised one during the handshake.
     pub fn instructions(&self) -> Option<&str> {
@@ -234,6 +294,38 @@ impl ServerEntry {
 
     pub(crate) fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// `tools/list`, bounded in both time and count.
+    ///
+    /// Every caller wants the same two guarantees and none of them had both. `list_all_tools`
+    /// follows the server's pagination cursor to exhaustion, so a server that answers slowly holds
+    /// the caller open with no deadline, and one that keeps handing back cursors grows the tool set
+    /// without limit. The connect path already wrapped its discovery in a timeout; the two others
+    /// -- a `tools/list_changed` refresh and `meka mcp tools` -- did not.
+    pub(crate) async fn list_tools_bounded(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<rmcp::model::Tool>> {
+        let peer = self.require_connected().await?;
+        let listed = tokio::time::timeout(timeout, peer.list_all_tools())
+            .await
+            .map_err(|_elapsed| MekaError::McpConnection {
+                server_name: self.server_name.clone(),
+                message: format!("tools/list timed out after {:?}", timeout),
+            })?
+            .map_err(|error| MekaError::McpConnection {
+                server_name: self.server_name.clone(),
+                message: format!("list_tools failed: {}", error),
+            })?;
+
+        let advertised = listed.len();
+        let kept = cap_advertised_tools(listed, &self.server_name);
+        self.dropped_tools.store(
+            advertised.saturating_sub(kept.len()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(kept)
     }
 }
 
@@ -484,6 +576,8 @@ impl McpClientManager {
                 }),
                 reconnect_lock: Mutex::new(()),
                 instructions: OnceLock::new(),
+                request_timeout: OnceLock::new(),
+                dropped_tools: std::sync::atomic::AtomicUsize::new(0),
             });
             if !is_disabled {
                 pending.push(Arc::clone(&entry));
@@ -504,6 +598,7 @@ impl McpClientManager {
             pending_entries: std::sync::Mutex::new(Some(pending)),
             tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
             attached_registries: tokio::sync::RwLock::new(Vec::new()),
+            connect_timeout: OnceLock::new(),
         });
         Ok(manager)
     }
@@ -583,7 +678,24 @@ impl McpClientManager {
     /// The connector writes tool discoveries through [`Self::update_server_tools`], which fans out
     /// to every registry attached via [`Self::attach_registry`]. The caller does not pass a
     /// specific registry: attach yours first, then start the connector.
+    /// The bound to put on an MCP request made outside the connector.
+    fn request_timeout(&self) -> std::time::Duration {
+        self.connect_timeout
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT)
+    }
+
     pub fn start_connector(self: &Arc<Self>, runtime: McpRuntimeConfig) {
+        // Recorded before the early return, so a second `start_connector` call still leaves the
+        // timeout set for the request paths that read it.
+        let _ = self.connect_timeout.set(runtime.connect_timeout);
+        // Every entry gets the same bound, so the request helpers that only hold an
+        // `Arc<ServerEntry>` honour the configured timeout rather than falling back to the
+        // module default.
+        for entry in self.servers.values() {
+            let _ = entry.request_timeout.set(runtime.connect_timeout);
+        }
         let Some(pending) = self
             .pending_entries
             .lock()
@@ -701,14 +813,7 @@ impl McpClientManager {
 
         let server_config = &entry.config;
 
-        let peer = entry.require_connected().await?;
-        let tools = peer
-            .list_all_tools()
-            .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: server_name.to_string(),
-                message: format!("list_tools failed: {}", error),
-            })?;
+        let tools = entry.list_tools_bounded(self.request_timeout()).await?;
 
         // Collect advertised raw names up-front so we can flag stale `allowed_tools` /
         // `disabled_tools` / `tool_permissions` entries that no longer match anything the server
@@ -995,14 +1100,7 @@ impl McpClientManager {
         };
 
         let server_config = &entry.config;
-        let peer = entry.require_connected().await?;
-        let tools = peer
-            .list_all_tools()
-            .await
-            .map_err(|error| MekaError::McpConnection {
-                server_name: server_name.to_string(),
-                message: format!("list_tools failed: {}", error),
-            })?;
+        let tools = entry.list_tools_bounded(self.request_timeout()).await?;
 
         let mut out = Vec::with_capacity(tools.len());
         for tool in tools {
@@ -1024,12 +1122,15 @@ impl McpClientManager {
                 self.mcp_default_permission,
             )?;
             let allowed = tool_is_allowed(server_config, &raw_name);
+            let read_only_hint_declined =
+                read_only_hint_was_declined(tool.annotations.as_ref(), permission_source);
             out.push(AdvertisedTool {
                 raw_name,
                 description,
                 resolved_permission,
                 permission_source,
                 allowed,
+                read_only_hint_declined,
             });
         }
 
@@ -1217,7 +1318,8 @@ pub(crate) fn warn_on_stale_tool_config(
 ///
 /// 1. `server.tool_permissions[tool]`: per-tool user override.
 /// 2. `server.permission`: server-level user override.
-/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` → Write.
+/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` → Write. The
+///    `true` half is skipped when the server sets `trust_read_only_hint = false`.
 /// 4. `mcp.default_permission`: global fallback when no hint exists.
 /// 5. Hardcoded `Write`: ultimate strict fallback.
 ///
@@ -1268,9 +1370,7 @@ impl PermissionSource {
 
 /// A tool advertised by an MCP server, paired with the resolved permission and the source step of
 /// the resolution chain. Returned by [`McpClientManager::list_advertised_tools`] and printed by
-/// `meka mcp tools <server>`. The raw `readOnlyHint` value isn't carried here because
-/// [`PermissionSource::ReadOnlyHint`] already signals when the hint drove the decision; downstream
-/// renderers that want the raw value can re-query.
+/// `meka mcp tools <server>`.
 pub struct AdvertisedTool {
     /// Raw name as advertised by the server. Use this value in `allowed_tools` / `disabled_tools`
     /// / `tool_permissions` config.
@@ -1284,6 +1384,15 @@ pub struct AdvertisedTool {
     /// `false` if currently filtered out by `allowed_tools` / `disabled_tools`, i.e. the agent
     /// would never see this tool.
     pub allowed: bool,
+    /// The server advertised `readOnlyHint: true` and `trust_read_only_hint = false` withheld it,
+    /// so resolution fell through to the steps below.
+    ///
+    /// Carried separately because [`Self::permission_source`] names only what *won*, and a
+    /// declined hint by definition did not. Without it the one thing the setting exists to do
+    /// is invisible at the one place a user checks it: `meka mcp tools` showed
+    /// `default_permission` either way, so a server advertising no hint and a server whose
+    /// hint was refused read identically.
+    pub read_only_hint_declined: bool,
 }
 
 /// Same resolution as [`resolve_tool_permission`] but also returns which step of the chain fired,
@@ -1326,22 +1435,61 @@ fn resolve_tool_permission_with_source(
         return Ok((permission, PermissionSource::ServerOverride));
     }
     // 3. Server-advertised readOnlyHint.
+    //
+    // The two directions are not symmetric, so they are gated differently. A hint of `false` only
+    // ever *raises* the requirement to Write, so believing it costs nothing and it is always
+    // honoured. A hint of `true` *lowers* the requirement to Read, and that is the direction in
+    // which a wrong or dishonest hint matters: MCP tools run in the server's own process with no
+    // sandbox, so a tool wrongly classified Read can write the user's tree while meka sits at
+    // `read`. `trust_read_only_hint = false` withholds exactly that, leaving the hint advisory for
+    // display and dropping the tool through to the strict fallback -- past the global default, for
+    // the reason step 4 gives.
+    let mut hint_declined = false;
     if let Some(annotations) = tool_annotations
         && let Some(hint) = annotations.read_only_hint
     {
-        let permission = if hint {
-            Permission::Read
-        } else {
-            Permission::Write
-        };
-        return Ok((permission, PermissionSource::ReadOnlyHint));
+        if !hint {
+            return Ok((Permission::Write, PermissionSource::ReadOnlyHint));
+        }
+        if server_config.trust_read_only_hint.unwrap_or(true) {
+            return Ok((Permission::Read, PermissionSource::ReadOnlyHint));
+        }
+        hint_declined = true;
     }
-    // 4. Global [mcp].default_permission.
-    if let Some(permission) = mcp_default {
+    // 4. Global [mcp].default_permission -- but not for a hint this server was refused.
+    //
+    // A declined hint skips straight to the strict fallback, because otherwise the knob is
+    // display-only in exactly the configuration where it matters most. `default_permission =
+    // "read"` sent a refused `readOnlyHint: true` back to `Read` here, which is bit-for-bit the
+    // outcome of trusting it: the tool registers at `Read` and dispatches unapproved at
+    // `--permission read`. `"none"` was worse, since a required level of `None` is permitted at
+    // every tier. Either way the user set a per-server flag saying "do not take this server's word
+    // for it" and a global convenience setting quietly took its word for it anyway.
+    //
+    // Per-server beats global, which is the direction the rest of this chain already runs: steps 1
+    // and 2 are the per-server `tool_permissions` / `permission` overrides and they are checked
+    // above. Those remain the way to put a distrusted server's tool back within reach of `read`.
+    if !hint_declined && let Some(permission) = mcp_default {
         return Ok((permission, PermissionSource::GlobalDefault));
     }
     // 5. Hardcoded strict fallback.
     Ok((Permission::Write, PermissionSource::Fallback))
+}
+
+/// Whether a server offered `readOnlyHint: true` and resolution refused it.
+///
+/// A hint that *won* is reported as [`PermissionSource::ReadOnlyHint`], so anything else means the
+/// hint was present and something below it decided. Only the `true` direction can be declined:
+/// `readOnlyHint: false` only ever raises the requirement, so it is always honoured and always wins
+/// when present.
+fn read_only_hint_was_declined(
+    tool_annotations: Option<&rmcp::model::ToolAnnotations>,
+    source: PermissionSource,
+) -> bool {
+    tool_annotations
+        .and_then(|annotations| annotations.read_only_hint)
+        .unwrap_or(false)
+        && !matches!(source, PermissionSource::ReadOnlyHint)
 }
 
 /// Shared context threaded into every [`handler::MekaClientHandler`] so notification callbacks and
@@ -1392,70 +1540,118 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Bound one MCP round-trip in time and against the turn's cancellation.
+///
+/// Every helper below is a request to a process meka does not control, over a transport that can
+/// accept and then go quiet. Without this a server that never answers parks the tool call, and with
+/// it the turn, for the life of the process -- and pressing stop did not reach it either, because
+/// the token the tool was handed went unused. `call_tool_once` has had both since it was written;
+/// the resource and prompt helpers were the asymmetry.
+///
+/// `biased` so a token already fired wins over a response arriving in the same instant: once the
+/// user has stopped the turn, the answer is not wanted whichever got there first.
+async fn bounded<T>(
+    entry: &Arc<ServerEntry>,
+    what: &str,
+    cancellation: &CancellationToken,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
+        outcome = tokio::time::timeout(entry.request_timeout(), work) => match outcome {
+            Ok(result) => result,
+            Err(_elapsed) => Err(MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("{} timed out after {:?}", what, entry.request_timeout()),
+            }),
+        },
+    }
+}
+
 /// List all resources advertised by a server. Returned verbatim from the current peer; no caching
 /// is done here.
-pub async fn list_resources(entry: &Arc<ServerEntry>) -> Result<Vec<Resource>> {
-    let peer = entry.require_connected().await?;
-    match peer.list_all_resources().await {
-        Ok(resources) => Ok(resources),
-        Err(ServiceError::TransportClosed) => {
-            entry.reconnect().await?;
-            let peer = entry.require_connected().await?;
-            peer.list_all_resources()
-                .await
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: entry.server_name.clone(),
-                    message: format!("list_resources failed: {}", error),
-                })
+pub async fn list_resources(
+    entry: &Arc<ServerEntry>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Resource>> {
+    bounded(entry, "resources/list", cancellation, async {
+        let peer = entry.require_connected().await?;
+        match peer.list_all_resources().await {
+            Ok(resources) => Ok(resources),
+            Err(ServiceError::TransportClosed) => {
+                entry.reconnect().await?;
+                let peer = entry.require_connected().await?;
+                peer.list_all_resources()
+                    .await
+                    .map_err(|error| MekaError::McpConnection {
+                        server_name: entry.server_name.clone(),
+                        message: format!("list_resources failed: {}", error),
+                    })
+            }
+            Err(error) => Err(MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("list_resources failed: {}", error),
+            }),
         }
-        Err(error) => Err(MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("list_resources failed: {}", error),
-        }),
-    }
+    })
+    .await
 }
 
-pub async fn read_resource(entry: &Arc<ServerEntry>, uri: String) -> Result<ReadResourceResult> {
-    let params = ReadResourceRequestParams::new(uri.clone());
-    let peer = entry.require_connected().await?;
-    match peer.read_resource(params.clone()).await {
-        Ok(result) => Ok(result),
-        Err(ServiceError::TransportClosed) => {
-            entry.reconnect().await?;
-            let peer = entry.require_connected().await?;
-            peer.read_resource(params)
-                .await
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: entry.server_name.clone(),
-                    message: format!("read_resource({}) failed: {}", uri, error),
-                })
+pub async fn read_resource(
+    entry: &Arc<ServerEntry>,
+    uri: String,
+    cancellation: &CancellationToken,
+) -> Result<ReadResourceResult> {
+    bounded(entry, "resources/read", cancellation, async {
+        let params = ReadResourceRequestParams::new(uri.clone());
+        let peer = entry.require_connected().await?;
+        match peer.read_resource(params.clone()).await {
+            Ok(result) => Ok(result),
+            Err(ServiceError::TransportClosed) => {
+                entry.reconnect().await?;
+                let peer = entry.require_connected().await?;
+                peer.read_resource(params)
+                    .await
+                    .map_err(|error| MekaError::McpConnection {
+                        server_name: entry.server_name.clone(),
+                        message: format!("read_resource({}) failed: {}", uri, error),
+                    })
+            }
+            Err(error) => Err(MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("read_resource({}) failed: {}", uri, error),
+            }),
         }
-        Err(error) => Err(MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("read_resource({}) failed: {}", uri, error),
-        }),
-    }
+    })
+    .await
 }
 
-pub async fn list_prompts(entry: &Arc<ServerEntry>) -> Result<Vec<Prompt>> {
-    let peer = entry.require_connected().await?;
-    match peer.list_all_prompts().await {
-        Ok(prompts) => Ok(prompts),
-        Err(ServiceError::TransportClosed) => {
-            entry.reconnect().await?;
-            let peer = entry.require_connected().await?;
-            peer.list_all_prompts()
-                .await
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: entry.server_name.clone(),
-                    message: format!("could not list prompts: {}", error),
-                })
+pub async fn list_prompts(
+    entry: &Arc<ServerEntry>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Prompt>> {
+    bounded(entry, "prompts/list", cancellation, async {
+        let peer = entry.require_connected().await?;
+        match peer.list_all_prompts().await {
+            Ok(prompts) => Ok(prompts),
+            Err(ServiceError::TransportClosed) => {
+                entry.reconnect().await?;
+                let peer = entry.require_connected().await?;
+                peer.list_all_prompts()
+                    .await
+                    .map_err(|error| MekaError::McpConnection {
+                        server_name: entry.server_name.clone(),
+                        message: format!("could not list prompts: {}", error),
+                    })
+            }
+            Err(error) => Err(MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("could not list prompts: {}", error),
+            }),
         }
-        Err(error) => Err(MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("could not list prompts: {}", error),
-        }),
-    }
+    })
+    .await
 }
 
 // rmcp 3.1 deprecates `subscribe` / `unsubscribe` in favour of `Peer::listen`, but that is a
@@ -1470,55 +1666,73 @@ pub async fn list_prompts(entry: &Arc<ServerEntry>) -> Result<Vec<Prompt>> {
 // updates `mcp_resource_poll` reads would need a per-server pump task feeding them instead. That
 // belongs with the move to 2026-07-28, not ahead of it.
 #[allow(deprecated)]
-pub async fn subscribe_resource(entry: &Arc<ServerEntry>, uri: String) -> Result<()> {
-    let peer = entry.require_connected().await?;
-    let params = rmcp::model::SubscribeRequestParams::new(uri.clone());
-    peer.subscribe(params)
-        .await
-        .map_err(|error| MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("subscribe({}) failed: {}", uri, error),
-        })
+pub async fn subscribe_resource(
+    entry: &Arc<ServerEntry>,
+    uri: String,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    bounded(entry, "resources/subscribe", cancellation, async {
+        let peer = entry.require_connected().await?;
+        let params = rmcp::model::SubscribeRequestParams::new(uri.clone());
+        peer.subscribe(params)
+            .await
+            .map_err(|error| MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("subscribe({}) failed: {}", uri, error),
+            })
+    })
+    .await
 }
 
 #[allow(deprecated)]
-pub async fn unsubscribe_resource(entry: &Arc<ServerEntry>, uri: String) -> Result<()> {
-    let peer = entry.require_connected().await?;
-    let params = rmcp::model::UnsubscribeRequestParams::new(uri.clone());
-    peer.unsubscribe(params)
-        .await
-        .map_err(|error| MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("unsubscribe({}) failed: {}", uri, error),
-        })
+pub async fn unsubscribe_resource(
+    entry: &Arc<ServerEntry>,
+    uri: String,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    bounded(entry, "resources/unsubscribe", cancellation, async {
+        let peer = entry.require_connected().await?;
+        let params = rmcp::model::UnsubscribeRequestParams::new(uri.clone());
+        peer.unsubscribe(params)
+            .await
+            .map_err(|error| MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("unsubscribe({}) failed: {}", uri, error),
+            })
+    })
+    .await
 }
 
 pub async fn get_prompt(
     entry: &Arc<ServerEntry>,
     name: String,
     arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    cancellation: &CancellationToken,
 ) -> Result<GetPromptResult> {
-    let mut params = GetPromptRequestParams::new(name.clone());
-    params.arguments = arguments;
+    bounded(entry, "prompts/get", cancellation, async {
+        let mut params = GetPromptRequestParams::new(name.clone());
+        params.arguments = arguments;
 
-    let peer = entry.require_connected().await?;
-    match peer.get_prompt(params.clone()).await {
-        Ok(result) => Ok(result),
-        Err(ServiceError::TransportClosed) => {
-            entry.reconnect().await?;
-            let peer = entry.require_connected().await?;
-            peer.get_prompt(params)
-                .await
-                .map_err(|error| MekaError::McpConnection {
-                    server_name: entry.server_name.clone(),
-                    message: format!("could not render prompt '{}': {}", name, error),
-                })
+        let peer = entry.require_connected().await?;
+        match peer.get_prompt(params.clone()).await {
+            Ok(result) => Ok(result),
+            Err(ServiceError::TransportClosed) => {
+                entry.reconnect().await?;
+                let peer = entry.require_connected().await?;
+                peer.get_prompt(params)
+                    .await
+                    .map_err(|error| MekaError::McpConnection {
+                        server_name: entry.server_name.clone(),
+                        message: format!("could not render prompt '{}': {}", name, error),
+                    })
+            }
+            Err(error) => Err(MekaError::McpConnection {
+                server_name: entry.server_name.clone(),
+                message: format!("could not render prompt '{}': {}", name, error),
+            }),
         }
-        Err(error) => Err(MekaError::McpConnection {
-            server_name: entry.server_name.clone(),
-            message: format!("could not render prompt '{}': {}", name, error),
-        }),
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1542,6 +1756,7 @@ pub(crate) mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
+            trust_read_only_hint: None,
             disabled: false,
             required: None,
         }
@@ -1618,6 +1833,213 @@ pub(crate) mod tests {
         )
         .expect("should resolve");
         assert_eq!(resolved, Permission::Write);
+    }
+
+    /// `trust_read_only_hint = false` is the knob that keeps an unsandboxed MCP tool out of the
+    /// `read` tier on a server whose self-classification the user does not accept. Without it, a
+    /// server advertising `readOnlyHint: true` for a tool that in fact writes gets to write while
+    /// The advertised-tool bound is a residency bound: the list is held per session and re-sent in
+    /// every request's tools array, so an unbounded one is a per-turn cost, not a one-off.
+    #[test]
+    fn an_over_advertising_server_is_capped_at_the_tool_ceiling() {
+        let under: Vec<usize> = (0..MAX_MCP_TOOLS_PER_SERVER).collect();
+        assert_eq!(
+            cap_advertised_tools(under.clone(), "s").len(),
+            MAX_MCP_TOOLS_PER_SERVER,
+            "a server exactly at the ceiling keeps everything"
+        );
+
+        let over: Vec<usize> = (0..MAX_MCP_TOOLS_PER_SERVER + 250).collect();
+        let capped = cap_advertised_tools(over, "s");
+        assert_eq!(capped.len(), MAX_MCP_TOOLS_PER_SERVER);
+        assert_eq!(
+            capped.first().copied(),
+            Some(0),
+            "the kept ones are the first, not an arbitrary slice"
+        );
+    }
+
+    /// meka sits at `read`, because MCP tools run in the server's process with no sandbox.
+    #[test]
+    fn a_declined_read_only_hint_cannot_reach_the_read_tier() {
+        let mut server = bare_server_config("s");
+        server.trust_read_only_hint = Some(false);
+        let annotations = annotations_with_read_only_hint(Some(true));
+
+        // Every global default, including the two that are themselves at or below `read`.
+        //
+        // Those two are the whole point. `default_permission = "read"` used to send a refused hint
+        // straight back to `Read`, which is bit-for-bit what trusting it would have done, so the
+        // knob changed nothing but a label. `"none"` was worse: a required level of `None` is
+        // permitted at every tier, so the tool ran even at `--permission none`. This test asserted
+        // the invariant in its name while only ever passing `Some(Write)` and `None`.
+        for default in [
+            Some(Permission::Write),
+            Some(Permission::Ask),
+            Some(Permission::Read),
+            Some(Permission::None),
+            None,
+        ] {
+            let resolved =
+                resolve_tool_permission("s", "search", Some(&annotations), &server, default)
+                    .expect("should resolve");
+            assert_eq!(
+                resolved,
+                Permission::Write,
+                "a declined hint must reach the strict fallback whatever the global default is, \
+                 but with {:?} it resolved to {}",
+                default,
+                resolved
+            );
+        }
+    }
+
+    /// The knob is per-server, so it has to beat the global default; the per-server *overrides*
+    /// still beat it in turn.
+    ///
+    /// Without this second half the fix would be a lockout: a distrusted server's tool could never
+    /// be brought back within reach of `read` at all. `tool_permissions` and `permission` are
+    /// checked before the hint, and they remain the documented escape hatch.
+    #[test]
+    fn an_explicit_override_still_outranks_a_declined_hint() {
+        let mut server = bare_server_config("s");
+        server.trust_read_only_hint = Some(false);
+        let annotations = annotations_with_read_only_hint(Some(true));
+
+        server.tool_permissions = Some(std::collections::HashMap::from([(
+            "search".to_string(),
+            "read".to_string(),
+        )]));
+        let resolved = resolve_tool_permission(
+            "s",
+            "search",
+            Some(&annotations),
+            &server,
+            Some(Permission::Read),
+        )
+        .expect("should resolve");
+        assert_eq!(
+            resolved,
+            Permission::Read,
+            "an explicit per-tool override is how a distrusted server's tool is re-admitted"
+        );
+    }
+
+    /// Declining the hint withholds only the direction that *lowers* the requirement. A
+    /// `readOnlyHint: false` can only ever raise it, so believing it costs nothing and it stays
+    /// honoured, including the attribution, so `meka mcp tools` still explains the classification.
+    #[test]
+    fn a_declined_read_only_hint_still_honours_the_raising_direction() {
+        let mut server = bare_server_config("s");
+        server.trust_read_only_hint = Some(false);
+        let annotations = annotations_with_read_only_hint(Some(false));
+
+        let (resolved, source) = resolve_tool_permission_with_source(
+            "s",
+            "write-page",
+            Some(&annotations),
+            &server,
+            Some(Permission::Read),
+        )
+        .expect("should resolve");
+        assert_eq!(resolved, Permission::Write);
+        assert_eq!(source, PermissionSource::ReadOnlyHint);
+    }
+
+    /// Every MCP round-trip has to answer to the turn's cancellation and to a clock.
+    ///
+    /// A server can accept a request and then go quiet, and the resource and prompt helpers awaited
+    /// that unconditionally: the tool call parked, the turn with it, and pressing stop did not
+    /// reach it either, because the token the tool was handed went unused. `call_tool_once` had
+    /// both bounds from the start; these six were the asymmetry.
+    #[tokio::test]
+    async fn an_mcp_round_trip_answers_to_cancellation_and_to_the_clock() {
+        let entry = pending_entry("quiet-srv", McpTransport::Http);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let outcome = bounded(&entry, "resources/read", &cancelled, async {
+            std::future::pending::<Result<()>>().await
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stopped turn must not wait on the server: {outcome:?}",
+        );
+
+        // And the clock, for a server nobody stopped waiting on.
+        tokio::time::pause();
+        let live = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move {
+                bounded(&entry, "resources/read", &live, async {
+                    std::future::pending::<Result<()>>().await
+                })
+                .await
+            }
+        });
+        tokio::time::advance(DEFAULT_MCP_REQUEST_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        let outcome = waiting.await.expect("join");
+        assert!(
+            matches!(outcome, Err(MekaError::McpConnection { .. })),
+            "an unanswered request must end: {outcome:?}",
+        );
+    }
+
+    /// A user who sets `trust_read_only_hint = false` has to be able to see what it moved.
+    ///
+    /// `meka mcp tools` reports the step that *won*, and a declined hint by definition did not, so
+    /// a server advertising no hint at all and a server whose hint was refused both printed
+    /// `default_permission` and read identically. The one place the setting is observable showed
+    /// nothing of it.
+    #[test]
+    fn a_declined_read_only_hint_is_reported_as_declined() {
+        let offered = annotations_with_read_only_hint(Some(true));
+
+        assert!(
+            read_only_hint_was_declined(Some(&offered), PermissionSource::GlobalDefault),
+            "offered and outvoted by the global default is the case this exists for",
+        );
+        assert!(
+            read_only_hint_was_declined(Some(&offered), PermissionSource::Fallback),
+            "and the same when there is no global default to fall to",
+        );
+        assert!(
+            !read_only_hint_was_declined(Some(&offered), PermissionSource::ReadOnlyHint),
+            "a hint that won was not declined",
+        );
+        assert!(
+            !read_only_hint_was_declined(None, PermissionSource::GlobalDefault),
+            "and a server that offered nothing has nothing to decline",
+        );
+        assert!(
+            !read_only_hint_was_declined(
+                Some(&annotations_with_read_only_hint(Some(false))),
+                PermissionSource::GlobalDefault,
+            ),
+            "only the lowering direction can be declined; `false` always wins when present",
+        );
+    }
+
+    /// Declining the hint must not also discard the user's own overrides: steps 1 and 2 sit above
+    /// the hint in the chain and are the documented way to make a distrusted server's tool usable.
+    #[test]
+    fn a_declined_read_only_hint_leaves_user_overrides_in_charge() {
+        let mut server = bare_server_config("s");
+        server.trust_read_only_hint = Some(false);
+        server.tool_permissions = Some(
+            [("search".to_string(), "read".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let annotations = annotations_with_read_only_hint(Some(true));
+
+        let (resolved, source) =
+            resolve_tool_permission_with_source("s", "search", Some(&annotations), &server, None)
+                .expect("should resolve");
+        assert_eq!(resolved, Permission::Read);
+        assert_eq!(source, PermissionSource::ToolOverride);
     }
 
     #[test]
@@ -1841,6 +2263,55 @@ pub(crate) mod tests {
 
     /// Build a bare server entry in `Pending` state for pure-state tests. No network, no process
     /// spawn.
+    /// The configured `connect_timeout` has to reach the request helpers, not just `tools/list`.
+    ///
+    /// `bounded` hardcoded the module default, so `[mcp].connect_timeout_seconds` governed
+    /// discovery and silently not `resources/read`, `prompts/get` or any of the other four. An
+    /// operator who raised it for a slow server still had those calls cut at the default, and one
+    /// who lowered it still waited the default.
+    #[tokio::test]
+    async fn a_request_helper_waits_the_configured_timeout_not_the_default() {
+        let entry = pending_entry("slow-srv", McpTransport::Http);
+        let configured = std::time::Duration::from_secs(3);
+        entry
+            .request_timeout
+            .set(configured)
+            .expect("first and only set");
+        assert_ne!(
+            configured, DEFAULT_MCP_REQUEST_TIMEOUT,
+            "the test is only meaningful while the two differ"
+        );
+
+        tokio::time::pause();
+        let live = CancellationToken::new();
+        let waiting = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move {
+                bounded(&entry, "resources/read", &live, async {
+                    std::future::pending::<Result<()>>().await
+                })
+                .await
+            }
+        });
+
+        // Measured, not merely awaited. A paused clock auto-advances to the next timer whenever
+        // every task is idle, so *some* timeout always fires and asserting only on the error tells
+        // the two apart not at all -- the default would fire too, just later in virtual time.
+        // Elapsed virtual time is the thing that differs.
+        let started = tokio::time::Instant::now();
+        let outcome = waiting.await.expect("join");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(MekaError::McpConnection { .. })),
+            "an unanswered request must end: {outcome:?}",
+        );
+        assert!(
+            waited < DEFAULT_MCP_REQUEST_TIMEOUT,
+            "waited {waited:?}, which is the module default rather than the configured {configured:?}",
+        );
+    }
+
     fn pending_entry(name: &str, transport: McpTransport) -> Arc<ServerEntry> {
         let mut config = bare_server_config(name);
         config.transport = transport;
@@ -1852,6 +2323,8 @@ pub(crate) mod tests {
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
             instructions: OnceLock::new(),
+            request_timeout: OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 

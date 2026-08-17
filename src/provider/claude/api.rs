@@ -52,10 +52,10 @@ impl ClaudeApiProvider {
         effort: Option<String>,
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_effort = resolve_effort(effort.as_deref(), &model);
-        Self {
-            client: reqwest::Client::new(),
+        Ok(Self {
+            client: crate::provider::build_http_client("claude-api", |builder| builder)?,
             api_key,
             base_url: shared::normalize_claude_base_url(
                 base_url.as_deref().unwrap_or("https://api.anthropic.com"),
@@ -67,7 +67,7 @@ impl ClaudeApiProvider {
             resolved_effort,
             max_output_tokens,
             session_stats,
-        }
+        })
     }
 
     fn is_thinking_enabled(&self) -> bool {
@@ -323,6 +323,7 @@ mod tests {
             None,
             None,
         )
+        .expect("build test provider")
     }
 
     #[test]
@@ -381,7 +382,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let betas = thinking_on.compute_betas().unwrap_or_default();
         assert!(betas.contains("interleaved-thinking-2025-05-14"));
         assert!(

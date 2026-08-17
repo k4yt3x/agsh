@@ -187,7 +187,18 @@ pub async fn run_serve(
     drain_active_sessions(&state).await;
     let _ = drain_tx.send(());
 
-    let drain_result = tokio::time::timeout(shutdown_drain_timeout, serve_handle).await;
+    // The drain waits for the turns as well as for the accept loop. A turn runs on a task the
+    // handler spawns rather than inside the handler itself, and `stream_reattach_grace` exists to
+    // keep one running with no client attached, so axum's graceful shutdown finds no in-flight
+    // request to wait for and returns while the work is still going. Awaiting only that was
+    // therefore a drain in name: `handlers::turn` documents at length what a turn dropped
+    // mid-flight costs (an orphaned process group, an assistant `tool_use` whose result never
+    // lands), and every one of those was still on the table at shutdown.
+    let drain_result = tokio::time::timeout(shutdown_drain_timeout, async {
+        let (join_result, ()) = tokio::join!(serve_handle, wait_for_turns_to_unwind(&state));
+        join_result
+    })
+    .await;
     gc_handle.abort();
     scheduler_handle.abort();
     background_handle.abort();
@@ -228,6 +239,38 @@ async fn drain_active_sessions(state: &ServerState) {
         let token =
             crate::server::poisoned::read(&entry.cancellation, "drain::session_cancel").clone();
         token.cancel();
+    }
+}
+
+/// Resolve once every turn this process is running has finished unwinding.
+///
+/// Cancelling a turn is not the same as waiting for one: the token stops the agent at its next
+/// check, and what follows is the commit of the partial assistant message, the tool result the
+/// round already produced, and the frontend teardown. That tail is what a drain exists to protect,
+/// and it is measured in database round-trips, not instants.
+///
+/// Both counters are consulted because neither covers everything. The process-wide one still counts
+/// a client turn whose session has since been evicted from the map. The per-session one counts the
+/// work that never takes a [`crate::server::state::TurnGuard`]: a scheduled fire, a
+/// background-outcome delivery, a compaction or rewind. The latter run on the scheduler and poller
+/// tasks that the caller aborts as soon as this returns, so leaving them out would abandon
+/// precisely the unattended turns nobody is watching.
+async fn wait_for_turns_to_unwind(state: &ServerState) {
+    loop {
+        let idle = state
+            .concurrent_turns
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+            && {
+                let sessions = state.sessions.read().await;
+                sessions
+                    .values()
+                    .all(|entry| entry.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0)
+            };
+        if idle {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -329,9 +372,17 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .route("/v1/health/live", get(handlers::discovery::live))
         .route("/v1/health/ready", get(handlers::discovery::ready));
 
+    // `/v1/docs` and `/v1/openapi.json` are the only unauthenticated routes that describe the
+    // deployment rather than report on it, so they are opt-in; see `[serve].docs`.
+    let documentation = if state.config.docs {
+        openapi::router()
+    } else {
+        Router::new()
+    };
+
     authenticated
         .merge(public)
-        .merge(openapi::router())
+        .merge(documentation)
         // `RequestBodyLimitLayer` is the only authority on body size. Without disabling axum's
         // own default, the `Bytes` extractor every handler uses applies a 2 MiB cap of its own, so
         // any `max_body_bytes` above that was silently inert -- and the 413 this middleware
@@ -343,6 +394,7 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
             max_body_bytes,
             rewrite_payload_too_large,
         ))
+        .layer(middleware::from_fn(rewrite_plain_bad_request))
         .layer(middleware::from_fn(inject_problem_instance))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -380,6 +432,53 @@ async fn rewrite_payload_too_large(
     )
     .instance(path)
     .with("max_body_bytes", serde_json::Value::from(max_body_bytes))
+    .into_response()
+}
+
+/// Convert axum's plain-text extractor rejections into Problem Details.
+///
+/// A malformed path segment or query parameter is rejected by the `Path` / `Query` extractor before
+/// any handler runs, and axum answers `400 text/plain`. Every other error on this surface is RFC
+/// 9457, so a client that parses `application/problem+json` had one response shape it could not
+/// read, for the most ordinary mistake there is. Handled as middleware for the same reason as the
+/// 413 rewrite: the alternative is a custom rejection type threaded through every handler
+/// signature.
+async fn rewrite_plain_bad_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if response.status() != axum::http::StatusCode::BAD_REQUEST {
+        return response;
+    }
+    let is_plain = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.starts_with("text/plain"));
+    if !is_plain {
+        return response;
+    }
+
+    // The rejection text names which parameter failed and why, which is exactly what the caller
+    // needs; it is generated by axum from the route definition, not from anything the caller sent.
+    let (_, body) = response.into_parts();
+    let detail = match axum::body::to_bytes(body, 4096).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+        Err(_) => String::new(),
+    };
+    let detail = if detail.is_empty() {
+        "invalid path or query parameter".to_string()
+    } else {
+        detail
+    };
+    ProblemDetail::new(
+        ErrorKind::InvalidBody,
+        axum::http::StatusCode::BAD_REQUEST,
+        detail,
+    )
+    .instance(path)
     .into_response()
 }
 

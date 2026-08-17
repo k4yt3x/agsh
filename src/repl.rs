@@ -193,7 +193,7 @@ impl Highlighter for UserInputHighlighter {
 struct SlashCompleter {
     mcp_server_names: Vec<String>,
     skill_names: Vec<String>,
-    cwd: crate::agent::SharedCwd,
+    cwd: crate::workspace::SharedCwd,
 }
 
 /// `/mcp` first-argument keywords, mirroring the grammar of `parse_mcp_slash`.
@@ -322,7 +322,7 @@ fn terminal_suggestions(
 /// Complete a `/cd` argument token to matching subdirectories. Only directories are offered (`/cd`
 /// rejects files), and each value ends in `/` so Tab can keep drilling into nested directories.
 fn complete_cd_path(
-    cwd: &crate::agent::SharedCwd,
+    cwd: &crate::workspace::SharedCwd,
     token: &str,
     token_start: usize,
     pos: usize,
@@ -333,12 +333,12 @@ fn complete_cd_path(
     };
 
     let scan_dir = if parent_portion.is_empty() {
-        crate::agent::cwd_snapshot(cwd)
+        crate::workspace::cwd_snapshot(cwd)
     } else {
         let Some(expanded) = expand_cd_target(parent_portion) else {
             return Vec::new();
         };
-        crate::agent::resolve_against_cwd(cwd, expanded)
+        crate::workspace::resolve_against_cwd(cwd, expanded)
     };
 
     let entries = match std::fs::read_dir(&scan_dir) {
@@ -380,7 +380,7 @@ struct MekaPrompt {
     /// Per-session working directory shared with the agent and the `/cd` slash command. Reading
     /// the lock per prompt render is cheap (microseconds) and bounded; `/cd` is the only
     /// writer.
-    cwd: crate::agent::SharedCwd,
+    cwd: crate::workspace::SharedCwd,
     /// Live context-window gauge, present only when `display.show_context_in_prompt` is set.
     context: Option<ContextIndicator>,
 }
@@ -413,7 +413,7 @@ impl ContextIndicator {
 impl Prompt for MekaPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         let mut left = if self.show_path {
-            let path = crate::agent::cwd_snapshot(&self.cwd);
+            let path = crate::workspace::cwd_snapshot(&self.cwd);
             format!("meka {} ", shorten_path_with_tilde(&path))
         } else {
             "meka ".to_string()
@@ -896,7 +896,7 @@ pub fn run_repl(
     sandbox_state: crate::sandbox::SandboxState,
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
-    cwd: crate::agent::SharedCwd,
+    cwd: crate::workspace::SharedCwd,
     mcp_server_names: Vec<String>,
     history_db_path: Option<PathBuf>,
     // `wake` is set by the scheduler watcher when one of this session's jobs is due. reedline
@@ -1147,7 +1147,7 @@ pub fn run_repl(
                     // Run in the session's working directory so `!` commands track `/cd`. `/cd`
                     // updates the `SharedCwd` (not the process cwd), so without this `!pwd` would
                     // report the original launch directory.
-                    let working_dir = crate::agent::cwd_snapshot(&cwd);
+                    let working_dir = crate::workspace::cwd_snapshot(&cwd);
                     #[cfg(windows)]
                     let status = std::process::Command::new("powershell")
                         .arg("-Command")
@@ -1255,26 +1255,42 @@ fn render_progress_update(update: &crate::mcp::progress::ProgressUpdate) {
 
 /// Format a progress line. Sanitises server-controlled strings so an MCP server can't inject ANSI
 /// escapes to clear the screen or spoof prompts.
+///
+/// Every field is flattened to a single line and width-bounded, not merely stripped of controls.
+/// The line opens with meka's own `\r` to overwrite the previous progress, so anything that
+/// survives a newline in a server's string would be painted at column zero on a *fresh* row, below
+/// chrome the user has already read -- which is a forged approval prompt with no escape sequence
+/// involved. `begin_own_line` cannot help there: it clears the current row, and the newline has
+/// already committed the rows above it.
 fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> String {
+    // Flattened, not merely sanitised. `sanitize_text` deliberately keeps `\n`, and both of these
+    // are server-controlled: `tool_name` is the raw name the server advertised (only the namespaced
+    // form goes through `normalize_server_name`). A tool called "x\n[ask] execute_command\n..."
+    // would otherwise open new rows inside meka's own chrome, which is the forgery the message half
+    // of this line was already fixed for.
+    let server = crate::render::sanitize_to_line(&update.server_name, usize::MAX);
+    let tool = crate::render::sanitize_to_line(&update.tool_name, usize::MAX);
+    let counter = match update.total {
+        Some(total) if total > 0.0 => format!("{:.0}/{:.0}", update.progress, total),
+        _ => format!("{:.0}", update.progress),
+    };
+    let prefix = format!("[mcp:{}/{}] {} ", server, tool, counter);
+
+    // Budget what is left of the row for the server's message, after meka's own chrome and the
+    // trailing pad. Saturating: a narrow terminal or a long server/tool name simply leaves no room
+    // for the message rather than underflowing.
+    let pad = 5;
+    let budget = crate::render::output_width()
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(pad);
     let message = update
         .message
         .as_deref()
-        .map(crate::mcp::sanitize::sanitize_text)
+        .map(|raw| crate::render::sanitize_to_line(raw, budget))
         .unwrap_or_default();
-    let server = crate::mcp::sanitize::sanitize_text(&update.server_name);
-    let tool = crate::mcp::sanitize::sanitize_text(&update.tool_name);
-    let body = match update.total {
-        Some(total) if total > 0.0 => format!(
-            "\r[mcp:{}/{}] {:.0}/{:.0} {}",
-            server, tool, update.progress, total, message
-        ),
-        _ => format!(
-            "\r[mcp:{}/{}] {:.0} {}",
-            server, tool, update.progress, message
-        ),
-    };
+
     // Pad with a few spaces so the next print clears trailing chars from any longer previous line.
-    format!("{}     ", body)
+    format!("\r{}{}{}", prefix, message, " ".repeat(pad))
 }
 
 /// Route a structured/url elicitation request to the user. For forms, walks the JSON Schema one
@@ -1285,6 +1301,11 @@ fn handle_elicitation_prompt(
     prompt: crate::mcp::elicitation::ElicitationPrompt,
     responder: tokio::sync::oneshot::Sender<crate::mcp::elicitation::ElicitationResponse>,
 ) {
+    // Same reason the approval prompt drains: `read_line` reads a buffer the tty has been filling
+    // throughout the turn, so a line the user typed in answer to something else -- or to a prompt a
+    // server forged -- would be consumed the instant this one is drawn. The approval prompt got
+    // this; the elicitation prompt, which reads the same buffer, did not.
+    drain_pending_stdin();
     let response = resolve_elicitation(&prompt, || {
         use std::io::Write;
         let _ = std::io::stderr().flush();
@@ -1306,24 +1327,30 @@ fn resolve_elicitation(
     prompt: &crate::mcp::elicitation::ElicitationPrompt,
     mut read: impl FnMut() -> Option<String>,
 ) -> crate::mcp::elicitation::ElicitationResponse {
-    use crate::mcp::{
-        elicitation::{ElicitationKind, ElicitationResponse},
-        sanitize::sanitize_text,
-    };
+    use crate::mcp::elicitation::{ElicitationKind, ElicitationResponse};
     // Server-controlled strings get stripped of control/format codepoints before they reach the
     // terminal. Without this a malicious server could ship ANSI escapes to clear the screen or RTL
     // overrides to spoof the field the user thinks they're filling in.
+    // One row, bounded. `sanitize_text` keeps `\n`, so a server that puts a newline in `message`
+    // could paint extra rows below meka's banner -- enough to forge an approval block verbatim,
+    // since nothing after this line is meka chrome the user can use to tell them apart. Same
+    // treatment the MCP progress line already gets.
+    let banner_prefix = format!(
+        "[mcp elicit: {}] ",
+        crate::render::sanitize_to_line(&prompt.server_name, 64)
+    );
+    let banner_budget = crate::render::output_width().saturating_sub(banner_prefix.chars().count());
     eprintln!(
-        "[mcp elicit: {}] {}",
-        sanitize_text(&prompt.server_name),
-        sanitize_text(&prompt.message)
+        "{}{}",
+        banner_prefix,
+        crate::render::sanitize_to_line(&prompt.message, banner_budget)
     );
 
     match &prompt.kind {
         ElicitationKind::Url { url } => {
             eprint!(
                 "Open {} in your browser? [Y/n/s=skip]: ",
-                sanitize_text(url)
+                crate::render::sanitize_to_line(url, 200)
             );
             // Same end-of-input rule as the approval prompt: without it, Ctrl+D counts as the bare
             // Enter that accepts, and opens a server-supplied URL with nobody there to consent.
@@ -1380,8 +1407,8 @@ fn resolve_elicitation(
                     };
                     eprint!(
                         "  {} ({}): ",
-                        sanitize_text(field_name),
-                        sanitize_text(hint)
+                        crate::render::sanitize_to_line(field_name, 64),
+                        crate::render::sanitize_to_line(hint, 160)
                     );
                     // Same end-of-input rule as the URL branch and the approval prompt. Without
                     // it Ctrl+D walked every remaining field with an empty answer and returned an
@@ -1539,8 +1566,99 @@ fn resolve_approval(
     false
 }
 
+/// Drop whatever is already sitting in the terminal's input buffer.
+///
+/// Best-effort and deliberately silent: a non-tty stdin (a pipe, a test harness) has nothing to
+/// drain and no `FIONREAD` to ask, and failing to drain must never stop an approval prompt from
+/// being shown. Implemented with a non-blocking read rather than `crossterm::event::poll`, because
+/// the REPL is in cooked mode here and the pending bytes are ordinary line-buffered input.
+#[cfg(unix)]
+fn drain_pending_stdin() {
+    use std::os::fd::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+    // SAFETY: `fd` is a valid descriptor for the lifetime of this call (it comes from the process's
+    // own stdin, which is not closed here), and both `fcntl` calls are plain flag get/set on it.
+    let previous = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if previous < 0 {
+        return;
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, previous | libc::O_NONBLOCK) } < 0 {
+        return;
+    }
+
+    let mut scratch = [0u8; 1024];
+    loop {
+        // SAFETY: `scratch` is a live, correctly-sized buffer and `fd` is valid, as above.
+        let read = unsafe {
+            libc::read(
+                fd,
+                scratch.as_mut_ptr() as *mut libc::c_void,
+                scratch.len() as libc::size_t,
+            )
+        };
+        // Stop only on EOF, EAGAIN (buffer empty, the usual exit) or an error -- never on a short
+        // read.
+        //
+        // A short read used to end the loop, on the reasoning that it meant the buffer was drained.
+        // In canonical mode that is false: the tty hands over exactly one line per `read`, whatever
+        // the buffer size, so a user who typed two lines ahead had the first discarded and the
+        // second left sitting there to answer the prompt about to be drawn. One queued line is the
+        // whole attack this function exists to stop. Termination is unchanged: `O_NONBLOCK` is set
+        // above, so an empty buffer returns EAGAIN and takes the `read <= 0` arm.
+        if read <= 0 {
+            break;
+        }
+    }
+
+    // Restore the original flags. Leaving stdin non-blocking would make the `read_line` below
+    // return `WouldBlock` instead of waiting for the user, i.e. auto-deny every prompt.
+    unsafe { libc::fcntl(fd, libc::F_SETFL, previous) };
+}
+
+/// The Windows counterpart. `FlushConsoleInputBuffer` discards everything queued on the console
+/// input handle, which is exactly what the Unix path achieves by reading until `EAGAIN`.
+///
+/// This was a no-op, so the keystroke-at-a-forged-prompt hole the Unix path closes stayed open on
+/// Windows: a model that had read attacker text could paint a convincing approval block, and the
+/// `y` the user typed at it was still sitting in the buffer when the real prompt was drawn.
+///
+/// A non-console stdin (a pipe, a redirect) has no input buffer to flush and the call fails; that
+/// is not an error worth reporting, because a caller feeding meka from a pipe is not a user who
+/// can be tricked into typing ahead.
+#[cfg(windows)]
+fn drain_pending_stdin() {
+    use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+
+    // SAFETY: `handle` is stdin's console handle, obtained from the standard library, and
+    // `FlushConsoleInputBuffer` only reads and clears the buffer it names.
+    let handle = unsafe {
+        windows_sys::Win32::System::Console::GetStdHandle(
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        )
+    };
+    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return;
+    }
+    // SAFETY: as above; a non-console handle simply returns zero.
+    if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+        tracing::debug!("stdin is not a console; nothing to drain before the approval prompt");
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn drain_pending_stdin() {}
+
 fn handle_approval_request(request: ToolApprovalRequest) {
     use crossterm::style::Stylize;
+
+    // Discard anything typed before the prompt was drawn. `read_line` below reads from a buffer the
+    // tty has been filling all along, and nothing was consuming it during the turn: a keystroke the
+    // user made in answer to something else -- notably a forged prompt painted by a tool result or
+    // a server's progress message -- would otherwise be waiting here and satisfy the real
+    // question without the user ever seeing it. `parse_approval_answer` treats a bare Enter as
+    // allow, so a stray newline is enough. Only an answer typed *after* this point counts.
+    drain_pending_stdin();
 
     // An MCP progress line parks the cursor mid-row with no newline, and its text comes from the
     // server. Without this the prompt's first line continues that row, so `[ask] Shell` reads as
@@ -1614,14 +1732,14 @@ fn expand_cd_target(target: &str) -> Option<PathBuf> {
 /// The message is returned rather than printed because the caller owns the `[display]` spacing: a
 /// `cd` that works says nothing (the prompt already shows where you are), and blank lines wrapped
 /// around no output are a gap with nothing in it.
-fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) -> Option<String> {
+fn handle_cd(cwd: &crate::workspace::SharedCwd, target: &str) -> Option<String> {
     let Some(raw) = expand_cd_target(target) else {
         return Some("cd: could not determine home directory".to_string());
     };
 
     // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
     // agent's current view, then canonicalize so the prompt and the tools see a clean path.
-    let resolved = crate::agent::resolve_against_cwd(cwd, &raw);
+    let resolved = crate::workspace::resolve_against_cwd(cwd, &raw);
     let canonical = match std::fs::canonicalize(&resolved) {
         Ok(canonical) => canonical,
         Err(error) => return Some(format!("cd: {}: {}", raw.display(), error)),
@@ -1967,6 +2085,7 @@ impl Frontend for ReplFrontend {
 
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
         let (response_sender, response_receiver) = tokio::sync::oneshot::channel::<bool>();
+        let tool_name = request.tool_name.clone();
         let approval = ToolApprovalRequest {
             tool_name: request.tool_name,
             input: request.input,
@@ -1979,7 +2098,14 @@ impl Frontend for ReplFrontend {
             .is_err()
         {
             // REPL thread is gone; there is no human to ask. Treat as cancellation rather than
-            // denial so the caller's ToolOutput message is honest about the cause.
+            // denial so the caller's ToolOutput message is honest about the cause. Named at `warn`
+            // because in one-shot mode this is the *permanent* state rather than a shutdown race,
+            // and a run whose every tool is refused otherwise reads as a model that chose not to
+            // use them.
+            tracing::warn!(
+                "no interactive prompt available, so '{}' was refused without asking",
+                tool_name
+            );
             return PermissionOutcome::Cancelled;
         }
         match response_receiver.await {
@@ -1998,6 +2124,7 @@ impl Frontend for ReplFrontend {
         // sender so this `.await` resolves.
         let (responder, receiver) =
             tokio::sync::oneshot::channel::<crate::mcp::elicitation::ElicitationResponse>();
+        let server_name = prompt.server_name.clone();
         if self
             .config
             .agent_event_sender
@@ -2007,7 +2134,16 @@ impl Frontend for ReplFrontend {
             // REPL thread is gone: no human to ask. Decline so the server learns the elicitation
             // wasn't answered. (Same posture as the agent-disconnected case in
             // `request_permission`.)
-            tracing::debug!("MCP elicitation dropped (REPL disconnected); declining");
+            //
+            // At `warn` for that function's reason, not `debug`: a decline is an *outcome*, not a
+            // dropped status line, and in one-shot mode there is no REPL thread to begin with, so
+            // this is the permanent answer rather than a shutdown race. The tool call that needed
+            // the answer then fails, and at default verbosity nothing said why.
+            tracing::warn!(
+                "no interactive prompt available, so an elicitation from '{}' was declined without \
+                 asking",
+                server_name
+            );
             return crate::mcp::elicitation::ElicitationResponse::Decline;
         }
         receiver
@@ -2477,6 +2613,132 @@ mod frontend_tests {
         );
     }
 
+    /// A capture sink for a scoped subscriber, so a test can assert what a run prints at the
+    /// default `warn` floor rather than what it logs at any level.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A dead `agent_event_sender` is one-shot mode's permanent state, not a shutdown race, so an
+    /// auto-declined elicitation has to be visible without `-v`.
+    ///
+    /// It was logged at `debug`, which the default `warn` floor drops. The tool call waiting on the
+    /// answer then failed with nothing naming the cause, which is the same silence
+    /// `request_permission` was fixed for one method above; `HttpFrontend::handle_elicitation`
+    /// records a warn notice for exactly this. Asserted through a subscriber pinned to `WARN` so
+    /// the test fails if the level drops back, which no assertion on the return value can catch:
+    /// `Decline` is correct either way.
+    #[test]
+    fn a_declined_elicitation_is_reported_at_default_verbosity() {
+        let capture = Capture::default();
+        let buffer = Arc::clone(&capture.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        // Current-thread, so the scoped subscriber's thread-local is in force for the whole await.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let response = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                frontend()
+                    .handle_elicitation(crate::mcp::elicitation::ElicitationPrompt {
+                        server_name: "notion".to_string(),
+                        message: "authorise?".to_string(),
+                        kind: crate::mcp::elicitation::ElicitationKind::Url {
+                            url: "https://example.com/".to_string(),
+                        },
+                    })
+                    .await
+            })
+        });
+
+        assert!(matches!(
+            response,
+            crate::mcp::elicitation::ElicitationResponse::Decline
+        ));
+        let logged = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("log output is utf-8");
+        assert!(
+            logged.contains("notion"),
+            "the decline must name the server at default verbosity: {logged:?}"
+        );
+    }
+
+    /// The same guarantee for the tool-approval half, which had the level right but nothing holding
+    /// it there.
+    ///
+    /// A one-shot run at `ask` refuses every tool that needs approval. Without this line the run is
+    /// indistinguishable from a model that simply chose not to use its tools, which is what sent
+    /// someone debugging the prompt instead of the flag.
+    #[test]
+    fn a_refused_tool_is_reported_at_default_verbosity() {
+        let capture = Capture::default();
+        let buffer = Arc::clone(&capture.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                frontend()
+                    .request_permission(crate::frontend::PermissionRequest {
+                        tool_name: "execute_command".to_string(),
+                        primary_param: Some("rm -rf /".to_string()),
+                        input: serde_json::json!({"command": "rm -rf /"}),
+                        cancellation: tokio_util::sync::CancellationToken::new(),
+                    })
+                    .await
+            })
+        });
+
+        // `Cancelled`, not `Deny`: nobody was asked, so the tool result says so honestly.
+        assert!(matches!(outcome, PermissionOutcome::Cancelled));
+        let logged = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("log output is utf-8");
+        assert!(
+            logged.contains("execute_command"),
+            "the refusal must name the tool at default verbosity: {logged:?}"
+        );
+    }
+
     /// The happy path still closes on `TurnFinished`, so a completed turn doesn't hold its last
     /// paragraph until the following prompt.
     #[tokio::test]
@@ -2679,7 +2941,7 @@ mod tests {
         let target = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
         let process_cwd_before = std::env::current_dir().expect("read process cwd before /cd");
 
-        let cwd: crate::agent::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
+        let cwd: crate::workspace::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
             std::path::PathBuf::from("/this/path/does/not/exist"),
         ));
         let complaint = handle_cd(&cwd, target.to_str().expect("utf-8 tempdir"));
@@ -2705,7 +2967,7 @@ mod tests {
         std::fs::write(&file, b"x").expect("write file");
         let start = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
 
-        let cwd: crate::agent::SharedCwd =
+        let cwd: crate::workspace::SharedCwd =
             std::sync::Arc::new(std::sync::RwLock::new(start.clone()));
 
         let missing = handle_cd(&cwd, "/this/path/does/not/exist");
@@ -2791,11 +3053,11 @@ mod tests {
         SlashCompleter {
             mcp_server_names: Vec::new(),
             skill_names: Vec::new(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
         }
     }
 
-    fn completer_at(cwd: crate::agent::SharedCwd) -> SlashCompleter {
+    fn completer_at(cwd: crate::workspace::SharedCwd) -> SlashCompleter {
         SlashCompleter {
             mcp_server_names: vec!["postgres".into(), "github".into()],
             skill_names: vec!["search".into(), "deep-research".into()],
@@ -2898,7 +3160,7 @@ mod tests {
 
     #[test]
     fn test_slash_completer_skill_arg_prefix() {
-        let completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::workspace::test_cwd());
         let suggestions = completer.suggestions("/skill sea", 10);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "search");
@@ -2906,13 +3168,13 @@ mod tests {
 
     #[test]
     fn test_slash_completer_skill_no_complete_second_arg() {
-        let completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::workspace::test_cwd());
         assert!(completer.suggestions("/skill search foo", 17).is_empty());
     }
 
     #[test]
     fn test_slash_completer_mcp_arg1_keywords() {
-        let completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::workspace::test_cwd());
         let all: Vec<String> = completer
             .suggestions("/mcp ", 5)
             .into_iter()
@@ -2926,7 +3188,7 @@ mod tests {
 
     #[test]
     fn test_slash_completer_mcp_arg2_server_after_subcommand() {
-        let completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::workspace::test_cwd());
         let servers: Vec<String> = completer
             .suggestions("/mcp reconnect ", 15)
             .into_iter()
@@ -2980,7 +3242,7 @@ mod tests {
 
     #[test]
     fn test_slash_completer_command_word_still_completes() {
-        let completer = completer_at(crate::agent::test_cwd());
+        let completer = completer_at(crate::workspace::test_cwd());
         let suggestions = completer.suggestions("/comp", 5);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "/compact");
@@ -3199,6 +3461,53 @@ mod tests {
         );
         assert!(line.contains("spoofed"));
         assert!(line.contains("[mcp:svr/tool]"));
+    }
+
+    /// The progress line opens with meka's own `\r` to overwrite the previous one. A newline in the
+    /// server's message would therefore commit that row and start painting at column zero on a
+    /// fresh line, below chrome the user has already read -- a forged approval block needing no
+    /// escape sequence at all. `begin_own_line` cannot undo it, because it only clears the
+    /// current row.
+    #[test]
+    fn a_progress_message_cannot_open_a_second_row() {
+        let update = crate::mcp::progress::ProgressUpdate {
+            server_name: "svr".to_string(),
+            tool_name: "tool".to_string(),
+            tool_use_id: None,
+            message: Some("working\n[ask] Shell\n  command: ls -la\nAllow? (Y/n) ".to_string()),
+            progress: 1.0,
+            total: None,
+        };
+
+        let line = format_progress_update(&update);
+
+        // One leading `\r` (meka's own) and no other line break of any kind.
+        assert_eq!(line.matches('\r').count(), 1, "{:?}", line);
+        assert!(line.starts_with('\r'), "{:?}", line);
+        assert!(!line.contains('\n'), "{:?}", line);
+    }
+
+    /// A server that pads its message must not be able to scroll the transcript by writing a line
+    /// longer than the terminal.
+    #[test]
+    fn a_progress_message_is_bounded_by_the_terminal_width() {
+        let update = crate::mcp::progress::ProgressUpdate {
+            server_name: "svr".to_string(),
+            tool_name: "tool".to_string(),
+            tool_use_id: None,
+            message: Some("x".repeat(10_000)),
+            progress: 1.0,
+            total: None,
+        };
+
+        let line = format_progress_update(&update);
+        let visible = line.trim_start_matches('\r').chars().count();
+        assert!(
+            visible <= crate::render::output_width(),
+            "progress line ran to {} columns: {:?}",
+            visible,
+            line
+        );
     }
 
     #[test]

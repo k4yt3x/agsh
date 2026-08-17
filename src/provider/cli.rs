@@ -156,11 +156,22 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // a config.toml that meka can't deserialize, since it is one of the ways such a file gets
     // repaired.
     let has_credential = token_store.load_provider_credential(name).await?.is_some();
-    let (path, mut document) = open_document()?;
-    let has_profile = document
-        .get("providers")
-        .and_then(|item| item.as_table())
-        .is_some_and(|providers| providers.contains_key(name));
+
+    // Probed under its own short-lived guard, and the guard dropped before the `await` below.
+    //
+    // `ConfigFileLock` tracks reentrancy in a *thread*-local depth counter, so holding one across
+    // an await is unsound on a multi-threaded runtime: the task can resume on another worker, where
+    // the depth reads zero, and a nested acquisition then tries to take a file lock this process
+    // already holds. That is a self-deadlock, and the counter it leaves behind is under-balanced on
+    // one thread and over-balanced on the other. Two short critical sections cost a TOCTOU window
+    // no CLI invocation can lose anything to; one long one costs correctness.
+    let has_profile = {
+        let (_lock, _path, document) = open_document()?;
+        document
+            .get("providers")
+            .and_then(|item| item.as_table())
+            .is_some_and(|providers| providers.contains_key(name))
+    };
 
     if !has_profile && !has_credential {
         anyhow::bail!("no provider profile or stored credential named '{}'", name);
@@ -171,6 +182,9 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // stops the command above instead, with nothing done: an error that leaves the secret deleted
     // reads to the user as "nothing happened", which is the one thing it must not mean.
     token_store.delete_provider_credential(name).await?;
+    // Re-read under a fresh guard so the edit below is applied to the current file, and so the
+    // read-modify-write is one critical section with no await inside it.
+    let (_lock, path, mut document) = open_document()?;
     // Written even with no profile to remove: `default_provider` can still point at the name, and
     // dropping that dangling pointer is exactly the cleanup this case is for.
     remove_profile_document(&mut document, name);
@@ -332,7 +346,7 @@ async fn acquire_credential(
                 io::stdin().read_to_string(&mut buffer)?;
                 buffer.trim().to_string()
             } else {
-                prompt_line("Enter your API key: ")?
+                prompt_secret("Enter your API key: ")?
             };
             if key.is_empty() {
                 anyhow::bail!("API key cannot be empty");
@@ -345,7 +359,15 @@ async fn acquire_credential(
 
 // ----- Config file editing (toml_edit, comment-preserving) ---------------------------------------
 
-fn open_document() -> anyhow::Result<(std::path::PathBuf, toml_edit::DocumentMut)> {
+/// Returns the lock alongside the document so a caller cannot read, mutate and write without
+/// holding it: the whole point is that the read and the write are one critical section, and a
+/// separate `lock_config_file()` call would be a step someone eventually forgets.
+fn open_document() -> anyhow::Result<(
+    config::ConfigFileLock,
+    std::path::PathBuf,
+    toml_edit::DocumentMut,
+)> {
+    let lock = config::lock_config_file()?;
     let path = config::config_file_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
     // Only a genuinely absent file starts from empty. Treating *any* read failure as "" turns
@@ -361,7 +383,7 @@ fn open_document() -> anyhow::Result<(std::path::PathBuf, toml_edit::DocumentMut
         }
     };
     let document = contents.parse::<toml_edit::DocumentMut>()?;
-    Ok((path, document))
+    Ok((lock, path, document))
 }
 
 /// Borrow the `[providers]` table as a real (header) table, creating it implicit if absent. Without
@@ -437,14 +459,18 @@ fn write_profile(
     model: &str,
     base_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (path, mut document) = open_document()?;
+    // `_lock` is held to the end of the function, so the read above and the write below are
+    // one critical section.
+    let (_lock, path, mut document) = open_document()?;
     upsert_profile_document(&mut document, name, backend, model, base_url)?;
     config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
 
 fn set_default_provider(name: &str) -> anyhow::Result<()> {
-    let (path, mut document) = open_document()?;
+    // `_lock` is held to the end of the function, so the read above and the write below are
+    // one critical section.
+    let (_lock, path, mut document) = open_document()?;
     document["default_provider"] = toml_edit::value(name);
     config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
@@ -452,9 +478,127 @@ fn set_default_provider(name: &str) -> anyhow::Result<()> {
 
 // ----- Interactive prompts -----------------------------------------------------------------------
 
+/// Read a line without echoing it, so a pasted API key is not left on screen, in a scrollback
+/// buffer, or in a screen recording.
+///
+/// Falls back to a visible prompt where echo cannot be suppressed (not a tty, or a platform without
+/// termios), and says so, because silently echoing a secret the caller asked to hide is worse than
+/// the visible prompt they can decide about.
+fn prompt_secret(prompt: &str) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = io::stdin().as_raw_fd();
+        // SAFETY: `fd` is stdin's descriptor and `termios` is a valid out-parameter for the
+        // duration of the call. `tcgetattr` only writes through it.
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } == 0 {
+            let mut quiet = original;
+            quiet.c_lflag &= !libc::ECHO;
+            // SAFETY: `quiet` is a termios obtained from this same descriptor with one flag
+            // cleared.
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } == 0 {
+                // Restored on the way out of *every* exit, including the one the ordinary code
+                // path cannot see. Ctrl-C at this prompt is a normal thing to do -- wrong profile,
+                // wrong account, changed your mind -- and SIGINT's default disposition kills the
+                // process where it stands, so nothing below runs and the user is left in a shell
+                // that shows nothing they type until they find `stty sane`. That is the exact
+                // outcome the doc above says must not happen.
+                let _echo = EchoGuard::install(fd, original);
+                let result = prompt_line(prompt);
+                // The Enter the user pressed was not echoed either, so the cursor is still on the
+                // prompt line.
+                drop(_echo);
+                eprintln!();
+                return result;
+            }
+        }
+        // `warn!`, not `debug!`: this is a secret about to appear on screen, and the doc above
+        // promises meka says so rather than quietly echoing it.
+        tracing::warn!("could not disable terminal echo; the API key will be visible as typed");
+    }
+    prompt_line(prompt)
+}
+
+/// Restores terminal echo when dropped *and* when the process is interrupted.
+///
+/// The handler is what makes this more than a `Drop` impl. `Drop` covers a return and a panic;
+/// SIGINT bypasses both. It runs only `tcsetattr` and `_exit`, which are async-signal-safe, and
+/// reads the saved settings through an `AtomicPtr` because a lock is not.
+#[cfg(unix)]
+struct EchoGuard {
+    fd: std::os::unix::io::RawFd,
+    original: libc::termios,
+    previous_handler: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+static SAVED_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(unix)]
+static SAVED_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn restore_echo_on_interrupt(_signal: libc::c_int) {
+    let saved = SAVED_TERMIOS.load(std::sync::atomic::Ordering::Acquire);
+    let fd = SAVED_FD.load(std::sync::atomic::Ordering::Acquire);
+    if !saved.is_null() && fd >= 0 {
+        // SAFETY: `saved` was published by `EchoGuard::install` from a live `Box` that outlives the
+        // guard, and `fd` is the descriptor those settings came from. `tcsetattr` is
+        // async-signal-safe.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, saved) };
+    }
+    // 128 + SIGINT, the conventional status, and `_exit` rather than `exit` because only the
+    // former is async-signal-safe.
+    unsafe { libc::_exit(130) };
+}
+
+#[cfg(unix)]
+impl EchoGuard {
+    fn install(fd: std::os::unix::io::RawFd, original: libc::termios) -> Self {
+        // Leaked deliberately: the handler may read it at any point until the guard is dropped, and
+        // freeing it on the drop path would race a signal arriving in the same instant. One
+        // termios per prompt is a rounding error against a process that is about to hold a
+        // conversation in memory.
+        let saved = Box::into_raw(Box::new(original));
+        SAVED_TERMIOS.store(saved, std::sync::atomic::Ordering::Release);
+        SAVED_FD.store(fd, std::sync::atomic::Ordering::Release);
+        // SAFETY: installing a handler for SIGINT; the function pointer is a valid `extern "C"`
+        // handler and the returned value is the previous disposition, restored on drop.
+        let previous_handler = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                restore_echo_on_interrupt as *const () as libc::sighandler_t,
+            )
+        };
+        Self {
+            fd,
+            original,
+            previous_handler,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.original` came from this descriptor, and the handler is being put back to
+        // whatever it was before `install`.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            libc::signal(libc::SIGINT, self.previous_handler);
+        }
+        SAVED_TERMIOS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        SAVED_FD.store(-1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn prompt_line(prompt: &str) -> io::Result<String> {
     eprint!("{}", prompt);
-    io::stdout().flush()?;
+    // The prompt went to stderr, so that is what has to be flushed; flushing stdout left the
+    // prompt sitting in stderr's buffer and the user staring at a blank line.
+    io::stderr().flush()?;
     let mut input = String::new();
     // `read_line` reports end of input as `Ok(0)` with an empty buffer, which is indistinguishable
     // from a bare Enter unless the count is checked. A caller that re-prompts on a bad answer would
@@ -594,7 +738,11 @@ async fn exchange_claude_code(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0);
-        now_millis + (seconds * 1000)
+        // Saturating: a nonsense `expires_in` should read as "far future" and let the 401 correct
+        // it, not overflow to a past instant and refresh on every request.
+        seconds
+            .checked_mul(1000)
+            .map_or(i64::MAX, |millis| now_millis.saturating_add(millis))
     });
 
     Ok(AuthCredential::OAuthToken {
@@ -961,8 +1109,291 @@ fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
     Some(value.get("exp")?.as_i64()? * 1000)
 }
 
+/// Local (no-network) auth status for a stored credential: is the token valid, and when does it
+/// expire. Serialized as the `auth` block of `meka account whoami --format json`.
+#[derive(serde::Serialize)]
+struct AuthStatus {
+    valid: bool,
+    /// Token expiry as Unix seconds (`None` for API keys / no expiry).
+    expires_at: Option<i64>,
+    /// Seconds until expiry (negative if already expired).
+    expires_in_seconds: Option<i64>,
+}
+
+impl AuthStatus {
+    fn from_credential(credential: &AuthCredential) -> Self {
+        match credential {
+            AuthCredential::OAuthToken { expires_at, .. } => {
+                // `expires_at` is stored as epoch milliseconds.
+                let expires_at = expires_at.map(|millis| millis / 1000);
+                let expires_in_seconds =
+                    expires_at.map(|secs| secs - chrono::Utc::now().timestamp());
+                AuthStatus {
+                    valid: expires_in_seconds.is_none_or(|remaining| remaining > 0),
+                    expires_at,
+                    expires_in_seconds,
+                }
+            }
+            AuthCredential::ApiKey(_) => AuthStatus {
+                valid: true,
+                expires_at: None,
+                expires_in_seconds: None,
+            },
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UsageOutput<'a> {
+    provider: &'a str,
+    #[serde(flatten)]
+    usage: &'a crate::provider::AccountUsage,
+}
+
+#[derive(serde::Serialize)]
+struct WhoamiOutput<'a> {
+    provider: &'a str,
+    backend: &'a str,
+    auth: AuthStatus,
+    identity: Option<crate::provider::AccountIdentity>,
+}
+
+// ----- `meka account` -----------------------------------------------------------------------
+//
+// Lives beside the `meka provider` suite rather than in `main.rs`: both read the same profiles and
+// the same credentials, and `account` is the read-only view of what `provider` configures. Keeping
+// them apart meant a change to profile resolution had to be made in two files.
+
+pub async fn run_account_subcommand(
+    session_manager: &crate::session::SessionManager,
+    action: &crate::cli::AccountAction,
+) -> anyhow::Result<()> {
+    let (profile_arg, format) = match action {
+        crate::cli::AccountAction::Usage { profile, format } => (profile.clone(), *format),
+        crate::cli::AccountAction::Whoami { profile, format } => (profile.clone(), *format),
+        crate::cli::AccountAction::Stats { profile, format } => (profile.clone(), *format),
+    };
+
+    let token_store = session_manager.token_store();
+    let config_file = config::load_config_file_or_err()?;
+    let requested = profile_arg.or_else(|| config_file.default_provider.clone());
+    let (name, error) = config::select_active_profile(requested, &config_file.providers);
+    let name = name.ok_or_else(|| {
+        anyhow::anyhow!(error.unwrap_or_else(|| "no provider configured".to_string()))
+    })?;
+    let profile = config_file
+        .providers
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("provider profile '{}' not found", name))?;
+    let credential = token_store
+        .load_provider_credential(&name)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stored credential for profile '{}'. Run `meka provider login {}`.",
+                name,
+                name
+            )
+        })?;
+
+    let provider = crate::provider::ProviderBuilder::new(
+        profile.backend.clone(),
+        credential.clone(),
+        profile.model.clone().unwrap_or_default(),
+    )
+    .base_url(profile.base_url.clone())
+    .client_id(profile.client_id.clone())
+    .oauth_token_url(profile.oauth_token_url.clone())
+    .credential_key(Some(name.clone()))
+    .token_store(Some(std::sync::Arc::new(session_manager.token_store())))
+    .build()?;
+
+    match action {
+        crate::cli::AccountAction::Usage { .. } => match provider.fetch_usage().await? {
+            Some(usage) => match format {
+                crate::cli::OutputFormat::Plain => {
+                    print!("{}", crate::render::format_account_usage(&usage));
+                }
+                crate::cli::OutputFormat::Json => {
+                    let out = UsageOutput {
+                        provider: &name,
+                        usage: &usage,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+            },
+            None => {
+                eprintln!("Account usage isn't available for provider '{}'.", name);
+                std::process::exit(1);
+            }
+        },
+        crate::cli::AccountAction::Whoami { .. } => {
+            // The identity call may refresh + rotate the token; re-read afterwards so the auth
+            // block reflects the current expiry. A failed identity fetch (e.g. re-login needed)
+            // still prints the local auth status so scripts can detect it.
+            let identity = provider.fetch_identity().await;
+            let fresh = session_manager
+                .token_store()
+                .load_provider_credential(&name)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(credential);
+            let auth = AuthStatus::from_credential(&fresh);
+            let identity = match identity {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!("could not fetch identity: {}", error);
+                    None
+                }
+            };
+            let out = WhoamiOutput {
+                provider: &name,
+                backend: &profile.backend,
+                auth,
+                identity,
+            };
+            match format {
+                crate::cli::OutputFormat::Plain => print!("{}", format_whoami_plain(&out)),
+                crate::cli::OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&out)?)
+                }
+            }
+            if !out.auth.valid {
+                std::process::exit(1);
+            }
+        }
+        crate::cli::AccountAction::Stats { .. } => match provider.fetch_history().await? {
+            Some(history) => {
+                let out = StatsOutput {
+                    provider: &name,
+                    history: &history,
+                };
+                match format {
+                    crate::cli::OutputFormat::Plain => print!("{}", format_stats_plain(&out)),
+                    crate::cli::OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&out)?)
+                    }
+                }
+            }
+            None => {
+                eprintln!("Account history isn't available for provider '{}'.", name);
+                std::process::exit(1);
+            }
+        },
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct StatsOutput<'a> {
+    provider: &'a str,
+    #[serde(flatten)]
+    history: &'a crate::provider::UsageHistory,
+}
+
+/// Plain-text (ANSI-free) rendering of `meka account stats`.
+fn format_stats_plain(out: &StatsOutput<'_>) -> String {
+    use std::fmt::Write as _;
+    let history = out.history;
+    let mut text = format!("Account history: {}\n", out.provider);
+    let row_tokens = |text: &mut String, label: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            let _ = writeln!(
+                text,
+                "  {label:<18} {}",
+                crate::render::format_token_count(value.max(0) as u64)
+            );
+        }
+    };
+    let row_days = |text: &mut String, label: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            let _ = writeln!(text, "  {label:<18} {value} days");
+        }
+    };
+    if let Some(first) = &history.first_used {
+        // Trim an RFC 3339 timestamp to just the date for the human view.
+        let date = first.split('T').next().unwrap_or(first);
+        let _ = writeln!(text, "  {:<18} {date}", "First used:");
+    }
+    row_tokens(&mut text, "Lifetime tokens:", history.lifetime_tokens);
+    row_tokens(&mut text, "Peak daily:", history.peak_daily_tokens);
+    row_days(&mut text, "Current streak:", history.current_streak_days);
+    row_days(&mut text, "Longest streak:", history.longest_streak_days);
+    if !history.daily.is_empty() {
+        let _ = writeln!(text, "  Recent:");
+        for day in history.daily.iter().rev().take(7) {
+            let _ = writeln!(
+                text,
+                "    {}  {}",
+                day.date,
+                crate::render::format_token_count(day.tokens.max(0) as u64)
+            );
+        }
+    }
+    text
+}
+
+/// Plain-text (ANSI-free) rendering of `meka account whoami`.
+fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!("Account: {} ({})\n", out.provider, out.backend);
+    let auth = match (out.auth.valid, out.auth.expires_in_seconds) {
+        (true, Some(secs)) => format!(
+            "valid ({})",
+            crate::render::format_duration_short(secs.max(0))
+        ),
+        (true, None) => "valid".to_string(),
+        (false, _) => "EXPIRED: run `meka provider login`".to_string(),
+    };
+    let _ = writeln!(text, "  Auth:          {auth}");
+    if let Some(identity) = &out.identity {
+        let row = |text: &mut String, label: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                let _ = writeln!(text, "  {label:<14} {value}");
+            }
+        };
+        row(&mut text, "Name:", &identity.display_name);
+        row(&mut text, "Email:", &identity.email);
+        row(&mut text, "Plan:", &identity.plan);
+        row(&mut text, "Tier:", &identity.tier);
+        row(&mut text, "Subscription:", &identity.subscription_status);
+        row(&mut text, "Organization:", &identity.organization);
+        row(&mut text, "Role:", &identity.role);
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_auth_status_from_credential() {
+        let future = crate::provider::AuthCredential::OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            // 1 hour out, in epoch millis.
+            expires_at: Some((chrono::Utc::now().timestamp() + 3600) * 1000),
+            account_id: None,
+        };
+        let status = AuthStatus::from_credential(&future);
+        assert!(status.valid);
+        assert!(status.expires_in_seconds.unwrap() > 3000);
+
+        let expired = crate::provider::AuthCredential::OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            expires_at: Some((chrono::Utc::now().timestamp() - 60) * 1000),
+            account_id: None,
+        };
+        assert!(!AuthStatus::from_credential(&expired).valid);
+
+        // API keys never expire.
+        let api = crate::provider::AuthCredential::ApiKey("k".into());
+        let status = AuthStatus::from_credential(&api);
+        assert!(status.valid);
+        assert_eq!(status.expires_at, None);
+    }
     use super::*;
 
     /// A config meka can't read must never be treated as a config that is empty: `open_document`
@@ -1001,7 +1432,7 @@ mod tests {
         let result = open_document();
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
-        let (_, document) = result.expect("a missing config is not an error");
+        let (_lock, _, document) = result.expect("a missing config is not an error");
         assert!(document.as_table().is_empty());
     }
 

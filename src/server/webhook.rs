@@ -120,7 +120,14 @@ impl WebhookDispatcher {
     ///
     /// `data` becomes the event-specific part of the body. Returns immediately; failures are
     /// reported through `tracing` because there is nobody on this side of the call to return them
-    /// to. `timestamp` is taken once here so every endpoint receives, and signs over, the same one.
+    /// to.
+    ///
+    /// The body's `timestamp` is when the *event* happened, taken once here, so every endpoint sees
+    /// the same value and a retry does not appear to be a later event. The `X-Meka-Timestamp`
+    /// header is when *this attempt* was sent and is re-stamped per retry, because that is what a
+    /// receiver checks against its replay window: a retry carrying the original time is rejected as
+    /// stale by exactly the check the header exists for. The two therefore differ on a retry, on
+    /// purpose, and the signature covers the header's.
     pub fn send(&self, event: WebhookEvent, data: serde_json::Value) {
         let Some(client) = self.client.as_ref() else {
             return;
@@ -152,7 +159,6 @@ impl WebhookDispatcher {
                 max_retries: endpoint.max_retries,
                 event: event.as_str(),
                 delivery_id,
-                timestamp: timestamp.clone(),
                 payload,
             };
             tokio::spawn(task.run());
@@ -168,17 +174,11 @@ struct DeliveryTask {
     max_retries: u32,
     event: &'static str,
     delivery_id: String,
-    timestamp: String,
     payload: Vec<u8>,
 }
 
 impl DeliveryTask {
     async fn run(self) {
-        let signature = self
-            .secret
-            .as_deref()
-            .map(|secret| sign(secret, &self.timestamp, &self.payload));
-
         // Attempt 0 plus `max_retries` retries.
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
@@ -190,6 +190,17 @@ impl DeliveryTask {
                 let delay = Duration::from_secs(std::cmp::min(30, 1u64 << exponent));
                 tokio::time::sleep(delay).await;
             }
+            // Stamped and signed per attempt, not once. Receivers reject a signature whose
+            // timestamp is outside a replay window (the convention this header exists for), and the
+            // backoff can put the last retry minutes past the first: the delivery was then rejected
+            // as a replay of itself, which reads at the receiver as an attack rather than a retry.
+            // The delivery id stays constant, which is what a receiver deduplicates on.
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let signature = self
+                .secret
+                .as_deref()
+                .map(|secret| sign(secret, &timestamp, &self.payload));
+
             let mut request = self
                 .client
                 .post(&self.url)
@@ -197,7 +208,7 @@ impl DeliveryTask {
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header("X-Meka-Event", self.event)
                 .header("X-Meka-Delivery", &self.delivery_id)
-                .header("X-Meka-Timestamp", &self.timestamp)
+                .header("X-Meka-Timestamp", &timestamp)
                 .body(self.payload.clone());
             if let Some(signature) = &signature {
                 request = request.header("X-Meka-Signature", signature);

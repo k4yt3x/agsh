@@ -86,7 +86,7 @@ pub struct ToolBuilderParams {
     /// Parent's per-session working directory. Sub-agents snapshot the current value at spawn time
     /// so a parent `/cd` mid-sub-agent-turn can't change the sub-agent's path resolution
     /// mid-flight.
-    pub parent_cwd: crate::agent::SharedCwd,
+    pub parent_cwd: crate::workspace::SharedCwd,
     /// Parent's extra workspace roots, so a delegated search sees the same folders the parent
     /// does.
     ///
@@ -95,7 +95,7 @@ pub struct ToolBuilderParams {
     /// have no such hazard today because ACP fixes them for a session runtime's lifetime and
     /// nothing mutates them after construction. If that ever changes, this needs the same
     /// snapshot.
-    pub parent_roots: crate::agent::SharedRoots,
+    pub parent_roots: crate::workspace::SharedRoots,
     /// Parent's frontend. Sub-agents wrap it in a
     /// [`crate::frontend::PermissionForwardingFrontend`] so their permission prompts surface
     /// in the parent's UI (REPL line or ACP `session/request_permission`). Without this,
@@ -169,13 +169,33 @@ impl SubagentSpec {
     ///
     /// Falls back to a singleton set when the persisted list is empty or invalid, rather than to
     /// `EnabledPermissions::ALL`: an unreadable spec must not widen what the worker can do.
+    ///
+    /// Test-only. Production goes through [`Self::shared_permission_bounded`], which applies this
+    /// same clamp and then stays bound to the parent; this one is kept because the clamp is worth
+    /// asserting in isolation from the tracking.
+    #[cfg(test)]
     fn shared_permission(&self, ceiling: Permission) -> SharedPermission {
         let effective = self.effective_permission(ceiling);
+        SharedPermission::new(effective, self.clamped_enabled(effective))
+    }
+
+    /// Same, but bounded by the parent's *live* level rather than a snapshot of it.
+    ///
+    /// This is what production uses. The spawn-time clamp is still applied (a worker granted `read`
+    /// under a `write` parent stays at `read`), and the ceiling then tracks the parent afterwards,
+    /// so cycling the parent down to `none` stops the worker on its next tool call instead of
+    /// letting it run to completion at the level it started with.
+    fn shared_permission_bounded(&self, parent: &SharedPermission) -> SharedPermission {
+        let effective = self.effective_permission(parent.get());
+        SharedPermission::with_ceiling(effective, self.clamped_enabled(effective), parent)
+    }
+
+    fn clamped_enabled(&self, effective: Permission) -> EnabledPermissions {
         let enabled = EnabledPermissions::from_modes(self.enabled_permissions.iter().copied())
             .unwrap_or_else(|| {
                 EnabledPermissions::from_modes([effective]).unwrap_or(EnabledPermissions::DEFAULT)
             });
-        SharedPermission::new(effective, clamp_enabled_permissions(enabled, effective))
+        clamp_enabled_permissions(enabled, effective)
     }
 
     /// The memory level this worker actually gets, capped at `Read`.
@@ -542,8 +562,8 @@ impl Tool for AgentSpawnTool {
         // shift the sub-agent's path resolution mid-flight. The same value is written to the
         // child's session row, handed to its tool registry, and used to render its
         // environment context; a follow-up reads it back off the row.
-        let sub_cwd_snapshot = crate::agent::cwd_snapshot(&self.tool_builder_params.parent_cwd);
-        let sub_cwd: crate::agent::SharedCwd =
+        let sub_cwd_snapshot = crate::workspace::cwd_snapshot(&self.tool_builder_params.parent_cwd);
+        let sub_cwd: crate::workspace::SharedCwd =
             Arc::new(std::sync::RwLock::new(sub_cwd_snapshot.clone()));
 
         let spec = SubagentSpec {
@@ -585,7 +605,7 @@ impl Tool for AgentSpawnTool {
         );
 
         let sub_roots_snapshot =
-            crate::agent::roots_snapshot(&self.tool_builder_params.parent_roots);
+            crate::workspace::roots_snapshot(&self.tool_builder_params.parent_roots);
         let environment_context =
             build_environment_context(sub_perm, &sub_cwd_snapshot, &sub_roots_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, task);
@@ -603,9 +623,10 @@ impl Tool for AgentSpawnTool {
             &self.tool_builder_params,
             &self.provider,
             &spec,
-            // Already clamped against the parent's live level by `resolve_subagent_permission`, so
-            // it is its own ceiling here.
-            sub_perm,
+            // The parent's live handle. `resolve_subagent_permission` has already clamped the
+            // spec against it, so this re-derives the same starting level -- but it also stays
+            // bound to the parent afterwards, which a snapshot could not do.
+            &self.parent_permission,
             parent_sid,
             sub_session_id,
             sub_cwd,
@@ -1052,15 +1073,15 @@ impl Tool for AgentFollowupTool {
 
         // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
         // `/cd` between the spawn and the follow-up must not move a worker mid-task.
-        let sub_cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+        let sub_cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
             row.cwd
                 .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
-                    crate::agent::cwd_snapshot(&self.tool_builder_params.parent_cwd)
+                    crate::workspace::cwd_snapshot(&self.tool_builder_params.parent_cwd)
                 }),
         ));
-        let sub_cwd_snapshot = crate::agent::cwd_snapshot(&sub_cwd);
+        let sub_cwd_snapshot = crate::workspace::cwd_snapshot(&sub_cwd);
 
         let ceiling = self.parent_permission.get();
         let effective_permission = spec.effective_permission(ceiling);
@@ -1078,7 +1099,7 @@ impl Tool for AgentFollowupTool {
             &self.tool_builder_params,
             &self.provider,
             &spec,
-            ceiling,
+            &self.parent_permission,
             parent_sid,
             agent_id,
             Arc::clone(&sub_cwd),
@@ -1109,7 +1130,8 @@ impl Tool for AgentFollowupTool {
             );
         }
 
-        let roots_snapshot = crate::agent::roots_snapshot(&self.tool_builder_params.parent_roots);
+        let roots_snapshot =
+            crate::workspace::roots_snapshot(&self.tool_builder_params.parent_roots);
         let environment_context =
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
@@ -1226,14 +1248,17 @@ async fn build_subagent(
     params: &ToolBuilderParams,
     provider: &Arc<dyn Provider>,
     spec: &SubagentSpec,
-    ceiling: Permission,
+    // The parent's live handle, not a snapshot of its level. Taking a `Permission` here is what
+    // let a worker outlive its parent's downgrade: the value was read once and frozen into a fresh
+    // atomic, so nothing the user did afterwards could reach the running child.
+    parent_permission: &SharedPermission,
     parent_session_id: Uuid,
     sub_session_id: Uuid,
-    sub_cwd: crate::agent::SharedCwd,
+    sub_cwd: crate::workspace::SharedCwd,
     tool_name: &'static str,
 ) -> Result<Agent> {
-    let sub_shared_perm = spec.shared_permission(ceiling);
-    let effective_permission = spec.effective_permission(ceiling);
+    let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
+    let effective_permission = spec.effective_permission(parent_permission.get());
     let denials = spec.denials();
     // Resolved once: it feeds both this worker's system prompt and what its own children can be
     // given. `None` here is what makes nesting self-enforcing -- a worker that was not granted the
@@ -1469,20 +1494,27 @@ fn clamp_enabled_permissions(
 /// Compute the recursion budget for a sub-agent one level below a `AgentSpawnTool` with the given
 /// `remaining_depth` / `absolute_depth`, honoring an optional `max_depth` override.
 ///
-/// Returns `(child_remaining, child_absolute, allow_nested)`. `remaining_depth` is the soft,
-/// agent-tunable budget seeded from `session.subagent_max_depth`; `max_depth` may raise it.
+/// Returns `(child_remaining, child_absolute, allow_nested)`. `remaining_depth` is the budget
+/// seeded from `session.subagent_max_depth`; `max_depth` may lower it but never raise it.
 /// `absolute_depth` is the monotonic hard counter: it always increments and, once it reaches
-/// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], no further `agent_spawn` is granted, so recursion terminates
-/// even if the agent re-grants `max_depth` at every level. A nested `agent_spawn` is granted only
-/// when both budgets allow it.
+/// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], no further `agent_spawn` is granted. A nested `agent_spawn` is
+/// granted only when both budgets allow it.
+///
+/// The override is clamped because `[session] subagent_max_depth` is documented as a ceiling
+/// ("`subagent_max_depth = 1` means sub-agents cannot spawn further sub-agents"), and an
+/// unclamped override made it merely a default: one `agent_spawn` passing `max_depth: 15` handed a
+/// worker a budget the operator had explicitly denied, and each level could re-grant it. Recursion
+/// was still bounded by [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], so this is about the config key meaning
+/// what it says rather than about termination.
 fn child_spawn_depth(
     remaining_depth: usize,
     absolute_depth: usize,
     max_depth_override: Option<usize>,
 ) -> (usize, usize, bool) {
+    let inherited = remaining_depth.saturating_sub(1);
     let child_remaining = match max_depth_override {
-        Some(requested) => requested,
-        None => remaining_depth.saturating_sub(1),
+        Some(requested) => requested.min(inherited),
+        None => inherited,
     };
     let child_absolute = absolute_depth + 1;
     let allow_nested = child_remaining >= 1 && child_absolute < SUBAGENT_ABSOLUTE_MAX_DEPTH;
@@ -1833,12 +1865,25 @@ mod tests {
         assert!(!allow);
     }
 
+    /// `max_depth` narrows the child's budget and can never widen it. `[session]
+    /// subagent_max_depth` is documented as a ceiling, so a model asking for more than the operator
+    /// allowed gets the operator's answer.
     #[test]
-    fn test_child_spawn_depth_override_raises_soft_budget() {
-        // An explicit max_depth raises the soft budget above the natural decrement.
-        let (remaining, _absolute, allow) = child_spawn_depth(1, 0, Some(5));
-        assert_eq!(remaining, 5);
+    fn test_child_spawn_depth_override_only_narrows() {
+        // Asking for more than is left yields what is left, not what was asked for.
+        let (remaining, _absolute, allow) = child_spawn_depth(3, 0, Some(9));
+        assert_eq!(remaining, 2);
         assert!(allow);
+
+        // At the documented `subagent_max_depth = 1`, no override can grant a grandchild.
+        let (remaining, _absolute, allow) = child_spawn_depth(1, 0, Some(5));
+        assert_eq!(remaining, 0);
+        assert!(!allow, "subagent_max_depth = 1 must forbid nesting");
+
+        // Asking for less than is left is honoured: the agent may still restrict itself.
+        let (remaining, _absolute, _allow) = child_spawn_depth(5, 0, Some(1));
+        assert_eq!(remaining, 1);
+
         // max_depth = 0 explicitly forbids the sub-agent from spawning further.
         let (_remaining, _absolute, allow_zero) = child_spawn_depth(3, 0, Some(0));
         assert!(!allow_zero);
@@ -1896,8 +1941,8 @@ mod tests {
             MemoryAccess::Write,
             None,
             Vec::new(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("subagent registry should build");
@@ -2007,6 +2052,57 @@ mod tests {
         );
     }
 
+    /// The clamp above happens once, at build time. This is the half that was missing: a worker
+    /// already running when the user presses Shift+Tab has to see the new level on its next tool
+    /// call, not finish at the level it started with. Previously `shared_permission` minted a fresh
+    /// atomic from a snapshot, so a downgrade reached the parent's next call and nothing else --
+    /// while `permissions.md` presents cycling the parent as the way to restrict sub-agents.
+    #[test]
+    fn a_running_sub_agent_sees_a_parent_downgrade() {
+        let parent = SharedPermission::new(Permission::Write, EnabledPermissions::ALL);
+        let spec = SubagentSpec {
+            enabled_permissions: vec![Permission::Read, Permission::Write],
+            ..test_spec(Permission::Write)
+        };
+
+        let worker = spec.shared_permission_bounded(&parent);
+        assert_eq!(
+            worker.get(),
+            Permission::Write,
+            "spawned under a write parent"
+        );
+
+        // The user cycles the session down mid-run.
+        parent.set_unchecked(Permission::None);
+        assert_eq!(
+            worker.get(),
+            Permission::None,
+            "the worker must not outlive the authority it was granted under"
+        );
+
+        // And back up: the rule is min(own grant, what the human currently permits), read in both
+        // directions. The worker never exceeds its own grant either way.
+        parent.set_unchecked(Permission::Write);
+        assert_eq!(worker.get(), Permission::Write);
+    }
+
+    /// A worker granted less than its parent keeps its own lower level when the parent is raised:
+    /// the ceiling bounds from above and never lifts.
+    #[test]
+    fn a_parent_raise_does_not_lift_a_worker_above_its_own_grant() {
+        let parent = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
+        let spec = test_spec(Permission::Read);
+
+        let worker = spec.shared_permission_bounded(&parent);
+        parent.set_unchecked(Permission::Write);
+
+        assert_eq!(
+            worker.get(),
+            Permission::Read,
+            "the spec's own grant is still the worker's ceiling"
+        );
+    }
+
     /// A spec whose enabled set is empty or unparseable must not fall back to "everything". The
     /// safe floor is the recorded level alone.
     #[test]
@@ -2077,8 +2173,8 @@ mod tests {
                 mcp_grace: std::time::Duration::ZERO,
                 system_prompt_override: None,
             },
-            parent_cwd: crate::agent::test_cwd(),
-            parent_roots: crate::agent::test_roots(),
+            parent_cwd: crate::workspace::test_cwd(),
+            parent_roots: crate::workspace::test_roots(),
             parent_frontend: Arc::new(crate::frontend::SilentFrontend),
         }
     }

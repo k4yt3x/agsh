@@ -1,11 +1,17 @@
-//! SQLite-backed session store. Persists messages, large tool outputs (so they can be referenced
-//! from the conversation by handle), OAuth tokens, and MCP credentials. Per-session mutual
-//! exclusion is provided by an OS-level file lock ([`SessionLock`]) so the kernel reclaims it
-//! whenever the holder dies: no PID-aliveness check, no risk of stale locks.
+//! SQLite-backed session store, over eight tables: `sessions` and `messages` for the conversation,
+//! `tool_outputs` for results too large to keep inline (referenced from the conversation by
+//! handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, `scheduled_jobs` and
+//! `background_tasks` for work the agent starts and does not wait for, and `model_metadata_cache`
+//! for what a provider reports about a model.
+//!
+//! Per-session mutual exclusion is provided by an OS-level file lock ([`SessionLock`]) so the
+//! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
 //!
 //! On Unix the data directory (`0700`), lock directory (`0700`), and the database file itself
 //! (`0600`) are tightened after creation so the persisted OAuth tokens, MCP credentials, and
 //! conversation content aren't readable by other local users regardless of the user's umask.
+
+pub mod cli;
 
 use std::{
     fs::{File, OpenOptions},
@@ -154,6 +160,23 @@ pub enum RenameOutcome {
     TargetExists,
 }
 
+/// Per-session counters carried on the `sessions` row so `/status` totals survive a resume.
+///
+/// Listed once here because `initialize_schema` adds them one at a time and needs to name each; the
+/// list is the migration's unit of work, not a formatting detail. These are compile-time literals,
+/// so interpolating them into an `ALTER TABLE` is not a SQL-injection surface -- no caller supplies
+/// a column name, and there is no bound-parameter form for a DDL identifier.
+const STAT_COLUMNS: [&str; 8] = [
+    "stat_turns",
+    "stat_input_tokens",
+    "stat_output_tokens",
+    "stat_cache_creation_input_tokens",
+    "stat_cache_read_input_tokens",
+    "stat_redactions",
+    "stat_redacted_images",
+    "stat_redacted_bytes",
+];
+
 #[derive(Clone)]
 pub struct SessionManager {
     connection: Arc<Connection>,
@@ -217,6 +240,22 @@ impl Drop for SessionLock {
     }
 }
 
+/// File stem of the process-wide schema lock, which lives beside the per-session ones.
+///
+/// Named rather than spelled inline at both sites, because the prune below has to exclude exactly
+/// this file and a literal in two places is how that pairing gets broken.
+const SCHEMA_LOCK_STEM: &str = "schema";
+
+/// Stamped into `PRAGMA user_version` once [`SessionManager::initialize_schema`] has run to
+/// completion.
+///
+/// One number, not a migration ladder: the per-step probes are idempotent and stay the mechanism
+/// for deciding what to add. This exists for the one step that is *not* safe to re-run -- the
+/// cascade rebuild, which recreates `sessions` from a column list that omits everything added
+/// since. Its guard is a `LIKE` over generated SQL, and this makes that guard unreachable for any
+/// database that has already been initialised rather than trusting it a second time.
+const SCHEMA_VERSION: i32 = 1;
+
 fn default_database_path() -> Result<PathBuf> {
     // `MEKA_DATA_DIR` is the cross-platform override, the only env var that works on every OS,
     // mirroring how `MEKA_CONFIG_DIR` overrides the config directory. The value points at the
@@ -225,7 +264,20 @@ fn default_database_path() -> Result<PathBuf> {
     if let Ok(value) = std::env::var("MEKA_DATA_DIR")
         && !value.is_empty()
     {
-        return Ok(PathBuf::from(value).join("meka.db"));
+        // Absolute only, matching `meka_config_dir`. A relative value means the database -- which
+        // holds every provider credential -- lands under whatever directory meka happened to start
+        // in, so `meka` in one project and `meka` in another silently get different credential
+        // stores, and neither is the one the user set up. Ignored rather than fatal, for the same
+        // reason the config directory ignores it: the platform default is always a usable answer.
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return Ok(path.join("meka.db"));
+        }
+        tracing::warn!(
+            "MEKA_DATA_DIR '{}' is not an absolute path; ignoring it and using the platform data \
+             directory",
+            path.display()
+        );
     }
 
     // `dirs::data_dir()` honors XDG_DATA_HOME on Linux, returns `~/Library/Application Support` on
@@ -397,6 +449,42 @@ impl SessionManager {
     }
 
     async fn initialize_schema(&self) -> Result<()> {
+        // Serialise schema work across processes.
+        //
+        // The migrations below are a sequence of check-then-`ALTER` steps, and two meka processes
+        // opening the same database in the same window both see "not migrated" and both issue the
+        // same `ALTER`; the loser dies with `duplicate column name`. That is not an upgrade-only
+        // hazard: `CREATE TABLE sessions` does not declare the `stat_*` columns, so *every* fresh
+        // database runs those eight `ALTER`s on first open, which is exactly when a systemd unit
+        // and a shell REPL are most likely to start together.
+        //
+        // A SQLite transaction cannot be the mechanism: the cascade rebuild needs
+        // `PRAGMA foreign_keys = OFF`, which is a no-op inside one. So the lock is an OS file lock,
+        // the same primitive `SessionLock` uses, held for the whole of the schema work. The loser
+        // waits, then re-runs its probes against the winner's finished schema and no-ops.
+        let lock_path = self.lock_dir.join(format!("{}.lock", SCHEMA_LOCK_STEM));
+        let mut lock_file = FdRwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| {
+                    MekaError::Database(format!(
+                        "failed to open schema lock '{}': {}",
+                        lock_path.display(),
+                        error
+                    ))
+                })?,
+        );
+        let _schema_guard = lock_file.write().map_err(|error| {
+            MekaError::Database(format!(
+                "failed to acquire schema lock '{}': {}",
+                lock_path.display(),
+                error
+            ))
+        })?;
+
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
                 connection.execute_batch(
@@ -562,16 +650,32 @@ impl SessionManager {
                 //
                 // Detection key: the `messages` table SQL contains the literal `ON DELETE CASCADE`
                 // after the migration runs.
-                let has_cascade: bool = connection
-                    .query_row(
+                // Propagated, never defaulted. `.unwrap_or(0)` here would read *any* failure of this
+                // probe -- `SQLITE_BUSY` past the busy_timeout, an I/O error on a network mount --
+                // as "not migrated", and the branch it guards is destructive: the rebuild recreates
+                // `sessions` from a column list that omits `permission`, `capabilities_json`,
+                // `token_id`, `additional_roots_json`, `subagent_spec_json` and all eight `stat_*`
+                // counters, so running it against an already-migrated database silently empties them
+                // for every session. A probe that cannot answer must abort the open.
+                //
+                // Gated on `PRAGMA user_version` as well, and that is the belt to this brace. The
+                // `LIKE` is a heuristic over generated SQL text: it answers correctly today, but it
+                // is the kind of check that a later schema change quietly invalidates, and what it
+                // guards destroys data. A database this process has already taken through
+                // initialisation carries the stamp, so the probe -- and the branch under it -- is
+                // never consulted for it again. Databases predating the stamp still get the text
+                // probe, which is what they have.
+                let schema_version: i32 = connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                    .unwrap_or(0);
+                let has_cascade: bool = schema_version >= SCHEMA_VERSION
+                    || connection.query_row(
                         "SELECT COUNT(*) FROM sqlite_master \
                          WHERE type = 'table' AND name = 'messages' \
                            AND sql LIKE '%ON DELETE CASCADE%'",
                         [],
                         |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
+                    )? > 0;
                 if !has_cascade {
                     // PRAGMA foreign_keys only takes effect outside any transaction. Toggle, run
                     // rebuild, restore (even on failure) so the connection isn't left in a state
@@ -725,25 +829,25 @@ impl SessionManager {
                 // Migration: per-session cumulative stat columns (surfaced by `/status`) so the
                 // running totals survive resume instead of restarting at zero each process. Added as
                 // a set; the presence of `stat_turns` gates the whole batch.
-                let has_stat_cols: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'stat_turns'",
-                        [],
+                // Checked and added per column rather than gating all eight on the presence of the
+                // first. `ALTER TABLE` statements are eight separate autocommits, so a failure or
+                // kill partway through (ENOSPC, `SQLITE_BUSY`, OOM) used to leave `stat_turns`
+                // present and the other seven missing -- and because the guard only tested
+                // `stat_turns`, no later run would ever add them. `session list` kept working while
+                // `session fork` and every stats write failed permanently with "no column named
+                // stat_input_tokens", with no recovery path short of hand-written SQL.
+                for column in STAT_COLUMNS {
+                    let present: bool = connection.query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                        [column],
                         |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_stat_cols {
-                    connection.execute_batch(
-                        "ALTER TABLE sessions ADD COLUMN stat_turns INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_input_tokens INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_output_tokens INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_redactions INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_redacted_images INTEGER NOT NULL DEFAULT 0;
-                         ALTER TABLE sessions ADD COLUMN stat_redacted_bytes INTEGER NOT NULL DEFAULT 0;",
-                    )?;
+                    )? > 0;
+                    if !present {
+                        connection.execute_batch(&format!(
+                            "ALTER TABLE sessions ADD COLUMN {} INTEGER NOT NULL DEFAULT 0;",
+                            column
+                        ))?;
+                    }
                 }
 
                 // Scheduled wakeups (see `crate::schedule`). Created last, after the cascade-FK
@@ -764,6 +868,7 @@ impl SessionManager {
                         gate_command      TEXT,
                         gate_fire         TEXT,
                         gate_last_output  TEXT,
+                        gate_permission   TEXT,
                         isolated          INTEGER NOT NULL DEFAULT 0,
                         created_at        TEXT NOT NULL,
                         last_fired_at     TEXT,
@@ -776,6 +881,22 @@ impl SessionManager {
                     CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_session
                         ON scheduled_jobs(session_id);",
                 )?;
+
+                // `gate_permission` records the level a gate was authorised at, so `prepare` can
+                // re-check it rather than trusting a decision the creating session has since walked
+                // back. Added by `ALTER` for databases whose `scheduled_jobs` predates it; a row
+                // written before this column reads back as `Permission::None` and its gate is
+                // refused, which is the safe direction.
+                let has_gate_permission: bool = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('scheduled_jobs') \
+                     WHERE name = 'gate_permission'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? > 0;
+                if !has_gate_permission {
+                    connection
+                        .execute_batch("ALTER TABLE scheduled_jobs ADD COLUMN gate_permission TEXT;")?;
+                }
 
                 // Background tool calls (see `crate::background`). Same placement rationale as
                 // `scheduled_jobs` above: declared after the cascade-FK rebuild so its FK target
@@ -802,6 +923,13 @@ impl SessionManager {
                     CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
                         ON background_tasks(session_id, status);",
                 )?;
+
+                // Stamped last, so it means "everything above ran to completion". A kill partway
+                // through leaves the stamp unwritten and the next open re-runs the whole sequence,
+                // which is safe because every step is idempotent. What the stamp buys is the
+                // destructive cascade rebuild above: once set, that branch is never reached again
+                // on the strength of a `LIKE` over generated SQL.
+                connection.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
 
                 Ok(())
             })
@@ -1143,6 +1271,15 @@ impl SessionManager {
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
+            // `schema.lock` shares this directory and is not a session's. It survives the UUID
+            // check below by accident -- "schema" does not parse as one -- and the accident is
+            // worth not relying on: unlinking a file does not release a held `flock`, so a swept
+            // schema lock would let the next process create a different inode and both would enter
+            // the migration believing they held it. Named explicitly so a future lock called
+            // anything UUID-shaped does not quietly inherit the hazard.
+            if stem == SCHEMA_LOCK_STEM {
+                continue;
+            }
             if Uuid::parse_str(stem).is_err() || live_ids.contains(stem) {
                 continue;
             }
@@ -2002,8 +2139,36 @@ impl SessionManager {
             .call(move |connection| -> rusqlite::Result<_> {
                 // FK CASCADE sweeps messages, tool_outputs, and any sub-agent child sessions of the
                 // expired parents.
+                //
+                // A session with a scheduled job still ahead of it is *not* expired, whatever
+                // `updated_at` says. Only turns bump that column -- `stamp_scheduled_job_fired` and
+                // `reschedule_scheduled_job` touch `scheduled_jobs` alone -- so a gated watcher
+                // that evaluates every tick but rarely fires looks untouched for as
+                // long as it stays quiet, which is exactly when it is working. The
+                // cascade then took the job with the session, and the sweep
+                // reported "deleted 1 session(s)" without ever mentioning
+                // that a schedule went with it.
+                //
+                // Sparing only the row that *owns* the job is not enough. `parent_session_id`
+                // carries `ON DELETE CASCADE`, so deleting a stale parent silently takes its
+                // sub-agent children -- and a job created against a child (reachable over HTTP,
+                // whose only gate is that the session exists) goes with them. The recursive term
+                // walks parent links up from every job-owning session and spares that whole chain.
                 let deleted = connection.execute(
-                    "DELETE FROM sessions WHERE updated_at < ?1",
+                    "DELETE FROM sessions WHERE updated_at < ?1 \
+                       AND id NOT IN (SELECT session_id FROM scheduled_jobs) \
+                       AND id NOT IN ( \
+                           WITH RECURSIVE ancestors(id) AS ( \
+                               SELECT parent_session_id FROM sessions \
+                                 WHERE parent_session_id IS NOT NULL \
+                                   AND id IN (SELECT session_id FROM scheduled_jobs) \
+                               UNION \
+                               SELECT s.parent_session_id FROM sessions s \
+                                 JOIN ancestors a ON s.id = a.id \
+                                WHERE s.parent_session_id IS NOT NULL \
+                           ) \
+                           SELECT id FROM ancestors \
+                       )",
                     rusqlite::params![cutoff_str],
                 )?;
                 Ok(deleted as u64)
@@ -2401,661 +2566,6 @@ impl SessionManager {
             .await
             .map_err(|error| MekaError::Database(format!("failed to load tool outputs: {}", error)))
     }
-
-    /// Persist a new scheduled job. The caller owns computing `next_fire_at` from the job's anchor
-    /// (see [`crate::schedule::ScheduledJob::anchor`]).
-    pub async fn create_scheduled_job(&self, job: &crate::schedule::ScheduledJob) -> Result<()> {
-        let id = job.id.clone();
-        let session_id = job.session_id.to_string();
-        let kind = job.schedule.kind_str().to_string();
-        let spec = job.schedule.spec();
-        let prompt = job.prompt.clone();
-        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
-        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
-        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
-        let isolated = i64::from(job.isolated);
-        let created_at = job.created_at.to_rfc3339();
-        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
-        let next_fire_at = job.next_fire_at.to_rfc3339();
-
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_command, \
-                     gate_fire, gate_last_output, isolated, created_at, last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    rusqlite::params![
-                        id,
-                        session_id,
-                        kind,
-                        spec,
-                        prompt,
-                        gate_command,
-                        gate_fire,
-                        gate_last_output,
-                        isolated,
-                        created_at,
-                        last_fired_at,
-                        next_fire_at
-                    ],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to create scheduled job: {}", error))
-            })
-    }
-
-    /// Every job belonging to one session, soonest first.
-    pub async fn list_scheduled_jobs(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
-        self.query_scheduled_jobs(
-            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
-             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
-             FROM scheduled_jobs WHERE session_id = ?1 ORDER BY next_fire_at ASC",
-            vec![session_id.to_string()],
-        )
-        .await
-    }
-
-    /// Every job in the database, soonest first. Backs `meka schedule list` and `meka schedule
-    /// cancel`, which work from a job id and so cannot ask the caller which session to look in.
-    pub async fn list_all_scheduled_jobs(&self) -> Result<Vec<crate::schedule::ScheduledJob>> {
-        self.query_scheduled_jobs(
-            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
-             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
-             FROM scheduled_jobs ORDER BY next_fire_at ASC",
-            Vec::new(),
-        )
-        .await
-    }
-
-    /// Every job across all sessions whose `next_fire_at` has passed, soonest first. The
-    /// scheduler's per-tick query; served by `idx_scheduled_jobs_next_fire`.
-    pub async fn list_due_scheduled_jobs(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
-        self.query_scheduled_jobs(
-            "SELECT id, session_id, kind, spec, prompt, gate_command, gate_fire, \
-             gate_last_output, isolated, created_at, last_fired_at, next_fire_at \
-             FROM scheduled_jobs WHERE next_fire_at <= ?1 ORDER BY next_fire_at ASC",
-            vec![now.to_rfc3339()],
-        )
-        .await
-    }
-
-    /// Shared row decoder. A row that fails to decode (hand-edited spec, a `kind` from a future
-    /// version) is skipped with a warning rather than failing the whole query: one bad row must not
-    /// stop every other job in the database from firing.
-    async fn query_scheduled_jobs(
-        &self,
-        sql: &'static str,
-        params: Vec<String>,
-    ) -> Result<Vec<crate::schedule::ScheduledJob>> {
-        let rows: Vec<ScheduledJobRow> = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(sql)?;
-                let rows = statement
-                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                        Ok(ScheduledJobRow {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            kind: row.get(2)?,
-                            spec: row.get(3)?,
-                            prompt: row.get(4)?,
-                            gate_command: row.get(5)?,
-                            gate_fire: row.get(6)?,
-                            gate_last_output: row.get(7)?,
-                            isolated: row.get::<_, i64>(8)? != 0,
-                            created_at: row.get(9)?,
-                            last_fired_at: row.get(10)?,
-                            next_fire_at: row.get(11)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to load scheduled jobs: {}", error))
-            })?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let id = row.id.clone();
-                row.decode()
-                    .inspect_err(|error| {
-                        tracing::warn!("skipping unreadable scheduled job {}: {}", id, error);
-                    })
-                    .ok()
-            })
-            .collect())
-    }
-
-    /// Delete a job by full or unique-prefix id. Returns the id actually removed, or `None` when
-    /// nothing matched. An ambiguous prefix is an error rather than an arbitrary pick.
-    pub async fn cancel_scheduled_job(
-        &self,
-        session_id: Uuid,
-        id_prefix: &str,
-    ) -> Result<Option<String>> {
-        let jobs = self.list_scheduled_jobs(session_id).await?;
-        let matches: Vec<&crate::schedule::ScheduledJob> = jobs
-            .iter()
-            .filter(|job| job.id.starts_with(id_prefix))
-            .collect();
-        let id = match matches.as_slice() {
-            [] => return Ok(None),
-            [job] => job.id.clone(),
-            several => {
-                return Err(MekaError::Database(format!(
-                    "'{}' matches {} jobs; use a longer id",
-                    id_prefix,
-                    several.len()
-                )));
-            }
-        };
-
-        let id_for_db = id.clone();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "DELETE FROM scheduled_jobs WHERE id = ?1",
-                    rusqlite::params![id_for_db],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to cancel scheduled job: {}", error))
-            })?;
-        Ok(Some(id))
-    }
-
-    /// Delete a job by exact id, without the prefix resolution [`Self::cancel_scheduled_job`] does.
-    /// Used by the scheduler to retire a fired one-shot.
-    pub async fn delete_scheduled_job(&self, id: &str) -> Result<()> {
-        let id = id.to_string();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "DELETE FROM scheduled_jobs WHERE id = ?1",
-                    rusqlite::params![id],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to delete scheduled job: {}", error))
-            })
-    }
-
-    /// Record that a job fired and when it is next due.
-    ///
-    /// Written *before* the turn runs, not after: a prompt that reliably crashes or hangs the
-    /// process would otherwise re-fire on every restart, turning one bad job into a boot loop in
-    /// the daemon that is supposed to stay up. Stamping first costs one missed occurrence instead.
-    pub async fn stamp_scheduled_job_fired(
-        &self,
-        id: &str,
-        fired_at: chrono::DateTime<chrono::Utc>,
-        next_fire_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let id = id.to_string();
-        let fired_at = fired_at.to_rfc3339();
-        let next_fire_at = next_fire_at.to_rfc3339();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE scheduled_jobs SET last_fired_at = ?2, next_fire_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, fired_at, next_fire_at],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to stamp scheduled job: {}", error))
-            })
-    }
-
-    /// Move a job's next due time without claiming it fired.
-    ///
-    /// Separate from [`Self::stamp_scheduled_job_fired`] because a gated job that evaluates to "no
-    /// change" has been *considered* but not fired, and recording it as fired would both mislead
-    /// `schedule list` and, for an interval schedule, silently re-anchor the cadence on evaluations
-    /// rather than on fires.
-    pub async fn reschedule_scheduled_job(
-        &self,
-        id: &str,
-        next_fire_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        let id = id.to_string();
-        let next_fire_at = next_fire_at.to_rfc3339();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE scheduled_jobs SET next_fire_at = ?2 WHERE id = ?1",
-                    rusqlite::params![id, next_fire_at],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to reschedule job: {}", error)))
-    }
-
-    /// Put a job back exactly as it was, for a host that turned out to be unable to run it after
-    /// the scheduler had already claimed the occurrence.
-    ///
-    /// An upsert of the whole row rather than an update of the columns that moved, because claiming
-    /// a job can *delete* it: a one-shot has no next occurrence, so it is retired the moment it
-    /// comes due, and an `UPDATE` would then match nothing while still reporting success -- losing
-    /// the reminder outright. Restoring every column also puts back `gate_last_output`, without
-    /// which a deferred `on-change` watcher would have already absorbed the very change it exists
-    /// to report.
-    pub async fn restore_scheduled_job(&self, job: &crate::schedule::ScheduledJob) -> Result<()> {
-        let id = job.id.clone();
-        let session_id = job.session_id.to_string();
-        let kind = job.schedule.kind_str().to_string();
-        let spec = job.schedule.spec();
-        let prompt = job.prompt.clone();
-        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
-        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
-        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
-        let isolated = i64::from(job.isolated);
-        let created_at = job.created_at.to_rfc3339();
-        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
-        let next_fire_at = job.next_fire_at.to_rfc3339();
-
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT OR REPLACE INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
-                     gate_command, gate_fire, gate_last_output, isolated, created_at, \
-                     last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    rusqlite::params![
-                        id,
-                        session_id,
-                        kind,
-                        spec,
-                        prompt,
-                        gate_command,
-                        gate_fire,
-                        gate_last_output,
-                        isolated,
-                        created_at,
-                        last_fired_at,
-                        next_fire_at
-                    ],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to restore scheduled job: {}", error))
-            })
-    }
-
-    /// Persist the gate's latest stdout so the next `on-change` evaluation has something to compare
-    /// against.
-    pub async fn update_scheduled_job_gate_output(&self, id: &str, output: &str) -> Result<()> {
-        let id = id.to_string();
-        let output = output.to_string();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE scheduled_jobs SET gate_last_output = ?2 WHERE id = ?1",
-                    rusqlite::params![id, output],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to record gate output: {}", error))
-            })
-    }
-
-    /// Record a task as started. Written before the work is spawned, so a process that dies between
-    /// the two leaves a `running` row the sweep will retire rather than a task nobody knows about.
-    pub async fn start_background_task(
-        &self,
-        task: &crate::background::BackgroundTask,
-    ) -> Result<()> {
-        let id = task.id.clone();
-        let session_id = task.session_id.to_string();
-        let tool_name = task.tool_name.clone();
-        let label = task.label.clone();
-        let status = task.status.as_str().to_string();
-        let started_at = task.started_at.to_rfc3339();
-
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT INTO background_tasks \
-                     (id, session_id, tool_name, label, status, started_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![id, session_id, tool_name, label, status, started_at],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to start background task: {}", error))
-            })
-    }
-
-    /// Record a terminal outcome.
-    ///
-    /// Guarded on `status = 'running'` so a task that was cancelled, or swept to `interrupted`,
-    /// cannot be overwritten by its own work finishing a moment later. The first terminal write
-    /// wins, which is what keeps a cancelled task from reporting success.
-    pub async fn finish_background_task(
-        &self,
-        id: &str,
-        status: crate::background::TaskStatus,
-        outcome: Option<String>,
-        scratchpad_name: Option<String>,
-    ) -> Result<()> {
-        let id = id.to_string();
-        let status = status.as_str().to_string();
-        let finished_at = chrono::Utc::now().to_rfc3339();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "UPDATE background_tasks \
-                     SET status = ?2, outcome = ?3, scratchpad_name = ?4, finished_at = ?5 \
-                     WHERE id = ?1 AND status = 'running'",
-                    rusqlite::params![id, status, outcome, scratchpad_name, finished_at],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to finish background task: {}", error))
-            })
-    }
-
-    /// Every task belonging to one session, newest first.
-    pub async fn list_background_tasks(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::background::BackgroundTask>> {
-        self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
-             WHERE session_id = ?1 ORDER BY started_at DESC",
-            vec![session_id.to_string()],
-        )
-        .await
-    }
-
-    /// A session's tasks still running, oldest first. Backs the `[Background]` index and the
-    /// Ctrl+C survivor line.
-    pub async fn list_running_background_tasks(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::background::BackgroundTask>> {
-        self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
-             WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
-            vec![session_id.to_string()],
-        )
-        .await
-    }
-
-    /// A session's finished-but-unreported tasks, oldest first. The delivery poll's query; served
-    /// by `idx_background_tasks_session_status`.
-    pub async fn list_undelivered_background_tasks(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<crate::background::BackgroundTask>> {
-        self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
-             WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
-             ORDER BY finished_at ASC",
-            vec![session_id.to_string()],
-        )
-        .await
-    }
-
-    /// Stamp outcomes as delivered.
-    ///
-    /// Called *before* the turn runs, matching [`Self::stamp_scheduled_job_fired`] and for the same
-    /// reason: an outcome that reliably wedges the process would otherwise be redelivered on every
-    /// restart, turning one bad result into a boot loop. Losing one report is the cheaper failure.
-    pub async fn mark_background_tasks_delivered(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let ids = ids.to_vec();
-        let delivered_at = chrono::Utc::now().to_rfc3339();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                // One transaction, so a failure part-way cannot leave half a batch stamped. The
-                // caller renders every one of these into a single turn, and stamping only some of
-                // them would repeat the rest alongside it on the next tick.
-                let txn = connection.transaction()?;
-                {
-                    let mut statement =
-                        txn.prepare("UPDATE background_tasks SET delivered_at = ?2 WHERE id = ?1")?;
-                    for id in &ids {
-                        statement.execute(rusqlite::params![id, delivered_at])?;
-                    }
-                }
-                txn.commit()?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to mark tasks delivered: {}", error))
-            })
-    }
-
-    /// Retire every `running` task in this session as
-    /// [`crate::background::TaskStatus::Interrupted`], returning how many were swept.
-    ///
-    /// Called when a process takes ownership of a session. The session lock
-    /// ([`Self::lock_session`]) is the lease: holding it means no other process can still be
-    /// running this session's tasks, so any row that still says `running` belongs to a process
-    /// that is gone. Without this a task in flight at shutdown would leave the agent waiting on
-    /// a report that can never arrive, having very likely already promised one.
-    pub async fn sweep_interrupted_background_tasks(&self, session_id: Uuid) -> Result<usize> {
-        let session_id = session_id.to_string();
-        let status = crate::background::TaskStatus::Interrupted
-            .as_str()
-            .to_string();
-        let finished_at = chrono::Utc::now().to_rfc3339();
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let swept = connection.execute(
-                    "UPDATE background_tasks SET status = ?2, finished_at = ?3 \
-                     WHERE session_id = ?1 AND status = 'running'",
-                    rusqlite::params![session_id, status, finished_at],
-                )?;
-                Ok(swept)
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to sweep background tasks: {}", error))
-            })
-    }
-
-    /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
-    /// rather than an arbitrary pick, matching [`Self::cancel_scheduled_job`].
-    pub async fn resolve_background_task(
-        &self,
-        session_id: Uuid,
-        id_prefix: &str,
-    ) -> Result<Option<crate::background::BackgroundTask>> {
-        let tasks = self.list_background_tasks(session_id).await?;
-        let matches: Vec<crate::background::BackgroundTask> = tasks
-            .into_iter()
-            .filter(|task| task.id.starts_with(id_prefix))
-            .collect();
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.into_iter().next()),
-            _ => Err(MekaError::Config(format!(
-                "task id '{}' is ambiguous; it matches {} tasks",
-                id_prefix,
-                matches.len()
-            ))),
-        }
-    }
-
-    /// Shared row decoder, mirroring [`Self::query_scheduled_jobs`]: one unreadable row is skipped
-    /// with a warning rather than failing every other task in the query.
-    async fn query_background_tasks(
-        &self,
-        sql: &'static str,
-        params: Vec<String>,
-    ) -> Result<Vec<crate::background::BackgroundTask>> {
-        let rows: Vec<BackgroundTaskRow> = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let mut statement = connection.prepare(sql)?;
-                let rows = statement
-                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                        Ok(BackgroundTaskRow {
-                            id: row.get(0)?,
-                            session_id: row.get(1)?,
-                            tool_name: row.get(2)?,
-                            label: row.get(3)?,
-                            status: row.get(4)?,
-                            outcome: row.get(5)?,
-                            scratchpad_name: row.get(6)?,
-                            started_at: row.get(7)?,
-                            finished_at: row.get(8)?,
-                            delivered_at: row.get(9)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to load background tasks: {}", error))
-            })?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let id = row.id.clone();
-                row.decode()
-                    .inspect_err(|error| {
-                        tracing::warn!("skipping unreadable background task {}: {}", id, error);
-                    })
-                    .ok()
-            })
-            .collect())
-    }
-}
-
-/// Raw `background_tasks` row, decoded outside the database closure so a parse failure can be
-/// logged and skipped individually.
-struct BackgroundTaskRow {
-    id: String,
-    session_id: String,
-    tool_name: String,
-    label: String,
-    status: String,
-    outcome: Option<String>,
-    scratchpad_name: Option<String>,
-    started_at: String,
-    finished_at: Option<String>,
-    delivered_at: Option<String>,
-}
-
-impl BackgroundTaskRow {
-    fn decode(self) -> std::result::Result<crate::background::BackgroundTask, String> {
-        let parse_time =
-            |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
-                chrono::DateTime::parse_from_rfc3339(text)
-                    .map(|at| at.with_timezone(&chrono::Utc))
-                    .map_err(|error| format!("bad timestamp '{}': {}", text, error))
-            };
-        let parse_optional = |text: Option<String>| -> std::result::Result<_, String> {
-            text.as_deref().map(parse_time).transpose()
-        };
-
-        Ok(crate::background::BackgroundTask {
-            id: self.id,
-            session_id: Uuid::parse_str(&self.session_id)
-                .map_err(|error| format!("bad session id: {}", error))?,
-            tool_name: self.tool_name,
-            label: self.label,
-            status: crate::background::TaskStatus::parse(&self.status)
-                .ok_or_else(|| format!("unknown status '{}'", self.status))?,
-            outcome: self.outcome,
-            scratchpad_name: self.scratchpad_name,
-            started_at: parse_time(&self.started_at)?,
-            finished_at: parse_optional(self.finished_at)?,
-            delivered_at: parse_optional(self.delivered_at)?,
-        })
-    }
-}
-
-/// Raw `scheduled_jobs` row, decoded into a [`crate::schedule::ScheduledJob`] outside the database
-/// closure so parse failures can be logged and skipped individually.
-struct ScheduledJobRow {
-    id: String,
-    session_id: String,
-    kind: String,
-    spec: String,
-    prompt: String,
-    gate_command: Option<String>,
-    gate_fire: Option<String>,
-    gate_last_output: Option<String>,
-    isolated: bool,
-    created_at: String,
-    last_fired_at: Option<String>,
-    next_fire_at: String,
-}
-
-impl ScheduledJobRow {
-    fn decode(self) -> std::result::Result<crate::schedule::ScheduledJob, String> {
-        let parse_time =
-            |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
-                chrono::DateTime::parse_from_rfc3339(text)
-                    .map(|at| at.with_timezone(&chrono::Utc))
-                    .map_err(|error| format!("bad timestamp '{}': {}", text, error))
-            };
-
-        let gate = match (self.gate_command, self.gate_fire) {
-            (Some(command), Some(fire)) => Some(crate::schedule::Gate {
-                command,
-                fire: crate::schedule::GateFire::parse(&fire)?,
-                last_output: self.gate_last_output,
-            }),
-            // A half-written gate is a corrupt row, not a job without a gate: silently dropping the
-            // condition would turn a watcher into an unconditional timer.
-            (Some(_), None) | (None, Some(_)) => {
-                return Err("gate_command and gate_fire must both be set or both be null".into());
-            }
-            (None, None) => None,
-        };
-
-        Ok(crate::schedule::ScheduledJob {
-            id: self.id,
-            session_id: Uuid::parse_str(&self.session_id)
-                .map_err(|error| format!("bad session id '{}': {}", self.session_id, error))?,
-            schedule: crate::schedule::Schedule::from_stored(&self.kind, &self.spec)?,
-            prompt: self.prompt,
-            gate,
-            isolated: self.isolated,
-            created_at: parse_time(&self.created_at)?,
-            last_fired_at: self.last_fired_at.as_deref().map(parse_time).transpose()?,
-            next_fire_at: parse_time(&self.next_fire_at)?,
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -3358,6 +2868,14 @@ impl SessionManager {
             connection: Arc::clone(&self.connection),
         }
     }
+
+    pub fn schedule_store(&self) -> crate::schedule::ScheduleStore {
+        crate::schedule::ScheduleStore::new(Arc::clone(&self.connection))
+    }
+
+    pub fn background_store(&self) -> crate::background::BackgroundStore {
+        crate::background::BackgroundStore::new(Arc::clone(&self.connection))
+    }
 }
 
 /// Strip `<context>...</context>` tags from a stored user message, returning only the actual user
@@ -3561,6 +3079,45 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    /// `MEKA_DATA_DIR` has to be absolute, for a sharper version of the reason `MEKA_CONFIG_DIR`
+    /// does: `meka.db` holds every provider credential, so a relative value gives one credential
+    /// store per directory meka is launched from, none of them the one the user set up.
+    ///
+    /// The comment justifying the config-directory hardening asserted this sibling "already refuses
+    /// both". It refused only the empty value.
+    #[tokio::test]
+    async fn a_relative_data_dir_is_refused_rather_than_joined_to_the_cwd() {
+        let _env = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        let previous = std::env::var_os("MEKA_DATA_DIR");
+        // SAFETY: `MEKA_DATA_DIR` is process-global; the lock above serialises every test that
+        // touches it, and the original value is restored before the guard drops.
+        unsafe { std::env::set_var("MEKA_DATA_DIR", "relative/data") };
+        let relative = default_database_path();
+
+        let absolute_dir = std::env::temp_dir().join("meka-data-dir-test");
+        unsafe { std::env::set_var("MEKA_DATA_DIR", &absolute_dir) };
+        let absolute = default_database_path();
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MEKA_DATA_DIR", value),
+                None => std::env::remove_var("MEKA_DATA_DIR"),
+            }
+        }
+
+        let relative = relative.expect("a rejected override still resolves a platform default");
+        assert!(
+            !relative.starts_with("relative"),
+            "a relative override must not be joined to the cwd; got {}",
+            relative.display(),
+        );
+        assert_eq!(
+            absolute.expect("an absolute override is honoured"),
+            absolute_dir.join("meka.db"),
+            "and an absolute one is still used verbatim",
+        );
     }
 
     /// Populate a session with the full spread of state a fork has to carry.
@@ -4809,6 +4366,116 @@ mod tests {
         assert!(messages.is_empty());
     }
 
+    /// A session holding a scheduled job is not idle, whatever its `updated_at` says: only turns
+    /// bump that column, so a gated watcher that evaluates every tick and rarely fires looks
+    /// untouched precisely while it is doing its job. The FK cascade then destroyed the schedule
+    /// The FK cascade must not take a job-owning child with its stale parent.
+    ///
+    /// Sparing only the row named by `scheduled_jobs.session_id` left the guard half-built:
+    /// `parent_session_id` carries `ON DELETE CASCADE`, so a top-level session that has gone quiet
+    /// still deletes its sub-agent children, and a job created against a child -- which the HTTP
+    /// surface allows, gating only on the session existing -- went with them. The sweep then
+    /// reported one deletion and said nothing about the schedule it destroyed.
+    #[tokio::test]
+    async fn retention_spares_the_parent_of_a_child_that_has_a_scheduled_job() {
+        let manager = test_manager().await;
+        let parent = manager.create_session(None).await.expect("create parent");
+        let child = manager
+            .create_child_session(parent, None, None)
+            .await
+            .expect("create child");
+
+        let job = crate::schedule::ScheduledJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: child,
+            schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            prompt: "check the build".to_string(),
+            gate: None,
+            isolated: false,
+            created_at: chrono::Utc::now(),
+            last_fired_at: None,
+            next_fire_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        };
+        manager
+            .schedule_store()
+            .create_scheduled_job(&job)
+            .await
+            .expect("save job");
+
+        // Only the parent looks ancient; the child is what owns the future.
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        manager
+            .set_session_updated_at_for_test(parent, &ancient)
+            .await
+            .expect("backdate");
+
+        manager.delete_expired_sessions(30).await.expect("sweep");
+
+        assert!(
+            manager.session_exists(child).await.expect("exists"),
+            "the child owning the job was cascaded away with its stale parent"
+        );
+        assert!(
+            manager.session_exists(parent).await.expect("exists"),
+            "the parent must be spared too, since deleting it is what takes the child"
+        );
+    }
+
+    /// along with the session, and the sweep reported only "deleted N session(s)".
+    #[tokio::test]
+    async fn retention_spares_a_session_that_still_has_a_scheduled_job() {
+        let manager = test_manager().await;
+        let watcher = manager.create_session(None).await.expect("create");
+        let plain = manager.create_session(None).await.expect("create");
+
+        let job = crate::schedule::ScheduledJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: watcher,
+            schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
+            prompt: "check the build".to_string(),
+            gate: None,
+            isolated: false,
+            created_at: chrono::Utc::now(),
+            last_fired_at: None,
+            next_fire_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        };
+        manager
+            .schedule_store()
+            .create_scheduled_job(&job)
+            .await
+            .expect("save job");
+
+        // Both look ancient by `updated_at`; only one of them has a future.
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        for id in [watcher, plain] {
+            manager
+                .set_session_updated_at_for_test(id, &ancient)
+                .await
+                .expect("backdate");
+        }
+
+        manager.delete_expired_sessions(30).await.expect("sweep");
+
+        assert!(
+            manager.session_exists(watcher).await.expect("exists"),
+            "a session with a pending job must survive retention"
+        );
+        assert!(
+            !manager.session_exists(plain).await.expect("exists"),
+            "a genuinely idle session should still be swept"
+        );
+        assert_eq!(
+            manager
+                .schedule_store()
+                .list_scheduled_jobs(watcher)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "the job must survive with its session"
+        );
+    }
+
     #[tokio::test]
     async fn test_delete_expired_sessions_keeps_recent() {
         let manager = test_manager().await;
@@ -5253,6 +4920,67 @@ mod tests {
     // sessions(parent_session_id)` ran before the ADD COLUMN step and bombed with "no such column:
     // parent_session_id".
     #[tokio::test]
+    /// The stamp has to be written, and it has to make the destructive branch unreachable.
+    ///
+    /// The cascade rebuild recreates `sessions` from a five-column list, so running it against an
+    /// already-migrated database empties `permission`, `token_id` and all eight `stat_*` counters
+    /// for every session. Its only guard was a `LIKE` over generated SQL. This pins the second
+    /// guard: after one successful open the version says "done", and a database whose DDL text has
+    /// been altered out from under the probe is still left alone.
+    async fn an_initialised_database_is_never_rebuilt_a_second_time() {
+        use rusqlite::Connection as RusqliteConnection;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("meka.db");
+
+        let manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("first open");
+        let session = manager.create_session(None).await.expect("session");
+        manager
+            .update_session_permission(session, "write")
+            .await
+            .expect("set permission");
+        drop(manager);
+
+        {
+            let conn = RusqliteConnection::open(&db_path).expect("rusqlite open");
+            let stamped: i32 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read user_version");
+            assert_eq!(
+                stamped, SCHEMA_VERSION,
+                "a completed initialisation must stamp the version"
+            );
+
+            // Break the text probe the way a future schema edit would, leaving the stamp as the
+            // only thing standing between this database and the rebuild.
+            conn.execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master
+                     SET sql = replace(sql, 'ON DELETE CASCADE', 'ON DELETE NO ACTION')
+                     WHERE type = 'table' AND name = 'messages';
+                 PRAGMA writable_schema = OFF;",
+            )
+            .expect("blunt the probe");
+        }
+
+        let manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("second open");
+        let summary = manager
+            .session_info(session)
+            .await
+            .expect("look up")
+            .expect("the session survived");
+        assert_eq!(
+            summary.permission.as_deref(),
+            Some("write"),
+            "the rebuild ran and dropped the columns it does not carry"
+        );
+    }
+
+    #[tokio::test]
     async fn test_migration_from_pre_0_24_schema() {
         use rusqlite::Connection as RusqliteConnection;
 
@@ -5654,8 +5382,8 @@ mod tests {
         );
     }
 
-    // MCP TokenStore tests. Exercise the methods backing `meka mcp login/logout` and the auth-probe
-    // cache that skips unauthenticated connects after a 401. In-memory DB keeps each case hermetic.
+    // MCP TokenStore tests. Exercise the methods backing `meka mcp login/logout`. In-memory DB
+    // keeps each case hermetic.
 
     #[tokio::test]
     async fn mcp_credentials_round_trip() {
@@ -6001,6 +5729,7 @@ mod tests {
             next_fire_at,
         };
         manager
+            .schedule_store()
             .create_scheduled_job(&job)
             .await
             .expect("create scheduled job");
@@ -6019,11 +5748,13 @@ mod tests {
                 command: "gh pr checks 123".to_string(),
                 fire: crate::schedule::GateFire::OnChange,
                 last_output: None,
+                permission: crate::permission::Permission::Write,
             }),
         )
         .await;
 
         let jobs = manager
+            .schedule_store()
             .list_scheduled_jobs(session_id)
             .await
             .expect("list jobs");
@@ -6055,6 +5786,7 @@ mod tests {
             delivered_at: None,
         };
         manager
+            .background_store()
             .start_background_task(&task)
             .await
             .expect("start background task");
@@ -6068,6 +5800,7 @@ mod tests {
         let written = task_fixture(&manager, session_id, "cargo test --all").await;
 
         let running = manager
+            .background_store()
             .list_running_background_tasks(session_id)
             .await
             .expect("list running");
@@ -6076,6 +5809,7 @@ mod tests {
         assert_eq!(running[0].label, "cargo test --all");
 
         manager
+            .background_store()
             .finish_background_task(
                 &written.id,
                 crate::background::TaskStatus::Completed,
@@ -6086,6 +5820,7 @@ mod tests {
             .expect("finish");
 
         let undelivered = manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -6099,6 +5834,7 @@ mod tests {
         assert!(undelivered[0].finished_at.is_some());
         assert!(
             manager
+                .background_store()
                 .list_running_background_tasks(session_id)
                 .await
                 .expect("list running")
@@ -6114,6 +5850,7 @@ mod tests {
         let session_id = manager.create_session(None).await.expect("create session");
         let task = task_fixture(&manager, session_id, "sleep 60").await;
         manager
+            .background_store()
             .finish_background_task(
                 &task.id,
                 crate::background::TaskStatus::Completed,
@@ -6124,12 +5861,14 @@ mod tests {
             .expect("finish");
 
         manager
+            .background_store()
             .mark_background_tasks_delivered(std::slice::from_ref(&task.id))
             .await
             .expect("mark delivered");
 
         assert!(
             manager
+                .background_store()
                 .list_undelivered_background_tasks(session_id)
                 .await
                 .expect("list undelivered")
@@ -6146,12 +5885,14 @@ mod tests {
         task_fixture(&manager, session_id, "sleep 600").await;
 
         let swept = manager
+            .background_store()
             .sweep_interrupted_background_tasks(session_id)
             .await
             .expect("sweep");
         assert_eq!(swept, 1);
 
         let undelivered = manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -6165,6 +5906,7 @@ mod tests {
         // Idempotent: a second attach must not re-report what the first already retired.
         assert_eq!(
             manager
+                .background_store()
                 .sweep_interrupted_background_tasks(session_id)
                 .await
                 .expect("second sweep"),
@@ -6184,11 +5926,13 @@ mod tests {
 
         // A fresh process takes the session: it holds no handles, and the sweep is all it knows.
         manager
+            .background_store()
             .sweep_interrupted_background_tasks(session_id)
             .await
             .expect("sweep");
 
         let ready = manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -6205,6 +5949,7 @@ mod tests {
         let task = task_fixture(&manager, session_id, "sleep 600").await;
 
         manager
+            .background_store()
             .finish_background_task(
                 &task.id,
                 crate::background::TaskStatus::Cancelled,
@@ -6214,6 +5959,7 @@ mod tests {
             .await
             .expect("cancel");
         manager
+            .background_store()
             .finish_background_task(
                 &task.id,
                 crate::background::TaskStatus::Completed,
@@ -6224,6 +5970,7 @@ mod tests {
             .expect("late completion is accepted but ignored");
 
         let undelivered = manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -6241,6 +5988,7 @@ mod tests {
         let task = task_fixture(&manager, session_id, "sleep 60").await;
 
         let found = manager
+            .background_store()
             .resolve_background_task(session_id, &task.id[..8])
             .await
             .expect("resolve")
@@ -6249,6 +5997,7 @@ mod tests {
 
         assert!(
             manager
+                .background_store()
                 .resolve_background_task(session_id, "zzzzzzzz")
                 .await
                 .expect("resolve")
@@ -6269,6 +6018,7 @@ mod tests {
 
         assert!(
             manager
+                .background_store()
                 .list_background_tasks(session_id)
                 .await
                 .expect("list")
@@ -6296,6 +6046,7 @@ mod tests {
             .expect("delete session");
 
         let due = manager
+            .schedule_store()
             .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::days(365))
             .await
             .expect("list due");
@@ -6320,6 +6071,7 @@ mod tests {
 
         assert!(
             manager
+                .schedule_store()
                 .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::days(365 * 100))
                 .await
                 .expect("list due")
@@ -6328,6 +6080,7 @@ mod tests {
         );
         assert_eq!(
             manager
+                .schedule_store()
                 .list_all_scheduled_jobs()
                 .await
                 .expect("list all")
@@ -6349,12 +6102,14 @@ mod tests {
         .await;
 
         let none_yet = manager
+            .schedule_store()
             .list_due_scheduled_jobs(chrono::Utc::now())
             .await
             .expect("list due");
         assert!(none_yet.is_empty(), "not due for another hour");
 
         let later = manager
+            .schedule_store()
             .list_due_scheduled_jobs(chrono::Utc::now() + chrono::Duration::hours(2))
             .await
             .expect("list due");
@@ -6380,11 +6135,13 @@ mod tests {
         let fired_at = chrono::Utc::now();
         let next = job.schedule.next_after(fired_at).expect("has a next fire");
         manager
+            .schedule_store()
             .stamp_scheduled_job_fired(&job.id, fired_at, next)
             .await
             .expect("stamp fired");
 
         let reloaded = manager
+            .schedule_store()
             .list_scheduled_jobs(session_id)
             .await
             .expect("list jobs");
@@ -6415,6 +6172,7 @@ mod tests {
 
         assert!(
             manager
+                .schedule_store()
                 .cancel_scheduled_job(session_id, "nomatch")
                 .await
                 .expect("cancel runs")
@@ -6422,6 +6180,7 @@ mod tests {
         );
 
         let cancelled = manager
+            .schedule_store()
             .cancel_scheduled_job(session_id, job.short_id())
             .await
             .expect("cancel runs")
@@ -6429,6 +6188,7 @@ mod tests {
         assert_eq!(cancelled, job.id);
         assert!(
             manager
+                .schedule_store()
                 .list_scheduled_jobs(session_id)
                 .await
                 .expect("list jobs")
@@ -6450,6 +6210,7 @@ mod tests {
                 command: "true".to_string(),
                 fire: crate::schedule::GateFire::OnSuccess,
                 last_output: None,
+                permission: crate::permission::Permission::Write,
             }),
         )
         .await;
@@ -6458,6 +6219,7 @@ mod tests {
         // be the decoder rejecting it.
         assert_eq!(
             manager
+                .schedule_store()
                 .list_scheduled_jobs(session_id)
                 .await
                 .expect("list jobs")
@@ -6480,6 +6242,7 @@ mod tests {
 
         assert!(
             manager
+                .schedule_store()
                 .list_scheduled_jobs(session_id)
                 .await
                 .expect("list jobs")

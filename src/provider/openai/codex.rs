@@ -50,6 +50,9 @@ fn now_epoch_millis() -> i64 {
 pub struct OpenAiCodexProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
+    /// Serialises refreshes without blocking readers. Held across the database and network awaits
+    /// a refresh performs; `credential` is not.
+    refresh_gate: tokio::sync::Mutex<()>,
     base_url: String,
     model: String,
     client_id: String,
@@ -72,6 +75,11 @@ pub struct OpenAiCodexProvider {
     user_agent: String,
 }
 
+/// A token refresh is a small request to a well-known endpoint, and it runs while holding the gate
+/// that serialises every other caller's refresh. A whole-request deadline is right here in a way it
+/// never is for a turn: nothing legitimate takes minutes.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl OpenAiCodexProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -87,15 +95,9 @@ impl OpenAiCodexProvider {
     ) -> Result<Self> {
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
         // (e.g. `__cf_bm`) persist across requests.
-        let client = reqwest::Client::builder()
-            .cookie_store(true)
-            .build()
-            .map_err(|error| {
-                MekaError::Provider(format!(
-                    "failed to build openai-codex HTTP client: {}",
-                    error
-                ))
-            })?;
+        let client = crate::provider::build_http_client("openai-codex", |builder| {
+            builder.cookie_store(true)
+        })?;
 
         let resolved_effort = std::sync::Mutex::new(super::resolve_reasoning_effort(
             reasoning_effort.as_deref(),
@@ -104,6 +106,7 @@ impl OpenAiCodexProvider {
         Ok(Self {
             client,
             credential: tokio::sync::RwLock::new(credential),
+            refresh_gate: tokio::sync::Mutex::new(()),
             base_url: crate::provider::normalize_base_url(
                 base_url.as_deref().unwrap_or(DEFAULT_BASE_URL),
             ),
@@ -225,7 +228,7 @@ impl OpenAiCodexProvider {
                 access_token,
                 expires_at,
                 account_id,
-                ..
+                refresh_token,
             } = &*credential
             else {
                 return Err(MekaError::Provider(
@@ -233,13 +236,20 @@ impl OpenAiCodexProvider {
                 ));
             };
 
-            let needs_refresh = expires_at.is_some_and(|exp| now_epoch_millis() + 300_000 >= exp);
-            if !needs_refresh {
+            if !crate::provider::oauth_needs_refresh(
+                *expires_at,
+                refresh_token.is_some(),
+                now_epoch_millis(),
+            ) {
                 return Ok((access_token.clone(), account_id.clone()));
             }
         }
 
-        let mut credential = self.credential.write().await;
+        // Only refreshers queue here. `credential` is taken for the reads and writes themselves and
+        // never held across the database or network awaits below: using its write lock as the
+        // refresh gate meant a provider endpoint that went silent wedged every reader in the
+        // process, not just the task refreshing. See the Claude provider for the same contract.
+        let _refreshing = self.refresh_gate.lock().await;
 
         // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
         // refresh, and a sibling meka process may have rotated ours since startup. Without this
@@ -247,7 +257,7 @@ impl OpenAiCodexProvider {
         // `invalid_grant`.
         if let Some(store) = &self.token_store {
             match store.load_provider_credential(&self.credential_key).await {
-                Ok(Some(latest)) => *credential = latest,
+                Ok(Some(latest)) => *self.credential.write().await = latest,
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -260,22 +270,27 @@ impl OpenAiCodexProvider {
 
         // Double-check after the DB re-read: another caller (in this process or a sibling meka) may
         // already have rotated to a still-valid access token.
-        if let AuthCredential::OAuthToken {
-            access_token,
-            expires_at,
-            account_id,
-            ..
-        } = &*credential
-        {
-            let needs_refresh = expires_at.is_some_and(|exp| now_epoch_millis() + 300_000 >= exp);
-            if !needs_refresh {
+        let refresh_token = {
+            let credential = self.credential.read().await;
+            if let AuthCredential::OAuthToken {
+                access_token,
+                expires_at,
+                account_id,
+                refresh_token,
+            } = &*credential
+                && !crate::provider::oauth_needs_refresh(
+                    *expires_at,
+                    refresh_token.is_some(),
+                    now_epoch_millis(),
+                )
+            {
                 return Ok((access_token.clone(), account_id.clone()));
             }
-        }
 
-        let refresh_token = match &*credential {
-            AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
-            _ => None,
+            match &*credential {
+                AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
+                _ => None,
+            }
         };
         let Some(refresh_token) = refresh_token else {
             return Err(MekaError::Provider(
@@ -298,10 +313,15 @@ impl OpenAiCodexProvider {
                 .save_provider_credential(&self.credential_key, &new_credential)
                 .await
         {
-            tracing::warn!("failed to persist refreshed Codex OAuth token: {}", error);
+            tracing::warn!(
+                "failed to persist the refreshed Codex OAuth token ({}); this session continues, \
+                 but the stored token is now stale and the next launch will need `meka provider \
+                 login`",
+                error
+            );
         }
 
-        *credential = new_credential;
+        *self.credential.write().await = new_credential;
         Ok((token_value, account_id))
     }
 
@@ -311,6 +331,7 @@ impl OpenAiCodexProvider {
         let response = self
             .client
             .post(&self.oauth_token_url)
+            .timeout(REFRESH_TIMEOUT)
             .json(&serde_json::json!({
                 "client_id": self.client_id,
                 "grant_type": "refresh_token",
@@ -360,10 +381,15 @@ impl OpenAiCodexProvider {
         };
 
         // expires_at comes from the access_token JWT's `exp` claim.
-        let expires_at = match extract_expiration_seconds(&access_token) {
-            Ok(Some(seconds)) => Some(seconds * 1000),
-            _ => None,
-        };
+        let expires_at = Some(match extract_expiration_seconds(&access_token) {
+            // A nonsense `exp` reads as "far future" and lets the 401 correct it, rather than
+            // overflowing to a past instant and refreshing on every request.
+            Ok(Some(seconds)) => seconds.checked_mul(1000).unwrap_or(i64::MAX),
+            // A token carrying no readable `exp` gets an assumed lifetime rather than `None`, which
+            // reads as due and would send every later request back through this whole path,
+            // rotating the refresh token each time.
+            _ => crate::provider::oauth_assumed_expiry(now_epoch_millis()),
+        });
 
         Ok(AuthCredential::OAuthToken {
             access_token,

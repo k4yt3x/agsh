@@ -118,7 +118,13 @@ impl Tool for RenderImageTool {
             None => "Image rendered from base64 input".to_string(),
         };
 
-        Ok(build_image_tool_output(&marker, handling, &bytes))
+        // Off the runtime; same reason as `read_file` and `fetch_url`.
+        tokio::task::spawn_blocking(move || build_image_tool_output(&marker, handling, &bytes))
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "render_image".to_string(),
+                message: format!("image decode task failed: {}", error),
+            })
     }
 }
 

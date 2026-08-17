@@ -279,6 +279,10 @@ pub async fn delete_skill(
         .root()
         .ok_or_else(|| store_disabled("skills"))?
         .to_path_buf();
+    // Validated before the probe, the way `delete_memory` does. Probing first answered "does this
+    // directory exist" for any string a caller sent, including one the name rules would have
+    // refused, which is a filesystem oracle reachable with only `skills:w`.
+    crate::skills::validate_skill_name(&name).map_err(store_error)?;
     // Classified on the path rather than on the error text, the way `delete_memory` does. The
     // store layer races its own existence check against `remove_dir_all`, whose ENOENT renders as
     // "No such file or directory" and would fall through a substring match for "not found" into a

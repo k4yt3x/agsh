@@ -108,7 +108,7 @@ impl Tool for ListMcpResourcesTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server_filter = input
             .get("server")
@@ -136,7 +136,7 @@ impl Tool for ListMcpResourcesTool {
             let Some(entry) = self.manager.server_entry(&name) else {
                 continue;
             };
-            match crate::mcp::list_resources(&entry).await {
+            match crate::mcp::list_resources(&entry, &cancellation).await {
                 Ok(resources) => {
                     for resource in resources {
                         // rmcp 2.1 flattened `Resource` (the fields that used to sit under `.raw`
@@ -213,7 +213,7 @@ impl Tool for ReadMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "mcp_resource_read")?;
         let uri = require_str(&input, "uri", "mcp_resource_read")?;
@@ -221,7 +221,7 @@ impl Tool for ReadMcpResourceTool {
         let entry =
             visible_server_entry("mcp_resource_read", &self.manager, &self.denials, &server)?;
 
-        let result = crate::mcp::read_resource(&entry, uri.clone()).await?;
+        let result = crate::mcp::read_resource(&entry, uri.clone(), &cancellation).await?;
 
         let chunks = format_resource_contents(&result.contents, MAX_MCP_RESOURCE_BYTES);
 
@@ -339,7 +339,7 @@ impl Tool for ListMcpPromptsTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server_filter = input
             .get("server")
@@ -367,7 +367,7 @@ impl Tool for ListMcpPromptsTool {
             let Some(entry) = self.manager.server_entry(&name) else {
                 continue;
             };
-            match crate::mcp::list_prompts(&entry).await {
+            match crate::mcp::list_prompts(&entry, &cancellation).await {
                 Ok(prompts) => {
                     for prompt in prompts {
                         let description = prompt.description.unwrap_or_default();
@@ -460,7 +460,7 @@ impl Tool for GetMcpPromptTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "mcp_prompt_get")?;
         let name = require_str(&input, "name", "mcp_prompt_get")?;
@@ -469,11 +469,19 @@ impl Tool for GetMcpPromptTool {
 
         let entry = visible_server_entry("mcp_prompt_get", &self.manager, &self.denials, &server)?;
 
-        let result = crate::mcp::get_prompt(&entry, name.clone(), arguments).await?;
+        let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
 
+        // Sanitised before truncation, like every other server-supplied string in this file. This
+        // one was the omission: `prompts/get`'s description is server text that reaches the model
+        // and the terminal, and it went through `truncate` alone.
         let description = result
             .description
-            .map(|d| truncate(&d, MAX_MCP_DESCRIPTION_LENGTH))
+            .map(|description| {
+                truncate(
+                    &crate::mcp::sanitize::sanitize_text(&description),
+                    MAX_MCP_DESCRIPTION_LENGTH,
+                )
+            })
             .unwrap_or_default();
 
         let mut lines = Vec::new();
@@ -627,7 +635,7 @@ impl Tool for SubscribeMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "mcp_resource_subscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_subscribe")?;
@@ -637,7 +645,7 @@ impl Tool for SubscribeMcpResourceTool {
             &self.denials,
             &server,
         )?;
-        crate::mcp::subscribe_resource(&entry, uri.clone())
+        crate::mcp::subscribe_resource(&entry, uri.clone(), &cancellation)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_subscribe".to_string(),
@@ -680,7 +688,7 @@ impl Tool for UnsubscribeMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let server = require_str(&input, "server", "mcp_resource_unsubscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_unsubscribe")?;
@@ -690,7 +698,7 @@ impl Tool for UnsubscribeMcpResourceTool {
             &self.denials,
             &server,
         )?;
-        crate::mcp::unsubscribe_resource(&entry, uri.clone())
+        crate::mcp::unsubscribe_resource(&entry, uri.clone(), &cancellation)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_unsubscribe".to_string(),
@@ -727,6 +735,7 @@ impl Tool for ListMcpResourceUpdatesTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
+        // Reads an in-process ledger; there is no round-trip to bound or interrupt.
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         // The update log is process-wide, so a parent's subscription to a denied server would show
@@ -892,6 +901,7 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
+            trust_read_only_hint: None,
             disabled: false,
             required: None,
         };

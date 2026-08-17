@@ -27,7 +27,13 @@ Durations use the same syntax as `config.toml`, so `every = "30m"` means what
 months**, and decimals work (`1.5h` and `1h 30m` are the same duration).
 
 Cron expressions have **no seconds field**, and follow standard Vixie semantics: when both
-day-of-month and day-of-week are set, the job fires when **either** matches, not both.
+day-of-month and day-of-week are set, the job fires when **either** matches, not both. A six-field
+expression is rejected rather than read as Quartz, where `*/10 * * * * *` would mean every ten
+seconds instead of the every-ten-minutes it looks like.
+
+A pattern that matches no calendar date (`0 0 30 2 *`) is rejected when the job is created. One whose
+next occurrence is far off is not: `0 0 29 2 *` waits up to four years for the next February 29th and
+stays on the books until then.
 
 ## Gates: watching something without burning tokens
 
@@ -72,9 +78,16 @@ commit sha, avoids both.
 > until someone cancels it: a longer-lived grant than `execute_command`, which at least ends with
 > the turn that called it. Ungated reminders work at `read`.
 
-A gate that fails or times out is **not** treated as "nothing happened". It is logged as a warning,
-because a watcher whose command broke otherwise looks exactly like a healthy watcher with nothing to
-report.
+A gate that cannot run at all -- it times out, or the shell fails to start it -- is **not** treated
+as "nothing happened". It is logged as a warning, because a watcher whose command broke otherwise
+looks exactly like a healthy watcher with nothing to report.
+
+A non-zero **exit code** is different, and `on-change` deliberately does not treat it as a failure:
+for a large class of good gates it is the signal. `diff -q a b` and `git diff --exit-code` exit 1
+exactly when there *is* a difference; `grep ERROR log` exits 1 through the entire quiet period it is
+watching; `curl -f` exits non-zero until the endpoint returns. `on-change` compares stdout as usual
+and logs the exit code, so a genuinely broken command is visible in the log without a working one
+being silenced. `on-success` reads the exit code by definition.
 
 ## Where jobs run
 
@@ -178,8 +191,30 @@ approval resolves to **deny** and the job fails to do whatever needed approval. 
 the session transcript rather than anywhere louder, so a job in `ask` mode that seems to do nothing
 is worth checking there first.
 
-The REPL and ACP both have someone attached, so approvals reach them normally. Jobs created in
-`read` or `write` mode run at that level everywhere.
+The REPL and ACP both have someone attached, so approvals reach them normally.
+
+A job's **turn** runs at whatever permission the session holds when it fires, not at the level the
+job was created with: the level lives on the session and the session is mutable, through Shift+Tab in
+the REPL or `PATCH /v1/sessions/{id}` under `serve`.
+
+A job's **gate** is the exception, because it is a shell command that runs unattended and
+unsandboxed. It needs `write` from two places every time it comes due: the level recorded on the job
+when it was authored, and the level in force *now* -- the session's, or the host process's for a
+session that carries none. Drop the session to `read`, or restart `meka serve --permission read` so
+it inherits the job, and the gate stops running -- and with it the job, because a gate is the
+condition on the job and an unevaluated condition has not been met. The occurrence is declined the
+same way a gate that ran and said "nothing happened" declines it, and a warning is logged naming the
+job. Raise the session back to `write` to restore it.
+
+Firing the reminder ungated instead would be the more forgiving-looking choice and the wrong one: it
+turns a conditional job into an unconditional one, so an `every = "1m"` watcher that normally speaks
+once a week would deliver a turn a minute for as long as the session stayed below `write`. An
+*ungated* job is unaffected by any of this and keeps firing.
+
+Both halves are load-bearing. The recorded level alone can never refuse anything, since creating a
+gate already demands `write`; the live level is what makes a withdrawal real. The recorded level
+still matters for a job created before it was stored, which reads as "no authority" and stays
+refused.
 
 ## Inspecting jobs
 

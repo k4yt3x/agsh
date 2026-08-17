@@ -4576,11 +4576,16 @@ enabled = ["read", "ask", "write"]
 
 // === fs/read_text_file line + limit =================================
 
-/// `read_file` with `offset` + `limit` in the tool input translates to `fs/read_text_file` with
-/// `line: offset + 1` (1-based) and the same `limit`, when the client advertises `fs.readTextFile`.
-/// The existing happy-path test only sends `{ path }`, leaving the line/limit translation untested.
+/// `read_file` asks the editor for the whole document even when the model passed `offset`/`limit`,
+/// and windows what comes back locally.
+///
+/// Pushing the window down to `fs/read_text_file` looked tidier and cost two things. The freshness
+/// stamp recorded the slice rather than the document, so the next `edit_file` compared a slice
+/// against the whole buffer and refused with a false "changed in the editor". And a response of
+/// exactly `limit` lines was indistinguishable from a file that ended there, so a truncated read
+/// was handed to the model with no notice.
 #[test]
-fn acp_fs_read_text_file_passes_line_and_limit_when_delegated() {
+fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
     let on_disk_marker = "DO-NOT-READ-ME-FROM-DISK\n".repeat(100);
     let on_disk_marker_for_seed = on_disk_marker.clone();
     let mut harness = AcpTestHarness::builder()
@@ -4612,12 +4617,14 @@ fn acp_fs_read_text_file_passes_line_and_limit_when_delegated() {
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "read partial");
 
-    let mut observed_line: Option<u64> = None;
-    let mut observed_limit: Option<u64> = None;
+    let mut saw_request = false;
+    let mut observed_line = serde_json::Value::Null;
+    let mut observed_limit = serde_json::Value::Null;
     let _ = harness.await_response_with_dispatch(id, |value| match value["method"].as_str() {
         Some("fs/read_text_file") => {
-            observed_line = value["params"]["line"].as_u64();
-            observed_limit = value["params"]["limit"].as_u64();
+            saw_request = true;
+            observed_line = value["params"]["line"].clone();
+            observed_limit = value["params"]["limit"].clone();
             Some(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": value["id"].clone(),
@@ -4627,12 +4634,15 @@ fn acp_fs_read_text_file_passes_line_and_limit_when_delegated() {
         _ => None,
     });
 
-    assert_eq!(
-        observed_line,
-        Some(10),
-        "offset 9 must translate to 1-based line 10 on fs/read_text_file",
+    assert!(saw_request, "the read must still be delegated");
+    assert!(
+        observed_line.is_null(),
+        "the window is applied locally, so no line is sent: {observed_line}",
     );
-    assert_eq!(observed_limit, Some(50), "limit must pass through verbatim");
+    assert!(
+        observed_limit.is_null(),
+        "the window is applied locally, so no limit is sent: {observed_limit}",
+    );
     // On-disk file is untouched, proving the delegate path won.
     assert_eq!(
         std::fs::read_to_string(&target).expect("read on-disk"),
@@ -5517,5 +5527,66 @@ fn acp_scheduled_job_fires_without_a_prompt() {
         agent_text.contains("ACP_SCHEDULED_REPLY"),
         "the agent's reply to the scheduled turn must reach the client; updates were:\n{:#?}",
         updates,
+    );
+}
+
+/// A mode set through `session/set_mode` survives a reload.
+///
+/// Two halves of one invariant. `set_mode` only moved the in-memory cell, so the session row kept
+/// whatever it was created with; the scheduler's live gate re-check reads that row, which meant a
+/// gate authored after cycling to `write` was refused forever and one authored before cycling down
+/// to `read` kept firing. Persisting alone is not enough either: `build_session_runtime` seeds the
+/// permission from process config, so a reloaded session would run at the default while its row
+/// claimed the level the gate check would then trust -- the same fail-open from the other side.
+///
+/// Asserted through `currentModeId`, which is the client-visible form of the live cell, so this
+/// fails if either the write or the restore is dropped.
+#[test]
+fn a_mode_set_through_acp_survives_a_reload() {
+    const CONFIG: &str = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "read"
+enabled = ["read", "ask", "write"]
+"#;
+    let mut harness = AcpTestHarness::spawn(CONFIG, None);
+    let cwd = harness.config_dir().to_path_buf();
+
+    let new_response = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_eq!(
+        new_response["result"]["modes"]["currentModeId"], "read",
+        "a fresh session starts at the configured default"
+    );
+    let sid = new_response["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    let set = harness.set_mode(&sid, "write");
+    assert!(set["result"].is_object(), "set_mode must succeed: {}", set);
+
+    // Drop it from the live map so the reload rebuilds from the row rather than reusing the entry.
+    let closed = harness.request("session/close", serde_json::json!({ "sessionId": sid }));
+    assert!(
+        closed["result"].is_object(),
+        "session/close must succeed: {}",
+        closed
+    );
+
+    let loaded = harness.request(
+        "session/load",
+        serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_eq!(
+        loaded["result"]["modes"]["currentModeId"], "write",
+        "the reloaded session fell back to the process default instead of the mode it was set to: \
+         {}",
+        loaded
     );
 }

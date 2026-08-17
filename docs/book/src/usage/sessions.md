@@ -69,7 +69,10 @@ Sessions are stored in a SQLite database at a platform-specific location:
 
 ## Database Schema
 
-The database has three tables:
+The three tables below are the conversation itself. The database holds five more, which the
+features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)), `background_tasks`
+([background work](./background.md)), `provider_credentials` and `mcp_oauth_credentials` (secrets,
+never in `config.toml`), and `model_metadata_cache`.
 
 **sessions**, one row per session:
 
@@ -136,7 +139,7 @@ Long sessions can exceed the LLM's context window or become expensive. The `cont
 context_messages = 100
 ```
 
-The full history remains in SQLite for resumption. Only the API payload is truncated. The truncation preserves tool call chains (it never splits a tool use from its result).
+The full history remains in SQLite for resumption. Only the API payload is truncated. The cap applies to every request in a turn, not just the first, so a long tool loop cannot grow the payload past it mid-turn, and the truncation preserves tool call chains (it never splits a tool use from its result). Removing the key restores the default of `200` rather than lifting the cap.
 
 The tool catalogue and skill list travel in the conversation rather than the system prompt, so they are subject to this window too. meka tracks where it last stated them and restates them in full once that message scrolls out, which works out to roughly once per window. Setting `context_messages` very low therefore makes those restatements more frequent.
 
@@ -251,6 +254,13 @@ By default the 20 most recent sessions are shown. Use `-n` to change:
 
 ```bash
 meka session list -n 50
+```
+
+Sub-agent transcripts are hidden by default, so the listing stays the conversations you started. Add
+`--include-children` to see them too:
+
+```bash
+meka session list --include-children
 ```
 
 ## Exporting a Session

@@ -170,6 +170,16 @@ pub struct DisabledMode(pub Permission);
 pub struct SharedPermission {
     inner: Arc<AtomicU8>,
     enabled: EnabledPermissions,
+    /// A parent's live level, for a sub-agent's handle. [`Self::get`] returns the minimum of this
+    /// and `inner`, so a parent downgrade takes effect on the worker's very next tool call.
+    ///
+    /// Without it the clamp happened only at spawn: `shared_permission` built a fresh `AtomicU8`
+    /// from a snapshot of the parent's level, and nothing propagated afterwards. A user who
+    /// pressed Shift+Tab to `none` to stop a runaway worker saw the prompt indicator change
+    /// and the parent's next call denied, while the worker kept writing files and running
+    /// unsandboxed commands to completion -- and `permissions.md` presents cycling the parent
+    /// as the way to restrict sub-agents.
+    ceiling: Option<Arc<AtomicU8>>,
 }
 
 impl SharedPermission {
@@ -177,6 +187,34 @@ impl SharedPermission {
         Self {
             inner: Arc::new(AtomicU8::new(initial as u8)),
             enabled,
+            ceiling: None,
+        }
+    }
+
+    /// A handle bounded from above by `parent`'s live level, for a sub-agent.
+    ///
+    /// The child keeps its own level (it may sit below the parent, and `agent_spawn` clamps it at
+    /// creation), but can never read higher than the parent does right now. A raise is inherited
+    /// too, which is the same rule read in the other direction: the child's authority is always
+    /// `min(its own grant, what the human currently permits)`.
+    pub fn with_ceiling(
+        initial: Permission,
+        enabled: EnabledPermissions,
+        parent: &SharedPermission,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AtomicU8::new(initial as u8)),
+            enabled,
+            // Share the parent's *own* cell rather than its effective value, and flatten a chain:
+            // a grandchild whose parent is itself bounded takes the root's cell, and its own
+            // spawn-time clamp already folded the intermediate level in. That keeps `get` a fixed
+            // two loads however deep the tree goes.
+            ceiling: Some(
+                parent
+                    .ceiling
+                    .clone()
+                    .unwrap_or_else(|| parent.inner.clone()),
+            ),
         }
     }
 
@@ -185,7 +223,15 @@ impl SharedPermission {
     }
 
     pub fn get(&self) -> Permission {
-        match self.inner.load(Ordering::Relaxed) {
+        let own = Self::decode(self.inner.load(Ordering::Relaxed));
+        match &self.ceiling {
+            Some(parent) => own.min(Self::decode(parent.load(Ordering::Relaxed))),
+            None => own,
+        }
+    }
+
+    fn decode(raw: u8) -> Permission {
+        match raw {
             0 => Permission::None,
             1 => Permission::Read,
             2 => Permission::Ask,

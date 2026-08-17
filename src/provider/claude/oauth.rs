@@ -43,6 +43,9 @@ fn now_epoch_millis() -> i64 {
 pub struct ClaudeOAuthProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
+    /// Serialises refreshes without blocking readers. Held across the database and network awaits
+    /// a refresh performs; `credential` is not.
+    refresh_gate: tokio::sync::Mutex<()>,
     base_url: String,
     model: String,
     client_id: String,
@@ -75,6 +78,11 @@ pub struct ClaudeOAuthProvider {
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
+/// A token refresh is a small request to a well-known endpoint, and it runs while holding the
+/// credential write lock that serialises every other caller's refresh. A whole-request deadline is
+/// right here in a way it never is for a turn: nothing legitimate takes minutes.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl ClaudeOAuthProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -92,15 +100,16 @@ impl ClaudeOAuthProvider {
         redact_thinking: bool,
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let account_uuid = match &credential {
             AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
             _ => String::new(),
         };
         let resolved_effort = resolve_effort(effort.as_deref(), &model);
-        Self {
-            client: reqwest::Client::new(),
+        Ok(Self {
+            client: crate::provider::build_http_client("claude-oauth", |builder| builder)?,
             credential: tokio::sync::RwLock::new(credential),
+            refresh_gate: tokio::sync::Mutex::new(()),
             base_url: super::shared::normalize_claude_base_url(
                 base_url.as_deref().unwrap_or("https://api.anthropic.com"),
             ),
@@ -120,7 +129,7 @@ impl ClaudeOAuthProvider {
             redact_thinking,
             max_output_tokens,
             session_stats,
-        }
+        })
     }
 
     fn is_thinking_enabled(&self) -> bool {
@@ -196,11 +205,17 @@ impl ClaudeOAuthProvider {
     /// expiry.
     ///
     /// Concurrency contract (relevant under multi-session ACP where two sessions may call this in
-    /// parallel): the `RwLock` on `credential` doubles as the refresh gate. Two tasks that both
-    /// observe an expiring token race for the write lock; the loser re-reads after acquiring it and
-    /// finds the winner's fresh token via the double-check at the top of the slow path
-    /// (`needs_refresh` block below). Exactly one refresh API call fires under contention; both
-    /// callers return a valid token. No separate `Mutex<()>` refresh gate is needed.
+    /// parallel): `refresh_gate` serialises refreshers, and `credential` is held only across the
+    /// reads and writes themselves, never across an await on the network or the database. Two tasks
+    /// that both observe an expiring token queue on the gate; the loser re-checks after acquiring
+    /// it and finds the winner's fresh token. Exactly one refresh API call fires under
+    /// contention and both callers return a valid token.
+    ///
+    /// The gate is what makes that true. Using the `credential` write lock as the gate instead --
+    /// which is what this did -- meant every *reader* queued behind the refresh too, so a provider
+    /// endpoint that accepted the connection and then went silent wedged every session in the
+    /// process, not just the one refreshing. A stalled refresh now blocks only another refresh, and
+    /// the bounded HTTP timeout ends even that.
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
         {
             let credential = self.credential.read().await;
@@ -213,31 +228,33 @@ impl ClaudeOAuthProvider {
                 AuthCredential::OAuthToken {
                     access_token,
                     expires_at,
+                    refresh_token,
                     ..
                 } => {
-                    let needs_refresh = if let Some(exp) = expires_at {
-                        now_epoch_millis() + 300_000 >= *exp
-                    } else {
-                        false
-                    };
-
-                    if !needs_refresh {
+                    if !crate::provider::oauth_needs_refresh(
+                        *expires_at,
+                        refresh_token.is_some(),
+                        now_epoch_millis(),
+                    ) {
                         return Ok(("Authorization", format!("Bearer {}", access_token)));
                     }
                 }
             }
         }
 
-        // Token expired: attempt refresh
-        let mut credential = self.credential.write().await;
+        // Token expired: attempt refresh. Only refreshers queue here; readers are untouched.
+        let _refreshing = self.refresh_gate.lock().await;
 
         // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
         // refresh, and a sibling meka process (or `meka mcp login` flow) may have rotated ours
         // since startup. Without this re-read we'd POST a stale refresh_token and the OAuth
         // provider would reject it with `invalid_grant`.
+        //
+        // The store call is awaited with no credential lock held, and the result installed under a
+        // write lock that spans an assignment and nothing else.
         if let Some(store) = &self.token_store {
             match store.load_provider_credential(&self.credential_key).await {
-                Ok(Some(latest)) => *credential = latest,
+                Ok(Some(latest)) => *self.credential.write().await = latest,
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -248,32 +265,33 @@ impl ClaudeOAuthProvider {
             }
         }
 
-        // Double-check after the DB re-read: another process may have already rotated and persisted
-        // a new access token that's still valid.
-        if let AuthCredential::OAuthToken {
-            access_token,
-            expires_at,
-            ..
-        } = &*credential
-        {
-            let needs_refresh = if let Some(exp) = expires_at {
-                now_epoch_millis() + 300_000 >= *exp
-            } else {
-                false
-            };
-
-            if !needs_refresh {
+        // Double-check after the DB re-read: another task or process may have already rotated and
+        // persisted a new access token that is still valid.
+        let (refresh_token, prior_account_id) = {
+            let credential = self.credential.read().await;
+            if let AuthCredential::OAuthToken {
+                access_token,
+                expires_at,
+                refresh_token,
+                ..
+            } = &*credential
+                && !crate::provider::oauth_needs_refresh(
+                    *expires_at,
+                    refresh_token.is_some(),
+                    now_epoch_millis(),
+                )
+            {
                 return Ok(("Authorization", format!("Bearer {}", access_token)));
             }
-        }
 
-        let (refresh_token, prior_account_id) = match &*credential {
-            AuthCredential::OAuthToken {
-                refresh_token,
-                account_id,
-                ..
-            } => (refresh_token.clone(), account_id.clone()),
-            _ => (None, None),
+            match &*credential {
+                AuthCredential::OAuthToken {
+                    refresh_token,
+                    account_id,
+                    ..
+                } => (refresh_token.clone(), account_id.clone()),
+                _ => (None, None),
+            }
         };
 
         let Some(refresh_token) = refresh_token else {
@@ -287,15 +305,23 @@ impl ClaudeOAuthProvider {
             .await?;
         let (header_name, header_value) = new_credential.auth_header();
 
+        // A refresh rotates the refresh token, so the one in the database is now dead. If the write
+        // fails, this process carries on with the new pair in memory but the next launch will load
+        // the dead one and get `invalid_grant` with nothing naming why, so name it here.
         if let Some(store) = &self.token_store
             && let Err(error) = store
                 .save_provider_credential(&self.credential_key, &new_credential)
                 .await
         {
-            tracing::warn!("failed to persist refreshed Claude OAuth token: {}", error);
+            tracing::warn!(
+                "failed to persist the refreshed Claude OAuth token ({}); this session continues, \
+                 but the stored token is now stale and the next launch will need \
+                 `meka provider login`",
+                error
+            );
         }
 
-        *credential = new_credential;
+        *self.credential.write().await = new_credential;
         Ok((header_name, header_value))
     }
 
@@ -309,6 +335,7 @@ impl ClaudeOAuthProvider {
         let response = self
             .client
             .post(&self.oauth_token_url)
+            .timeout(REFRESH_TIMEOUT)
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -352,9 +379,25 @@ impl ClaudeOAuthProvider {
             MekaError::Provider(format!("failed to parse refresh response: {}", error))
         })?;
 
-        let expires_at = data
-            .expires_in
-            .map(|seconds| now_epoch_millis() + (seconds as i64) * 1000);
+        // Saturating rather than wrapping: a nonsense `expires_in` should read as "far future" and
+        // let the 401 correct it, not overflow to a past instant and refresh on every request.
+        //
+        // An *absent* `expires_in` gets an assumed lifetime rather than staying `None`, for the
+        // same reason: `None` reads as due, so a token whose issuer never states an expiry sent
+        // every later request back through this whole path, rotating the refresh token each time.
+        let expires_at = Some(data.expires_in.map_or_else(
+            || crate::provider::oauth_assumed_expiry(now_epoch_millis()),
+            |seconds| {
+                // `try_from` rather than `as`: the cast wraps, and it happens *before* the
+                // `checked_mul` that was supposed to make this saturating, so an `expires_in` past
+                // `i64::MAX` produced a negative and landed the expiry in the past -- the exact
+                // refresh-every-request loop the comment above says this avoids.
+                i64::try_from(seconds)
+                    .ok()
+                    .and_then(|seconds| seconds.checked_mul(1000))
+                    .map_or(i64::MAX, |millis| now_epoch_millis().saturating_add(millis))
+            },
+        ));
 
         Ok(AuthCredential::OAuthToken {
             access_token: data.access_token,
@@ -947,6 +990,7 @@ mod tests {
             None,
             None,
         )
+        .expect("build test provider")
     }
 
     #[test]
@@ -1446,7 +1490,8 @@ mod tests {
             false,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         // This provider reaches `/v1/messages` *and* `/api/oauth/usage` off the same root, so the
         // base has to stay the root: a stored `.../v1` would put the OAuth endpoints out of reach.
         assert_eq!(provider.base_url, "https://gateway.example.com/anthropic");
@@ -1474,7 +1519,8 @@ mod tests {
             false,
             None,
             None,
-        );
+        )
+        .expect("build test provider");
         let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
         let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
@@ -1637,6 +1683,7 @@ mod tests {
             None,
             None,
         )
+        .expect("build test provider")
     }
 
     fn provider_full(
@@ -1661,6 +1708,7 @@ mod tests {
             None,
             None,
         )
+        .expect("build test provider")
     }
 
     #[test]
@@ -2243,8 +2291,8 @@ mod tests {
             false,
             crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -2375,8 +2423,8 @@ mod tests {
             false,
             crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -2518,8 +2566,8 @@ mod tests {
             false,
             crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -2635,8 +2683,8 @@ mod tests {
             false,
             crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -2747,8 +2795,8 @@ mod tests {
             false,
             crate::memory::MemoryCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
-            crate::agent::test_cwd(),
-            crate::agent::test_roots(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
             std::sync::Arc::new(crate::frontend::SilentFrontend),
             crate::config::ResolvedScheduleConfig::default(),
             (
@@ -3264,9 +3312,12 @@ mod tests {
 
     /// A minimal in-process OAuth refresh endpoint that counts hits. Returns a valid refresh
     /// response on every call so the provider path completes; the test then asserts the hit count.
+    /// `state_expiry` distinguishes a well-behaved issuer from one that answers without an
+    /// `expires_in`, which is the input that used to make the token due again on arrival.
     async fn run_mock_refresh_endpoint(
         listener: tokio::net::TcpListener,
         hits: Arc<std::sync::atomic::AtomicUsize>,
+        states_expiry: bool,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3310,12 +3361,14 @@ mod tests {
                 }
                 hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "access_token": "fresh-token-xyz",
                     "refresh_token": "fresh-refresh",
-                    "expires_in": 3600,
-                })
-                .to_string();
+                });
+                if states_expiry && let Some(object) = body.as_object_mut() {
+                    object.insert("expires_in".to_string(), serde_json::json!(3600));
+                }
+                let body = body.to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3356,7 +3409,7 @@ mod tests {
             .expect("bind mock OAuth endpoint");
         let local = listener.local_addr().expect("local addr");
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tokio::spawn(run_mock_refresh_endpoint(listener, Arc::clone(&hits)));
+        tokio::spawn(run_mock_refresh_endpoint(listener, Arc::clone(&hits), true));
 
         // Credential whose access token already counts as "expiring soon" (the threshold is 5
         // minutes / 300_000 ms). Setting expires_at to "now" forces every caller into the slow path
@@ -3368,22 +3421,25 @@ mod tests {
             account_id: None,
         };
 
-        let provider = Arc::new(ClaudeOAuthProvider::new(
-            credential,
-            "claude-sonnet-4-20250514".to_string(),
-            None,
-            None,
-            Some(format!("http://{}/", local)),
-            None,
-            "test".to_string(),
-            false,
-            10000,
-            "a".repeat(64),
-            Some("high".to_string()),
-            false,
-            None,
-            None,
-        ));
+        let provider = Arc::new(
+            ClaudeOAuthProvider::new(
+                credential,
+                "claude-sonnet-4-20250514".to_string(),
+                None,
+                None,
+                Some(format!("http://{}/", local)),
+                None,
+                "test".to_string(),
+                false,
+                10000,
+                "a".repeat(64),
+                Some("high".to_string()),
+                false,
+                None,
+                None,
+            )
+            .expect("build test provider"),
+        );
 
         // Fire many concurrent callers. The exact count isn't load- bearing; we just want enough to
         // make a fan-out plausible if the gate broke.
@@ -3413,6 +3469,67 @@ mod tests {
             observed_hits, 1,
             "exactly one refresh API call must fire under concurrent demand; got {}",
             observed_hits,
+        );
+    }
+
+    /// An issuer that answers a refresh without an `expires_in` must not put every later request
+    /// back through the refresh.
+    ///
+    /// `expires_at: None` reads as due, which is right for a *stored* token of unknown age and
+    /// wrong for one that has just been minted. Handing the `None` straight back meant the
+    /// credential was due again the instant it arrived, so every request took the write lock,
+    /// re-read the database and ran a full OAuth round trip -- serialised, and rotating the
+    /// refresh token each pass, which is the state most likely to end in an `invalid_grant`
+    /// nobody can explain.
+    #[tokio::test]
+    async fn a_refresh_without_an_expiry_does_not_refresh_again_on_the_next_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock OAuth endpoint");
+        let local = listener.local_addr().expect("local addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(run_mock_refresh_endpoint(
+            listener,
+            Arc::clone(&hits),
+            false,
+        ));
+
+        let credential = AuthCredential::OAuthToken {
+            access_token: "stale".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: Some(now_epoch_millis()),
+            account_id: None,
+        };
+        let provider = ClaudeOAuthProvider::new(
+            credential,
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            Some(format!("http://{}/", local)),
+            None,
+            "test".to_string(),
+            false,
+            10000,
+            "a".repeat(64),
+            Some("high".to_string()),
+            false,
+            None,
+            None,
+        )
+        .expect("build test provider");
+
+        for _ in 0..3 {
+            let (_, header) = provider
+                .ensure_valid_credential()
+                .await
+                .expect("ensure_valid");
+            assert_eq!(header, "Bearer fresh-token-xyz");
+        }
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the token the refresh returned must be usable without refreshing it again",
         );
     }
 }

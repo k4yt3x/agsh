@@ -106,6 +106,7 @@ pub async fn list_all(
     let jobs = state
         .shared
         .session_manager
+        .schedule_store()
         .list_all_scheduled_jobs()
         .await
         .map_err(|error| {
@@ -140,6 +141,7 @@ pub async fn list_for_session(
     let jobs = state
         .shared
         .session_manager
+        .schedule_store()
         .list_scheduled_jobs(id)
         .await
         .map_err(|error| {
@@ -322,6 +324,11 @@ pub async fn create(
                 command: requested.command.clone(),
                 fire,
                 last_output: None,
+                // See `schedule_create`: the level is recorded so `prepare` can re-check it at fire
+                // time. `permission` is `Write` by the guard above, and the session's level is
+                // mutable through `PATCH /v1/sessions/{id}`, so the check above cannot stand in for
+                // one made when the command actually runs.
+                permission,
             })
         }
     };
@@ -329,6 +336,7 @@ pub async fn create(
     let existing = state
         .shared
         .session_manager
+        .schedule_store()
         .list_scheduled_jobs(id)
         .await
         .map_err(|error| {
@@ -371,6 +379,7 @@ pub async fn create(
     state
         .shared
         .session_manager
+        .schedule_store()
         .create_scheduled_job(&job)
         .await
         .map_err(|error| {
@@ -506,6 +515,7 @@ pub async fn cancel(
     let jobs = state
         .shared
         .session_manager
+        .schedule_store()
         .list_all_scheduled_jobs()
         .await
         .map_err(|error| {
@@ -543,6 +553,7 @@ pub async fn cancel(
     state
         .shared
         .session_manager
+        .schedule_store()
         .delete_scheduled_job(&resolved)
         .await
         .map_err(|error| {
@@ -625,6 +636,7 @@ pub async fn list_tasks(
     let tasks = state
         .shared
         .session_manager
+        .background_store()
         .list_background_tasks(id)
         .await
         .map_err(|error| {
@@ -664,6 +676,7 @@ pub async fn cancel_task(
     let Some(task) = state
         .shared
         .session_manager
+        .background_store()
         .resolve_background_task(id, &task_id)
         .await
         .map_err(|error| match &error {
@@ -699,6 +712,7 @@ pub async fn cancel_task(
     state
         .shared
         .session_manager
+        .background_store()
         .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
         .await
         .map_err(|error| {

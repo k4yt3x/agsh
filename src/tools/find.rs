@@ -28,10 +28,10 @@ struct FindOutcome {
 }
 
 pub(super) struct FindFilesTool {
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
     /// multi-root ACP session.
-    pub roots: crate::agent::SharedRoots,
+    pub roots: crate::workspace::SharedRoots,
 }
 
 #[async_trait]
@@ -101,8 +101,8 @@ impl Tool for FindFilesTool {
         // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
         // silently misses whole folders the user can see in their editor.
         let base_paths = match input["path"].as_str() {
-            Some(raw) => vec![crate::agent::resolve_against_cwd(&self.cwd, raw)],
-            None => crate::agent::glob_roots(&self.cwd, &self.roots),
+            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
+            None => crate::workspace::glob_roots(&self.cwd, &self.roots),
         };
         let full_patterns: Vec<String> = base_paths
             .iter()
@@ -293,8 +293,8 @@ mod tests {
         std::fs::write(temp_dir.path().join("c.rs"), "").expect("failed");
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -313,10 +313,10 @@ mod tests {
         assert!(!text_content(&result).contains("c.rs"));
     }
 
-    /// End-to-end guard for the root set `execute` picks. [`crate::agent::search_roots`] and
-    /// [`crate::agent::glob_roots`] have identical signatures, so swapping one for the other still
-    /// compiles and the `run_walk` tests (which take patterns, not roots) stay green. Only a
-    /// tool-level search of a workspace whose roots nest catches it.
+    /// End-to-end guard for the root set `execute` picks. [`crate::workspace::search_roots`] and
+    /// [`crate::workspace::glob_roots`] have identical signatures, so swapping one for the other
+    /// still compiles and the `run_walk` tests (which take patterns, not roots) stay green.
+    /// Only a tool-level search of a workspace whose roots nest catches it.
     #[tokio::test]
     async fn test_find_files_sweeps_cwd_when_an_additional_root_contains_it() {
         let top = tempfile::tempdir().expect("tempdir");
@@ -354,8 +354,8 @@ mod tests {
         }
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -384,8 +384,8 @@ mod tests {
         }
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -414,8 +414,8 @@ mod tests {
         }
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -453,8 +453,8 @@ mod tests {
         }
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let result = tool
             .execute(
@@ -483,8 +483,8 @@ mod tests {
         }
 
         let tool = FindFilesTool {
-            cwd: crate::agent::test_cwd(),
-            roots: crate::agent::test_roots(),
+            cwd: crate::workspace::test_cwd(),
+            roots: crate::workspace::test_roots(),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();

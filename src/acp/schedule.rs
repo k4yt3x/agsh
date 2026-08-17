@@ -87,6 +87,7 @@ pub(super) fn spawn_background_poller(
                 let ready = match state
                     .shared
                     .session_manager
+                    .background_store()
                     .list_undelivered_background_tasks(session_uuid)
                     .await
                 {
@@ -105,6 +106,7 @@ pub(super) fn spawn_background_poller(
                 if let Err(error) = state
                     .shared
                     .session_manager
+                    .background_store()
                     .mark_background_tasks_delivered(&ids)
                     .await
                 {
@@ -114,7 +116,21 @@ pub(super) fn spawn_background_poller(
                     );
                     continue;
                 }
-                deliver_outcomes(&entry, crate::background::render_outcomes(&ready)).await;
+                // Supervised for the reason the `meka serve` twin documents at
+                // src/server/schedule.rs:175: this runs a whole agent turn, so anything in the
+                // tool loop can panic, and nothing joins this handle -- losing it would strand
+                // the batch that was just stamped `delivered` and every outcome after it, with no
+                // error anywhere. This is the sibling that did not get the guard.
+                let sweep = std::panic::AssertUnwindSafe(deliver_outcomes(
+                    &entry,
+                    crate::background::render_outcomes(&ready),
+                ));
+                if let Err(panic) = futures::FutureExt::catch_unwind(sweep).await {
+                    tracing::error!(
+                        "background outcome delivery panicked ({}); continuing",
+                        crate::error::panic_message(&*panic)
+                    );
+                }
             }
         }
     })
@@ -124,6 +140,11 @@ pub(super) fn spawn_background_poller(
 /// first, then show the prompt, so the transcript reads trigger-then-reply and the report never
 /// lands in the middle of a turn the user typed.
 async fn deliver_outcomes(entry: &super::SessionEntry, prompt: String) {
+    // A turn is activity whoever started it. Without this the idle sweep sees a session whose only
+    // traffic is out-of-band as untouched since the user last typed, and evicts it after 24h --
+    // taking its schedule out of scope permanently, since `run_due` skips jobs whose session is not
+    // in the live map. `meka serve` stamps on this same path (src/server/schedule.rs:525).
+    entry.touch();
     let mut runtime = entry.runtime.lock().await;
     entry.frontend.push_out_of_band_prompt(&prompt);
 
@@ -178,6 +199,10 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
             job_id
         );
     }
+
+    // A fire is activity on this session; see `deliver_outcomes`. A schedule whose session is only
+    // ever driven by the scheduler would otherwise be evicted as idle and never fire again.
+    entry.touch();
 
     // Taken before the prompt is shown, not after. The editor may be part-way through a
     // `session/prompt` the user typed, in which case this waits; announcing first would drop the

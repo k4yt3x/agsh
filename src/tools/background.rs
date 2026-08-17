@@ -81,6 +81,7 @@ impl Tool for TaskListTool {
         let tasks = self
             .context
             .session_manager
+            .background_store()
             .list_background_tasks(session_id)
             .await?;
         if tasks.is_empty() {
@@ -185,9 +186,9 @@ impl Tool for TaskCancelTool {
             // reason: the work reacting to its token reports an interruption, which would otherwise
             // land as `failed` and tell the agent its build broke rather than that it was stopped.
             let ids = self.context.tasks.session_task_ids(session_id).await;
+            let store = self.context.session_manager.background_store();
             for id in &ids {
-                self.context
-                    .session_manager
+                store
                     .finish_background_task(id, TaskStatus::Cancelled, None, None)
                     .await?;
             }
@@ -209,6 +210,7 @@ impl Tool for TaskCancelTool {
         let Some(task) = self
             .context
             .session_manager
+            .background_store()
             .resolve_background_task(session_id, &id_prefix)
             .await?
         else {
@@ -239,6 +241,7 @@ impl Tool for TaskCancelTool {
         // was told it was stopped.
         self.context
             .session_manager
+            .background_store()
             .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
             .await?;
         let signalled = self.context.tasks.cancel(&task.id).await;
@@ -323,6 +326,7 @@ mod tests {
         };
         context
             .session_manager
+            .background_store()
             .start_background_task(&task)
             .await
             .expect("start task");
@@ -366,6 +370,7 @@ mod tests {
         let task = seed(&context, session_id, "make").await;
         context
             .session_manager
+            .background_store()
             .finish_background_task(&task.id, TaskStatus::Failed, Some("boom".to_string()), None)
             .await
             .expect("finish");
@@ -408,6 +413,7 @@ mod tests {
         assert!(!result.is_error, "{:?}", result.content);
 
         let undelivered = session_manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list");
@@ -443,6 +449,7 @@ mod tests {
         let task = seed(&context, session_id, "cargo test").await;
         context
             .session_manager
+            .background_store()
             .finish_background_task(
                 &task.id,
                 TaskStatus::Completed,
@@ -494,6 +501,7 @@ mod tests {
         assert!(!result.is_error);
 
         let undelivered = session_manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list");

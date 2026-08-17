@@ -172,6 +172,7 @@ impl Tool for ScheduleCreateTool {
 
         let existing = self
             .session_manager
+            .schedule_store()
             .list_scheduled_jobs(session_id)
             .await?
             .len();
@@ -206,7 +207,10 @@ impl Tool for ScheduleCreateTool {
             last_fired_at: None,
             next_fire_at,
         };
-        self.session_manager.create_scheduled_job(&job).await?;
+        self.session_manager
+            .schedule_store()
+            .create_scheduled_job(&job)
+            .await?;
 
         tracing::info!(
             "scheduled job {} ({}), next fire {}",
@@ -279,6 +283,10 @@ impl ScheduleCreateTool {
             command: command.to_string(),
             fire,
             last_output: None,
+            // Recorded, not re-derived. The check above proves the level *now*; the row will be
+            // executed by some other process on some later day, and `prepare` re-reads this to
+            // confirm the authority still stands. `permission` is `Write` here by the guard above.
+            permission,
         }))
     }
 }
@@ -372,6 +380,7 @@ impl Tool for ScheduleListTool {
         let jobs = self
             .context
             .session_manager
+            .schedule_store()
             .list_scheduled_jobs(session_id)
             .await?;
         if jobs.is_empty() {
@@ -453,6 +462,7 @@ impl Tool for ScheduleCancelTool {
         match self
             .context
             .session_manager
+            .schedule_store()
             .cancel_scheduled_job(session_id, &id)
             .await?
         {

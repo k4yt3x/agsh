@@ -29,9 +29,9 @@ use crate::{
 
 /// Serialized event used by [`MockProvider`]. Mirrors the runtime [`StreamEvent`] enum but uses
 /// owned struct-tagged variants so scripts can be loaded from JSON (`serde`'s internally-tagged
-/// enums don't accept tuple/newtype variants). `Sleep` is the one non-stream-event variant. It
-/// stalls the mock so a test can fire `session/cancel` mid-turn; the sleep races against the
-/// cancellation token, so cancel cuts it short cleanly.
+/// enums don't accept tuple/newtype variants). `Sleep` and `Stall` are the two non-stream-event
+/// variants; both delay the mock so a test can act mid-turn, and they differ in whether
+/// cancellation cuts them short.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MockEvent {
@@ -63,6 +63,17 @@ pub enum MockEvent {
     Sleep {
         ms: u64,
     },
+    /// A delay cancellation does *not* cut short, standing in for the part of a turn a drain has
+    /// to wait out rather than interrupt: a tool call already inside a syscall, an MCP round-trip
+    /// under its own timeout, the conversation commit at the end. Cancellation is checked between
+    /// events, so a real turn's response to it is never instant either.
+    ///
+    /// [`Self::Sleep`] is the opposite and stays the default choice: a test asserting that cancel
+    /// *works* wants the sleep to end the moment the token fires. This one exists for the tests
+    /// asserting what happens to a turn that is still unwinding.
+    Stall {
+        ms: u64,
+    },
     /// Synthetic provider failure. The stream returns `Err(MekaError::Provider(message))`
     /// immediately, exercising the non-Interrupted error arm of `Agent::run_turn` (which the ACP
     /// layer maps to a JSON-RPC `internal_error`).
@@ -84,6 +95,26 @@ pub enum MockEvent {
     /// `[FailInvalidRequest, ..success events..]` simulates "the provider refused the content meka
     /// just appended, the retry without it succeeds".
     FailInvalidRequest {
+        message: String,
+    },
+    /// A provider-side advisory forwarded to the frontend mid-stream. Exists so a test can put a
+    /// notice *before* a failure and assert the retry still fires: notices are the one event the
+    /// agent forwards without marking the turn as having produced output.
+    Notice {
+        message: String,
+    },
+    /// Synthetic *transport* failure: the stream returns `Err(MekaError::StreamError(message))`,
+    /// which the agent retries only while nothing user-visible has been emitted. Each attempt
+    /// consumes one round.
+    FailStream {
+        message: String,
+    },
+    /// Synthetic *context-window overflow*. The stream returns `Err(MekaError::ContextOverflow)`,
+    /// which is the one recovery path in `Agent::run_turn` no test could previously reach: the
+    /// emergency compact-and-retry only fires on this error, and nothing could produce it. Each
+    /// attempt consumes one round, so `[FailContextOverflow, ..success events..]` is "the request
+    /// was too large, the compacted retry fit".
+    FailContextOverflow {
         message: String,
     },
 }
@@ -130,9 +161,41 @@ pub struct MockProvider {
     /// the expected list itself asserts on its own arithmetic and passes even when the production
     /// path is reverted, which is worse than no test at all.
     completions: Mutex<Vec<Vec<Message>>>,
+    /// What each [`Provider::stream`] call was handed, in order.
+    ///
+    /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
+    /// more: some behaviour is only observable in the request and only on the streaming path.
+    /// Whether `[session].context_messages` is re-applied on every round of a turn, for instance,
+    /// cannot be seen in the response at all, so a test that did not record this had nothing to
+    /// assert against and passed with the production path reverted.
+    streams: Mutex<Vec<StreamRequest>>,
+}
+
+/// One recorded [`Provider::stream`] call. Owned rather than borrowed because a test inspects it
+/// after the turn has finished and the caller's slices are long gone.
+///
+/// Only ever read from `#[cfg(test)]` code, but recorded unconditionally: the recording lives in
+/// `stream`, which is one function compiled for both builds, and splitting it would put a `cfg` in
+/// the middle of the mock's hot path to save three fields in a binary that already carries the
+/// whole mock.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct StreamRequest {
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub tools: Vec<ToolDefinition>,
 }
 
 impl MockProvider {
+    /// What each `stream` call was handed so far, in order.
+    #[cfg(test)]
+    pub fn streams(&self) -> Vec<StreamRequest> {
+        self.streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// The messages behind each `complete` call so far, in order.
     #[cfg(test)]
     pub fn completions(&self) -> Vec<Vec<Message>> {
@@ -209,6 +272,14 @@ impl Provider for MockProvider {
                 MockEvent::Fail { message } => {
                     return Err(crate::error::MekaError::Provider(message));
                 }
+                MockEvent::FailStream { message } => {
+                    return Err(crate::error::MekaError::StreamError(message));
+                }
+                // No frontend on the non-streaming path, so there is nothing to forward it to.
+                MockEvent::Notice { .. } => {}
+                MockEvent::FailContextOverflow { message } => {
+                    return Err(crate::error::MekaError::ContextOverflow(message));
+                }
                 MockEvent::FailRetryable {
                     message,
                     retry_after_secs,
@@ -221,7 +292,9 @@ impl Provider for MockProvider {
                 MockEvent::FailInvalidRequest { message } => {
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
-                MockEvent::Sleep { ms } => {
+                // `complete` takes no cancellation token, so the two delays are the same thing
+                // here.
+                MockEvent::Sleep { ms } | MockEvent::Stall { ms } => {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 MockEvent::Text { text: chunk } => text.push_str(&chunk),
@@ -276,12 +349,21 @@ impl Provider for MockProvider {
 
     async fn stream(
         &self,
-        _system_prompt: &str,
-        _messages: &[Message],
-        _tools: &[ToolDefinition],
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        self.streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(StreamRequest {
+                system_prompt: system_prompt.to_string(),
+                messages: messages.to_vec(),
+                tools: tools.to_vec(),
+            });
+
         let events = {
             let mut rounds = self
                 .rounds
@@ -301,6 +383,23 @@ impl Provider for MockProvider {
                 MockEvent::Fail { message } => {
                     send_stream_error(&event_sender, &message).await;
                     return Err(crate::error::MekaError::Provider(message));
+                }
+                MockEvent::FailStream { message } => {
+                    send_stream_error(&event_sender, &message).await;
+                    return Err(crate::error::MekaError::StreamError(message));
+                }
+                MockEvent::Notice { message } => {
+                    if event_sender
+                        .send(StreamEvent::Notice(crate::provider::Notice::info(message)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                MockEvent::FailContextOverflow { message } => {
+                    send_stream_error(&event_sender, &message).await;
+                    return Err(crate::error::MekaError::ContextOverflow(message));
                 }
                 MockEvent::FailRetryable {
                     message,
@@ -325,8 +424,15 @@ impl Provider for MockProvider {
                     }
                     continue;
                 }
+                MockEvent::Stall { ms } => {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    continue;
+                }
                 event => {
                     let stream_event = match event {
+                        MockEvent::Notice { message } => {
+                            StreamEvent::Notice(crate::provider::Notice::info(message))
+                        }
                         MockEvent::Text { text } => StreamEvent::TextDelta(text),
                         MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
                         MockEvent::ThinkingComplete { signature } => {
@@ -341,9 +447,12 @@ impl Provider for MockProvider {
                             stop_reason: stop_reason.into(),
                         },
                         MockEvent::Sleep { .. }
+                        | MockEvent::Stall { .. }
                         | MockEvent::Fail { .. }
+                        | MockEvent::FailStream { .. }
                         | MockEvent::FailRetryable { .. }
-                        | MockEvent::FailInvalidRequest { .. } => {
+                        | MockEvent::FailInvalidRequest { .. }
+                        | MockEvent::FailContextOverflow { .. } => {
                             unreachable!("handled above")
                         }
                     };

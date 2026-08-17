@@ -9,52 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Compaction runs a checkpoint turn first: the agent saves what must last and writes the summary.
-- `/compact <instructions>` says what to keep or drop, and reports the memories written.
+- `trust_read_only_hint` refuses an MCP server's `readOnlyHint`, keeping the tool out of read mode.
+- `meka mcp add --auth-token-stdin` / `--client-secret-stdin` keep a secret out of `ps` and history.
+- Compaction runs a checkpoint turn first, so the agent saves what must outlast the summary.
+- `/compact <instructions>` says what to keep or drop, and reports the memories it wrote.
 - `context_check` and `context_compact` let the agent read its own headroom and ask to compact.
 - `skill_search` greps the full text of every installed skill, bodies included.
 - `skill_write` / `skill_delete` let the agent author skills, off unless `[skills].agent_managed`.
 - Skills take an optional `priority` in frontmatter, ordering the `[Skills]` index like memory's.
 - HTTP: compact, rewind, export and import sessions, and report context occupancy.
-- HTTP: manage scheduled jobs and background tasks.
-- HTTP: full CRUD for skills and memory, behind new `skills:w`, `memory:r` and `memory:w` scopes.
+- HTTP: manage scheduled jobs, background tasks, skills and memory, behind four new scopes.
 - HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
+- HTTP: rejoin a turn's SSE stream with `Last-Event-ID`, and see compaction as it happens.
 - HTTP: `tool_call.composing` marks when the model starts writing a tool call's arguments.
-- HTTP: rejoin a turn's SSE stream with `Last-Event-ID` after a dropped connection.
-- HTTP: compaction is visible through a `revision` counter, a summary marker, and an SSE event.
 - HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 - `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
-- `[schedule].max_consecutive_fires` splits one session's due backlog into groups, interleaving others.
+- `[schedule].max_consecutive_fires` interleaves one session's due backlog with other sessions'.
 
 ### Changed
 
-- **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
-- `meka provider` reports success through the log, dropping the `ok:` prefix, matching `meka mcp`.
-- Log messages lost prefixes that repeat the module the subscriber already prints, and internal
-  Rust function names that meant nothing to a reader.
-- Provider log messages name their backend, so Claude and Codex lines are told apart.
-- A Claude or Codex tool call with unparseable arguments says it runs the tool with empty input.
-- Compaction, sandbox and MCP messages are shorter, and no longer log one event twice.
+- **Breaking:** `/v1/docs` and `/v1/openapi.json` are off unless `[serve].docs = true`.
 - **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
+- **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
+- CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
+- Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
+- Internal restructuring, no behaviour change: workspace, stores, CLI modules, turn recovery.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - An unknown or stale tool name now suggests the built-in it probably meant.
-- `schedule_create` explains what makes a gate's output usable and names the `isolated` trade.
-- Tool indicators are cyan rather than dark cyan, and their arguments blue under `tool_params`.
-- The `ask` prompt asks again on an unrecognised answer instead of reading it as a denial.
-- Every line meka renders from model output is budgeted whole, so none of them wraps by default.
-- A tool indicator keeps the whole tool name when space is short, dropping the argument instead.
-- A cut tool name, path or URL keeps both ends, so the filename survives instead of the directories.
-- Dropped rows keep the last one, so a trimmed argument still shows how it ends.
-- A fully-shown thinking block stops at a row ceiling instead of printing without bound.
+- Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
 - A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
-- `GET /v1/skills` reports priority, version, author and `source_url`, not just name and text.
-- An unrecognised `[[serve.tokens]]` scope warns at startup instead of silently granting nothing.
-- reedline moved from a pinned Git rev to the 0.50.0 release that carries the `ExternalPrinter` fix.
-- Building meka needs Rust 1.95; `Cargo.toml` declares it, so an older toolchain is refused by name.
-- Upgrade `rmcp` to 3.1, `base64` to 0.23, `infer` to 0.22 and `termimad` to 0.35.
+- Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
+- Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
 
 ### Removed
 
@@ -62,68 +50,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `/rewind 0` and `meka session rewind -n 0` blame the argument instead of reporting that the
-  conversation has "fewer than 0 turn(s)".
-- An MCP 401 always tells you to run `meka mcp login`; the advice was gated on an unrelated
-  cache write succeeding.
-- A tool annotation that fails to serialize now warns on the refresh and sub-agent paths too,
-  where a lost `readOnlyHint` was silently relaxing permission resolution.
-- A failed background-outcome turn logs its cause rather than a Rust variant name.
-- `meka mcp list` and `mcp get` no longer report `read` for a server whose permission is unset.
-- `meka mcp get` names the configured auth flow instead of printing `Discriminant(1)`.
-- `meka mcp get` no longer tells you to write `auth = oauth`, which does not parse; it is a table.
-- The Claude body-size error no longer claims a 32 MiB limit while rejecting at meka's 30 MiB.
-- The Landlock hint named a config key without its table, so pasting it broke the config.
-- The `--edit` flag warns when `$EDITOR` is unset instead of no-opping below the default log level.
-- `$EDITOR` failure reports the exit status rather than `Some(1)`.
-- Retention deletion says "not updated in N days", which is what it actually deletes.
-- The Ctrl+C hint pointed at `/tasks`, which only lists; it now names `/tasks cancel --all`.
-- `/help` lists `/mcp list`, and its columns line up again for `/permission`.
-- `-h` for `meka account` and `--render-mode` no longer omit a subcommand and a valid value.
-- `meka instructions show` no longer claims to consult `--instructions`, which it ignores.
-- `meka mcp reconnect` no longer promises to print `ok`, and no longer promises a background retry
-  that a CLI run cannot perform.
-- The MCP elicitation timeout is read from its constant instead of a hardcoded "60s".
-- The session-GC log named `scan_interval`; the key is `gc_scan_interval`.
-- The documented `meka mcp add` and `mcp login` transcripts match what meka prints.
-- A `base_url` with a trailing slash no longer doubles it into every request path.
-- A `claude-*` `base_url` ending in `/v1` now works instead of requesting `/v1/v1/messages`.
-- An invisible character a terminal still paints is dropped, so it cannot push text off the row.
-- A skin-toned emoji no longer overflows the row meka measured it to fit.
-- A long run of combining marks in a tool call no longer freezes the terminal for minutes.
-- `meka provider add` with no terminal exits instead of looping on its own prompt forever.
-- The elided thinking preview fills its line instead of stopping at the reasoning's first newline.
-- Replayed history shows a built-in tool call's argument, which only the live indicator carried.
-- `/status` counts compaction tokens, which were spent but never reported against the session.
-- Ctrl+C interrupts a compaction; it previously ran to completion with no way to stop it.
-- A turn that rewrote the conversation could panic on a later malformed-request repair.
-- A compaction that fails to save no longer leaves the conversation half-rewritten.
-- A blocking turn survives its client hanging up; an `Idempotency-Key` retry then replays it.
-- A skill or memory rewritten twice within one clock tick is no longer served stale from cache.
-- Deleting a session stops its running background tasks instead of orphaning their processes.
-- `DELETE` and `PATCH` are refused during a scheduled turn, which they could previously interrupt.
-- A scheduled job that fires during shutdown runs next time instead of being silently skipped.
-- One session's long turn no longer delays the scheduled jobs of every other session.
-- A recurring fire the provider never received withdraws its prompt instead of leaving it unanswered.
-- A job due while `meka serve` shuts down no longer leaves a prompt behind and then repeats it.
-- A gated job is no longer re-evaluated every tick while another process holds its session.
-- A restart mid-sweep no longer loses background outcomes the agent was never told about.
-- A recurring `isolated` scheduled job no longer leaks its tool registry on every fire.
-- Deleting or evicting a session no longer stalls other requests or locks out unrelated ones.
-- `[serve].max_body_bytes` above 2 MiB is honoured; larger bodies were refused regardless.
-- `[serve].gc_scan_interval = "0s"` is rejected rather than silently killing session eviction.
+- **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
+- **Breaking:** ACP's sticky options read "Always allow any `<tool>`", matching their real scope.
+- **Breaking:** a stdio MCP server gets a curated environment, not meka's; declare secrets in `env`.
+- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
+- `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
+- Schema migration is serialised and gated on `user_version`, never rebuilt on a failed probe.
+- Retention spares a session that owns a scheduled job, and its ancestors.
+- Every client, provider and MCP round trip is bounded in time and answers the turn's cancellation.
+- A stalled provider, token endpoint or MCP server no longer parks a turn for the process's life.
+- ACP `session/close` and `session/cancel` no longer deadlock or strand an `fs/*` round trip.
+- Shutdown drains in-flight turns, scheduled fires and background tasks instead of abandoning them.
+- Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
+- `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
+- `[session].context_messages` applies every round; a tool loop cannot carry the window past it.
+- `cron` parses the documented five fields, and a job whose next fire is years out is kept.
+- A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
+- An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
+- Output, images, MCP text and the idempotency cache are bounded in memory, with drops disclosed.
+- Blocking work moved off the async runtime, where it stalled unrelated sessions under `meka serve`.
+- A running sub-agent sees a parent downgrade, and `subagent_max_depth` can only be lowered.
+- Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
+- HTTP: an `Idempotency-Key` is scoped to its session, and a cancelled turn is not cached under it.
+- HTTP: one lagging SSE consumer no longer cancels the turn for every other consumer of it.
+- HTTP: a malformed body, a bad parameter or a re-attach race no longer answers a false 409.
+- A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
+- Terminal rendering survives emoji, combining marks and invisible characters without a broken row.
+- CLI, log and help text corrected throughout: wrong keys, stale advice, leaked Rust internals.
 
 ### Security
 
-- An `ask` prompt keeps the end of an argument too long to show, where a pipeline's effect lives.
-- Ctrl+D at an `ask` prompt denies; end of input was read as the Enter that approves it.
-- Ctrl+D during an MCP elicitation declines; it accepted a partial form or opened the server's URL.
-- An elicitation form with no fields is declined; meka consented to it without asking anything.
-- `background` is shown at the `ask` prompt; the argument that detaches a call was hidden.
-- The `ask` approval prompt shows every argument, not just the one that names the call's target.
-- The `ask` approval prompt strips escapes from the tool name and argument it asks you to approve.
-- Thinking blocks, todo lists and tool arguments are stripped of escapes, cursor moves and bidi.
+- Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
+- The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
+- Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
+- `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.
+- A command-output capture is created at `0600` and swept after a day.
 - `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
+- `utoipa-swagger-ui` is vendored, so a build no longer downloads an unpinned, unverified zip.
+- `event-listener` and `memmap2` move to patched releases, and the audit ignore list is gone.
 
 ## [0.41.0] - 2026-08-13
 

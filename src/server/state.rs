@@ -20,7 +20,7 @@ use super::{
     idempotency::IdempotencyCache,
 };
 use crate::{
-    SharedDeps, agent::SharedCwd, conversation::Conversation, permission::SharedPermission,
+    SharedDeps, conversation::Conversation, permission::SharedPermission, workspace::SharedCwd,
 };
 
 /// Top-level server state. Cloned by `Arc` reference into handlers; mutation goes through inner
@@ -116,6 +116,25 @@ pub struct SessionEntry {
     /// turn; if no turn is in flight the cancel is a no-op (the next turn that starts will
     /// install a fresh token).
     pub cancellation: Arc<std::sync::RwLock<tokio_util::sync::CancellationToken>>,
+    /// Count of `POST /cancel` calls against this session, so a turn can tell whether one landed
+    /// while it was still being admitted.
+    ///
+    /// The token above is published *after* `TurnGuard::acquire`, and it has to be: publishing
+    /// before the guard would let a rejected turn overwrite a running one's token and make the
+    /// running one uncancellable. But the guard is what makes `turn_in_flight` report `true`, so
+    /// between those two points the session advertises a running turn while `/cancel` is still
+    /// reading the *previous* turn's token. Cancelling that is a no-op, the caller is told 204,
+    /// and the new turn then installs a fresh, uncancelled token and runs to completion. Poll
+    /// `turn_in_flight`, then cancel is the flow the HTTP docs describe, so this was reachable
+    /// rather than theoretical.
+    ///
+    /// The turn samples this at admission and re-reads it after publishing; a change means a
+    /// cancel arrived in the window and it cancels itself immediately. Sampling *after* the
+    /// guard rather than before is deliberate: it leaves a sub-microsecond gap between the CAS
+    /// and the load in which a cancel is still missed, but the alternative ordering would let
+    /// a cancel aimed at the *previous* turn abort the one just submitted, and a spurious
+    /// cancellation is the worse failure of the two.
+    pub cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Held only for its Drop side-effect (releasing the per-session OS file lock on session
     /// eviction). See `SessionLock` at `src/session.rs:76`.
     #[allow(dead_code, reason = "RAII guard: held for Drop, never read")]
@@ -244,6 +263,13 @@ impl Drop for InFlightGuard {
 pub struct TurnGuard {
     process: Arc<AtomicUsize>,
     session: Arc<AtomicUsize>,
+    /// [`SessionEntry::cancel_epoch`] as it stood the instant this guard was taken.
+    ///
+    /// Carried on the guard rather than sampled by the caller so the "sampled exactly at
+    /// admission" part is structural. Acquiring the guard is what makes `turn_in_flight` report
+    /// `true`, so this is the only correct instant to read it, and a caller that sampled a few
+    /// statements later would silently reopen the window the counter exists to close.
+    pub epoch_at_admission: u64,
 }
 
 impl TurnGuard {
@@ -257,6 +283,7 @@ impl TurnGuard {
         process_counter: Arc<AtomicUsize>,
         session_counter: Arc<AtomicUsize>,
         max_concurrent: Option<usize>,
+        cancel_epoch: &std::sync::atomic::AtomicU64,
     ) -> Result<Self, ProblemDetail> {
         // Two-phase admission: fetch_add unconditionally, then re-check. Two callers racing
         // both seeing `current == cap - 1` would both pass a plain load+check, but the post-
@@ -278,10 +305,30 @@ impl TurnGuard {
             .with_retry_after(1));
         }
         session_counter.fetch_add(1, Ordering::AcqRel);
+        // Read after the session counter goes up, which is the instant `turn_in_flight` starts
+        // reporting `true`. Every cancel from here on is aimed at this turn.
+        let epoch_at_admission = cancel_epoch.load(std::sync::atomic::Ordering::SeqCst);
         Ok(Self {
             process: process_counter,
             session: session_counter,
+            epoch_at_admission,
         })
+    }
+
+    /// Count a turn against the *process* only, for work that owns no session entry.
+    ///
+    /// An isolated scheduled fire creates its session inside `run_turn` and never registers it in
+    /// `state.sessions`, so there is no per-session counter to bump -- but the shutdown drain also
+    /// watches the process-wide one, and without this the fire is invisible to it and gets aborted
+    /// part-way through.
+    pub fn mark_process_busy(process_counter: Arc<AtomicUsize>) -> Self {
+        process_counter.fetch_add(1, Ordering::AcqRel);
+        let session = Arc::new(AtomicUsize::new(1));
+        Self {
+            process: process_counter,
+            session,
+            epoch_at_admission: 0,
+        }
     }
 }
 

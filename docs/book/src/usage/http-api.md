@@ -350,13 +350,12 @@ A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these auto
 
 ### SSE lag
 
-The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server:
+The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server closes that consumer's stream, and what it sends first depends on whether anyone else was still reading:
 
-1. **Cancels the in-flight turn** to stop burning provider tokens.
-2. **Emits a terminal `turn.failed`** event with error type `https://meka.so/errors/sse-lag`.
-3. **Closes the stream.**
+- **Nobody else was reading.** The turn is cancelled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. Retry by submitting a new turn.
+- **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `notice` explaining the drop and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
 
-The client should retry by submitting a new turn. Use `GET /messages` to inspect what the agent completed before the lag occurred.
+Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way.
 
 ### Reconnection
 
@@ -415,6 +414,8 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
 
 When `secret` is set, each request carries `X-Meka-Signature: sha256=<hex>`, an HMAC-SHA256 over `<timestamp>.<body>` keyed with the secret. The timestamp is *inside* the signed material, so a captured delivery cannot be replayed forever: reject anything whose `X-Meka-Timestamp` is too old and the window closes.
 
+Each **attempt** carries its own timestamp and signature. A retry can land minutes after the first attempt, so re-sending the original stamp would have it rejected by that very window. Deduplicate on `X-Meka-Delivery`, which stays constant across a delivery's attempts.
+
 ```python
 import hmac, hashlib
 
@@ -426,6 +427,8 @@ def verify(secret: str, timestamp: str, body: bytes, signature: str) -> bool:
 ```
 
 Deliveries also carry `X-Meka-Event`, `X-Meka-Delivery` (unique per delivery, for deduplicating retries), and `X-Meka-Timestamp`.
+
+`X-Meka-Timestamp` and the body's `timestamp` field differ on a retry, deliberately. The header is when *this attempt* was sent, re-stamped each time, because that is what your replay window is checking; a retry carrying the original time would be rejected as stale by the very check the header exists for. The body's field is when the *event* happened and stays fixed across attempts, so ordering and deduplication see one event rather than several.
 
 Omitting `secret` is allowed for loopback receivers and logs a startup warning; no signature header is sent, rather than one computed over an empty key.
 
@@ -471,7 +474,7 @@ When `stream: false` and the session is in `ask` mode, there is no SSE channel f
 
 ## Authentication
 
-Every request (except health probes and `/v1/openapi.json`) requires `Authorization: Bearer <token>`.
+Every request requires `Authorization: Bearer <token>`, except the two health probes and, when `[serve].docs` is enabled, `/v1/openapi.json` and `/v1/docs`. Both of those are off by default, so on a default deployment they answer 404 rather than serving anything unauthenticated.
 
 ### Scopes
 
@@ -535,7 +538,13 @@ curl -X POST http://localhost:8080/v1/sessions/$ID/turn \
   -d '{"message": "deploy to staging"}'
 ```
 
-If the same key is replayed, the server returns the cached response. If the same key is sent with a different body, it returns `409 Conflict`. Keys are scoped per-token and expire after 24 hours.
+If the same key is replayed, the server returns the cached response. If the same key is sent with a different body, it returns `409 Conflict`.
+
+Keys are scoped per-token **and per-session**, and expire after 24 hours. The session is part of the scope because an `Idempotency-Key` names *your* unit of work: sending the same key to two sessions is a reasonable thing to do, and it now runs both turns instead of answering the second with the first's transcript.
+
+A turn that was cancelled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason.
+
+The cache is bounded per token by both entry count and total bytes; a response too large to keep is not cached, and its retry re-executes.
 
 Idempotency keys are **ignored for streaming responses**; streaming clients should reconnect by submitting a new turn.
 
@@ -573,6 +582,8 @@ All HTTP error responses use [RFC 9457 Problem Details](https://www.rfc-editor.o
 The `type` URI is the stable, machine-readable error code. Route error handling on `type`, not on `status` or `detail`.
 
 > **Error detail redaction:** Validation errors (`422`) return a generic detail message (e.g. `"invalid session creation request body"`) rather than echoing internal field names or parser diagnostics. Consult the [OpenAPI spec](#endpoint-reference) for the expected request schema.
+>
+> A `502` says only that the provider rejected or failed the turn; it carries none of the provider's own response. An upstream refusal can contain account identifiers, rate-limit posture, and fragments of the request that triggered it, and none of that is meka's to publish to an HTTP caller. The full text goes to the server log, which is where an operator reads it.
 
 ### Error types
 
@@ -589,7 +600,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-cancelled` | 409 | Turn was cancelled |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
-| `/errors/invalid-body` | 422 | Request body validation failed |
+| `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes` |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
@@ -610,8 +621,8 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | `GET /v1/info` | Any read scope | Server version, model, capabilities. `vision` reports whether `POST /turn` accepts [image attachments](#image-attachments) |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
-| `GET /v1/openapi.json` | None | OpenAPI 3 spec |
-| `GET /v1/docs` | None | Swagger UI |
+| `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
+| `GET /v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
 ## Session lifecycle
 
@@ -643,8 +654,12 @@ Sessions with an in-flight turn are never evicted.
 1. Stop accepting new connections.
 2. Cancel all in-flight turns (same mechanism as `POST /cancel`).
 3. Emit `turn.cancelled` with `reason: "server_shutdown"` on open SSE streams.
-4. Wait up to `shutdown_drain_timeout` for tasks to flush.
-5. Exit.
+4. Wait up to `shutdown_drain_timeout` for every turn to finish unwinding, including scheduled
+   fires, background-outcome deliveries, and turns whose client has already disconnected.
+   Cancelling a turn is not the same as waiting for one: what follows the cancellation is the
+   commit of the partial reply and of whatever the round already produced.
+5. Exit `0`. A drain that hits the timeout instead logs a warning, abandons what is still
+   running, and exits `1`, so a supervisor can tell the two apart.
 
 ```toml
 [serve]
@@ -834,8 +849,8 @@ Key points:
 | POST | `/v1/mcp/{name}/reconnect` | `mcp:w` | Reconnect an MCP server |
 | GET | `/v1/instructions` | `sessions:r` | Resolved system instructions |
 | GET | `/v1/providers` | read | Configured provider profiles |
-| GET | `/v1/openapi.json` | None | OpenAPI spec |
-| GET | `/v1/docs` | None | Swagger UI |
+| GET | `/v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI spec |
+| GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
 `GET /v1/sessions` takes `include_children=true` to list sub-agent sessions alongside top-level ones, and `cwd=<path>` to filter by working directory. Every session record carries `parent_id`, which is what reconnects a spawned worker to the session that dispatched it.
 
@@ -849,7 +864,9 @@ Cancelling a background task records the cancellation and signals the running ta
 
 MCP OAuth login and logout are deliberately absent: the flow opens a browser and pastes back a callback, which does not belong on a service-to-service surface. Use `meka mcp login` on the host. `/v1/providers` is read-only for the same reason provider selection has no environment tier: an ambient value must never silently rebind which account a named profile bills.
 
-For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it interactively at `/v1/docs` (Swagger UI). Both endpoints are unauthenticated so CI pipelines and code generators can fetch the spec without a token.
+For full request/response schemas, see `/v1/openapi.json` on a running server, or browse it interactively at `/v1/docs` (Swagger UI).
+
+Both are **off unless you set [`[serve].docs`](../configuration/config-file.md#servedocs)**, and both are unauthenticated when on, so CI pipelines and code generators can fetch the spec without a token. That combination is what makes them opt-in: they take no token *and* they publish the shape of every endpoint the deployment exposes, which is useful on a workstation and reconnaissance anywhere else.
 
 ### Exporting the spec
 

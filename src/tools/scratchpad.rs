@@ -167,7 +167,21 @@ pub async fn persist_oversized_results(
                     }
 
                     counter += 1;
-                    let name = format!("{}_{}", base_name, counter);
+                    // Unique for the life of the session, not just within this call.
+                    //
+                    // `counter` restarts at zero on every invocation -- this runs once per
+                    // assistant message -- so the name was `<tool>_1` for the
+                    // first oversized result of *every*
+                    // turn. `save_tool_output` is `INSERT OR REPLACE` keyed on `(session, name)`,
+                    // so turn 3's 150 KB command output silently overwrote turn
+                    // 1's, and the model reading back the handle it was given
+                    // in turn 1 got turn 3's bytes with no error and no size
+                    // complaint. MCP tools were worse: their hint is a stable
+                    // `mcp_<server>_<tool>`, so every large fetch from one server collapsed onto
+                    // one name. The `tool_use_id` is provider-generated and
+                    // unique per call, which is exactly the scope the name
+                    // needs.
+                    let name = format!("{}_{}_{}", base_name, short_call_id(tool_use_id), counter);
 
                     session_manager
                         .save_tool_output(session_id, &name, text)
@@ -179,6 +193,33 @@ pub async fn persist_oversized_results(
         }
     }
     Ok(())
+}
+
+/// A short, name-safe slice of a provider tool-call id, for disambiguating scratchpad entries.
+///
+/// Ids run to ~30 characters (`toolu_01A9…`, `call_abc…`) and the whole thing in every entry name
+/// would make `scratchpad_list` unreadable and the handles tedious for the model to quote back. The
+/// tail is used rather than the head because providers put their fixed prefix at the front, so the
+/// last few characters carry the entropy. Restricted to `[A-Za-z0-9]` because the name is also an
+/// entry key.
+fn short_call_id(tool_use_id: &str) -> String {
+    let cleaned: String = tool_use_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    let tail: String = cleaned
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if tail.is_empty() {
+        "call".to_string()
+    } else {
+        tail
+    }
 }
 
 pub(super) struct ScratchpadWriteTool {
@@ -1008,7 +1049,7 @@ pub(super) struct ScratchpadLoadFileTool {
     pub inherited_names: Vec<String>,
     /// Per-session cwd, so a relative `path` resolves the same way `read_file` does (against the
     /// agent's `/cd` directory, not the process cwd).
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
 }
 
 #[async_trait]
@@ -1074,7 +1115,7 @@ impl Tool for ScratchpadLoadFileTool {
 
         // Resolve a relative path against the session cwd before canonicalizing, so `/cd` is
         // honoured (canonicalize alone would resolve relative to the process cwd).
-        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
+        let resolved = crate::workspace::resolve_against_cwd(&self.cwd, &path);
         let canonical =
             super::util::canonicalize_for_tool("scratchpad_load_file", &resolved).await?;
 
@@ -1132,7 +1173,7 @@ pub(super) struct ScratchpadSaveFileTool {
     pub inherited_names: Vec<String>,
     /// Per-session cwd, so a relative `path` resolves the same way `write_file` does (against the
     /// agent's `/cd` directory, not the process cwd).
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
 }
 
 #[async_trait]
@@ -1209,37 +1250,12 @@ impl Tool for ScratchpadSaveFileTool {
             message: format!("scratchpad entry \"{}\" not found", name),
         })?;
 
-        // Path resolution mirrors `write_file`: resolve a relative path against the session cwd (so
-        // `/cd` is honoured, not the process cwd), then canonicalize the parent dir (creating it if
-        // necessary) and re-join the filename so the O_NOFOLLOW open at the leaf closes the
-        // canonicalize→open TOCTOU window for symlink-swap attacks. See src/tools/file.rs for the
-        // original rationale.
-        let file_path = crate::agent::resolve_against_cwd(&self.cwd, &path);
-        let file_name = file_path
-            .file_name()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "scratchpad_save_file".to_string(),
-                message: format!("invalid path (no file name): '{}'", path),
-            })?;
-        let parent = file_path.parent().ok_or_else(|| MekaError::ToolExecution {
-            tool_name: "scratchpad_save_file".to_string(),
-            message: format!("invalid path (no parent): '{}'", path),
-        })?;
-        let parent_for_create: &std::path::Path = if parent.as_os_str().is_empty() {
-            std::path::Path::new(".")
-        } else {
-            parent
-        };
-        tokio::fs::create_dir_all(parent_for_create)
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "scratchpad_save_file".to_string(),
-                message: format!("failed to create directories for '{}': {}", path, error),
-            })?;
-
-        let canonical_parent =
-            super::util::canonicalize_for_tool("scratchpad_save_file", parent_for_create).await?;
-        let target = canonical_parent.join(file_name);
+        // Shared with `write_file` rather than mirrored, because the two must agree on the file
+        // they name and on the lock they take, and a copy of the resolution here agreed on neither.
+        // Both are dispatched concurrently from one assistant message and both write through a temp
+        // file derived from the target, so two calls naming one path could interleave.
+        let (target, _write_guard) =
+            super::file::resolve_write_target("scratchpad_save_file", &self.cwd, &path).await?;
 
         let byte_count = content.len();
         super::file::write_file_bytes(&target, content.as_bytes())
@@ -1324,18 +1340,69 @@ mod tests {
         if let ContentBlock::ToolResult { content, .. } = &results[0] {
             let text = ContentBlock::tool_result_text_content(content);
             assert!(text.contains("<large-output"));
-            assert!(text.contains("name=\"execute_command_1\""));
+            // The tool name still leads, so the handle stays recognisable; the call-id tail after
+            // it is what makes it unique (see the collision test below).
+            assert!(text.contains("name=\"execute_command_"), "{}", text);
             assert!(text.contains("scratchpad_read"));
             assert!(!text.contains(&large_text));
         } else {
             panic!("expected ToolResult");
         }
 
+        let name = format!("execute_command_{}_1", short_call_id("call-1"));
         let loaded = manager
-            .load_tool_output(session_id, "execute_command_1")
+            .load_tool_output(session_id, &name)
             .await
             .expect("load");
         assert_eq!(loaded, Some(large_text));
+    }
+
+    /// The counter restarts on every call, so a name built from it alone repeated across turns --
+    /// and `save_tool_output` is `INSERT OR REPLACE`, so the later spill silently destroyed the
+    /// earlier one. The model still held the first handle from its conversation and would read back
+    /// the *second* result under it, with nothing to signal the substitution.
+    #[tokio::test]
+    async fn spilled_outputs_from_different_calls_do_not_overwrite_each_other() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+
+        let mut names = Vec::new();
+        for (call_id, body) in [("call-turn1", 'a'), ("call-turn3", 'b')] {
+            let text = body.to_string().repeat(MAX_INLINE_RESULT_BYTES + 100);
+            let assistant_msg =
+                make_assistant_message(vec![(call_id, "execute_command", serde_json::json!({}))]);
+            let mut results = vec![ContentBlock::ToolResult {
+                tool_use_id: call_id.to_string(),
+                content: vec![ToolResultContent::Text { text: text.clone() }],
+                is_error: false,
+            }];
+            persist_oversized_results(
+                &manager,
+                session_id,
+                &assistant_msg,
+                &mut results,
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .expect("persist");
+            names.push((
+                format!("execute_command_{}_1", short_call_id(call_id)),
+                text,
+            ));
+        }
+
+        assert_ne!(names[0].0, names[1].0, "two calls must not share a name");
+        for (name, expected) in &names {
+            assert_eq!(
+                manager
+                    .load_tool_output(session_id, name)
+                    .await
+                    .expect("load"),
+                Some(expected.clone()),
+                "entry {} was overwritten",
+                name
+            );
+        }
     }
 
     #[tokio::test]
@@ -2443,7 +2510,7 @@ mod tests {
             .expect("write input");
 
         let tool = ScratchpadLoadFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2475,7 +2542,7 @@ mod tests {
         tokio::fs::write(dir.path().join("rel.txt"), "relative contents")
             .await
             .expect("write input");
-        let cwd: crate::agent::SharedCwd =
+        let cwd: crate::workspace::SharedCwd =
             std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf()));
 
         let tool = ScratchpadLoadFileTool {
@@ -2513,7 +2580,7 @@ mod tests {
             .await
             .expect("seed");
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd: crate::agent::SharedCwd =
+        let cwd: crate::workspace::SharedCwd =
             std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf()));
 
         let tool = ScratchpadSaveFileTool {
@@ -2538,6 +2605,72 @@ mod tests {
         assert_eq!(written, "final analysis");
     }
 
+    /// `scratchpad_save_file` has to take the same per-path write lock `write_file` does.
+    ///
+    /// It carried its own copy of the path resolution and then called `write_file_bytes` directly,
+    /// so the two shared no lock at all. Both are dispatched concurrently from one assistant
+    /// message and both write through a temp file derived from the target, so two calls naming one
+    /// path could interleave their write-then-rename and publish a spliced file. Asserted by
+    /// holding the file tool's lock and showing the save cannot proceed behind it.
+    #[tokio::test]
+    async fn test_scratchpad_save_file_contends_with_write_file_for_the_same_path() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+        manager
+            .save_tool_output(session_id, "report", "final analysis")
+            .await
+            .expect("seed");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("out.txt");
+        tokio::fs::write(&target, "existing")
+            .await
+            .expect("seed target");
+
+        let tool = ScratchpadSaveFileTool {
+            cwd: std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf())),
+            session_manager: manager,
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+
+        // Whoever holds it, holds it against both tools: this is the lock `write_file` takes.
+        let (_, held) = super::super::file::resolve_write_target(
+            "write_file",
+            &tool.cwd,
+            target.to_str().expect("path"),
+        )
+        .await
+        .expect("take the write lock");
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tool.execute(
+                serde_json::json!({"name": "report", "path": "out.txt"}),
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the save must wait behind a write_file holding the same path",
+        );
+
+        drop(held);
+        let result = tool
+            .execute(
+                serde_json::json!({"name": "report", "path": "out.txt"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("save once the lock is free");
+        assert!(!result.is_error, "got: {}", text_content(&result));
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.expect("read back"),
+            "final analysis",
+        );
+    }
+
     #[tokio::test]
     async fn test_scratchpad_load_file_rejects_inherited_name() {
         let manager = test_manager().await;
@@ -2553,7 +2686,7 @@ mod tests {
             .expect("write input");
 
         let tool = ScratchpadLoadFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(child),
             inherited_names: vec!["captured".to_string()],
@@ -2596,7 +2729,7 @@ mod tests {
         tokio::fs::write(&path, png_bytes).await.expect("write png");
 
         let tool = ScratchpadLoadFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2632,7 +2765,7 @@ mod tests {
             .expect("write blob");
 
         let tool = ScratchpadLoadFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2668,7 +2801,7 @@ mod tests {
         let path = dir.path().join("subdir").join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),
             parent_session_id: None,
@@ -2704,7 +2837,7 @@ mod tests {
         let path = dir.path().join("log.txt");
 
         let tool = ScratchpadSaveFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(child),
             parent_session_id: Some(parent),
@@ -2731,7 +2864,7 @@ mod tests {
         let path = dir.path().join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),
             parent_session_id: None,

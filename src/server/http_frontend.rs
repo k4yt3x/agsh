@@ -280,18 +280,37 @@ impl HttpFrontend {
         match entry {
             Some(pending) => {
                 let outcome = match resolution {
-                    PermissionResolution::Allow => PermissionOutcome::Allow,
-                    PermissionResolution::AllowAlways => {
-                        self.remember_allow(&pending.tool_name);
+                    PermissionResolution::Allow | PermissionResolution::AllowAlways => {
                         PermissionOutcome::Allow
                     }
-                    PermissionResolution::Deny => PermissionOutcome::Deny,
-                    PermissionResolution::DenyAlways => {
-                        self.remember_deny(&pending.tool_name);
+                    PermissionResolution::Deny | PermissionResolution::DenyAlways => {
                         PermissionOutcome::Deny
                     }
                 };
-                pending.sender.send(outcome).is_ok()
+
+                // Deliver first, and only record the sticky decision if the waiter actually took
+                // it.
+                //
+                // `request_permission` resolves through a `tokio::select!`, so its
+                // `oneshot::Receiver` is already dropped once the 60s timeout
+                // expires, the turn is cancelled, or the SSE client disconnects.
+                // Recording before the send meant a reply that lost that race was
+                // reported to the caller as `404 request-not-found` -- the tool call denied, the
+                // client told nothing was resolved -- while the tool had nonetheless been written
+                // into `always_allowed` for the rest of the session, silently
+                // short-circuiting every later call to it with no prompt and no SSE
+                // event. An answer nobody received must not grant anything.
+                let delivered = pending.sender.send(outcome).is_ok();
+                if delivered {
+                    match resolution {
+                        PermissionResolution::AllowAlways => {
+                            self.remember_allow(&pending.tool_name)
+                        }
+                        PermissionResolution::DenyAlways => self.remember_deny(&pending.tool_name),
+                        PermissionResolution::Allow | PermissionResolution::Deny => {}
+                    }
+                }
+                delivered
             }
             None => false,
         }
@@ -361,6 +380,18 @@ impl HttpFrontend {
         stream.record(event.clone());
         stream.terminal = Some(event.clone());
         event
+    }
+
+    /// How many SSE consumers are attached to the live turn right now.
+    ///
+    /// Zero once the turn's stream has ended or was never installed. Read by the stream task to
+    /// decide whether one lagging consumer speaks for the whole turn.
+    pub fn subscriber_count(&self) -> usize {
+        let guard = super::poisoned::lock(&self.stream, "http_frontend::subscriber_count");
+        guard
+            .as_ref()
+            .and_then(|stream| stream.sender.as_ref())
+            .map_or(0, |sender| sender.receiver_count())
     }
 
     /// End the turn's stream: drop the sender so live subscribers see the close, keeping the ring
@@ -692,6 +723,53 @@ mod tests {
         mcp::elicitation::{ElicitationKind, ElicitationPrompt},
     };
 
+    /// `subscriber_count` has to see a re-attached second consumer, because that count is the only
+    /// thing standing between one slow reader and everyone else's turn.
+    ///
+    /// The SSE stream task cancels the turn when a consumer lags, and it used to do so
+    /// unconditionally: turn events are a broadcast, so a re-attached client or a second consumer
+    /// is a separate receiver, and one slow reader killed the turn out from under the client that
+    /// was keeping up. The guard is `subscriber_count() <= 1`, and reverting it left all four
+    /// suites green. This pins the count's semantics, including the part the guard depends on --
+    /// that the lagging receiver, which is about to be dropped, is still included while it lives,
+    /// which is why the threshold is `<= 1` rather than `== 0`.
+    #[tokio::test]
+    async fn subscriber_count_sees_every_live_consumer_of_a_turn() {
+        let frontend = HttpFrontend::new();
+        assert_eq!(
+            frontend.subscriber_count(),
+            0,
+            "no stream installed yet, so nobody is reading"
+        );
+
+        let (first, _ids) = frontend.install_stream(
+            16,
+            16,
+            Duration::from_secs(1),
+            uuid::Uuid::from_u128(0xfeed),
+        );
+        assert_eq!(frontend.subscriber_count(), 1, "the turn's own consumer");
+
+        let second = frontend
+            .attach_stream(None)
+            .expect("a live stream accepts a re-attach");
+        assert_eq!(
+            frontend.subscriber_count(),
+            2,
+            "a re-attached client is a second receiver; cancelling on the first one's lag would \
+             take the turn away from it"
+        );
+
+        drop(second);
+        assert_eq!(
+            frontend.subscriber_count(),
+            1,
+            "and once it goes, the lagging consumer speaks for the whole turn again"
+        );
+        drop(first);
+        assert_eq!(frontend.subscriber_count(), 0);
+    }
+
     #[tokio::test]
     async fn emit_buffers_events_in_order() {
         let frontend = HttpFrontend::new();
@@ -942,6 +1020,70 @@ mod tests {
     ///
     /// Zero grace, so this tests the resolution path rather than the reconnect window;
     /// `client_disconnected_waits_out_the_reattach_grace` covers the window itself.
+    /// A reply that loses the race must grant nothing.
+    ///
+    /// `resolve_permission` answers the HTTP caller `404 request-not-found` when the waiter has
+    /// already gone -- cancelled, timed out, or disconnected. Recording the sticky decision
+    /// *before* the send meant that same call still wrote the tool into `always_allowed` for
+    /// the rest of the session: the caller was told nothing was resolved, the tool call was
+    /// denied, and every later call to that tool was silently approved with no prompt and no
+    /// SSE event. Ordering the record after a successful delivery is the whole fix, and nothing
+    /// pinned it.
+    #[tokio::test]
+    async fn a_reply_that_arrives_too_late_grants_nothing() {
+        let frontend = Arc::new(HttpFrontend::new());
+        let (_receiver, _ids) = frontend.install_stream(16, 16, Duration::ZERO, uuid::Uuid::nil());
+
+        let frontend_inner = Arc::clone(&frontend);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let waiter = cancellation.clone();
+        let join = tokio::spawn(async move {
+            frontend_inner
+                .request_permission(PermissionRequest {
+                    tool_name: "execute_command".into(),
+                    primary_param: Some("rm -rf /".into()),
+                    input: serde_json::Value::Null,
+                    cancellation: waiter,
+                })
+                .await
+        });
+
+        // Let it register, then drop the waiter *without* letting it tidy up.
+        //
+        // Cancelling instead would not reach the race: `request_permission` removes its own entry
+        // after the select, so a resolve arriving later finds nothing and returns at the
+        // unknown-request arm, never reaching the record at all. Aborting drops the future
+        // mid-await -- the receiver dies, the removal never runs -- which leaves exactly
+        // the state the fix is about: an entry still in the map whose reader is gone, so
+        // `send` fails.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let request_id = frontend
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .next()
+            .cloned()
+            .expect("the request must be registered before it is answered");
+        drop(cancellation);
+        join.abort();
+        assert!(
+            join.await.is_err(),
+            "the waiter must be gone before the reply arrives"
+        );
+
+        // The user's "always allow" arrives after the waiter is gone.
+        let delivered = frontend.resolve_permission(&request_id, PermissionResolution::AllowAlways);
+        assert!(
+            !delivered,
+            "the caller has to be told the reply landed nowhere"
+        );
+        assert!(
+            !frontend.is_always_allowed("execute_command"),
+            "and a reply nobody received must not grant the tool for the rest of the session"
+        );
+    }
+
     #[tokio::test]
     async fn request_permission_detects_sse_disconnect() {
         let frontend = Arc::new(HttpFrontend::new());

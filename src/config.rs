@@ -103,6 +103,13 @@ pub struct ScheduleConfig {
 #[derive(Debug, Clone)]
 pub struct ResolvedScheduleConfig {
     pub enabled: bool,
+    /// The permission level of the process running the scheduler.
+    ///
+    /// A gate is an unattended shell command, so it needs `Write` from the session *and* from the
+    /// host: a `meka serve --permission read` that inherits a job written by a write-mode session
+    /// must not run its gate. Sessions that carry no per-session level (the REPL and ACP paths
+    /// derive theirs from process config) fall back to this.
+    pub host_permission: crate::permission::Permission,
     pub poll_interval: std::time::Duration,
     pub missed_grace: std::time::Duration,
     pub gate_timeout: std::time::Duration,
@@ -127,9 +134,13 @@ impl ResolvedScheduleConfig {
     /// needs better, and it keeps a `--oneshot` run from paying for a tick it will never use.
     const DEFAULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-    fn resolve(raw: Option<ScheduleConfig>) -> Self {
+    fn resolve(
+        raw: Option<ScheduleConfig>,
+        host_permission: crate::permission::Permission,
+    ) -> Self {
         let raw = raw.unwrap_or_default();
         Self {
+            host_permission,
             enabled: raw.enabled.unwrap_or(true),
             poll_interval: raw.poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL),
             missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
@@ -143,8 +154,10 @@ impl ResolvedScheduleConfig {
 }
 
 impl Default for ResolvedScheduleConfig {
+    /// `None` for the host level, which is the most restrictive: a default-constructed config is a
+    /// test fixture or a caller that never said, and neither should be able to run a gate.
     fn default() -> Self {
-        Self::resolve(None)
+        Self::resolve(None, crate::permission::Permission::None)
     }
 }
 
@@ -236,6 +249,15 @@ pub struct ServeConfig {
     pub max_concurrent_turns: Option<usize>,
     /// Request body size limit (bytes). Default 10 MiB.
     pub max_body_bytes: Option<usize>,
+    /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
+    /// `/v1/openapi.json`. Default `false`.
+    ///
+    /// Off by default because they are unauthenticated -- as are the two health probes, which
+    /// publish nothing -- and what they publish is the shape of every endpoint the deployment
+    /// exposes. That is useful while
+    /// building a client and pure reconnaissance value once the deployment is real. Turn it on
+    /// deliberately, on a deployment where anyone who can reach the port is entitled to the map.
+    pub docs: Option<bool>,
     /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
     /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
     ///
@@ -429,7 +451,7 @@ impl ResolvedWebhook {
 
 /// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See
 /// the Auth section of the HTTP API docs for the full scope catalogue.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServeTokenConfig {
     /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
@@ -442,6 +464,27 @@ pub struct ServeTokenConfig {
     pub description: Option<String>,
     /// Scopes granted to this token. See the HTTP API docs for the catalogue.
     pub scopes: Vec<String>,
+}
+
+// Manual `Debug` for the same reason as [`WebhookConfig`]'s, and more urgently: `ServeConfig` and
+// `ResolvedConfig` both derive `Debug` and `ResolvedConfig` owns the whole `[serve]` table, so the
+// derived impl made every bearer token reachable from a single `{:?}` on the config. Redacting only
+// `ResolvedServeToken` left that path open, because the raw form survives resolution.
+impl std::fmt::Debug for ServeTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeTokenConfig")
+            .field(
+                "token",
+                &self
+                    .token
+                    .as_ref()
+                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
+            )
+            .field("token_file", &self.token_file)
+            .field("description", &self.description)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 /// `[permissions]` table: choose which modes are reachable at runtime and which mode the session
@@ -617,7 +660,7 @@ pub struct McpConfig {
     pub connect_timeout_seconds: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
@@ -652,6 +695,28 @@ pub struct McpServerConfig {
     /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
     /// permission at registration time.
     pub tool_permissions: Option<std::collections::HashMap<String, String>>,
+    /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
+    /// true, so a server that says a tool only reads is believed.
+    ///
+    /// The hint is asserted by the server, not verified by meka, and MCP tools execute in the
+    /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
+    /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
+    /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
+    /// the tool falls through to the strict `Write` fallback, and nothing from this server is
+    /// reachable at `read` without an explicit [`Self::tool_permissions`] or [`Self::permission`]
+    /// entry.
+    ///
+    /// A refused hint deliberately skips `[mcp].default_permission` on the way. That is a global
+    /// convenience and this is a per-server audit decision, so the per-server one wins, the same
+    /// direction the two overrides above already run. Falling through to it meant that with
+    /// `default_permission = "read"` the knob changed nothing at all: the tool landed back on
+    /// `Read` and dispatched unapproved at `--permission read`, which is precisely the outcome
+    /// setting it to `false` was meant to prevent.
+    ///
+    /// Defaulting to true keeps existing configurations working and keeps read mode useful with
+    /// well-behaved servers; the trade is that read mode's filesystem guarantee covers meka's
+    /// built-in tools plus whichever MCP servers the user has chosen to trust.
+    pub trust_read_only_hint: Option<bool>,
     /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
     /// attempt is made. Lets users mute a flaky or in-development server without removing the
     /// entry.
@@ -673,7 +738,7 @@ pub enum McpTransport {
     Http,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpAuthConfig {
     ClientCredentials {
@@ -696,6 +761,109 @@ pub enum McpAuthConfig {
         scopes: Option<Vec<String>>,
         redirect_port: Option<u16>,
     },
+}
+
+/// Redacts the value of every header and environment entry, and `auth_token`.
+///
+/// `headers` and `env` are the two places a user is most likely to put a bearer token, and a
+/// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
+/// Names are kept: knowing that `Authorization` was set is the diagnostic; knowing its value is the
+/// leak.
+fn redact_map(
+    map: &Option<std::collections::HashMap<String, String>>,
+) -> Option<std::collections::BTreeMap<&str, String>> {
+    map.as_ref().map(|entries| {
+        entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), format!("[REDACTED len={}]", value.len())))
+            .collect()
+    })
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &redact_map(&self.env))
+            .field("url", &self.url)
+            .field(
+                "auth_token",
+                &self
+                    .auth_token
+                    .as_ref()
+                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
+            )
+            .field("headers", &redact_map(&self.headers))
+            .field("headers_helper", &self.headers_helper)
+            .field("auth", &self.auth)
+            .field("permission", &self.permission)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("disabled_tools", &self.disabled_tools)
+            .field("eager_load_tools", &self.eager_load_tools)
+            .field("tool_permissions", &self.tool_permissions)
+            .field("trust_read_only_hint", &self.trust_read_only_hint)
+            .field("disabled", &self.disabled)
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+/// Redacts `client_secret`, for the same reason as [`McpServerConfig`]'s impl. The flow's name and
+/// its `client_id` stay, because those are what an auth failure is diagnosed from.
+impl std::fmt::Debug for McpAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientCredentials {
+                client_id,
+                client_secret,
+                scopes,
+                resource,
+            } => f
+                .debug_struct("ClientCredentials")
+                .field("client_id", client_id)
+                .field(
+                    "client_secret",
+                    &format_args!("[REDACTED len={}]", client_secret.len()),
+                )
+                .field("scopes", scopes)
+                .field("resource", resource)
+                .finish(),
+            Self::ClientCredentialsJwt {
+                client_id,
+                signing_key_path,
+                signing_algorithm,
+                scopes,
+                resource,
+            } => f
+                .debug_struct("ClientCredentialsJwt")
+                .field("client_id", client_id)
+                .field("signing_key_path", signing_key_path)
+                .field("signing_algorithm", signing_algorithm)
+                .field("scopes", scopes)
+                .field("resource", resource)
+                .finish(),
+            Self::OAuth {
+                client_id,
+                client_secret,
+                scopes,
+                redirect_port,
+            } => f
+                .debug_struct("OAuth")
+                .field("client_id", client_id)
+                .field(
+                    "client_secret",
+                    &client_secret
+                        .as_ref()
+                        .map(|secret| format_args!("[REDACTED len={}]", secret.len()).to_string()),
+                )
+                .field("scopes", scopes)
+                .field("redirect_port", redirect_port)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1206,6 +1374,8 @@ pub struct ResolvedServeConfig {
     pub shutdown_drain_timeout: std::time::Duration,
     pub max_concurrent_turns: Option<usize>,
     pub max_body_bytes: usize,
+    /// Whether `/v1/docs` and `/v1/openapi.json` are served. Off unless asked for.
+    pub docs: bool,
     /// How many SSE events per turn to retain for `Last-Event-ID` replay.
     pub stream_replay_events: usize,
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
@@ -1338,6 +1508,7 @@ impl ResolvedServeConfig {
                 .unwrap_or(std::time::Duration::from_secs(30)),
             max_concurrent_turns: raw.max_concurrent_turns,
             max_body_bytes: raw.max_body_bytes.unwrap_or(10 * 1024 * 1024),
+            docs: raw.docs.unwrap_or(false),
             // Matches the broadcast channel's capacity: retaining more than the live channel can
             // buffer would let a client replay events a *connected* consumer would have been
             // dropped for missing.
@@ -1533,7 +1704,27 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
 /// on macOS and Windows, where `dirs::config_dir()` doesn't honour `XDG_CONFIG_HOME`.
 pub fn meka_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MEKA_CONFIG_DIR") {
-        return Some(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        // An empty value reads as unset rather than as the current directory. `MEKA_CONFIG_DIR=`
+        // in a shell profile, or an exported-but-unset variable in a systemd unit, made meka load
+        // `./config.toml` from whatever directory it happened to start in -- and then spawn that
+        // file's MCP servers. A relative value has the same shape of problem: which config you get
+        // depends on your cwd. `MEKA_DATA_DIR` refuses both for the same reasons, and more
+        // sharply: `meka.db` holds every provider credential.
+        if path.as_os_str().is_empty() {
+            // `warn!`, not `debug!`: an override the user set and meka did not honour is exactly
+            // the recoverable-fallback case, and the environment-variable documentation says a
+            // warning is what happens.
+            tracing::warn!("MEKA_CONFIG_DIR is empty; using the platform config directory");
+        } else if !path.is_absolute() {
+            tracing::warn!(
+                "MEKA_CONFIG_DIR '{}' is not an absolute path; ignoring it and using the platform \
+                 config directory",
+                path.display()
+            );
+        } else {
+            return Some(path);
+        }
     }
     dirs::config_dir().map(|directory| directory.join("meka"))
 }
@@ -1602,6 +1793,117 @@ fn resolve_instructions(
     Ok(crate::instructions::discover())
 }
 
+/// Resolve `path` through a final-component symlink, leaving anything else untouched.
+///
+/// Returns `path` unchanged when it is not a link, when the link cannot be read, or when the target
+/// is itself a link that leads nowhere useful: every failure mode falls back to writing where the
+/// caller asked, which is the previous behaviour. A relative link target is joined onto the link's
+/// own directory, as the OS resolves it.
+///
+/// Chains are followed to a small depth so a link-to-a-link still lands on the real file, with the
+/// bound there to stop a cycle (`a -> b -> a`) spinning.
+fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
+    const MAX_LINK_DEPTH: usize = 8;
+
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINK_DEPTH {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return current;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) => parent.join(target),
+                None => return current,
+            }
+        };
+    }
+    tracing::warn!(
+        "'{}' is a symlink chain deeper than {} links; writing to the link itself",
+        path.display(),
+        MAX_LINK_DEPTH
+    );
+    path.to_path_buf()
+}
+
+/// Exclusive cross-process lock over `config.toml`, held for a whole read-modify-write.
+///
+/// Every editor of the file reads it, mutates a `toml_edit` document, and writes the whole thing
+/// back. Two of those interleaving means the second write is computed from a snapshot taken before
+/// the first, so the first is silently discarded -- `write_file_atomic` makes each *write* atomic,
+/// which does nothing for a lost update. This is not a hypothetical race between two humans running
+/// CLI commands: `device_id::persist` runs from `ResolvedConfig::from_cli` on every start for a
+/// `claude-oauth` profile without one, so an ordinary launch races `meka mcp add`.
+///
+/// The lock lives beside the file rather than on it, because the editors replace the file by rename
+/// and a lock held on the replaced inode would guard nothing.
+/// Reentrant within a thread. `flock` is associated with the open file description, so a second
+/// `open` in the same process conflicts with the first exactly as another process would: nesting
+/// `lock_config_file()` inside a held one self-deadlocks. That nesting is real -- `meka mcp add` on
+/// an HTTPS URL holds the lock and then calls `persist_auth_block_for`, which wants it too -- so
+/// the depth is tracked and only the outermost acquisition touches the file.
+pub(crate) enum ConfigFileLock {
+    /// The outermost acquisition on this thread; owns the `flock` and releases it on drop.
+    Held {
+        _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+        _lock: Box<fd_lock::RwLock<std::fs::File>>,
+    },
+    /// A nested acquisition. The outer guard still holds the file; this one only keeps the depth
+    /// accurate so the outer release happens at the right moment.
+    Reentrant,
+}
+
+thread_local! {
+    /// How many [`ConfigFileLock`]s this thread currently holds.
+    static CONFIG_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        CONFIG_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Take [`ConfigFileLock`]. Blocks until the holder releases it, which is right for a CLI edit:
+/// the alternative is failing a `meka mcp add` because a background `device_id` write happened to
+/// be in flight.
+pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
+    if CONFIG_LOCK_DEPTH.with(|depth| depth.get()) > 0 {
+        CONFIG_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        return Ok(ConfigFileLock::Reentrant);
+    }
+
+    let directory = meka_config_dir()
+        .ok_or_else(|| std::io::Error::other("could not determine the config directory"))?;
+    std::fs::create_dir_all(&directory)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(directory.join(".config.toml.lock"))?;
+
+    let mut lock = Box::new(fd_lock::RwLock::new(file));
+    let guard = lock.write()?;
+    // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
+    // lock's heap address is stable for as long as the box lives, and the field order above drops
+    // `_guard` before `_lock`. Same shape as `SessionLock` in `crate::session`.
+    let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
+        unsafe { std::mem::transmute(guard) };
+    CONFIG_LOCK_DEPTH.with(|depth| depth.set(1));
+    Ok(ConfigFileLock::Held {
+        _guard: guard,
+        _lock: lock,
+    })
+}
+
 /// Write `content` to `path` atomically: serialise to `<path>.tmp` in the same directory,
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
 /// Unix) and chmods the final file to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
@@ -1610,8 +1912,26 @@ fn resolve_instructions(
 /// Not config-specific despite living here: the same durability and permission guarantees are what
 /// the Markdown stores under the config dir want, so `meka skill` bodies and [`crate::memory`]
 /// entries go through it too.
+///
+/// A symlinked target is followed (see [`resolve_symlink_target`]), so writing through a
+/// dotfile-manager link updates the tracked file instead of replacing the link.
 pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
+
+    // Follow a symlink to its target before choosing where to write.
+    //
+    // `rename(2)` replaces the directory entry, so renaming over a symlink destroys the link itself
+    // rather than updating what it points at. Dotfile managers (stow, chezmoi, yadm) leave
+    // `~/.config/meka/config.toml` as a link into a tracked repo, and one `meka mcp add` turned it
+    // into a plain file: the tracked copy went stale, every later edit diverged from it, and the
+    // next `stow --restow` silently reverted the lot. Resolving first keeps the write on the file
+    // the user actually manages, and the atomicity below is unaffected because the temp file is
+    // then created beside the *target*.
+    //
+    // Only the link itself is resolved, not the whole path: `canonicalize` would also resolve
+    // symlinked parent directories, which changes where the temp file lands for no benefit here.
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_path();
 
     if let Some(parent) = path.parent() {
         // Create newly-missing parents already at 0700 to avoid the umask window left by
@@ -2057,7 +2377,6 @@ impl ResolvedConfig {
             .unwrap_or_default()
             .enabled
             .unwrap_or(true);
-        let schedule = ResolvedScheduleConfig::resolve(config_file.schedule);
         let background = ResolvedBackgroundConfig::resolve(config_file.background);
         let subagents = ResolvedSubagentsConfig::resolve(config_file.subagents);
         // Destructure the [mcp] table into its two independent fields so we don't have to re-open
@@ -2180,6 +2499,10 @@ impl ResolvedConfig {
             file_permissions.default.as_deref(),
             file_permissions.enabled.as_deref(),
         );
+
+        // After `resolve_permission`, because a gate needs the level this process actually starts
+        // at: a `meka serve --permission read` must not run a gate a write-mode session authored.
+        let schedule = ResolvedScheduleConfig::resolve(config_file.schedule, permission);
 
         // Compute device_id before the struct literal so we can borrow `provider_name` and
         // `active_profile` here without conflicting with the field moves below.
@@ -2364,6 +2687,17 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
+        // `context_messages = 0` reads as "send no history", which is not a thing the provider APIs
+        // accept: a request needs at least the current user message. It also used to index one past
+        // the end of the message slice on the first turn and panic -- fatal in the REPL, and under
+        // ACP it left the client's `session/prompt` waiting forever with no response.
+        if self.context_messages == Some(0) {
+            return Err(crate::error::MekaError::Config(format!(
+                "[session].context_messages = 0 would send no conversation at all. Remove the \
+                     key for the default of {}, or set it to the number of messages to keep.",
+                DEFAULT_CONTEXT_MESSAGES
+            )));
+        }
         // `tokio::time::interval` panics on a zero period, so this would be a config value taking
         // the process down rather than a setting behaving oddly.
         if self.schedule.poll_interval.is_zero() {
@@ -2539,6 +2873,11 @@ mod device_id {
     }
 
     pub(super) fn persist(path: &Path, profile: &str, id: &str) -> std::io::Result<()> {
+        // This is the writer that made the race ordinary rather than theoretical: it runs from
+        // `ResolvedConfig::from_cli` on every start for a `claude-oauth` profile without a device
+        // id, so a plain `meka` launch competes with whatever `meka mcp add` is doing in the next
+        // terminal.
+        let _lock = super::lock_config_file()?;
         let contents = std::fs::read_to_string(path).unwrap_or_default();
         let mut doc: toml_edit::DocumentMut = contents
             .parse()
@@ -2560,7 +2899,8 @@ mod device_id {
     }
 }
 
-/// The one lock serialising every test in this crate that mutates `MEKA_CONFIG_DIR`.
+/// The one lock serialising every test in this crate that mutates `MEKA_CONFIG_DIR` or
+/// `MEKA_DATA_DIR`.
 ///
 /// The var is process-global and unit tests share a process, so a per-module lock only serialises a
 /// module against itself. Two of them are worse than none: while `src/skills/cli.rs` held its own
@@ -2573,6 +2913,98 @@ pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The redacting `Debug` impls exist to keep a secret out of a log, and until this test there
+    /// was nothing asserting any of them: all three could have been deleted and the suite would
+    /// have stayed green while `{:?}` started printing bearer tokens again.
+    #[test]
+    fn a_secret_never_reaches_a_debug_rendering() {
+        let mut server = fixture_server("s");
+        server.auth_token = Some("tok-AUTHTOKEN".to_string());
+        server.headers = Some(std::collections::HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer HEADERSECRET".to_string(),
+        )]));
+        server.env = Some(std::collections::HashMap::from([(
+            "API_KEY".to_string(),
+            "ENVSECRET".to_string(),
+        )]));
+        server.auth = Some(McpAuthConfig::ClientCredentials {
+            client_id: "public-client-id".to_string(),
+            client_secret: "CLIENTSECRET".to_string(),
+            scopes: None,
+            resource: None,
+        });
+
+        let rendered = format!("{:?}", server);
+        for secret in ["tok-AUTHTOKEN", "HEADERSECRET", "ENVSECRET", "CLIENTSECRET"] {
+            assert!(
+                !rendered.contains(secret),
+                "'{secret}' leaked into {rendered}"
+            );
+        }
+        // The names around the secrets are the diagnostic, and must survive.
+        assert!(rendered.contains("Authorization"), "{rendered}");
+        assert!(rendered.contains("API_KEY"), "{rendered}");
+        assert!(rendered.contains("public-client-id"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+
+        let oauth = McpAuthConfig::OAuth {
+            client_id: Some("public-client-id".to_string()),
+            client_secret: Some("OAUTHSECRET".to_string()),
+            scopes: None,
+            redirect_port: None,
+        };
+        let rendered = format!("{:?}", oauth);
+        assert!(!rendered.contains("OAUTHSECRET"), "{rendered}");
+
+        let serve_token = ResolvedServeToken {
+            token: "SERVETOKEN".to_string(),
+            description: None,
+            scopes: Default::default(),
+            source: TokenSource::Inline,
+        };
+        let rendered = format!("{:?}", serve_token);
+        assert!(!rendered.contains("SERVETOKEN"), "{rendered}");
+
+        // The *raw* config form too, and by the route that actually reaches a log: `ResolvedConfig`
+        // derives `Debug` and owns the whole `[serve]` table, so redacting only the resolved token
+        // left every configured bearer token one `{:?}` away. Asserting on the raw struct alone
+        // would not have caught that; this walks the containment chain.
+        let raw_token = ServeTokenConfig {
+            token: Some("RAWSERVETOKEN".to_string()),
+            token_file: None,
+            description: Some("ci".to_string()),
+            scopes: vec!["sessions:r".to_string()],
+        };
+        let rendered = format!("{:?}", raw_token);
+        assert!(!rendered.contains("RAWSERVETOKEN"), "{rendered}");
+        assert!(
+            rendered.contains("ci"),
+            "the label must survive: {rendered}"
+        );
+
+        let serve = ServeConfig {
+            tokens: Some(vec![raw_token]),
+            ..Default::default()
+        };
+        let rendered = format!("{:?}", serve);
+        assert!(
+            !rendered.contains("RAWSERVETOKEN"),
+            "a token must not reach a log through the enclosing [serve] table: {rendered}"
+        );
+
+        let webhook = WebhookConfig {
+            url: "https://example/hook".to_string(),
+            secret: Some("WEBHOOKSECRET".to_string()),
+            secret_file: None,
+            events: Vec::new(),
+            timeout: None,
+            max_retries: None,
+        };
+        let rendered = format!("{:?}", webhook);
+        assert!(!rendered.contains("WEBHOOKSECRET"), "{rendered}");
+    }
 
     fn fixture_server(name: &str) -> McpServerConfig {
         McpServerConfig {
@@ -2591,6 +3023,7 @@ mod tests {
             disabled_tools: None,
             eager_load_tools: None,
             tool_permissions: None,
+            trust_read_only_hint: None,
             disabled: false,
             required: None,
         }
@@ -3399,7 +3832,8 @@ max_consecutive_fires = 3
 "#,
         )
         .expect("failed to parse toml");
-        let schedule = ResolvedScheduleConfig::resolve(config.schedule);
+        let schedule =
+            ResolvedScheduleConfig::resolve(config.schedule, crate::permission::Permission::Write);
         assert!(schedule.enabled);
         assert_eq!(schedule.poll_interval, std::time::Duration::from_secs(5));
         assert_eq!(schedule.missed_grace, std::time::Duration::from_secs(7200));
@@ -3412,7 +3846,8 @@ max_consecutive_fires = 3
     fn test_schedule_config_defaults_are_filled_when_absent() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.schedule.is_none());
-        let schedule = ResolvedScheduleConfig::resolve(config.schedule);
+        let schedule =
+            ResolvedScheduleConfig::resolve(config.schedule, crate::permission::Permission::Write);
         assert!(schedule.enabled, "scheduling is on unless turned off");
         assert!(!schedule.poll_interval.is_zero());
         assert!(!schedule.gate_timeout.is_zero());
@@ -3690,6 +4125,34 @@ command = "ida-mcp"
     }
 
     /// Zero is "delete everything, every startup". Refuse rather than discover it after the fact.
+    /// `context_messages = 0` would send an empty conversation, which no provider accepts, and the
+    /// assembly path indexes on the assumption that the window is non-empty. Rejecting it at load
+    /// is what keeps that from becoming a panic mid-turn; nothing asserted the rejection.
+    #[test]
+    fn test_context_messages_zero_is_rejected() {
+        let resolved = resolve_with_config(
+            r#"
+default_provider = "p"
+
+[providers.p]
+type = "openai-api"
+model = "m"
+
+[session]
+context_messages = 0
+"#,
+        );
+        assert_eq!(
+            resolved.context_messages,
+            Some(0),
+            "fixture must actually set it"
+        );
+        let error = resolved
+            .validate()
+            .expect_err("context_messages = 0 must not be accepted");
+        assert!(error.to_string().contains("context_messages"), "{error}");
+    }
+
     #[test]
     fn test_retention_days_zero_is_rejected() {
         // Needs a usable provider: `validate` reports a missing one first, and rightly so - it
@@ -4410,6 +4873,140 @@ read_file = "ask"
         std::fs::write(&path, "old contents that are LONGER than the new ones").expect("seed file");
         write_file_atomic(&path, "new\n").expect("atomic overwrite");
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new\n");
+    }
+
+    /// Dotfile managers (stow, chezmoi, yadm) leave `config.toml` as a link into a tracked repo.
+    /// `rename(2)` replaces the directory entry, so writing without resolving first turned the link
+    /// into a regular file: the tracked copy went stale, every later edit diverged from it, and the
+    /// next `stow --restow` reverted them all. The write has to land on the target.
+    #[cfg(unix)]
+    /// `write_file_atomic` makes each *write* atomic, which does nothing for a lost update: two
+    /// editors that each read, mutate and write back will silently discard whichever finished
+    /// first. The lock is what makes the read and the write one critical section.
+    #[tokio::test]
+    async fn the_config_lock_serialises_a_read_modify_write() {
+        let _env = CONFIG_DIR_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // touches it and is held across the whole set → use → clear cycle.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "counter = 0\n").expect("seed");
+
+        // Each thread does the full read-modify-write under the lock. Without it the two reads
+        // race and one increment is lost; with it the file ends at 2.
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let _lock = lock_config_file().expect("lock");
+                    let contents = std::fs::read_to_string(&path).expect("read");
+                    let current: u32 = contents
+                        .trim()
+                        .strip_prefix("counter = ")
+                        .and_then(|value| value.parse().ok())
+                        .expect("parse");
+                    // Widen the window the lock has to cover, so an unlocked version loses
+                    // reliably rather than occasionally.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    write_file_atomic(&path, &format!("counter = {}\n", current + 1))
+                        .expect("write");
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+
+        let final_contents = std::fs::read_to_string(&path).expect("read");
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        assert_eq!(
+            final_contents.trim(),
+            "counter = 2",
+            "both increments must survive; one lost means the reads interleaved"
+        );
+    }
+
+    /// `flock` is per open file description, so a second `open` in the same process conflicts with
+    /// the first exactly as another process would. Nesting is not hypothetical: `meka mcp add` on
+    /// an HTTPS URL holds the lock through `run_add` and then calls `persist_auth_block_for`,
+    /// which wants it too. The first version of this lock hung there.
+    #[tokio::test]
+    async fn the_config_lock_can_be_taken_again_by_the_thread_already_holding_it() {
+        let _env = CONFIG_DIR_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // touches it and is held across the whole set -> use -> clear cycle.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+
+        let outer = lock_config_file().expect("outer");
+        let inner = lock_config_file().expect("a nested acquisition must not block");
+        drop(inner);
+        // Still held by the outer guard, so a third nested take is also fine.
+        let another = lock_config_file().expect("still reentrant");
+        drop(another);
+        drop(outer);
+
+        // Once the outermost is dropped the file is free again, so a fresh acquisition takes the
+        // real lock rather than believing it is still nested.
+        let reacquired = lock_config_file().expect("reacquire after full release");
+        assert!(matches!(reacquired, ConfigFileLock::Held { .. }));
+        drop(reacquired);
+
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+    }
+
+    // Unix-only: the body calls `std::os::unix::fs::symlink`, so without this the file does not
+    // compile on Windows at all -- taking out the `lint` and `test` jobs that CI now runs on the
+    // three-OS matrix, which is exactly the platform-only break that matrix was added to catch and
+    // which cannot be reproduced from a Linux workstation.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_writes_through_a_symlink_instead_of_replacing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("tracked.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, "old\n").expect("seed target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_file_atomic(&link, "new\n").expect("atomic write through link");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat link")
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive the write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "new\n",
+            "the tracked file is what should have changed"
+        );
+    }
+
+    /// A chain still resolves to the real file, and a cycle must not spin.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_follows_a_symlink_chain_and_survives_a_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real.toml");
+        let middle = dir.path().join("middle.toml");
+        let entry = dir.path().join("entry.toml");
+        std::fs::write(&target, "old\n").expect("seed");
+        std::os::unix::fs::symlink(&target, &middle).expect("link 1");
+        std::os::unix::fs::symlink(&middle, &entry).expect("link 2");
+
+        write_file_atomic(&entry, "new\n").expect("write through chain");
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "new\n");
+
+        // `a -> b -> a`: resolution gives up and the call still returns rather than hanging.
+        let loop_a = dir.path().join("a.toml");
+        let loop_b = dir.path().join("b.toml");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).expect("cycle a");
+        std::os::unix::fs::symlink(&loop_a, &loop_b).expect("cycle b");
+        let _ = write_file_atomic(&loop_a, "whatever\n");
     }
 
     #[cfg(unix)]

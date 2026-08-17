@@ -145,6 +145,101 @@ async fn open_read_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     }
 }
 
+/// Per-path write locks, so two tool calls that mutate the same file cannot interleave.
+///
+/// Process-global rather than a field on the tools, because the hazard belongs to the file, not to
+/// a registry: a sub-agent and its parent hold different `ToolRegistry` instances but write the
+/// same disk, and a per-registry lock would let exactly the pair that shares a workspace race.
+/// Keyed on the canonicalised path so two spellings of one file take the same lock.
+///
+/// The registry is a `std::sync::Mutex` holding only `Arc` clones -- no `.await` happens inside it,
+/// so it never blocks the runtime -- while the per-path lock is a `tokio::sync::Mutex`, since it is
+/// held across the read/modify/write awaits.
+static WRITE_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Acquire the write lock for `canonical`, creating it on first use.
+///
+/// Entries whose only remaining owner is the map are dropped on the way past, which keeps it
+/// bounded by the number of files being written *concurrently* rather than by every file the
+/// session has ever touched.
+async fn lock_path_for_write(canonical: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut registry = match WRITE_LOCKS.lock() {
+            Ok(guard) => guard,
+            // A panic while holding this map leaves only `Arc` clones behind; the data cannot be
+            // torn, so recovering is strictly better than propagating the poison into every later
+            // write.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry.retain(|_, held| Arc::strong_count(held) > 1);
+        Arc::clone(
+            registry
+                .entry(canonical.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    lock.lock_owned().await
+}
+
+/// Resolve `path` to the file a write will land on, and take that file's write lock.
+///
+/// Shared by `write_file` and `scratchpad_save_file` because they must agree on both answers. They
+/// did not: `scratchpad_save_file` carried its own copy of the path resolution and then called
+/// [`write_file_bytes`] directly, so the two took no lock in common. Both are dispatched
+/// concurrently from one assistant message and both compute a temp path from the same target, so a
+/// `write_file` and a `scratchpad_save_file` naming one file could interleave their write-then-
+/// rename and publish a spliced result.
+///
+/// The parent is created and canonicalized first, so the final open is pinned to a directory whose
+/// symlinks are already resolved and a swap of some ancestor cannot redirect it. The full path is
+/// then canonicalized when it resolves, which is what makes the lock key, the read-tracker key and
+/// the bytes on disk name the same file as `read_file` and `edit_file` do; see the comment in
+/// `WriteFileTool::execute` for what disagreeing about it cost. A path that does not resolve yet is
+/// a create and keeps the joined form: there is no link to follow, and a dangling link is replaced
+/// rather than followed, since writing through it would mean creating the file it names.
+pub(super) async fn resolve_write_target(
+    tool_name: &str,
+    cwd: &crate::workspace::SharedCwd,
+    path: &str,
+) -> Result<(std::path::PathBuf, tokio::sync::OwnedMutexGuard<()>)> {
+    let file_path = crate::workspace::resolve_against_cwd(cwd, path);
+    let file_name = file_path
+        .file_name()
+        .ok_or_else(|| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("invalid path (no file name): '{}'", path),
+        })?;
+    let parent = file_path.parent().ok_or_else(|| MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message: format!("invalid path (no parent): '{}'", path),
+    })?;
+
+    // An empty parent (a bare relative filename like "out.txt") is the current directory.
+    let parent_for_create: &Path = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    tokio::fs::create_dir_all(parent_for_create)
+        .await
+        .map_err(|error| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("failed to create directories for '{}': {}", path, error),
+        })?;
+
+    let canonical_parent = canonicalize_for_tool(tool_name, parent_for_create).await?;
+    let joined = canonical_parent.join(file_name);
+    let target = match tokio::fs::canonicalize(&joined).await {
+        Ok(resolved) => resolved,
+        Err(_not_yet_a_file) => joined,
+    };
+
+    let guard = lock_path_for_write(&target).await;
+    Ok((target, guard))
+}
+
 /// Open a file for writing (create-or-truncate) refusing to follow a symlink. A safer default than
 /// `tokio::fs::write` for paths that may race against a hostile rename. On Unix `O_NOFOLLOW` errors
 /// on a symlinked final component; on Windows the equivalent is opening the reparse point itself
@@ -192,25 +287,286 @@ async fn open_write_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     }
 }
 
+/// Ceiling on what one `read_file` will pull into memory.
+///
+/// Sits above `MAX_RESIDENT_OUTPUT_BYTES` (8 MiB) on purpose: a command's output is produced by a
+/// process meka is already streaming and can spill, while a file is read whole in one call, and the
+/// text ends up in the conversation where the window is the real limit long before this is. Any
+/// file this large is one the model wants a slice of rather than the whole of.
+const MAX_READ_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a file's bytes, bounded by [`MAX_READ_FILE_BYTES`] exactly as the text path is.
+///
+/// The image branch of `read_file` selects on the *extension* alone, so a 3 GB `.tga` of non-image
+/// data reached an unbounded `read_to_end` here, went fully resident, and only then failed
+/// `classify_bytes` and fell through to the text read -- which applies the ceiling the image path
+/// had already blown past. Same limit, same reason, on the sibling that missed it.
 pub(super) async fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut file = open_read_nofollow(path).await?;
+    let file = open_read_nofollow(path).await?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).await?;
+    // One past the cap, so hitting it exactly is distinguishable from exceeding it.
+    file.take(MAX_READ_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .await?;
+    if buffer.len() > MAX_READ_FILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "file is larger than the {} MiB read ceiling",
+            MAX_READ_FILE_BYTES / (1024 * 1024)
+        )));
+    }
     Ok(buffer)
 }
 
+/// Read at most [`MAX_READ_FILE_BYTES`], erroring rather than filling memory.
+///
+/// The cancellation race at the call site makes a `/dev/zero` read *interruptible*; it does not
+/// make it *bounded*, and an unattended `serve` or ACP session has nobody to press stop. A cap is
+/// what turns "the process died" into "the tool said no", and the model can act on the second.
+///
+/// Reads one byte past the cap so hitting it exactly is distinguishable from exceeding it.
 async fn read_file_to_string(path: &Path) -> std::io::Result<String> {
-    let mut file = open_read_nofollow(path).await?;
+    let file = open_read_nofollow(path).await?;
     let mut buffer = String::new();
-    file.read_to_string(&mut buffer).await?;
+    let read = file
+        .take(MAX_READ_FILE_BYTES as u64 + 1)
+        .read_to_string(&mut buffer)
+        .await?;
+    if read > MAX_READ_FILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "file is larger than the {} MiB read_file ceiling; pass offset and limit to read it a \
+             window at a time, or use execute_command with a tool that streams (head, tail, grep, \
+             sed)",
+            MAX_READ_FILE_BYTES / (1024 * 1024),
+        )));
+    }
     Ok(buffer)
 }
 
+/// Describe a window read out of a file too large to hold, in the same terms the in-memory path
+/// uses, so the model cannot tell which route answered it apart from the extra ceiling note.
+fn render_windowed_read(
+    path: &str,
+    window: String,
+    offset: usize,
+    total_lines: usize,
+    cut_by_ceiling: bool,
+) -> String {
+    let shown_lines = if window.is_empty() {
+        0
+    } else {
+        window.lines().count()
+    };
+    if shown_lines == 0 {
+        // Two different facts, and the ceiling one used to be reported as the other. A minified
+        // JSON blob or a base64 capture is one enormous line, so the window is empty because that
+        // single line does not fit, not because the offset ran off the end -- and answering "offset
+        // 0 is past the end of a file which has 1 line" is both self-contradictory and reads as
+        // "unreadable" when the truth is "ask for it differently".
+        if cut_by_ceiling {
+            return format!(
+                "(no lines: the first line at offset {} of '{}' is itself larger than the {} MiB \
+                 read_file ceiling, so no whole line fits; use execute_command with a tool that \
+                 slices by bytes, such as head -c or cut)",
+                offset,
+                path,
+                MAX_READ_FILE_BYTES / (1024 * 1024),
+            );
+        }
+        return format!(
+            "(no lines: offset {} is past the end of '{}', which has {} line{})",
+            offset,
+            path,
+            total_lines,
+            if total_lines == 1 { "" } else { "s" },
+        );
+    }
+
+    let last_shown = offset.saturating_add(shown_lines);
+    let mut rendered = window;
+    if cut_by_ceiling {
+        rendered.push_str(&format!(
+            "\n\n... (showing lines {}-{} of {}; the window stopped at the {} MiB read_file \
+             ceiling, so ask for fewer lines to see the rest)",
+            offset.saturating_add(1),
+            last_shown,
+            total_lines,
+            MAX_READ_FILE_BYTES / (1024 * 1024),
+        ));
+    } else if last_shown < total_lines {
+        rendered.push_str(&format!(
+            "\n\n... (showing lines {}-{} of {}, use offset/limit to read more)",
+            offset.saturating_add(1),
+            last_shown,
+            total_lines,
+        ));
+    }
+    rendered
+}
+
+/// Read one line window out of a file, streaming past everything outside it.
+///
+/// Returns the window, the file's total line count, and whether the window itself was cut short by
+/// the residency ceiling.
+///
+/// The ceiling bounds what this *keeps*, not how large a file it will look at, and that difference
+/// is the point. Applying it to the file's size instead made a capture larger than the ceiling
+/// unreadable by any means -- while `execute_command`'s own spill notice was telling the model the
+/// file was "still reachable with `read_file`", and the shell docs said so too. A window is a
+/// bounded amount of memory whatever the file's size, so refusing one bought nothing and cost the
+/// model the only route to its own captured output.
+async fn read_file_window(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+) -> std::io::Result<(String, usize, bool)> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = open_read_nofollow(path).await?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut window = String::new();
+    let mut total_lines = 0usize;
+    let mut cut_by_ceiling = false;
+
+    while let Some(line) = lines.next_line().await? {
+        let inside_window = total_lines >= offset && total_lines - offset < limit;
+        if inside_window && !cut_by_ceiling {
+            // `+ 1` for the separator this line would carry.
+            if window.len() + line.len() + 1 > MAX_READ_FILE_BYTES {
+                cut_by_ceiling = true;
+            } else {
+                if !window.is_empty() {
+                    window.push('\n');
+                }
+                window.push_str(&line);
+            }
+        }
+        total_lines += 1;
+    }
+
+    Ok((window, total_lines, cut_by_ceiling))
+}
+
+/// Replace `path`'s contents atomically: write a sibling temp file, fsync it, then rename over the
+/// target.
+///
+/// The previous shape opened the target with `truncate(true)` and streamed the new bytes in, so the
+/// window between the truncate and the last write had the file at zero length with the original
+/// content existing nowhere. A full disk, a kill, or a power loss in that window destroyed the
+/// user's file and left `edit_file` reporting `No space left on device` about content that had been
+/// in memory a microsecond earlier.
+///
+/// Rename preserves the `O_NOFOLLOW` guarantee rather than weakening it: `rename(2)` acts on the
+/// directory entry, so a symlink swapped in at the final component is *replaced*, not written
+/// through. The temp file is created in the target's own directory so the rename stays within one
+/// filesystem (a cross-device rename fails with `EXDEV`).
+///
+/// On failure the temp file is removed; leaving `foo.txt.meka-tmp-…` beside a file the write did
+/// not touch would be its own small confusion.
 pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let mut file = open_write_nofollow(path).await?;
-    file.write_all(bytes).await?;
-    file.flush().await
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    // The pid keeps two meka processes writing the same path from colliding on the temp name; the
+    // per-path lock only serialises within this one.
+    let temp_path = parent.join(format!(".{}.meka-tmp-{}", file_name, std::process::id()));
+
+    // Carry the target's mode across the rename.
+    //
+    // `rename(2)` replaces the inode, so the new file keeps the *temp* file's permissions, which
+    // `open_write_nofollow` creates at `0o666 & ~umask` -- typically 0644. Before this function
+    // wrote through a temp file it opened the target in place, so the mode was preserved for free.
+    // Without this, `edit_file` on a 0600 secret returns it world-readable and reports success, and
+    // on a 0755 script returns it non-executable. `config::write_file_atomic` sets its temp mode
+    // explicitly for the same reason.
+    //
+    // Read before the write so a concurrent chmod loses the race rather than being half-applied.
+    // A target that does not exist yet has no mode to carry; the umask default is correct there.
+    #[cfg(unix)]
+    let existing_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|metadata| metadata.permissions().mode())
+    };
+
+    // `open_write_nofollow` on the temp path: it is ours and should not exist, but a symlink
+    // planted at that name would otherwise be written through.
+    let write_result = async {
+        let mut file = open_write_nofollow(&temp_path).await?;
+        // Born at the target's mode, not merely renamed into it.
+        //
+        // The mode was applied to the temp file after `sync_all`, which is early enough that the
+        // *published* path is never wrong -- but the temp file itself sits in the target's own
+        // directory holding the full plaintext, and until that call it is `0o666 & ~umask`, i.e.
+        // 0644 by default. Editing a 0600 secret in a 0755 directory therefore left its contents
+        // world-readable for the whole write plus an fsync. Narrowing first and keeping the
+        // post-write call means the window never opens, whichever order the filesystem completes
+        // in.
+        #[cfg(unix)]
+        if let Some(mode) = existing_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await?;
+        }
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        // Durability before visibility: without this the rename can be recorded while the data is
+        // still only in the page cache, so a crash leaves an intact directory entry pointing at an
+        // empty or partial file -- the exact loss this function exists to prevent.
+        file.sync_all().await
+    }
+    .await;
+
+    if let Err(error) = write_result {
+        if let Err(cleanup) = tokio::fs::remove_file(&temp_path).await {
+            tracing::debug!(
+                "failed to remove temp file '{}': {}",
+                temp_path.display(),
+                cleanup
+            );
+        }
+        return Err(error);
+    }
+
+    // Applied to the temp file, before the rename, so the target is never briefly visible at the
+    // wrong mode.
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            tokio::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(mode)).await
+        {
+            // Refuse rather than publish the file at a looser mode than it had. The caller sees a
+            // failed write on a target that still holds its original content, which is recoverable;
+            // a silently world-readable secret is not.
+            if let Err(cleanup) = tokio::fs::remove_file(&temp_path).await {
+                tracing::debug!(
+                    "failed to remove temp file '{}': {}",
+                    temp_path.display(),
+                    cleanup
+                );
+            }
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = tokio::fs::rename(&temp_path, path).await {
+        if let Err(cleanup) = tokio::fs::remove_file(&temp_path).await {
+            tracing::debug!(
+                "failed to remove temp file '{}': {}",
+                temp_path.display(),
+                cleanup
+            );
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 /// Which filesystem one file tool call is operating through.
@@ -263,18 +619,19 @@ impl FileRoute {
 
 /// Local `old_text` for `write_file`'s diff metadata. A missing file is a create, not a failure,
 /// and any other read error only costs the diff its "before" side, so neither is propagated.
-async fn local_old_text(target: &Path) -> Option<String> {
+/// The file's current contents: `Ok(None)` when it does not exist, `Err` when it exists and cannot
+/// be read.
+///
+/// The two used to collapse to `None`, and the staleness guard runs only on `Some` -- so a file
+/// that exists but cannot be re-read (past the 16 MiB ceiling, or not valid UTF-8) skipped the
+/// check entirely and was overwritten from a stale copy without a word. That is fail-open on
+/// exactly the files where a blind overwrite costs most. `edit_file` refuses when it cannot verify;
+/// this is the same posture, and `force` remains the escape hatch for both.
+async fn local_old_text(target: &Path) -> std::result::Result<Option<String>, std::io::Error> {
     match read_file_to_string(target).await {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            tracing::debug!(
-                "write_file: local pre-read of '{}' failed ({}); diff metadata will omit old_text",
-                target.display(),
-                error,
-            );
-            None
-        }
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -307,6 +664,10 @@ async fn apply_write(
     if route.is_delegated() {
         match frontend.delegate_fs_write(target, content).await {
             Some(Ok(())) => return Ok(FileRoute::Delegated),
+            // Stopping the turn is not the client failing, and it is emphatically not a reason to
+            // write the file locally instead: the editor may hold unsaved changes this content was
+            // never diffed against.
+            Some(Err(error)) if error.is_cancelled() => return Err(MekaError::Interrupted),
             // The client serves this path, so a write failure is never a reason to write behind
             // its back: it may be about to show the user its own view of the file.
             Some(Err(error)) => {
@@ -334,7 +695,7 @@ async fn apply_write(
 
 pub(super) struct ReadFileTool {
     pub read_tracker: ReadTracker,
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// When the connected ACP client advertises `fs.read_text_file`, plain-text reads are
     /// delegated to the editor's hosted filesystem so it can serve the in-buffer view of the
     /// file rather than the on-disk bytes. `None` (no delegate) and a delegate failure that
@@ -374,7 +735,7 @@ impl Tool for ReadFileTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to read. Optional."
+                        "description": "Maximum number of lines to read. Optional; defaults to 2000, and a read that is cut short says so."
                     },
                     "regex": {
                         "type": "string",
@@ -403,7 +764,7 @@ impl Tool for ReadFileTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let path = input["path"]
             .as_str()
@@ -413,7 +774,7 @@ impl Tool for ReadFileTool {
             })?
             .to_string();
 
-        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
+        let resolved = crate::workspace::resolve_against_cwd(&self.cwd, &path);
         let canonical = canonicalize_for_tool("read_file", &resolved).await?;
 
         // Detect image files and return multimodal content, converting non-native formats (TIFF,
@@ -429,13 +790,18 @@ impl Tool for ReadFileTool {
             .unwrap_or(ImageHandling::Unsupported);
 
         if !matches!(handling, ImageHandling::Unsupported) {
-            let data =
-                read_file_bytes(&canonical)
-                    .await
-                    .map_err(|error| MekaError::ToolExecution {
-                        tool_name: "read_file".to_string(),
-                        message: format!("failed to read '{}': {}", path, error),
-                    })?;
+            // Raced against the token for the same reason the text read is: the bound above stops
+            // this filling memory, but on a slow or blocking path (a fuse mount, a device file with
+            // an image extension) it is still the thing standing between a stop keypress and the
+            // turn ending.
+            let data = tokio::select! {
+                _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                read = read_file_bytes(&canonical) => read,
+            }
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "read_file".to_string(),
+                message: format!("failed to read '{}': {}", path, error),
+            })?;
 
             // The extension only gates whether to *try* the image path; the bytes decide both the
             // media type and whether this is an image at all. A `.png` holding something else
@@ -443,7 +809,19 @@ impl Tool for ReadFileTool {
             // reject, and a `.png` holding a JPEG is labelled `image/jpeg`.
             let sniffed = crate::image::classify_bytes(&data);
             if !matches!(sniffed, ImageHandling::Unsupported) {
-                let (media_type, payload) = match prepare_image_payload(sniffed, &data) {
+                // Decoding and re-encoding a multi-megapixel image is tens of milliseconds of pure
+                // CPU, and on the runtime it blocks every other task on that worker: a `serve`
+                // process would stall unrelated sessions' streams behind one agent's screenshot.
+                let prepared = tokio::task::spawn_blocking({
+                    let data = data.clone();
+                    move || prepare_image_payload(sniffed, &data)
+                })
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "read_file".to_string(),
+                    message: format!("image decode task failed: {}", error),
+                })?;
+                let (media_type, payload) = match prepared {
                     Ok(pair) => pair,
                     Err(message) => {
                         return Ok(ToolOutput::text(
@@ -496,77 +874,113 @@ impl Tool for ReadFileTool {
         // read in terms `edit_file`'s freshness check could not compare against that buffer, so on
         // the common find-then-edit path the check silently skipped. Image reads stay local: they
         // are bytes, not text, and nothing edits them.
-        {
-            // The whole file for a regex read, which is a search and has no business being
-            // windowed; otherwise mirror the local fallback's `DEFAULT_LINE_LIMIT` so the delegate
-            // path can't pull an unbounded file into the agent's context when the caller passed no
-            // limit. Without that, an `fs.read_text_file`-capable client (e.g. Zed) returns the
-            // whole file while the local path would cap at 2000 lines with a truncation marker:
-            // divergent behavior + context-window risk.
-            let (delegate_line, delegate_limit) = match regex {
-                Some(_) => (None, None),
-                None => (
-                    offset.map(|o| u32::try_from(o.saturating_add(1)).unwrap_or(u32::MAX)),
-                    Some(
-                        limit
-                            .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
-                            .unwrap_or(DEFAULT_LINE_LIMIT as u32),
-                    ),
-                ),
-            };
-            match self
-                .frontend
-                .delegate_fs_read(&canonical, delegate_line, delegate_limit)
-                .await
-            {
-                Some(Ok(content)) => {
-                    record_delegated_read(&self.read_tracker, canonical, &content).await;
-                    return match regex {
-                        Some(pattern) => search_lines(&content, pattern, "read_file"),
-                        None => Ok(ToolOutput::text(content, false)),
-                    };
-                }
-                // The client will not serve this path, so it holds no buffer for it either: the
-                // local bytes are not a degraded substitute for the delegate's view, they are the
-                // same view. Fall through and read them, rather than turning a readable file into
-                // a tool error -- which is what made skills, prompts, and configuration
-                // unreadable under ACP.
-                Some(Err(error)) if error.is_unservable_path() => {
-                    tracing::debug!(
-                        "read_file: client cannot serve '{}' ({}); reading it locally",
-                        canonical.display(),
-                        error,
-                    );
-                }
-                // Any other failure leaves open that the client owns this file and has unsaved
-                // changes in it. Reading disk bytes would silently hand the model a stale view of
-                // a file the user is editing, so surface the failure instead.
-                Some(Err(error)) => {
-                    return Err(MekaError::ToolExecution {
-                        tool_name: "read_file".to_string(),
-                        message: format!("failed to read '{}': {}", path, error),
-                    });
-                }
-                None => {}
+        // The delegate is asked for the whole document, never a window, and the windowing below is
+        // applied to what it returns. Asking it for the window directly cost two things: the
+        // freshness stamp recorded the *slice*, so every later `edit_file` compared it against the
+        // whole buffer and reported a false "changed in the editor"; and a cut at exactly `limit`
+        // lines was indistinguishable from a file that happened to end there, so it was returned
+        // with no truncation notice at all. The local route reads the whole file too, so the two
+        // now agree on both.
+        let delegated = match self.frontend.delegate_fs_read(&canonical, None, None).await {
+            Some(Ok(content)) => Some(content),
+            // The client will not serve this path, so it holds no buffer for it either: the local
+            // bytes are not a degraded substitute for the delegate's view, they are the same view.
+            // Fall through and read them, rather than turning a readable file into a tool error --
+            // which is what made skills, prompts, and configuration unreadable under ACP.
+            Some(Err(error)) if error.is_unservable_path() => {
+                tracing::debug!(
+                    "read_file: client cannot serve '{}' ({}); reading it locally",
+                    canonical.display(),
+                    error,
+                );
+                None
             }
-        }
-
-        let content =
-            read_file_to_string(&canonical)
-                .await
-                .map_err(|error| MekaError::ToolExecution {
+            // The turn was stopped while the client had the request. Reading locally instead would
+            // be answering a question the user withdrew.
+            Some(Err(error)) if error.is_cancelled() => return Err(MekaError::Interrupted),
+            // Any other failure leaves open that the client owns this file and has unsaved changes
+            // in it. Reading disk bytes would silently hand the model a stale view of a file the
+            // user is editing, so surface the failure instead.
+            Some(Err(error)) => {
+                return Err(MekaError::ToolExecution {
                     tool_name: "read_file".to_string(),
                     message: format!("failed to read '{}': {}", path, error),
-                })?;
+                });
+            }
+            None => None,
+        };
+
+        let content = match delegated {
+            Some(content) => {
+                record_delegated_read(&self.read_tracker, canonical.clone(), &content).await;
+                content
+            }
+            None => {
+                // A file past the ceiling is still readable a window at a time. Only this case
+                // diverts: everything that fits is read whole, so the verbatim-CRLF return and the
+                // freshness stamp below behave exactly as they did.
+                if regex.is_none()
+                    && (offset.is_some() || limit.is_some())
+                    && tokio::fs::metadata(&canonical)
+                        .await
+                        .is_ok_and(|metadata| metadata.len() > MAX_READ_FILE_BYTES as u64)
+                {
+                    let start = offset.unwrap_or(0);
+                    let span = limit.unwrap_or(DEFAULT_LINE_LIMIT);
+                    let (window, total_lines, cut_by_ceiling) = tokio::select! {
+                        _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                        result = read_file_window(&canonical, start, span) => {
+                            result.map_err(|error| MekaError::ToolExecution {
+                                tool_name: "read_file".to_string(),
+                                message: format!("failed to read '{}': {}", path, error),
+                            })?
+                        }
+                    };
+                    // Deliberately not stamped for freshness: this read saw a window, and a stamp
+                    // taken from one would make every later `edit_file` on the file report a false
+                    // change. The whole-document stamping the delegated path does exists for the
+                    // same reason, and a file this size is not an edit target anyway.
+                    return Ok(ToolOutput::text(
+                        render_windowed_read(&path, window, start, total_lines, cut_by_ceiling),
+                        false,
+                    ));
+                }
+
+                // Raced against cancellation because a path can be a device rather than a file:
+                // `read_file("/dev/zero")` never returns, and without this the tool ignored the
+                // turn's token and Ctrl+C alike, leaving the read running for the life of the
+                // process while it consumed memory.
+                let content = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                    result = read_file_to_string(&canonical) => {
+                        result.map_err(|error| MekaError::ToolExecution {
+                            tool_name: "read_file".to_string(),
+                            message: format!("failed to read '{}': {}", path, error),
+                        })?
+                    }
+                };
+                record_read(&self.read_tracker, canonical).await;
+                content
+            }
+        };
 
         if let Some(pattern) = regex {
-            record_read(&self.read_tracker, canonical).await;
             return search_lines(&content, pattern, "read_file");
         }
 
         let total_lines = content.lines().count();
         let effective_offset = offset.unwrap_or(0);
         let effective_limit = limit.unwrap_or(DEFAULT_LINE_LIMIT);
+
+        // A read that shows the whole file returns it verbatim, because the windowing below is also
+        // a normalisation: `lines()` drops `\r` and `join("\n")` drops the trailing newline. The
+        // model then copies an `old_string` out of LF text and `edit_file` cannot find it in the
+        // CRLF file it is actually editing -- a "not found" whose cause is invisible in both the
+        // read and the edit. Windowed reads still normalise; there is no way to slice lines and
+        // keep their terminators without deciding which one each line ended with.
+        if effective_offset == 0 && total_lines <= effective_limit {
+            return Ok(ToolOutput::text(content, false));
+        }
 
         let result: String = content
             .lines()
@@ -575,16 +989,42 @@ impl Tool for ReadFileTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let result = if offset.is_none() && limit.is_none() && total_lines > DEFAULT_LINE_LIMIT {
+        // Disclose the cut whenever one happened, not only for a bare `read_file`.
+        //
+        // `effective_limit` defaults to `DEFAULT_LINE_LIMIT` regardless of whether `offset` was
+        // given, but the notice used to be gated on *both* being absent -- so
+        // `read_file({path, offset: 0})` on a 50,000-line log returned exactly 2,000 lines, with no
+        // marker and no line count, and the model answered "the log contains no errors" from four
+        // percent of the file. This is the failure the `find_files` / `search_contents` disclosures
+        // exist to prevent; a definitive-sounding answer drawn from a silent truncation is worse
+        // than an error.
+        let shown_lines = result.lines().count();
+        // An offset past the end returns nothing, and nothing reads as "the file is empty" -- which
+        // is a different fact, and the one the model will act on. Say which it is.
+        if shown_lines == 0 && effective_offset >= total_lines {
+            return Ok(ToolOutput::text(
+                format!(
+                    "(no lines: offset {} is past the end of '{}', which has {} line{})",
+                    effective_offset,
+                    path,
+                    total_lines,
+                    if total_lines == 1 { "" } else { "s" },
+                ),
+                false,
+            ));
+        }
+        let last_shown = effective_offset.saturating_add(shown_lines);
+        let result = if last_shown < total_lines {
             format!(
-                "{}\n\n... (showing first {} of {} lines, use offset/limit to read more)",
-                result, DEFAULT_LINE_LIMIT, total_lines,
+                "{}\n\n... (showing lines {}-{} of {}, use offset/limit to read more)",
+                result,
+                effective_offset.saturating_add(1),
+                last_shown,
+                total_lines,
             )
         } else {
             result
         };
-
-        record_read(&self.read_tracker, canonical).await;
 
         Ok(ToolOutput::text(result, false))
     }
@@ -592,7 +1032,7 @@ impl Tool for ReadFileTool {
 
 pub(super) struct EditFileTool {
     pub read_tracker: ReadTracker,
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// Read + write both go through the frontend so the editor can apply the edit in-buffer (Zed's
     /// apply-diff UI). `None` from the frontend means "fall back to local I/O".
     pub frontend: Arc<dyn crate::frontend::Frontend>,
@@ -713,8 +1153,19 @@ impl Tool for EditFileTool {
 
         // Canonicalize once. All subsequent I/O goes through this path so a symlink swap between
         // the tracker check and the actual read/write can't redirect us onto a different file.
-        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
+        let resolved = crate::workspace::resolve_against_cwd(&self.cwd, &path);
         let canonical = canonicalize_for_tool("edit_file", &resolved).await?;
+
+        // Serialise everything from here to the write against other writers of this same file.
+        //
+        // An edit is read → check-freshness → modify → write with `.await` at every step, and the
+        // agent dispatches all the tool calls in one assistant message concurrently
+        // (`futures::future::join_all`). Two `edit_file` calls on one file therefore both read the
+        // original, both pass the freshness gate (the tracker stamp is still the pre-edit one for
+        // both), and the second write silently discards the first -- while *both* results report
+        // success and show a context snippet proving the change landed. The freshness machinery
+        // cannot catch this on its own: it compares against a stamp taken before either write.
+        let _write_guard = lock_path_for_write(&canonical).await;
 
         // Bound the guard to a `let` rather than matching on it directly: a temporary in a match
         // scrutinee lives for the whole match, which would hold the lock across the `of_path` await
@@ -749,6 +1200,9 @@ impl Tool for EditFileTool {
                     FileRoute::LocalUnservable,
                 )
             }
+            // The turn was stopped mid-request. Same short-circuit as below, reported as the stop
+            // it is.
+            Some(Err(error)) if error.is_cancelled() => return Err(MekaError::Interrupted),
             // Any other failure has to short-circuit. The client may own this file and hold
             // unsaved changes; diffing against on-disk bytes and then writing the result
             // through the delegate would overwrite the user's unsaved work with an edit
@@ -782,11 +1236,23 @@ impl Tool for EditFileTool {
         }
 
         if !content.contains(&old_string) {
+            // Name the line endings when they are the likely cause. A windowed `read_file` shows
+            // the model LF text, so an `old_string` spanning a line break will not match a CRLF
+            // file, and nothing in a bare "not found" points at an invisible difference.
+            let crlf_hint = if content.contains("\r\n")
+                && old_string.contains('\n')
+                && !old_string.contains("\r\n")
+            {
+                " (this file uses CRLF line endings; old_string uses LF)"
+            } else {
+                ""
+            };
             return Ok(ToolOutput::text(
                 format!(
-                    "Error: '{}' not found in '{}'",
+                    "Error: '{}' not found in '{}'{}",
                     truncate_string(&old_string, 100),
-                    path
+                    path,
+                    crlf_hint
                 ),
                 true,
             ));
@@ -898,7 +1364,7 @@ pub(super) struct WriteFileTool {
     /// redundant `read_file` or `force: true`; the agent obviously knows the content it just
     /// wrote.
     pub read_tracker: ReadTracker,
-    pub cwd: crate::agent::SharedCwd,
+    pub cwd: crate::workspace::SharedCwd,
     /// Write step is delegated to the editor's filesystem so the apply-diff UI sees the new
     /// content alongside the `tool_call_update`'s diff. `None` from the frontend means "fall
     /// back to local write".
@@ -922,6 +1388,10 @@ impl Tool for WriteFileTool {
                         "type": "string",
                         "description": "The content to write to the file"
                     },
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true, overwrite an existing file even if it changed since it was read. Defaults to false."
+                    },
                     "scratchpad": {
                         "type": "string",
                         "description": "If provided, save the output to the scratchpad under this name instead of returning it inline."
@@ -944,40 +1414,9 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput> {
         let path = require_str(&input, "path", "write_file")?;
         let content = require_str(&input, "content", "write_file")?;
+        let force = input["force"].as_bool().unwrap_or(false);
 
-        // The target file may not exist yet, so we canonicalize the *parent* directory and re-join
-        // the filename. This pins the final open to a directory whose symlinks have been resolved,
-        // closing the window where a symlink-pointing-at-a-parent swap could redirect the write.
-        // The per-file `O_NOFOLLOW` in `write_file_bytes` then prevents a last-component symlink
-        // swap.
-        let file_path = crate::agent::resolve_against_cwd(&self.cwd, &path);
-        let file_name = file_path
-            .file_name()
-            .ok_or_else(|| MekaError::ToolExecution {
-                tool_name: "write_file".to_string(),
-                message: format!("invalid path (no file name): '{}'", path),
-            })?;
-        let parent = file_path.parent().ok_or_else(|| MekaError::ToolExecution {
-            tool_name: "write_file".to_string(),
-            message: format!("invalid path (no parent): '{}'", path),
-        })?;
-
-        // Treat an empty parent (relative filename like "out.txt") as the current directory; this
-        // matches the previous `tokio::fs::write` behavior for bare filenames.
-        let parent_for_create: &Path = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        tokio::fs::create_dir_all(parent_for_create)
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "write_file".to_string(),
-                message: format!("failed to create directories for '{}': {}", path, error),
-            })?;
-
-        let canonical_parent = canonicalize_for_tool("write_file", parent_for_create).await?;
-        let target = canonical_parent.join(file_name);
+        let (target, _write_guard) = resolve_write_target("write_file", &self.cwd, &path).await?;
 
         // Snapshot the existing content (if any) so frontends can render a proper diff. `None`
         // means the file did not exist (this is a create); we use the `not_found` ErrorKind to
@@ -1013,7 +1452,8 @@ impl Tool for WriteFileTool {
                 } else {
                     Some(text)
                 };
-                (old, FileRoute::Delegated)
+                // The client served it, so there is nothing unreadable to refuse over.
+                (Ok(old), FileRoute::Delegated)
             }
             Some(Err(error)) if error.is_unservable_path() => {
                 tracing::debug!(
@@ -1023,6 +1463,9 @@ impl Tool for WriteFileTool {
                 );
                 (local_old_text(&target).await, FileRoute::LocalUnservable)
             }
+            // Not a degraded probe: the user stopped the turn, so there is no write to do. Falling
+            // through here would carry on and write the file after the stop.
+            Some(Err(error)) if error.is_cancelled() => return Err(MekaError::Interrupted),
             // The client did not disown the path, it just failed this probe. The write still goes
             // to it; only the diff's `old_text` is degraded, and that is informational.
             Some(Err(error)) => {
@@ -1036,6 +1479,48 @@ impl Tool for WriteFileTool {
             }
             None => (local_old_text(&target).await, FileRoute::Local),
         };
+
+        // A file that exists but could not be read is refused rather than silently overwritten.
+        let old_text = match old_text {
+            Ok(text) => text,
+            Err(error) if force => {
+                tracing::debug!(
+                    "write_file: '{}' could not be pre-read ({}); force was set, writing anyway",
+                    target.display(),
+                    error,
+                );
+                None
+            }
+            Err(error) => {
+                return Ok(ToolOutput::text(
+                    format!(
+                        "Error: '{}' exists but its current contents could not be read ({}), so \
+                         meka cannot tell whether it changed since you last read it. Overwriting \
+                         it blind could discard someone else's edit. Pass force to write anyway.",
+                        path, error
+                    ),
+                    true,
+                ));
+            }
+        };
+
+        // Refuse to clobber a file that changed since the agent last read it.
+        //
+        // `edit_file` has always done this; `write_file` consulted the read tracker only to
+        // *insert* into it, never to check. So the model reading `config.toml`, the user
+        // editing and saving it, and the model then writing the whole file back from its
+        // now-stale copy overwrote the user's change with no error, no warning and no
+        // re-read prompt -- while the identical change routed through `edit_file` would
+        // have been refused. Creating a new file stays unguarded (there is nothing to
+        // lose), and `force` is the same escape hatch.
+        if !force && let Some(existing) = old_text.as_deref() {
+            let recorded = self.read_tracker.read().await.get(&target).copied();
+            if let Some(stale) =
+                stale_read_complaint(recorded, route, existing, &target, &path).await
+            {
+                return Ok(ToolOutput::text(stale, true));
+            }
+        }
 
         // Write through whichever filesystem the probe selected. Same shape as `edit_file`.
         let route = apply_write(
@@ -1146,6 +1631,21 @@ mod tests {
             }
         }
 
+        /// A client that owns the path and was still holding the request when the user pressed
+        /// stop, so no answer is coming. What `AcpFrontend::until_cancelled` reports.
+        fn cancelled(buffer: Option<&str>) -> Self {
+            Self {
+                read: Some(Err(crate::frontend::FrontendError::cancelled(
+                    "fs/read_text_file",
+                ))),
+                write: Some(Err(crate::frontend::FrontendError::cancelled(
+                    "fs/write_text_file",
+                ))),
+                buffer: std::sync::Mutex::new(buffer.map(str::to_string)),
+                delegated_writes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
         /// Someone else changes the document: the user typing, or the editor reloading a file that
         /// was rewritten underneath it.
         fn set_buffer(&self, text: &str) {
@@ -1197,6 +1697,89 @@ mod tests {
         }
     }
 
+    /// Reports how many tool calls are inside the tool body at once. Every `edit_file` consults
+    /// the delegate after it has taken the path lock, so a count taken here is a count taken
+    /// where the lock is supposed to have serialised things. Answers `None`, leaving the edit to
+    /// read locally exactly as `SilentFrontend` does.
+    #[derive(Default)]
+    struct ConcurrencyProbeFrontend {
+        inside: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::frontend::Frontend for ConcurrencyProbeFrontend {
+        async fn emit(&self, _event: crate::frontend::FrontendEvent) {}
+
+        async fn request_permission(
+            &self,
+            _request: crate::frontend::PermissionRequest,
+        ) -> crate::frontend::PermissionOutcome {
+            crate::frontend::PermissionOutcome::Allow
+        }
+
+        async fn delegate_fs_read(
+            &self,
+            _path: &Path,
+            _line: Option<u32>,
+            _limit: Option<u32>,
+        ) -> Option<std::result::Result<String, crate::frontend::FrontendError>> {
+            use std::sync::atomic::Ordering;
+            let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Long enough that the other call is certainly polled while this one is parked here,
+            // so a missing lock shows up as a peak of two rather than as a lost race.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.inside.fetch_sub(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// The lost-edit test above passes with the path lock removed, because the freshness check
+    /// catches the interleaving it happens to produce: the first write lands before the second
+    /// read, so the second edit is refused as stale. The freshness check cannot catch the other
+    /// one, where both edits read and both pass the gate before either writes -- the recorded
+    /// stamp is the pre-edit one for both, so both are judged fresh and the second write
+    /// discards the first. Only the lock closes that, so pin the lock rather than the symptom:
+    /// while one edit is inside the tool body, no second edit may enter it.
+    #[tokio::test]
+    async fn one_edit_holds_the_path_until_it_is_done_with_it() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("shared.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+        let probe = Arc::new(ConcurrencyProbeFrontend::default());
+        let make_tool = || EditFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: probe.clone(),
+        };
+        let path_arg = file_path.to_str().expect("path").to_string();
+
+        let tool_one = make_tool();
+        let tool_two = make_tool();
+        let (first, second) = tokio::join!(
+            tool_one.execute(
+                serde_json::json!({"path": path_arg, "old_string": "alpha", "new_string": "ALPHA"}),
+                CancellationToken::new(),
+            ),
+            tool_two.execute(
+                serde_json::json!({"path": path_arg, "old_string": "beta", "new_string": "BETA"}),
+                CancellationToken::new(),
+            ),
+        );
+        first.expect("first edit");
+        second.expect("second edit");
+
+        assert_eq!(
+            probe.peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two edits on one path were inside the tool body at the same time",
+        );
+    }
+
     #[tokio::test]
     async fn test_read_file() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -1205,7 +1788,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1232,7 +1815,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
         };
         let result = tool
@@ -1257,7 +1840,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(ScriptedDelegateFrontend::transient()),
         };
         let error = tool
@@ -1268,6 +1851,56 @@ mod tests {
             .await
             .expect_err("a transient delegate failure must not silently read stale bytes");
         assert!(error.to_string().contains("Internal error"), "{}", error);
+    }
+
+    /// The agent dispatches every tool call in one assistant message concurrently, so two
+    /// `edit_file` calls on the same file used to both read the original, both pass the freshness
+    /// gate against a stamp taken before either wrote, and the second write discarded the first --
+    /// with both results reporting success. Serialising them means the loser sees the winner's
+    /// content: either it applies on top, or its `old_string` no longer matches and it says so.
+    /// Silently reporting two successes for one surviving edit is the outcome ruled out.
+    #[tokio::test]
+    async fn concurrent_edits_to_one_file_cannot_both_report_success_and_lose_one() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("shared.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+        let make_tool = || EditFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let path_arg = file_path.to_str().expect("path").to_string();
+
+        let tool_one = make_tool();
+        let tool_two = make_tool();
+        let (first, second) = tokio::join!(
+            tool_one.execute(
+                serde_json::json!({"path": path_arg, "old_string": "alpha", "new_string": "ALPHA"}),
+                CancellationToken::new(),
+            ),
+            tool_two.execute(
+                serde_json::json!({"path": path_arg, "old_string": "beta", "new_string": "BETA"}),
+                CancellationToken::new(),
+            ),
+        );
+
+        let final_content = std::fs::read_to_string(&file_path).expect("read back");
+        let succeeded = [&first, &second]
+            .iter()
+            .filter(|result| result.as_ref().is_ok_and(|output| !output.is_error))
+            .count();
+        let applied = usize::from(final_content.contains("ALPHA"))
+            + usize::from(final_content.contains("BETA"));
+
+        assert_eq!(
+            succeeded, applied,
+            "every reported success must be visible on disk; got {} success(es) but {} edit(s) \
+             applied in {:?}",
+            succeeded, applied, final_content
+        );
     }
 
     #[tokio::test]
@@ -1283,7 +1916,7 @@ mod tests {
         mark_read(&tracker, &file_path).await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: frontend.clone(),
         };
         let result = tool
@@ -1324,7 +1957,7 @@ mod tests {
         mark_read(&tracker, &file_path).await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(ScriptedDelegateFrontend::transient()),
         };
         let error = tool
@@ -1367,7 +2000,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend,
         };
         let result = tool
@@ -1405,7 +2038,7 @@ mod tests {
         record_delegated_read(&tracker, canonical.clone(), "alpha in the buffer\n").await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend,
         };
         let first = tool
@@ -1460,7 +2093,7 @@ mod tests {
         let tracker = test_tracker();
         let read = ReadFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: frontend.clone(),
         };
         let found = read
@@ -1484,7 +2117,7 @@ mod tests {
 
         let edit = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend,
         };
         let result = edit
@@ -1533,7 +2166,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend,
         };
         let result = tool
@@ -1571,7 +2204,7 @@ mod tests {
         record_read(&tracker, canonical.clone()).await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: frontend.clone(),
         };
         let result = tool
@@ -1625,7 +2258,7 @@ mod tests {
         record_read(&tracker, canonical).await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend,
         };
         let result = tool
@@ -1674,7 +2307,7 @@ mod tests {
         });
         let tool = WriteFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: frontend.clone(),
         };
         let result = tool
@@ -1711,7 +2344,7 @@ mod tests {
 
         let tool = WriteFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(ScriptedDelegateFrontend::unservable()),
         };
         let result = tool
@@ -1744,7 +2377,7 @@ mod tests {
 
         let tool = WriteFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(ScriptedDelegateFrontend::transient()),
         };
         let error = tool
@@ -1761,6 +2394,112 @@ mod tests {
         assert!(!file_path.exists(), "nothing should have been written");
     }
 
+    /// Stopping a turn while the editor holds an `fs/*` request must not turn into a local write.
+    ///
+    /// `delegate_fs_write` returns `Option<Result<..>>`, where `None` means "this frontend has no
+    /// delegate, do it locally". `AcpFrontend` reported cancellation as exactly that `None`, so
+    /// pressing stop mid-write did the write anyway, on disk, behind the back of an editor that
+    /// may have been holding unsaved changes for the same file.
+    #[tokio::test]
+    async fn test_write_file_cancelled_delegate_does_not_fall_back_to_disk() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("owned.txt");
+        std::fs::write(&file_path, "on disk\n").expect("seed");
+
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::cancelled(Some("in buffer\n"))),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "the model's version\n",
+                    "force": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a cancelled write must not become a local write");
+        assert!(
+            matches!(error, MekaError::Interrupted),
+            "a stopped turn reads as an interruption, not a client failure: {}",
+            error,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "on disk\n",
+            "the file must be untouched",
+        );
+    }
+
+    /// The read half: `edit_file`'s pre-read picks the route *and* supplies the text the edit is
+    /// computed from, so a cancelled read that fell through to disk would diff against bytes the
+    /// editor had already moved past.
+    #[tokio::test]
+    async fn test_edit_file_cancelled_delegate_read_stops_the_edit() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("owned.txt");
+        std::fs::write(&file_path, "on disk\n").expect("seed");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::cancelled(None)),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "on disk",
+                    "new_string": "edited",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a cancelled pre-read must stop the edit");
+        assert!(
+            matches!(error, MekaError::Interrupted),
+            "expected an interruption, got: {}",
+            error,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read back"),
+            "on disk\n",
+            "the file must be untouched",
+        );
+    }
+
+    /// `read_file` has the mildest consequence of the three -- a stale view rather than a lost
+    /// edit -- and the same rule: a withdrawn question is not answered from somewhere else.
+    #[tokio::test]
+    async fn test_read_file_cancelled_delegate_does_not_read_disk() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("owned.txt");
+        std::fs::write(&file_path, "on disk\n").expect("seed");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(ScriptedDelegateFrontend::cancelled(None)),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a cancelled read must not fall through to disk");
+        assert!(
+            matches!(error, MekaError::Interrupted),
+            "expected an interruption, got: {}",
+            error,
+        );
+    }
+
     #[tokio::test]
     async fn test_read_file_with_offset_and_limit() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -1769,7 +2508,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1798,7 +2537,7 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let write_result = write_tool
@@ -1817,9 +2556,121 @@ mod tests {
         assert_eq!(content, "hello world");
     }
 
+    /// `write_file` through a symlink must name the same file `read_file` and `edit_file` name.
+    ///
+    /// All three canonicalize now, but `write_file` used to canonicalize only the parent and
+    /// re-join the filename, so a symlinked final component gave it a path the other two never
+    /// use. Three things followed from that one mismatch: the freshness check looked up a tracker
+    /// key nothing writes and so never fired, `edit_file` and `write_file` on the one file took
+    /// different per-path locks and stopped being serialised against each other, and the write
+    /// itself landed on the link rather than through it -- replacing a dotfile-managed symlink
+    /// with a regular file and leaving the file the model had just read untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_follows_a_symlink_to_the_file_it_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let real = temp_dir.path().join("real.txt");
+        std::fs::write(&real, "original").expect("seed real file");
+        let link = temp_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let tracker = test_tracker();
+        let write_tool = WriteFileTool {
+            read_tracker: Arc::clone(&tracker),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let output = write_tool
+            .execute(
+                serde_json::json!({
+                    "path": link.to_str().expect("path"),
+                    "content": "rewritten",
+                    "force": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+        assert!(
+            !output.is_error,
+            "write_file through a symlink must succeed"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read real"),
+            "rewritten",
+            "the write must land on the file the link points at",
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive the write",
+        );
+
+        // The stamp lands under the canonical name, which is the name `read_file` and `edit_file`
+        // look up. Recorded under the link's name it was invisible to both.
+        let canonical = std::fs::canonicalize(&real).expect("canonicalize");
+        assert!(
+            tracker.read().await.contains_key(&canonical),
+            "the write must stamp the tracker under the canonical path",
+        );
+    }
+
+    /// The staleness guard has to fire for a symlinked path too, which is the concrete loss the
+    /// key mismatch caused: `read_file` stamped the canonical name, `write_file` looked up the
+    /// link's, missed, and clobbered whatever the user had saved in between.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_refuses_a_stale_write_through_a_symlink() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let real = temp_dir.path().join("real.txt");
+        std::fs::write(&real, "original").expect("seed real file");
+        let link = temp_dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &link).await;
+
+        // The user saves over it between the read and the write.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::fs::write(&real, "the user's edit").expect("user edit");
+
+        let write_tool = WriteFileTool {
+            read_tracker: Arc::clone(&tracker),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let output = write_tool
+            .execute(
+                serde_json::json!({
+                    "path": link.to_str().expect("path"),
+                    "content": "the model's stale copy",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute");
+
+        assert!(output.is_error, "a stale write through a link must refuse");
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read real"),
+            "the user's edit",
+            "the user's change must survive",
+        );
+    }
+
+    /// The Windows half of `test_write_file_follows_a_symlink_to_the_file_it_read`.
+    ///
+    /// This used to assert the opposite -- that a symlinked target was refused -- which made
+    /// Windows the one platform where `write_file` and `edit_file` disagreed about whether a link
+    /// could be written at all. The reparse-point check in `open_write_nofollow` still stands; it
+    /// guards the path *after* resolution, which is where a swap is a redirection rather than the
+    /// user's own indirection.
     #[cfg(windows)]
     #[tokio::test]
-    async fn test_write_file_rejects_symlink_on_windows() {
+    async fn test_write_file_follows_a_symlink_on_windows() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let real = temp_dir.path().join("real.txt");
         std::fs::write(&real, "original").expect("seed real file");
@@ -1832,27 +2683,36 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
-        let result = write_tool
+        let output = write_tool
             .execute(
                 serde_json::json!({
                     "path": link.to_str().expect("path"),
-                    "content": "overwritten"
+                    "content": "rewritten",
+                    "force": true,
                 }),
                 CancellationToken::new(),
             )
-            .await;
+            .await
+            .expect("write should succeed");
+        assert!(
+            !output.is_error,
+            "write_file through a symlink must succeed"
+        );
 
         assert_eq!(
             std::fs::read_to_string(&real).expect("read real"),
-            "original",
-            "symlink target was overwritten"
+            "rewritten",
+            "the write must land on the file the link points at",
         );
         assert!(
-            result.map(|output| output.is_error).unwrap_or(true),
-            "write through a symlink should be rejected"
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive the write",
         );
     }
 
@@ -1866,7 +2726,7 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         write_tool
@@ -1882,7 +2742,7 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let edit_result = edit_tool
@@ -1916,7 +2776,7 @@ mod tests {
         // Read the file first to satisfy read-before-edit
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
@@ -1929,7 +2789,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1957,7 +2817,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -1988,7 +2848,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2023,7 +2883,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2051,7 +2911,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2087,7 +2947,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2115,6 +2975,520 @@ mod tests {
         );
     }
 
+    /// The same race as above, routed through `write_file` instead of `edit_file`.
+    ///
+    /// A whole-file rewrite is the *more* destructive of the two, and it used to be the unguarded
+    /// one: the model's stale copy replaced the user's saved edit with no error and no re-read
+    /// prompt.
+    #[tokio::test]
+    async fn a_whole_file_rewrite_cannot_silently_clobber_a_concurrent_edit() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("raced.txt");
+        std::fs::write(&file_path, "hello world").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+
+        std::fs::write(&file_path, "the user's saved edit").expect("rewrite");
+
+        let tool = WriteFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let arguments = serde_json::json!({
+            "path": file_path.to_str().expect("path"),
+            "content": "what the model still thinks is there",
+        });
+        let result = tool
+            .execute(arguments.clone(), CancellationToken::new())
+            .await
+            .expect("should return Ok");
+
+        assert!(result.is_error);
+        assert!(text_content(&result).contains("changed on disk"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "the user's saved edit",
+            "the user's content must survive"
+        );
+
+        // `force` is the same escape hatch `edit_file` offers, and it must still write.
+        let mut forced = arguments;
+        forced["force"] = serde_json::Value::Bool(true);
+        let result = tool
+            .execute(forced, CancellationToken::new())
+            .await
+            .expect("should return Ok");
+        assert!(!result.is_error, "{}", text_content(&result));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "what the model still thinks is there"
+        );
+    }
+
+    /// The model edits what it was shown, so what it is shown has to be what is there. Windowing a
+    /// whole-file read through `lines()` rewrote CRLF to LF, and the resulting `old_string` then
+    /// matched nothing.
+    #[tokio::test]
+    async fn a_whole_file_read_preserves_crlf_so_a_later_edit_matches() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dos.txt");
+        std::fs::write(&file_path, "first\r\nsecond\r\nthird\r\n").expect("write");
+
+        let tracker = test_tracker();
+        let read = ReadFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = read
+            .execute(
+                serde_json::json!({ "path": file_path.to_str().expect("path") }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        let shown = text_content(&result);
+        assert_eq!(shown, "first\r\nsecond\r\nthird\r\n");
+
+        // The round trip that matters: an `old_string` copied out of what was shown must apply.
+        let edit = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = edit
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "first\r\nsecond",
+                    "new_string": "first\r\nSECOND",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        assert!(!result.is_error, "{}", text_content(&result));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "first\r\nSECOND\r\nthird\r\n"
+        );
+    }
+
+    /// A windowed read still normalises, so the failure it can cause has to be legible.
+    #[tokio::test]
+    async fn an_lf_old_string_against_a_crlf_file_names_the_line_endings() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("dos.txt");
+        std::fs::write(&file_path, "first\r\nsecond\r\n").expect("write");
+
+        let tracker = test_tracker();
+        mark_read(&tracker, &file_path).await;
+
+        let tool = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "first\nsecond",
+                    "new_string": "first\nSECOND",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(result.is_error);
+        assert!(
+            text_content(&result).contains("CRLF"),
+            "{}",
+            text_content(&result)
+        );
+    }
+
+    /// A windowed delegated read must disclose the cut and still stamp the whole document.
+    ///
+    /// Asking the editor for the window directly returned exactly `limit` lines, which is
+    /// indistinguishable from a file that ends there, so the model got a silent truncation; and the
+    /// stamp recorded that slice, so the next `edit_file` compared it against the whole buffer and
+    /// refused a perfectly good edit with "changed in the editor".
+    #[tokio::test]
+    async fn a_windowed_delegated_read_discloses_the_cut_and_stamps_the_whole_document() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("buffered.txt");
+        std::fs::write(&file_path, "on disk, not the buffer\n").expect("write");
+
+        let buffer: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let frontend = Arc::new(ScriptedDelegateFrontend::serving(&buffer));
+        let tracker = test_tracker();
+
+        let read = ReadFileTool {
+            read_tracker: tracker.clone(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: frontend.clone(),
+        };
+        let result = read
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "offset": 9,
+                    "limit": 50,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        let shown = text_content(&result);
+        assert!(shown.starts_with("line 10\n"), "{shown}");
+        assert!(shown.contains("showing lines 10-59 of 100"), "{shown}");
+
+        // The window came from the buffer, not the disk.
+        assert!(!shown.contains("on disk"), "{shown}");
+
+        // The stamp has to describe the document, so an edit against a line the window never showed
+        // is accepted rather than read as someone else's write.
+        let edit = EditFileTool {
+            read_tracker: tracker,
+            cwd: crate::workspace::test_cwd(),
+            frontend,
+        };
+        let result = edit
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "line 90",
+                    "new_string": "line ninety",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+        assert!(!result.is_error, "{}", text_content(&result));
+    }
+
+    /// The image path is bounded by the same ceiling the text path is.
+    ///
+    /// `read_file` picks the image branch on the *extension* alone, so a large file that merely
+    /// ends `.tga` reached an unbounded `read_to_end`, went fully resident, and only then
+    /// failed the byte sniff and fell through to the text read that would have refused it.
+    /// `execute_command` spills output past 8 MiB to a capture file and tells the model the whole
+    /// thing is "still reachable with `read_file`" -- and the shell docs promise the same. A
+    /// residency ceiling applied to the file's *size* rather than to what a read *keeps* broke that
+    /// promise for exactly the files it was written about: a runaway build log could be captured
+    /// and then read by nothing.
+    #[tokio::test]
+    async fn a_capture_past_the_ceiling_is_still_readable_a_window_at_a_time() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let capture = temp_dir.path().join("capture.log");
+
+        // Comfortably past the ceiling, with identifiable lines at a known offset.
+        let filler = "x".repeat(1023);
+        let mut body = String::with_capacity(MAX_READ_FILE_BYTES + 4096);
+        let mut line = 0usize;
+        while body.len() <= MAX_READ_FILE_BYTES + 2048 {
+            body.push_str(&format!("line {} {}\n", line, filler));
+            line += 1;
+        }
+        std::fs::write(&capture, &body).expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": capture.to_str().expect("path"),
+                    "offset": 3,
+                    "limit": 2,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a windowed read of an oversized capture must succeed");
+
+        assert!(!result.is_error, "{}", text_content(&result));
+        let shown = text_content(&result);
+        assert!(
+            shown.contains("line 3 ") && shown.contains("line 4 "),
+            "the requested window must be returned: {}",
+            shown.chars().take(120).collect::<String>()
+        );
+        assert!(
+            !shown.contains("line 5 "),
+            "and only the requested window: {}",
+            shown.chars().take(120).collect::<String>()
+        );
+        assert!(
+            shown.contains(&format!("of {}", line)),
+            "with the file's real line count disclosed: {}",
+            shown
+        );
+    }
+
+    /// The other half of the same boundary: a read that asks for the whole of an oversized file
+    /// still has to refuse, because there is no bounded way to return it.
+    #[tokio::test]
+    async fn an_unwindowed_read_of_an_oversized_file_still_refuses_and_says_how_to_proceed() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let huge = temp_dir.path().join("huge.log");
+        std::fs::write(&huge, vec![b'x'; MAX_READ_FILE_BYTES + 1]).expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({"path": huge.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a file too large to return whole must be refused");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("offset") && message.contains("limit"),
+            "the refusal must name the route that does work: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_bytes_refuses_a_file_past_the_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.tga");
+        std::fs::write(&path, vec![0u8; MAX_READ_FILE_BYTES + 1]).expect("write");
+
+        let error = read_file_bytes(&path)
+            .await
+            .expect_err("a file past the ceiling must be refused, not read whole");
+        assert!(error.to_string().contains("ceiling"), "{error}");
+
+        // And the boundary itself is still readable.
+        let ok = dir.path().join("big.tga");
+        std::fs::write(&ok, vec![0u8; MAX_READ_FILE_BYTES]).expect("write");
+        assert_eq!(
+            read_file_bytes(&ok).await.expect("at the ceiling").len(),
+            MAX_READ_FILE_BYTES
+        );
+    }
+
+    /// A target that exists but cannot be re-read is refused, not overwritten blind.
+    ///
+    /// `local_old_text` mapped every read failure except `NotFound` to `None`, and the staleness
+    /// guard runs only on `Some` -- so a file holding invalid UTF-8, or one past the 16 MiB
+    /// ceiling, skipped the check entirely. `edit_file` refuses when it cannot verify; this is
+    /// the same posture, and `force` remains the way through.
+    #[tokio::test]
+    async fn write_file_refuses_a_target_it_cannot_re_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("binary.dat");
+        std::fs::write(&path, [0xff, 0xfe, 0xff]).expect("write invalid utf-8");
+
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let refused = tool
+            .execute(
+                serde_json::json!({
+                    "path": path.to_str().expect("path"),
+                    "content": "replacement\n",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the tool reports, it does not error");
+        assert!(refused.is_error, "an unverifiable target must be refused");
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            [0xff, 0xfe, 0xff],
+            "the original bytes must survive the refusal"
+        );
+
+        // `force` is the documented way through, and still writes.
+        let forced = tool
+            .execute(
+                serde_json::json!({
+                    "path": path.to_str().expect("path"),
+                    "content": "replacement\n",
+                    "force": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("forced write");
+        assert!(!forced.is_error, "force must still write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "replacement\n"
+        );
+    }
+
+    /// Carrying the mode across the rename fixes the *published* file, but the temp file it is
+    /// renamed from sits in the target's own directory holding the entire plaintext, and is born
+    /// at `0o666 & ~umask`. Applying the mode only after the write therefore leaves a 0600 secret
+    /// world-readable on disk for the length of the write plus an fsync -- a window nothing else
+    /// in this suite looks at, because every other assertion is about the file that survives.
+    /// Watch the directory during the write instead: no temp file may hold bytes at a wider mode
+    /// than the target it will replace.
+    ///
+    /// Under a umask tight enough that the temp file is born narrow (0077, say) there is no
+    /// window to catch and this passes on any implementation, which is correct rather than
+    /// vacuous: the bug is unreachable there.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewritten_secret_is_never_briefly_world_readable() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let secret = temp_dir.path().join("secret.txt");
+        std::fs::write(&secret, "old\n").expect("write");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // Large enough that the write is still running when the watcher first looks.
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::task::spawn_blocking({
+            let done = done.clone();
+            let watch_dir = temp_dir.path().to_path_buf();
+            move || {
+                let mut saw_temp = false;
+                let mut widest_holding_content = 0u32;
+                while !done.load(Ordering::SeqCst) {
+                    let Ok(entries) = std::fs::read_dir(&watch_dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        if !entry.file_name().to_string_lossy().contains(".meka-tmp-") {
+                            continue;
+                        }
+                        saw_temp = true;
+                        // A zero-length temp file discloses nothing, and there is always an
+                        // instant between creating it and narrowing it. Only bytes matter.
+                        if let Ok(metadata) = entry.metadata()
+                            && metadata.len() > 0
+                        {
+                            widest_holding_content |= metadata.permissions().mode() & 0o777;
+                        }
+                    }
+                }
+                (saw_temp, widest_holding_content)
+            }
+        });
+
+        write_file_bytes(&secret, &payload).await.expect("write");
+        done.store(true, Ordering::SeqCst);
+        let (saw_temp, widest_holding_content) = watcher.await.expect("watcher");
+
+        assert!(
+            saw_temp,
+            "the watcher never caught the temp file, so it proved nothing; raise the payload size"
+        );
+        assert!(
+            widest_holding_content & 0o077 == 0,
+            "the temp file held the plaintext at mode {:o}, readable beyond the owner of the 0600 \
+             file it replaces",
+            widest_holding_content
+        );
+    }
+
+    /// A write must not loosen a file's permissions. `rename(2)` replaces the inode, so the mode
+    /// has to be carried across deliberately; before the atomic-write change it survived for free
+    /// because the target was opened in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_preserves_the_modes_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        // A secret at 0600 must not come back world-readable.
+        let secret = temp_dir.path().join("credentials");
+        std::fs::write(&secret, "token = old\n").expect("write");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        write_file_bytes(
+            &secret,
+            b"token = new
+",
+        )
+        .await
+        .expect("write succeeds");
+        assert_eq!(
+            std::fs::metadata(&secret)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "a 0600 secret must not become world-readable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("read"),
+            "token = new
+"
+        );
+
+        // And an executable script must stay executable.
+        let script = temp_dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho old\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        write_file_bytes(&script, b"#!/bin/sh\necho new\n")
+            .await
+            .expect("write succeeds");
+        assert_eq!(
+            std::fs::metadata(&script)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "an executable script must stay executable"
+        );
+    }
+
+    /// Creating a file has nothing to lose, so the guard must not demand a prior read.
+    #[tokio::test]
+    async fn writing_a_new_file_needs_no_prior_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("fresh.txt");
+
+        let tool = WriteFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "brand new",
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok");
+
+        assert!(!result.is_error, "{}", text_content(&result));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read"),
+            "brand new"
+        );
+    }
+
     #[tokio::test]
     async fn test_edit_accepts_a_file_that_is_unchanged_since_the_read() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2126,7 +3500,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2160,7 +3534,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2191,7 +3565,7 @@ mod tests {
         mark_read(&tracker, &file_path).await;
         let tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
 
@@ -2235,7 +3609,7 @@ mod tests {
 
         let writer = WriteFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         writer
@@ -2251,7 +3625,7 @@ mod tests {
 
         let editor = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = editor
@@ -2277,7 +3651,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2308,7 +3682,7 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
@@ -2321,7 +3695,7 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool
@@ -2358,7 +3732,7 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
@@ -2375,7 +3749,7 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool
@@ -2418,7 +3792,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2448,7 +3822,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2474,7 +3848,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2502,7 +3876,7 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2524,6 +3898,128 @@ mod tests {
         );
     }
 
+    /// `read_file` reads a file whole, so it needs a ceiling of its own.
+    ///
+    /// The cancellation race added alongside makes `read_file("/dev/zero")` *interruptible*; it
+    /// does not make it *bounded*, and an unattended `serve` or ACP session has nobody to press
+    /// stop. The cap turns "the process died" into a tool error the model can act on.
+    #[tokio::test]
+    async fn test_read_file_refuses_a_file_past_the_ceiling() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("huge.txt");
+        // One byte over, so the boundary itself is what is being tested.
+        std::fs::write(&file_path, vec![b'x'; MAX_READ_FILE_BYTES + 1]).expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let error = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a file past the ceiling must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("ceiling") && text.contains("execute_command"),
+            "the refusal must name a way forward: {text}",
+        );
+
+        // And a file at the ceiling still reads, so the bound is not off by one.
+        std::fs::write(&file_path, vec![b'x'; MAX_READ_FILE_BYTES]).expect("rewrite");
+        let result = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a file exactly at the ceiling is readable");
+        assert!(!result.is_error);
+    }
+
+    /// An offset past the end of the file returns nothing, and nothing is indistinguishable from
+    /// an empty file -- a different fact, and the one the model goes on to act on.
+    #[tokio::test]
+    async fn test_read_file_past_the_end_says_so_rather_than_returning_nothing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("short.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path"), "offset": 100}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(!result.is_error, "a past-the-end read is not an error");
+        assert!(
+            text.contains("past the end") && text.contains("3 lines"),
+            "the notice must name the real length: {text}",
+        );
+    }
+
+    /// The reported total has to be the real one.
+    ///
+    /// The old count resumed the scan by skipping `matches.len()` *lines* to account for
+    /// `matches.len()` *matches*, so every hit past that index was counted twice. A file where
+    /// every line matches cannot show it -- lines and matches coincide, so both forms agree -- and
+    /// that is exactly the file the cap test above writes, which is why the bug survived a test
+    /// named for the behaviour it broke. A sparse file separates them: 100 hits shown out of 100,
+    /// reported as 150 under the old arithmetic.
+    #[tokio::test]
+    async fn test_read_file_regex_reports_the_real_total_on_a_sparse_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sparse.txt");
+        let mut body = String::new();
+        for line in 0..200 {
+            if line % 2 == 0 {
+                body.push_str(&format!("match-{}\n", line));
+            } else {
+                body.push_str("quiet\n");
+            }
+        }
+        std::fs::write(&file_path, &body).expect("write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "regex": "match-"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(
+            !text.contains("showing first"),
+            "all 100 matches fit under the cap, so nothing was withheld; got: {}",
+            text,
+        );
+        assert_eq!(
+            text.lines().count(),
+            100,
+            "every match on an even line, and nothing else",
+        );
+    }
+
     #[tokio::test]
     async fn test_edit_file_insert_before() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2532,7 +4028,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2561,7 +4057,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2590,7 +4086,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2619,7 +4115,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2648,7 +4144,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2683,7 +4179,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2718,7 +4214,7 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
@@ -2753,7 +4249,7 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
@@ -2766,7 +4262,7 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
-            cwd: crate::agent::test_cwd(),
+            cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool

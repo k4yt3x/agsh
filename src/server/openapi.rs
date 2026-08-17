@@ -2,9 +2,14 @@
 //! annotations on each handler. Served at `GET /v1/openapi.json` and rendered by Swagger UI at
 //! `GET /v1/docs`.
 //!
-//! Keeping the spec inline in the binary (via derive macros rather than a hand-written JSON
-//! file) means it can never drift from the implementation: wire-shape changes that forget the
-//! annotation fail to compile or surface in the spec as missing fields.
+//! Keeping the spec inline in the binary (via derive macros rather than a hand-written JSON file)
+//! keeps most of it honest: a response type that changes shape changes the schema with it, because
+//! the schema is derived from the type.
+//!
+//! It is not a guarantee, and has drifted. What the macros derive is the *shape*; what a handler
+//! actually returns for a given input is prose in the annotation, and prose does not recompile. A
+//! status code a handler stopped returning, or started returning, stays as written until someone
+//! reads both. Treat an annotation as documentation with a compiler-checked type, not as a proof.
 
 use axum::Router;
 use utoipa::{

@@ -9,13 +9,17 @@
 //! - input items:   `temp/codex/codex-rs/protocol/src/models.rs:686`
 //! - SSE events:    `temp/codex/codex-rs/codex-api/src/sse/responses.rs:283`
 
-use std::time::Duration;
-
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Abort the SSE read if no event arrives within this window. The ChatGPT backend can silently
+/// stall a stream; without a ceiling the turn would hang forever. Shared with the Claude and
+/// `openai-api` drivers, and matches codex's own `stream_idle_timeout` default
+/// (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a [`MekaError::StreamError`],
+/// which the agent retries when no output has been forwarded yet.
+use crate::provider::STREAM_IDLE_TIMEOUT as CODEX_STREAM_IDLE_TIMEOUT;
 use crate::{
     error::{MekaError, Result},
     provider::{
@@ -23,12 +27,6 @@ use crate::{
         ToolResultContent,
     },
 };
-
-/// Abort the SSE read if no event arrives within this window. The ChatGPT backend can silently
-/// stall a stream; without a ceiling the turn would hang forever. Matches codex's own
-/// `stream_idle_timeout` default (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a
-/// [`MekaError::StreamError`], which the agent retries when no output has been forwarded yet.
-const CODEX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Build the JSON body POSTed to `/responses`. Translates the meka internal `Message` /
 /// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
@@ -311,6 +309,19 @@ pub(super) fn process_event(
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if item_type == "function_call" {
                 let buffered = state.active_tool_call.take();
+                // Read off the completed item: `ActiveToolCall` carries only the argument buffer,
+                // and the item is the authoritative copy of the identity anyway.
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let call_name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 // Prefer the final `arguments` string from the item over our accumulated buffer;
                 // the server may normalise it.
                 let arguments_str = item
@@ -319,21 +330,31 @@ pub(super) fn process_event(
                     .map(|s| s.to_string())
                     .or_else(|| buffered.map(|tool| tool.arguments_buffer))
                     .unwrap_or_default();
-                let input = if arguments_str.is_empty() {
-                    serde_json::json!({})
+                // Empty arguments are a legitimate zero-parameter call; arguments that arrived and
+                // do not parse are rejected rather than replaced with `{}`. Substituting an empty
+                // object runs the tool on whatever defaults it tolerates -- a valid call the model
+                // never made -- with nothing told to anyone. Matches the Chat Completions path,
+                // which has a regression test named for this exact bug.
+                let parsed = if arguments_str.is_empty() {
+                    Ok(serde_json::json!({}))
                 } else {
-                    match serde_json::from_str(&arguments_str) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed to parse tool arguments JSON; running the tool with empty arguments: {}",
-                                error
-                            );
-                            serde_json::json!({})
-                        }
-                    }
+                    serde_json::from_str(&arguments_str)
                 };
-                out.push(StreamEvent::ToolUseEnd { input });
+                match parsed {
+                    Ok(input) => out.push(StreamEvent::ToolUseEnd { input }),
+                    Err(error) => {
+                        tracing::warn!(
+                            tool = %call_name,
+                            "rejecting tool call with unparseable JSON arguments: {}",
+                            error
+                        );
+                        out.push(StreamEvent::ToolCallRejected {
+                            id: call_id,
+                            name: call_name,
+                            reason: format!("invalid JSON arguments: {}", error),
+                        });
+                    }
+                }
             } else if item_type == "reasoning" && state.in_reasoning {
                 state.in_reasoning = false;
                 let signature = item
@@ -544,13 +565,25 @@ pub(super) async fn drive_responses_sse_stream(
                 }
 
                 if state.finished {
-                    break;
+                    return Ok(());
                 }
             }
         }
     }
 
-    Ok(())
+    // The stream ended without `response.completed`, `response.failed` or `response.incomplete`.
+    // Falling through here committed a truncated turn as a complete one: the agent saw whatever
+    // text had arrived, wrote it to the conversation, and moved on, with the retry path never
+    // consulted. A connection cut mid-response is exactly what that path exists for.
+    let message = "Codex stream ended before a terminal response event".to_string();
+    if event_sender
+        .send(StreamEvent::Error(message.clone()))
+        .await
+        .is_err()
+    {
+        tracing::trace!("stream event receiver dropped");
+    }
+    Err(MekaError::StreamError(message))
 }
 
 #[cfg(test)]
@@ -883,6 +916,109 @@ mod tests {
         assert!(matches!(events[4], StreamEvent::MessageEnd {
             stop_reason: StopReason::ToolUse
         }));
+    }
+
+    /// `run_events` drives `process_event` directly, so it can never reach the fall-through at the
+    /// bottom of `drive_responses_sse_stream` -- the code that decides what a stream ending with
+    /// no terminal event means. Drive the real loop instead, the way the Claude decoder's
+    /// counterpart test does.
+    async fn decode_sse(body: &str) -> (Vec<StreamEvent>, Result<()>) {
+        let response: reqwest::Response = axum::http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(body.to_string())
+            .expect("build response")
+            .into();
+        let (sender, mut receiver) = mpsc::channel(64);
+        let outcome = drive_responses_sse_stream(response, sender, CancellationToken::new()).await;
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        (events, outcome)
+    }
+
+    /// A connection cut partway through the answer never sends `response.completed`. Committing
+    /// that as a finished turn hands the agent half a response and never consults the retry path,
+    /// which is the one case that path exists for.
+    #[tokio::test]
+    async fn a_stream_cut_before_its_terminal_event_is_an_error() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"half an ans\"}\n\n",
+        ))
+        .await;
+
+        assert!(
+            matches!(outcome, Err(MekaError::StreamError(_))),
+            "a truncated stream must reach the retry path, got {outcome:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error(_))),
+            "and say so on the stream: {events:?}",
+        );
+    }
+
+    /// The other half of the same boundary: a stream that did reach `response.completed` is
+    /// finished, and must not be turned into a spurious retry by the check above.
+    #[tokio::test]
+    async fn a_stream_that_reaches_its_terminal_event_is_complete() {
+        let (_events, outcome) = decode_sse(concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"a whole answer\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"response\": {\"id\": \"r1\", \"status\": \"completed\"}}\n\n",
+        ))
+        .await;
+
+        outcome.expect("a stream with a terminal event is complete");
+    }
+
+    /// The Codex half of the same boundary the Claude decoder has: arguments that do not parse are
+    /// the model's intent, mangled, and running the tool with `{}` executes something it never
+    /// asked for while reporting success.
+    #[test]
+    fn a_tool_call_with_unparseable_arguments_is_rejected_not_run_empty() {
+        let (events, outcome) = run_events(&[
+            (
+                "response.output_item.added",
+                serde_json::json!({
+                    "item": {"type": "function_call", "call_id": "c1", "name": "write_file"}
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({"delta": "{\"path\": "}),
+            ),
+            (
+                "response.output_item.done",
+                serde_json::json!({
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "c1",
+                        "name": "write_file",
+                        "arguments": "{\"path\": "
+                    }
+                }),
+            ),
+        ]);
+        outcome.expect("a rejected tool call is not a stream failure");
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallRejected { name, .. } if name == "write_file"
+            )),
+            "the call must be rejected: {events:?}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolUseEnd { .. })),
+            "and must not also be dispatched: {events:?}",
+        );
     }
 
     #[test]

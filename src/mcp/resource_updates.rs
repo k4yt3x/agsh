@@ -15,6 +15,12 @@ fn ledger() -> &'static Mutex<Ledger> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The most entries the ledger will hold. Keyed by `(server, uri)`, so a server that invents a
+/// fresh URI per notification grows it without bound, and nothing ever removes an entry. The bound
+/// is generous: a server with more than this many *distinct* resources changing in one process
+/// lifetime is not one the agent can act on resource by resource anyway.
+const MAX_LEDGER_ENTRIES: usize = 10_000;
+
 /// Record that a resource was updated. Stamp is unix seconds.
 pub fn record(server_name: &str, uri: &str) {
     let stamp = SystemTime::now()
@@ -22,7 +28,26 @@ pub fn record(server_name: &str, uri: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if let Ok(mut state) = ledger().lock() {
-        state.insert((server_name.to_string(), uri.to_string()), stamp);
+        let key = (server_name.to_string(), uri.to_string());
+        // Re-recording a URI already in the ledger is just a restamp and cannot grow it.
+        if state.len() >= MAX_LEDGER_ENTRIES && !state.contains_key(&key) {
+            // Drop the oldest rather than refusing the new one: the agent asks this list what to
+            // re-read, and the freshest changes are the ones it has not seen.
+            if let Some(oldest) = state
+                .iter()
+                .min_by_key(|(_, stamp)| **stamp)
+                .map(|(key, _)| key.clone())
+            {
+                state.remove(&oldest);
+                tracing::debug!(
+                    "resource update ledger is full at {} entries; evicted {}:{}",
+                    MAX_LEDGER_ENTRIES,
+                    oldest.0,
+                    oldest.1
+                );
+            }
+        }
+        state.insert(key, stamp);
     }
 }
 
@@ -65,5 +90,24 @@ mod tests {
         clear_for_server("srv-clear");
         let snap = snapshot();
         assert!(!snap.iter().any(|(s, ..)| s == "srv-clear"));
+    }
+
+    /// The ledger is a process-lifetime map fed by a *server's* notifications, so an unbounded one
+    /// is memory a remote peer decides the size of. Raising `MAX_LEDGER_ENTRIES` to `usize::MAX`
+    /// left every suite green.
+    ///
+    /// Scoped to its own server name and cleaned up, because the ledger is process-global and the
+    /// suite runs in parallel; the assertion is on the global total, which the cap governs.
+    #[test]
+    fn the_ledger_stops_growing_at_its_ceiling() {
+        for index in 0..MAX_LEDGER_ENTRIES + 500 {
+            record("srv-flood", &format!("file:///{}", index));
+        }
+        let total = snapshot().len();
+        assert!(
+            total <= MAX_LEDGER_ENTRIES,
+            "the ledger grew past its ceiling: {total} > {MAX_LEDGER_ENTRIES}"
+        );
+        clear_for_server("srv-flood");
     }
 }

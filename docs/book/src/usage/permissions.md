@@ -8,7 +8,7 @@ meka uses a four-level permission system to control what tools the agent can use
 |-------|-----------|---------------|
 | **None** | `[n]` (green) | No tools. The agent can only respond with text. |
 | **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`, `execute_command` (sandboxed), `todo`, `agent_spawn`, scratchpad tools |
-| **Ask** | `[a]` (magenta) | All tools, but each call requires user approval (Y/n prompt) |
+| **Ask** | `[a]` (magenta) | All tools, but each call requires user approval (Y/n prompt). `execute_command` still runs sandboxed: approval says the command may run, not that it may write |
 | **Write** | `[w]` (red) | All tools without restrictions: `write_file`, `edit_file`, `execute_command` (unsandboxed) |
 
 Each level includes all tools from the levels below it. Write mode includes all read tools.
@@ -173,14 +173,21 @@ Sub-agents spawned via `agent_spawn` inherit the parent's permission level by de
 meka [r] > read the contents of main.rs
 ```
 
-The agent uses `read_file` and shows the contents. Shell commands also work in read mode, but run in a **read-only sandbox**; the filesystem is physically write-protected for the child process:
+The agent uses `read_file` and shows the contents. Shell commands also work in read mode, but run in a **read-only sandbox**; the filesystem is write-protected for the child process:
 
 ```text
 meka [r] > list the files in this directory
 meka [r] > show me the git log
 ```
 
-Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Commands that attempt to write to the filesystem (e.g., `touch`, `rm`, `mkdir`) will fail with a permission error.
+Commands like `ls`, `cat`, `git log`, `df`, `ps`, and `uname` work normally. Commands that attempt to write to the filesystem (e.g. `touch`, `rm`, `mkdir`) fail with a permission error.
+
+Two things the sandbox deliberately does **not** restrict, on every backend:
+
+- **Reads.** A sandboxed command can read anything your user can, including `~/.ssh`, `~/.aws/credentials` and meka's own database. Read mode protects the machine from being *changed*, not from being *read*.
+- **The network.** Outbound connections are left open, so a read-mode command can still send what it read. Provider API keys are scrubbed from the child's environment, but that is one vector, not a boundary.
+
+If no sandbox backend is usable, read-mode shell commands **fail** rather than running unconfined. On Linux that means Bubblewrap (preferred whenever `bwrap` is installed) or Landlock at ABI v3 or newer. Landlock below v3 does not mediate `truncate(2)`, so a "read-only" command could still empty an existing file, and meka refuses it rather than promise a protection the kernel is not enforcing. Kernels 5.13–6.1 therefore need `bwrap` installed for read-mode shell; `meka` says so at startup.
 
 If you ask the agent to modify a file:
 
@@ -200,9 +207,19 @@ Read mode means the agent cannot modify **your tree**. It can still write to sto
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
 | Scratchpad, todos, scheduled jobs, background tasks | the session database | various |
 
-Nothing else in read mode reaches the filesystem for writing. That boundary is enforced in two places: entry names are restricted to `[A-Za-z0-9_-]`, so a name cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the store. `write_file`, `edit_file` and `scratchpad_save_file` are the only tools that touch your tree, and all three require write mode.
+No **built-in** tool other than those reaches the filesystem for writing in read mode. That boundary is enforced in two places: entry names are restricted to `[A-Za-z0-9_-]`, so a name cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the store. `write_file`, `edit_file` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require write mode.
 
-> **Note:** The read-only sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands are not available in read mode. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config File](../configuration/config-file.md)).
+#### MCP tools are the exception
+
+Tools from MCP servers are not built-ins and are not covered by that boundary. They execute inside the server's own process, which meka does not sandbox, so what an MCP tool may do is bounded by the server, not by meka's permission level.
+
+What decides whether such a tool is reachable at read is the permission meka resolves for it, and by default a server's own `readOnlyHint: true` annotation is enough to classify it as `read`. That hint is asserted by the server and not verified. A server that advertises it for a tool that in fact writes therefore gets to write your tree while meka sits at `read`.
+
+For a server you have not audited, either pin its tools explicitly with [`tool_permissions`](../configuration/config-file.md#mcp) or set [`trust_read_only_hint = false`](../configuration/config-file.md#mcp) on it, which makes the hint advisory for display only and drops its tools to the strict `write` fallback, past `[mcp].default_permission`.
+
+So the honest statement of read mode's filesystem guarantee is: your tree is safe from meka's built-in tools, plus whichever MCP servers you have chosen to trust.
+
+> **Note:** The read-only sandbox uses Bubblewrap or Landlock (ABI v3+, kernel 6.2+) on Linux, `sandbox-exec` on macOS, and a Low-integrity token on Windows. See [Shell](../tools/shell.md#read-only-sandbox) for what each backend covers. Where no backend is usable, shell commands are not available in read mode. You can disable sandboxed shell execution by setting `sandbox = false` under `[shell]` in the config file (see [Config File](../configuration/config-file.md)), which makes `execute_command` require write mode instead.
 
 ### Write Mode
 

@@ -2,10 +2,7 @@
 //! messages to the session store. Also handles mid-conversation auto-compaction when the
 //! input-token budget is exceeded.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -47,125 +44,6 @@ pub enum PromptRetention {
     WithdrawOnFailure,
 }
 
-/// Per-session working directory, shared by reference between the agent, every file-touching tool,
-/// the REPL prompt, the `/cd` slash command, and the per-turn environment-context block.
-/// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt can read
-/// it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
-/// replace), never held across `.await`.
-pub type SharedCwd = Arc<RwLock<PathBuf>>;
-
-/// Read the current value of [`SharedCwd`]. Recovers from a poisoned lock by extracting the inner
-/// value; meka never panics with the cwd lock held, so the only way to see a poisoned lock is a
-/// separate bug that already triggered, and falling back to the stored value beats crashing the
-/// agent on every subsequent tool call.
-pub fn cwd_snapshot(cwd: &SharedCwd) -> PathBuf {
-    cwd.read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
-}
-
-/// Resolve a tool-input path against the per-session [`SharedCwd`]. Absolute paths pass through
-/// unchanged; relative paths are joined to the current cwd value. Tools use this at the top of
-/// their `execute` methods to decouple from process `cwd`.
-pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) -> PathBuf {
-    let input = input.as_ref();
-    if input.is_absolute() {
-        input.to_path_buf()
-    } else {
-        cwd_snapshot(cwd).join(input)
-    }
-}
-
-/// Workspace roots beyond [`SharedCwd`], as supplied by an ACP client's `additionalDirectories`.
-///
-/// A separate handle rather than a field on `SharedCwd` because only the two search tools and the
-/// environment-context block care: widening [`resolve_against_cwd`] would touch every file tool's
-/// constructor to serve two callers. `cwd` remains the base for relative paths, per the ACP spec,
-/// so these expand *discovery* scope only.
-///
-/// Empty for the REPL, the HTTP API, and any ACP client that sends no extra roots.
-pub type SharedRoots = Arc<RwLock<Vec<PathBuf>>>;
-
-/// Read the current value of [`SharedRoots`], with the same poisoned-lock recovery as
-/// [`cwd_snapshot`] and for the same reason.
-pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
-    roots
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
-}
-
-/// The ordered set of roots a **recursive** search should sweep when the caller named no explicit
-/// path: `cwd` first, then each additional root, with anything already covered by another root
-/// dropped.
-///
-/// Only correct for a walker that descends, which today means `search_contents`. A tool that
-/// anchors a pattern at each root instead wants [`glob_roots`]; dropping a contained root would
-/// drop the files under it.
-///
-/// A root is dropped when some other root *contains* it, which subsumes exact duplicates. Both
-/// shapes are things a client legitimately sends: Zed may repeat `cwd` inside
-/// `additionalDirectories`, and nothing stops a client naming a folder nested inside another. Left
-/// in, the overlapping tree is walked twice, so every file under it is reported twice, consumes two
-/// slots of the result cap, and spends the shared walk budget twice.
-///
-/// Containment is checked in both directions, so a root that is an *ancestor* of `cwd` wins and
-/// `cwd` drops out of the search set. A descending walk from the ancestor still reaches everything
-/// under `cwd`, and this does not affect `cwd`'s real job: it remains the base for relative paths
-/// and the shell's working directory regardless of what this returns.
-///
-/// Paths are compared as given. A symlink pointing at another root, or a path containing `..`, is
-/// not detected; canonicalising to catch those would resolve symlinked roots to targets the client
-/// never named, which is a worse trade than an occasional duplicate.
-pub fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
-    let mut kept: Vec<PathBuf> = Vec::new();
-    for path in std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)) {
-        if kept.iter().any(|existing| path.starts_with(existing)) {
-            continue;
-        }
-        // This root is broader than ones already kept, so those become redundant.
-        kept.retain(|existing| !existing.starts_with(&path));
-        kept.push(path);
-    }
-    kept
-}
-
-/// The ordered set of roots to anchor a glob at when the caller named no explicit path: `cwd`
-/// first, then each additional root, with only *exact* repeats dropped.
-///
-/// The counterpart to [`search_roots`] for a tool that builds one rooted pattern per root rather
-/// than descending from it. Containment must not drop anything here: `find_files` turns each root
-/// into `<root>/<pattern>`, and a glob's `*` does not cross `/`, so a workspace of `/work` plus
-/// `cwd = /work/main` would answer `*.md` from `/work/*.md` alone and miss
-/// `/work/main/README.md` entirely. That is the exact "the agent says a file you can see doesn't
-/// exist" failure multi-root support was added to prevent, so nested roots are all kept and the
-/// caller deduplicates the matches instead.
-pub fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
-    let mut kept: Vec<PathBuf> = Vec::new();
-    for path in std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)) {
-        if !kept.contains(&path) {
-            kept.push(path);
-        }
-    }
-    kept
-}
-
-/// Construct a fresh [`SharedCwd`] pointing at the process cwd, for use in tests that need to
-/// instantiate a tool but don't exercise the per-session cwd resolution path. Tests using absolute
-/// paths or `tempdir()` are unaffected by the value here.
-#[cfg(test)]
-pub fn test_cwd() -> SharedCwd {
-    Arc::new(RwLock::new(
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    ))
-}
-
-/// Construct an empty [`SharedRoots`], for tools under test that don't exercise multi-root search.
-#[cfg(test)]
-pub fn test_roots() -> SharedRoots {
-    Arc::new(RwLock::new(Vec::new()))
-}
-
 use crate::{
     context,
     conversation::Conversation,
@@ -180,6 +58,7 @@ use crate::{
     session::SessionManager,
     skills::SkillCache,
     tools::{ToolRegistry, todo::SharedTodoList},
+    workspace::{SharedCwd, SharedRoots, cwd_snapshot, roots_snapshot},
 };
 
 /// Trigger auto-compaction once a turn's input tokens exceed this fraction of the configured
@@ -218,9 +97,19 @@ pub struct AgentOptions {
     /// Whether read-mode `execute_command` calls run inside the platform sandbox. Forced off when
     /// no sandbox backend is available.
     pub sandboxed_shell: bool,
-    /// Cap on messages sent to the provider per turn. `None` = unlimited; the agent walks back to
-    /// a safe boundary so tool-result chains stay intact (see
-    /// `truncate_messages_for_context`).
+    /// Cap on messages sent to the provider, re-applied on every round of a turn rather than once
+    /// at its start.
+    ///
+    /// A maximum, not a target: `truncate_messages_for_context` cuts *forward* to the first
+    /// message that neither splits a `tool_use` → `tool_result` chain nor starts the window on
+    /// a role the provider rejects, so a window ending inside a long tool loop can hold fewer
+    /// messages than asked for. It reaches backward only when the whole tail is one unbroken
+    /// chain, where exceeding the cap beats sending something that will be refused.
+    ///
+    /// `None` is unlimited, but nothing reaches it from `config.toml`: an absent
+    /// `[session].context_messages` resolves to a default, so removing the key lowers the cap
+    /// rather than lifting it. Only a directly-constructed `AgentOptions` (tests, and a sub-agent
+    /// inheriting one) can be `None`.
     pub context_messages: Option<usize>,
     /// When true, the agent auto-compacts the conversation once a turn's input tokens cross
     /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of [`Self::context_window`]. Requires `context_window >
@@ -509,6 +398,294 @@ const LAST_ACCEPTED_UNKNOWN: usize = usize::MAX;
 
 /// Sentinel for [`Agent::compaction_generation`] before it has been read from the database.
 const GENERATION_UNKNOWN: u64 = u64::MAX;
+
+/// Everything a turn has to remember in order to recover from a round that went wrong.
+///
+/// These nine values were locals of [`Agent::run_turn_retaining`], declared across eighty lines of
+/// setup and then mutated from arms scattered through several hundred more, which left the ways
+/// they depend on each other invisible. They are not independent: an emergency compaction has to
+/// invalidate the pending repair and move the floor a later rejection is allowed to blame, a repair
+/// is only undoable by the round that proves it wrong, and the withdrawal at the end of the turn is
+/// only safe while the log still measures what it measured before the first provider call. Holding
+/// them together, with one method per recovery path, puts each of those couplings in one place
+/// instead of leaving it to be reconstructed from the order of the assignments.
+struct TurnRecovery {
+    /// The turn's request base. Wrapped in `Arc` once so a round that appended nothing shares it
+    /// with a cheap `Arc::clone` instead of a deep `Vec` clone, and rebuilt from the conversation
+    /// by every recovery that rewrites what came before.
+    base_messages: Arc<[Message]>,
+    /// Where the loop's own additions start, so each round re-truncates the assembled request
+    /// rather than trusting a cap applied before the tool loop spliced anything onto it.
+    turn_start_len: usize,
+    /// Where this turn's additions begin, captured before the prompt is appended so the user
+    /// message (which may carry attached images) is inside the window a rejection can blame.
+    /// Distinct from [`Self::turn_start_len`], which marks the start of the *loop's* additions
+    /// and so excludes it.
+    suspect_floor: usize,
+    /// The log's length with this turn's prompt on the end and nothing after it. A withdrawal is
+    /// only safe while it still reads this, so it is captured up front rather than reconstructed
+    /// later: every way the turn can move on from its prompt -- an assistant reply, a tool round,
+    /// either compaction, a repair, the thinking-only nudge -- goes through the event log and
+    /// moves this number. Inspecting the materialized tail instead is not equivalent, because
+    /// a compaction summary and a nudge are both plain `User` messages that look exactly like
+    /// a prompt from the outside.
+    prompt_only_events: usize,
+    /// Bounds the emergency compact-and-retry on a [`MekaError::ContextOverflow`] so a request
+    /// that stays too large after one compaction fails cleanly instead of looping.
+    overflow_retries: u32,
+    /// Bounds the degrade-and-retry on a [`MekaError::InvalidRequest`], in the same spirit.
+    repairs_used: u32,
+    /// A repair applied to the in-memory conversation but not yet proven good by a 2xx, so not yet
+    /// persisted. Dropped back into the log on success, undone on a second rejection.
+    pending_repair: Option<crate::conversation::Event>,
+    /// Whether this turn's prompt is on disk. True from the start when the eager persist before
+    /// the first provider call succeeded; otherwise the lazy path retries it against the first
+    /// response.
+    user_saved: bool,
+    /// Set once the model has been nudged for a user-visible response this turn, so the recovery
+    /// fires at most once and can't loop (see [`should_nudge_thinking_only`]).
+    thinking_only_nudged: bool,
+}
+
+impl TurnRecovery {
+    /// Compact and retry after the provider reported an overflow the local pre-send estimate missed
+    /// (it under-counts, having no view of tool schemas).
+    ///
+    /// The compacted conversation already holds this turn's tool results, so the retry rebuilds the
+    /// request base from it and re-sends. Everything reset here is a position measured against a
+    /// conversation that compaction has just rewritten, which is also why the pending repair goes:
+    /// [`crate::conversation::Event::Repair`] is position-relative, so one parked here would be
+    /// persisted *after* the new `CompactBoundary` and, on the next load, truncate the wrong
+    /// messages -- deleting the compaction summary outright when the split kept no tail, leaving
+    /// memory and disk permanently disagreeing for that session. A secondary effect was just as
+    /// bad: a later `InvalidRequest` in the same turn took the "already repaired" arm, found no
+    /// `Repair` at the tail, and killed the turn without ever attempting a fresh degrade.
+    ///
+    /// Returns the overflow the turn should fail with when the compaction itself failed, since
+    /// re-sending the same request would be refused identically.
+    async fn recover_from_context_overflow(
+        &mut self,
+        agent: &Agent,
+        session_id: &mut Option<Uuid>,
+        messages: &mut Conversation,
+        cancellation: &CancellationToken,
+        reason: String,
+    ) -> Result<()> {
+        self.overflow_retries += 1;
+        tracing::warn!(
+            "provider reported context overflow; compacting and retrying ({})",
+            reason
+        );
+        if let Err(compact_error) = agent
+            .compact_session(
+                session_id,
+                messages,
+                CompactRequest::new(CompactOrigin::Emergency),
+                cancellation.clone(),
+            )
+            .await
+        {
+            tracing::warn!("emergency compaction failed: {}", compact_error);
+            return Err(MekaError::ContextOverflow(reason));
+        }
+        self.base_messages = Arc::from(truncate_messages_for_context(
+            messages.as_slice(),
+            agent.options.context_messages,
+        ));
+        self.turn_start_len = messages.len();
+        self.suspect_floor = messages.len();
+        self.pending_repair = None;
+        Ok(())
+    }
+
+    /// Strip the non-text content appended since the last accepted request and retry once, after
+    /// the provider refused the request as malformed.
+    ///
+    /// Retrying it unchanged is pointless (a 400 is deterministic on the body), and failing
+    /// outright is worse than it looks: the content is already committed to the session, so
+    /// every later request carries it and dies the same way, leaving the session unusable. The
+    /// model is told what happened through the tool result it is already equipped to read.
+    ///
+    /// Returns the rejection the turn should fail with when there was nothing to strip, which means
+    /// the complaint was never about content: a `max_tokens` over the model's ceiling, an unknown
+    /// header, a bad `tool_choice`.
+    async fn repair_rejected_content(
+        &mut self,
+        agent: &Agent,
+        messages: &mut Conversation,
+        reason: String,
+    ) -> Result<()> {
+        let suspect_start = match agent
+            .last_accepted_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // Clamped like the arm below, and for a sharper reason: `suspect_floor` is captured
+            // before this turn's message is appended and is *not* reset by a proactive compaction,
+            // which can leave it pointing past the end of a conversation that has just collapsed to
+            // a summary. Compaction also sets `last_accepted_len` to `LAST_ACCEPTED_UNKNOWN`, so
+            // this is the arm a post-compaction rejection takes, and the slice below would panic
+            // rather than fail the turn.
+            LAST_ACCEPTED_UNKNOWN => self.suspect_floor.min(messages.len()),
+            accepted => accepted.min(messages.len()),
+        };
+        let Some(degraded) =
+            degrade_rejected_content(&messages.as_slice()[suspect_start..], &reason)
+        else {
+            return Err(MekaError::InvalidRequest(reason));
+        };
+        self.repairs_used += 1;
+        let replaced_count = messages.len() - suspect_start;
+        tracing::warn!(
+            "provider rejected the request; degrading {} message(s) appended since the last \
+             accepted one and retrying ({})",
+            replaced_count,
+            reason,
+        );
+        agent
+            .frontend
+            .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
+                // No provider body here. `reason` is the verbatim rejection text from
+                // `error::provider_http_error`, and the HTTP error path was fixed to stop relaying
+                // it because it has carried an account identifier and a fragment of the request;
+                // under `serve` this notice rides the same response and reinstated exactly that.
+                // The full text is on the `warn!` immediately above, at default verbosity.
+                "provider rejected content in this turn; retrying without it (its response is in \
+                 the log)"
+                    .to_string(),
+            )))
+            .await;
+        self.pending_repair = Some(messages.replace_tail(replaced_count, degraded));
+        self.base_messages = Arc::from(truncate_messages_for_context(
+            messages.as_slice(),
+            agent.options.context_messages,
+        ));
+        self.turn_start_len = messages.len();
+        Ok(())
+    }
+
+    /// Put back what [`Self::repair_rejected_content`] degraded, after the retry carrying it was
+    /// refused too.
+    ///
+    /// The repair was therefore not the fix, and the conversation is left byte-identical to before
+    /// the attempt: the cost of guessing wrong has to be one round trip, never a destroyed tool
+    /// result.
+    fn undo_rejected_repair(&self, messages: &mut Conversation) {
+        if messages.pop_repair() {
+            tracing::warn!(
+                "degrading this turn's content did not satisfy the provider; restored it unchanged"
+            );
+        }
+    }
+
+    /// Persist the repair a 2xx has just vindicated.
+    ///
+    /// Ordering carries the correctness: [`crate::conversation::Event::Repair`] replaces the
+    /// *trailing* messages on replay, so this runs after the prompt is guaranteed on disk and
+    /// before anything else is appended, or a row written in between would be swallowed
+    /// instead. A failed write still leaves the in-memory conversation repaired, so the turn
+    /// completes; the cost is that a resume re-reads the rejected content and pays one more
+    /// round trip to heal it again.
+    async fn persist_vindicated_repair(&mut self, agent: &Agent, session_id: Uuid) {
+        if let Some(event) = self.pending_repair.take()
+            && let Err(error) = agent.session_manager.save_event(session_id, &event).await
+        {
+            tracing::warn!("failed to persist content repair: {}", error);
+        }
+    }
+
+    /// Persist the turn's prompt when the eager write before the first provider call failed.
+    ///
+    /// Runs against the turn's first response, so the prompt reaches disk before any row that
+    /// replays after it. A second failure fails the turn: nothing later is worth persisting on top
+    /// of a stored conversation whose opening message is missing.
+    async fn ensure_prompt_saved(
+        &mut self,
+        agent: &Agent,
+        session_id: Uuid,
+        prompt: &Message,
+    ) -> Result<()> {
+        if self.user_saved {
+            return Ok(());
+        }
+        let event = crate::conversation::Event::Append(prompt.clone());
+        agent.session_manager.save_event(session_id, &event).await?;
+        self.user_saved = true;
+        Ok(())
+    }
+
+    /// Ask once for a user-visible response after a turn that made no tool call and produced only
+    /// thinking (or nothing at all), which would otherwise end silently.
+    ///
+    /// Mirrors Claude Code's `query_thinking_only_response`: record the turn, then nudge and
+    /// continue. The nudge is appended *after* the assistant message so the thinking-only turn
+    /// isn't the trailing assistant message - Claude strips trailing thinking blocks only from
+    /// the last assistant turn, so keeping it non-last preserves its thinking block on the
+    /// retry request.
+    async fn nudge_thinking_only(
+        &mut self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+        assistant_message: &Message,
+        stop_reason: &StopReason,
+    ) -> Result<()> {
+        messages.append(assistant_message.clone());
+        let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
+        let nudge = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: THINKING_ONLY_NUDGE.to_string(),
+            }],
+        };
+        let nudge_event = crate::conversation::Event::Append(nudge.clone());
+        agent
+            .session_manager
+            .save_events_atomic(session_id, vec![assistant_event, nudge_event])
+            .await?;
+        messages.append(nudge);
+        self.thinking_only_nudged = true;
+        tracing::info!(
+            "thinking-only response (no visible text, stop_reason {:?}); nudging once",
+            stop_reason,
+        );
+        Ok(())
+    }
+
+    /// Take back a prompt whose turn produced nothing at all, for a caller whose prompt will be
+    /// produced again ([`PromptRetention::WithdrawOnFailure`]).
+    ///
+    /// Whether the prompt reached disk decides how, and the difference is not cosmetic. Persisted,
+    /// it is withdrawn by appending an [`crate::conversation::Event::Repair`] rather than deleting
+    /// a row: the log stays append-only, and the materialized view -- which is what a later
+    /// turn actually sends -- loses the orphan. Unpersisted, it has to be dropped from memory
+    /// instead, because a `Repair` is position-relative and writing one for an `Append` that
+    /// never reached disk would, on reload, delete whatever message *does* sit at the end of
+    /// the stored log: a turn from before this one.
+    async fn withdraw_unanswered_prompt(
+        &self,
+        agent: &Agent,
+        session_id: Uuid,
+        messages: &mut Conversation,
+    ) {
+        if self.user_saved {
+            let withdrawal = messages.replace_tail(1, Vec::new());
+            if let Err(error) = agent
+                .session_manager
+                .save_event(session_id, &withdrawal)
+                .await
+            {
+                tracing::warn!(
+                    "failed to persist the withdrawal of a failed scheduled prompt; it will \
+                     reappear if this session is resumed: {}",
+                    error
+                );
+            }
+        } else {
+            // Reached only when a database write failed, which no test here can provoke.
+            messages.pop_unsaved();
+        }
+    }
+}
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -960,6 +1137,7 @@ impl Agent {
             match (*session_id).filter(|_| context::background_index_is_live(&catalogue)) {
                 Some(id) => self
                     .session_manager
+                    .background_store()
                     .list_running_background_tasks(id)
                     .await
                     .unwrap_or_else(|error| {
@@ -982,6 +1160,7 @@ impl Agent {
                 match (*session_id).filter(|_| context::schedule_index_is_live(&catalogue)) {
                     Some(id) => self
                         .session_manager
+                        .schedule_store()
                         .list_scheduled_jobs(id)
                         .await
                         .unwrap_or_else(|error| {
@@ -1041,19 +1220,11 @@ impl Agent {
         // Build the user message once (text preamble + any input images) and reuse it for both the
         // in-memory append and every persist path below, so attached images survive resume.
         let user_message = Message::user_with_images(augmented_input, images);
-        // Where this turn's additions begin, captured before the append so the user message (which
-        // may carry the attached images) is inside the window a rejection can blame. Distinct from
-        // `turn_start_len` below, which marks the start of the *loop's* additions and so excludes
-        // it.
-        let mut suspect_floor = messages.len();
+        // Captured around the append rather than in the `TurnRecovery` literal below, which is
+        // built after a proactive compaction may have moved the conversation under both. See their
+        // field documentation for what each one is measured against.
+        let suspect_floor = messages.len();
         messages.append(user_message.clone());
-        // The log's length with this turn's prompt on the end and nothing after it. A withdrawal is
-        // only safe while it still reads this, so it is captured here rather than reconstructed
-        // later: every way the turn can move on from its prompt -- an assistant reply, a tool
-        // round, either compaction, a repair, the thinking-only nudge -- goes through the
-        // event log and moves this number. Inspecting the materialized tail instead is not
-        // equivalent, because a compaction summary and a nudge are both plain `User`
-        // messages that look exactly like a prompt from the outside.
         let prompt_only_events = messages.events_len();
         // Persist the user message eagerly, before the first provider call.  A crash
         // during the provider roundtrip would otherwise lose it from disk.  On transient
@@ -1111,27 +1282,21 @@ impl Agent {
             }
         }
 
-        // Wrapped in `Arc` once so the no-tool-progress branch below can share it with a cheap
-        // `Arc::clone` instead of a deep `Vec` clone on every loop iteration. `mut` so an overflow
-        // recovery (compact-and-retry, below) can rebuild it from the compacted conversation.
-        let mut base_messages: Arc<[Message]> = Arc::from(truncate_messages_for_context(
-            messages.as_slice(),
-            self.options.context_messages,
-        ));
-        let mut turn_start_len = messages.len();
-        // Bounds the emergency compact-and-retry on a `ContextOverflow` so a request that stays too
-        // large after one compaction fails cleanly instead of looping.
-        let mut overflow_retries = 0u32;
-        // Bounds the degrade-and-retry on a `MekaError::InvalidRequest`, in the same spirit.
-        let mut repairs_used = 0u32;
-        // A repair applied to the in-memory conversation but not yet proven good by a 2xx, so not
-        // yet persisted. Dropped back into the log on success, undone on a second rejection.
-        let mut pending_repair: Option<crate::conversation::Event> = None;
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(truncate_messages_for_context(
+                messages.as_slice(),
+                self.options.context_messages,
+            )),
+            turn_start_len: messages.len(),
+            suspect_floor,
+            prompt_only_events,
+            overflow_retries: 0,
+            repairs_used: 0,
+            pending_repair: None,
+            user_saved: user_eagerly_saved,
+            thinking_only_nudged: false,
+        };
 
-        let mut user_saved = user_eagerly_saved;
-        // Set once we've nudged the model for a user-visible response this turn, so the recovery
-        // fires at most once and can't loop (see `should_nudge_thinking_only`).
-        let mut thinking_only_nudged = false;
         // Accumulate token usage across every provider call within this turn so the per-turn
         // display reflects the whole turn (including tool-execution loops), not just the final
         // round-trip.
@@ -1153,12 +1318,35 @@ impl Agent {
                 // the provider takes it.
                 let sent_len = messages.len();
 
-                let api_messages: Arc<[Message]> = if messages.len() > turn_start_len {
-                    let mut combined = base_messages.to_vec();
-                    combined.extend_from_slice(&messages.as_slice()[turn_start_len..]);
-                    Arc::from(combined)
+                // Re-truncate the assembled request, not just the turn's starting point.
+                //
+                // This costs cache. The cut walks forward to the first safe boundary, so once a
+                // tool loop pushes the request past the cap the prefix sent to the provider moves
+                // several times within one turn, where it previously never moved -- the same
+                // property the tools array is built to preserve a few lines below. It buys a cap
+                // that actually holds; an unbounded request eventually hits the context limit the
+                // setting exists to avoid, which is the more expensive failure. Named here because
+                // it shows up as a bill rather than as a bug.
+                //
+                // `base_messages` is capped once at turn start and everything the tool loop appends
+                // was then spliced on untruncated, so `[session] context_messages` -- documented as
+                // "maximum number of messages to send to the LLM API per request" -- stopped
+                // applying the moment a turn made its second provider call. Worse, it stayed broken
+                // for the rest of the session: the safe-cut walk looks for a `User` message that is
+                // *not* a tool-result message, and during a tool loop every user message is one, so
+                // on later turns the walk ran to index 0 and truncated nothing at all.
+                let api_messages: Arc<[Message]> = if messages.len() > recovery.turn_start_len {
+                    Arc::from(assemble_api_messages(
+                        messages.as_slice(),
+                        &recovery.base_messages,
+                        recovery.turn_start_len,
+                        self.options.context_messages,
+                    ))
                 } else {
-                    Arc::clone(&base_messages)
+                    // What `assemble_api_messages` returns with nothing appended, reusing the
+                    // allocation instead of copying it. `base_messages` was truncated at turn
+                    // start, so there is nothing left for the cap to do.
+                    Arc::clone(&recovery.base_messages)
                 };
 
                 // Recompute the active tool set every iteration so a `load_tool` call earlier in
@@ -1253,113 +1441,41 @@ impl Agent {
 
                 let (mut assistant_message, stop_reason, usage) = match call_result {
                     Ok(value) => value,
-                    // Context overflow despite the proactive check (the local estimate under-counts
-                    // tool schemas). Compact once and retry rather than fail the turn; the
-                    // compacted conversation already holds this turn's tool
-                    // results, so the retry rebuilds `base_messages` from it
-                    // and re-sends.
                     Err(MekaError::ContextOverflow(message))
                         if self.options.auto_compact
                             && self.options.context_window > 0
                             && messages.len() > 1
-                            && overflow_retries < MAX_OVERFLOW_RETRIES =>
+                            && recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
                     {
-                        overflow_retries += 1;
-                        tracing::warn!(
-                            "provider reported context overflow; compacting and retrying ({})",
-                            message
-                        );
-                        if let Err(compact_error) = self
-                            .compact_session(
+                        if let Err(error) = recovery
+                            .recover_from_context_overflow(
+                                self,
                                 session_id,
                                 messages,
-                                CompactRequest::new(CompactOrigin::Emergency),
-                                cancellation.clone(),
+                                &cancellation,
+                                message,
                             )
                             .await
                         {
-                            tracing::warn!("emergency compaction failed: {}", compact_error);
-                            break 'turn Err(MekaError::ContextOverflow(message));
+                            break 'turn Err(error);
                         }
-                        base_messages = Arc::from(truncate_messages_for_context(
-                            messages.as_slice(),
-                            self.options.context_messages,
-                        ));
-                        turn_start_len = messages.len();
-                        // Compaction rewrote everything before this point, so the old floor no
-                        // longer marks anything.
-                        suspect_floor = messages.len();
                         continue;
                     }
-                    // The retry after a repair was refused too, so the repair was not the fix.
-                    // Undo it and report what the provider actually said, leaving the conversation
-                    // byte-identical to before the attempt: the cost of guessing wrong has to be
-                    // one round trip, never a destroyed tool result.
-                    Err(MekaError::InvalidRequest(message)) if pending_repair.is_some() => {
-                        if messages.pop_repair() {
-                            tracing::warn!(
-                                "degrading this turn's content did not satisfy the provider; \
-                                 restored it unchanged"
-                            );
-                        }
+                    Err(MekaError::InvalidRequest(message))
+                        if recovery.pending_repair.is_some() =>
+                    {
+                        recovery.undo_rejected_repair(messages);
                         break 'turn Err(MekaError::InvalidRequest(message));
                     }
-                    // The provider refused the request as malformed. Retrying it unchanged is
-                    // pointless (a 400 is deterministic on the body), and failing outright is worse
-                    // than it looks: the content is already committed to the session, so every
-                    // later request carries it and dies the same way, leaving the session
-                    // unusable. Strip the non-text content appended since the last accepted request
-                    // and try once more, telling the model what happened via the tool result it is
-                    // already equipped to read.
                     Err(MekaError::InvalidRequest(message))
-                        if repairs_used < MAX_REQUEST_REPAIRS =>
+                        if recovery.repairs_used < MAX_REQUEST_REPAIRS =>
                     {
-                        let suspect_start = match self
-                            .last_accepted_len
-                            .load(std::sync::atomic::Ordering::Relaxed)
+                        if let Err(error) = recovery
+                            .repair_rejected_content(self, messages, message)
+                            .await
                         {
-                            // Clamped like the arm below, and for a sharper reason: `suspect_floor`
-                            // is captured before this turn's message is appended and is *not* reset
-                            // by a proactive compaction, which can leave it pointing past the end
-                            // of a conversation that has just collapsed
-                            // to a summary. Compaction also
-                            // sets `last_accepted_len` to `LAST_ACCEPTED_UNKNOWN`, so this is the
-                            // arm a post-compaction rejection takes, and the slice below would
-                            // panic rather than fail the turn.
-                            LAST_ACCEPTED_UNKNOWN => suspect_floor.min(messages.len()),
-                            accepted => accepted.min(messages.len()),
-                        };
-                        let Some(degraded) = degrade_rejected_content(
-                            &messages.as_slice()[suspect_start..],
-                            &message,
-                        ) else {
-                            // Nothing to strip, so this is not a content problem: a `max_tokens`
-                            // over the model's ceiling, an unknown header, a bad `tool_choice`.
-                            break 'turn Err(MekaError::InvalidRequest(message));
-                        };
-                        repairs_used += 1;
-                        let replaced_count = messages.len() - suspect_start;
-                        tracing::warn!(
-                            "provider rejected the request; degrading {} message(s) appended since \
-                             the last accepted one and retrying ({})",
-                            replaced_count,
-                            message,
-                        );
-                        self.frontend
-                            .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
-                                format!(
-                                    "provider rejected content in this turn; retrying without it: \
-                                     {}",
-                                    elide_reason(&message)
-                                ),
-                            )))
-                            .await;
-                        pending_repair = Some(messages.replace_tail(replaced_count, degraded));
-                        base_messages = Arc::from(truncate_messages_for_context(
-                            messages.as_slice(),
-                            self.options.context_messages,
-                        ));
-                        turn_start_len = messages.len();
+                            break 'turn Err(error);
+                        }
                         continue;
                     }
                     Err(error) => break 'turn Err(error),
@@ -1394,26 +1510,11 @@ impl Agent {
                     .cache_read_input_tokens
                     .saturating_add(usage.cache_read_input_tokens);
 
-                if !user_saved {
-                    let user_event = crate::conversation::Event::Append(user_message.clone());
-                    if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
-                        break 'turn Err(error);
-                    }
-                    user_saved = true;
+                if let Err(error) = recovery.ensure_prompt_saved(self, sid, &user_message).await {
+                    break 'turn Err(error);
                 }
 
-                // Persist the repair this response just vindicated, after the user message is
-                // guaranteed on disk and before anything else is appended. `Event::Repair` replaces
-                // the *trailing* messages on replay, so any row written between the messages it
-                // repairs and the repair itself would be swallowed instead.
-                if let Some(event) = pending_repair.take()
-                    && let Err(error) = self.session_manager.save_event(sid, &event).await
-                {
-                    // The in-memory conversation is repaired either way, so this turn still
-                    // completes; the cost is that a resume re-reads the rejected content and pays
-                    // one more round trip to heal it again.
-                    tracing::warn!("failed to persist content repair: {}", error);
-                }
+                recovery.persist_vindicated_repair(self, sid).await;
 
                 if cancellation.is_cancelled() {
                     // Interrupted mid-stream. Persist the partial assistant text so it survives
@@ -1456,42 +1557,18 @@ impl Agent {
                     .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
                 let has_visible_text = has_visible_text(&assistant_message.content);
 
-                // A turn that makes no tool call and produces no visible text (a thinking-only
-                // response, or an empty one) would otherwise end silently. Mirror Claude Code's
-                // `query_thinking_only_response`: record the turn, then nudge the model once for a
-                // user-visible response and continue. The nudge is appended *after* the assistant
-                // message so the thinking-only turn isn't the trailing assistant message - Claude
-                // strips trailing thinking blocks only from the last assistant turn, so keeping it
-                // non-last preserves its thinking block on the retry request.
                 if should_nudge_thinking_only(
                     has_tool_calls,
                     has_visible_text,
                     &stop_reason,
-                    thinking_only_nudged,
+                    recovery.thinking_only_nudged,
                 ) {
-                    messages.append(assistant_message.clone());
-                    let assistant_event =
-                        crate::conversation::Event::Append(assistant_message.clone());
-                    let nudge = Message {
-                        role: Role::User,
-                        content: vec![ContentBlock::Text {
-                            text: THINKING_ONLY_NUDGE.to_string(),
-                        }],
-                    };
-                    let nudge_event = crate::conversation::Event::Append(nudge.clone());
-                    if let Err(error) = self
-                        .session_manager
-                        .save_events_atomic(sid, vec![assistant_event, nudge_event])
+                    if let Err(error) = recovery
+                        .nudge_thinking_only(self, sid, messages, &assistant_message, &stop_reason)
                         .await
                     {
                         break 'turn Err(error);
                     }
-                    messages.append(nudge);
-                    thinking_only_nudged = true;
-                    tracing::info!(
-                        "thinking-only response (no visible text, stop_reason {:?}); nudging once",
-                        stop_reason,
-                    );
                     continue;
                 }
 
@@ -1651,43 +1728,24 @@ impl Agent {
             // returns on its own schedule.
             Err(_)
                 if retention == PromptRetention::WithdrawOnFailure
-                    && messages.events_len() == prompt_only_events
+                    && messages.events_len() == recovery.prompt_only_events
                     && messages.ends_on_a_turn_opening() =>
             {
-                if user_saved {
-                    // Appends an `Event::Repair` rather than deleting a row: the log stays
-                    // append-only, and the materialized view -- which is what a later turn actually
-                    // sends -- loses the orphan.
-                    let withdrawal = messages.replace_tail(1, Vec::new());
-                    if let Err(error) = self.session_manager.save_event(sid, &withdrawal).await {
-                        tracing::warn!(
-                            "failed to persist the withdrawal of a failed scheduled prompt; it will \
-                             reappear if this session is resumed: {}",
-                            error
-                        );
-                    }
-                } else {
-                    // The eager persist failed, so the prompt exists only in memory. It has to be
-                    // dropped rather than repaired, and the difference is not cosmetic: a `Repair`
-                    // is position-relative, so writing one for an `Append` that never reached disk
-                    // would, on reload, delete whatever message *does* sit at the end of the stored
-                    // log -- a turn from before this one.
-                    //
-                    // Reached only when a database write failed, which no test here can provoke.
-                    messages.pop_unsaved();
-                }
+                recovery
+                    .withdraw_unanswered_prompt(self, sid, messages)
+                    .await;
                 *self.last_rendered_world.write().await = world_state_rollback;
                 if resumed {
                     messages.restore_resumed_notice();
                 }
             }
-            Err(MekaError::Interrupted) if !user_saved => {
+            Err(MekaError::Interrupted) if !recovery.user_saved => {
                 let user_event = crate::conversation::Event::Append(user_message.clone());
                 if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
                     tracing::error!("failed to save user message on interruption: {}", error);
                 }
             }
-            Err(error) if !matches!(error, MekaError::Interrupted) && !user_saved => {
+            Err(error) if !matches!(error, MekaError::Interrupted) && !recovery.user_saved => {
                 messages.pop_unsaved();
                 // The popped message carried this turn's world-state announcement, so put the
                 // snapshot back to what the model has actually seen. The next turn then re-renders
@@ -1986,7 +2044,17 @@ impl Agent {
                     // Forward provider-side advisories (image redaction, etc.) to the frontend
                     // alongside the stream. Emitted inline so the user sees them in order with the
                     // assistant text that follows.
-                    *content_started = true;
+                    //
+                    // Deliberately does *not* set `content_started`. That flag exists so a retry
+                    // cannot double-emit model output, and a notice is not model output -- the
+                    // Claude providers queue the image-redaction advisory before the request is
+                    // even sent, so marking it would have disabled retry for
+                    // the whole turn from the first event onward. An
+                    // image-heavy session would then fail outright on the
+                    // next 429 or dropped connection instead of backing off, having produced
+                    // nothing at all, and the user would pay to re-send the
+                    // same multi-megabyte body. Re-showing one advisory line
+                    // after a retry is far cheaper than losing the turn.
                     self.frontend.emit(FrontendEvent::Notice(notice)).await;
                 }
                 StreamEvent::Error(error) => {
@@ -2413,7 +2481,12 @@ impl Agent {
 
         // Recorded before the spawn, so a process that dies in between leaves a `running` row the
         // sweep can retire rather than work nobody knows happened.
-        if let Err(error) = self.session_manager.start_background_task(&task).await {
+        if let Err(error) = self
+            .session_manager
+            .background_store()
+            .start_background_task(&task)
+            .await
+        {
             // Hand the slot back, or a failed start would shrink the ceiling for the session's
             // lifetime.
             self.background_tasks.forget(&task.id).await;
@@ -2434,8 +2507,15 @@ impl Agent {
             let task_id = task.id.clone();
             let tool_name = task.tool_name.clone();
             async move {
+                // Published for the frontend as well as passed to the tool: a delegated `fs/*` or
+                // elicitation must race *this* token, not the session's current turn. See
+                // `crate::frontend::scope_call_cancellation`.
+                let scoped = cancellation.clone();
                 let run = crate::tools::with_tool_call_id(tool_call_id, async move {
-                    Self::run_tool(&*tool, &input, cancellation.clone(), &frontend).await
+                    crate::frontend::scope_call_cancellation(scoped.clone(), async move {
+                        Self::run_tool(&*tool, &input, scoped.clone(), &frontend).await
+                    })
+                    .await
                 });
                 // A panic must not escape this task. Nothing awaits its `JoinHandle` outside
                 // `--oneshot`, so an unwind here would skip both the outcome write and the slot
@@ -2485,6 +2565,7 @@ impl Agent {
                     crate::background::TaskStatus::Completed
                 };
                 if let Err(error) = session_manager
+                    .background_store()
                     .finish_background_task(&task_id, status, Some(inline), scratchpad_name)
                     .await
                 {
@@ -3192,6 +3273,29 @@ fn world_state_still_visible(
     context_messages.is_none_or(|limit| current_len.saturating_sub(rendered_at) < limit)
 }
 
+/// Assemble the message list for one provider call inside a turn: the turn's stable base plus
+/// whatever the tool loop has appended since, re-truncated as a whole.
+///
+/// A named function rather than four lines inline, because the four lines had a *copy* in the test
+/// module that omitted the truncation. The five tests written to protect this windowing therefore
+/// drove the copy, could not see a change to the real path, and two of them settled on message
+/// counts the real path never produces. A test that cannot fail when its subject changes is worse
+/// than no test: it reads as coverage.
+fn assemble_api_messages(
+    messages: &[Message],
+    base_messages: &[Message],
+    turn_start_len: usize,
+    context_messages: Option<usize>,
+) -> Vec<Message> {
+    if messages.len() > turn_start_len {
+        let mut combined = base_messages.to_vec();
+        combined.extend_from_slice(&messages[turn_start_len..]);
+        truncate_messages_for_context(&combined, context_messages)
+    } else {
+        base_messages.to_vec()
+    }
+}
+
 fn truncate_messages_for_context(
     messages: &[Message],
     context_messages: Option<usize>,
@@ -3204,21 +3308,36 @@ fn truncate_messages_for_context(
         return messages.to_vec();
     }
 
-    let mut start_index = messages.len().saturating_sub(limit);
+    // Clamped to a valid index before the walk below reads `messages[start_index]`. `limit == 0` is
+    // rejected at config load, but this function is also called with the value threaded through
+    // `AgentOptions`, and an out-of-bounds index here is a panic that takes the process (or, under
+    // `serve`, the turn task) down. Costing one message is the right trade against that.
+    let mut start_index = messages
+        .len()
+        .saturating_sub(limit)
+        .min(messages.len().saturating_sub(1));
 
-    // Walk backward to find a safe cut point: a user message that is NOT a tool_results message.
-    // This avoids splitting assistant(ToolUse) → user(ToolResult) chains and ensures the first
-    // message has role User (required by Claude API).
-    loop {
-        if start_index == 0 {
-            break;
-        }
+    // A safe cut point is a user message that is NOT a tool_results message: it neither splits an
+    // assistant(ToolUse) → user(ToolResult) chain nor leaves the window starting on a role the
+    // Claude API rejects.
+    let is_safe_cut = |index: usize| {
+        messages.get(index).is_some_and(|message| {
+            message.role == Role::User && !has_tool_results(&message.content)
+        })
+    };
 
-        let message = &messages[start_index];
-        if message.role == Role::User && !has_tool_results(&message.content) {
-            break;
-        }
+    // Search *forward* first, which drops the leading tool chain whole rather than reaching back
+    // over it. Reaching back was the only behaviour, and it made the cap advisory: one long tool
+    // loop with no plain user message inside it dragged `start_index` to 0, so a session configured
+    // for 50 messages sent all 900 of them and hit the context limit the setting exists to avoid.
+    // Cutting forward can keep fewer messages than asked for, which is what a maximum means.
+    if let Some(index) = (start_index..messages.len()).find(|&index| is_safe_cut(index)) {
+        return messages[index..].to_vec();
+    }
 
+    // Nothing ahead is safe (the tail is one unbroken tool chain), so reach back for the last cut
+    // point that is. Exceeding the cap beats sending a conversation the provider will reject.
+    while start_index > 0 && !is_safe_cut(start_index) {
         start_index -= 1;
     }
 
@@ -3632,6 +3751,97 @@ mod tests {
         test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
     }
 
+    /// An emergency compaction must drop a pending repair rather than carry it across.
+    ///
+    /// `Event::Repair` is *position-relative*: it records how many trailing entries it replaces,
+    /// and its own doc comment states the producer invariant that those entries must still be
+    /// the trailing ones. Compaction rewrites the conversation and writes a `CompactBoundary`,
+    /// so a repair left pending afterwards is measured against a log that no longer has the
+    /// shape it was taken from, and would replace the wrong messages. Deleting the clearing
+    /// line left every suite green: the one test that reaches this arm asserts on the turn's
+    /// outcome and never looks at the recovery state.
+    #[tokio::test]
+    async fn an_emergency_compaction_drops_a_pending_repair() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        // The compaction runs a checkpoint turn and then a summary, so it needs more than the one
+        // round the retry itself would consume.
+        let round = || {
+            vec![
+                MockEvent::Text {
+                    text: "compacted".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            round(),
+            round(),
+            round(),
+            round(),
+        ]));
+        let (agent, session_manager) =
+            test_agent_that_compacts(provider as Arc<dyn Provider>).await;
+
+        // A real row: `compact_session` refuses outright without one, which is what made an earlier
+        // attempt at this test fail for a reason unrelated to the invariant.
+        let created = session_manager
+            .create_session(None)
+            .await
+            .expect("create session");
+        let mut session_id = Some(created);
+
+        let mut messages = Conversation::new();
+        messages.append(Message::user("a task whose request overflowed"));
+        messages.append(Message::assistant_text("a reply"));
+
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(messages.as_slice().to_vec()),
+            turn_start_len: messages.len(),
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            overflow_retries: 0,
+            repairs_used: 1,
+            pending_repair: Some(crate::conversation::Event::Repair {
+                replaced_count: 1,
+                messages: vec![Message::user("the degraded replacement")],
+            }),
+            user_saved: false,
+            thinking_only_nudged: false,
+        };
+
+        recovery
+            .recover_from_context_overflow(
+                &agent,
+                &mut session_id,
+                &mut messages,
+                &CancellationToken::new(),
+                "prompt is too long".to_string(),
+            )
+            .await
+            .expect("the emergency compaction succeeds");
+
+        assert!(
+            recovery.pending_repair.is_none(),
+            "a position-relative repair survived the compaction that moved everything it points at"
+        );
+    }
+
+    /// A harness that can actually reach the emergency-compaction arm.
+    ///
+    /// The default one cannot: it sets `auto_compact: false` and `context_window: 0`, and the guard
+    /// requires both, so a test driving `FailContextOverflow` through `test_agent` proves only that
+    /// the *guard* short-circuits. It was written specifically to close that gap and did not.
+    async fn test_agent_that_compacts(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
+        let (mut agent, session_manager) =
+            test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await;
+        agent.options.auto_compact = true;
+        agent.options.context_window = 200_000;
+        (agent, session_manager)
+    }
+
     async fn test_agent_with_registry(
         provider: Arc<dyn Provider>,
         registry: crate::tools::ToolRegistry,
@@ -3682,6 +3892,221 @@ mod tests {
     const REJECTION: &str = "API returned status 400 Bad Request: the image was specified using \
                              the image/png media type, but the image appears to be a image/jpeg \
                              image";
+
+    /// An overflow the agent cannot compact away has to surface once, not loop.
+    ///
+    /// This is the *guard*, not the recovery: `test_agent` sets `auto_compact: false` and
+    /// `context_window: 0`, so the match arm never fires here whatever the conversation looks like.
+    /// It was written to close the plan's `FailContextOverflow` gap and does not -- deleting
+    /// `recover_from_context_overflow`, `MAX_OVERFLOW_RETRIES` and the arm leaves it green. The
+    /// recovery itself is covered by
+    /// `an_overflow_it_can_compact_away_is_compacted_and_retried_once`, which uses a harness that
+    /// can reach it.
+    ///
+    /// What this does prove is worth keeping: the overflow keeps its own error type and is
+    /// attempted exactly once. The recorded requests are the only way to see the second part,
+    /// since the returned error is identical whether the loop ran once or a thousand times.
+    #[tokio::test]
+    async fn an_overflow_it_cannot_compact_away_surfaces_instead_of_looping() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::FailContextOverflow {
+                message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+            },
+        ]]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _session_manager) = test_agent(provider_handle).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "summarise the log".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an overflow nothing can shrink must reach the caller");
+        assert!(
+            matches!(error, MekaError::ContextOverflow(_)),
+            "the overflow must keep its own type, not become a generic provider error: {error:?}"
+        );
+
+        // One attempt, not a retry storm. Recording the requests is the only way to see this: the
+        // returned error is identical whether the loop ran once or a thousand times.
+        let requests = provider.streams();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a compaction that cannot help must not be retried"
+        );
+
+        // And the one attempt carried the turn meka meant to send, which is what distinguishes
+        // "the provider refused a real request" from "meka sent something malformed and the
+        // overflow was incidental".
+        let attempt = &requests[0];
+        assert!(
+            attempt
+                .messages
+                .iter()
+                .any(|message| message.text_content().contains("summarise the log")),
+            "the prompt must reach the provider: {:?}",
+            attempt.messages
+        );
+        assert!(
+            !attempt.system_prompt.is_empty(),
+            "a turn always carries a system prompt"
+        );
+        assert!(
+            attempt.tools.is_empty(),
+            "this harness registers no tools, so none should be advertised"
+        );
+    }
+
+    /// A notice is not model output, so it must not disable the turn's retry.
+    ///
+    /// `content_started` exists to stop a retry double-emitting what the user already saw. The
+    /// Claude providers queue the image-redaction advisory *before* the request is sent, so a
+    /// notice that set the flag would disable retry from the first event of every image-bearing
+    /// turn: the next dropped connection would fail outright, having produced nothing, and the user
+    /// would pay to re-send the images by hand.
+    #[tokio::test]
+    async fn a_notice_before_a_dropped_stream_does_not_disable_the_retry() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // An advisory, then the connection drops with nothing user-visible emitted.
+            vec![
+                MockEvent::Notice {
+                    message: "an image was too large and was downscaled".to_string(),
+                },
+                MockEvent::FailStream {
+                    message: "connection reset".to_string(),
+                },
+            ],
+            // The retry, which must happen.
+            vec![
+                MockEvent::Text {
+                    text: "answered on the retry".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _session_manager) = test_agent(provider_handle).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "go".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn must retry past a notice-then-drop, not fail");
+
+        assert!(
+            matches!(outcome, TurnOutcome::EndTurn),
+            "the retry must carry the turn to a normal end: {outcome:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text_content().contains("answered on the retry")),
+            "and the retry's answer is what lands in the conversation",
+        );
+    }
+
+    /// The emergency arm, actually reached: an overflow the agent *can* compact away is compacted
+    /// and the turn retried once.
+    ///
+    /// Its sibling above exercises the case where the guard short-circuits, which is the honest
+    /// reading of what `test_agent` allows -- `auto_compact: false` and `context_window: 0` mean
+    /// `recover_from_context_overflow` is never called there. Deleting the method, the retry
+    /// constant and the match arm left that test green, so the branch this feature exists for was
+    /// still unreached after the test written to reach it.
+    #[tokio::test]
+    async fn an_overflow_it_can_compact_away_is_compacted_and_retried_once() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // The turn's first request: too large.
+            vec![MockEvent::FailContextOverflow {
+                message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+            }],
+            // The summariser, which `CompactOrigin::Emergency` always runs through `complete`.
+            vec![
+                MockEvent::Text {
+                    text: "the log said everything was fine".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            // The retry, against the compacted conversation.
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _session_manager) = test_agent_that_compacts(provider_handle).await;
+
+        // Long enough to have something to compact: the split keeps everything as head below five
+        // messages, so a shorter conversation has no summary to make and correctly surfaces.
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+
+        let mut session_id = None;
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "summarise the log".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the compacted retry must succeed");
+        assert!(
+            matches!(outcome, TurnOutcome::EndTurn),
+            "the retry must end the turn cleanly: {outcome:?}",
+        );
+
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the emergency summariser must have run",
+        );
+        assert_eq!(
+            provider.streams().len(),
+            2,
+            "the turn is attempted once, compacted, and attempted once more",
+        );
+        // The retry is the point: it must carry less than the request that overflowed.
+        let requests = provider.streams();
+        assert!(
+            requests[1].messages.len() < requests[0].messages.len(),
+            "the retry sent {} messages against the original's {}; compaction achieved nothing",
+            requests[1].messages.len(),
+            requests[0].messages.len(),
+        );
+    }
 
     /// The whole point of the feature: a rejection of content meka just appended must not end the
     /// turn, and the repair must be persisted so a resume doesn't walk back into it.
@@ -4483,6 +4908,7 @@ mod tests {
         assert!(results.contains("task_cancel"), "{results}");
 
         let running = session_manager
+            .background_store()
             .list_running_background_tasks(session_id.expect("session"))
             .await
             .expect("list running");
@@ -4546,6 +4972,7 @@ mod tests {
         );
         assert!(
             session_manager
+                .background_store()
                 .list_background_tasks(session_id.expect("session"))
                 .await
                 .expect("list")
@@ -4581,6 +5008,7 @@ mod tests {
         agent.background_tasks().wait_for_session(session_id).await;
 
         let ready = session_manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -4594,11 +5022,13 @@ mod tests {
 
         let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
         session_manager
+            .background_store()
             .mark_background_tasks_delivered(&ids)
             .await
             .expect("stamp");
         assert!(
             session_manager
+                .background_store()
                 .list_undelivered_background_tasks(session_id)
                 .await
                 .expect("list undelivered")
@@ -4661,6 +5091,7 @@ mod tests {
         agent.background_tasks().wait_for_session(session_id).await;
 
         let ready = session_manager
+            .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
             .expect("list undelivered");
@@ -5411,101 +5842,6 @@ mod tests {
         }
     }
 
-    /// `cwd` leads and duplicates are dropped: a client is free to repeat `cwd` inside
-    /// `additionalDirectories`, and a repeated root would double every search result and spend the
-    /// shared walk budget twice on the same tree.
-    #[test]
-    fn test_search_roots_puts_cwd_first_and_dedupes() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![
-            PathBuf::from("/work/shared"),
-            PathBuf::from("/work/main"),
-            PathBuf::from("/work/shared"),
-            PathBuf::from("/work/docs"),
-        ]));
-
-        assert_eq!(search_roots(&cwd, &roots), vec![
-            PathBuf::from("/work/main"),
-            PathBuf::from("/work/shared"),
-            PathBuf::from("/work/docs"),
-        ]);
-    }
-
-    /// A root nested inside another is covered by it, so keeping both walks that tree twice and
-    /// reports every file in it twice.
-    #[test]
-    fn test_search_roots_drops_roots_nested_in_another() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![
-            PathBuf::from("/work/main/nested"),
-            PathBuf::from("/work/other"),
-        ]));
-
-        assert_eq!(search_roots(&cwd, &roots), vec![
-            PathBuf::from("/work/main"),
-            PathBuf::from("/work/other"),
-        ]);
-    }
-
-    /// And the inverse: a root that *contains* `cwd` wins, because its walk already reaches
-    /// everything under `cwd`. Dropping `cwd` from the search set is safe; it stays the base for
-    /// relative paths and the shell either way.
-    #[test]
-    fn test_search_roots_lets_an_ancestor_root_subsume_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work")]));
-        assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from("/work")]);
-    }
-
-    /// A shared prefix is not containment: `/work/main2` is not inside `/work/main`.
-    #[test]
-    fn test_search_roots_keeps_sibling_with_shared_prefix() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work/main2")]));
-        assert_eq!(search_roots(&cwd, &roots), vec![
-            PathBuf::from("/work/main"),
-            PathBuf::from("/work/main2"),
-        ]);
-    }
-
-    /// The single-root case has to stay exactly one path: that is every REPL and HTTP session, and
-    /// every ACP client that sends no extra roots.
-    #[test]
-    fn test_search_roots_without_extras_is_just_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(Vec::new()));
-        assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from(
-            "/work/main"
-        )]);
-    }
-
-    #[test]
-    fn test_resolve_against_cwd_passes_absolute_paths_through() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent")));
-        let absolute = std::path::Path::new("/etc/hosts");
-        let resolved = resolve_against_cwd(&cwd, absolute);
-        assert_eq!(resolved, PathBuf::from("/etc/hosts"));
-    }
-
-    #[test]
-    fn test_resolve_against_cwd_joins_relative_paths_to_session_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent/project")));
-        let resolved = resolve_against_cwd(&cwd, "src/main.rs");
-        assert_eq!(resolved, PathBuf::from("/home/agent/project/src/main.rs"));
-    }
-
-    #[test]
-    fn test_resolve_against_cwd_follows_subsequent_writes() {
-        // Confirms multiple sessions in one process would observe their own cwds: a write to the
-        // shared lock is visible on the next resolve, without touching process cwd.
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/tmp/a")));
-        let first = resolve_against_cwd(&cwd, "foo.txt");
-        *cwd.write().expect("cwd lock") = PathBuf::from("/tmp/b");
-        let second = resolve_against_cwd(&cwd, "foo.txt");
-        assert_eq!(first, PathBuf::from("/tmp/a/foo.txt"));
-        assert_eq!(second, PathBuf::from("/tmp/b/foo.txt"));
-    }
-
     #[test]
     fn test_truncate_no_limit() {
         let messages = vec![user_msg("hello"), assistant_msg("hi")];
@@ -5568,7 +5904,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_walks_back_past_tool_result() {
+    fn test_truncate_skips_forward_past_tool_result() {
         let messages = vec![
             user_msg("first"),
             assistant_tool_use(),
@@ -5577,9 +5913,48 @@ mod tests {
             user_msg("second"),
             assistant_msg("response2"),
         ];
-        // Limit 4 would naively start at index 2 (tool_result_msg), should walk back to index 0
-        // (user "first")
+        // Limit 4 lands on index 2 (tool_result_msg), which would orphan the tool_use above it.
+        // The next safe cut ahead is index 4 (user "second"); the pair is dropped whole.
         let result = truncate_messages_for_context(&messages, Some(4));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, Role::User);
+        assert!(!has_tool_results(&result[0].content));
+    }
+
+    /// `context_messages` is a maximum, and reaching *back* over a tool chain to find a cut point
+    /// let one long tool loop ignore it entirely: a session capped at 4 sent all 12 messages, into
+    /// the context limit the cap exists to stay under.
+    #[test]
+    fn a_long_tool_loop_cannot_carry_the_window_past_its_cap() {
+        let mut messages = vec![user_msg("go")];
+        for _ in 0..5 {
+            messages.push(assistant_tool_use());
+            messages.push(tool_result_msg());
+        }
+        messages.push(user_msg("and now this"));
+
+        let result = truncate_messages_for_context(&messages, Some(4));
+        assert!(
+            result.len() <= 4,
+            "{} messages survived the cap",
+            result.len()
+        );
+        assert_eq!(result[0].role, Role::User);
+        assert!(!has_tool_results(&result[0].content));
+    }
+
+    /// When nothing ahead is a safe cut, reaching back is still right: an invalid conversation the
+    /// provider rejects is worse than one over the cap.
+    #[test]
+    fn an_unbroken_trailing_tool_chain_falls_back_to_reaching_back() {
+        let mut messages = vec![user_msg("go")];
+        for _ in 0..5 {
+            messages.push(assistant_tool_use());
+            messages.push(tool_result_msg());
+        }
+
+        let result = truncate_messages_for_context(&messages, Some(4));
+        assert_eq!(result.len(), messages.len());
         assert_eq!(result[0].role, Role::User);
         assert!(!has_tool_results(&result[0].content));
     }
@@ -5686,24 +6061,6 @@ mod tests {
         }
     }
 
-    /// Simulates the tool-loop message assembly logic from `run_turn`:
-    ///   base_messages = truncate(messages, limit)   // computed once
-    ///   turn_start_len = messages.len()
-    ///   loop { api_messages = base + messages[turn_start_len..] }
-    fn build_api_messages(
-        messages: &[Message],
-        base_messages: &[Message],
-        turn_start_len: usize,
-    ) -> Vec<Message> {
-        if messages.len() > turn_start_len {
-            let mut combined = base_messages.to_vec();
-            combined.extend_from_slice(&messages[turn_start_len..]);
-            combined
-        } else {
-            base_messages.to_vec()
-        }
-    }
-
     #[test]
     fn test_stable_base_during_tool_loop() {
         // Simulate a conversation with history, then a tool loop that adds 3 tool call/result
@@ -5718,14 +6075,14 @@ mod tests {
         let base_messages = truncate_messages_for_context(&messages, None);
         let turn_start_len = messages.len();
 
-        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_iter0.len(), 3);
 
         // Iteration 1: model calls a tool
         messages.push(assistant_tool_use_named("t1", "read_file"));
         messages.push(tool_result_for("t1", "file contents"));
 
-        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_iter1.len(), 5);
 
         // The first 3 messages (the base) must be identical.
@@ -5735,7 +6092,7 @@ mod tests {
         messages.push(assistant_tool_use_named("t2", "execute_command"));
         messages.push(tool_result_for("t2", "command output"));
 
-        let api_iter2 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter2 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_iter2.len(), 7);
 
         // Base is still identical.
@@ -5747,21 +6104,31 @@ mod tests {
         messages.push(assistant_tool_use_named("t3", "read_file"));
         messages.push(tool_result_for("t3", "more contents"));
 
-        let api_iter3 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter3 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_iter3.len(), 9);
 
         assert_messages_equal(&api_iter2[..7], &api_iter3[..7], "iter2→iter3 prefix");
         assert_messages_equal(&api_iter0[..3], &api_iter3[..3], "iter0→iter3 base");
     }
 
+    /// Once a tool loop pushes the assembled request past `context_messages`, the window moves
+    /// forward with it. This is the trade the per-round truncation makes, stated rather than
+    /// implied.
+    ///
+    /// The test this replaces asserted the opposite -- that the base stays frozen for the whole
+    /// turn -- which was true when the cap was applied once at turn start, and is the behaviour
+    /// that made `context_messages` stop applying the moment a turn made its second provider call.
+    /// It could not see the change because it drove a copy of the assembly that omitted the
+    /// truncation; against the real path it asserts 7 where the answer is 5.
+    ///
+    /// The cost is real and belongs here: a prefix that moves is a prefix the provider cannot serve
+    /// from cache, so a long tool loop now re-reads its window several times per turn. The
+    /// alternative was a cap that did not hold, which is worse -- an unbounded request eventually
+    /// hits the context limit the setting exists to avoid.
     #[test]
-    fn test_truncation_boundary_does_not_shift_during_tool_loop() {
-        // This is the critical test for the fix: when context_messages is set and we're near the
-        // limit, adding tool results within the loop must NOT cause the truncated prefix to shift.
-        // Before the fix, truncation was recomputed inside the loop, causing prefix instability.
+    fn the_window_moves_forward_when_a_tool_loop_pushes_past_the_cap() {
         let limit = Some(6);
 
-        // Start with 5 messages (under the limit of 6).
         let mut messages = vec![
             user_msg("msg-1"),
             assistant_msg("resp-1"),
@@ -5770,40 +6137,56 @@ mod tests {
             user_msg("msg-3"),
         ];
 
-        // Compute the stable base ONCE before the loop (as run_turn does).
         let base_messages = truncate_messages_for_context(&messages, limit);
         let turn_start_len = messages.len();
+        assert_eq!(base_messages.len(), 5, "five fits under a cap of six");
 
-        // All 5 messages fit within the limit; no truncation yet.
-        assert_eq!(base_messages.len(), 5);
+        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
+        assert_eq!(api_iter0.len(), 5, "nothing appended yet");
 
-        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
-        assert_eq!(api_iter0.len(), 5);
-
-        // Iteration 1: add tool call + result → 7 messages total, over limit. With the old code,
-        // truncation would kick in and drop messages from the front.  With the new code, the base
-        // is frozen.
+        // Round 1 takes the assembled request to seven, over the cap.
         messages.push(assistant_tool_use_named("t1", "read_file"));
         messages.push(tool_result_for("t1", "data"));
+        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
 
-        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
-        // Should be base(5) + new(2) = 7
-        assert_eq!(api_iter1.len(), 7);
-
-        // The first 5 messages must be identical to iter0.
-        assert_messages_equal(&api_iter0[..5], &api_iter1[..5], "iter0→iter1 base");
-
-        // Iteration 2: add another tool call → 9 total, well over limit.
+        // Round 2 takes it to nine.
         messages.push(assistant_tool_use_named("t2", "execute_command"));
         messages.push(tool_result_for("t2", "output"));
+        let api_iter2 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
 
-        let api_iter2 = build_api_messages(&messages, &base_messages, turn_start_len);
-        assert_eq!(api_iter2.len(), 9);
+        for (round, request) in [(1, &api_iter1), (2, &api_iter2)] {
+            assert!(
+                request.len() <= 6,
+                "round {round} sent {} messages under a cap of 6",
+                request.len(),
+            );
+            assert_eq!(
+                request.first().map(|message| &message.role),
+                Some(&Role::User),
+                "round {round} must start on a role the provider accepts",
+            );
+            assert!(
+                !has_tool_results(&request.first().expect("non-empty").content),
+                "round {round} must not start mid tool chain",
+            );
+        }
 
-        // The first 7 messages must match iter1 exactly.
-        assert_messages_equal(&api_iter1[..7], &api_iter2[..7], "iter1→iter2 prefix");
-        // And the base (first 5) is still untouched.
-        assert_messages_equal(&api_iter0[..5], &api_iter2[..5], "iter0→iter2 base");
+        // What the round costs: the request no longer opens on the same message it did before, so
+        // the cached prefix ends where the two diverge.
+        let first_of = |request: &[Message]| serde_json::to_string(&request[0].content).unwrap();
+        assert_ne!(
+            first_of(&api_iter1),
+            first_of(&api_iter2),
+            "the window is expected to move once the cap bites; if this ever holds, the cap has \
+             stopped applying inside the turn again",
+        );
+
+        // And the newest messages always survive: the cut only ever comes off the front.
+        let newest = serde_json::to_string(&messages[messages.len() - 1].content).unwrap();
+        assert_eq!(
+            serde_json::to_string(&api_iter2[api_iter2.len() - 1].content).unwrap(),
+            newest,
+        );
     }
 
     #[test]
@@ -5830,13 +6213,13 @@ mod tests {
         assert_eq!(base_messages[0].role, Role::User);
         assert!(!has_tool_results(&base_messages[0].content));
 
-        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
 
         // Add tool loop messages
         messages.push(assistant_tool_use_named("t1", "read_file"));
         messages.push(tool_result_for("t1", "more data"));
 
-        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter1 = assemble_api_messages(&messages, &base_messages, turn_start_len, limit);
 
         // The base portion must be identical.
         let base_len = base_messages.len();
@@ -5890,7 +6273,7 @@ mod tests {
 
         assert_eq!(base_messages.len(), 3);
 
-        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_iter0 = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_iter0.len(), 3);
 
         // Add many tool calls
@@ -5902,7 +6285,7 @@ mod tests {
             ));
         }
 
-        let api_final = build_api_messages(&messages, &base_messages, turn_start_len);
+        let api_final = assemble_api_messages(&messages, &base_messages, turn_start_len, None);
         assert_eq!(api_final.len(), 13); // 3 base + 10 tool messages
 
         // Base prefix still matches.
@@ -5910,10 +6293,11 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_turn_with_truncation_each_turn_gets_stable_base() {
-        // Simulate multiple turns, each computing its own stable base. Verify that within each
-        // turn's tool loop the base stays fixed, and that across turns the overlapping messages are
-        // consistent.
+    fn test_multi_turn_truncation_keeps_every_request_well_formed() {
+        // Two turns, each computing its own base. Turn 1 stays under the cap, so its base is
+        // stable across the loop; turn 2 crosses it, so the window moves and only the
+        // well-formedness invariants hold. The old name promised a stable base in both,
+        // which stopped being true when the cap started applying per round.
         let limit = Some(6);
 
         // -- Turn 1 --
@@ -5924,10 +6308,10 @@ mod tests {
         // Tool loop: 2 iterations
         messages.push(assistant_tool_use_named("t1a", "read_file"));
         messages.push(tool_result_for("t1a", "data-a"));
-        let api_t1_iter1 = build_api_messages(&messages, &base_t1, start_t1);
+        let api_t1_iter1 = assemble_api_messages(&messages, &base_t1, start_t1, limit);
 
         messages.push(assistant_msg("here's your answer"));
-        let api_t1_iter2 = build_api_messages(&messages, &base_t1, start_t1);
+        let api_t1_iter2 = assemble_api_messages(&messages, &base_t1, start_t1, limit);
 
         // Base is stable within turn 1.
         assert_messages_equal(
@@ -5944,26 +6328,33 @@ mod tests {
 
         messages.push(assistant_tool_use_named("t2a", "execute_command"));
         messages.push(tool_result_for("t2a", "output"));
-        let api_t2_iter1 = build_api_messages(&messages, &base_t2, start_t2);
+        let api_t2_iter1 = assemble_api_messages(&messages, &base_t2, start_t2, limit);
 
         messages.push(assistant_tool_use_named("t2b", "read_file"));
         messages.push(tool_result_for("t2b", "more"));
-        let api_t2_iter2 = build_api_messages(&messages, &base_t2, start_t2);
+        let api_t2_iter2 = assemble_api_messages(&messages, &base_t2, start_t2, limit);
 
-        // Base is stable within turn 2.
-        assert_messages_equal(
-            &api_t2_iter1[..base_t2.len()],
-            &api_t2_iter2[..base_t2.len()],
-            "turn 2 base stable",
-        );
-
-        // And the tool-loop prefix from iter1 is preserved in iter2.
-        let shared = api_t2_iter1.len();
-        assert_messages_equal(
-            &api_t2_iter1[..shared],
-            &api_t2_iter2[..shared],
-            "turn 2 iter1→iter2 prefix",
-        );
+        // Turn 2 is the one where the cap bites, and there the base is *not* stable: the request
+        // is re-truncated each round, so the window walks forward. Asserting stability here was
+        // what made this test false -- it expected seven messages where the real path sends three.
+        // What survives is the invariant that matters: the cap holds and the request stays
+        // well-formed.
+        for (round, request) in [(1, &api_t2_iter1), (2, &api_t2_iter2)] {
+            assert!(
+                request.len() <= 6,
+                "turn 2 round {round} sent {} messages under a cap of 6",
+                request.len(),
+            );
+            assert_eq!(
+                request.first().map(|message| &message.role),
+                Some(&Role::User),
+                "turn 2 round {round} must start on a role the provider accepts",
+            );
+            assert!(
+                !has_tool_results(&request.first().expect("non-empty").content),
+                "turn 2 round {round} must not start mid tool chain",
+            );
+        }
     }
 
     /// Compaction strategy selection and the fallback ladder.

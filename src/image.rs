@@ -88,10 +88,29 @@ pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
     }
 }
 
+/// The most memory one image decode may allocate.
+///
+/// A payload meka accepts is capped at a few megabytes, but compression ratio is not bounded: a
+/// small PNG can describe a 60000x60000 canvas and decode to gigabytes. `image` allocates
+/// optimistically unless told otherwise, so this is the only thing standing between a crafted image
+/// in a tool result and the process. 128 MiB is a 5792x5792 RGBA image, far past any real
+/// screenshot or diagram.
+const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`].
+fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, String> {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| format!("failed to decode {:?} image: {}", format, error))
+}
+
 /// Decode arbitrary supported image bytes and re-encode as PNG.
 pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8>, String> {
-    let decoded = image::load_from_memory_with_format(bytes, source)
-        .map_err(|error| format!("failed to decode {:?} image: {}", source, error))?;
+    let decoded = decode_with_limits(bytes, source)?;
 
     let mut out = Vec::new();
     decoded
@@ -121,8 +140,18 @@ pub(crate) fn downscale_to_dim_cap(
     source: ImageFormat,
     max_dim: u32,
 ) -> Result<Vec<u8>, String> {
-    let decoded = image::load_from_memory_with_format(bytes, source)
-        .map_err(|error| format!("failed to decode {:?} image: {}", source, error))?;
+    // Ask the header first. An image already inside the cap needs no work at all, and decoding it
+    // only to re-encode the same pixels was the common case: every request re-decoded every
+    // attached image, most of which were never oversized.
+    if let Ok((width, height)) = read_image_dimensions(bytes, source)
+        && width <= max_dim
+        && height <= max_dim
+        && source == ImageFormat::Png
+    {
+        return Ok(bytes.to_vec());
+    }
+
+    let decoded = decode_with_limits(bytes, source)?;
     let scaled = if decoded.width() > max_dim || decoded.height() > max_dim {
         decoded.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
     } else {
