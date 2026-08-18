@@ -36,20 +36,15 @@ model = "claude-opus-5"
 
 ### `effort`
 
-meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-oauth`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset, meka picks a model-aware default (`xhigh` where supported, else `high`, omitted on models with no effort knob). See the [`effort`](../configuration/config-file.md#effort) config reference for the full per-model matrix and the supported levels.
+meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-oauth`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset the field is omitted entirely, which is how you ask for Anthropic's own default. See the [`effort`](../configuration/config-file.md#effort) config reference for the levels.
+
+### `thinking`
+
+`adaptive` (the default) sends `thinking: {"type": "adaptive"}` and lets the model set its own budget; `budgeted` sends the older `{"type": "enabled", "budget_tokens": N}` form, taking N from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens); `off` sends no thinking field. Pre-4.6 Claude models require `budgeted`.
 
 ## Supported Models
 
-Any model available through the Claude Messages API. Current line-up (per [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview)):
-
-| Family | Alias | Notes |
-|--------|-------|-------|
-| Fable 5 | `claude-fable-5` | Most capable; thinking always on |
-| Opus 5 | `claude-opus-5` | Default for new profiles; complex agentic coding |
-| Sonnet 5 | `claude-sonnet-5` | Speed + intelligence balance |
-| Haiku 4.5 | `claude-haiku-4-5` | Fastest; no effort knob |
-
-Older but still available: `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`. Deprecated and retiring 2026-08-05: `claude-opus-4-1`.
+Any model available through the Claude Messages API; meka forwards the model string verbatim and doesn't gate which strings are valid. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) - `meka provider add` suggests `claude-opus-5` for new Claude profiles.
 
 ## Custom Base URL
 
@@ -57,6 +52,28 @@ To use a Claude-API-compatible proxy or gateway:
 
 ```bash
 meka --provider claude-api --model claude-opus-5 --base-url https://my-proxy.example.com
+```
+
+A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.
+
+### Anthropic-compatible endpoints
+
+The model behind the endpoint doesn't have to be Claude. Ollama, LM Studio and similar runtimes serve local weights over `POST /v1/messages`, and `claude-api` reaches them with a placeholder key:
+
+```bash
+meka provider add local --type claude-api \
+    --model 'hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0' \
+    --base-url http://127.0.0.1:11434
+```
+
+Nothing in the request is tuned to Claude unless you ask for it. `effort` is omitted when unset, so a backend with no reasoning tiers is never handed one, and `thinking` is whatever the profile says rather than something inferred from the model name - set `budgeted` if your endpoint only implements the older encoding, or `off` if it implements neither.
+
+The one setting worth stating is the context window. meka never probes for it, so an unset profile budgets against the 1M default; on a smaller model that means compaction only fires once the backend itself rejects the request:
+
+```toml
+[providers.local]
+context_window = 262144
+thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 ```
 
 ## API Details

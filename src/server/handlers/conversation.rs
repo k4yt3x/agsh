@@ -363,7 +363,7 @@ pub async fn context(
         .map(|runtime| runtime.messages.len());
 
     // `agent_options`, not the raw config: this is the window the agent actually runs with, after
-    // profile precedence and model-name inference. Reading `config.context_window` would report the
+    // profile precedence and the default. Reading `config.context_window` would report the
     // unresolved `Option` and disagree with the gauge it is being divided into.
     let options = &state.shared.agent_options;
     let compact_at_percent = options

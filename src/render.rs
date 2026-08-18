@@ -2124,9 +2124,9 @@ pub struct ModelStatus<'a> {
     pub profile: Option<&'a str>,
     /// Backend type (e.g. `claude-oauth`).
     pub backend: Option<&'a str>,
-    /// The reasoning effort sent on the wire, or `None` when the model sends none.
+    /// The reasoning effort sent on the wire, or `None` when the request sends none.
     pub effort: Option<&'a str>,
-    pub thinking: bool,
+    pub thinking: crate::provider::ThinkingMode,
 }
 
 /// The body of the session-status block, without ANSI and without the header line.
@@ -2161,15 +2161,26 @@ pub fn format_session_status(
     if let Some(effort) = model.effort {
         let _ = writeln!(out, "  Effort:          {}", effort);
     }
-    let _ = writeln!(
-        out,
-        "  Thinking:        {}",
-        if model.thinking { "on" } else { "off" }
-    );
+    // Claude-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
+    // status block should report what the request carries, and `thinking` is not a field an OpenAI
+    // request has. Naming an encoding there would read as a setting that is in force.
+    if model
+        .backend
+        .is_some_and(|backend| backend.starts_with("claude"))
+    {
+        let _ = writeln!(out, "  Thinking:        {}", model.thinking.as_str());
+    }
     let _ = writeln!(out, "  Turns:           {}", snap.turns);
     // Live context occupancy: how full the window was on the last request. Distinct from the
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
-    if context_window > 0 && context_tokens > 0 {
+    //
+    // Shown from turn zero, at `0 / <window>`, rather than waiting for occupancy to be non-zero.
+    // The window used to be inferred from the model name, so before the first turn there was
+    // nothing to report but a guess. It is now the profile's `context_window` or a documented
+    // default, and meka neither probes for it nor checks it against the model - which makes this
+    // the only place a user can confirm the number their session will actually budget against.
+    // Getting it wrong is otherwise invisible until compaction misbehaves several turns in.
+    if context_window > 0 {
         let pct = ((context_tokens as f64 / context_window as f64) * 100.0).round() as u64;
         let remaining = context_window.saturating_sub(context_tokens);
         let _ = writeln!(
@@ -3093,6 +3104,82 @@ fn coerce_display_value(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The window is reported from turn zero, before there is any occupancy to divide into it.
+    ///
+    /// It is no longer inferred from the model name, so `/status` is the only place a user can
+    /// check the number their session budgets against - and a wrong one is invisible until
+    /// compaction misbehaves several turns later. Waiting for the first turn to show it means the
+    /// setting can only be verified by spending a turn, which is the wrong way round.
+    #[test]
+    fn the_context_window_is_reported_before_the_first_turn() {
+        use crate::provider::ThinkingMode;
+
+        let snap = crate::stats::SessionStats::default().snapshot();
+        let model = ModelStatus {
+            model: Some("some-local-model"),
+            profile: Some("local"),
+            backend: Some("claude-api"),
+            effort: None,
+            thinking: ThinkingMode::Adaptive,
+        };
+
+        // Nothing sent yet: the window still has to appear, at zero occupancy.
+        let fresh = format_session_status(&snap, &model, 0, 0, 262_144);
+        assert!(fresh.contains("Context:"), "{fresh}");
+        assert!(
+            fresh.contains("0 / 262.1k"),
+            "the configured window: {fresh}"
+        );
+
+        // Once a turn has run, the same line carries the occupancy.
+        let used = format_session_status(&snap, &model, 2, 65_536, 262_144);
+        assert!(used.contains("25% used"), "{used}");
+
+        // An unknown window (sub-agents, tests) still has nothing to report.
+        let unknown = format_session_status(&snap, &model, 0, 0, 0);
+        assert!(!unknown.contains("Context:"), "{unknown}");
+    }
+
+    /// `/status` reports what the request actually carries, not what meka happens to hold.
+    ///
+    /// Both of these lines are conditional for the same reason: `effort` is omitted when the
+    /// profile sets none, because the provider then picks its own, and `thinking` is omitted on a
+    /// backend whose requests have no such field. Printing either unconditionally states a setting
+    /// that is not in force - which is exactly what the status block exists to rule out.
+    #[test]
+    fn the_status_block_omits_settings_the_request_does_not_carry() {
+        use crate::provider::ThinkingMode;
+
+        let snap = crate::stats::SessionStats::default().snapshot();
+        let body = |backend: &'static str, effort: Option<&'static str>| {
+            format_session_status(
+                &snap,
+                &ModelStatus {
+                    model: Some("some-model"),
+                    profile: Some("p"),
+                    backend: Some(backend),
+                    effort,
+                    thinking: ThinkingMode::Adaptive,
+                },
+                0,
+                0,
+                0,
+            )
+        };
+
+        let claude = body("claude-api", Some("xhigh"));
+        assert!(claude.contains("Thinking:"), "{claude}");
+        assert!(claude.contains("Effort:"), "{claude}");
+
+        // An OpenAI request has no `thinking` field, whatever mode the struct carries.
+        let openai = body("openai-api", Some("high"));
+        assert!(!openai.contains("Thinking:"), "{openai}");
+
+        // Unset effort means the provider's own default, so there is no tier to report.
+        let unset = body("claude-api", None);
+        assert!(!unset.contains("Effort:"), "{unset}");
+    }
     /// Everything meka prints on its own line has to start from a known attribute state.
     ///
     /// `ESC[K` erases *using the current attributes*, so clearing the row does not undo a

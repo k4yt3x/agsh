@@ -6780,9 +6780,30 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
         body
     );
     assert_eq!(
-        body["window"], 200_000,
-        "the harness configures no context_window, so this is the model-inferred value; reading \
+        body["window"], 1_000_000,
+        "the harness configures no context_window, so this is the documented default; reading \
          `config.context_window` instead would have reported nothing at all: {}",
+        body
+    );
+
+    // And the configured value actually reaches the agent. Since meka no longer infers a window
+    // from the model name or probes for it, this config key is the *only* way to state the real
+    // one, so a call site that dropped it would silently budget every session against the default.
+    let configured =
+        ServeTestHarness::spawn("\n[session]\ncontext_window = 262144\n", mock_simple_turn());
+    let id = session_with_one_turn(&configured);
+    let body: serde_json::Value = configured
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/context", id),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        body["window"], 262_144,
+        "`[session].context_window` must reach the agent, not just the config struct: {}",
         body
     );
 }

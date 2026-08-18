@@ -5,7 +5,7 @@ mod attestation;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicI8, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
@@ -18,14 +18,13 @@ use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
     drive_claude_sse_stream, model_is_haiku, model_supports_mid_conversation_system,
     model_supports_modern_features, model_supports_temperature, parse_non_streaming_response,
-    resolve_effort,
 };
 use crate::{
     error::{MekaError, Result},
     provider::{
         AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, ExtraUsage,
-        Message, ModelInfo, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-        UsageHistory, UsageWindow,
+        Message, Notice, Provider, StopReason, StreamEvent, ThinkingMode, TokenUsage,
+        ToolDefinition, UsageHistory, UsageWindow,
     },
     session::TokenStore,
 };
@@ -60,14 +59,15 @@ pub struct ClaudeOAuthProvider {
     /// Code). Captured from the credential at construction; empty for pre-existing logins until a
     /// refresh persists it and the session restarts, or the user re-logs in.
     account_uuid: String,
-    thinking_enabled: bool,
+    thinking: ThinkingMode,
     thinking_budget_tokens: u64,
-    thinking_override: AtomicI8,
+    /// Set while an internal turn (compaction) runs, so its summary doesn't pay for reasoning.
+    /// Only ever suppresses; it cannot turn thinking on for a profile that asked for none.
+    thinking_suppressed: AtomicBool,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
-    /// the profile's override and the model's name predicates (`xhigh` where supported, else
-    /// `high`). Anthropic's models API reports no effort levels, so there is no catalog to refine
-    /// from post-build. Both the body field and the `effort-2025-11-24` beta gate read it, so they
-    /// stay in lockstep.
+    /// the profile's override. `None` - the unconfigured case - omits the field, so Anthropic
+    /// applies its own default. Both the body field and the `effort-2025-11-24` beta gate read
+    /// this one slot, so they stay in lockstep.
     resolved_effort: Option<String>,
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
@@ -93,7 +93,7 @@ impl ClaudeOAuthProvider {
         oauth_token_url: Option<String>,
         token_store: Option<Arc<TokenStore>>,
         credential_key: String,
-        thinking_enabled: bool,
+        thinking: ThinkingMode,
         thinking_budget_tokens: u64,
         device_id: String,
         effort: Option<String>,
@@ -105,13 +105,15 @@ impl ClaudeOAuthProvider {
             AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
             _ => String::new(),
         };
-        let resolved_effort = resolve_effort(effort.as_deref(), &model);
+        let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
         Ok(Self {
             client: crate::provider::build_http_client("claude-oauth", |builder| builder)?,
             credential: tokio::sync::RwLock::new(credential),
             refresh_gate: tokio::sync::Mutex::new(()),
             base_url: super::shared::normalize_claude_base_url(
-                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                base_url
+                    .as_deref()
+                    .unwrap_or(crate::provider::DEFAULT_CLAUDE_BASE_URL),
             ),
             model,
             client_id: client_id.unwrap_or_else(|| DEFAULT_CLAUDE_CLIENT_ID.to_string()),
@@ -122,9 +124,9 @@ impl ClaudeOAuthProvider {
             session_id: Uuid::new_v4().to_string(),
             device_id,
             account_uuid,
-            thinking_enabled,
+            thinking,
             thinking_budget_tokens,
-            thinking_override: AtomicI8::new(-1),
+            thinking_suppressed: AtomicBool::new(false),
             resolved_effort,
             redact_thinking,
             max_output_tokens,
@@ -132,8 +134,8 @@ impl ClaudeOAuthProvider {
         })
     }
 
-    fn is_thinking_enabled(&self) -> bool {
-        shared::resolve_thinking_enabled(&self.thinking_override, self.thinking_enabled)
+    fn effective_thinking(&self) -> ThinkingMode {
+        shared::effective_thinking(&self.thinking_suppressed, self.thinking)
     }
 
     /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]). The
@@ -190,8 +192,8 @@ impl ClaudeOAuthProvider {
         }
 
         // Keep the beta in lockstep with the body field: both read the same settled effort slot, so
-        // the beta fires exactly when `output_config.effort` will be sent (the model-aware default
-        // on effort-capable models, or any explicit override, which is absolute).
+        // the beta fires exactly when `output_config.effort` will be sent, which is only when the
+        // profile configured one. An unconfigured profile advertises neither.
         if self.wire_effort().is_some() {
             parts.push("effort-2025-11-24");
         }
@@ -466,8 +468,7 @@ impl ClaudeOAuthProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.is_thinking_enabled(),
-            &self.model,
+            self.effective_thinking(),
             self.thinking_budget_tokens,
             self.max_output_tokens,
         );
@@ -476,7 +477,7 @@ impl ClaudeOAuthProvider {
         // OAuth-without-ant-tool-clearing case: when thinking is on and the model supports context
         // management, preserve thinking blocks across previous assistant turns via
         // `clear_thinking_20251015`.
-        if self.is_thinking_enabled() && model_supports_modern_features(&self.model) {
+        if self.effective_thinking().is_on() && model_supports_modern_features(&self.model) {
             body.insert(
                 "context_management".to_string(),
                 serde_json::json!({
@@ -488,7 +489,7 @@ impl ClaudeOAuthProvider {
         // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
         // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
         // Fable/Mythos reject `temperature` with a 400.
-        if !self.is_thinking_enabled() && model_supports_temperature(&self.model) {
+        if !self.effective_thinking().is_on() && model_supports_temperature(&self.model) {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
@@ -642,13 +643,9 @@ impl Provider for ClaudeOAuthProvider {
         self.wire_effort()
     }
 
-    fn set_thinking_override(&self, enabled: Option<bool>) {
-        let value = match enabled {
-            None => -1,
-            Some(false) => 0,
-            Some(true) => 1,
-        };
-        self.thinking_override.store(value, Ordering::Relaxed);
+    fn suppress_thinking(&self, suppressed: bool) {
+        self.thinking_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 
     async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
@@ -792,37 +789,6 @@ impl Provider for ClaudeOAuthProvider {
             first_used: parsed.first_token_date,
             daily: Vec::new(),
         }))
-    }
-
-    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
-        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
-        let request = attestation::apply_headers(
-            self.client
-                .get(format!("{}/v1/models/{}", self.base_url, self.model)),
-            auth_name,
-            &auth_value,
-            &self.session_id,
-            None,
-        );
-        let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "model info request failed: {}",
-                crate::error::format_reqwest_error(&error),
-            ))
-        })?;
-        let status = response.status();
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read model info response: {}", error))
-        })?;
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &text,
-                retry_after,
-            ));
-        }
-        super::shared::model_info_from_claude_model(&text)
     }
 }
 
@@ -982,7 +948,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
-            false,
+            ThinkingMode::Off,
             10000,
             "a".repeat(64),
             Some("high".to_string()),
@@ -1483,7 +1449,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
-            false,
+            ThinkingMode::Off,
             10000,
             "a".repeat(64),
             None,
@@ -1512,7 +1478,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
-            false,
+            ThinkingMode::Off,
             10000,
             "a".repeat(64),
             Some("high".to_string()),
@@ -1675,7 +1641,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
-            false,
+            ThinkingMode::Off,
             10000,
             "a".repeat(64),
             effort.map(str::to_string),
@@ -1686,6 +1652,8 @@ mod tests {
         .expect("build test provider")
     }
 
+    /// `thinking` is a bool here because every caller is asserting on a beta or on `temperature`,
+    /// and those gate on whether thinking is on at all rather than on which encoding it uses.
     fn provider_full(
         model: &str,
         thinking: bool,
@@ -1700,7 +1668,11 @@ mod tests {
             None,
             None,
             "test".to_string(),
-            thinking,
+            if thinking {
+                ThinkingMode::Adaptive
+            } else {
+                ThinkingMode::Off
+            },
             10000,
             "a".repeat(64),
             Some(effort.to_string()),
@@ -1874,27 +1846,27 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_effort_defaults_by_model() {
-        // Unset effort resolves, on the wire, to the strongest tier the model supports.
-        let modern = provider_effort("claude-opus-4-8", None);
-        let body = modern.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "xhigh");
-        // The 4.6 generation has effort but no xhigh, so it falls back to high.
-        let four_six = provider_effort("claude-opus-4-6-20250514", None);
-        let body = four_six.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "high");
-    }
-
-    #[test]
-    fn test_output_config_omitted_when_unset_and_model_lacks_effort() {
-        // sonnet-4 (not 4-6) is not effort-capable: with effort unset, the field is omitted.
-        let provider = provider_effort("claude-sonnet-4-20250514", None);
-        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
-        assert!(
-            body.get("output_config").is_none(),
-            "output_config must be omitted when effort is unset on a non-effort model"
-        );
-        // An explicit override is absolute: it is sent even to a model the default would skip.
+    fn an_unconfigured_profile_sends_no_output_config_and_no_effort_beta() {
+        // Anthropic owns the effort default; meka asks for it by omitting the field. The beta
+        // header reads the same settled slot, so it must fall away with the body field rather than
+        // advertising a capability the request never uses.
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-6-20250514",
+            "claude-opus-5",
+        ] {
+            let provider = provider_effort(model, None);
+            let body = provider.build_request_body("s", &[Message::user("hi")], &[], false);
+            assert!(body.get("output_config").is_none(), "{model}");
+            assert!(
+                !provider
+                    .compute_betas(true)
+                    .unwrap_or_default()
+                    .contains("effort-2025-11-24"),
+                "{model}"
+            );
+        }
+        // A configured value is absolute, and the beta accompanies it.
         let forced = provider_effort("claude-sonnet-4-20250514", Some("high"));
         let body = forced.build_request_body("system prompt", &[Message::user("hi")], &[], false);
         assert_eq!(body["output_config"]["effort"], "high");
@@ -3430,7 +3402,7 @@ mod tests {
                 Some(format!("http://{}/", local)),
                 None,
                 "test".to_string(),
-                false,
+                ThinkingMode::Off,
                 10000,
                 "a".repeat(64),
                 Some("high".to_string()),
@@ -3508,7 +3480,7 @@ mod tests {
             Some(format!("http://{}/", local)),
             None,
             "test".to_string(),
-            false,
+            ThinkingMode::Off,
             10000,
             "a".repeat(64),
             Some("high".to_string()),

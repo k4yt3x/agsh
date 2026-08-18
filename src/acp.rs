@@ -2672,6 +2672,12 @@ pub async fn run_acp(
         })
         .await;
 
+    // The connection has unwound, so nothing will issue another tool call. An editor that quits
+    // takes meka's stdio with it but not the grandchildren meka spawned, which is what this closes.
+    if let Some(manager) = &state.shared.mcp_manager {
+        manager.shutdown_within(crate::mcp::SHUTDOWN_BUDGET).await;
+    }
+
     acp_result.map_err(|error| anyhow::anyhow!("ACP server error: {}", error))
 }
 

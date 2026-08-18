@@ -415,7 +415,7 @@ pub async fn build_shared_deps(
         } else {
             None
         })
-        .thinking(config.thinking_enabled, config.thinking_budget_tokens)
+        .thinking(config.thinking, config.thinking_budget_tokens)
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
@@ -453,15 +453,9 @@ pub async fn build_shared_deps(
     );
     warn_on_stale_tool_config(&config, &builtin_filter);
 
-    let context_window = crate::provider::model_metadata::resolve_model_metadata(
-        config.context_window,
-        &provider,
-        &session_manager.token_store(),
-        config.active_profile.as_deref(),
-        config.model.as_deref(),
-    )
-    .await
-    .context_window;
+    let context_window = config
+        .context_window
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -781,7 +775,7 @@ async fn create_agent_from_config(
         } else {
             None
         })
-        .thinking(config.thinking_enabled, config.thinking_budget_tokens)
+        .thinking(config.thinking, config.thinking_budget_tokens)
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
@@ -827,15 +821,9 @@ async fn create_agent_from_config(
     // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
     // sub-agents to inherit `sandboxed_shell` / `context_messages` / the auto-compaction settings
     // via `Agent::new_subagent`. `user_instructions` is deliberately not among them.
-    let context_window = crate::provider::model_metadata::resolve_model_metadata(
-        config.context_window,
-        &provider,
-        &session_manager.token_store(),
-        config.active_profile.as_deref(),
-        config.model.as_deref(),
-    )
-    .await
-    .context_window;
+    let context_window = config
+        .context_window
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -1316,6 +1304,13 @@ async fn run_oneshot(
         render::render_session_id("Leaving session", &id.to_string());
     }
 
+    // Same pairing the REPL does: this path attached the registry to the manager when the agent was
+    // built, so it detaches it here rather than leaving the cycle for the process teardown.
+    if let Some(manager) = &mcp_manager {
+        manager.detach_registry(agent.tool_registry()).await;
+    }
+    drop(agent);
+
     if let Some(manager) = mcp_manager {
         shutdown_mcp_manager(manager).await;
     }
@@ -1429,16 +1424,11 @@ async fn run_interactive(
     // hold it; the agent adopts the same atomic via `set_context_tokens`. Seeded with an
     // estimate when resuming so the gauge isn't blank until the first new turn measures the
     // context exactly.
-    // Probe-free (no provider handle here): override / table / cache / floor. The agent built below
-    // runs the full resolver, which caches any API-probed value, so an unrecognized model's gauge
-    // converges to the accurate window on the next launch (and matches immediately otherwise).
-    let context_window = crate::provider::model_metadata::resolve_context_window_cached(
-        config.context_window,
-        &session_manager.token_store(),
-        config.active_profile.as_deref(),
-        config.model.as_deref(),
-    )
-    .await;
+    // The same two-step the agent below uses, so the gauge and the compaction threshold can never
+    // disagree: the configured window, else the documented default.
+    let context_window = config
+        .context_window
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if !messages.is_empty() {
         context_tokens.store(
@@ -2226,7 +2216,7 @@ async fn run_interactive(
                                 profile: config.active_profile.as_deref(),
                                 backend: config.provider_name.as_deref(),
                                 effort: effort.as_deref(),
-                                thinking: config.thinking_enabled,
+                                thinking: config.thinking,
                             },
                             messages.len(),
                             context_tokens,
@@ -2328,14 +2318,14 @@ async fn run_interactive(
         }
     }
 
-    // Release the agent before shutting the MCP manager down. `shutdown_mcp_manager` can only close
-    // the servers if it is the last owner of the `Arc`, and the agent's `ToolRegistry` holds six
-    // strong clones of it (one per `mcp_resource_*` / `mcp_prompt_*` tool, see
-    // `mcp_resources::register_all`). Without this the `try_unwrap` failed on every launch that had
-    // any MCP server configured -- which is every launch that has anything to shut down -- and the
-    // graceful path was dead code: no `close_with_timeout`, no in-flight grace, no `close`
-    // handshake. Cleanup fell to rmcp's drop guard, which spawns a kill task onto a runtime that is
-    // already tearing down and may never poll it, leaving the stdio child alive after meka exits.
+    // Detach before dropping the agent, so the manager stops holding the registry whose tools hold
+    // the manager. Shutdown no longer depends on this -- it takes `&self` -- but every other
+    // surface (ACP `session/close`, `meka serve`) pairs `attach_registry` with `detach_registry`,
+    // and leaving the REPL as the one that attaches and never detaches means the cycle outlives the
+    // session it belongs to.
+    if let Some(manager) = &mcp_manager {
+        manager.detach_registry(agent.tool_registry()).await;
+    }
     drop(agent);
 
     if let Some(manager) = mcp_manager {
@@ -2345,24 +2335,15 @@ async fn run_interactive(
     Ok(())
 }
 
-/// Unwrap the shared MCP manager and drive its shutdown. The manager is held behind an `Arc`
-/// because resource/prompt tools keep clones of it; once the agent and tool registry have been
-/// dropped, try_unwrap should succeed.
+/// Close the MCP servers on the way out.
+///
+/// [`mcp::McpClientManager::shutdown`] takes `&self`, so this runs regardless of how many owners
+/// the `Arc` still has. It used to `try_unwrap` first and warn when that failed, which it always
+/// did: the manager holds the registries it serves, and those registries hold six tools that each
+/// hold the manager back, so the graceful path was unreachable and every run ended by leaving its
+/// stdio children to rmcp's drop guard.
 async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
-    match Arc::try_unwrap(manager) {
-        Ok(manager) => manager.shutdown().await,
-        Err(arc) => {
-            // Promoted from `debug!` because reaching it means the graceful path did not run and
-            // stdio children may outlive the process. It was previously the *only* outcome whenever
-            // an MCP server was configured, which made it look routine; with the agent dropped
-            // first, an owner still holding on is a real leak worth seeing at default verbosity.
-            tracing::warn!(
-                "MCP manager still has {} owner(s) at shutdown; servers were not closed \
-                 gracefully and a stdio child may outlive this process",
-                Arc::strong_count(&arc),
-            );
-        }
-    }
+    manager.shutdown_within(mcp::SHUTDOWN_BUDGET).await;
 }
 
 /// How long leaving the REPL waits for its cancelled background tasks to unwind.

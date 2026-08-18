@@ -141,11 +141,9 @@ Custom OAuth token refresh endpoint. Defaults:
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-oauth` under the `effort-2025-11-24` beta, `claude-api` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
 
-When unset, meka picks a model-aware default: `xhigh` on models that support it (Claude Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5; OpenAI gpt-5.2+, gpt-5.1-codex-max), `high` on effort-capable models without `xhigh` (Claude Opus 4.5/4.6, Sonnet 4.6, Mythos Preview; OpenAI o-series, gpt-5, gpt-5.1), and the field is omitted entirely on models with no effort knob (Claude Sonnet 4.0/4.5, Opus 4.1, and any Haiku; OpenAI gpt-4o, o1-mini, and unrecognised names such as local models served through `openai-api`).
+**When unset the field is omitted, and the provider applies its own default.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements - `claude-api` and `openai-api` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
 
-For `openai-codex`, the supported tiers come from your account's models catalog (`/models`), which is authoritative: the default stays accurate even for models newer than meka, and the name-based lists above are only the fallback when the catalog is unavailable. Claude and the public OpenAI API expose no such catalog, so they always use the name-based lists. The lookup is one bounded, cached probe per model (see [`session.context_window`](#sessioncontext_window)).
-
-An explicit value is absolute: sent verbatim, with no validation or clamping, and applied even to a model the default would omit it for. You own correctness for your model/endpoint; an invalid value is rejected by the API.
+An explicit value is absolute: sent verbatim (trimmed and lowercased), with no validation or clamping, whatever model it is aimed at. You own correctness for your model and endpoint; an invalid value is rejected by the API. A blank value reads as unset.
 
 Typical values: `low`, `medium`, `high`, `xhigh`, `max`.
 
@@ -167,13 +165,33 @@ redact_thinking = false
 
 ### `context_window`
 
-Override the model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over `[session].context_window`, which in turn overrides the model-name inference. Leave unset to use the inferred default.
+The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, meka assumes **1000000**.
+
+meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request - but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
 
 ```toml
 [providers.work]
 type           = "openai-api"
 model          = "my-128k-model"
 context_window = 131072
+```
+
+### `thinking`
+
+Claude-only. How the request encodes extended thinking, and whether it asks for it at all:
+
+| Value | Wire shape |
+|-------|-----------|
+| `adaptive` (default) | `thinking: {"type": "adaptive"}` - the model sets its own budget. Claude 4.6+ |
+| `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](#thinkingbudget_tokens). Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement |
+| `off` | No `thinking` field |
+
+One knob rather than two: it replaces both the old on/off switch and the encoding meka used to infer from the model name. The right value depends on the model *and* on what the endpoint implements, which meka can't determine, so the profile states it - and a profile whose `model` later changes is yours to keep correct.
+
+```toml
+[providers.local]
+type     = "claude-api"
+thinking = "budgeted"
 ```
 
 ### `vision`
@@ -189,7 +207,7 @@ vision = false
 
 ### `max_output_tokens`
 
-Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on thinking; OpenAI 32k with reasoning effort; otherwise the API default). On Claude with thinking enabled, the value must exceed `[thinking].budget_tokens` (validated at startup).
+Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed `[thinking].budget_tokens` (validated at startup).
 
 ```toml
 [providers.work]
@@ -722,7 +740,9 @@ compact_checkpoint = false
 
 Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this.
 
-When neither is set, meka resolves the window automatically. A built-in table is authoritative for recognized models: it encodes each model's real window as meka's request receives it (for example 1M for Opus 4.8, which is the default on the direct API and what `claude-oauth` negotiates by mirroring Claude Code), so it reflects the window the request truly gets and wins over the live API. For a model the table doesn't recognize, meka makes one bounded query of the provider's models API (supported for `openai-codex` and the Claude backends; not the public OpenAI API), falling back to a 128k floor. That single probe also carries the reasoning-effort levels (for `openai-codex`), so window and [`effort`](#effort) share one lookup, and the whole result is cached in the session database keyed by profile and model so later runs don't re-query. Setting this option pins the window and skips the table and the API lookup for the window (a catalog probe may still run to resolve effort).
+When neither is set, meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
+
+1M suits the current flagship models and overshoots the smaller and older ones. Overshooting is survivable rather than free - planned compaction never fires, so those sessions compact only after the provider rejects an over-long request, paying a wasted round trip each time. Set the real window on any profile whose model is smaller.
 
 ```toml
 [session]
@@ -742,21 +762,15 @@ subagent_max_depth = 3
 
 ## `[thinking]`
 
-Settings for extended thinking (`claude-api` and `claude-oauth` providers). Claude 4.6+ models use adaptive thinking automatically; older models use a fixed token budget.
+Presentation and budget settings for extended thinking (`claude-api` and `claude-oauth` providers). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key - not a setting here.
 
 While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-oauth` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `claude-api` does not report one, so the line stays bare. The count is coarse -- a progress signal, not an accounting figure.
 
 When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
 
-### `thinking.enabled`
-
-Whether to enable extended thinking. When enabled, the model can use additional tokens for internal reasoning before responding.
-
-Default: `true`
-
 ### `thinking.budget_tokens`
 
-Maximum number of tokens the model can use for thinking (for non-adaptive models).
+Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap.
 
 Default: `16000`
 
@@ -768,7 +782,6 @@ Default: `false`
 
 ```toml
 [thinking]
-enabled = true
 budget_tokens = 20000
 show_content = true
 ```

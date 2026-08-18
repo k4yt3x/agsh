@@ -69,10 +69,10 @@ Sessions are stored in a SQLite database at a platform-specific location:
 
 ## Database Schema
 
-The three tables below are the conversation itself. The database holds five more, which the
+The three tables below are the conversation itself. The database holds four more, which the
 features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)), `background_tasks`
-([background work](./background.md)), `provider_credentials` and `mcp_oauth_credentials` (secrets,
-never in `config.toml`), and `model_metadata_cache`.
+([background work](./background.md)), and `provider_credentials` and `mcp_oauth_credentials`
+(secrets, never in `config.toml`).
 
 **sessions**, one row per session:
 

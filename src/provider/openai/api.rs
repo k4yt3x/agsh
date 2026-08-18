@@ -20,8 +20,9 @@ pub struct OpenAiProvider {
     base_url: String,
     model: String,
     /// The settled `reasoning_effort` for the request body, resolved once at construction from the
-    /// profile's override and the model's name predicates. The public OpenAI API exposes no models
-    /// catalog, so there is nothing to refine from post-build.
+    /// profile's override. `None` - the unconfigured case - omits the field so the endpoint
+    /// applies its own default, which matters most for the local servers this backend also
+    /// reaches.
     resolved_effort: Option<String>,
     max_output_tokens: Option<u64>,
 }
@@ -34,12 +35,14 @@ impl OpenAiProvider {
         reasoning_effort: Option<String>,
         max_output_tokens: Option<u64>,
     ) -> Result<Self> {
-        let resolved_effort = super::resolve_reasoning_effort(reasoning_effort.as_deref(), &model);
+        let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
         Ok(Self {
             client: crate::provider::build_http_client("openai-api", |builder| builder)?,
             api_key,
             base_url: crate::provider::normalize_base_url(
-                base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
+                base_url
+                    .as_deref()
+                    .unwrap_or(crate::provider::DEFAULT_OPENAI_BASE_URL),
             ),
             model,
             resolved_effort,
@@ -194,8 +197,11 @@ impl OpenAiProvider {
         let reasoning_effort = self.wire_effort();
         if let Some(effort) = &reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(effort);
-            // A reasoning model needs a generous completion cap or it truncates mid-thought. The
-            // profile override wins; otherwise default to 32k.
+            // Reasoning eats output tokens, so a request that asks for it gets a generous cap or
+            // it truncates mid-thought. This keys off the profile naming a tier, not off the model:
+            // meka no longer decides which models reason, so a reasoning model with no configured
+            // effort now goes without the 32k floor and takes the endpoint's own cap. The profile's
+            // `max_output_tokens` wins either way.
             body["max_completion_tokens"] =
                 serde_json::json!(self.max_output_tokens.unwrap_or(32_000));
         } else if let Some(max_output) = self.max_output_tokens {
@@ -972,29 +978,27 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_request_body_reasoning_effort_defaults_by_model() {
-        // Unset effort on a recognized reasoning model resolves to its strongest tier.
-        let provider = OpenAiProvider::new(
-            "test-key".to_string(),
-            "gpt-5.6-sol".to_string(),
-            None,
-            None,
-            None,
-        )
-        .expect("build test provider");
-        let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
-        assert_eq!(body["reasoning_effort"], "xhigh");
-        // An unrecognized (local) model omits the field even with effort unset.
-        let local = OpenAiProvider::new(
+    fn an_unconfigured_profile_sends_no_reasoning_effort_whatever_the_model() {
+        // Recognized reasoning model or local weights, the answer is the same: OpenAI owns the
+        // default and meka asks for it by omitting the field.
+        for model in ["gpt-5.6-sol", "o3", "llama3.1"] {
+            let provider =
+                OpenAiProvider::new("test-key".to_string(), model.to_string(), None, None, None)
+                    .expect("build test provider");
+            let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
+            assert!(body.get("reasoning_effort").is_none(), "{model}");
+        }
+        // A configured value is absolute, including on a model meka does not recognize.
+        let configured = OpenAiProvider::new(
             "test-key".to_string(),
             "llama3.1".to_string(),
             None,
-            None,
+            Some("low".to_string()),
             None,
         )
         .expect("build test provider");
-        let body = local.build_request_body("", &[Message::user("hi")], &[], false);
-        assert!(body.get("reasoning_effort").is_none());
+        let body = configured.build_request_body("", &[Message::user("hi")], &[], false);
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]

@@ -925,6 +925,13 @@ impl Agent {
         *self.last_rendered_world.write().await = None;
     }
 
+    /// The registry this agent dispatches through. Exposed so a caller that attached it to the MCP
+    /// manager can detach it again on the way out; `build_session_agent` hands its callers the
+    /// registry directly, but `create_agent_from_config` does not.
+    pub fn tool_registry(&self) -> &ToolRegistry {
+        &self.tool_registry
+    }
+
     /// Turn on background tool calls and hand this agent the shared task registry.
     ///
     /// Called only on the primary agent, before the first turn. Sub-agents are deliberately never
@@ -1570,6 +1577,22 @@ impl Agent {
                         break 'turn Err(error);
                     }
                     continue;
+                }
+
+                // The blocking path returns the message whole, with no event channel to have put
+                // anything on while it was being written. Every frontend renders assistant text
+                // from `AssistantTextDelta` and nothing else carries it, so without this a turn
+                // that succeeded shows the user nothing at all. Emitted per round, matching the
+                // streaming path, so text the model writes before a tool call still precedes the
+                // indicator `execute_tool_calls` emits for it.
+                if !self.options.streaming {
+                    for block in &assistant_message.content {
+                        if let ContentBlock::Text { text } = block {
+                            self.frontend
+                                .emit(FrontendEvent::AssistantTextDelta(text.clone()))
+                                .await;
+                        }
+                    }
                 }
 
                 // No tool call and no visible text, and the nudge above didn't fire (already used
@@ -3183,14 +3206,14 @@ impl Agent {
         // inherit `auto_compact`.
         let scoped_override = !crate::provider::is_subagent();
         if scoped_override {
-            self.provider.set_thinking_override(Some(false));
+            self.provider.suppress_thinking(true);
         }
         let compact_result = self
             .provider
             .complete(&system_prompt, &compact_messages, &[])
             .await;
         if scoped_override {
-            self.provider.set_thinking_override(None);
+            self.provider.suppress_thinking(false);
         }
         let (summary_message, _stop_reason, usage, notices) = compact_result?;
         self.session_stats.record_untracked_tokens(&usage);
@@ -3749,6 +3772,50 @@ mod tests {
 
     pub(super) async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
         test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
+    }
+
+    /// `--no-stream` must still show the answer.
+    ///
+    /// Every frontend renders assistant text from `AssistantTextDelta`, and the blocking path
+    /// produces the whole message at once with no event channel to put one on. Nothing else carries
+    /// the text: `TurnFinished` is a signal, and the message goes straight into the conversation
+    /// log. So a turn that works perfectly prints nothing at all.
+    #[tokio::test]
+    async fn a_turn_that_does_not_stream_still_shows_what_the_model_said() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![MockEvent::Text {
+            text: "the answer".to_string(),
+        }]]));
+        let (mut agent, frontend) =
+            test_agent_recording(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        agent.options.streaming = false;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let events = frontend.events();
+        let shown: String = events
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::AssistantTextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown, "the answer",
+            "nothing reached the frontend: {events:?}"
+        );
     }
 
     /// An emergency compaction must drop a pending repair rather than carry it across.

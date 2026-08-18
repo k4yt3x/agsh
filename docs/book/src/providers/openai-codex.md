@@ -37,10 +37,10 @@ default_provider = "chatgpt"
 [providers.chatgpt]
 type = "openai-codex"
 model = "gpt-5.6-sol"
-effort = "xhigh"   # optional; "low"|"medium"|"high"|"xhigh"|...
+effort = "xhigh"   # optional; unset sends none, so OpenAI's default applies
 ```
 
-The `effort` field maps to the Responses API `reasoning.effort` knob. When unset, meka reads the model's supported effort tiers from your account's models catalog (`GET /backend-api/codex/models`, the same call that resolves the context window) and defaults to the strongest available: `xhigh` where the catalog offers it, else `high`, omitted for a non-reasoning model. The catalog is authoritative, so the default is accurate even for models newer than meka; if the catalog is unavailable it falls back to name-based guesses (`xhigh` for gpt-5.2+/gpt-5.1-codex-max, `high` for the o-series/gpt-5/gpt-5.1). The lookup is one bounded, cached probe per model. An explicit value is absolute: sent verbatim, never clamped to a lower tier.
+The `effort` field maps to the Responses API `reasoning.effort` knob. When unset the `reasoning` block is omitted and OpenAI applies its own default; meka picks no tier and consults no catalog. An explicit value is absolute: sent verbatim, never clamped.
 
 ## Supported Models
 

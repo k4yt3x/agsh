@@ -1,9 +1,9 @@
 //! Helpers shared by [`super::api::ClaudeApiProvider`] and [`super::oauth::ClaudeOAuthProvider`].
 //! Everything in this module is independent of the authentication scheme: message/tool conversion
 //! to the Claude wire format, SSE streaming, response parsing, per-model capability detection, and
-//! the thinking-override helper.
+//! the thinking-suppression helper.
 
-use std::{borrow::Cow, sync::atomic::AtomicI8};
+use std::{borrow::Cow, sync::atomic::AtomicBool};
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, ModelInfo, Role, StopReason, StreamEvent, TokenUsage,
+        ContentBlock, Message, Role, StopReason, StreamEvent, ThinkingMode, TokenUsage,
         ToolDefinition, ToolResultContent,
     },
 };
@@ -49,31 +49,6 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
         }
         None => trimmed,
     }
-}
-
-/// Subset of the Anthropic `GET /v1/models/{id}` body carrying the model's context window.
-/// Anthropic exposes no reasoning-effort levels here, so [`ModelInfo::effort_levels`] is always
-/// `None` for Claude and effort falls to the name-based predicates.
-#[derive(serde::Deserialize)]
-struct ClaudeModelResponse {
-    #[serde(default)]
-    max_input_tokens: Option<u64>,
-}
-
-/// Parse an Anthropic model object into [`ModelInfo`]. Shared by both Claude providers (same wire
-/// shape). `Err` on malformed JSON. The API reports `0` for an unset limit, so treat `0` as unknown
-/// (`None`); returns `Ok(None)` when the context window is unknown.
-pub(super) fn model_info_from_claude_model(body: &str) -> Result<Option<ModelInfo>> {
-    let parsed: ClaudeModelResponse = serde_json::from_str(body)
-        .map_err(|error| MekaError::Provider(format!("invalid Claude model JSON: {}", error)))?;
-    let context_window = parsed.max_input_tokens.filter(|value| *value > 0);
-    if context_window.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(ModelInfo {
-        context_window,
-        effort_levels: None,
-    }))
 }
 
 /// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom for headers, URL,
@@ -112,24 +87,18 @@ pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
     }
 }
 
-/// Resolves the effective thinking state given the override atomic's raw value (`-1` = unset, `0` =
-/// forced off, `1` = forced on) and the configured default. Kept separate from the atomic itself so
-/// the providers can own their own `AtomicI8` without duplicating the branching logic.
-pub(super) fn is_thinking_enabled(override_raw: i8, default: bool) -> bool {
-    match override_raw {
-        0 => false,
-        1 => true,
-        _ => default,
+/// The mode a request actually uses: the profile's, unless something has suppressed thinking for
+/// the call in flight (compaction does, so a summary doesn't pay for reasoning). Suppression only
+/// ever turns thinking *off*, never on, so it cannot resurrect a mode the profile disabled.
+pub(super) fn effective_thinking(
+    suppressed: &AtomicBool,
+    configured: ThinkingMode,
+) -> ThinkingMode {
+    if suppressed.load(std::sync::atomic::Ordering::Relaxed) {
+        ThinkingMode::Off
+    } else {
+        configured
     }
-}
-
-/// Convenience wrapper that loads the atomic with relaxed ordering and applies
-/// [`is_thinking_enabled`]. Most callers want this form.
-pub(super) fn resolve_thinking_enabled(override_atomic: &AtomicI8, default: bool) -> bool {
-    is_thinking_enabled(
-        override_atomic.load(std::sync::atomic::Ordering::Relaxed),
-        default,
-    )
 }
 
 /// Parse a `(major, minor)` version out of a Claude model name. The version is written as
@@ -152,58 +121,39 @@ fn parse_model_version(model: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Whether `model` is a known *pre-4.6* Claude model, i.e. one that predates adaptive thinking and
-/// the `output_config.effort` knob (both shipped with Claude 4.6). Rather than allowlist the models
-/// that have these features (which silently denies every newly released model, like
-/// `claude-fable-5`, until the list is updated), we denylist the ones that don't: only the families
-/// that existed before 4.6 - `opus`, `sonnet`, `haiku`, and the Claude 3.x line - can predate them,
-/// and then only when their parsed version (see [`parse_model_version`]) is below 4.6. Any other
-/// model - a new family such as `fable`, or anything without a recognised pre-4.6 family - is
-/// assumed to support these features regardless of its version number.
-fn model_predates_adaptive_thinking(model: &str) -> bool {
-    const ADAPTIVE_MIN_VERSION: (u32, u32) = (4, 6);
-    let lower = model.to_ascii_lowercase();
-    let pre_adaptive_family =
-        lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku");
-    pre_adaptive_family
-        && parse_model_version(&lower).is_some_and(|version| version < ADAPTIVE_MIN_VERSION)
-}
-
-/// Whether a Claude model supports adaptive thinking (`thinking: {type: "adaptive"}`, with no
-/// explicit `budget_tokens`) rather than the older budgeted form. Enabled by default; only known
-/// pre-4.6 models are excluded (see [`model_predates_adaptive_thinking`]).
-pub(crate) fn model_supports_adaptive_thinking(model: &str) -> bool {
-    !model_predates_adaptive_thinking(model)
-}
-
 pub(super) fn model_is_haiku(model: &str) -> bool {
     model.to_ascii_lowercase().contains("haiku")
 }
 
 /// Insert the `max_tokens` + `thinking` fields shared by both Claude providers' request bodies.
-/// Adaptive-thinking models get a fixed 64k ceiling; others get `max(budget*2, 32k)` with an
-/// explicit budget; thinking-off uses a flat 32k. A `max_output_tokens` override (the profile knob)
-/// replaces whichever default would otherwise apply; on the budgeted path it is clamped to stay
-/// above `budget_tokens` (the API rejects `max_tokens <= thinking.budget_tokens`).
+/// [`ThinkingMode::Adaptive`] gets a fixed 64k ceiling, [`ThinkingMode::Budgeted`] gets
+/// `max(budget*2, 32k)` with an explicit budget, and [`ThinkingMode::Off`] a flat 32k. A
+/// `max_output_tokens` override (the profile knob) replaces whichever default would otherwise
+/// apply; under `Budgeted` it is clamped to stay above `budget_tokens` (the API rejects
+/// `max_tokens <= thinking.budget_tokens`).
+///
+/// The encoding comes from the profile rather than from the model name: this is what a request
+/// reaching an arbitrary Anthropic-compatible endpoint needs, since meka cannot tell which of the
+/// two forms that endpoint implements.
 ///
 /// No `display` field is set: real Claude Code 2.1.219 sends `{type:"adaptive"}` with no `display`
 /// (verified by wire capture), so the model default applies.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
-    thinking_enabled: bool,
-    model: &str,
+    thinking: ThinkingMode,
     budget_tokens: u64,
     max_output_tokens: Option<u64>,
 ) {
-    if thinking_enabled {
-        if model_supports_adaptive_thinking(model) {
+    match thinking {
+        ThinkingMode::Adaptive => {
             let max_tokens = max_output_tokens.unwrap_or(64_000);
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
             body.insert(
                 "thinking".to_string(),
                 serde_json::json!({ "type": "adaptive" }),
             );
-        } else {
+        }
+        ThinkingMode::Budgeted => {
             let default_max = std::cmp::max(budget_tokens * 2, 32_000);
             // Clamp above the budget so an override that's too small can't produce a 400.
             let max_tokens = max_output_tokens
@@ -218,9 +168,10 @@ pub(super) fn insert_thinking_fields(
                 }),
             );
         }
-    } else {
-        let max_tokens = max_output_tokens.unwrap_or(32_000);
-        body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        ThinkingMode::Off => {
+            let max_tokens = max_output_tokens.unwrap_or(32_000);
+            body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        }
     }
 }
 
@@ -230,61 +181,6 @@ pub(super) fn insert_thinking_fields(
 pub(super) fn model_supports_modern_features(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     lower.contains("claude") && !lower.contains("claude-3-")
-}
-
-/// Whether a Claude model supports the `output_config.effort` knob (the `effort-2025-11-24` beta).
-/// Effort shipped with Claude 4.6, so adaptive-thinking-era models are enabled by default. The one
-/// exception is Opus 4.5, which predates adaptive thinking (manual budgeted thinking, 200K window)
-/// yet still supports effort (`low`/`medium`/`high`, no `xhigh`); it's carved out here so only the
-/// other pre-4.6 gates keep treating it as old (see [`model_predates_adaptive_thinking`]).
-///
-/// Haiku is excluded by family rather than by version. The tier has never shipped an effort knob,
-/// and the version gate below would wave through a future Haiku whose version clears 4.6, sending a
-/// tier the model rejects. The costs are asymmetric: omitting effort is benign (`high` is defined
-/// as identical to omitting the field) while sending an unsupported one is a 400, so the durable
-/// family rule wins over the optimistic default that serves the frontier models.
-pub(super) fn model_supports_effort(model: &str) -> bool {
-    if model_is_haiku(model) {
-        return false;
-    }
-    if !model_predates_adaptive_thinking(model) {
-        return true;
-    }
-    let lower = model.to_ascii_lowercase();
-    lower.contains("opus") && parse_model_version(&lower) == Some((4, 5))
-}
-
-/// Whether a Claude model supports the `xhigh` effort tier. Effort-capable, but excluding the
-/// models that shipped effort without `xhigh`: Opus 4.5 (caps at `high`), the 4.6 line (Opus 4.6,
-/// Sonnet 4.6), and Mythos Preview. The last three have `max` but not `xhigh`, which is why this
-/// can't be derived from effort support alone: "`xhigh` is a newer level; some models that support
-/// `max` don't support `xhigh`." Everything newer (Opus 4.7+, Sonnet 5, Fable/Mythos 5) and any
-/// unrecognized future model supports it, mirroring the optimistic default in
-/// [`model_supports_effort`].
-pub(super) fn model_supports_xhigh(model: &str) -> bool {
-    if !model_supports_effort(model) {
-        return false;
-    }
-    let lower = model.to_ascii_lowercase();
-    // Mythos Preview is versionless, so the generation check below can't catch it: it supports
-    // effort (and `max`) but not `xhigh`, and would otherwise default to a tier the API rejects.
-    if lower.contains("mythos-preview") {
-        return false;
-    }
-    let no_xhigh = (lower.contains("opus") || lower.contains("sonnet"))
-        && matches!(parse_model_version(&lower), Some((4, 5)) | Some((4, 6)));
-    !no_xhigh
-}
-
-/// Resolve the `output_config.effort` value for `model` given the profile's explicit override
-/// (`None` = unset). Returns `None` when the model has no effort knob (the caller then omits the
-/// field). See [`crate::provider::resolve_effort_level`] for the shared policy.
-pub(super) fn resolve_effort(configured: Option<&str>, model: &str) -> Option<String> {
-    crate::provider::resolve_effort_level(
-        configured,
-        model_supports_effort(model),
-        model_supports_xhigh(model),
-    )
 }
 
 /// Whether a Claude model accepts the `temperature` sampling parameter. Mirrors Claude Code
@@ -1502,26 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn test_model_info_from_claude_model() {
-        let info = model_info_from_claude_model(
-            r#"{"id":"claude-opus-4-6","max_input_tokens":200000,"max_tokens":64000}"#,
-        )
-        .unwrap()
-        .expect("known context window");
-        assert_eq!(info.context_window, Some(200_000));
-        // Anthropic exposes no effort levels; effort falls to the name predicates.
-        assert_eq!(info.effort_levels, None);
-        // The API reports 0 for an unset limit → treated as unknown.
-        assert!(
-            model_info_from_claude_model(r#"{"max_input_tokens":0}"#)
-                .unwrap()
-                .is_none()
-        );
-        // Malformed JSON → Err.
-        assert!(model_info_from_claude_model("{nope").is_err());
-    }
-
-    #[test]
     fn test_is_retryable_claude_error_type() {
         for retryable in ["overloaded_error", "rate_limit_error", "api_error"] {
             assert!(
@@ -1641,62 +1517,76 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_thinking_fields_max_output_default_thinking_off() {
-        let mut body = serde_json::Map::new();
-        insert_thinking_fields(&mut body, false, "claude-opus-4-8", 10_000, None);
-        assert_eq!(body["max_tokens"], 32_000);
-        // Thinking off: no `thinking` object is emitted.
-        assert!(body.get("thinking").is_none());
-    }
-
-    #[test]
-    fn test_insert_thinking_fields_max_output_override_thinking_off() {
-        let mut body = serde_json::Map::new();
-        insert_thinking_fields(&mut body, false, "claude-opus-4-8", 10_000, Some(50_000));
-        assert_eq!(body["max_tokens"], 50_000);
-    }
-
-    #[test]
-    fn test_insert_thinking_fields_max_output_override_adaptive() {
-        // `opus-4-6` is an adaptive-thinking model; the override replaces the 64k default.
-        let mut body = serde_json::Map::new();
-        insert_thinking_fields(&mut body, true, "claude-opus-4-6", 10_000, Some(80_000));
-        assert_eq!(body["max_tokens"], 80_000);
-        assert_eq!(body["thinking"]["type"], "adaptive");
+    fn each_thinking_mode_writes_its_own_encoding_and_ceiling() {
+        // The encoding now comes from the profile, not from the model name, so the same model can
+        // legitimately be asked for either form - which is what an arbitrary Anthropic-compatible
+        // endpoint needs.
+        let mut adaptive = serde_json::Map::new();
+        insert_thinking_fields(&mut adaptive, ThinkingMode::Adaptive, 10_000, None);
+        assert_eq!(adaptive["max_tokens"], 64_000);
+        assert_eq!(adaptive["thinking"]["type"], "adaptive");
+        assert!(adaptive["thinking"].get("budget_tokens").is_none());
         // No `display` field: real Claude Code sends `{type:"adaptive"}` only.
-        assert!(body["thinking"].get("display").is_none());
+        assert!(adaptive["thinking"].get("display").is_none());
+
+        let mut budgeted = serde_json::Map::new();
+        insert_thinking_fields(&mut budgeted, ThinkingMode::Budgeted, 10_000, None);
+        assert_eq!(budgeted["max_tokens"], 32_000);
+        assert_eq!(budgeted["thinking"]["type"], "enabled");
+        assert_eq!(budgeted["thinking"]["budget_tokens"], 10_000);
+
+        let mut off = serde_json::Map::new();
+        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, None);
+        assert_eq!(off["max_tokens"], 32_000);
+        assert!(off.get("thinking").is_none());
     }
 
     #[test]
-    fn test_insert_thinking_fields_max_output_clamped_above_budget() {
-        // Non-adaptive thinking sends an explicit budget; an override below it is clamped so the
-        // API's `max_tokens > budget_tokens` invariant holds.
-        let mut body = serde_json::Map::new();
-        insert_thinking_fields(&mut body, true, "claude-3-5-sonnet", 20_000, Some(5_000));
-        assert_eq!(body["max_tokens"], 20_001);
-        assert_eq!(body["thinking"]["budget_tokens"], 20_000);
+    fn a_max_output_override_replaces_the_default_but_never_undercuts_the_budget() {
+        let mut adaptive = serde_json::Map::new();
+        insert_thinking_fields(&mut adaptive, ThinkingMode::Adaptive, 10_000, Some(80_000));
+        assert_eq!(adaptive["max_tokens"], 80_000);
+
+        let mut off = serde_json::Map::new();
+        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, Some(50_000));
+        assert_eq!(off["max_tokens"], 50_000);
+
+        // Budgeted draws the budget from `max_tokens`, so an override at or below it would be a
+        // 400. Clamped rather than rejected: the config guard catches the configured case, and this
+        // keeps a request valid regardless.
+        let mut clamped = serde_json::Map::new();
+        insert_thinking_fields(&mut clamped, ThinkingMode::Budgeted, 20_000, Some(5_000));
+        assert_eq!(clamped["max_tokens"], 20_001);
+        assert_eq!(clamped["thinking"]["budget_tokens"], 20_000);
     }
 
     #[test]
-    fn test_is_thinking_enabled_override_off() {
-        assert!(!is_thinking_enabled(0, true));
-        assert!(!is_thinking_enabled(0, false));
-    }
+    fn suppressing_thinking_turns_it_off_and_never_on() {
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[test]
-    fn test_is_thinking_enabled_override_on() {
-        assert!(is_thinking_enabled(1, true));
-        assert!(is_thinking_enabled(1, false));
-    }
+        let flag = AtomicBool::new(false);
+        assert_eq!(
+            effective_thinking(&flag, ThinkingMode::Adaptive),
+            ThinkingMode::Adaptive
+        );
 
-    #[test]
-    fn test_is_thinking_enabled_unset_uses_default() {
-        assert!(is_thinking_enabled(-1, true));
-        assert!(!is_thinking_enabled(-1, false));
-        // Any non-0/1 value should be treated as "unset" and fall through to the configured
-        // default.
-        assert!(is_thinking_enabled(42, true));
-        assert!(!is_thinking_enabled(-99, false));
+        // Compaction sets this so its summary doesn't pay for reasoning.
+        flag.store(true, Ordering::Relaxed);
+        assert_eq!(
+            effective_thinking(&flag, ThinkingMode::Adaptive),
+            ThinkingMode::Off
+        );
+        assert_eq!(
+            effective_thinking(&flag, ThinkingMode::Budgeted),
+            ThinkingMode::Off
+        );
+        // It cannot resurrect thinking for a profile that asked for none, so the two settings can
+        // never disagree about whether a request asks for thinking.
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            effective_thinking(&flag, ThinkingMode::Off),
+            ThinkingMode::Off
+        );
     }
 
     #[test]
@@ -1709,117 +1599,6 @@ mod tests {
         ));
         assert!(!model_supports_modern_features("claude-3-opus-20240229"));
         assert!(!model_supports_modern_features("gpt-4o"));
-    }
-
-    #[test]
-    fn test_model_supports_effort() {
-        assert!(model_supports_effort("claude-opus-4-6-20250514"));
-        assert!(model_supports_effort("claude-sonnet-4-6"));
-        // Opus 4.5 predates adaptive thinking but still supports effort (the one exception).
-        assert!(model_supports_effort("claude-opus-4-5-20250929"));
-        // Older / non-4-6 sonnet/opus/haiku are explicitly denied (Sonnet 4.5 is NOT
-        // effort-capable).
-        assert!(!model_supports_effort("claude-sonnet-4-5"));
-        assert!(!model_supports_effort("claude-sonnet-4-20250514"));
-        assert!(!model_supports_effort("claude-opus-4-1"));
-        assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
-        // Haiku is denied by family, not version: a future Haiku that clears the 4.6 boundary must
-        // still omit effort rather than send a tier the tier has never had.
-        for model in [
-            "claude-haiku-5",
-            "claude-haiku-5-1",
-            "claude-haiku-6-20270101",
-        ] {
-            assert!(!model_supports_effort(model), "{model}");
-            assert!(!model_supports_xhigh(model), "{model}");
-            assert_eq!(resolve_effort(None, model), None, "{model}");
-        }
-        // Unknown 1P model defaults to true.
-        assert!(model_supports_effort("claude-future-experimental-7"));
-        // New families are effort-capable by default, even with a low version number.
-        assert!(model_supports_effort("claude-fable-5"));
-        assert!(model_supports_effort("claude-fable-2"));
-    }
-
-    #[test]
-    fn test_model_supports_xhigh() {
-        // Opus 4.5 and the 4.6 generation are effort-capable but have no xhigh.
-        assert!(!model_supports_xhigh("claude-opus-4-5-20250929"));
-        assert!(!model_supports_xhigh("claude-opus-4-6-20250514"));
-        assert!(!model_supports_xhigh("claude-sonnet-4-6"));
-        // 4.7+ / Opus 5 / Sonnet 5 / new families support xhigh.
-        assert!(model_supports_xhigh("claude-opus-4-8"));
-        assert!(model_supports_xhigh("claude-opus-4-7"));
-        assert!(model_supports_xhigh("claude-opus-5"));
-        assert!(model_supports_xhigh("claude-sonnet-5"));
-        assert!(model_supports_xhigh("claude-fable-5"));
-        assert!(model_supports_xhigh("claude-future-experimental-7"));
-        // Non-effort models never reach xhigh.
-        assert!(!model_supports_xhigh("claude-haiku-4-5-20251001"));
-        assert!(!model_supports_xhigh("claude-opus-4-1"));
-        // Mythos Preview takes effort and `max` but NOT `xhigh`, and carries no version to sort it
-        // into the 4.5/4.6 carve-out; defaulting it to xhigh would be a 400.
-        assert!(model_supports_effort("claude-mythos-preview"));
-        assert!(!model_supports_xhigh("claude-mythos-preview"));
-        assert_eq!(
-            resolve_effort(None, "claude-mythos-preview").as_deref(),
-            Some("high")
-        );
-    }
-
-    #[test]
-    fn test_resolve_effort() {
-        // Unset: best tier the model supports.
-        assert_eq!(
-            resolve_effort(None, "claude-opus-4-8").as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            resolve_effort(None, "claude-opus-5").as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            resolve_effort(None, "claude-sonnet-5").as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            resolve_effort(None, "claude-opus-4-6").as_deref(),
-            Some("high")
-        );
-        // Explicit values are absolute: passed through verbatim, never clamped.
-        assert_eq!(
-            resolve_effort(Some("xhigh"), "claude-opus-4-6").as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            resolve_effort(Some("low"), "claude-opus-4-8").as_deref(),
-            Some("low")
-        );
-        assert_eq!(
-            resolve_effort(Some("max"), "claude-opus-4-6").as_deref(),
-            Some("max")
-        );
-        // ...even on a model the default would omit effort for.
-        assert_eq!(
-            resolve_effort(Some("high"), "claude-opus-4-1").as_deref(),
-            Some("high")
-        );
-        // Unset on a legacy / non-effort model omits the field entirely.
-        assert_eq!(resolve_effort(None, "claude-haiku-4-5-20251001"), None);
-        // A blank override (empty / whitespace) is treated as unset → model-aware default, never an
-        // empty `output_config.effort` the API would reject.
-        assert_eq!(
-            resolve_effort(Some("  "), "claude-opus-4-8").as_deref(),
-            Some("xhigh")
-        );
-        assert_eq!(
-            resolve_effort(Some(""), "claude-opus-4-6").as_deref(),
-            Some("high")
-        );
-        assert_eq!(
-            resolve_effort(Some("   "), "claude-haiku-4-5-20251001"),
-            None
-        );
     }
 
     #[test]
@@ -1844,39 +1623,6 @@ mod tests {
         );
         // No version-like segment at all.
         assert_eq!(parse_model_version("claude-custom"), None);
-    }
-
-    #[test]
-    fn test_model_supports_adaptive_thinking_by_version() {
-        // 4.6 is the cutoff: 4.6 and newer use adaptive thinking.
-        assert!(model_supports_adaptive_thinking("claude-opus-4-6"));
-        assert!(model_supports_adaptive_thinking("claude-sonnet-4-6"));
-        // Regression: opus 4.8 was wrongly denied by the old hardcoded allowlist.
-        assert!(model_supports_adaptive_thinking("claude-opus-4-8"));
-        assert!(model_supports_adaptive_thinking("claude-opus-5-0"));
-        assert!(model_supports_adaptive_thinking("claude-opus-5"));
-        assert!(model_supports_adaptive_thinking("claude-sonnet-5"));
-        assert!(model_supports_adaptive_thinking("claude-opus-4-6-20250514"));
-        // Older than 4.6 -> budgeted thinking.
-        assert!(!model_supports_adaptive_thinking("claude-sonnet-4-5"));
-        assert!(!model_supports_adaptive_thinking("claude-opus-4-1"));
-        assert!(!model_supports_adaptive_thinking(
-            "claude-haiku-4-5-20251001"
-        ));
-        assert!(!model_supports_adaptive_thinking(
-            "claude-3-5-sonnet-20241022"
-        ));
-        assert!(!model_supports_adaptive_thinking("claude-3-opus-20240229"));
-        // Unparseable version -> default to adaptive (matches Claude Code's 1P default).
-        assert!(model_supports_adaptive_thinking(
-            "claude-future-experimental"
-        ));
-        // New model families are adaptive by default; the denylist only excludes known pre-4.6
-        // families.
-        assert!(model_supports_adaptive_thinking("claude-fable-5"));
-        // A new family is adaptive even with a low version number (the old `>= 4.6` rule would
-        // wrongly deny this).
-        assert!(model_supports_adaptive_thinking("claude-fable-2"));
     }
 
     #[test]

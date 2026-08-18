@@ -203,6 +203,14 @@ pub async fn run_serve(
     scheduler_handle.abort();
     background_handle.abort();
     pruner_handle.abort();
+    // Close the MCP servers before the exit paths below: the drain-timeout arm of the match ends
+    // in `std::process::exit(1)`, so anything after it is skipped exactly when a hung shutdown
+    // makes closing them matter most. `serve` runs for days and respawns nothing, so its stdio
+    // children are the ones most likely to outlive the process.
+    if let Some(manager) = &state.shared.mcp_manager {
+        manager.shutdown_within(crate::mcp::SHUTDOWN_BUDGET).await;
+    }
+
     // Flush the SQLite WAL before exit so a quick restart doesn't pay WAL-replay cost.
     // Best-effort, SQLite recovers from an unflushed WAL automatically.
     if let Err(error) = state.shared.session_manager.checkpoint().await {

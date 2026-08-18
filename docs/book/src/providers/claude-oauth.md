@@ -33,7 +33,8 @@ default_provider = "work"
 [providers.work]
 type = "claude-oauth"
 model = "claude-opus-5"
-effort = "xhigh"         # optional; "low"|"medium"|"high"|"xhigh"|"max"
+effort = "xhigh"         # optional; unset sends none, so Anthropic's default applies
+thinking = "adaptive"    # optional; "adaptive"|"budgeted"|"off", default "adaptive"
 redact_thinking = true   # optional; default on, matching Claude Code
 # device_id, oauth_token_url, client_id are all optional overrides
 ```
@@ -44,7 +45,11 @@ See [Configuration → Config File](../configuration/config-file.md) for the ful
 
 ### `effort`
 
-Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset it defaults to `"xhigh"` where the model supports it (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) and `"high"` on models that take effort but not `xhigh` (Opus 4.5, Opus 4.6, Sonnet 4.6, Mythos Preview); models with no effort knob (Sonnet 4.0/4.5, Opus 4.1, and any Haiku) omit the field automatically. An explicit value is absolute: sent verbatim (beta included), with no validation or clamping, and applied even to a model the default would skip. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
+Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, both the field and the beta are omitted and Anthropic applies its own default (`high`). An explicit value is absolute: sent verbatim, with no validation or clamping, whatever model it is aimed at. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
+
+### `thinking`
+
+`adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens), which pre-4.6 models require; `off` sends no thinking field. Betas and `temperature` follow whether thinking is on at all, not which encoding it uses.
 
 ### `redact_thinking`
 
@@ -86,18 +91,9 @@ The OAuth client ID defaults to Claude Code's client ID but can be overridden pe
 
 ## Supported Models
 
-Any model your Claude Code subscription exposes. Current line-up (per [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview)):
+Any model your Claude Code subscription exposes. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) - `meka provider add` suggests `claude-opus-5` for new Claude profiles.
 
-| Family | Alias | Notes |
-|--------|-------|-------|
-| Fable 5 | `claude-fable-5` | Most capable; thinking always on |
-| Opus 5 | `claude-opus-5` | Default for new profiles; complex agentic coding |
-| Sonnet 5 | `claude-sonnet-5` | Speed + intelligence balance |
-| Haiku 4.5 | `claude-haiku-4-5` | Fastest; no effort knob |
-
-Older but still available: `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`. Deprecated and retiring 2026-08-05: `claude-opus-4-1`.
-
-meka forwards the model string verbatim; it doesn't gate which strings are valid. Per-model behaviour comes from capability gates baked into the request shape (see [Beta header](#beta-header)). The two kinds of gate deliberately fail in opposite directions. Gates that shape the request (adaptive thinking, the 1M window) are a denylist, so Claude 4.6+ and any newly released family are enabled by default and a new model works without a meka update. Gates whose wrong guess would draw a 400 are allowlists: `temperature` goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older), and effort is skipped for the whole Haiku tier, which has never had the knob. Opus 4.5 is the one pre-4.6 model that is effort-capable (`low`/`medium`/`high`, no `xhigh`).
+meka forwards the model string verbatim; it doesn't gate which strings are valid, and it no longer picks request parameters from it: `effort` and `thinking` come from the profile, and are omitted or defaulted rather than inferred. What remains model-derived is the small set of gates whose wrong guess would draw a 400, and those are allowlists so an unrecognised model omits the field rather than being handed one - `temperature` goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older), and the `claude-code-20250219` beta is skipped for the Haiku tier. See [Beta header](#beta-header).
 
 ## API Details
 
@@ -147,9 +143,9 @@ Only block 3 is marked for caching, matching the captured Claude Code CLI wire s
 
 - `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "", "session_id": "..."}` (`device_id` from the profile's `device_id`; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
-- `output_config.effort`: present for effort-capable models. Uses the profile's `effort` when set, otherwise a model-aware default (`xhigh` where supported, else `high`).
-- `temperature: 1` (only when thinking is disabled).
-- `max_tokens`: `64_000` for adaptive-thinking models, `max(thinking_budget * 2, 32_000)` for legacy thinking models, `32_000` otherwise.
+- `output_config.effort`: present only when the profile sets `effort`; otherwise omitted, along with its beta.
+- `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
+- `max_tokens`: `64_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`.
 
 ### Cache control
 

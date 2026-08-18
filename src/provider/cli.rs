@@ -38,6 +38,9 @@ pub async fn run(action: &ProviderAction, token_store: &TokenStore) -> anyhow::R
             r#type,
             model,
             base_url,
+            thinking,
+            context_window,
+            effort,
             api_key_stdin,
         } => {
             run_add(
@@ -45,6 +48,11 @@ pub async fn run(action: &ProviderAction, token_store: &TokenStore) -> anyhow::R
                 r#type.as_deref(),
                 model.clone(),
                 base_url.clone(),
+                ProfileTuning {
+                    thinking: *thinking,
+                    context_window: *context_window,
+                    effort: effort.clone(),
+                },
                 *api_key_stdin,
                 token_store,
             )
@@ -57,11 +65,22 @@ pub async fn run(action: &ProviderAction, token_store: &TokenStore) -> anyhow::R
     }
 }
 
+/// The settings `provider add` can write beyond the four it always asks for. Each is `None` when
+/// the flag was absent and the user declined (or skipped) the advanced prompt, which leaves the key
+/// out of the profile entirely so the documented default applies.
+#[derive(Default)]
+struct ProfileTuning {
+    thinking: Option<crate::provider::ThinkingMode>,
+    context_window: Option<u64>,
+    effort: Option<String>,
+}
+
 async fn run_add(
     name: &str,
     type_flag: Option<&str>,
     model_flag: Option<String>,
     base_url_flag: Option<String>,
+    tuning_flags: ProfileTuning,
     api_key_stdin: bool,
     token_store: &TokenStore,
 ) -> anyhow::Result<()> {
@@ -71,10 +90,8 @@ async fn run_add(
     // Hard-fails on an unparseable config rather than warning: this guard is the only thing
     // standing between `provider add <existing>` and `upsert_profile_document` replacing the
     // profile's table, and an empty parsed map defeats it.
-    if config::load_config_file_or_err()?
-        .providers
-        .contains_key(name)
-    {
+    let existing = config::load_config_file_or_err()?;
+    if existing.providers.contains_key(name) {
         anyhow::bail!(
             "a profile named '{}' already exists. Use `meka provider login {}` to re-authenticate, \
              or `meka provider remove {}` first.",
@@ -110,10 +127,29 @@ async fn run_add(
     let base_url = match base_url_flag {
         Some(url) => Some(url),
         None => {
-            let input = prompt_line("API base URL (leave empty for default): ")?;
+            // Shows the endpoint an empty answer accepts, matching the model prompt above. Unlike
+            // the model, an empty answer writes nothing: pinning the default into the profile would
+            // freeze it, and this is the one setting where meka's own value is the right one for
+            // almost everybody.
+            let prompt = match crate::provider::default_base_url(&backend) {
+                Some(default) => format!("API base URL [{}]: ", default),
+                None => "API base URL (leave empty for default): ".to_string(),
+            };
+            let input = prompt_line(&prompt)?;
             (!input.is_empty()).then_some(input)
         }
     };
+
+    let tuning = resolve_tuning(
+        tuning_flags,
+        &backend,
+        name,
+        existing
+            .session
+            .as_ref()
+            .and_then(|session| session.context_window),
+        api_key_stdin,
+    )?;
 
     // Acquire the credential last: the Codex OAuth login races a pasted-callback-URL reader against
     // the loopback callback, and if the callback wins it can leave a stdin read parked. Keeping the
@@ -123,7 +159,7 @@ async fn run_add(
     token_store
         .save_provider_credential(name, &credential)
         .await?;
-    write_profile(name, &backend, model.as_str(), base_url.as_deref())?;
+    write_profile(name, &backend, model.as_str(), base_url.as_deref(), &tuning)?;
 
     tracing::info!("added provider profile '{}'", name);
     Ok(())
@@ -418,12 +454,24 @@ fn upsert_profile_document(
     backend: &str,
     model: &str,
     base_url: Option<&str>,
+    tuning: &ProfileTuning,
 ) -> anyhow::Result<()> {
     let mut profile = toml_edit::Table::new();
     profile.insert("type", toml_edit::value(backend));
     profile.insert("model", toml_edit::value(model));
     if let Some(url) = base_url {
         profile.insert("base_url", toml_edit::value(url));
+    }
+    // An unset knob is left out rather than written at its default, so the profile records only
+    // what the user actually chose and a later change to a default reaches existing profiles.
+    if let Some(mode) = tuning.thinking {
+        profile.insert("thinking", toml_edit::value(mode.as_str()));
+    }
+    if let Some(window) = tuning.context_window {
+        profile.insert("context_window", toml_edit::value(window as i64));
+    }
+    if let Some(effort) = tuning.effort.as_deref() {
+        profile.insert("effort", toml_edit::value(effort));
     }
     ensure_providers_table(document)?.insert(name, toml_edit::Item::Table(profile));
 
@@ -458,11 +506,12 @@ fn write_profile(
     backend: &str,
     model: &str,
     base_url: Option<&str>,
+    tuning: &ProfileTuning,
 ) -> anyhow::Result<()> {
     // `_lock` is held to the end of the function, so the read above and the write below are
     // one critical section.
     let (_lock, path, mut document) = open_document()?;
-    upsert_profile_document(&mut document, name, backend, model, base_url)?;
+    upsert_profile_document(&mut document, name, backend, model, base_url, tuning)?;
     config::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
@@ -477,6 +526,147 @@ fn set_default_provider(name: &str) -> anyhow::Result<()> {
 }
 
 // ----- Interactive prompts -----------------------------------------------------------------------
+
+/// What declining the advanced step leaves in force, or `None` when the flags already pinned every
+/// setting so there is no default left to report.
+///
+/// Only the still-unset ones are named: stating a default for something the flags set would
+/// contradict the file this same command is about to write. Split out from the prompt so the
+/// composition is testable without stdin - the prompt is the one part of `resolve_tuning` a test
+/// cannot drive.
+fn unset_defaults_summary(
+    tuning: &ProfileTuning,
+    takes_thinking: bool,
+    effective_window: u64,
+) -> Option<String> {
+    let mut defaults: Vec<String> = Vec::new();
+    if takes_thinking && tuning.thinking.is_none() {
+        defaults.push(format!(
+            "thinking {}",
+            crate::provider::ThinkingMode::default().as_str()
+        ));
+    }
+    if tuning.context_window.is_none() {
+        defaults.push(format!("context window {}", effective_window));
+    }
+    if tuning.effort.is_none() {
+        defaults.push("the provider's own reasoning effort".to_string());
+    }
+    (!defaults.is_empty()).then(|| defaults.join(", "))
+}
+
+/// Fill in whatever the flags didn't set, offering one opt-in prompt rather than three
+/// unconditional ones. Declining leaves every unset knob out of the profile, and says which
+/// defaults that implies, because these are the settings meka stopped inferring: nothing else will
+/// tell the user they exist.
+///
+/// `stdin_is_the_key` suppresses the prompt entirely. Under `--api-key-stdin` the piped line is the
+/// credential, and a prompt here would read it as the answer and then leave the key read at end of
+/// input. The flags stay available for setting these non-interactively.
+fn resolve_tuning(
+    flags: ProfileTuning,
+    backend: &str,
+    profile_name: &str,
+    session_window: Option<u64>,
+    stdin_is_the_key: bool,
+) -> anyhow::Result<ProfileTuning> {
+    // What an unset profile would actually budget against: `[session].context_window` if the user
+    // already set one, else the built-in default. Showing the constant unconditionally would state
+    // a window the run is not going to use.
+    let effective_window = session_window.unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
+    // `thinking` is a Claude request field, so an OpenAI profile is neither asked about it nor told
+    // what it defaults to: writing the key there would produce a setting that reads plausibly and
+    // does nothing.
+    let takes_thinking = backend.starts_with("claude");
+    let mut flags = flags;
+    // The flag is dropped, not just left unprompted. Guarding only the prompt produced a run that
+    // printed "using defaults:" without thinking *and* wrote `thinking` into the profile.
+    if !takes_thinking && flags.thinking.take().is_some() {
+        tracing::warn!(
+            "ignoring --thinking for a '{}' profile: thinking is a Claude request field",
+            backend
+        );
+    }
+    let complete = flags.context_window.is_some()
+        && flags.effort.is_some()
+        && (!takes_thinking || flags.thinking.is_some());
+    if complete || stdin_is_the_key {
+        return Ok(flags);
+    }
+    if !prompt_yes_no("Configure advanced settings? [y/N]: ")? {
+        if let Some(defaults) = unset_defaults_summary(&flags, takes_thinking, effective_window) {
+            eprintln!(
+                "using defaults: {}. Change these under [providers.{}] in config.toml.",
+                defaults, profile_name,
+            );
+        }
+        return Ok(flags);
+    }
+
+    let thinking = match flags.thinking {
+        Some(mode) => Some(mode),
+        None if !takes_thinking => None,
+        None => {
+            let input = prompt_line("  Thinking mode (adaptive, budgeted, off) [adaptive]: ")?;
+            match input.as_str() {
+                "" => None,
+                // Parsed through clap's `ValueEnum` rather than a fourth hand-written match, so
+                // this prompt accepts exactly what `--thinking` accepts.
+                other => Some(
+                    <crate::provider::ThinkingMode as clap::ValueEnum>::from_str(other, true)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "'{}' is not a thinking mode. Expected adaptive, budgeted, or off.",
+                                other
+                            )
+                        })?,
+                ),
+            }
+        }
+    };
+
+    let context_window = match flags.context_window {
+        Some(window) => Some(window),
+        None => {
+            let input = prompt_line(&format!(
+                "  Context window in tokens [{}]: ",
+                effective_window
+            ))?;
+            match input.as_str() {
+                "" => None,
+                other => Some(other.parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!("'{}' is not a whole number of tokens.", other)
+                })?),
+            }
+        }
+    };
+
+    let effort = match flags.effort {
+        Some(effort) => Some(effort),
+        None => {
+            let input = prompt_line("  Reasoning effort (empty for the provider's default): ")?;
+            (!input.is_empty()).then_some(input)
+        }
+    };
+
+    Ok(ProfileTuning {
+        thinking,
+        context_window,
+        effort,
+    })
+}
+
+/// A `[y/N]` prompt: anything but `y` / `yes` (case-insensitively) is a no, **including end of
+/// input**. An optional prompt must not be able to fail a run that would otherwise succeed: with
+/// stdin closed or redirected, `provider add` takes the defaults and carries on to the credential
+/// step, which is what it did before this prompt existed.
+fn prompt_yes_no(prompt: &str) -> io::Result<bool> {
+    match prompt_line(prompt) {
+        Ok(answer) => Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes")),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 
 /// Read a line without echoing it, so a pasted API key is not left on screen, in a scrollback
 /// buffer, or in a screen recording.
@@ -1702,6 +1892,131 @@ mod tests {
         assert_eq!(extract_jwt_expiration_millis(&jwt), Some(1_700_000_000_000));
     }
 
+    /// `--thinking` must be *dropped* on a backend whose requests have no thinking field, not
+    /// merely left unprompted.
+    ///
+    /// Guarding only the prompt is the bug this closes: the run then printed a "using defaults:"
+    /// line with no thinking in it *and* wrote `thinking` into the profile anyway, so the file
+    /// disagreed with what the user had just been told, and the key sat there reading plausibly
+    /// while doing nothing. Both halves are asserted, because either one alone passes the wrong
+    /// implementation.
+    #[test]
+    fn a_thinking_flag_aimed_at_a_backend_without_thinking_is_dropped() {
+        let flags = || ProfileTuning {
+            thinking: Some(crate::provider::ThinkingMode::Budgeted),
+            context_window: Some(1_024),
+            effort: Some("low".to_string()),
+        };
+        // Every setting is pinned, so this returns before any prompt: no stdin involved.
+        let openai = resolve_tuning(flags(), "openai-api", "oai", None, false).expect("resolve");
+        assert_eq!(openai.thinking, None, "written into an OpenAI profile");
+        assert_eq!(openai.context_window, Some(1_024));
+        assert_eq!(openai.effort.as_deref(), Some("low"));
+
+        let claude = resolve_tuning(flags(), "claude-api", "work", None, false).expect("resolve");
+        assert_eq!(
+            claude.thinking,
+            Some(crate::provider::ThinkingMode::Budgeted),
+            "the same flag must still reach a Claude profile"
+        );
+    }
+
+    /// The defaults line names what is still unset, and nothing else.
+    ///
+    /// It is the only thing that tells a user these settings exist - meka stopped inferring them,
+    /// so nothing else in the run mentions them. Naming one the flags already pinned would state a
+    /// default that contradicts the file being written in the same breath.
+    #[test]
+    fn the_defaults_line_reports_only_the_settings_still_unset() {
+        let bare = ProfileTuning::default();
+        let claude = unset_defaults_summary(&bare, true, 1_000_000).expect("something is unset");
+        assert!(claude.contains("thinking adaptive"), "{claude}");
+        assert!(claude.contains("context window 1000000"), "{claude}");
+        assert!(claude.contains("reasoning effort"), "{claude}");
+
+        // No thinking on a backend that has no such field, so it is not reported either.
+        let openai = unset_defaults_summary(&bare, false, 1_000_000).expect("something is unset");
+        assert!(!openai.contains("thinking"), "{openai}");
+
+        // The window reported is the one an unset profile would actually budget against, which is
+        // `[session].context_window` when the user already set one.
+        let session_window = unset_defaults_summary(&bare, false, 262_144).expect("unset");
+        assert!(
+            session_window.contains("context window 262144"),
+            "{session_window}"
+        );
+
+        // A pinned setting is not reported as a default.
+        let pinned = ProfileTuning {
+            thinking: Some(crate::provider::ThinkingMode::Off),
+            context_window: Some(8_192),
+            effort: None,
+        };
+        let partial = unset_defaults_summary(&pinned, true, 1_000_000).expect("effort is unset");
+        assert!(!partial.contains("thinking"), "{partial}");
+        assert!(!partial.contains("context window"), "{partial}");
+        assert!(partial.contains("reasoning effort"), "{partial}");
+
+        // Nothing unset, nothing to say.
+        assert_eq!(
+            unset_defaults_summary(
+                &ProfileTuning {
+                    thinking: Some(crate::provider::ThinkingMode::Off),
+                    context_window: Some(8_192),
+                    effort: Some("low".to_string()),
+                },
+                true,
+                1_000_000,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_advanced_settings_are_written_only_when_chosen() {
+        // Unset knobs stay out of the profile rather than being written at their defaults, so a
+        // profile records the user's choices and a later change to a default still reaches it.
+        let mut bare = toml_edit::DocumentMut::new();
+        upsert_profile_document(
+            &mut bare,
+            "local",
+            "claude-api",
+            "some-local-model",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert");
+        let rendered = bare.to_string();
+        for key in ["thinking", "context_window", "effort"] {
+            assert!(!rendered.contains(key), "{key} in: {rendered}");
+        }
+
+        // Chosen ones round-trip through the runtime config, which is what actually reads them.
+        let mut tuned = toml_edit::DocumentMut::new();
+        upsert_profile_document(
+            &mut tuned,
+            "local",
+            "claude-api",
+            "some-local-model",
+            None,
+            &ProfileTuning {
+                thinking: Some(crate::provider::ThinkingMode::Budgeted),
+                context_window: Some(262_144),
+                effort: Some("medium".to_string()),
+            },
+        )
+        .expect("upsert");
+        let config: config::ConfigFile =
+            toml::from_str(&tuned.to_string()).expect("re-parse config");
+        let profile = config.providers.get("local").expect("profile present");
+        assert_eq!(
+            profile.thinking,
+            Some(crate::provider::ThinkingMode::Budgeted)
+        );
+        assert_eq!(profile.context_window, Some(262_144));
+        assert_eq!(profile.effort.as_deref(), Some("medium"));
+    }
+
     #[test]
     fn test_upsert_profile_document_first_profile_becomes_default() {
         let mut document = toml_edit::DocumentMut::new();
@@ -1711,6 +2026,7 @@ mod tests {
             "openai-api",
             "gpt-4o",
             Some("http://localhost:1234/v1"),
+            &ProfileTuning::default(),
         )
         .expect("upsert");
         // The rendered TOML must parse back into the runtime config with the profile and default.
@@ -1729,10 +2045,24 @@ mod tests {
     #[test]
     fn test_upsert_profile_document_second_profile_keeps_existing_default() {
         let mut document = toml_edit::DocumentMut::new();
-        upsert_profile_document(&mut document, "work", "claude-oauth", "claude-x", None)
-            .expect("upsert work");
-        upsert_profile_document(&mut document, "personal", "openai-api", "gpt-4o", None)
-            .expect("upsert personal");
+        upsert_profile_document(
+            &mut document,
+            "work",
+            "claude-oauth",
+            "claude-x",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert work");
+        upsert_profile_document(
+            &mut document,
+            "personal",
+            "openai-api",
+            "gpt-4o",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert personal");
         let config: config::ConfigFile =
             toml::from_str(&document.to_string()).expect("re-parse config");
         // The default must remain the first profile, not silently flip to the newest one.
@@ -1746,10 +2076,24 @@ mod tests {
     #[test]
     fn test_remove_profile_document_clears_dangling_default() {
         let mut document = toml_edit::DocumentMut::new();
-        upsert_profile_document(&mut document, "work", "claude-oauth", "claude-x", None)
-            .expect("upsert work");
-        upsert_profile_document(&mut document, "personal", "openai-api", "gpt-4o", None)
-            .expect("upsert personal");
+        upsert_profile_document(
+            &mut document,
+            "work",
+            "claude-oauth",
+            "claude-x",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert work");
+        upsert_profile_document(
+            &mut document,
+            "personal",
+            "openai-api",
+            "gpt-4o",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert personal");
         remove_profile_document(&mut document, "work");
         let config: config::ConfigFile =
             toml::from_str(&document.to_string()).expect("re-parse config");

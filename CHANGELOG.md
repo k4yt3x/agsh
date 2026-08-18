@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 - `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
 - `[schedule].max_consecutive_fires` interleaves one session's due backlog with other sessions'.
+- `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
+- `meka provider add` offers an optional advanced step for thinking, context window and effort.
+- `meka provider add --thinking` / `--context-window` / `--effort` set those non-interactively.
 
 ### Changed
 
@@ -43,10 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
 - Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
 - Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
+- **Breaking:** `[thinking].enabled` is retired; the per-profile `thinking` mode replaces it.
+- **Breaking:** `--thinking` takes `adaptive`, `budgeted` or `off` rather than a boolean.
+- **Breaking:** pre-4.6 Claude profiles need `thinking = "budgeted"`; the default is now adaptive.
+- **Breaking:** unset `effort` now sends no tier, so the provider's own default applies.
+- **Breaking:** an unset context window is 1000000, not a guess from the model name.
+- `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
+- `/status` shows the context window from turn zero, so a configured window is verifiable up front.
 
 ### Removed
 
 - The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
+- The model-metadata subsystem: the models-API probe, its cache table, and the window table.
 
 ### Fixed
 
@@ -76,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: a malformed body, a bad parameter or a re-attach race no longer answers a false 409.
 - A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
 - Terminal rendering survives emoji, combining marks and invisible characters without a broken row.
+- MCP servers are closed on exit on every surface; the handshake was previously unreachable.
+- MCP shutdown is bounded, so a server that will not close cannot hold up a `serve` or `acp` exit.
+- `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
 - CLI, log and help text corrected throughout: wrong keys, stale advice, leaked Rust internals.
 
 ### Security

@@ -631,7 +631,7 @@ impl ResolvedSubagentsConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ThinkingConfig {
-    pub enabled: Option<bool>,
+    /// Budget for [`crate::provider::ThinkingMode::Budgeted`]; ignored under the other modes.
     pub budget_tokens: Option<u64>,
     pub show_content: Option<bool>,
 }
@@ -1168,9 +1168,10 @@ pub struct ProviderProfile {
     pub backend: String,
     pub model: Option<String>,
     pub base_url: Option<String>,
-    /// Override the model's context window (total tokens the model can hold), used for the context
-    /// gauge and auto-compaction. When unset, falls back to `[session].context_window` and then to
-    /// the model-name inference in [`crate::provider::context_window_for_model`].
+    /// The model's context window (total tokens it can hold), used for the context gauge and
+    /// auto-compaction. Falls back to `[session].context_window`, then to
+    /// [`crate::provider::DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
+    /// asks the provider for it, so this is where a model smaller than the default gets stated.
     pub context_window: Option<u64>,
     /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
     /// the ACP frontend from advertising / accepting images for a text-only model.
@@ -1183,9 +1184,15 @@ pub struct ProviderProfile {
     /// OAuth client ID override (advanced; `claude-oauth` / `openai-codex`).
     pub client_id: Option<String>,
     /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
-    /// `reasoning.effort`. Passed through verbatim; when unset the provider picks a model-aware
-    /// default (`xhigh` where supported, else `high`, omitted on models with no effort knob).
+    /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
+    /// is omitted entirely, which is how meka asks for the provider's own default. meka picks no
+    /// tier of its own - see [`crate::provider::resolve_effort_level`].
     pub effort: Option<String>,
+    /// Claude-only: how this profile encodes extended thinking - `adaptive`, `budgeted`, or `off`.
+    /// Defaults to `adaptive`. The right value depends on the model *and* on what the endpoint
+    /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
+    /// later changes `model` is the user's to keep correct.
+    pub thinking: Option<crate::provider::ThinkingMode>,
     /// `claude-oauth` only: when true, meka sends the `redact-thinking-2026-02-12` beta header so
     /// the server returns `redacted_thinking` blocks instead of full thinking summaries (saves
     /// bandwidth, but the redacted payloads can't be replayed back to the server in multi-turn
@@ -1281,16 +1288,15 @@ pub struct ResolvedConfig {
     pub context_messages: Option<usize>,
     /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
     pub retention_days: Option<u64>,
-    pub thinking_enabled: bool,
+    pub thinking: crate::provider::ThinkingMode,
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
     /// Stable per-device identifier for `claude-oauth`'s `metadata.user_id`. Empty string for
     /// non-`claude-oauth` providers (the value is ignored downstream).
     pub device_id: String,
     /// The user's explicit reasoning-effort override for every backend (Claude
-    /// `output_config.effort`, OpenAI `reasoning.effort`), or `None` when unset (the provider then
-    /// picks a model-aware default: `xhigh` where supported, else `high`, omitted on models with
-    /// no effort knob). Passed through verbatim.
+    /// `output_config.effort`, OpenAI `reasoning.effort`). Passed through verbatim; `None` leaves
+    /// the field off the request, so the provider applies its own default.
     pub effort: Option<String>,
     /// `claude-oauth`: when true, request `redacted_thinking` blocks via
     /// `redact-thinking-2026-02-12` beta. Default false.
@@ -2587,9 +2593,10 @@ impl ResolvedConfig {
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
             retention_days: file_session.retention_days,
-            thinking_enabled: cli
+            thinking: cli
                 .thinking
-                .unwrap_or_else(|| file_thinking.enabled.unwrap_or(true)),
+                .or_else(|| active.and_then(|profile| profile.thinking))
+                .unwrap_or_default(),
             thinking_budget_tokens: cli.thinking_budget.unwrap_or_else(|| {
                 file_thinking
                     .budget_tokens
@@ -2598,14 +2605,14 @@ impl ResolvedConfig {
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
             device_id,
             // Pure passthrough for every backend: whatever the profile sets goes to the provider
-            // verbatim (the provider trims/lowercases and applies the model-aware default when
-            // unset). An invalid value is the user's to own; the API rejects it.
+            // verbatim (the provider trims and lowercases it). Unset means the field is omitted
+            // and the provider applies its own default. An invalid value is the user's to own.
             effort: active.and_then(|profile| profile.effort.clone()),
             redact_thinking,
             auto_compact: file_session.auto_compact.unwrap_or(true),
             compact_checkpoint: file_session.compact_checkpoint.unwrap_or(true),
-            // Precedence: profile > `[session].context_window` > model-name inference (applied at
-            // the call sites in `main.rs` via `context_window_for_model`).
+            // Precedence: profile > `[session].context_window`. The call sites in `main.rs` apply
+            // `DEFAULT_CONTEXT_WINDOW` when both are unset.
             context_window: active
                 .and_then(|profile| profile.context_window)
                 .or(file_session.context_window),
@@ -2756,38 +2763,35 @@ impl ResolvedConfig {
         }
         validate_max_output_tokens(
             self.provider_name.as_deref(),
-            self.model.as_deref(),
             self.max_output_tokens,
-            self.thinking_enabled,
+            self.thinking,
             self.thinking_budget_tokens,
         )?;
         Ok(())
     }
 }
 
-/// Reject a `max_output_tokens` override that can't produce a valid Claude request: with thinking
-/// enabled the budget is drawn from `max_tokens`, so the cap must exceed it. Surfaced as a config
-/// error with clear guidance rather than a provider 400 mid-turn. Non-Claude backends and the
-/// thinking-off case have no such constraint.
+/// Reject a `max_output_tokens` override that can't produce a valid Claude request: under
+/// [`crate::provider::ThinkingMode::Budgeted`] the budget is drawn from `max_tokens`, so the cap
+/// must exceed it. Surfaced as a config error with clear guidance rather than a provider 400
+/// mid-turn. The other two modes send no `budget_tokens` and have no such constraint, and neither
+/// do the OpenAI backends.
 fn validate_max_output_tokens(
     provider_name: Option<&str>,
-    model: Option<&str>,
     max_output_tokens: Option<u64>,
-    thinking_enabled: bool,
+    thinking: crate::provider::ThinkingMode,
     thinking_budget_tokens: u64,
 ) -> crate::error::Result<()> {
     let Some(max_output) = max_output_tokens else {
         return Ok(());
     };
     let is_claude = matches!(provider_name, Some("claude-api") | Some("claude-oauth"));
-    // Adaptive-thinking models (Claude 4.6+) send `thinking: {type: adaptive}` with no explicit
-    // `budget_tokens`, so the `max_tokens > budget` invariant only applies to the budgeted
-    // (non-adaptive) path. Don't reject an adaptive config that's actually valid.
-    let adaptive = model.is_some_and(crate::provider::model_supports_adaptive_thinking);
-    if is_claude && thinking_enabled && !adaptive && max_output <= thinking_budget_tokens {
+    let budgeted = matches!(thinking, crate::provider::ThinkingMode::Budgeted);
+    if is_claude && budgeted && max_output <= thinking_budget_tokens {
         return Err(crate::error::MekaError::Config(format!(
             "max_output_tokens ({}) must exceed the thinking budget ({}) for a Claude profile \
-             with thinking enabled; raise max_output_tokens or lower [thinking].budget_tokens.",
+             with thinking = \"budgeted\"; raise max_output_tokens or lower \
+             [thinking].budget_tokens.",
             max_output, thinking_budget_tokens,
         )));
     }
@@ -3620,6 +3624,7 @@ type = "claude-oauth"
 type = "claude-oauth"
 model = "claude-opus-4-6-20250514"
 effort = "medium"
+thinking = "budgeted"
 redact_thinking = true
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
@@ -3628,7 +3633,21 @@ redact_thinking = true
             .get("work")
             .expect("profile should be present");
         assert_eq!(profile.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            profile.thinking,
+            Some(crate::provider::ThinkingMode::Budgeted)
+        );
         assert_eq!(profile.redact_thinking, Some(true));
+    }
+
+    #[test]
+    fn the_thinking_block_parses_its_keys() {
+        let config: ConfigFile =
+            toml::from_str("[thinking]\nbudget_tokens = 10000\nshow_content = true\n")
+                .expect("parse");
+        let thinking = config.thinking.expect("[thinking] present");
+        assert_eq!(thinking.budget_tokens, Some(10_000));
+        assert_eq!(thinking.show_content, Some(true));
     }
 
     #[test]
@@ -3677,78 +3696,55 @@ max_output_tokens = 64000
     }
 
     #[test]
-    fn test_validate_max_output_tokens_rejects_below_budget_on_claude() {
-        // `claude-sonnet-4-5` uses the budgeted (non-adaptive) thinking path.
+    fn the_budget_invariant_is_checked_only_under_budgeted_thinking() {
+        use crate::provider::ThinkingMode;
+
+        // Budgeted draws the thinking budget out of `max_tokens`, so a cap at or below it can only
+        // produce a 400. Catch it at config load, where the message can say what to change.
         let result = validate_max_output_tokens(
             Some("claude-oauth"),
-            Some("claude-sonnet-4-5"),
             Some(5_000),
-            true,
+            ThinkingMode::Budgeted,
             10_000,
         );
         assert!(result.is_err());
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("thinking budget"), "got: {message}");
-    }
-
-    #[test]
-    fn test_validate_max_output_tokens_allows_above_budget_on_claude() {
+        assert!(
+            result.unwrap_err().to_string().contains("thinking budget"),
+            "the error must name the budget it conflicts with"
+        );
         assert!(
             validate_max_output_tokens(
                 Some("claude-oauth"),
-                Some("claude-sonnet-4-5"),
                 Some(20_000),
-                true,
+                ThinkingMode::Budgeted,
                 10_000
             )
             .is_ok()
         );
-    }
 
-    #[test]
-    fn test_validate_max_output_tokens_allows_adaptive_below_budget() {
-        // Adaptive-thinking models send no `budget_tokens`, so a cap below the configured budget is
-        // valid and must not be rejected.
+        // The other two modes send no `budget_tokens` at all, so the same cap is fine. Reading the
+        // mode rather than guessing it from the model name is the point: a budget-free request is
+        // no longer inferred, it is stated.
+        for mode in [ThinkingMode::Adaptive, ThinkingMode::Off] {
+            assert!(
+                validate_max_output_tokens(Some("claude-oauth"), Some(5_000), mode, 10_000).is_ok(),
+                "{mode:?}"
+            );
+        }
+        // Non-Claude backends have no such constraint either, whatever the mode.
         assert!(
             validate_max_output_tokens(
-                Some("claude-oauth"),
-                Some("claude-opus-4-6"),
-                Some(5_000),
-                true,
-                10_000
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_max_output_tokens_ignores_non_claude_and_thinking_off() {
-        // Non-Claude backend: no budget constraint even when below.
-        assert!(
-            validate_max_output_tokens(Some("openai-api"), Some("gpt-5"), Some(100), true, 10_000)
-                .is_ok()
-        );
-        // Claude with thinking off: the budget isn't drawn from max_tokens.
-        assert!(
-            validate_max_output_tokens(
-                Some("claude-api"),
-                Some("claude-sonnet-4-5"),
+                Some("openai-api"),
                 Some(100),
-                false,
+                ThinkingMode::Budgeted,
                 10_000
             )
             .is_ok()
         );
         // No override at all.
         assert!(
-            validate_max_output_tokens(
-                Some("claude-api"),
-                Some("claude-sonnet-4-5"),
-                None,
-                true,
-                10_000
-            )
-            .is_ok()
+            validate_max_output_tokens(Some("claude-api"), None, ThinkingMode::Budgeted, 10_000)
+                .is_ok()
         );
     }
 
@@ -4767,6 +4763,50 @@ read_file = "ask"
             blank.expect("ok").is_none(),
             "an all-whitespace flag is no instructions, not empty ones"
         );
+    }
+
+    /// Touches process env, so it serializes against any other env-var test in this file via
+    /// [`CONFIG_DIR_ENV_LOCK`].
+    #[test]
+    fn a_profiles_thinking_mode_reaches_the_resolved_config() {
+        // The resolution step, not the parse: `ProviderProfile.thinking` deserializing is separate
+        // from `from_cli` actually consulting it, and dropping the profile arm here is invisible to
+        // every wire-level test - those construct providers directly.
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+default_provider = "local"
+
+[providers.local]
+type = "claude-api"
+model = "some-local-model"
+thinking = "budgeted"
+"#,
+        )
+        .expect("write config.toml");
+
+        // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with any other env-var test.
+        unsafe {
+            std::env::set_var("MEKA_CONFIG_DIR", dir.path());
+        }
+        use clap::Parser;
+        let from_profile = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
+        // A CLI flag still wins over the profile.
+        let from_flag =
+            ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka", "--thinking", "off"]));
+        // SAFETY: same as above; the guard is held for the full set→read→clear cycle.
+        unsafe {
+            std::env::remove_var("MEKA_CONFIG_DIR");
+        }
+
+        assert_eq!(
+            from_profile.thinking,
+            crate::provider::ThinkingMode::Budgeted
+        );
+        assert_eq!(from_flag.thinking, crate::provider::ThinkingMode::Off);
     }
 
     /// End-to-end check that `MEKA_INSTRUCTIONS` reaches `user_instructions` when

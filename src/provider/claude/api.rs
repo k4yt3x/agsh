@@ -4,7 +4,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicI8, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
@@ -13,12 +13,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, parse_non_streaming_response, resolve_effort,
+    drive_claude_sse_stream, parse_non_streaming_response,
 };
 use crate::{
     error::{MekaError, Result},
     provider::{
-        Message, ModelInfo, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        Message, Notice, Provider, StopReason, StreamEvent, ThinkingMode, TokenUsage,
+        ToolDefinition,
     },
 };
 
@@ -27,13 +28,15 @@ pub struct ClaudeApiProvider {
     api_key: String,
     base_url: String,
     model: String,
-    thinking_enabled: bool,
+    thinking: ThinkingMode,
     thinking_budget_tokens: u64,
-    thinking_override: AtomicI8,
+    /// Set while an internal turn (compaction) runs, so its summary doesn't pay for reasoning.
+    /// Only ever suppresses; it cannot turn thinking on for a profile that asked for none.
+    thinking_suppressed: AtomicBool,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
-    /// the profile's override and the model's name predicates. Anthropic's models API reports no
-    /// effort levels, so there is no catalog to refine from post-build. The direct Messages API
-    /// takes effort with no beta header.
+    /// the profile's override. `None` - the unconfigured case - omits the field so Anthropic (or
+    /// whatever endpoint `base_url` names) applies its own default. The direct Messages API takes
+    /// effort with no beta header.
     resolved_effort: Option<String>,
     /// Per-request output token cap from the profile; `None` keeps the built-in default.
     max_output_tokens: Option<u64>,
@@ -47,31 +50,33 @@ impl ClaudeApiProvider {
         api_key: String,
         model: String,
         base_url: Option<String>,
-        thinking_enabled: bool,
+        thinking: ThinkingMode,
         thinking_budget_tokens: u64,
         effort: Option<String>,
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Result<Self> {
-        let resolved_effort = resolve_effort(effort.as_deref(), &model);
+        let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
         Ok(Self {
             client: crate::provider::build_http_client("claude-api", |builder| builder)?,
             api_key,
             base_url: shared::normalize_claude_base_url(
-                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                base_url
+                    .as_deref()
+                    .unwrap_or(crate::provider::DEFAULT_CLAUDE_BASE_URL),
             ),
             model,
-            thinking_enabled,
+            thinking,
             thinking_budget_tokens,
-            thinking_override: AtomicI8::new(-1),
+            thinking_suppressed: AtomicBool::new(false),
             resolved_effort,
             max_output_tokens,
             session_stats,
         })
     }
 
-    fn is_thinking_enabled(&self) -> bool {
-        shared::resolve_thinking_enabled(&self.thinking_override, self.thinking_enabled)
+    fn effective_thinking(&self) -> ThinkingMode {
+        shared::effective_thinking(&self.thinking_suppressed, self.thinking)
     }
 
     /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]).
@@ -81,12 +86,12 @@ impl ClaudeApiProvider {
 
     fn compute_betas(&self) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
-        if self.is_thinking_enabled() {
+        if self.effective_thinking().is_on() {
             parts.push("interleaved-thinking-2025-05-14");
         }
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
         // the current large-context models (Opus 4.6+, Sonnet 4.6, Fable 5) with no beta header,
-        // so `context_window_for_model`'s 1M value is already what the request gets. See
+        // so the 1M window is already what the request gets. See
         // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. (claude-oauth
         // still sends it, mirroring Claude Code's captured wire.)
         if parts.is_empty() {
@@ -114,8 +119,7 @@ impl ClaudeApiProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.is_thinking_enabled(),
-            &self.model,
+            self.effective_thinking(),
             self.thinking_budget_tokens,
             self.max_output_tokens,
         );
@@ -260,39 +264,9 @@ impl Provider for ClaudeApiProvider {
         self.wire_effort()
     }
 
-    fn set_thinking_override(&self, enabled: Option<bool>) {
-        let value = match enabled {
-            None => -1,
-            Some(false) => 0,
-            Some(true) => 1,
-        };
-        self.thinking_override.store(value, Ordering::Relaxed);
-    }
-
-    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
-        let request = self.apply_headers(
-            self.client
-                .get(format!("{}/v1/models/{}", self.base_url, self.model)),
-        );
-        let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "model info request failed: {}",
-                crate::error::format_reqwest_error(&error),
-            ))
-        })?;
-        let status = response.status();
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read model info response: {}", error))
-        })?;
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &text,
-                retry_after,
-            ));
-        }
-        super::shared::model_info_from_claude_model(&text)
+    fn suppress_thinking(&self, suppressed: bool) {
+        self.thinking_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 }
 
@@ -317,7 +291,7 @@ mod tests {
             "test-key".to_string(),
             model.to_string(),
             base_url.map(str::to_string),
-            false,
+            ThinkingMode::Off,
             10000,
             effort.map(str::to_string),
             None,
@@ -348,23 +322,31 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_effort_wired_and_gated() {
-        // Unset effort defaults to the strongest tier the model supports, no beta header needed.
-        let modern = provider("claude-opus-4-8", None);
-        let body = modern.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "xhigh");
-        // Explicit override is honored.
-        let explicit = provider("claude-opus-4-8", Some("medium"));
-        let body = explicit.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "medium");
-        // Unset on a legacy (pre-4.6) model omits the field.
-        let legacy_unset = provider("claude-sonnet-4-20250514", None);
-        let body = legacy_unset.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert!(body.get("output_config").is_none());
-        // An explicit override is absolute: sent even on a model the default would skip.
-        let legacy_forced = provider("claude-sonnet-4-20250514", Some("high"));
-        let body = legacy_forced.build_request_body("s", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "high");
+    fn an_unconfigured_profile_sends_no_output_config_whatever_the_model() {
+        // No model name earns an effort tier. `claude-api` reaches any Anthropic-compatible
+        // endpoint, so meka cannot know which tiers the far side implements; omitting the field is
+        // how it asks for whatever that endpoint's default is.
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-20250514",
+            "hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0",
+        ] {
+            let body =
+                provider(model, None).build_request_body("s", &[Message::user("hi")], &[], false);
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
+        // A configured value is absolute: sent verbatim on any model, including one meka has never
+        // heard of, because the user knows their endpoint and meka does not.
+        for model in ["claude-opus-4-8", "hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0"] {
+            let body = provider(model, Some("medium")).build_request_body(
+                "s",
+                &[Message::user("hi")],
+                &[],
+                false,
+            );
+            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
+        }
     }
 
     #[test]
@@ -377,7 +359,7 @@ mod tests {
             "test-key".to_string(),
             "claude-opus-4-8".to_string(),
             None,
-            true,
+            ThinkingMode::Adaptive,
             10000,
             None,
             None,

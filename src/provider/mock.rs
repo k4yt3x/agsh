@@ -22,8 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::Result,
     provider::{
-        ContentBlock, Message, ModelInfo, Provider, Role, StopReason, StreamEvent, TokenUsage,
-        ToolDefinition,
+        ContentBlock, Message, Provider, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
     },
 };
 
@@ -148,12 +147,6 @@ impl From<MockStopReason> for StopReason {
 #[derive(Debug, Default)]
 pub struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
-    /// Canned response for [`Provider::fetch_model_info`]; `None` mimics a provider/model with no
-    /// models API (returns `Ok(None)`).
-    model_info: Option<ModelInfo>,
-    /// Value [`Provider::needs_effort_catalog`] returns; `true` mimics Codex wanting its effort
-    /// catalog probed so a resolver test can assert a table-known model still gets probed.
-    reports_effort: bool,
     /// Messages handed to each [`Provider::complete`] call, in order.
     ///
     /// Recorded because some behaviour is only observable in the *request*: whether the checkpoint
@@ -208,26 +201,6 @@ impl MockProvider {
     pub fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),
-            ..Default::default()
-        }
-    }
-
-    /// Build a mock whose `fetch_model_info` returns `info`, for model-metadata resolver tests.
-    #[cfg(test)]
-    pub fn with_model_info(info: ModelInfo) -> Self {
-        Self {
-            model_info: Some(info),
-            ..Default::default()
-        }
-    }
-
-    /// Like [`Self::with_model_info`] but also advertises an effort catalog
-    /// ([`Provider::needs_effort_catalog`] → `true`), mimicking Codex.
-    #[cfg(test)]
-    pub fn with_effort_catalog(info: ModelInfo) -> Self {
-        Self {
-            model_info: Some(info),
-            reports_effort: true,
             ..Default::default()
         }
     }
@@ -337,14 +310,6 @@ impl Provider for MockProvider {
             TokenUsage::default(),
             Vec::new(),
         ))
-    }
-
-    async fn fetch_model_info(&self) -> Result<Option<ModelInfo>> {
-        Ok(self.model_info.clone())
-    }
-
-    fn needs_effort_catalog(&self) -> bool {
-        self.reports_effort
     }
 
     async fn stream(

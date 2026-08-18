@@ -87,6 +87,20 @@ meka has several configuration surfaces. Keep coverage principled rather than ad
 - **Environment variables are operational-only**: config/data dirs (`MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`), permission, instructions, sandbox backend, render mode, MCP timeout, and `RUST_LOG`. For these the precedence is **CLI flags > env > `config.toml`** (the idiom is `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`).
 - **Session and display tuning stays config-only** (e.g. `context_messages`, `retention_days`, `auto_compact`, `newline_*`, `show_*`) — don't add env vars or flags for set-once preferences.
 
+## Whose fact is it
+
+If another system is the authority for a fact, ask it or let the user state it - never encode it.
+
+meka used to pick a reasoning-effort tier, a thinking encoding and a context window from the model's *name*, via version-parsing heuristics and family lists. Every one of those was a guess about someone else's system, and each went stale on its own schedule. Sorting a setting by who owns the fact says what to do with it:
+
+- **The provider owns it** - a request parameter it will default sensibly if meka says nothing (`output_config.effort`, `reasoning.effort`). Omit it unless the user asked for a value. Omitting is not a degraded setting; it is how you request the provider's default. This also means meka can't be wrong about an endpoint it has never seen, which matters because `claude-api` and `openai-api` reach any compatible server.
+- **The user owns it** - something neither meka nor the provider can determine, or where a wrong guess is invisible (`context_window`, the `thinking` encoding). Give it a config key with one documented default; don't infer, probe, or cache. State the default in the docs and, where a setup flow exists, on screen.
+- **meka owns it** - its own tool names, its own schema, its own defaults for its own behaviour. Encoding these is not the same thing, and needs no apology.
+
+Two exceptions. A guess whose wrong answer is a **rejected request** may stay: `model_supports_temperature` is the clean case, an allowlist that fails toward omission. `claude-oauth` also keeps `model_supports_modern_features`, `model_is_haiku` and `model_supports_mid_conversation_system`, which gate beta headers and `context_management`; those are denylists that fail toward *sending*, and they survive only because that backend's endpoint is always Anthropic, so an unrecognised name is necessarily a real Claude. Don't copy that shape onto a backend reachable via `base_url`. And a value verified against a captured wire is a fact about the protocol, not a prediction (the `anthropic-beta` strings) - those are pinned deliberately and cite the capture.
+
+A hardcoded fact about an external system will expire, and nothing in the build will notice: this repo shipped a "retiring 2026-08-05" line in two doc files that was still presented as upcoming a fortnight later.
+
 ## Built-in tool naming
 
 Tool names are read by the model on every turn, and `tool_catalogue` is sorted, so a name is both a

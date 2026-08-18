@@ -50,7 +50,7 @@ meka history clear
 
 ### `[PROMPT]`
 
-Run the agent's first turn immediately with this text as the user message, then drop into the interactive REPL for follow-up. Pair with [`--oneshot`](#oneshot) to exit after the first turn instead of opening the REPL.
+Run the agent's first turn immediately with this text as the user message, then drop into the interactive REPL for follow-up. Pair with [`--oneshot`](#--oneshot) to exit after the first turn instead of opening the REPL.
 
 ```bash
 meka "list all files larger than 1MB in the current directory"   # first turn, then REPL
@@ -154,20 +154,21 @@ meka --render-mode raw
 
 Can also be set permanently via `display.render_mode` in the config file.
 
-### `--thinking <BOOL>`
+### `--thinking <MODE>`
 
-Enable or disable extended thinking (`claude-api` and `claude-oauth` providers). Takes a value; it
-is not a bare flag, because it has to be able to turn thinking *off* for a run, and thinking is on
-by default.
+Extended thinking mode for this run (`claude-api` and `claude-oauth` providers): `adaptive`,
+`budgeted`, or `off`. Overrides the profile's
+[`thinking`](./config-file.md#thinking) key, which defaults to `adaptive`.
 
 ```bash
-meka --thinking false
+meka --thinking off
 ```
 
 ### `--thinking-budget <TOKENS>`
 
-Set the extended thinking token budget. Independent of `--thinking`: it sets the budget and does
-not turn thinking on, so `--thinking false --thinking-budget 20000` leaves thinking off.
+Set the extended thinking token budget. Read only under `--thinking budgeted` (and the profile's
+`thinking = "budgeted"`), since the adaptive encoding lets the model set its own budget and `off`
+sends none at all.
 
 ```bash
 meka --thinking-budget 20000
@@ -183,7 +184,7 @@ meka --instructions "Be terse. No code fences in answers."
 
 ### `--skill <NAME>`
 
-Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). The positional `[PROMPT]` arg, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#oneshot) to exit after the turn instead of opening the REPL.
+Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli). The positional `[PROMPT]` arg, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#--oneshot) to exit after the turn instead of opening the REPL.
 
 ```bash
 meka --skill download-videos "https://example.com/video"             # first turn, then REPL

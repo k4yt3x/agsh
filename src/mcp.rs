@@ -155,6 +155,10 @@ where
     SESSION_ID.scope(session_id, fut).await
 }
 
+/// Total wall-clock budget for closing every MCP server on the way out. Serial teardown at up to
+/// `CLOSE_TIMEOUT` per server would otherwise make exit latency scale with how many of them hang.
+pub(crate) const SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
     /// Global fallback permission from `[mcp].default_permission`. Consulted by
@@ -1138,21 +1142,51 @@ impl McpClientManager {
         Ok(out)
     }
 
-    /// Shutdown helper for callers that hold the manager through an `Arc`. Try-unwraps; if the Arc
-    /// is unshared, drives the owned [`Self::shutdown`]. If something still holds a reference,
-    /// drops the Arc and lets rmcp's drop guards clean up.
+    /// Shutdown helper for callers that hold the manager through an `Arc`. Just calls
+    /// [`Self::shutdown_within`], which needs only `&self`.
     pub async fn shutdown_arc(self: Arc<Self>) {
-        match Arc::try_unwrap(self) {
-            Ok(manager) => manager.shutdown().await,
-            Err(_shared) => {
-                tracing::debug!(
-                    "MCP manager still referenced at shutdown; relying on drop guards for cleanup"
-                );
-            }
+        self.shutdown_within(SHUTDOWN_BUDGET).await;
+    }
+
+    /// [`Self::shutdown`] under a total wall-clock bound.
+    ///
+    /// The loop is serial and each server can spend up to `CLOSE_TIMEOUT`, so an exit's cost scales
+    /// with the number of servers that refuse to answer. Every caller is on its way out and some of
+    /// them are being timed by something else - systemd, a container runtime, a user holding a
+    /// terminal - so the whole teardown gets one budget rather than each server getting its own.
+    /// Overrunning it is not an error: the remaining servers fall to rmcp's drop guards, which is
+    /// exactly where they were before any of this ran.
+    pub async fn shutdown_within(&self, budget: std::time::Duration) {
+        if tokio::time::timeout(budget, self.shutdown()).await.is_err() {
+            tracing::warn!(
+                "MCP shutdown exceeded {:?}; the servers still closing are left to their drop \
+                 guards, and a stdio child that ignores both may outlive this process",
+                budget
+            );
         }
     }
 
-    pub async fn shutdown(self) {
+    /// Close every connected server, in place.
+    ///
+    /// Takes `&self` deliberately. This used to consume `self`, so callers had to `try_unwrap` an
+    /// `Arc<Self>` first and the whole graceful path was skipped whenever anything else still held
+    /// a reference - which was always, because the manager holds the tool registries it serves
+    /// (`attached_registries`) and those registries hold the six `mcp_resource_*` / `mcp_prompt_*`
+    /// tools, each of which holds an `Arc` back to the manager. Sole ownership was unreachable by
+    /// construction, so `close_with_timeout` never ran and stdio children were left to rmcp's drop
+    /// guard, which spawns onto a runtime already tearing down.
+    ///
+    /// The service is taken out from under each entry's `state` lock rather than by owning the
+    /// entry, so a `ServerEntry` clone held by an in-flight call doesn't block teardown either. The
+    /// entry is left `Disabled` so a tool call arriving during teardown is refused rather than
+    /// handed a service that is closing.
+    ///
+    /// This does *not* stop a racing connect. `connect_one` and `reconnect` write `Connected`
+    /// unconditionally, and a `Pending` entry is left `Pending` here because it has nothing to
+    /// close - so a connector still working through its queue at exit can bring a server up behind
+    /// this loop and leave that child running. Shutting the connector down first is the fix, and is
+    /// not attempted here.
+    pub async fn shutdown(&self) {
         /// Max time to wait for in-flight tool calls to complete before we drop the shared service
         /// Arc and let the drop-guard cancel it.
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
@@ -1160,25 +1194,28 @@ impl McpClientManager {
         /// released.
         const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
-        for (server_name, entry) in self.servers {
-            let Ok(entry) = Arc::try_unwrap(entry) else {
-                tracing::debug!(
-                    "MCP server '{}' entry still referenced; relying on drop guard for cleanup",
-                    server_name
-                );
-                continue;
-            };
-
+        for (server_name, entry) in &self.servers {
             // Only Connected entries have a service to close; Pending / Failed / Disabled entries
-            // are tear-down no-ops.
-            let service = match entry.state.into_inner() {
-                ServerState::Connected { service } => service,
-                _ => continue,
+            // are tear-down no-ops. Taken under the write lock so a concurrent reconnect can't
+            // hand this loop a service it is about to replace.
+            let service = {
+                let mut state = entry.state.write().await;
+                match std::mem::replace(&mut *state, ServerState::Disabled) {
+                    ServerState::Connected { service } => service,
+                    other => {
+                        *state = other;
+                        continue;
+                    }
+                }
             };
 
-            // In-flight tool calls hold their own Arc<RunningService> clone. Wait up to
-            // `SHUTDOWN_GRACE` for those to complete so the normal `RunningService::close` path can
-            // run instead of falling straight to the drop-guard abort.
+            // Intended to let in-flight tool calls finish before the transport goes. It does not
+            // currently wait: dispatch goes through `require_connected`, which clones
+            // `service.peer()`, and rmcp 3.1's `Peer` holds channels rather than an
+            // `Arc<RunningService>` - so the count is already 1 and the loop exits immediately.
+            // Kept because the shape is right and the fix belongs in what dispatch
+            // holds, not here; it was unreachable before shutdown ran at all, and is
+            // merely ineffective now.
             let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
             while Arc::strong_count(&service) > 1 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2326,6 +2363,48 @@ pub(crate) mod tests {
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Shutdown must run while the manager is still shared.
+    ///
+    /// It used to consume `self`, so the caller had to win an `Arc::try_unwrap` first - and never
+    /// could: the manager holds the registries it serves, and each of those holds six
+    /// `mcp_resource_*` / `mcp_prompt_*` tools that hold the manager back. Sole ownership was
+    /// unreachable by construction, so the close handshake never ran on any launch that had an MCP
+    /// server to close, and every exit warned about it instead.
+    ///
+    /// The cycle is built here rather than described, so a future change that reintroduces it is
+    /// caught: `attach_registry` puts a registry inside the manager, `install_tools_on` puts tools
+    /// holding the manager inside that registry, and shutdown still has to reach the entries.
+    #[tokio::test]
+    async fn shutdown_runs_while_the_manager_is_still_shared() {
+        let manager = McpClientManager::prepare(
+            &[bare_server_config("probe")],
+            None,
+            None,
+            McpClientContext::new(),
+        )
+        .await
+        .expect("prepare");
+        let registry = crate::tools::ToolRegistry::new();
+        manager.attach_registry(registry.clone()).await;
+        manager.install_tools_on(&registry).await;
+
+        // The cycle the old `try_unwrap` lost to.
+        assert!(
+            Arc::strong_count(&manager) > 1,
+            "the manager must be shared for this test to mean anything"
+        );
+
+        // Runs anyway. That this compiles at all is half the guard: `shutdown` taking `&self` is
+        // what makes it reachable, and a change back to `self` would fail here rather than silently
+        // restoring the warn-and-skip behaviour at runtime.
+        manager.shutdown().await;
+
+        // A `Pending` entry has no service, so it is left as it was; only `Connected` entries carry
+        // something to close, and those are left `Disabled` once their service has been taken.
+        let entry = manager.server_entry("probe").expect("entry");
+        assert!(matches!(entry.state().await, ServerState::Pending));
     }
 
     /// A server that never connected registers no tools, so its names reach the agent's

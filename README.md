@@ -113,7 +113,7 @@ Conversations are persisted in a local SQLite database and can be resumed:
 
 ## Features
 
-- **Extended/adaptive thinking**: enabled by default for Claude models that support it
+- **Extended thinking**: on by default for Claude; `thinking` picks adaptive, budgeted, or off
 - **Syntax-highlighted output**: markdown rendering with syntect-highlighted code blocks, using bat's Monokai Extended theme
 - **Auto-compact**: automatically compacts the conversation when approaching the context limit
 - **MCP support**: extend the agent with tools from external MCP servers

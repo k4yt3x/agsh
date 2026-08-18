@@ -190,10 +190,11 @@ pub enum HistoryAction {
 pub enum ProviderAction {
     /// Add a provider profile and authenticate it
     ///
-    /// Prompts for any of type/model not passed as flags, then acquires the
-    /// secret (OAuth login for claude-oauth / openai-codex, API-key prompt for
-    /// claude-api / openai-api) and stores it in the database. Sets the default
-    /// provider when this is the first profile.
+    /// Prompts for any of type/model/base-url not passed as flags, offers an
+    /// optional advanced step (thinking, context window, effort), then acquires
+    /// the secret (OAuth login for claude-oauth / openai-codex, API-key prompt
+    /// for claude-api / openai-api) and stores it in the database. Sets the
+    /// default provider when this is the first profile.
     Add {
         /// Profile name (e.g. `work`, `personal`).
         name: String,
@@ -208,6 +209,23 @@ pub enum ProviderAction {
         /// API base URL (for OpenAI-compatible endpoints).
         #[arg(long = "base-url")]
         base_url: Option<String>,
+        /// Thinking mode (Claude-only)
+        ///
+        /// Skips the advanced prompt for this setting. Defaults to `adaptive`.
+        #[arg(long, value_enum)]
+        thinking: Option<crate::provider::ThinkingMode>,
+        /// Context window in tokens
+        ///
+        /// Skips the advanced prompt for this setting. Defaults to 1000000. Set the model's real
+        /// window so compaction fires at the right point; meka never infers or probes for it.
+        #[arg(long = "context-window")]
+        context_window: Option<u64>,
+        /// Reasoning effort to send (e.g. low, medium, high, xhigh)
+        ///
+        /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
+        /// applies its own default.
+        #[arg(long)]
+        effort: Option<String>,
         /// Read the API key from stdin (API backends only).
         ///
         /// Non-interactive alternative to the key prompt.
@@ -676,9 +694,9 @@ pub struct Cli {
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
 
-    /// Enable extended thinking (Claude-only)
-    #[arg(long = "thinking")]
-    pub thinking: Option<bool>,
+    /// Thinking mode (Claude-only)
+    #[arg(long = "thinking", value_enum)]
+    pub thinking: Option<crate::provider::ThinkingMode>,
 
     /// Token budget for extended thinking (Claude-only)
     #[arg(long = "thinking-budget")]

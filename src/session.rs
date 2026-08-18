@@ -1,8 +1,7 @@
-//! SQLite-backed session store, over eight tables: `sessions` and `messages` for the conversation,
+//! SQLite-backed session store, over seven tables: `sessions` and `messages` for the conversation,
 //! `tool_outputs` for results too large to keep inline (referenced from the conversation by
-//! handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, `scheduled_jobs` and
-//! `background_tasks` for work the agent starts and does not wait for, and `model_metadata_cache`
-//! for what a provider reports about a model.
+//! handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and `scheduled_jobs`
+//! and `background_tasks` for work the agent starts and does not wait for.
 //!
 //! Per-session mutual exclusion is provided by an OS-level file lock ([`SessionLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
@@ -577,14 +576,7 @@ impl SessionManager {
 
                     DROP TABLE IF EXISTS model_context_cache;
 
-                    CREATE TABLE IF NOT EXISTS model_metadata_cache (
-                        provider_profile TEXT NOT NULL,
-                        model TEXT NOT NULL,
-                        metadata_json TEXT NOT NULL,
-                        source TEXT NOT NULL,
-                        fetched_at INTEGER NOT NULL,
-                        PRIMARY KEY (provider_profile, model)
-                    );",
+                    DROP TABLE IF EXISTS model_metadata_cache;",
                 )?;
 
                 // Migration: add `sessions.parent_session_id` so sub-agent sessions can be linked
@@ -2765,101 +2757,6 @@ impl TokenStore {
                 MekaError::Database(format!("failed to list MCP credentials: {}", error))
             })
     }
-
-    /// Load the cached [`crate::provider::ModelInfo`] for `(profile, model)`. Returns
-    /// `(info, source, age_seconds)` where `source` is `"api"` or `"resolver"`; the caller applies
-    /// the per-source TTL. `None` when no row exists or the stored JSON can't be parsed (treated as
-    /// a miss so the resolver re-probes and overwrites it).
-    pub async fn load_model_metadata(
-        &self,
-        profile: &str,
-        model: &str,
-    ) -> Result<Option<(crate::provider::ModelInfo, String, i64)>> {
-        let profile = profile.to_string();
-        let model = model.to_string();
-        let now = chrono::Utc::now().timestamp();
-        let row = self
-            .connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                let result = connection.query_row(
-                    "SELECT metadata_json, source, fetched_at FROM model_metadata_cache
-                     WHERE provider_profile = ?1 AND model = ?2",
-                    rusqlite::params![profile, model],
-                    |row| {
-                        let metadata_json: String = row.get(0)?;
-                        let source: String = row.get(1)?;
-                        let fetched_at: i64 = row.get(2)?;
-                        Ok((metadata_json, source, fetched_at))
-                    },
-                );
-                match result {
-                    Ok(row) => Ok(Some(row)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(error) => Err(error),
-                }
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to load model metadata cache: {}", error))
-            })?;
-        let Some((metadata_json, source, fetched_at)) = row else {
-            return Ok(None);
-        };
-        match serde_json::from_str::<crate::provider::ModelInfo>(&metadata_json) {
-            Ok(info) => Ok(Some((info, source, now - fetched_at))),
-            Err(error) => {
-                tracing::debug!("ignoring unparseable model-metadata cache row: {}", error);
-                Ok(None)
-            }
-        }
-    }
-
-    /// Upsert the cached [`crate::provider::ModelInfo`] for `(profile, model)`, stamping
-    /// `fetched_at = now`. The whole struct is stored as JSON so one probe caches every attribute
-    /// (context window and effort levels) in a single row.
-    ///
-    /// `preserve_fresh_api_secs` guards against a negative marker clobbering a healthy positive row
-    /// written by a concurrent process: when `Some(ttl)`, the write is skipped if the existing row
-    /// is an `api` row younger than `ttl` seconds. `None` (positive `api` writes) always wins.
-    pub async fn save_model_metadata(
-        &self,
-        profile: &str,
-        model: &str,
-        info: &crate::provider::ModelInfo,
-        source: &str,
-        preserve_fresh_api_secs: Option<i64>,
-    ) -> Result<()> {
-        let metadata_json = serde_json::to_string(info).map_err(|error| {
-            MekaError::Database(format!("failed to serialize model metadata: {}", error))
-        })?;
-        let profile = profile.to_string();
-        let model = model.to_string();
-        let source = source.to_string();
-        let now = chrono::Utc::now().timestamp();
-        // A row older than this cutoff is not a fresh `api` row, so the guard won't block. `None`
-        // uses `i64::MAX`, which no `fetched_at` can exceed, so the update always applies.
-        let fresh_api_cutoff = preserve_fresh_api_secs.map_or(i64::MAX, |ttl| now - ttl);
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT INTO model_metadata_cache
-                         (provider_profile, model, metadata_json, source, fetched_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(provider_profile, model) DO UPDATE SET
-                         metadata_json = excluded.metadata_json,
-                         source = excluded.source,
-                         fetched_at = excluded.fetched_at
-                     WHERE NOT (model_metadata_cache.source = 'api'
-                         AND model_metadata_cache.fetched_at > ?6)",
-                    rusqlite::params![profile, model, metadata_json, source, now, fresh_api_cutoff],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to save model metadata cache: {}", error))
-            })
-    }
 }
 
 impl SessionManager {
@@ -3640,126 +3537,6 @@ mod tests {
             lock_dir.exists(),
             "an on-disk lock dir must not be swept away with the manager"
         );
-    }
-
-    #[tokio::test]
-    async fn test_model_metadata_cache_roundtrip() {
-        use crate::provider::ModelInfo;
-        let store = test_manager().await.token_store();
-        // Miss before any write.
-        assert!(
-            store
-                .load_model_metadata("chatgpt", "gpt-5.6-sol")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        // Save + read back the whole ModelInfo (context window AND effort levels) and source.
-        let info = ModelInfo {
-            context_window: Some(1_050_000),
-            effort_levels: Some(vec![
-                "low".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-            ]),
-        };
-        store
-            .save_model_metadata("chatgpt", "gpt-5.6-sol", &info, "api", None)
-            .await
-            .unwrap();
-        let (cached, source, age) = store
-            .load_model_metadata("chatgpt", "gpt-5.6-sol")
-            .await
-            .unwrap()
-            .expect("row present");
-        assert_eq!(cached, info);
-        assert_eq!(source, "api");
-        assert!(age >= 0);
-        // Composite key isolation: a different model (same profile) is a miss.
-        assert!(
-            store
-                .load_model_metadata("chatgpt", "other-model")
-                .await
-                .unwrap()
-                .is_none()
-        );
-        // Upsert overwrites the metadata + source in place (here a negative all-None marker).
-        let negative = ModelInfo {
-            context_window: None,
-            effort_levels: None,
-        };
-        store
-            .save_model_metadata("chatgpt", "gpt-5.6-sol", &negative, "resolver", None)
-            .await
-            .unwrap();
-        let (cached, source, _) = store
-            .load_model_metadata("chatgpt", "gpt-5.6-sol")
-            .await
-            .unwrap()
-            .expect("row present");
-        assert_eq!(cached, negative);
-        assert_eq!(source, "resolver");
-    }
-
-    #[tokio::test]
-    async fn test_negative_marker_preserves_fresh_api_row() {
-        use crate::provider::ModelInfo;
-        let store = test_manager().await.token_store();
-        let positive = ModelInfo {
-            context_window: Some(321_000),
-            effort_levels: None,
-        };
-        store
-            .save_model_metadata("p", "m", &positive, "api", None)
-            .await
-            .unwrap();
-        // A negative marker must NOT clobber a still-fresh `api` row (guard: preserve within 1h).
-        let marker = ModelInfo {
-            context_window: None,
-            effort_levels: None,
-        };
-        store
-            .save_model_metadata("p", "m", &marker, "resolver", Some(3600))
-            .await
-            .unwrap();
-        let (cached, source, _) = store
-            .load_model_metadata("p", "m")
-            .await
-            .unwrap()
-            .expect("row present");
-        assert_eq!(source, "api", "fresh api row preserved");
-        assert_eq!(cached, positive);
-        // A positive `api` write always wins (`None`), refreshing even a fresh row.
-        let refreshed = ModelInfo {
-            context_window: Some(400_000),
-            effort_levels: None,
-        };
-        store
-            .save_model_metadata("p", "m", &refreshed, "api", None)
-            .await
-            .unwrap();
-        let (cached, source, _) = store
-            .load_model_metadata("p", "m")
-            .await
-            .unwrap()
-            .expect("row present");
-        assert_eq!(source, "api");
-        assert_eq!(cached, refreshed);
-        // The guard is api-specific: a negative marker still overwrites an existing non-api row.
-        store
-            .save_model_metadata("p", "n", &marker, "resolver", None)
-            .await
-            .unwrap();
-        store
-            .save_model_metadata("p", "n", &marker, "resolver", Some(3600))
-            .await
-            .unwrap();
-        let (_, source, _) = store
-            .load_model_metadata("p", "n")
-            .await
-            .unwrap()
-            .expect("row present");
-        assert_eq!(source, "resolver");
     }
 
     /// Persist one of every event variant via `save_event` and read it back through `load_events`.
