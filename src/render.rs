@@ -2122,7 +2122,7 @@ pub struct ModelStatus<'a> {
     pub model: Option<&'a str>,
     /// Active profile name (e.g. `claude-max`).
     pub profile: Option<&'a str>,
-    /// Backend type (e.g. `claude-oauth`).
+    /// Backend type (e.g. `claude-subscription`).
     pub backend: Option<&'a str>,
     /// The reasoning effort sent on the wire, or `None` when the request sends none.
     pub effort: Option<&'a str>,
@@ -2161,12 +2161,12 @@ pub fn format_session_status(
     if let Some(effort) = model.effort {
         let _ = writeln!(out, "  Effort:          {}", effort);
     }
-    // Claude-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
+    // Anthropic-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
     // status block should report what the request carries, and `thinking` is not a field an OpenAI
     // request has. Naming an encoding there would read as a setting that is in force.
     if model
         .backend
-        .is_some_and(|backend| backend.starts_with("claude"))
+        .is_some_and(crate::provider::backend_takes_thinking)
     {
         let _ = writeln!(out, "  Thinking:        {}", model.thinking.as_str());
     }
@@ -2378,7 +2378,7 @@ pub fn render_error(error: &dyn std::fmt::Display) {
 /// Deliberately says nothing about *why* setup failed: both call sites print the error first, and
 /// it is as often a configured profile missing its credential as no profile at all.
 pub fn render_provider_setup_hint() {
-    eprintln!("Example: meka provider add work --type claude-oauth --model claude-opus-5");
+    eprintln!("Example: meka provider add work --type claude-subscription --model claude-opus-5");
     eprintln!("Run `meka provider list` to see configured profiles.");
 }
 
@@ -3119,7 +3119,7 @@ mod tests {
         let model = ModelStatus {
             model: Some("some-local-model"),
             profile: Some("local"),
-            backend: Some("claude-api"),
+            backend: Some("anthropic-messages"),
             effort: None,
             thinking: ThinkingMode::Adaptive,
         };
@@ -3168,16 +3168,16 @@ mod tests {
             )
         };
 
-        let claude = body("claude-api", Some("xhigh"));
+        let claude = body("anthropic-messages", Some("xhigh"));
         assert!(claude.contains("Thinking:"), "{claude}");
         assert!(claude.contains("Effort:"), "{claude}");
 
         // An OpenAI request has no `thinking` field, whatever mode the struct carries.
-        let openai = body("openai-api", Some("high"));
+        let openai = body("openai-chat-completions", Some("high"));
         assert!(!openai.contains("Thinking:"), "{openai}");
 
         // Unset effort means the provider's own default, so there is no tier to report.
-        let unset = body("claude-api", None);
+        let unset = body("anthropic-messages", None);
         assert!(!unset.contains("Effort:"), "{unset}");
     }
     /// Everything meka prints on its own line has to start from a known attribute state.

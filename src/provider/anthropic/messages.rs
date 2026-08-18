@@ -1,6 +1,14 @@
-//! Direct Claude Messages API provider. Uses `x-api-key` auth without the Claude Code
-//! fingerprinting / attestation machinery that `claude-oauth` requires. Intended for users bringing
-//! their own `CLAUDE_API_KEY`.
+//! `anthropic-messages`: the Anthropic Messages API against any endpoint serving it, with an API
+//! key.
+//!
+//! `POST {base_url}/v1/messages` with `x-api-key`, and none of the Claude Code fingerprinting or
+//! attestation machinery [`super::subscription`] needs -- the two speak the same protocol and
+//! differ only in how they authenticate and whose client they look like. The wire format is shared
+//! through [`super::shared`].
+//!
+//! The key comes from the profile's stored credential, never from the environment: meka reads no
+//! provider env vars at all, so an ambient key cannot silently rebind which account a profile
+//! bills.
 
 use std::sync::{
     Arc,
@@ -23,7 +31,7 @@ use crate::{
     },
 };
 
-pub struct ClaudeApiProvider {
+pub struct AnthropicMessagesProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
@@ -44,7 +52,7 @@ pub struct ClaudeApiProvider {
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
-impl ClaudeApiProvider {
+impl AnthropicMessagesProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         api_key: String,
@@ -58,12 +66,12 @@ impl ClaudeApiProvider {
     ) -> Result<Self> {
         let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
         Ok(Self {
-            client: crate::provider::build_http_client("claude-api", |builder| builder)?,
+            client: crate::provider::build_http_client("anthropic-messages", |builder| builder)?,
             api_key,
             base_url: shared::normalize_claude_base_url(
                 base_url
                     .as_deref()
-                    .unwrap_or(crate::provider::DEFAULT_CLAUDE_BASE_URL),
+                    .unwrap_or(crate::provider::DEFAULT_ANTHROPIC_BASE_URL),
             ),
             model,
             thinking,
@@ -92,7 +100,7 @@ impl ClaudeApiProvider {
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
         // the current large-context models (Opus 4.6+, Sonnet 4.6, Fable 5) with no beta header,
         // so the 1M window is already what the request gets. See
-        // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. (claude-oauth
+        // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. (claude-subscription
         // still sends it, mirroring Claude Code's captured wire.)
         if parts.is_empty() {
             None
@@ -134,7 +142,7 @@ impl ClaudeApiProvider {
         }
 
         // The direct Messages API takes `output_config.effort` in the body with no beta header
-        // (unlike claude-oauth, which mirrors Claude Code's `effort-2025-11-24` beta). See
+        // (unlike claude-subscription, which mirrors Claude Code's `effort-2025-11-24` beta). See
         // <https://platform.claude.com/docs/en/build-with-claude/effort>.
         if let Some(effort) = self.wire_effort() {
             body.insert(
@@ -162,7 +170,7 @@ impl ClaudeApiProvider {
 }
 
 #[async_trait]
-impl Provider for ClaudeApiProvider {
+impl Provider for AnthropicMessagesProvider {
     async fn complete(
         &self,
         system_prompt: &str,
@@ -257,7 +265,7 @@ impl Provider for ClaudeApiProvider {
     }
 
     fn name(&self) -> &str {
-        "claude-api"
+        "anthropic-messages"
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -274,11 +282,11 @@ impl Provider for ClaudeApiProvider {
 mod tests {
     use super::*;
 
-    fn test_provider() -> ClaudeApiProvider {
+    fn test_provider() -> AnthropicMessagesProvider {
         provider("claude-sonnet-4-20250514", None)
     }
 
-    fn provider(model: &str, effort: Option<&str>) -> ClaudeApiProvider {
+    fn provider(model: &str, effort: Option<&str>) -> AnthropicMessagesProvider {
         provider_with_base(model, effort, None)
     }
 
@@ -286,8 +294,8 @@ mod tests {
         model: &str,
         effort: Option<&str>,
         base_url: Option<&str>,
-    ) -> ClaudeApiProvider {
-        ClaudeApiProvider::new(
+    ) -> AnthropicMessagesProvider {
+        AnthropicMessagesProvider::new(
             "test-key".to_string(),
             model.to_string(),
             base_url.map(str::to_string),
@@ -323,7 +331,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_profile_sends_no_output_config_whatever_the_model() {
-        // No model name earns an effort tier. `claude-api` reaches any Anthropic-compatible
+        // No model name earns an effort tier. `anthropic-messages` reaches any Anthropic-compatible
         // endpoint, so meka cannot know which tiers the far side implements; omitting the field is
         // how it asks for whatever that endpoint's default is.
         for model in [
@@ -352,10 +360,10 @@ mod tests {
     #[test]
     fn test_betas_omit_context_1m() {
         // The direct Messages API serves 1M context by default for 1M-capable models with no beta
-        // header, so claude-api never sends `context-1m-2025-08-07` (unlike claude-oauth, which
-        // mirrors Claude Code's captured wire). A thinking-enabled request still sends only the
-        // interleaved beta.
-        let thinking_on = ClaudeApiProvider::new(
+        // header, so anthropic-messages never sends `context-1m-2025-08-07` (unlike
+        // claude-subscription, which mirrors Claude Code's captured wire). A
+        // thinking-enabled request still sends only the interleaved beta.
+        let thinking_on = AnthropicMessagesProvider::new(
             "test-key".to_string(),
             "claude-opus-4-8".to_string(),
             None,
@@ -385,17 +393,17 @@ mod tests {
         let serialized = serde_json::to_string(&body).unwrap();
         assert!(
             !serialized.contains("cc_version"),
-            "claude-api body must not contain Claude Code billing header: {}",
+            "anthropic-messages body must not contain Claude Code billing header: {}",
             serialized
         );
         assert!(
             !serialized.contains("cc_entrypoint"),
-            "claude-api body must not contain Claude Code entrypoint tag: {}",
+            "anthropic-messages body must not contain Claude Code entrypoint tag: {}",
             serialized
         );
         assert!(
             !serialized.contains("cch="),
-            "claude-api body must not contain cch attestation placeholder: {}",
+            "anthropic-messages body must not contain cch attestation placeholder: {}",
             serialized
         );
     }
@@ -406,7 +414,7 @@ mod tests {
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(
             body.get("metadata").is_none(),
-            "claude-api body must not include metadata.user_id"
+            "anthropic-messages body must not include metadata.user_id"
         );
     }
 
@@ -418,7 +426,7 @@ mod tests {
         assert_eq!(
             system.as_str(),
             Some("my system"),
-            "claude-api should serialize `system` as a plain string"
+            "anthropic-messages should serialize `system` as a plain string"
         );
     }
 
@@ -428,7 +436,7 @@ mod tests {
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(
             body.get("system").is_none(),
-            "claude-api should omit `system` when the prompt is empty"
+            "anthropic-messages should omit `system` when the prompt is empty"
         );
     }
 }

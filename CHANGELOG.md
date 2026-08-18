@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `trust_read_only_hint` refuses an MCP server's `readOnlyHint`, keeping the tool out of read mode.
-- `meka mcp add --auth-token-stdin` / `--client-secret-stdin` keep a secret out of `ps` and history.
+- `openai-responses`, a backend for the OpenAI Responses API, authenticated with an API key.
+- `openai-responses` sends no encrypted-reasoning `include`; `chatgpt-subscription` still does.
+- `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
 - Compaction runs a checkpoint turn first, so the agent saves what must outlast the summary.
 - `/compact <instructions>` says what to keep or drop, and reports the memories it wrote.
 - `context_check` and `context_compact` let the agent read its own headroom and ask to compact.
@@ -21,85 +22,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: manage scheduled jobs, background tasks, skills and memory, behind four new scopes.
 - HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
 - HTTP: rejoin a turn's SSE stream with `Last-Event-ID`, and see compaction as it happens.
-- HTTP: `tool_call.composing` marks when the model starts writing a tool call's arguments.
 - HTTP: `GET /v1/sessions` filters by `cwd`, can include sub-agents, and reports `parent_id`.
+- HTTP: `tool_call.composing` marks when the model starts writing a tool call's arguments.
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
+- `trust_read_only_hint` refuses an MCP server's `readOnlyHint`, keeping the tool out of read mode.
+- `meka mcp add --auth-token-stdin` / `--client-secret-stdin` keep secrets out of `ps` and history.
+- `meka provider add` offers an optional advanced step for thinking, context window and effort.
+- `meka provider add --thinking` / `--context-window` / `--effort` set those non-interactively.
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 - `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
 - `[schedule].max_consecutive_fires` interleaves one session's due backlog with other sessions'.
-- `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
-- `meka provider add` offers an optional advanced step for thinking, context window and effort.
-- `meka provider add --thinking` / `--context-window` / `--effort` set those non-interactively.
 
 ### Changed
 
-- **Breaking:** `/v1/docs` and `/v1/openapi.json` are off unless `[serve].docs = true`.
-- **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
-- **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
-- CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
-- Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
-- Internal restructuring, no behaviour change: workspace, stores, CLI modules, turn recovery.
-- The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
-- An unknown or stale tool name now suggests the built-in it probably meant.
-- Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
-- A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
-- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
-- Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
-- Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
+- **Breaking:** `claude-api` has been renamed to `anthropic-messages`.
+- **Breaking:** `claude-oauth` has been renamed to `claude-subscription`.
+- **Breaking:** `openai-api` has been renamed to `openai-chat-completions`.
+- **Breaking:** `openai-codex` has been renamed to `chatgpt-subscription`.
+- **Breaking:** HTTP `GET /v1/providers` reports the new backend names in each profile's `type`.
 - **Breaking:** `[thinking].enabled` is retired; the per-profile `thinking` mode replaces it.
-- **Breaking:** `--thinking` takes `adaptive`, `budgeted` or `off` rather than a boolean.
 - **Breaking:** pre-4.6 Claude profiles need `thinking = "budgeted"`; the default is now adaptive.
+- **Breaking:** `--thinking` takes `adaptive`, `budgeted` or `off` rather than a boolean.
 - **Breaking:** unset `effort` now sends no tier, so the provider's own default applies.
 - **Breaking:** an unset context window is 1000000, not a guess from the model name.
+- **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
+- **Breaking:** `/v1/docs` and `/v1/openapi.json` are off unless `[serve].docs = true`.
+- **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
 - `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
 - `/status` shows the context window from turn zero, so a configured window is verifiable up front.
+- A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
+- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
+- CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
+- An unknown or stale tool name now suggests the built-in it probably meant.
+- The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
+- Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
+- Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
+- Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
+- Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
+- Internal restructuring, no behaviour change: workspace, stores, CLI modules, turn recovery.
 
 ### Removed
 
-- The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
+- The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
 
 ### Fixed
 
 - **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
+- **Breaking:** a stdio MCP server gets a curated environment; declare its secrets in `env`.
 - **Breaking:** ACP's sticky options read "Always allow any `<tool>`", matching their real scope.
-- **Breaking:** a stdio MCP server gets a curated environment, not meka's; declare secrets in `env`.
 - File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
 - `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
 - Schema migration is serialised and gated on `user_version`, never rebuilt on a failed probe.
+- Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
 - Retention spares a session that owns a scheduled job, and its ancestors.
 - Every client, provider and MCP round trip is bounded in time and answers the turn's cancellation.
 - A stalled provider, token endpoint or MCP server no longer parks a turn for the process's life.
 - ACP `session/close` and `session/cancel` no longer deadlock or strand an `fs/*` round trip.
 - Shutdown drains in-flight turns, scheduled fires and background tasks instead of abandoning them.
-- Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
+- MCP servers are closed on exit on every surface; the handshake was previously unreachable.
+- MCP shutdown is bounded, so a server that will not close cannot hold up a `serve` or `acp` exit.
+- Blocking work moved off the async runtime, where it stalled other sessions under `meka serve`.
+- Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
+- A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
+- `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
 - `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
 - `[session].context_messages` applies every round; a tool loop cannot carry the window past it.
-- `cron` parses the documented five fields, and a job whose next fire is years out is kept.
 - A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
 - An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
-- Output, images, MCP text and the idempotency cache are bounded in memory, with drops disclosed.
-- Blocking work moved off the async runtime, where it stalled unrelated sessions under `meka serve`.
+- `cron` parses the documented five fields, and a job whose next fire is years out is kept.
 - A running sub-agent sees a parent downgrade, and `subagent_max_depth` can only be lowered.
-- Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
+- Output, images, MCP text and the idempotency cache are bounded in memory, with drops disclosed.
 - HTTP: an `Idempotency-Key` is scoped to its session, and a cancelled turn is not cached under it.
 - HTTP: one lagging SSE consumer no longer cancels the turn for every other consumer of it.
 - HTTP: a malformed body, a bad parameter or a re-attach race no longer answers a false 409.
-- A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
 - Terminal rendering survives emoji, combining marks and invisible characters without a broken row.
-- MCP servers are closed on exit on every surface; the handshake was previously unreachable.
-- MCP shutdown is bounded, so a server that will not close cannot hold up a `serve` or `acp` exit.
-- `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
 - CLI, log and help text corrected throughout: wrong keys, stale advice, leaked Rust internals.
 
 ### Security
 
+- Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
-- Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
+- `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
 - `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.
 - A command-output capture is created at `0600` and swept after a day.
-- `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
 - `utoipa-swagger-ui` is vendored, so a build no longer downloads an unpinned, unverified zip.
 - `event-listener` and `memmap2` move to patched releases, and the audit ignore list is gone.
 

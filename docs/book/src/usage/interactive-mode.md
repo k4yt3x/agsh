@@ -144,7 +144,7 @@ Print the session's resolved model parameters followed by its cumulative counter
 ```
 Session status
   Model:           claude-opus-4-8
-  Provider:        claude-max (claude-oauth)
+  Provider:        claude-max (claude-subscription)
   Effort:          xhigh
   Thinking:        on
   Turns:           23
@@ -175,7 +175,7 @@ Account usage
   Weekly             [----------]   2% used  (resets in 22h 50m, 2026-07-02 13:00)
 ```
 
-This is distinct from `/status`, which reports this session's own token counters. `/usage` queries the provider for your whole-account subscription limits. It works only for OAuth subscription providers that expose a usage endpoint (`claude-oauth`'s 5-hour and weekly windows; `openai-codex`'s primary/secondary windows plus plan and credit balance). For API-key backends, OpenAI-compatible endpoints, and Ollama, it prints a short "not available for this provider" note instead. The same command is available under ACP.
+This is distinct from `/status`, which reports this session's own token counters. `/usage` queries the provider for your whole-account subscription limits. It works only for OAuth subscription providers that expose a usage endpoint (`claude-subscription`'s 5-hour and weekly windows; `chatgpt-subscription`'s primary/secondary windows plus plan and credit balance). For API-key backends, OpenAI-compatible endpoints, and Ollama, it prints a short "not available for this provider" note instead. The same command is available under ACP.
 
 ### `/compact`
 

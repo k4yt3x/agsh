@@ -192,24 +192,25 @@ pub enum ProviderAction {
     ///
     /// Prompts for any of type/model/base-url not passed as flags, offers an
     /// optional advanced step (thinking, context window, effort), then acquires
-    /// the secret (OAuth login for claude-oauth / openai-codex, API-key prompt
-    /// for claude-api / openai-api) and stores it in the database. Sets the
-    /// default provider when this is the first profile.
+    /// the secret (OAuth login for the subscription backends, API-key prompt for
+    /// the rest) and stores it in the database. Sets the default provider when
+    /// this is the first profile.
     Add {
         /// Profile name (e.g. `work`, `personal`).
         name: String,
-        /// Backend type.
+        /// Backend type: the wire protocol to speak.
         ///
-        /// One of: openai-api, openai-codex, claude-api, claude-oauth.
+        /// One of: anthropic-messages, chatgpt-subscription,
+        /// claude-subscription, openai-chat-completions, openai-responses.
         #[arg(long = "type")]
         r#type: Option<String>,
         /// Model name.
         #[arg(long)]
         model: Option<String>,
-        /// API base URL (for OpenAI-compatible endpoints).
+        /// API base URL, for any endpoint serving the chosen protocol.
         #[arg(long = "base-url")]
         base_url: Option<String>,
-        /// Thinking mode (Claude-only)
+        /// Thinking mode (Anthropic Messages backends only)
         ///
         /// Skips the advanced prompt for this setting. Defaults to `adaptive`.
         #[arg(long, value_enum)]
@@ -678,7 +679,7 @@ pub struct Cli {
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
 
-    /// API base URL (for OpenAI-compatible providers)
+    /// API base URL, for any endpoint serving the profile's protocol
     #[arg(long = "base-url")]
     pub base_url: Option<String>,
 
@@ -694,11 +695,11 @@ pub struct Cli {
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
 
-    /// Thinking mode (Claude-only)
+    /// Thinking mode (Anthropic Messages backends only)
     #[arg(long = "thinking", value_enum)]
     pub thinking: Option<crate::provider::ThinkingMode>,
 
-    /// Token budget for extended thinking (Claude-only)
+    /// Thinking token budget (Anthropic Messages, thinking = budgeted)
     #[arg(long = "thinking-budget")]
     pub thinking_budget: Option<u64>,
 
@@ -843,14 +844,14 @@ mod tests {
         let cli = Cli::parse_from([
             "meka",
             "--provider",
-            "openai-api",
+            "openai-chat-completions",
             "--model",
             "gpt-4o",
             "--no-stream",
             "-c",
             "-vv",
         ]);
-        assert_eq!(cli.provider.as_deref(), Some("openai-api"));
+        assert_eq!(cli.provider.as_deref(), Some("openai-chat-completions"));
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.no_stream);
         assert!(cli.continue_last);
@@ -880,13 +881,20 @@ mod tests {
 
     #[test]
     fn test_cli_provider_add_subcommand() {
-        let cli = Cli::parse_from(["meka", "provider", "add", "work", "--type", "claude-oauth"]);
+        let cli = Cli::parse_from([
+            "meka",
+            "provider",
+            "add",
+            "work",
+            "--type",
+            "claude-subscription",
+        ]);
         match cli.command {
             Some(Command::Provider {
                 action: ProviderAction::Add { name, r#type, .. },
             }) => {
                 assert_eq!(name, "work");
-                assert_eq!(r#type.as_deref(), Some("claude-oauth"));
+                assert_eq!(r#type.as_deref(), Some("claude-subscription"));
             }
             other => panic!("expected provider add, got {:?}", other),
         }

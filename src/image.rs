@@ -167,7 +167,7 @@ pub(crate) fn downscale_to_dim_cap(
 /// Run the classification pipeline end-to-end: pass-through native formats, convert others to PNG,
 /// enforce the byte cap. Provider-agnostic. Does NOT enforce per-axis pixel limits (Anthropic's
 /// 2000 px multi-image cap is enforced separately at the Claude provider layer in
-/// `src/provider/claude/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
+/// `src/provider/anthropic/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
 /// bytes)`.
 ///
 /// `hint` is what the *source* claimed the format was (a filename extension, an HTTP

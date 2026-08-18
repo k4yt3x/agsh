@@ -32,10 +32,11 @@
 # Providers
 
 - [Overview](./providers/overview.md)
-- [OpenAI API](./providers/openai-api.md)
-- [OpenAI Codex](./providers/openai-codex.md)
-- [Claude API](./providers/claude-api.md)
-- [Claude OAuth](./providers/claude-oauth.md)
+- [Anthropic Messages](./providers/anthropic-messages.md)
+- [Claude subscription](./providers/claude-subscription.md)
+- [OpenAI Chat Completions](./providers/openai-chat-completions.md)
+- [OpenAI Responses](./providers/openai-responses.md)
+- [ChatGPT subscription](./providers/chatgpt-subscription.md)
 
 # Tools
 

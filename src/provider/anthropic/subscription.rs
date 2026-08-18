@@ -1,5 +1,10 @@
-//! Claude OAuth provider. Uses Claude Code attestation / billing header machinery to send requests
-//! as the official CLI, and manages OAuth token refresh against the Claude token endpoint.
+//! `claude-subscription`: the Anthropic Messages API billed to a Claude subscription.
+//!
+//! Uses Claude Code's attestation and billing-header machinery to send requests as the official
+//! CLI, and manages OAuth token refresh against the Claude token endpoint. The protocol itself is
+//! shared with the API-key [`super::messages`] backend through [`super::shared`]; what is
+//! particular here is the credential, the client persona, and the beta headers that persona
+//! implies.
 
 mod attestation;
 
@@ -22,8 +27,8 @@ use super::shared::{
 use crate::{
     error::{MekaError, Result},
     provider::{
-        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, ExtraUsage,
-        Message, Notice, Provider, StopReason, StreamEvent, ThinkingMode, TokenUsage,
+        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
+        ExtraUsage, Message, Notice, Provider, StopReason, StreamEvent, ThinkingMode, TokenUsage,
         ToolDefinition, UsageHistory, UsageWindow,
     },
     session::TokenStore,
@@ -39,7 +44,7 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
-pub struct ClaudeOAuthProvider {
+pub struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
     /// Serialises refreshes without blocking readers. Held across the database and network awaits
@@ -83,7 +88,7 @@ pub struct ClaudeOAuthProvider {
 /// right here in a way it never is for a turn: nothing legitimate takes minutes.
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-impl ClaudeOAuthProvider {
+impl ClaudeSubscriptionProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         credential: AuthCredential,
@@ -107,16 +112,17 @@ impl ClaudeOAuthProvider {
         };
         let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
         Ok(Self {
-            client: crate::provider::build_http_client("claude-oauth", |builder| builder)?,
+            client: crate::provider::build_http_client("claude-subscription", |builder| builder)?,
             credential: tokio::sync::RwLock::new(credential),
             refresh_gate: tokio::sync::Mutex::new(()),
             base_url: super::shared::normalize_claude_base_url(
                 base_url
                     .as_deref()
-                    .unwrap_or(crate::provider::DEFAULT_CLAUDE_BASE_URL),
+                    .unwrap_or(crate::provider::DEFAULT_ANTHROPIC_BASE_URL),
             ),
             model,
-            client_id: client_id.unwrap_or_else(|| DEFAULT_CLAUDE_CLIENT_ID.to_string()),
+            client_id: client_id
+                .unwrap_or_else(|| DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url
                 .unwrap_or_else(|| "https://api.anthropic.com/v1/oauth/token".to_string()),
             token_store,
@@ -154,7 +160,7 @@ impl ClaudeOAuthProvider {
     /// 2.1.219 does not). On the current 1M models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5) the 1M
     /// window is the default with no beta header, so the beta is redundant. Verified by the 2.1.219
     /// interactive-CLI wire capture (opus-4-8 turn sends 11 betas, no `context-1m`), matching
-    /// the claude-api path.
+    /// the anthropic-messages path.
     ///
     /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
     /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
@@ -224,7 +230,7 @@ impl ClaudeOAuthProvider {
             match &*credential {
                 AuthCredential::ApiKey(_) => {
                     return Err(MekaError::Provider(
-                        "claude-oauth requires an OAuth token, not an API key".to_string(),
+                        "claude-subscription requires an OAuth token, not an API key".to_string(),
                     ));
                 }
                 AuthCredential::OAuthToken {
@@ -518,7 +524,7 @@ impl ClaudeOAuthProvider {
 }
 
 #[async_trait]
-impl Provider for ClaudeOAuthProvider {
+impl Provider for ClaudeSubscriptionProvider {
     async fn complete(
         &self,
         system_prompt: &str,
@@ -598,7 +604,7 @@ impl Provider for ClaudeOAuthProvider {
                     })
             })?;
         // Surface the redaction notice ahead of any provider text. See the mirror in
-        // `provider/claude/api.rs::stream` for the rationale.
+        // `provider/anthropic/messages.rs::stream` for the rationale.
         if let Some(notice) = redaction_notice
             && let Err(error) = event_sender.send(StreamEvent::Notice(notice)).await
         {
@@ -636,7 +642,7 @@ impl Provider for ClaudeOAuthProvider {
     }
 
     fn name(&self) -> &str {
-        "claude-oauth"
+        "claude-subscription"
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -939,8 +945,8 @@ mod tests {
     use super::{attestation::CC_VERSION, *};
     use crate::provider::{ContentBlock, Role, ToolResultContent};
 
-    fn test_provider() -> ClaudeOAuthProvider {
-        ClaudeOAuthProvider::new(
+    fn test_provider() -> ClaudeSubscriptionProvider {
+        ClaudeSubscriptionProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
             None,
@@ -1435,8 +1441,8 @@ mod tests {
     }
 
     #[test]
-    fn test_a_claude_oauth_base_url_keeps_the_root_the_oauth_endpoints_hang_off() {
-        let provider = ClaudeOAuthProvider::new(
+    fn a_claude_subscription_base_url_keeps_the_root_the_oauth_endpoints_hang_off() {
+        let provider = ClaudeSubscriptionProvider::new(
             AuthCredential::OAuthToken {
                 access_token: "token".to_string(),
                 refresh_token: None,
@@ -1465,7 +1471,7 @@ mod tests {
 
     #[test]
     fn test_account_uuid_sourced_from_oauth_credential() {
-        let provider = ClaudeOAuthProvider::new(
+        let provider = ClaudeSubscriptionProvider::new(
             AuthCredential::OAuthToken {
                 access_token: "token".to_string(),
                 refresh_token: None,
@@ -1628,12 +1634,12 @@ mod tests {
         }
     }
 
-    fn provider_with(model: &str, thinking: bool) -> ClaudeOAuthProvider {
+    fn provider_with(model: &str, thinking: bool) -> ClaudeSubscriptionProvider {
         provider_full(model, thinking, "high", false)
     }
 
-    fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeOAuthProvider {
-        ClaudeOAuthProvider::new(
+    fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeSubscriptionProvider {
+        ClaudeSubscriptionProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
             model.to_string(),
             None,
@@ -1659,8 +1665,8 @@ mod tests {
         thinking: bool,
         effort: &str,
         redact_thinking: bool,
-    ) -> ClaudeOAuthProvider {
-        ClaudeOAuthProvider::new(
+    ) -> ClaudeSubscriptionProvider {
+        ClaudeSubscriptionProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
             model.to_string(),
             None,
@@ -2226,7 +2232,7 @@ mod tests {
     ///   - [`ToolRegistry::tool_catalogue`] / [`ToolRegistry::definitions_active`]
     ///   - [`crate::context::build_system_prompt`]
     ///   - [`crate::context::build_turn_context`]
-    ///   - [`ClaudeOAuthProvider::build_request_body`]
+    ///   - [`ClaudeSubscriptionProvider::build_request_body`]
     #[tokio::test]
     async fn test_permission_toggle_preserves_cache_prefix() {
         use std::path::Path;
@@ -3394,7 +3400,7 @@ mod tests {
         };
 
         let provider = Arc::new(
-            ClaudeOAuthProvider::new(
+            ClaudeSubscriptionProvider::new(
                 credential,
                 "claude-sonnet-4-20250514".to_string(),
                 None,
@@ -3472,7 +3478,7 @@ mod tests {
             expires_at: Some(now_epoch_millis()),
             account_id: None,
         };
-        let provider = ClaudeOAuthProvider::new(
+        let provider = ClaudeSubscriptionProvider::new(
             credential,
             "claude-sonnet-4-20250514".to_string(),
             None,

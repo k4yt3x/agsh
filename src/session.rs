@@ -5248,12 +5248,12 @@ mod tests {
         };
 
         store
-            .save_provider_credential("openai-codex", &credential)
+            .save_provider_credential("chatgpt-subscription", &credential)
             .await
             .expect("save");
 
         let loaded = store
-            .load_provider_credential("openai-codex")
+            .load_provider_credential("chatgpt-subscription")
             .await
             .expect("load")
             .expect("present");
@@ -5314,7 +5314,7 @@ mod tests {
     }
 
     /// Two providers can persist independently with different `account_id` values. This test
-    /// verifies the provider PK keeps openai-codex and a hypothetical future OAuth provider
+    /// verifies the provider PK keeps chatgpt-subscription and a hypothetical future OAuth provider
     /// isolated.
     #[tokio::test]
     async fn test_oauth_token_two_providers_independent() {
@@ -5337,7 +5337,7 @@ mod tests {
         };
 
         store
-            .save_provider_credential("openai-codex", &codex_credential)
+            .save_provider_credential("chatgpt-subscription", &codex_credential)
             .await
             .expect("save codex");
         store
@@ -5346,7 +5346,7 @@ mod tests {
             .expect("save claude");
 
         let codex_loaded = store
-            .load_provider_credential("openai-codex")
+            .load_provider_credential("chatgpt-subscription")
             .await
             .expect("load codex")
             .expect("present");

@@ -1,6 +1,6 @@
 //! Claude Code anti-cheat machinery: request fingerprint, xxHash64-based `cch` attestation, billing
 //! header synthesis, and Stainless-SDK-matching HTTP headers. All of this is OAuth-specific.
-//! Direct API-key requests (`claude-api`) don't send billing headers, so there's no caller.
+//! Direct API-key requests (`anthropic-messages`) don't send billing headers, so there's no caller.
 //!
 //! References:
 //! - Claude Code source: `src/constants/system.ts`, `src/utils/fingerprint.ts`,

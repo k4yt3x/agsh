@@ -7,17 +7,17 @@ flow (OAuth login or API-key prompt) and writes the profile to `~/.config/meka/c
 
 ```bash
 # Claude Code subscription (OAuth)
-meka provider add work --type claude-oauth --model claude-opus-5
+meka provider add work --type claude-subscription --model claude-opus-5
 
 # or a Claude API key
-meka provider add work --type claude-api --model claude-opus-5
+meka provider add work --type anthropic-messages --model claude-opus-5
 
 # or OpenAI
-meka provider add work --type openai-api --model gpt-4o
+meka provider add work --type openai-chat-completions --model gpt-4o
 ```
 
 `add` prompts for any of `--type` / `--model` you omit, acquires the secret (browser OAuth for
-`claude-oauth` / `openai-codex`, an API-key prompt otherwise), stores it in the database, and makes
+`claude-subscription` / `chatgpt-subscription`, an API-key prompt otherwise), stores it in the database, and makes
 the profile the default. Add more profiles later and switch with `meka provider use <name>` or the
 per-run `--provider <name>` flag.
 

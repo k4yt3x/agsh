@@ -1,14 +1,16 @@
-# OpenAI Codex Provider
+# ChatGPT subscription
 
-The `openai-codex` provider talks to OpenAI's subscription endpoint using the OAuth tokens issued by ChatGPT login. It's the OpenAI counterpart to [`claude-oauth`](./claude-oauth.md): instead of paying per-token via an API key, you authenticate with your ChatGPT Plus / Pro / Team / Business / Enterprise account and your usage counts against your subscription.
+The **Responses API** billed to a ChatGPT subscription, at `chatgpt.com/backend-api/codex/responses`, using the OAuth tokens issued by ChatGPT login and mirroring the first-party Codex CLI's request shape. The OpenAI counterpart to [`claude-subscription`](./claude-subscription.md): instead of paying per token via an API key, you authenticate with your ChatGPT Plus / Pro / Team / Business / Enterprise account and usage counts against your subscription.
 
-> **Note:** This provider replicates the wire shape that OpenAI's first-party [Codex CLI](https://github.com/openai/codex) sends. It targets `chatgpt.com/backend-api/codex/responses` using the **OpenAI Responses API**, a different protocol than [`openai-api`](./openai-api.md), which uses Chat Completions against `api.openai.com`. The two providers are not interchangeable.
+For the same protocol with an API key, against OpenAI or any server that serves it, see [`openai-responses`](./openai-responses.md).
+
+> **Note:** This provider replicates the wire shape that OpenAI's first-party [Codex CLI](https://github.com/openai/codex) sends. It targets `chatgpt.com/backend-api/codex/responses` using the **OpenAI Responses API**, a different protocol than [`openai-chat-completions`](./openai-chat-completions.md), which uses Chat Completions against `api.openai.com`. The two providers are not interchangeable.
 
 ## Configuration
 
 | Setting | Value |
 |---------|-------|
-| Profile `type` | `openai-codex` |
+| Profile `type` | `chatgpt-subscription` |
 | Default base URL | `https://chatgpt.com` (request path `/backend-api/codex/responses`) |
 | Credential | OAuth bundle stored in the database (acquired via `meka provider add` / `login`) |
 | Auth method | OAuth 2.0 Authorization Code with PKCE |
@@ -18,7 +20,7 @@ The `openai-codex` provider talks to OpenAI's subscription endpoint using the OA
 ## Initial Setup
 
 ```bash
-meka provider add chatgpt --type openai-codex --model gpt-5
+meka provider add chatgpt --type chatgpt-subscription --model gpt-5
 # A browser opens; sign in to ChatGPT and approve.
 # Tokens are saved to ~/.local/share/meka/meka.db (chmod 0600).
 ```
@@ -35,7 +37,7 @@ On a remote or headless machine (SSH, container) the browser runs elsewhere, so 
 default_provider = "chatgpt"
 
 [providers.chatgpt]
-type = "openai-codex"
+type = "chatgpt-subscription"
 model = "gpt-5.6-sol"
 effort = "xhigh"   # optional; unset sends none, so OpenAI's default applies
 ```
@@ -58,7 +60,7 @@ Each request:
 
 ## Limitations
 
-- **Streaming-only**: the Codex endpoint doesn't support non-streaming completions. meka always streams for this provider; `--no-stream` is rejected with an explicit error.
+- **Streaming-only**: the Codex endpoint has no non-streaming shape, so meka always streams here and folds the stream internally to satisfy a non-streaming completion. `--no-stream` is accepted and behaves normally; it changes what the terminal renders, not what goes on the wire.
 - **Subscription required**: you need a paid ChatGPT plan with Codex enabled. Free-tier accounts can complete the OAuth flow but most models will reject requests at the API layer.
 - **Bot detection**: chatgpt.com may serve a Cloudflare challenge if request patterns look automated. meka's reqwest client handles cookie-clearance automatically; if you hit a hard challenge, complete it once in a regular browser to refresh the cookies.
 - **Endpoint stability**: this is OpenAI's subscription-internal API; OpenAI doesn't guarantee compatibility for third-party clients. Future Codex versions could add request signing or rotate scopes; meka will need updates if that happens.
@@ -67,8 +69,8 @@ Each request:
 
 If you have both a ChatGPT subscription and an OpenAI API key:
 
-- Use **`openai-codex`** for interactive work: it's billed against your subscription's usage cap rather than per-token, so heavy use is cheaper for most personal patterns.
-- Use **`openai-api`** for scripted / unattended work: API keys are stable, work with non-OpenAI Chat-Completions-compatible servers (Ollama, vLLM, OpenRouter), and don't depend on the Cloudflare cookie jar.
+- Use **`chatgpt-subscription`** for interactive work: it's billed against your subscription's usage cap rather than per-token, so heavy use is cheaper for most personal patterns.
+- Use **`openai-responses`** for scripted / unattended work: it is the same protocol as this backend with a plain API key, so keys are stable, nothing depends on the Cloudflare cookie jar, and it also reaches Ollama, vLLM, LM Studio and OpenRouter. Fall back to **`openai-chat-completions`** for a server that does not serve `/v1/responses`.
 
 ## Logging Out
 

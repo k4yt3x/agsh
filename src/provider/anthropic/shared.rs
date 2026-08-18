@@ -1,7 +1,7 @@
-//! Helpers shared by [`super::api::ClaudeApiProvider`] and [`super::oauth::ClaudeOAuthProvider`].
-//! Everything in this module is independent of the authentication scheme: message/tool conversion
-//! to the Claude wire format, SSE streaming, response parsing, per-model capability detection, and
-//! the thinking-suppression helper.
+//! Helpers shared by [`super::messages::AnthropicMessagesProvider`] and
+//! [`super::subscription::ClaudeSubscriptionProvider`]. Everything in this module is independent of
+//! the authentication scheme: message/tool conversion to the Claude wire format, SSE streaming,
+//! response parsing, per-model capability detection, and the thinking-suppression helper.
 
 use std::{borrow::Cow, sync::atomic::AtomicBool};
 
@@ -20,10 +20,10 @@ use crate::{
 
 /// Normalize a Claude-family base URL: trailing slashes, then one trailing `/v1`.
 ///
-/// A Claude base URL is the *host root*, not the versioned prefix. `ClaudeApiProvider` appends
-/// `/v1/messages` and `/v1/models/{id}`; `ClaudeOAuthProvider` appends those and also
-/// `/api/oauth/usage`, `/api/oauth/profile` and `/api/oauth/claude_cli/roles`, which sit under a
-/// different root entirely. Baking `/v1` into the base would put that second set out of reach, so
+/// A Claude base URL is the *host root*, not the versioned prefix. `AnthropicMessagesProvider`
+/// appends `/v1/messages` and `/v1/models/{id}`; `ClaudeSubscriptionProvider` appends those and
+/// also `/api/oauth/usage`, `/api/oauth/profile` and `/api/oauth/claude_cli/roles`, which sit under
+/// a different root entirely. Baking `/v1` into the base would put that second set out of reach, so
 /// the root is the only prefix both can share. The OpenAI family has the opposite convention (`/v1`
 /// belongs in the base), which is what makes this worth normalizing rather than merely documenting:
 /// a gateway serving both APIs publishes one URL per family, and its Anthropic one is routinely

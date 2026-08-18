@@ -1,6 +1,16 @@
-//! OpenAI-compatible provider. Targets the Chat Completions API and works with any compatible
-//! endpoint (vLLM, Together, Groq, local proxies, etc.) by way of the `--base-url` flag and
-//! `OPENAI_API_KEY`.
+//! `openai-chat-completions`: the Chat Completions API against any endpoint serving it, with an
+//! API key.
+//!
+//! `POST {base_url}/chat/completions`, reaching OpenAI and anything implementing that format
+//! (Ollama, vLLM, LM Studio, OpenRouter, Synthetic, LiteLLM, local proxies). This is *not* the
+//! legacy `/v1/completions`, a different protocol with no tool calling that several of those same
+//! servers also expose and that meka does not implement.
+//!
+//! The protocol sibling is [`super::responses`], which takes the same key against OpenAI's newer
+//! format; unlike the Responses pair, Chat Completions has one implementation here and shares no
+//! wire module.
+//!
+//! The key comes from the profile's stored credential, never from the environment.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -14,7 +24,7 @@ use crate::{
     },
 };
 
-pub struct OpenAiProvider {
+pub struct OpenAiChatCompletionsProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
@@ -27,7 +37,7 @@ pub struct OpenAiProvider {
     max_output_tokens: Option<u64>,
 }
 
-impl OpenAiProvider {
+impl OpenAiChatCompletionsProvider {
     pub fn new(
         api_key: String,
         model: String,
@@ -37,7 +47,9 @@ impl OpenAiProvider {
     ) -> Result<Self> {
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
         Ok(Self {
-            client: crate::provider::build_http_client("openai-api", |builder| builder)?,
+            client: crate::provider::build_http_client("openai-chat-completions", |builder| {
+                builder
+            })?,
             api_key,
             base_url: crate::provider::normalize_base_url(
                 base_url
@@ -94,8 +106,9 @@ impl OpenAiProvider {
                                 // type `text` is supported." Vision is on `user`-role messages
                                 // only. So we collapse any image blocks to the literal "[Image]"
                                 // via `tool_result_text_content` here. The Responses API (used by
-                                // `openai-codex`) does accept `input_image` content blocks in
-                                // `function_call_output.output`, and we emit those there.
+                                // `chatgpt-subscription`) does accept `input_image` content blocks
+                                // in `function_call_output.output`,
+                                // and we emit those there.
                                 let text = ContentBlock::tool_result_text_content(content);
                                 let mut tool_msg = serde_json::json!({
                                     "role": "tool",
@@ -335,7 +348,7 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiProvider {
+impl Provider for OpenAiChatCompletionsProvider {
     async fn complete(
         &self,
         system_prompt: &str,
@@ -518,8 +531,8 @@ impl Provider for OpenAiProvider {
         // treating the two alike committed a truncated message as a finished one:
         // `final_stop` is `None`, so the fallback below stamps `EndTurn` and the partial
         // answer is persisted as complete with no retry. The Claude and Codex drivers
-        // already return `StreamError` in this case (src/provider/claude/shared.rs,
-        // src/provider/openai/codex/responses.rs); this is the sibling that did not get it.
+        // already return `StreamError` in this case (src/provider/anthropic/shared.rs,
+        // src/provider/openai/responses_wire.rs); this is the sibling that did not get it.
         // `StreamError` is retryable, so the existing retry path applies.
         // No `receiver_gone` companion here, unlike the Claude driver: every send-failure site in
         // this loop returns immediately, so a dropped receiver never reaches this check.
@@ -549,7 +562,7 @@ impl Provider for OpenAiProvider {
     }
 
     fn name(&self) -> &str {
-        "openai-api"
+        "openai-chat-completions"
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -855,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_an_openai_base_url_is_normalized_at_construction() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             Some("https://openrouter.ai/api/v1/".to_string()),
@@ -868,7 +881,7 @@ mod tests {
         assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
 
         // The version segment belongs in an OpenAI-family base and must survive.
-        let default = OpenAiProvider::new(
+        let default = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -881,7 +894,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_simple() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -908,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_user_image_uses_content_array() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -935,7 +948,7 @@ mod tests {
     #[test]
     fn test_openai_request_body_max_output_tokens_override_without_effort() {
         // No reasoning_effort, but an explicit cap: `max_completion_tokens` is set.
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -950,7 +963,7 @@ mod tests {
     #[test]
     fn test_openai_request_body_max_output_tokens_override_wins_over_effort_default() {
         // With effort the default cap is 32k; the profile override replaces it.
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-5".to_string(),
             None,
@@ -965,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_no_cap_without_effort_or_override() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -982,14 +995,19 @@ mod tests {
         // Recognized reasoning model or local weights, the answer is the same: OpenAI owns the
         // default and meka asks for it by omitting the field.
         for model in ["gpt-5.6-sol", "o3", "llama3.1"] {
-            let provider =
-                OpenAiProvider::new("test-key".to_string(), model.to_string(), None, None, None)
-                    .expect("build test provider");
+            let provider = OpenAiChatCompletionsProvider::new(
+                "test-key".to_string(),
+                model.to_string(),
+                None,
+                None,
+                None,
+            )
+            .expect("build test provider");
             let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
             assert!(body.get("reasoning_effort").is_none(), "{model}");
         }
         // A configured value is absolute, including on a model meka does not recognize.
-        let configured = OpenAiProvider::new(
+        let configured = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "llama3.1".to_string(),
             None,
@@ -1003,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_with_tools() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1033,7 +1051,7 @@ mod tests {
 
     #[test]
     fn test_openai_request_body_with_tool_calls() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1078,7 +1096,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_non_streaming_text() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1107,7 +1125,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_non_streaming_tool_call() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1153,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_non_streaming_malformed_tool_args() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1202,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_missing_message_in_choice() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1223,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_missing_tool_call_id() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1255,7 +1273,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_missing_tool_call_function_name() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1287,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_non_streaming_flattened_tool_call() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1331,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_openai_parse_non_streaming_flattened_missing_name_still_errors() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,
@@ -1361,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_openai_tool_definitions_use_standard_chat_completions_format() {
-        let provider = OpenAiProvider::new(
+        let provider = OpenAiChatCompletionsProvider::new(
             "test-key".to_string(),
             "gpt-4o".to_string(),
             None,

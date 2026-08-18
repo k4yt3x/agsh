@@ -520,7 +520,7 @@ fn acp_tool_call_lifecycle_round_trips_through_mock_provider() {
     // mock swap inside `run_acp` then replaces the provider before any HTTP call is attempted.
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -597,7 +597,7 @@ model = "claude-sonnet-4-5"
 fn acp_todo_tool_emits_plan_update() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -760,7 +760,7 @@ fn run_permission_scenario(answer: PermissionAnswer) {
     // triggers the round-trip we want to exercise.
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -875,7 +875,7 @@ fn acp_session_load_replays_persisted_turn() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -1130,7 +1130,7 @@ fn acp_exits_and_releases_lock_on_stdin_eof() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -1300,7 +1300,7 @@ fn acp_session_list_filters_by_cwd() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -1471,7 +1471,7 @@ fn acp_session_resume_adopts_without_replay() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -1723,7 +1723,7 @@ fn acp_session_new_advertises_skills_and_modes() {
     // advertised.
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -1809,7 +1809,7 @@ enabled = ["read", "ask", "write"]
 fn acp_session_prompt_invokes_skill_by_slash_name() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -1934,7 +1934,7 @@ fn acp_session_prompt_skill_body_unreadable_is_internal_error() {
 fn acp_session_set_mode_flips_permission_and_emits_update() {
     const CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2001,7 +2001,7 @@ enabled = ["read", "ask"]
 fn acp_fs_read_text_file_is_delegated_when_capability_offered() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -2068,7 +2068,7 @@ fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     // the delegation seam.
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2160,7 +2160,7 @@ fn acp_write_file_falls_back_to_local_when_no_capability() {
     let content_to_write = "wrote locally";
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2231,7 +2231,7 @@ fn acp_execute_command_never_leaves_meka() {
         let config_toml = format!(
             r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2320,7 +2320,7 @@ enabled = ["read", "ask", "write"]
 /// Write mode, so `execute_command` isn't subject to the sandbox's availability on the test host.
 const ACP_WRITE_MODE_CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2600,7 +2600,7 @@ fn acp_session_cancel_interrupts_running_prompt() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -2742,7 +2742,7 @@ fn acp_interrupted_turn_persists_partial_assistant_text() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -2935,7 +2935,7 @@ model = "claude-sonnet-4-5"
 fn acp_edit_file_delegates_when_both_fs_capabilities_offered() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3032,7 +3032,7 @@ enabled = ["read", "write"]
 fn acp_subagent_permission_forwards_to_parent_client() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3119,7 +3119,7 @@ fn acp_session_list_paginates_across_cursor_boundary() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -3325,7 +3325,7 @@ model = "claude-sonnet-4-5"
 fn acp_permission_allow_always_skips_second_prompt() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3475,7 +3475,7 @@ fn acp_multi_session_parallel_prompts_dont_serialize() {
 
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
@@ -3645,7 +3645,7 @@ model = "claude-sonnet-4-5"
 fn acp_multi_session_set_mode_isolated() {
     const CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3888,7 +3888,7 @@ fn assert_invalid_params(response: &serde_json::Value, context: &str) {
 
 const ACP_INVALID_PARAMS_CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
 
@@ -3931,7 +3931,7 @@ fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
 fn acp_session_prompt_rejects_image_when_vision_disabled() {
     const NO_VISION_CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 vision = false
 "#;
@@ -4030,7 +4030,7 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
 fn acp_session_set_mode_rejects_unknown_and_disabled() {
     let config = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -4524,7 +4524,7 @@ fn acp_session_prompt_does_not_retry_once_content_shown() {
 fn acp_session_prompt_request_permission_failure_marks_disconnect() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -4834,7 +4834,7 @@ fn acp_session_set_mode_during_long_prompt_does_not_block() {
     ]]);
     const CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -4877,7 +4877,7 @@ enabled = ["read", "write"]
 fn acp_session_request_permission_cancelled_by_session_cancel() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -5085,7 +5085,7 @@ fn acp_empty_refusal_surfaces_standin_message() {
 fn acp_tool_calls_execute_despite_non_tool_use_stop_reason() {
     let config_toml = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -5443,7 +5443,7 @@ fn acp_session_fork_rejects_bad_input() {
 
 const ACP_SCHEDULE_CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -5545,7 +5545,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
 fn a_mode_set_through_acp_survives_a_reload() {
     const CONFIG: &str = r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]

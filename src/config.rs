@@ -1181,7 +1181,7 @@ pub struct ProviderProfile {
     pub max_output_tokens: Option<u64>,
     pub oauth_token_url: Option<String>,
     pub device_id: Option<String>,
-    /// OAuth client ID override (advanced; `claude-oauth` / `openai-codex`).
+    /// OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription`).
     pub client_id: Option<String>,
     /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
     /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
@@ -1193,10 +1193,10 @@ pub struct ProviderProfile {
     /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
     /// later changes `model` is the user's to keep correct.
     pub thinking: Option<crate::provider::ThinkingMode>,
-    /// `claude-oauth` only: when true, meka sends the `redact-thinking-2026-02-12` beta header so
-    /// the server returns `redacted_thinking` blocks instead of full thinking summaries (saves
-    /// bandwidth, but the redacted payloads can't be replayed back to the server in multi-turn
-    /// conversations). Defaults to false.
+    /// `claude-subscription` only: when true, meka sends the `redact-thinking-2026-02-12` beta
+    /// header so the server returns `redacted_thinking` blocks instead of full thinking
+    /// summaries (saves bandwidth, but the redacted payloads can't be replayed back to the
+    /// server in multi-turn conversations). Defaults to false.
     pub redact_thinking: Option<bool>,
 }
 
@@ -1291,14 +1291,14 @@ pub struct ResolvedConfig {
     pub thinking: crate::provider::ThinkingMode,
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
-    /// Stable per-device identifier for `claude-oauth`'s `metadata.user_id`. Empty string for
-    /// non-`claude-oauth` providers (the value is ignored downstream).
+    /// Stable per-device identifier for `claude-subscription`'s `metadata.user_id`. Empty string
+    /// for non-`claude-subscription` providers (the value is ignored downstream).
     pub device_id: String,
     /// The user's explicit reasoning-effort override for every backend (Claude
     /// `output_config.effort`, OpenAI `reasoning.effort`). Passed through verbatim; `None` leaves
     /// the field off the request, so the provider applies its own default.
     pub effort: Option<String>,
-    /// `claude-oauth`: when true, request `redacted_thinking` blocks via
+    /// `claude-subscription`: when true, request `redacted_thinking` blocks via
     /// `redact-thinking-2026-02-12` beta. Default false.
     pub redact_thinking: bool,
     pub auto_compact: bool,
@@ -1846,7 +1846,7 @@ fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
 /// the first, so the first is silently discarded -- `write_file_atomic` makes each *write* atomic,
 /// which does nothing for a lost update. This is not a hypothetical race between two humans running
 /// CLI commands: `device_id::persist` runs from `ResolvedConfig::from_cli` on every start for a
-/// `claude-oauth` profile without one, so an ordinary launch races `meka mcp add`.
+/// `claude-subscription` profile without one, so an ordinary launch races `meka mcp add`.
 ///
 /// The lock lives beside the file rather than on it, because the editors replace the file by rename
 /// and a lock held on the replaced inode would guard nothing.
@@ -2785,12 +2785,16 @@ fn validate_max_output_tokens(
     let Some(max_output) = max_output_tokens else {
         return Ok(());
     };
-    let is_claude = matches!(provider_name, Some("claude-api") | Some("claude-oauth"));
+    // The same predicate `/status` and `meka provider add` use, rather than a third copy of the
+    // backend list: the invariant belongs to the Messages protocol, so every backend that speaks it
+    // is in scope and a future one is in scope automatically. Missing a backend here is invisible
+    // until a real request is rejected mid-turn, which is what this check exists to pre-empt.
+    let speaks_messages = provider_name.is_some_and(crate::provider::backend_takes_thinking);
     let budgeted = matches!(thinking, crate::provider::ThinkingMode::Budgeted);
-    if is_claude && budgeted && max_output <= thinking_budget_tokens {
+    if speaks_messages && budgeted && max_output <= thinking_budget_tokens {
         return Err(crate::error::MekaError::Config(format!(
-            "max_output_tokens ({}) must exceed the thinking budget ({}) for a Claude profile \
-             with thinking = \"budgeted\"; raise max_output_tokens or lower \
+            "max_output_tokens ({}) must exceed the thinking budget ({}) for an Anthropic Messages \
+             profile with thinking = \"budgeted\"; raise max_output_tokens or lower \
              [thinking].budget_tokens.",
             max_output, thinking_budget_tokens,
         )));
@@ -2798,8 +2802,8 @@ fn validate_max_output_tokens(
     Ok(())
 }
 
-/// Stable per-device identity for `claude-oauth` (embedded in `metadata.user_id`). Other providers
-/// get an empty string; we don't write a stub config file just to hold an unused value.
+/// Stable per-device identity for `claude-subscription` (embedded in `metadata.user_id`). Other
+/// providers get an empty string; we don't write a stub config file just to hold an unused value.
 mod device_id {
     use std::path::Path;
 
@@ -2814,7 +2818,7 @@ mod device_id {
         profile_name: Option<&str>,
         configured: Option<&str>,
     ) -> String {
-        if backend != Some("claude-oauth") {
+        if backend != Some("claude-subscription") {
             return String::new();
         }
 
@@ -2830,7 +2834,7 @@ mod device_id {
             Some(id) => (id, "~/.claude.json"),
             None => (generate(), "random"),
         };
-        tracing::info!("seeded claude-oauth device_id from {}", source);
+        tracing::info!("seeded claude-subscription device_id from {}", source);
 
         // Persist into the active profile's table. Skip quietly when we can't locate the config
         // path or the profile name; the id is still returned and used for this run, just
@@ -2878,9 +2882,9 @@ mod device_id {
 
     pub(super) fn persist(path: &Path, profile: &str, id: &str) -> std::io::Result<()> {
         // This is the writer that made the race ordinary rather than theoretical: it runs from
-        // `ResolvedConfig::from_cli` on every start for a `claude-oauth` profile without a device
-        // id, so a plain `meka` launch competes with whatever `meka mcp add` is doing in the next
-        // terminal.
+        // `ResolvedConfig::from_cli` on every start for a `claude-subscription` profile without a
+        // device id, so a plain `meka` launch competes with whatever `meka mcp add` is
+        // doing in the next terminal.
         let _lock = super::lock_config_file()?;
         let contents = std::fs::read_to_string(path).unwrap_or_default();
         let mut doc: toml_edit::DocumentMut = contents
@@ -3363,7 +3367,7 @@ command = "npx"
 default_provider = "work"
 
 [providers.work]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "gpt-4o"
 base_url = "https://api.openai.com/v1"
 "#;
@@ -3373,7 +3377,7 @@ base_url = "https://api.openai.com/v1"
             .providers
             .get("work")
             .expect("profile should be present");
-        assert_eq!(profile.backend, "openai-api");
+        assert_eq!(profile.backend, "openai-chat-completions");
         assert_eq!(profile.model.as_deref(), Some("gpt-4o"));
         assert_eq!(
             profile.base_url.as_deref(),
@@ -3392,14 +3396,14 @@ base_url = "https://api.openai.com/v1"
     fn test_partial_config_file() {
         let toml_str = r#"
 [providers.main]
-type = "claude-oauth"
+type = "claude-subscription"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let profile = config
             .providers
             .get("main")
             .expect("profile should be present");
-        assert_eq!(profile.backend, "claude-oauth");
+        assert_eq!(profile.backend, "claude-subscription");
         assert!(profile.model.is_none());
         assert!(profile.base_url.is_none());
     }
@@ -3420,7 +3424,10 @@ type = "claude-oauth"
 
     #[test]
     fn test_select_active_profile_explicit_request_wins() {
-        let providers = profiles_from(&[("work", "claude-oauth"), ("personal", "openai-api")]);
+        let providers = profiles_from(&[
+            ("work", "claude-subscription"),
+            ("personal", "openai-chat-completions"),
+        ]);
         let (active, error) = select_active_profile(Some("personal".to_string()), &providers);
         assert_eq!(active.as_deref(), Some("personal"));
         assert!(error.is_none());
@@ -3428,7 +3435,7 @@ type = "claude-oauth"
 
     #[test]
     fn test_select_active_profile_sole_profile_when_no_request() {
-        let providers = profiles_from(&[("only", "claude-api")]);
+        let providers = profiles_from(&[("only", "anthropic-messages")]);
         let (active, error) = select_active_profile(None, &providers);
         assert_eq!(active.as_deref(), Some("only"));
         assert!(error.is_none());
@@ -3444,7 +3451,10 @@ type = "claude-oauth"
 
     #[test]
     fn test_select_active_profile_ambiguous_without_default_errors() {
-        let providers = profiles_from(&[("work", "claude-oauth"), ("personal", "openai-api")]);
+        let providers = profiles_from(&[
+            ("work", "claude-subscription"),
+            ("personal", "openai-chat-completions"),
+        ]);
         let (active, error) = select_active_profile(None, &providers);
         assert!(active.is_none());
         let error = error.expect("error expected");
@@ -3455,7 +3465,7 @@ type = "claude-oauth"
 
     #[test]
     fn test_select_active_profile_unknown_name_errors() {
-        let providers = profiles_from(&[("work", "claude-oauth")]);
+        let providers = profiles_from(&[("work", "claude-subscription")]);
         let (active, error) = select_active_profile(Some("missing".to_string()), &providers);
         assert!(active.is_none());
         assert!(
@@ -3466,22 +3476,26 @@ type = "claude-oauth"
     }
 
     #[test]
-    fn test_resolve_device_id_returns_empty_for_non_claude_oauth() {
+    fn a_device_id_is_empty_for_every_backend_but_claude_subscription() {
         // Should not generate / persist anything when the provider doesn't need a device_id. Empty
-        // string flows through but is ignored by non-claude-oauth providers.
+        // string flows through but is ignored by non-claude-subscription providers.
         assert_eq!(
-            device_id::resolve(Some("openai-api"), Some("work"), None),
+            device_id::resolve(Some("openai-chat-completions"), Some("work"), None),
             ""
         );
         assert_eq!(
-            device_id::resolve(Some("claude-api"), Some("work"), None),
+            device_id::resolve(Some("anthropic-messages"), Some("work"), None),
             ""
         );
         assert_eq!(device_id::resolve(None, None, None), "");
-        // Even an explicit configured value is suppressed when the provider isn't claude-oauth;
-        // the field is provider-scoped.
+        // Even an explicit configured value is suppressed when the provider isn't
+        // claude-subscription; the field is provider-scoped.
         assert_eq!(
-            device_id::resolve(Some("openai-api"), Some("work"), Some("explicit")),
+            device_id::resolve(
+                Some("openai-chat-completions"),
+                Some("work"),
+                Some("explicit")
+            ),
             ""
         );
     }
@@ -3491,9 +3505,9 @@ type = "claude-oauth"
         // A configured value returns before the persist branch, so this never touches the FS.
         let id = "deadbeef".repeat(8);
         assert_eq!(
-            device_id::resolve(Some("claude-oauth"), Some("work"), Some(&id)),
+            device_id::resolve(Some("claude-subscription"), Some("work"), Some(&id)),
             id,
-            "configured value must be used verbatim for claude-oauth"
+            "configured value must be used verbatim for claude-subscription"
         );
     }
 
@@ -3505,7 +3519,7 @@ type = "claude-oauth"
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "default_provider = \"work\"\n\n[providers.work]\ntype = \"claude-oauth\"\nmodel = \"claude-opus-4-8\"\n",
+            "default_provider = \"work\"\n\n[providers.work]\ntype = \"claude-subscription\"\nmodel = \"claude-opus-4-8\"\n",
         )
         .expect("seed config");
 
@@ -3530,12 +3544,12 @@ type = "claude-oauth"
         // Existing profile fields are preserved.
         assert_eq!(
             config.providers.get("work").map(|p| p.backend.as_str()),
-            Some("claude-oauth")
+            Some("claude-subscription")
         );
         // Closing the loop: the reader feeds the persisted value back through `resolve`, which must
         // return it verbatim rather than regenerate a fresh id on the next run.
         assert_eq!(
-            device_id::resolve(Some("claude-oauth"), Some("work"), persisted),
+            device_id::resolve(Some("claude-subscription"), Some("work"), persisted),
             "abc123",
             "a persisted device_id must be picked up on the next run, not regenerated"
         );
@@ -3621,7 +3635,7 @@ type = "claude-oauth"
     fn test_provider_profile_deserializes_effort_and_redact_thinking() {
         let toml_str = r#"
 [providers.work]
-type = "claude-oauth"
+type = "claude-subscription"
 model = "claude-opus-4-6-20250514"
 effort = "medium"
 thinking = "budgeted"
@@ -3656,7 +3670,7 @@ redact_thinking = true
         // nothing. An unknown key inside a provider profile (here the removed `reasoning_effort`).
         let stale_profile = r#"
 [providers.work]
-type = "openai-codex"
+type = "chatgpt-subscription"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
 "#;
@@ -3679,7 +3693,7 @@ reasoning_effort = "high"
     fn test_provider_profile_deserializes_capability_knobs() {
         let toml_str = r#"
 [providers.work]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "gpt-5.5"
 context_window = 1000000
 vision = false
@@ -3701,20 +3715,26 @@ max_output_tokens = 64000
 
         // Budgeted draws the thinking budget out of `max_tokens`, so a cap at or below it can only
         // produce a 400. Catch it at config load, where the message can say what to change.
-        let result = validate_max_output_tokens(
-            Some("claude-oauth"),
-            Some(5_000),
-            ThinkingMode::Budgeted,
-            10_000,
-        );
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("thinking budget"),
-            "the error must name the budget it conflicts with"
-        );
+        //
+        // Both Anthropic Messages backends, because the invariant belongs to the protocol rather
+        // than to the account: dropping either from the gate is invisible until a real request is
+        // rejected mid-turn, which is exactly what this check exists to pre-empt.
+        for backend in ["claude-subscription", "anthropic-messages"] {
+            let result = validate_max_output_tokens(
+                Some(backend),
+                Some(5_000),
+                ThinkingMode::Budgeted,
+                10_000,
+            );
+            assert!(result.is_err(), "{backend}");
+            assert!(
+                result.unwrap_err().to_string().contains("thinking budget"),
+                "{backend}: the error must name the budget it conflicts with"
+            );
+        }
         assert!(
             validate_max_output_tokens(
-                Some("claude-oauth"),
+                Some("claude-subscription"),
                 Some(20_000),
                 ThinkingMode::Budgeted,
                 10_000
@@ -3727,14 +3747,15 @@ max_output_tokens = 64000
         // no longer inferred, it is stated.
         for mode in [ThinkingMode::Adaptive, ThinkingMode::Off] {
             assert!(
-                validate_max_output_tokens(Some("claude-oauth"), Some(5_000), mode, 10_000).is_ok(),
+                validate_max_output_tokens(Some("claude-subscription"), Some(5_000), mode, 10_000)
+                    .is_ok(),
                 "{mode:?}"
             );
         }
         // Non-Claude backends have no such constraint either, whatever the mode.
         assert!(
             validate_max_output_tokens(
-                Some("openai-api"),
+                Some("openai-chat-completions"),
                 Some(100),
                 ThinkingMode::Budgeted,
                 10_000
@@ -3743,8 +3764,13 @@ max_output_tokens = 64000
         );
         // No override at all.
         assert!(
-            validate_max_output_tokens(Some("claude-api"), None, ThinkingMode::Budgeted, 10_000)
-                .is_ok()
+            validate_max_output_tokens(
+                Some("anthropic-messages"),
+                None,
+                ThinkingMode::Budgeted,
+                10_000
+            )
+            .is_ok()
         );
     }
 
@@ -3752,7 +3778,7 @@ max_output_tokens = 64000
     fn test_provider_profile_capability_knobs_default_to_none() {
         let toml_str = r#"
 [providers.work]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "gpt-5.5"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
@@ -4131,7 +4157,7 @@ command = "ida-mcp"
 default_provider = "p"
 
 [providers.p]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "m"
 
 [session]
@@ -4158,7 +4184,7 @@ context_messages = 0
 default_provider = "p"
 
 [providers.p]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "m"
 
 [session]
@@ -4185,7 +4211,7 @@ retention_days = 0
 default_provider = "p"
 
 [providers.p]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "m"
 
 [schedule]
@@ -4214,7 +4240,7 @@ poll_interval = "0s"
 default_provider = "p"
 
 [providers.p]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "m"
 
 [schedule]
@@ -4781,7 +4807,7 @@ read_file = "ask"
 default_provider = "local"
 
 [providers.local]
-type = "claude-api"
+type = "anthropic-messages"
 model = "some-local-model"
 thinking = "budgeted"
 "#,

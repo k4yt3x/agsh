@@ -701,7 +701,8 @@ pub async fn instructions(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProviderView {
     pub name: String,
-    /// Backend kind, e.g. `claude-api`, `openai-codex`.
+    /// Backend kind: the wire protocol this profile speaks, e.g. `anthropic-messages`,
+    /// `openai-responses`, or `chatgpt-subscription`.
     #[serde(rename = "type")]
     pub backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -38,7 +38,7 @@ All configuration flags work in one-shot mode:
 
 ```bash
 # Use a specific provider and model
-meka --oneshot --provider claude-oauth -m claude-sonnet-4-20250514 "explain this codebase"
+meka --oneshot --provider work -m claude-sonnet-4-20250514 "explain this codebase"
 
 # With write permission
 meka --oneshot --permission write "run 'cargo test' and summarize the results"

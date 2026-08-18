@@ -33,11 +33,11 @@ file holds only the non-secret settings shown below.
 default_provider = "work"
 
 [providers.work]
-type  = "claude-oauth"
+type  = "claude-subscription"
 model = "claude-opus-5"
 
 [providers.local]
-type     = "openai-api"
+type     = "openai-chat-completions"
 base_url = "http://localhost:11434/v1"
 model    = "llama3"
 ```
@@ -77,12 +77,15 @@ Top-level field naming the profile to use when `--provider` isn't passed. Set it
 
 The backend the profile uses (required).
 
-| Value | Description |
-|-------|-------------|
-| `openai-api` | OpenAI Chat Completions API (also works with OpenAI-compatible APIs) |
-| `openai-codex` | OpenAI Responses API via ChatGPT subscription OAuth, against `chatgpt.com/backend-api/codex` |
-| `claude-api` | Claude Messages API with `x-api-key` auth |
-| `claude-oauth` | Claude Messages API via Claude Code OAuth (fingerprinting + attestation) |
+| Value | Protocol | Auth |
+|-------|----------|------|
+| `anthropic-messages` | Anthropic Messages, `POST {base}/v1/messages` | API key (`x-api-key`) |
+| `claude-subscription` | Anthropic Messages, against `api.anthropic.com` | Claude subscription OAuth (fingerprinting + attestation) |
+| `openai-chat-completions` | OpenAI Chat Completions, `POST {base}/chat/completions` | API key |
+| `openai-responses` | OpenAI Responses, `POST {base}/responses` | API key |
+| `chatgpt-subscription` | OpenAI Responses, against `chatgpt.com/backend-api/codex` | ChatGPT subscription OAuth |
+
+A backend names the wire protocol it speaks, not a vendor. See [Providers Overview](../providers/overview.md) for why, and which servers implement which protocol.
 
 ### `model`
 
@@ -104,9 +107,9 @@ Custom API base URL. Useful for:
 
 If not set, defaults to:
 
-- `https://api.openai.com/v1` for the `openai-api` backend
-- `https://chatgpt.com` for the `openai-codex` backend (request path is `/backend-api/codex/responses`)
-- `https://api.anthropic.com` for the `claude-api` and `claude-oauth` backends
+- `https://api.openai.com/v1` for the `openai-chat-completions` and `openai-responses` backends
+- `https://chatgpt.com` for the `chatgpt-subscription` backend (request path is `/backend-api/codex/responses`)
+- `https://api.anthropic.com` for the `anthropic-messages` and `claude-subscription` backends
 
 Override per-run with `--base-url`.
 
@@ -119,13 +122,13 @@ set. The official SDKs draw the line the same way.
 
 A gateway that fronts both APIs therefore publishes two URLs, and its Anthropic one is often written
 with the `/v1` its OpenAI sibling needs (`https://api.synthetic.new/anthropic/v1`). Paste it as-is:
-for a `claude-api` or `claude-oauth` profile meka drops a trailing `/v1`, since it re-adds that
+for a `anthropic-messages` or `claude-subscription` profile meka drops a trailing `/v1`, since it re-adds that
 segment on every request and the alternative is a request to `/v1/v1/messages`. Only a trailing one
 goes, so a base whose path legitimately contains `/v1` earlier
 (`https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/anthropic`) is left alone. Trailing
 slashes are trimmed for every backend.
 
-The reverse is not inferred: an `openai-api` base is used exactly as written, because a gateway
+The reverse is not inferred: an `openai-chat-completions` base is used exactly as written, because a gateway
 serving `/chat/completions` at its root is legitimate and meka cannot tell that apart from a missing
 `/v1`. If an OpenAI-compatible endpoint 404s, check that the base carries the version segment its
 documentation shows.
@@ -134,14 +137,14 @@ documentation shows.
 
 Custom OAuth token refresh endpoint. Defaults:
 
-- `https://api.anthropic.com/v1/oauth/token` for `claude-oauth`
-- `https://auth.openai.com/oauth/token` for `openai-codex`
+- `https://api.anthropic.com/v1/oauth/token` for `claude-subscription`
+- `https://auth.openai.com/oauth/token` for `chatgpt-subscription`
 
 ### `effort`
 
-One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-oauth` under the `effort-2025-11-24` beta, `claude-api` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
+One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
 
-**When unset the field is omitted, and the provider applies its own default.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements - `claude-api` and `openai-api` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
+**When unset the field is omitted, and the provider applies its own default.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements - `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
 
 An explicit value is absolute: sent verbatim (trimmed and lowercased), with no validation or clamping, whatever model it is aimed at. You own correctness for your model and endpoint; an invalid value is rejected by the API. A blank value reads as unset.
 
@@ -149,17 +152,17 @@ Typical values: `low`, `medium`, `high`, `xhigh`, `max`.
 
 ```toml
 [providers.work]
-type   = "claude-oauth"
+type   = "claude-subscription"
 effort = "xhigh"
 ```
 
 ### `redact_thinking`
 
-`claude-oauth` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
+`claude-subscription` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
 
 ```toml
 [providers.work]
-type            = "claude-oauth"
+type            = "claude-subscription"
 redact_thinking = false
 ```
 
@@ -171,7 +174,7 @@ meka never infers this from the model name and never asks the provider for it, s
 
 ```toml
 [providers.work]
-type           = "openai-api"
+type           = "openai-chat-completions"
 model          = "my-128k-model"
 context_window = 131072
 ```
@@ -190,7 +193,7 @@ One knob rather than two: it replaces both the old on/off switch and the encodin
 
 ```toml
 [providers.local]
-type     = "claude-api"
+type     = "anthropic-messages"
 thinking = "budgeted"
 ```
 
@@ -200,7 +203,7 @@ Whether this profile's model accepts image input. Defaults to `true`. Set `false
 
 ```toml
 [providers.local]
-type   = "openai-api"
+type   = "openai-chat-completions"
 model  = "llama-3-8b"
 vision = false
 ```
@@ -211,25 +214,25 @@ Override the per-request output (completion) token cap. When unset, each backend
 
 ```toml
 [providers.work]
-type              = "claude-api"
+type              = "anthropic-messages"
 max_output_tokens = 16000
 ```
 
 ### `client_id`
 
-OAuth client ID override (advanced; `claude-oauth` / `openai-codex` only). Leave unset to use meka's built-in default client IDs.
+OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use meka's built-in default client IDs.
 
 ### `device_id`
 
-`claude-oauth` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
+`claude-subscription` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
 
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the profile under `[providers.<name>].device_id`. This file write only happens for the `claude-oauth` backend; other backends don't need a device ID.
+If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the profile under `[providers.<name>].device_id`. This file write only happens for the `claude-subscription` backend; other backends don't need a device ID.
 
 You can supply your own value if you want to control attribution explicitly:
 
 ```toml
 [providers.work]
-type      = "claude-oauth"
+type      = "claude-subscription"
 device_id = "your-stable-id-here"
 ```
 
@@ -241,7 +244,7 @@ config file.
 
 | Command | Action |
 |---|---|
-| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-oauth` / `openai-codex`, API-key prompt for `claude-api` / `openai-api`). Sets `default_provider` when it's the first profile. |
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). Sets `default_provider` when it's the first profile. |
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
 | `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
@@ -250,7 +253,7 @@ config file.
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
 
 ```console
-$ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-api --model gpt-4o --api-key-stdin
+$ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-chat-completions --model gpt-4o --api-key-stdin
 ```
 
 ### Leftover credentials
@@ -270,8 +273,8 @@ Instead, `meka provider list` reports what it finds:
 
 ```console
 $ meka provider list
-Name  Type        Model          Authenticated  Default
-work  claude-api  claude-opus-5  yes            *
+Name  Type                Model          Authenticated  Default
+work  anthropic-messages  claude-opus-5  yes            *
 
 Stored credentials with no profile: archive
 ```
@@ -281,45 +284,53 @@ mcp list`](#meka-mcp-cli) and cleaned by `meka mcp remove <name>`.
 
 ## Examples
 
-### Claude OAuth (Claude Code subscription)
+### `claude-subscription`
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-5
+$ meka provider add work --type claude-subscription --model claude-opus-5
 # Opens the browser for the OAuth login, then stores the token in the database.
 ```
 
-### Claude API
+### `anthropic-messages`
 
 ```console
-$ meka provider add anthropic --type claude-api --model claude-opus-5
-# Prompts for your CLAUDE API key (sk-ant-api03-...).
+$ meka provider add anthropic --type anthropic-messages --model claude-opus-5
+# Prompts for your Anthropic API key (sk-ant-api03-...).
 ```
 
-### OpenAI API
+### `openai-chat-completions`
 
 ```console
-$ meka provider add openai --type openai-api --model gpt-4o
+$ meka provider add openai --type openai-chat-completions --model gpt-4o
 # Prompts for your OpenAI API key (sk-...).
 ```
 
-### OpenAI Codex (ChatGPT subscription)
+### `openai-responses`
 
 ```console
-$ meka provider add chatgpt --type openai-codex --model gpt-5
+$ meka provider add openai --type openai-responses --model gpt-5.6-sol
+# Prompts for your OpenAI API key (sk-...). Same key as openai-chat-completions,
+# newer protocol; also reaches Ollama, vLLM, LM Studio and OpenRouter.
+```
+
+### `chatgpt-subscription`
+
+```console
+$ meka provider add chatgpt --type chatgpt-subscription --model gpt-5
 # Opens the browser for the ChatGPT OAuth login.
 ```
 
 ### Ollama (local, no key)
 
 ```console
-$ printf 'unused' | meka provider add ollama --type openai-api --model llama3 \
+$ printf 'unused' | meka provider add ollama --type openai-chat-completions --model llama3 \
     --base-url http://localhost:11434/v1 --api-key-stdin
 ```
 
 ### OpenRouter
 
 ```console
-$ meka provider add openrouter --type openai-api --model anthropic/claude-sonnet-4.6 \
+$ meka provider add openrouter --type openai-chat-completions --model anthropic/claude-sonnet-4.6 \
     --base-url https://openrouter.ai/api/v1
 # Prompts for your OpenRouter key (sk-or-...).
 ```
@@ -762,9 +773,9 @@ subagent_max_depth = 3
 
 ## `[thinking]`
 
-Presentation and budget settings for extended thinking (`claude-api` and `claude-oauth` providers). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key - not a setting here.
+Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` providers). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key - not a setting here.
 
-While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-oauth` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `claude-api` does not report one, so the line stays bare. The count is coarse -- a progress signal, not an accounting figure.
+While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the line stays bare. The count is coarse -- a progress signal, not an accounting figure.
 
 When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
 

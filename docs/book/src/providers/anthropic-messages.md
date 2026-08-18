@@ -1,12 +1,14 @@
-# Claude API Provider
+# Anthropic Messages
 
-The `claude-api` provider talks to the [Claude Messages API](https://docs.anthropic.com/en/api/messages) directly with an `x-api-key` header. Use this when you have a Claude API key (billed per-token). For Claude Code OAuth, see [`claude-oauth`](./claude-oauth.md).
+The **Anthropic Messages API** (`POST {base_url}/v1/messages`) with an API key. Use this when you have an Anthropic API key, billed per token; to bill a Claude subscription instead, see [`claude-subscription`](./claude-subscription.md), which speaks the same protocol.
+
+The protocol is not Anthropic's alone. Databricks, Vercel AI Gateway, LiteLLM, Synthetic and Ollama all serve `/v1/messages`, as does Amazon Bedrock on its Anthropic-compatible host (`https://bedrock-mantle.{region}.api.aws/anthropic`, with an API key, *not* `bedrock-runtime`, which is SigV4 and `/model/{id}/invoke`). This backend reaches any of them via `base_url`, which is why it is named for the protocol rather than for Claude.
 
 ## Configuration
 
 | Setting | Value |
 |---------|-------|
-| Profile `type` | `claude-api` |
+| Profile `type` | `anthropic-messages` |
 | Default base URL | `https://api.anthropic.com` |
 | Credential | API key (`sk-ant-api03-...`) stored in the database |
 | Auth method | `x-api-key` header |
@@ -15,7 +17,7 @@ The `claude-api` provider talks to the [Claude Messages API](https://docs.anthro
 ### Quickest Start
 
 ```bash
-meka provider add anthropic --type claude-api --model claude-opus-5
+meka provider add anthropic --type anthropic-messages --model claude-opus-5
 ```
 
 `meka provider add` prompts for your Claude API key, stores it in the database, and writes the
@@ -30,13 +32,13 @@ meka provider add anthropic --type claude-api --model claude-opus-5
 default_provider = "anthropic"
 
 [providers.anthropic]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-opus-5"
 ```
 
 ### `effort`
 
-meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-oauth`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset the field is omitted entirely, which is how you ask for Anthropic's own default. See the [`effort`](../configuration/config-file.md#effort) config reference for the levels.
+meka sends the reasoning-effort control as `output_config.effort` in the request body. Unlike `claude-subscription`, no beta header is needed: the parameter is generally available on the direct Messages API. When `effort` is unset the field is omitted entirely, which is how you ask for Anthropic's own default. See the [`effort`](../configuration/config-file.md#effort) config reference for the levels.
 
 ### `thinking`
 
@@ -51,17 +53,17 @@ Any model available through the Claude Messages API; meka forwards the model str
 To use a Claude-API-compatible proxy or gateway:
 
 ```bash
-meka --provider claude-api --model claude-opus-5 --base-url https://my-proxy.example.com
+meka --provider work --model claude-opus-5 --base-url https://my-proxy.example.com
 ```
 
 A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.
 
 ### Anthropic-compatible endpoints
 
-The model behind the endpoint doesn't have to be Claude. Ollama, LM Studio and similar runtimes serve local weights over `POST /v1/messages`, and `claude-api` reaches them with a placeholder key:
+The model behind the endpoint doesn't have to be Claude. Ollama, LM Studio and similar runtimes serve local weights over `POST /v1/messages`, and `anthropic-messages` reaches them with a placeholder key:
 
 ```bash
-meka provider add local --type claude-api \
+meka provider add local --type anthropic-messages \
     --model 'hf.co/bartowski/Qwen3.8-27B-GGUF:Q8_0' \
     --base-url http://127.0.0.1:11434
 ```

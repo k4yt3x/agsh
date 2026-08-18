@@ -1,7 +1,14 @@
 //! LLM provider abstraction. Defines the [`Provider`] trait, the shared message/content/tool types,
-//! and the [`ProviderBuilder`] that returns a concrete Claude or OpenAI-compatible implementation.
+//! and the [`ProviderBuilder`] that returns a concrete backend.
+//!
+//! A backend is named for the wire protocol it speaks, not for a vendor or an auth method, because
+//! neither of those identifies the request shape: one vendor serves several protocols (OpenAI has
+//! both Chat Completions and Responses) and one protocol is served by many vendors (`/v1/messages`
+//! by Anthropic, LiteLLM, Databricks, Ollama, …). The two subscription backends carry a vendor name
+//! instead, because what they select is a billing relationship whose endpoint and client shape come
+//! with it.
 
-mod claude;
+mod anthropic;
 /// `meka provider` subcommand suite (add/list/use/remove/login) and the provider OAuth login flows.
 pub mod cli;
 /// Scripted provider used by the ACP integration test. Available in debug builds only; release
@@ -15,9 +22,11 @@ pub(crate) mod retry;
 
 use std::{sync::Arc, time::Duration};
 
+pub use anthropic::{AnthropicMessagesProvider, ClaudeSubscriptionProvider};
 use async_trait::async_trait;
-pub use claude::{ClaudeApiProvider, ClaudeOAuthProvider};
-pub use openai::{OpenAiCodexProvider, OpenAiProvider};
+pub use openai::{
+    ChatGptSubscriptionProvider, OpenAiChatCompletionsProvider, OpenAiResponsesProvider,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,33 +36,51 @@ use crate::{
     session::TokenStore,
 };
 
-pub(crate) const DEFAULT_CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
+    "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the first-party CLI at
 /// `temp/codex/codex-rs/login/src/auth/manager.rs:869`.
-pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-pub const SUPPORTED_PROVIDERS: &[&str] =
-    &["openai-api", "openai-codex", "claude-api", "claude-oauth"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &[
+    "anthropic-messages",
+    "chatgpt-subscription",
+    "claude-subscription",
+    "openai-chat-completions",
+    "openai-responses",
+];
 
 /// The endpoint each backend talks to when a profile sets no `base_url`.
 ///
 /// Named rather than written inline at each constructor so `meka provider add` can *show* the
 /// default it is about to apply. A prompt carrying its own copy of the string would eventually
 /// offer one URL while the request went to another.
-pub(crate) const DEFAULT_CLAUDE_BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub(crate) const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub(crate) const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com";
+pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com";
 
 /// The default endpoint for `backend`, or `None` for a name that isn't a backend. Every supported
 /// backend has one, so the `None` arm exists only to keep the match total.
 pub(crate) fn default_base_url(backend: &str) -> Option<&'static str> {
     match backend {
-        "claude-api" | "claude-oauth" => Some(DEFAULT_CLAUDE_BASE_URL),
-        "openai-api" => Some(DEFAULT_OPENAI_BASE_URL),
-        "openai-codex" => Some(DEFAULT_OPENAI_CODEX_BASE_URL),
+        "anthropic-messages" | "claude-subscription" => Some(DEFAULT_ANTHROPIC_BASE_URL),
+        "openai-chat-completions" | "openai-responses" => Some(DEFAULT_OPENAI_BASE_URL),
+        "chatgpt-subscription" => Some(DEFAULT_CHATGPT_BASE_URL),
         _ => None,
     }
+}
+
+/// Whether `backend`'s requests carry a `thinking` field at all, i.e. whether it speaks Anthropic's
+/// Messages API. `/status` and `meka provider add` both key off this, so they agree about which
+/// profiles the [`ThinkingMode`] setting is even meaningful for.
+///
+/// A single function rather than a test at each site. Both used to ask
+/// `backend.starts_with("claude")`, which was true of every Anthropic backend only while they were
+/// *named* for Claude; the protocol name `anthropic-messages` silently falls out of a prefix test,
+/// and nothing about the failure is visible except a missing line.
+pub(crate) fn backend_takes_thinking(backend: &str) -> bool {
+    matches!(backend, "anthropic-messages" | "claude-subscription")
 }
 
 /// How long a provider stream may go without producing anything before it is treated as dead.
@@ -192,8 +219,9 @@ pub enum AuthCredential {
         refresh_token: Option<String>,
         expires_at: Option<i64>,
         /// Provider-flavoured identity carried alongside the bearer token. Currently only
-        /// `openai-codex` populates this, the `chatgpt_account_id` extracted from the id_token
-        /// JWT, sent on every request as `ChatGPT-Account-ID`. Claude OAuth leaves it `None`.
+        /// `chatgpt-subscription` populates this, the `chatgpt_account_id` extracted from the
+        /// id_token JWT, sent on every request as `ChatGPT-Account-ID`. Claude OAuth
+        /// leaves it `None`.
         account_id: Option<String>,
     },
 }
@@ -263,7 +291,7 @@ pub struct AccountUsage {
 /// Whether a Claude request asks for extended thinking, and which wire encoding it uses.
 ///
 /// One knob rather than two. Thinking used to be a global on/off plus a shape meka inferred from
-/// the model name, and that inference is what this replaces: `claude-api` reaches any
+/// the model name, and that inference is what this replaces: `anthropic-messages` reaches any
 /// Anthropic-compatible endpoint, so meka cannot tell which encoding the far side implements. The
 /// profile states it, and is the user's to keep correct if they later change `model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
@@ -274,7 +302,7 @@ pub enum ThinkingMode {
     /// Sends the adaptive thinking block, and is the default because it is what the current models
     /// want. These variant docs are also the clap help text, so they avoid backticks and braces,
     /// which render literally in `-h`; the wire shapes each mode produces live in
-    /// `claude::shared::insert_thinking_fields`.
+    /// `anthropic::shared::insert_thinking_fields`.
     #[default]
     Adaptive,
     /// A fixed budget, from the thinking budget_tokens setting. Required by pre-4.6 Claude.
@@ -317,9 +345,9 @@ impl ThinkingMode {
 /// unset.
 ///
 /// meka deliberately picks no default of its own. It cannot know what tiers a given endpoint
-/// implements - `claude-api` and `openai-api` reach any compatible server, including local ones
-/// serving weights that never had an effort knob - and a tier the backend does not implement is a
-/// rejected request rather than a graceful ignore.
+/// implements - `anthropic-messages` and `openai-chat-completions` reach any compatible server,
+/// including local ones serving weights that never had an effort knob - and a tier the backend does
+/// not implement is a rejected request rather than a graceful ignore.
 pub(crate) fn resolve_effort_level(configured: Option<&str>) -> Option<String> {
     configured
         .map(str::trim)
@@ -740,16 +768,17 @@ pub enum StopReason {
     Unknown(String),
 }
 
-/// Abstraction over an LLM provider (Claude API/OAuth, OpenAI, etc.). Implementors are held behind
+/// Abstraction over an LLM provider backend, each named for the wire protocol it speaks or the
+/// account it bills (see the module header). Implementors are held behind
 /// `Arc<dyn Provider>` and shared across concurrent tool dispatch; calls must be safe to make in
 /// parallel from multiple sub-agents in one turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Single round-trip request. Returns the assistant message, stop-reason, token-usage metadata,
     /// and any user-visible notices that arose during the request (e.g. the redaction hint from
-    /// `claude::shared::build_body_within_budget`). The caller is expected to forward each notice
-    /// to the active frontend; an empty `Vec` means nothing to surface. No streaming; the agent
-    /// awaits the full response.
+    /// `anthropic::shared::build_body_within_budget`). The caller is expected to forward each
+    /// notice to the active frontend; an empty `Vec` means nothing to surface. No streaming;
+    /// the agent awaits the full response.
     async fn complete(
         &self,
         system_prompt: &str,
@@ -882,7 +911,7 @@ async fn finalize_tool_call_accumulators(
     has_tools
 }
 
-/// Constructs a concrete [`Provider`] (Claude API, Claude OAuth, or OpenAI-compatible) from a bag
+/// Constructs a concrete [`Provider`] for any name in [`SUPPORTED_PROVIDERS`] from a bag
 /// of provider-specific settings. Each setter documents which provider(s) consume it; unused
 /// settings are silently ignored by providers that don't need them. The only required inputs are
 /// the provider name, the credential, and the model; everything else has a sensible default.
@@ -938,20 +967,20 @@ impl ProviderBuilder {
         self
     }
 
-    /// OAuth client ID. Only consumed by `claude-oauth`.
+    /// OAuth client ID. Only consumed by `claude-subscription`.
     pub fn client_id(mut self, value: Option<String>) -> Self {
         self.client_id = value;
         self
     }
 
-    /// OAuth token endpoint. Only consumed by `claude-oauth`.
+    /// OAuth token endpoint. Only consumed by `claude-subscription`.
     pub fn oauth_token_url(mut self, value: Option<String>) -> Self {
         self.oauth_token_url = value;
         self
     }
 
-    /// Sink for refreshed OAuth tokens. Only consumed by `claude-oauth`; when `None`, refreshed
-    /// tokens are held in memory only.
+    /// Sink for refreshed OAuth tokens. Only consumed by `claude-subscription`; when `None`,
+    /// refreshed tokens are held in memory only.
     pub fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
         self
@@ -972,7 +1001,8 @@ impl ProviderBuilder {
         self
     }
 
-    /// Stable device identity embedded in `metadata.user_id`. Only consumed by `claude-oauth`.
+    /// Stable device identity embedded in `metadata.user_id`. Only consumed by
+    /// `claude-subscription`.
     pub fn device_id(mut self, value: String) -> Self {
         self.device_id = value;
         self
@@ -986,7 +1016,7 @@ impl ProviderBuilder {
         self
     }
 
-    /// Request `redacted_thinking` blocks. Only consumed by `claude-oauth`.
+    /// Request `redacted_thinking` blocks. Only consumed by `claude-subscription`.
     pub fn redact_thinking(mut self, value: bool) -> Self {
         self.redact_thinking = value;
         self
@@ -1000,7 +1030,7 @@ impl ProviderBuilder {
     }
 
     /// Per-session counters incremented when image-redaction events fire. Currently consumed only
-    /// by `claude-oauth` and `claude-api`.
+    /// by `claude-subscription` and `anthropic-messages`.
     pub fn session_stats(mut self, value: Option<Arc<crate::stats::SessionStats>>) -> Self {
         self.session_stats = value;
         self
@@ -1008,12 +1038,14 @@ impl ProviderBuilder {
 
     pub fn build(self) -> Result<Arc<dyn Provider>> {
         match self.provider_name.as_str() {
-            "openai-api" => {
+            "openai-responses" => {
+                // Same credential handling as `openai-chat-completions`: these two differ by
+                // protocol, not by how they authenticate.
                 let api_key = match self.credential {
                     AuthCredential::ApiKey(key) => key,
                     AuthCredential::OAuthToken { access_token, .. } => access_token,
                 };
-                Ok(Arc::new(OpenAiProvider::new(
+                Ok(Arc::new(OpenAiResponsesProvider::new(
                     api_key,
                     self.model,
                     self.base_url,
@@ -1021,18 +1053,31 @@ impl ProviderBuilder {
                     self.max_output_tokens,
                 )?))
             }
-            "claude-api" => {
+            "openai-chat-completions" => {
+                let api_key = match self.credential {
+                    AuthCredential::ApiKey(key) => key,
+                    AuthCredential::OAuthToken { access_token, .. } => access_token,
+                };
+                Ok(Arc::new(OpenAiChatCompletionsProvider::new(
+                    api_key,
+                    self.model,
+                    self.base_url,
+                    self.effort,
+                    self.max_output_tokens,
+                )?))
+            }
+            "anthropic-messages" => {
                 let api_key = match self.credential {
                     AuthCredential::ApiKey(key) => key,
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "provider 'claude-api' requires an API key, not an OAuth token. \
-                             Use 'claude-oauth' for Claude Code OAuth."
+                            "provider 'anthropic-messages' requires an API key, not an OAuth \
+                             token. Use 'claude-subscription' to bill a Claude subscription."
                                 .to_string(),
                         ));
                     }
                 };
-                Ok(Arc::new(ClaudeApiProvider::new(
+                Ok(Arc::new(AnthropicMessagesProvider::new(
                     api_key,
                     self.model,
                     self.base_url,
@@ -1043,15 +1088,15 @@ impl ProviderBuilder {
                     self.session_stats,
                 )?))
             }
-            "claude-oauth" => {
+            "claude-subscription" => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
                     return Err(MekaError::Config(
-                        "provider 'claude-oauth' requires an OAuth token, not an API key. \
-                         Use 'claude-api' for direct API access."
+                        "provider 'claude-subscription' requires an OAuth token, not an API key. \
+                         Use 'anthropic-messages' to bill an Anthropic API key."
                             .to_string(),
                     ));
                 }
-                Ok(Arc::new(ClaudeOAuthProvider::new(
+                Ok(Arc::new(ClaudeSubscriptionProvider::new(
                     self.credential,
                     self.model,
                     self.base_url,
@@ -1069,15 +1114,16 @@ impl ProviderBuilder {
                     self.session_stats,
                 )?))
             }
-            "openai-codex" => {
+            "chatgpt-subscription" => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
                     return Err(MekaError::Config(
-                        "provider 'openai-codex' requires an OAuth token, not an API key. \
-                         Use 'openai-api' for direct API access."
+                        "provider 'chatgpt-subscription' requires an OAuth token, not an API key. \
+                         Use 'openai-responses' for the same protocol with an API key, or \
+                         'openai-chat-completions' for an endpoint that serves only that."
                             .to_string(),
                     ));
                 }
-                Ok(Arc::new(OpenAiCodexProvider::new(
+                Ok(Arc::new(ChatGptSubscriptionProvider::new(
                     self.credential,
                     self.model,
                     self.base_url,
@@ -1243,22 +1289,31 @@ mod tests {
     #[test]
     fn the_advertised_default_endpoint_is_the_one_the_backend_uses() {
         assert_eq!(
-            default_base_url("claude-api"),
-            Some(DEFAULT_CLAUDE_BASE_URL)
+            default_base_url("anthropic-messages"),
+            Some(DEFAULT_ANTHROPIC_BASE_URL)
         );
         assert_eq!(
-            default_base_url("claude-oauth"),
-            Some(DEFAULT_CLAUDE_BASE_URL)
+            default_base_url("claude-subscription"),
+            Some(DEFAULT_ANTHROPIC_BASE_URL)
         );
         assert_eq!(
-            default_base_url("openai-api"),
+            default_base_url("openai-chat-completions"),
+            Some(DEFAULT_OPENAI_BASE_URL)
+        );
+        // The two OpenAI protocols share a default host: `openai-responses` is a different wire
+        // format against the same API, not a different service. Aiming it at the subscription's
+        // `chatgpt.com` would compile and pass a mere is-some check, so it is named explicitly.
+        assert_eq!(
+            default_base_url("openai-responses"),
             Some(DEFAULT_OPENAI_BASE_URL)
         );
         assert_eq!(
-            default_base_url("openai-codex"),
-            Some(DEFAULT_OPENAI_CODEX_BASE_URL)
+            default_base_url("chatgpt-subscription"),
+            Some(DEFAULT_CHATGPT_BASE_URL)
         );
         // Every supported backend answers, so the prompt never has to fall back to naming no URL.
+        // A weaker guard than the assertions above and deliberately kept alongside them: it is what
+        // catches a *newly added* backend that nobody remembered to give a default.
         for backend in SUPPORTED_PROVIDERS {
             assert!(default_base_url(backend).is_some(), "{backend}");
         }
@@ -1268,8 +1323,9 @@ mod tests {
     #[test]
     fn an_unconfigured_effort_is_omitted_so_the_provider_applies_its_own() {
         // The whole policy: meka names a tier only when the profile did. It cannot know which tiers
-        // a given endpoint implements - `claude-api` and `openai-api` reach any compatible server -
-        // and an unimplemented tier is a rejected request, not a graceful ignore.
+        // a given endpoint implements - `anthropic-messages` and `openai-chat-completions` reach
+        // any compatible server - and an unimplemented tier is a rejected request, not a
+        // graceful ignore.
         assert_eq!(resolve_effort_level(None), None);
         // A blank override reads as unset rather than as an empty wire value the API would reject.
         assert_eq!(resolve_effort_level(Some("")), None);
@@ -1567,10 +1623,47 @@ mod tests {
         assert_eq!(deserialized.text_content(), "Let me read that.");
     }
 
+    /// Every supported backend must actually build.
+    ///
+    /// The last hand-written backend list with no loop behind it. `SUPPORTED_PROVIDERS`,
+    /// `validate_backend` and `ResolvedConfig::validate` all accept a name before `build` is
+    /// reached, so a backend added to the list and forgotten in the dispatch falls to the catch-all
+    /// and dies at runtime with "unknown provider" — the same failure `acquire_credential`'s
+    /// `unreachable!()` produced, which shipped as far as a live `provider add` before being
+    /// caught.
+    ///
+    /// Iterating the list rather than naming five backends is the point: a sixth is covered the day
+    /// it is added.
     #[test]
-    fn test_create_provider_openai_api() {
+    fn every_supported_backend_builds() {
+        for backend in SUPPORTED_PROVIDERS {
+            // Hand each backend the credential shape it accepts; the mismatch cases are asserted
+            // separately by the `_rejects_` tests.
+            let credential = if backend.ends_with("-subscription") {
+                AuthCredential::OAuthToken {
+                    access_token: "token".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    account_id: None,
+                }
+            } else {
+                AuthCredential::ApiKey("key".to_string())
+            };
+            let built = ProviderBuilder::new(*backend, credential, "some-model")
+                .device_id("a".repeat(64))
+                .build();
+            assert!(
+                built.is_ok(),
+                "{backend} is supported but does not build: {:?}",
+                built.err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_chat_completions_profile_builds_from_an_api_key() {
         let result = ProviderBuilder::new(
-            "openai-api",
+            "openai-chat-completions",
             AuthCredential::ApiKey("key".to_string()),
             "gpt-4o",
         )
@@ -1580,9 +1673,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_claude_api() {
+    fn an_anthropic_messages_profile_builds_from_an_api_key() {
         let result = ProviderBuilder::new(
-            "claude-api",
+            "anthropic-messages",
             AuthCredential::ApiKey("key".to_string()),
             "claude-sonnet-4-20250514",
         )
@@ -1592,9 +1685,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_claude_oauth() {
+    fn a_claude_subscription_profile_builds_from_an_oauth_token() {
         let result = ProviderBuilder::new(
-            "claude-oauth",
+            "claude-subscription",
             AuthCredential::OAuthToken {
                 access_token: "sk-ant-oat01-test".to_string(),
                 refresh_token: None,
@@ -1609,9 +1702,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_claude_api_rejects_oauth_token() {
+    fn anthropic_messages_refuses_an_oauth_token() {
         let result = ProviderBuilder::new(
-            "claude-api",
+            "anthropic-messages",
             AuthCredential::OAuthToken {
                 access_token: "sk-ant-oat01-test".to_string(),
                 refresh_token: None,
@@ -1625,9 +1718,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_claude_oauth_rejects_api_key() {
+    fn claude_subscription_refuses_an_api_key() {
         let result = ProviderBuilder::new(
-            "claude-oauth",
+            "claude-subscription",
             AuthCredential::ApiKey("sk-ant-api03-test".to_string()),
             "claude-sonnet-4-20250514",
         )
@@ -1636,9 +1729,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_openai_codex() {
+    fn a_chatgpt_subscription_profile_builds_from_an_oauth_token() {
         let result = ProviderBuilder::new(
-            "openai-codex",
+            "chatgpt-subscription",
             AuthCredential::OAuthToken {
                 access_token: "codex-access".to_string(),
                 refresh_token: Some("codex-refresh".to_string()),
@@ -1653,9 +1746,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_openai_codex_rejects_api_key() {
+    fn chatgpt_subscription_refuses_an_api_key() {
         let result = ProviderBuilder::new(
-            "openai-codex",
+            "chatgpt-subscription",
             AuthCredential::ApiKey("sk-...".to_string()),
             "gpt-5",
         )

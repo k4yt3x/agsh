@@ -1,10 +1,20 @@
 //! OpenAI Responses API encoder + SSE decoder.
 //!
-//! Codex's subscription endpoint (`chatgpt.com/backend-api/codex/responses`) speaks the Responses
-//! API, not Chat Completions. The on-the-wire request shape is documented at
-//! <https://platform.openai.com/docs/guides/function-calling?api-mode=responses>.
+//! The protocol, not a backend: both [`super::responses`] (API key, any endpoint serving
+//! `/v1/responses`) and [`super::subscription`] (ChatGPT's `/backend-api/codex/responses`) drive
+//! this. It is the OpenAI counterpart of [`crate::provider::anthropic`]'s `shared`, and the reason
+//! Chat Completions is a separate module rather than a flag: the two are different wire formats,
+//! not two dialects of one.
 //!
-//! Reference Codex source:
+//! Nothing here may assume which endpoint is on the other end. `store: false` is set
+//! unconditionally because meka replays the whole conversation every turn and never uses
+//! server-side state, which also happens to be all the stateless implementations (Ollama, vLLM)
+//! support. Anything that *is* endpoint-specific -- the encrypted-reasoning `include`, auth
+//! headers, the URL -- belongs to the backend, not here.
+//!
+//! The on-the-wire request shape is documented at
+//! <https://platform.openai.com/docs/guides/function-calling?api-mode=responses>. Verified against
+//! the first-party Codex client:
 //! - request shape: `temp/codex/codex-rs/codex-api/src/common.rs:163`
 //! - input items:   `temp/codex/codex-rs/protocol/src/models.rs:686`
 //! - SSE events:    `temp/codex/codex-rs/codex-api/src/sse/responses.rs:283`
@@ -14,16 +24,16 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Abort the SSE read if no event arrives within this window. The ChatGPT backend can silently
-/// stall a stream; without a ceiling the turn would hang forever. Shared with the Claude and
-/// `openai-api` drivers, and matches codex's own `stream_idle_timeout` default
-/// (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a [`MekaError::StreamError`],
-/// which the agent retries when no output has been forwarded yet.
-use crate::provider::STREAM_IDLE_TIMEOUT as CODEX_STREAM_IDLE_TIMEOUT;
+/// Abort the SSE read if no event arrives within this window. A Responses endpoint can
+/// silently stall a stream; without a ceiling the turn would hang forever. Shared with the
+/// Anthropic and `openai-chat-completions` drivers, and matches the first-party Codex client's
+/// `stream_idle_timeout` default (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a
+/// [`MekaError::StreamError`], which the agent retries when no output has been forwarded yet.
+use crate::provider::STREAM_IDLE_TIMEOUT as RESPONSES_STREAM_IDLE_TIMEOUT;
 use crate::{
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        ContentBlock, Message, Notice, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
         ToolResultContent,
     },
 };
@@ -31,6 +41,10 @@ use crate::{
 /// Build the JSON body POSTed to `/responses`. Translates the meka internal `Message` /
 /// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
 /// `function_call_output`).
+///
+/// The result carries only what every Responses implementation understands. A backend that knows
+/// more about its own endpoint adds to it afterwards -- see
+/// [`include_encrypted_reasoning`], which only `chatgpt-subscription` applies.
 pub(super) fn build_request_body(
     model: &str,
     system_prompt: &str,
@@ -68,7 +82,6 @@ pub(super) fn build_request_body(
 
     if let Some(effort) = reasoning_effort {
         body["reasoning"] = serde_json::json!({"effort": effort});
-        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
     }
 
     if let Some(max_output) = max_output_tokens {
@@ -76,6 +89,111 @@ pub(super) fn build_request_body(
     }
 
     body
+}
+
+/// Fold a [`StreamEvent`] stream into the tuple [`crate::provider::Provider::complete`] returns.
+/// Mirrors the accumulation in `Agent::run_streaming_attempt` but without any frontend emission, so
+/// a streaming-only provider can satisfy the non-streaming completion contract by silently
+/// consuming its own SSE. Text deltas concatenate into a trailing `Text` block; tool-call and
+/// thinking events fold into their blocks; usage tiers merge; notices collect; `MessageEnd` sets
+/// the stop reason. `StreamEvent::Error` is logged, not returned: the typed error surfaces from the
+/// concurrently-awaited `stream` future in each backend's `complete`.
+pub(super) async fn aggregate_stream(
+    mut receiver: mpsc::Receiver<StreamEvent>,
+) -> (Message, StopReason, TokenUsage, Vec<Notice>) {
+    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    let mut current_text = String::new();
+    let mut current_thinking = String::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut stop_reason = StopReason::EndTurn;
+    let mut token_usage = TokenUsage::default();
+    let mut notices: Vec<Notice> = Vec::new();
+
+    while let Some(event) = receiver.recv().await {
+        match event {
+            StreamEvent::TextDelta(text) => current_text.push_str(&text),
+            StreamEvent::ThinkingDelta(text) => current_thinking.push_str(&text),
+            StreamEvent::ThinkingComplete { signature } => {
+                let thinking = std::mem::take(&mut current_thinking);
+                if !thinking.is_empty() || signature.is_some() {
+                    content_blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+            StreamEvent::RedactedThinking { data } => {
+                content_blocks.push(ContentBlock::RedactedThinking { data });
+            }
+            // A display-only liveness signal with nothing to accumulate. Only the Claude providers
+            // emit it today; the arm exists so adding it there cannot silently change what this
+            // provider persists.
+            StreamEvent::ThinkingProgress { .. } => {}
+            StreamEvent::ToolUseStart { id, name } => {
+                if !current_text.is_empty() {
+                    content_blocks.push(ContentBlock::Text {
+                        text: std::mem::take(&mut current_text),
+                    });
+                }
+                current_tool_id = id;
+                current_tool_name = name;
+            }
+            // The full arguments object arrives whole in `ToolUseEnd`; the incremental JSON only
+            // feeds the live renderer, which this silent path has none of.
+            StreamEvent::ToolInputDelta(_) => {}
+            StreamEvent::ToolUseEnd { input } => {
+                content_blocks.push(ContentBlock::ToolUse {
+                    id: std::mem::take(&mut current_tool_id),
+                    name: std::mem::take(&mut current_tool_name),
+                    input,
+                });
+            }
+            StreamEvent::ToolCallRejected { id, name, reason } => {
+                let input = serde_json::json!({
+                    crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
+                });
+                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            StreamEvent::MessageEnd {
+                stop_reason: reason,
+            } => stop_reason = reason,
+            StreamEvent::Usage(usage) => token_usage.merge_stream(&usage),
+            StreamEvent::Notice(notice) => notices.push(notice),
+            StreamEvent::Error(error) => {
+                tracing::error!("responses: stream error: {}", error);
+            }
+        }
+    }
+
+    if !current_text.is_empty() {
+        content_blocks.push(ContentBlock::Text { text: current_text });
+    }
+
+    (
+        Message {
+            role: Role::Assistant,
+            content: content_blocks,
+        },
+        stop_reason,
+        token_usage,
+        notices,
+    )
+}
+
+/// Ask the server to round-trip its reasoning as `reasoning.encrypted_content`.
+///
+/// A no-op unless the request already asks for reasoning, since there would be nothing to encrypt.
+///
+/// This is *not* in [`build_request_body`] because it is a fact about one endpoint rather than
+/// about the protocol. `include` is an OpenAI extension; `chatgpt-subscription` sends it because
+/// its endpoint is always ChatGPT and the first-party Codex client sends it, while
+/// `openai-responses` reaches Ollama, vLLM, LM Studio and OpenRouter, where meka has no basis for
+/// assuming it is understood and a rejected request is the cost of guessing wrong.
+pub(super) fn include_encrypted_reasoning(body: &mut serde_json::Value) {
+    if body.get("reasoning").is_some() {
+        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    }
 }
 
 /// Build the `output` field of a `function_call_output` item from a slice of `ToolResultContent`.
@@ -115,7 +233,7 @@ fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value 
 fn input_image_part(source: &crate::provider::ImageSource) -> serde_json::Value {
     serde_json::json!({
         "type": "input_image",
-        "image_url": super::super::data_url(source),
+        "image_url": super::data_url(source),
         "detail": "auto",
     })
 }
@@ -238,8 +356,22 @@ struct ActiveToolCall {
 /// OpenAI documents as transient server-side conditions are retryable; anything else (including
 /// unrecognized codes) is treated as permanent so a real problem surfaces immediately instead of
 /// being masked by retries.
-fn is_retryable_codex_error_code(code: &str) -> bool {
+fn is_retryable_responses_error_code(code: &str) -> bool {
     matches!(code, "server_error" | "rate_limit_exceeded" | "overloaded")
+}
+
+/// Which Responses frame this is: the payload's `type`, falling back to the SSE `event:` line.
+///
+/// The payload field is the spec's discriminator and is always present; the `event:` line is an
+/// optional convenience only some servers set. Reading the event name alone worked while ChatGPT
+/// and OpenAI -- which send both -- were the only endpoints meka reached, and broke the moment an
+/// API-key backend could point anywhere: OpenRouter streams bare `data:` frames, so every frame
+/// looked unhandled and a perfectly good turn died with "stream ended before a terminal response
+/// event". The fallback keeps working for any server that names the event but omits `type`.
+fn frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
+    data.get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or(event_name)
 }
 
 pub(super) fn process_event(
@@ -422,7 +554,7 @@ pub(super) fn process_event(
                 .and_then(|error| error.get("code").or_else(|| error.get("type")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            return Err(if is_retryable_codex_error_code(error_code) {
+            return Err(if is_retryable_responses_error_code(error_code) {
                 MekaError::RetryableProvider {
                     message,
                     retry_after: None,
@@ -447,7 +579,7 @@ pub(super) fn process_event(
         }
 
         other => {
-            tracing::debug!("unhandled Codex SSE event: {}", other);
+            tracing::debug!("unhandled Responses SSE event: {}", other);
         }
     }
     Ok(out)
@@ -459,7 +591,7 @@ fn parse_response_status(status: &str) -> StopReason {
         "incomplete" => StopReason::MaxTokens,
         other => {
             tracing::warn!(
-                "Codex returned unrecognized response status {other:?}; mapping to Unknown"
+                "the Responses endpoint returned an unrecognized response status {other:?}; mapping to Unknown"
             );
             StopReason::Unknown(other.to_string())
         }
@@ -477,7 +609,7 @@ pub(super) async fn drive_responses_sse_stream(
     if !status.is_success() {
         let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.unwrap_or_else(|error| {
-            tracing::warn!("failed to read Codex error response body: {}", error);
+            tracing::warn!("failed to read the Responses error body: {}", error);
             String::new()
         });
         return Err(crate::error::provider_http_error(
@@ -495,15 +627,15 @@ pub(super) async fn drive_responses_sse_stream(
             _ = cancellation.cancelled() => {
                 return Err(MekaError::Interrupted);
             }
-            event = tokio::time::timeout(CODEX_STREAM_IDLE_TIMEOUT, event_stream.next()) => {
+            event = tokio::time::timeout(RESPONSES_STREAM_IDLE_TIMEOUT, event_stream.next()) => {
                 let event = match event {
                     Ok(event) => event,
                     Err(_elapsed) => {
                         // No event for the idle window: treat a stalled stream as a transport
                         // error so the agent can retry rather than hang forever.
                         let message = format!(
-                            "idle timeout waiting for Codex SSE event after {}s",
-                            CODEX_STREAM_IDLE_TIMEOUT.as_secs()
+                            "idle timeout waiting for a Responses SSE event after {}s",
+                            RESPONSES_STREAM_IDLE_TIMEOUT.as_secs()
                         );
                         if event_sender
                             .send(StreamEvent::Error(message.clone()))
@@ -533,12 +665,12 @@ pub(super) async fn drive_responses_sse_stream(
                 let data: serde_json::Value = match serde_json::from_str(&event.data) {
                     Ok(data) => data,
                     Err(error) => {
-                        tracing::warn!("failed to parse Codex SSE data: {}", error);
+                        tracing::warn!("failed to parse Responses SSE data: {}", error);
                         continue;
                     }
                 };
 
-                let outcomes = process_event(&event.event, &data, &mut state);
+                let outcomes = process_event(frame_name(&data, &event.event), &data, &mut state);
                 let events = match outcomes {
                     Ok(events) => events,
                     Err(error) => {
@@ -575,7 +707,7 @@ pub(super) async fn drive_responses_sse_stream(
     // Falling through here committed a truncated turn as a complete one: the agent saw whatever
     // text had arrived, wrote it to the conversation, and moved on, with the retry path never
     // consulted. A connection cut mid-response is exactly what that path exists for.
-    let message = "Codex stream ended before a terminal response event".to_string();
+    let message = "the Responses stream ended before a terminal response event".to_string();
     if event_sender
         .send(StreamEvent::Error(message.clone()))
         .await
@@ -709,9 +841,15 @@ mod tests {
         assert!(tools_arr[0].get("function").is_none());
     }
 
+    /// The shared body carries only what every Responses implementation understands.
+    ///
+    /// `include` is an OpenAI extension, so it is not the protocol's to add: it was moved out of
+    /// here when `openai-responses` arrived, because that backend reaches servers where an
+    /// unrecognised field is a rejected request. The subscription backend opts in explicitly, and
+    /// its half of this split is asserted alongside.
     #[test]
-    fn test_request_body_reasoning_effort_attaches_include_field() {
-        let body = build_request_body(
+    fn the_shared_body_asks_for_reasoning_but_never_for_an_openai_extension() {
+        let mut body = build_request_body(
             "gpt-5",
             "",
             &[Message::user("think hard")],
@@ -721,10 +859,26 @@ mod tests {
             true,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
-        // Codex always asks for encrypted reasoning content so the server round-trips reasoning
-        // blocks across multi-turn conversations.
+        assert!(body.get("include").is_none(), "{body}");
+
+        // The subscription backend adds it, so reasoning survives a stateless round trip against
+        // ChatGPT, whose support for it is a fact rather than a guess.
+        include_encrypted_reasoning(&mut body);
         let include = body["include"].as_array().expect("include");
-        assert!(include.iter().any(|v| v == "reasoning.encrypted_content"));
+        assert!(
+            include
+                .iter()
+                .any(|value| value == "reasoning.encrypted_content")
+        );
+    }
+
+    /// Nothing to encrypt means nothing to ask for.
+    #[test]
+    fn the_encrypted_reasoning_include_is_a_no_op_without_reasoning() {
+        let mut body =
+            build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
+        include_encrypted_reasoning(&mut body);
+        assert!(body.get("include").is_none(), "{body}");
     }
 
     #[test]
@@ -820,6 +974,46 @@ mod tests {
             }
         }
         (emitted, outcome)
+    }
+
+    /// A frame is named by its payload, not by the SSE `event:` line.
+    ///
+    /// Found against OpenRouter, which sends bare `data:` frames. That is valid SSE and the
+    /// Responses spec's own discriminator is the payload's `type`; the `event:` line is an optional
+    /// convenience. Keying off the event name alone worked only while ChatGPT and OpenAI -- which
+    /// send both -- were the only endpoints meka reached, and failed the moment an API-key backend
+    /// could point anywhere. The symptom was total: every frame looked unhandled, so a turn that
+    /// streamed perfectly well died with "stream ended before a terminal response event".
+    ///
+    /// Both orderings are asserted, because a fix that read only the payload would break the
+    /// endpoints that name the event and send a payload without one.
+    #[test]
+    fn a_frame_is_identified_by_its_payload_type_not_the_sse_event_name() {
+        // How OpenRouter streams: bare `data:`, no event name, type in the payload.
+        let bare = serde_json::json!({"type": "response.output_text.delta", "delta": "hi"});
+        assert_eq!(frame_name(&bare, ""), "response.output_text.delta");
+
+        // How ChatGPT streams: the event named and the payload agreeing.
+        assert_eq!(
+            frame_name(&bare, "response.output_text.delta"),
+            "response.output_text.delta"
+        );
+
+        // A payload with no `type` still falls back to the event name, so an endpoint that names
+        // the event and omits the field keeps working.
+        let untyped = serde_json::json!({"delta": "hi"});
+        assert_eq!(
+            frame_name(&untyped, "response.output_text.delta"),
+            "response.output_text.delta"
+        );
+
+        // And the name that comes out actually drives the decoder.
+        let (emitted, _) =
+            run_events(&[(frame_name(&bare, ""), serde_json::json!({"delta": "hi"}))]);
+        assert!(
+            matches!(emitted.as_slice(), [StreamEvent::TextDelta(text)] if text == "hi"),
+            "{emitted:?}"
+        );
     }
 
     #[test]
@@ -938,6 +1132,40 @@ mod tests {
         (events, outcome)
     }
 
+    /// A stream of bare `data:` frames decodes, end to end, through the real driver.
+    ///
+    /// This is how OpenRouter streams: valid SSE with no `event:` line, the frame named only by the
+    /// payload's `type`. It has to be asserted here rather than against [`frame_name`] alone,
+    /// because the bug was the *call site* -- the helper can be perfect while the driver still
+    /// passes it the wrong string. Every other case in this harness carries an `event:` line and a
+    /// payload without a `type`, so they exercise only the fallback branch and all stayed green
+    /// while every OpenRouter turn died with "stream ended before a terminal response event".
+    #[tokio::test]
+    async fn a_stream_of_bare_data_frames_decodes_end_to_end() {
+        let (events, outcome) = decode_sse(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"PO\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"NG\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
+             \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        ))
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "PONG", "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. })),
+            "the terminal frame must be recognised too: {events:?}"
+        );
+    }
+
     /// A connection cut partway through the answer never sends `response.completed`. Committing
     /// that as a finished turn hands the agent half a response and never consults the retry path,
     /// which is the one case that path exists for.
@@ -976,9 +1204,9 @@ mod tests {
         outcome.expect("a stream with a terminal event is complete");
     }
 
-    /// The Codex half of the same boundary the Claude decoder has: arguments that do not parse are
-    /// the model's intent, mangled, and running the tool with `{}` executes something it never
-    /// asked for while reporting success.
+    /// The Responses half of the same boundary the Anthropic decoder has: arguments that do not
+    /// parse are the model's intent, mangled, and running the tool with `{}` executes something
+    /// it never asked for while reporting success.
     #[test]
     fn a_tool_call_with_unparseable_arguments_is_rejected_not_run_empty() {
         let (events, outcome) = run_events(&[
@@ -1150,12 +1378,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_retryable_codex_error_code() {
+    fn test_is_retryable_responses_error_code() {
         for retryable in ["server_error", "rate_limit_exceeded", "overloaded"] {
-            assert!(is_retryable_codex_error_code(retryable));
+            assert!(is_retryable_responses_error_code(retryable));
         }
         for permanent in ["invalid_request_error", "unknown", ""] {
-            assert!(!is_retryable_codex_error_code(permanent));
+            assert!(!is_retryable_responses_error_code(permanent));
         }
     }
 

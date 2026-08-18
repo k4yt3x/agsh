@@ -5,7 +5,7 @@ meka is configured with named **provider profiles** in a config file at
 is to let `meka provider add` write both for you:
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-5
+$ meka provider add work --type claude-subscription --model claude-opus-5
 ```
 
 That command writes a `[providers.work]` profile to the config file, runs the OAuth login (or prompts
@@ -16,7 +16,7 @@ the default. The resulting config looks like:
 default_provider = "work"
 
 [providers.work]
-type  = "claude-oauth"
+type  = "claude-subscription"
 model = "claude-opus-5"
 ```
 
@@ -52,8 +52,8 @@ that run. There is **no environment-variable tier** for provider configuration; 
 The credential for the active profile is loaded from the database, keyed by the profile name. It is
 acquired interactively:
 
-- `meka provider add <name>` runs the OAuth login (`claude-oauth`, `openai-codex`) or prompts for the
-  API key (`claude-api`, `openai-api`) when the profile is created.
+- `meka provider add <name>` runs the OAuth login (`claude-subscription`, `chatgpt-subscription`) or prompts for the
+  API key (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) when the profile is created.
 - `meka provider login <name>` re-acquires it for an existing profile (rotate an API key, recover
   from a dead OAuth refresh token).
 - `meka provider remove <name>` deletes the stored credential and the profile.

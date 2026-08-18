@@ -30,7 +30,7 @@ The same agent core is exposed through four front-ends:
 - **Sub-agents**: delegate research or analysis to sub-agents that can orchestrate their own sub-agent teams and be run at a restricted permission level
 - **Skills**: load reusable, user-authored instruction packages on demand
 - **Context management**: automatic compaction keeps long sessions under the model's context limit
-- **Extended thinking**: `claude-api` and `claude-oauth` support extended thinking for complex reasoning
+- **Extended thinking**: `anthropic-messages` and `claude-subscription` support extended thinking for complex reasoning
 
 ## How It Works
 

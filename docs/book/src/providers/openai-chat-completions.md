@@ -1,12 +1,16 @@
-# OpenAI API Provider
+# OpenAI Chat Completions
 
-The `openai-api` provider uses the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat). It also works with any OpenAI-compatible API endpoint (Ollama, vLLM, OpenRouter, etc.).
+The **Chat Completions API** (`POST {base_url}/chat/completions`) with an API key. Works against OpenAI and any endpoint implementing that format: Ollama, vLLM, LM Studio, OpenRouter, Synthetic, LiteLLM.
+
+This is *not* the legacy `/v1/completions` endpoint, which is a different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. Several of those same servers also expose it; meka does not implement it.
+
+For the same key against OpenAI's newer protocol, see [`openai-responses`](./openai-responses.md).
 
 ## Configuration
 
 | Setting | Value |
 |---------|-------|
-| Profile `type` | `openai-api` |
+| Profile `type` | `openai-chat-completions` |
 | Default base URL | `https://api.openai.com/v1` |
 | Credential | API key (`sk-...`) stored in the database |
 | Auth method | Bearer token (`Authorization: Bearer <key>`) |
@@ -14,7 +18,7 @@ The `openai-api` provider uses the [Chat Completions API](https://platform.opena
 ### Quickest Start
 
 ```bash
-meka provider add openai --type openai-api --model gpt-4o
+meka provider add openai --type openai-chat-completions --model gpt-4o
 ```
 
 `meka provider add` prompts for your OpenAI API key, stores it in the database, and writes the
@@ -29,7 +33,7 @@ meka provider add openai --type openai-api --model gpt-4o
 default_provider = "openai"
 
 [providers.openai]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "gpt-4o"
 ```
 
@@ -48,11 +52,11 @@ To use an OpenAI-compatible endpoint, set the profile's `base_url`. Add it when 
 
 ```bash
 # Ollama (no real key; pipe a placeholder)
-printf 'unused' | meka provider add ollama --type openai-api --model llama3 \
+printf 'unused' | meka provider add ollama --type openai-chat-completions --model llama3 \
     --base-url http://localhost:11434/v1 --api-key-stdin
 
 # OpenRouter
-meka provider add openrouter --type openai-api --model anthropic/claude-sonnet-4.6 \
+meka provider add openrouter --type openai-chat-completions --model anthropic/claude-sonnet-4.6 \
     --base-url https://openrouter.ai/api/v1
 ```
 
@@ -60,7 +64,7 @@ The resulting profile (the key, if any, lives in the database):
 
 ```toml
 [providers.ollama]
-type = "openai-api"
+type = "openai-chat-completions"
 model = "llama3"
 base_url = "http://localhost:11434/v1"
 ```

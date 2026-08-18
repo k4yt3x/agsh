@@ -6,7 +6,7 @@ takes an optional profile (defaults to the active provider, same as `--provider`
 `--format plain|json`. The requested data goes to **stdout**; notes and errors go to **stderr**, so
 `meka account … 2>/dev/null | jq` stays clean.
 
-Availability is per backend: `claude-oauth` and `openai-codex` (subscription OAuth) support these;
+Availability is per backend: `claude-subscription` and `chatgpt-subscription` (subscription OAuth) support these;
 API-key backends, OpenAI-compatible endpoints, and Ollama print a short "not available" note and
 exit non-zero.
 
@@ -46,7 +46,7 @@ credential (no network), so even when the identity call fails because the token 
 
 ```console
 $ meka account whoami
-Account: claude-max (claude-oauth)
+Account: claude-max (claude-subscription)
   Auth:          valid (5h 45m)
   Plan:          claude_max
   Tier:          default_claude_max_20x
@@ -56,7 +56,7 @@ Account: claude-max (claude-oauth)
 $ meka account whoami --format json
 {
   "provider": "claude-max",
-  "backend": "claude-oauth",
+  "backend": "claude-subscription",
   "auth": { "valid": true, "expires_at": 1782971829, "expires_in_seconds": 20709 },
   "identity": { "plan": "claude_max", "tier": "default_claude_max_20x",
                 "subscription_status": "active", "role": "admin", ... }
@@ -68,8 +68,8 @@ are in seconds; a negative `expires_in_seconds` (or `valid: false`) means "run `
 
 ## `meka account stats`
 
-Historical usage. `openai-codex` is rich (lifetime tokens, peak day, streaks, and per-day token
-counts); `claude-oauth` reports only a first-used date:
+Historical usage. `chatgpt-subscription` is rich (lifetime tokens, peak day, streaks, and per-day token
+counts); `claude-subscription` reports only a first-used date:
 
 ```console
 $ meka account stats

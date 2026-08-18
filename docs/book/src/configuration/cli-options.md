@@ -13,7 +13,7 @@ Manage provider profiles (add, list, switch, login, remove). `meka provider add`
 `[providers.<name>]` profile to `~/.config/meka/config.toml` and stores its secret in the database.
 
 ```bash
-meka provider add work --type claude-oauth --model claude-opus-5
+meka provider add work --type claude-subscription --model claude-opus-5
 meka provider list
 meka provider use work
 meka provider login work
@@ -156,7 +156,7 @@ Can also be set permanently via `display.render_mode` in the config file.
 
 ### `--thinking <MODE>`
 
-Extended thinking mode for this run (`claude-api` and `claude-oauth` providers): `adaptive`,
+Extended thinking mode for this run (`anthropic-messages` and `claude-subscription` providers): `adaptive`,
 `budgeted`, or `off`. Overrides the profile's
 [`thinking`](./config-file.md#thinking) key, which defaults to `adaptive`.
 

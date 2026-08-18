@@ -16,10 +16,11 @@ meka is a general-purpose AI agent harness: it wraps a large language model with
 
 Supported providers:
 
-- **OpenAI API**: bring your own API key. Also works with any OpenAI-compatible endpoint.
-- **OpenAI Codex**: authenticate with a ChatGPT subscription.
-- **Claude API**: bring your own API key.
-- **Claude OAuth**: authenticate with a Claude subscription.
+- **Anthropic Messages**: bring your own API key; also reaches LiteLLM, Ollama and other servers implementing it.
+- **Claude subscription**: authenticate with a Claude subscription.
+- **OpenAI Chat Completions**: bring your own API key; works with any endpoint serving that format.
+- **OpenAI Responses**: OpenAI's newer protocol, likewise against any server that offers it.
+- **ChatGPT subscription**: authenticate with a ChatGPT subscription.
 
 ## Installation
 
@@ -36,13 +37,13 @@ Building from source needs Rust 1.95 or newer and a C toolchain, which `rusqlite
 Add a provider profile with `meka provider add`. It runs the OAuth login (or prompts for an API key), stores the secret in the database, and writes the profile to `~/.config/meka/config.toml`:
 
 ```bash
-meka provider add work --type claude-oauth --model claude-opus-4-6
+meka provider add work --type claude-subscription --model claude-opus-5
 ```
 
-The profile pins a backend `type` (`openai-api`, `openai-codex`, `claude-api`, or `claude-oauth`) plus a model. Add several profiles and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
+The profile pins a backend `type` plus a model. A backend names the wire protocol it speaks - `anthropic-messages`, `openai-chat-completions`, `openai-responses` - or, for the two subscription backends, the account it bills: `claude-subscription`, `chatgpt-subscription`. Add several profiles and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
 
 ```bash
-meka provider add openrouter --type openai-api --model anthropic/claude-opus-4.6 \
+meka provider add openrouter --type openai-chat-completions --model anthropic/claude-opus-4.6 \
     --base-url https://openrouter.ai/api/v1
 ```
 

@@ -1,13 +1,30 @@
 # Providers Overview
 
-Providers are the LLM inference backends that meka uses to process your instructions. meka ships with four built-in backends, each selectable as a profile `type`:
+Providers are the LLM inference backends meka uses to run your instructions. meka ships with five, each selectable as a profile `type`:
 
-| Backend | Auth | API | Notes |
-|---------|------|-----|-------|
-| [`openai-api`](./openai-api.md) | API key | Chat Completions | Works with OpenAI and any compatible endpoint (Ollama, vLLM, OpenRouter, …) |
-| [`openai-codex`](./openai-codex.md) | OAuth login | OpenAI Responses | Uses a ChatGPT subscription; talks to `chatgpt.com/backend-api/codex` like the Codex CLI |
-| [`claude-api`](./claude-api.md) | API key | Claude Messages | Direct Claude API, billed per-token |
-| [`claude-oauth`](./claude-oauth.md) | OAuth login | Claude Messages | Uses a Claude Code subscription; replicates Claude Code's request shape and attestation |
+| Backend | Protocol | Endpoint | Auth |
+|---------|----------|----------|------|
+| [`anthropic-messages`](./anthropic-messages.md) | Anthropic Messages | `{base}/v1/messages` | API key |
+| [`claude-subscription`](./claude-subscription.md) | Anthropic Messages | `api.anthropic.com/v1/messages` | Claude subscription |
+| [`openai-chat-completions`](./openai-chat-completions.md) | OpenAI Chat Completions | `{base}/chat/completions` | API key |
+| [`openai-responses`](./openai-responses.md) | OpenAI Responses | `{base}/responses` | API key |
+| [`chatgpt-subscription`](./chatgpt-subscription.md) | OpenAI Responses | `chatgpt.com/backend-api/codex/responses` | ChatGPT subscription |
+
+**A backend names the wire protocol, not a vendor.** That is deliberate, and it cuts both ways. One vendor can serve several protocols: OpenAI publishes Chat Completions *and* Responses, and they are different request shapes, not options on one. One protocol is served by many vendors: `/v1/messages` is implemented by Anthropic, Amazon Bedrock, Databricks, LiteLLM and Ollama, so calling it "the Claude API" would misname it the moment you point it elsewhere.
+
+The two subscription backends are the exception, and carry a vendor name instead. What you pick there is a billing relationship; the endpoint and the client shape come with it and are not yours to choose.
+
+Synthetic is the clearest case for why this matters. One vendor, two protocols, two base URLs:
+
+```toml
+[providers.synthetic-claude]
+type     = "anthropic-messages"
+base_url = "https://api.synthetic.new/anthropic/v1"
+
+[providers.synthetic-gpt]
+type     = "openai-chat-completions"
+base_url = "https://api.synthetic.new/openai/v1"
+```
 
 ## Configuring a Provider
 
@@ -15,7 +32,7 @@ Providers are configured as named profiles. The easiest way is `meka provider ad
 profile to the config file and stores the secret (API key or OAuth token) in the database:
 
 ```console
-$ meka provider add work --type claude-oauth --model claude-opus-5
+$ meka provider add work --type claude-subscription --model claude-opus-5
 ```
 
 This produces a `[providers.work]` entry in `~/.config/meka/config.toml`:
@@ -24,7 +41,7 @@ This produces a `[providers.work]` entry in `~/.config/meka/config.toml`:
 default_provider = "work"
 
 [providers.work]
-type  = "claude-oauth"
+type  = "claude-subscription"
 model = "claude-opus-5"
 ```
 
@@ -40,30 +57,39 @@ meka provider use work   # persist as default_provider
 
 There is no environment-variable override for provider selection.
 
-## OpenAI-Compatible APIs
+## Pointing a backend somewhere else
 
-The `openai-api` backend works with any API that implements the OpenAI Chat Completions format. This includes:
+Every API-key backend takes a `base_url` (or `--base-url` for one run), so the protocol you pick is independent of who serves it:
 
-- **OpenAI** (default endpoint)
-- **Ollama** (`http://localhost:11434/v1`)
-- **OpenRouter** (`https://openrouter.ai/api/v1`)
-- **vLLM**, **LiteLLM**, and other OpenAI-compatible servers
+| Server | Chat Completions | Responses | Anthropic Messages |
+|--------|------------------|-----------|--------------------|
+| OpenAI | yes | yes | no |
+| Anthropic | no | no | yes |
+| Ollama | yes | yes (v0.13.3+) | yes |
+| OpenRouter | yes | yes (beta) | yes |
+| vLLM / LM Studio | yes | yes | no |
+| Synthetic | yes | no | yes |
 
-Set the profile's `base_url` (or the `--base-url` flag for one run) to point at the alternative endpoint.
+Where a server offers both OpenAI protocols, prefer [`openai-responses`](./openai-responses.md): it is what OpenAI recommends for new work and what the agent tooling ecosystem has moved to. Use `openai-chat-completions` for a server that does not serve Responses.
 
-## claude-api vs claude-oauth
+Note that several of these also expose a **legacy `/v1/completions`** endpoint. That is a third, different protocol: a bare `prompt` string in, `choices[].text` out, no tool calling. meka does not speak it. It cannot: the agent loop needs tool calls, which that protocol has no representation for.
+
+## anthropic-messages vs claude-subscription
 
 Both talk to Claude's `/v1/messages` endpoint, but the auth and request shape differ:
 
-- **`claude-api`** is the straightforward path: an `x-api-key` header, a plain system prompt, no extra headers. Choose this when you have a Claude API key.
-- **`claude-oauth`** replicates the Claude Code CLI exactly: OAuth tokens, fingerprint-encoded version header, xxHash64 attestation over the request body, injected billing system block. Choose this when you want to use a Claude Code subscription. Any deviation from the expected shape causes requests to be rejected, so avoid proxies that rewrite headers or reformat the body.
+- **`anthropic-messages`** is the straightforward path: an `x-api-key` header, a plain system prompt, no extra headers. Choose this when you have a Claude API key.
+- **`claude-subscription`** replicates the Claude Code CLI exactly: OAuth tokens, fingerprint-encoded version header, xxHash64 attestation over the request body, injected billing system block. Choose this when you want to use a Claude Code subscription. Any deviation from the expected shape causes requests to be rejected, so avoid proxies that rewrite headers or reformat the body.
 
-## openai-api vs openai-codex
+## Choosing between the OpenAI backends
 
-The two OpenAI-flavoured providers hit different endpoints with different protocols:
+Three backends, two protocols:
 
-- **`openai-api`** posts to `/chat/completions` on `api.openai.com` (or any compatible endpoint), authenticating with an API key. This is the right choice when you have an OpenAI billing account or are pointing at a self-hosted OpenAI-compatible server.
-- **`openai-codex`** posts to `chatgpt.com/backend-api/codex/responses` using the **OpenAI Responses API** (a different protocol: different request body shape, different streaming events). Authentication is OAuth against `auth.openai.com`, mirroring the first-party Codex CLI. Choose this to use a ChatGPT Plus / Pro / Team / Business subscription instead of a per-token API key.
+- **`openai-chat-completions`** posts to `/chat/completions` with an API key. Choose it for a server that serves only this protocol.
+- **`openai-responses`** posts to `/responses` with an API key, the same protocol `chatgpt-subscription` uses. Choose it for OpenAI, or for any server that serves Responses.
+- **`chatgpt-subscription`** posts to `chatgpt.com/backend-api/codex/responses`, authenticating by OAuth against `auth.openai.com` and mirroring the first-party Codex CLI. Choose it to bill a ChatGPT Plus / Pro / Team / Business subscription instead of a per-token API key.
+
+The first two differ by protocol; the last two differ only by auth and endpoint.
 
 ## Streaming vs Non-Streaming
 

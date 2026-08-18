@@ -81,7 +81,7 @@ impl ServeTestHarness {
             let config = format!(
                 r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -5522,7 +5522,7 @@ fn providers_endpoint_lists_profiles_and_marks_the_active_one() {
         .iter()
         .find(|p| p["name"] == "mock")
         .expect("the harness configures a 'mock' profile");
-    assert_eq!(mock["type"], "claude-api");
+    assert_eq!(mock["type"], "anthropic-messages");
     assert_eq!(mock["active"], true);
     // Credentials live in the database keyed by profile name and must never transit this API.
     let serialized = body.to_string();
@@ -6396,7 +6396,7 @@ fn unknown_webhook_event_is_a_startup_error() {
         config_dir.join("config.toml"),
         r#"
 [providers.mock]
-type = "claude-api"
+type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [serve]
@@ -7001,7 +7001,7 @@ fn zero_valued_serve_knobs_are_rejected_at_startup() {
         std::fs::write(
             config_dir.join("config.toml"),
             format!(
-                "[providers.mock]\ntype = \"claude-api\"\nmodel = \"claude-sonnet-4-5\"\n\n\
+                "[providers.mock]\ntype = \"anthropic-messages\"\nmodel = \"claude-sonnet-4-5\"\n\n\
                  [serve]\nbind = \"127.0.0.1:0\"\n{}{}\n\
                  [[serve.tokens]]\ntoken = \"t\"\nscopes = [\"sessions:r\"]\n",
                 snippet, webhook

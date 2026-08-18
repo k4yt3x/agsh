@@ -11,7 +11,8 @@ use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 use super::{
-    AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, DEFAULT_OPENAI_CODEX_CLIENT_ID, SUPPORTED_PROVIDERS,
+    AuthCredential, DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
+    SUPPORTED_PROVIDERS,
 };
 use crate::{cli::ProviderAction, config, session::TokenStore};
 
@@ -21,8 +22,8 @@ const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 const SCOPES: &str =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers";
 
-/// `openai-codex` OAuth flow constants. Mirror Codex's first-party CLI: the authorization server
-/// lives at `auth.openai.com`, the redirect listener binds on `localhost:1455`.
+/// `chatgpt-subscription` OAuth flow constants. Mirror Codex's first-party CLI: the authorization
+/// server lives at `auth.openai.com`, the redirect listener binds on `localhost:1455`.
 const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_PORT: u16 = 1455;
@@ -351,8 +352,10 @@ fn validate_backend(value: &str) -> anyhow::Result<&str> {
 /// sensible default (none currently), where the prompt then requires an explicit answer.
 fn default_model_for(backend: &str) -> Option<&'static str> {
     match backend {
-        "claude-api" | "claude-oauth" => Some("claude-opus-5"),
-        "openai-api" | "openai-codex" => Some("gpt-5.6-sol"),
+        "anthropic-messages" | "claude-subscription" => Some("claude-opus-5"),
+        "openai-chat-completions" | "openai-responses" | "chatgpt-subscription" => {
+            Some("gpt-5.6-sol")
+        }
         _ => None,
     }
 }
@@ -366,6 +369,41 @@ fn join_profile_names(config_file: &config::ConfigFile) -> String {
         .join(", ")
 }
 
+/// How a backend proves who it is: an interactive OAuth flow, or a key the user pastes.
+///
+/// Split out from [`acquire_credential`] so the "every supported backend is accounted for" property
+/// can be tested without running a login. It used to be a bare match arm ending in
+/// `unreachable!()`, which was reachable: [`validate_backend`] accepts anything in
+/// [`crate::provider::SUPPORTED_PROVIDERS`], so adding a backend there and forgetting this match
+/// panicked at the credential step rather than failing to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialKind {
+    /// A Claude subscription login, against Anthropic's authorization server.
+    ClaudeLogin,
+    /// A ChatGPT subscription login, against OpenAI's.
+    ChatGptLogin,
+    /// A key the user supplies, for any endpoint the backend's protocol reaches.
+    ApiKey,
+}
+
+/// Which flow acquires this backend's credential, naming the *specific* login rather than "OAuth".
+///
+/// The distinction is load-bearing: the two subscription flows use different client IDs, scopes and
+/// callback handling, and they are not interchangeable. An earlier shape had one `OAuth` variant
+/// with the vendor picked by a string test inside the dispatch arm, which meant a third OAuth
+/// backend would silently receive OpenAI's login while still satisfying a test that only asserted
+/// *some* kind existed. Making the variant carry the vendor moves that into the match.
+fn credential_kind(backend: &str) -> Option<CredentialKind> {
+    match backend {
+        "claude-subscription" => Some(CredentialKind::ClaudeLogin),
+        "chatgpt-subscription" => Some(CredentialKind::ChatGptLogin),
+        "anthropic-messages" | "openai-chat-completions" | "openai-responses" => {
+            Some(CredentialKind::ApiKey)
+        }
+        _ => None,
+    }
+}
+
 /// Acquire a credential for `backend`: run the OAuth flow for OAuth backends, or read an API key
 /// (from stdin when `api_key_stdin`, else an interactive prompt) for key backends.
 async fn acquire_credential(
@@ -373,10 +411,10 @@ async fn acquire_credential(
     api_key_stdin: bool,
     client_id: Option<&str>,
 ) -> anyhow::Result<AuthCredential> {
-    match backend {
-        "claude-oauth" => claude_login(client_id).await,
-        "openai-codex" => codex_login(client_id).await,
-        "claude-api" | "openai-api" => {
+    match credential_kind(backend) {
+        Some(CredentialKind::ClaudeLogin) => claude_login(client_id).await,
+        Some(CredentialKind::ChatGptLogin) => codex_login(client_id).await,
+        Some(CredentialKind::ApiKey) => {
             let key = if api_key_stdin {
                 let mut buffer = String::new();
                 io::stdin().read_to_string(&mut buffer)?;
@@ -389,7 +427,11 @@ async fn acquire_credential(
             }
             Ok(AuthCredential::ApiKey(key))
         }
-        other => validate_backend(other).map(|_| unreachable!()),
+        // `validate_backend` rejects with the supported list; the `?` is what actually returns.
+        None => {
+            validate_backend(backend)?;
+            anyhow::bail!("no credential flow is defined for backend '{}'", backend)
+        }
     }
 }
 
@@ -574,16 +616,16 @@ fn resolve_tuning(
     // already set one, else the built-in default. Showing the constant unconditionally would state
     // a window the run is not going to use.
     let effective_window = session_window.unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
-    // `thinking` is a Claude request field, so an OpenAI profile is neither asked about it nor told
-    // what it defaults to: writing the key there would produce a setting that reads plausibly and
-    // does nothing.
-    let takes_thinking = backend.starts_with("claude");
+    // `thinking` is an Anthropic Messages request field, so an OpenAI profile is neither asked
+    // about it nor told what it defaults to: writing the key there would produce a setting that
+    // reads plausibly and does nothing.
+    let takes_thinking = crate::provider::backend_takes_thinking(backend);
     let mut flags = flags;
     // The flag is dropped, not just left unprompted. Guarding only the prompt produced a run that
     // printed "using defaults:" without thinking *and* wrote `thinking` into the profile.
     if !takes_thinking && flags.thinking.take().is_some() {
         tracing::warn!(
-            "ignoring --thinking for a '{}' profile: thinking is a Claude request field",
+            "ignoring --thinking for a '{}' profile: thinking is an Anthropic Messages request field",
             backend
         );
     }
@@ -802,13 +844,30 @@ fn prompt_line(prompt: &str) -> io::Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// The `provider add` menu.
+///
+/// Ordered subscription-then-key within each vendor, and `openai-responses` directly under
+/// `openai-chat-completions` because the two are a protocol choice against the same key: Responses
+/// is what new work should use, Chat Completions is what a server that doesn't serve Responses
+/// still speaks.
+/// The menu entries, in the order they are offered. Separate from [`prompt_backend`] so a test can
+/// check it against [`crate::provider::SUPPORTED_PROVIDERS`]: this is the last hand-written backend
+/// list, and a backend missing from it is simply never offered interactively, with nothing failing.
+fn backend_menu() -> [(&'static str, &'static str); 5] {
+    [
+        ("claude-subscription", "Claude subscription login"),
+        ("anthropic-messages", "Anthropic Messages API key"),
+        ("chatgpt-subscription", "ChatGPT subscription login"),
+        (
+            "openai-chat-completions",
+            "OpenAI-compatible Chat Completions API key",
+        ),
+        ("openai-responses", "OpenAI-compatible Responses API key"),
+    ]
+}
+
 fn prompt_backend() -> anyhow::Result<String> {
-    let options = [
-        ("claude-oauth", "Claude Code OAuth login"),
-        ("claude-api", "Claude API key"),
-        ("openai-codex", "ChatGPT subscription login"),
-        ("openai-api", "OpenAI API key"),
-    ];
+    let options = backend_menu();
     eprintln!("Select a provider type:");
     for (index, (id, label)) in options.iter().enumerate() {
         eprintln!("  {}. {} ({})", index + 1, id, label);
@@ -860,7 +919,7 @@ fn build_authorize_url(
 }
 
 async fn claude_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> {
-    let client_id = client_id.unwrap_or(DEFAULT_CLAUDE_CLIENT_ID);
+    let client_id = client_id.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
     let url = build_authorize_url(client_id, &code_challenge, &state)?;
@@ -946,7 +1005,7 @@ async fn exchange_claude_code(
 // ----- OpenAI Codex OAuth (localhost callback) ---------------------------------------------------
 
 async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> {
-    let client_id = client_id.unwrap_or(DEFAULT_OPENAI_CODEX_CLIENT_ID);
+    let client_id = client_id.unwrap_or(DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
     let redirect_uri = format!("http://localhost:{}/auth/callback", CODEX_REDIRECT_PORT);
@@ -1649,8 +1708,8 @@ mod tests {
         // `personal` is configured but never logged in to: the `Authenticated` column's job, not
         // an orphan. The diff runs in one direction only.
         let config_file: config::ConfigFile = toml::from_str(
-            "[providers.work]\ntype = \"claude-api\"\nmodel = \"claude-opus-5\"\n\
-             [providers.personal]\ntype = \"openai-api\"\nmodel = \"gpt-5.6-sol\"\n",
+            "[providers.work]\ntype = \"anthropic-messages\"\nmodel = \"claude-opus-5\"\n\
+             [providers.personal]\ntype = \"openai-chat-completions\"\nmodel = \"gpt-5.6-sol\"\n",
         )
         .expect("parse config");
 
@@ -1705,7 +1764,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("config.toml"),
-            "[providers.work]\ntype = \"claude-api\"\nmodel = \"claude-opus-5\"\n",
+            "[providers.work]\ntype = \"anthropic-messages\"\nmodel = \"claude-opus-5\"\n",
         )
         .expect("write config");
         let store = memory_token_store().await;
@@ -1795,16 +1854,28 @@ mod tests {
 
     #[test]
     fn test_validate_backend() {
-        assert!(validate_backend("claude-oauth").is_ok());
+        assert!(validate_backend("claude-subscription").is_ok());
         assert!(validate_backend("bogus").is_err());
     }
 
     #[test]
     fn test_default_model_for_known_backends() {
-        assert_eq!(default_model_for("claude-api"), Some("claude-opus-5"));
-        assert_eq!(default_model_for("claude-oauth"), Some("claude-opus-5"));
-        assert_eq!(default_model_for("openai-api"), Some("gpt-5.6-sol"));
-        assert_eq!(default_model_for("openai-codex"), Some("gpt-5.6-sol"));
+        assert_eq!(
+            default_model_for("anthropic-messages"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            default_model_for("claude-subscription"),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            default_model_for("openai-chat-completions"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            default_model_for("chatgpt-subscription"),
+            Some("gpt-5.6-sol")
+        );
         assert_eq!(default_model_for("unknown"), None);
         // Every supported backend has a default, so the prompt never forces a manual answer.
         for backend in SUPPORTED_PROVIDERS {
@@ -1892,6 +1963,60 @@ mod tests {
         assert_eq!(extract_jwt_expiration_millis(&jwt), Some(1_700_000_000_000));
     }
 
+    /// Every supported backend must be offered by the interactive menu.
+    ///
+    /// `meka provider add` with no `--type` is how most people meet the backend list, and a name
+    /// missing from the menu is unreachable that way while failing nothing: no error, no warning,
+    /// just a backend the wizard never mentions.
+    #[test]
+    fn every_supported_backend_is_offered_by_the_menu() {
+        let offered: Vec<&str> = backend_menu().iter().map(|(id, _)| *id).collect();
+        for backend in crate::provider::SUPPORTED_PROVIDERS {
+            assert!(
+                offered.contains(backend),
+                "{backend} is supported but is not in the `provider add` menu"
+            );
+        }
+        assert_eq!(
+            offered.len(),
+            crate::provider::SUPPORTED_PROVIDERS.len(),
+            "the menu offers something that is not a supported backend: {offered:?}"
+        );
+    }
+
+    /// Every supported backend must have a credential flow.
+    ///
+    /// This is the invariant that broke when `openai-responses` was added: the match ended in
+    /// `unreachable!()`, `validate_backend` waved the new name through as supported, and
+    /// `meka provider add --type openai-responses` panicked at the credential step. Nothing caught
+    /// it -- the backend built, resolved, and had a default model and endpoint. Asserting over
+    /// `SUPPORTED_PROVIDERS` rather than a hand-written list is the point: a backend added there
+    /// and forgotten here fails this test instead of a user's first `provider add`.
+    #[test]
+    fn every_supported_backend_has_a_credential_flow() {
+        for backend in crate::provider::SUPPORTED_PROVIDERS {
+            assert!(
+                credential_kind(backend).is_some(),
+                "{backend} is supported but has no credential flow"
+            );
+        }
+        // Each subscription backend gets its *own* vendor's login, not merely "an OAuth flow":
+        // the client IDs, scopes and callbacks differ and are not interchangeable.
+        assert_eq!(
+            credential_kind("claude-subscription"),
+            Some(CredentialKind::ClaudeLogin)
+        );
+        assert_eq!(
+            credential_kind("chatgpt-subscription"),
+            Some(CredentialKind::ChatGptLogin)
+        );
+        assert_eq!(
+            credential_kind("openai-responses"),
+            Some(CredentialKind::ApiKey)
+        );
+        assert_eq!(credential_kind("not-a-backend"), None);
+    }
+
     /// `--thinking` must be *dropped* on a backend whose requests have no thinking field, not
     /// merely left unprompted.
     ///
@@ -1908,12 +2033,14 @@ mod tests {
             effort: Some("low".to_string()),
         };
         // Every setting is pinned, so this returns before any prompt: no stdin involved.
-        let openai = resolve_tuning(flags(), "openai-api", "oai", None, false).expect("resolve");
+        let openai = resolve_tuning(flags(), "openai-chat-completions", "oai", None, false)
+            .expect("resolve");
         assert_eq!(openai.thinking, None, "written into an OpenAI profile");
         assert_eq!(openai.context_window, Some(1_024));
         assert_eq!(openai.effort.as_deref(), Some("low"));
 
-        let claude = resolve_tuning(flags(), "claude-api", "work", None, false).expect("resolve");
+        let claude =
+            resolve_tuning(flags(), "anthropic-messages", "work", None, false).expect("resolve");
         assert_eq!(
             claude.thinking,
             Some(crate::provider::ThinkingMode::Budgeted),
@@ -1980,7 +2107,7 @@ mod tests {
         upsert_profile_document(
             &mut bare,
             "local",
-            "claude-api",
+            "anthropic-messages",
             "some-local-model",
             None,
             &ProfileTuning::default(),
@@ -1996,7 +2123,7 @@ mod tests {
         upsert_profile_document(
             &mut tuned,
             "local",
-            "claude-api",
+            "anthropic-messages",
             "some-local-model",
             None,
             &ProfileTuning {
@@ -2023,7 +2150,7 @@ mod tests {
         upsert_profile_document(
             &mut document,
             "work",
-            "openai-api",
+            "openai-chat-completions",
             "gpt-4o",
             Some("http://localhost:1234/v1"),
             &ProfileTuning::default(),
@@ -2034,7 +2161,7 @@ mod tests {
             toml::from_str(&document.to_string()).expect("re-parse config");
         assert_eq!(config.default_provider.as_deref(), Some("work"));
         let profile = config.providers.get("work").expect("profile present");
-        assert_eq!(profile.backend, "openai-api");
+        assert_eq!(profile.backend, "openai-chat-completions");
         assert_eq!(profile.model.as_deref(), Some("gpt-4o"));
         assert_eq!(
             profile.base_url.as_deref(),
@@ -2048,7 +2175,7 @@ mod tests {
         upsert_profile_document(
             &mut document,
             "work",
-            "claude-oauth",
+            "claude-subscription",
             "claude-x",
             None,
             &ProfileTuning::default(),
@@ -2057,7 +2184,7 @@ mod tests {
         upsert_profile_document(
             &mut document,
             "personal",
-            "openai-api",
+            "openai-chat-completions",
             "gpt-4o",
             None,
             &ProfileTuning::default(),
@@ -2079,7 +2206,7 @@ mod tests {
         upsert_profile_document(
             &mut document,
             "work",
-            "claude-oauth",
+            "claude-subscription",
             "claude-x",
             None,
             &ProfileTuning::default(),
@@ -2088,7 +2215,7 @@ mod tests {
         upsert_profile_document(
             &mut document,
             "personal",
-            "openai-api",
+            "openai-chat-completions",
             "gpt-4o",
             None,
             &ProfileTuning::default(),

@@ -1,11 +1,15 @@
-//! OpenAI Codex (ChatGPT subscription) provider.
+//! `chatgpt-subscription`: the Responses API billed to a ChatGPT subscription.
 //!
 //! Talks the Responses API to `chatgpt.com/backend-api/codex/responses`, authenticated by the
 //! bearer token + `ChatGPT-Account-ID` header issued by the Codex OAuth flow. Mirrors how OpenAI's
 //! own first-party Codex CLI authenticates so the wire shape matches.
+//!
+//! The protocol itself lives in [`super::responses_wire`], shared with the API-key
+//! [`super::responses`] backend. What is particular to this one is the endpoint, the OAuth
+//! credential, the Codex client headers, and the `include` of encrypted reasoning content -- that
+//! last one stays here because this backend's endpoint is always ChatGPT.
 
 mod auth;
-mod responses;
 
 use std::sync::Arc;
 
@@ -14,16 +18,16 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use self::{
-    auth::{extract_account_id, extract_expiration_seconds},
-    responses::{build_request_body, drive_responses_sse_stream},
+use self::auth::{extract_account_id, extract_expiration_seconds};
+use super::responses_wire::{
+    aggregate_stream, build_request_body, drive_responses_sse_stream, include_encrypted_reasoning,
 };
 use crate::{
     error::{MekaError, Result},
     provider::{
-        AccountIdentity, AccountUsage, AuthCredential, ContentBlock,
-        DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage, ExtraUsage, Message, Notice, Provider, Role,
-        StopReason, StreamEvent, TokenUsage, ToolDefinition, UsageHistory, UsageWindow,
+        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID,
+        DailyUsage, ExtraUsage, Message, Notice, Provider, StopReason, StreamEvent, TokenUsage,
+        ToolDefinition, UsageHistory, UsageWindow,
     },
     session::TokenStore,
 };
@@ -42,7 +46,7 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
-pub struct OpenAiCodexProvider {
+pub struct ChatGptSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
     /// Serialises refreshes without blocking readers. Held across the database and network awaits
@@ -70,7 +74,7 @@ pub struct OpenAiCodexProvider {
 /// never is for a turn: nothing legitimate takes minutes.
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-impl OpenAiCodexProvider {
+impl ChatGptSubscriptionProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         credential: AuthCredential,
@@ -85,7 +89,7 @@ impl OpenAiCodexProvider {
     ) -> Result<Self> {
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
         // (e.g. `__cf_bm`) persist across requests.
-        let client = crate::provider::build_http_client("openai-codex", |builder| {
+        let client = crate::provider::build_http_client("chatgpt-subscription", |builder| {
             builder.cookie_store(true)
         })?;
 
@@ -97,10 +101,11 @@ impl OpenAiCodexProvider {
             base_url: crate::provider::normalize_base_url(
                 base_url
                     .as_deref()
-                    .unwrap_or(crate::provider::DEFAULT_OPENAI_CODEX_BASE_URL),
+                    .unwrap_or(crate::provider::DEFAULT_CHATGPT_BASE_URL),
             ),
             model,
-            client_id: client_id.unwrap_or_else(|| DEFAULT_OPENAI_CODEX_CLIENT_ID.to_string()),
+            client_id: client_id
+                .unwrap_or_else(|| DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url.unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string()),
             token_store,
             credential_key,
@@ -118,6 +123,33 @@ impl OpenAiCodexProvider {
     /// The settled reasoning-effort to send as `reasoning.effort` (see [`Self::resolved_effort`]).
     fn wire_effort(&self) -> Option<String> {
         self.resolved_effort.clone()
+    }
+
+    /// The request body: the shared Responses encoding, plus the one thing this backend may add
+    /// that its API-key sibling may not.
+    ///
+    /// A named method rather than inline in `stream` so the `include` can be asserted without a
+    /// live endpoint. It is the half of the split that has to keep *sending*, and a test that only
+    /// covered the other half would let it fall away silently.
+    fn build_body(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> serde_json::Value {
+        let mut body = build_request_body(
+            &self.model,
+            system_prompt,
+            messages,
+            tools,
+            self.wire_effort().as_deref(),
+            self.max_output_tokens,
+            true,
+        );
+        // Safe here and only here: this backend's endpoint is always ChatGPT, and the first-party
+        // Codex client asks for the same thing so reasoning survives a stateless round trip.
+        include_encrypted_reasoning(&mut body);
+        body
     }
 
     /// Returns the URL the request POSTs to. Codex's own client appends `/backend-api`
@@ -206,7 +238,7 @@ impl OpenAiCodexProvider {
             } = &*credential
             else {
                 return Err(MekaError::Provider(
-                    "openai-codex requires an OAuth token, not an API key".to_string(),
+                    "chatgpt-subscription requires an OAuth token, not an API key".to_string(),
                 ));
             };
 
@@ -394,98 +426,8 @@ impl OpenAiCodexProvider {
     }
 }
 
-/// Fold a [`StreamEvent`] stream into the tuple [`Provider::complete`] returns. Mirrors the
-/// accumulation in `Agent::run_streaming_attempt` but without any frontend emission, so a
-/// streaming-only provider can satisfy the non-streaming completion contract by silently consuming
-/// its own SSE. Text deltas concatenate into a trailing `Text` block; tool-call and thinking events
-/// fold into their blocks; usage tiers merge; notices collect; `MessageEnd` sets the stop reason.
-/// `StreamEvent::Error` is logged, not returned: the typed error surfaces from the
-/// concurrently-awaited `stream` future in [`OpenAiCodexProvider::complete`].
-async fn aggregate_stream(
-    mut receiver: mpsc::Receiver<StreamEvent>,
-) -> (Message, StopReason, TokenUsage, Vec<Notice>) {
-    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_thinking = String::new();
-    let mut current_tool_id = String::new();
-    let mut current_tool_name = String::new();
-    let mut stop_reason = StopReason::EndTurn;
-    let mut token_usage = TokenUsage::default();
-    let mut notices: Vec<Notice> = Vec::new();
-
-    while let Some(event) = receiver.recv().await {
-        match event {
-            StreamEvent::TextDelta(text) => current_text.push_str(&text),
-            StreamEvent::ThinkingDelta(text) => current_thinking.push_str(&text),
-            StreamEvent::ThinkingComplete { signature } => {
-                let thinking = std::mem::take(&mut current_thinking);
-                if !thinking.is_empty() || signature.is_some() {
-                    content_blocks.push(ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    });
-                }
-            }
-            StreamEvent::RedactedThinking { data } => {
-                content_blocks.push(ContentBlock::RedactedThinking { data });
-            }
-            // A display-only liveness signal with nothing to accumulate. Only the Claude providers
-            // emit it today; the arm exists so adding it there cannot silently change what this
-            // provider persists.
-            StreamEvent::ThinkingProgress { .. } => {}
-            StreamEvent::ToolUseStart { id, name } => {
-                if !current_text.is_empty() {
-                    content_blocks.push(ContentBlock::Text {
-                        text: std::mem::take(&mut current_text),
-                    });
-                }
-                current_tool_id = id;
-                current_tool_name = name;
-            }
-            // The full arguments object arrives whole in `ToolUseEnd`; the incremental JSON only
-            // feeds the live renderer, which this silent path has none of.
-            StreamEvent::ToolInputDelta(_) => {}
-            StreamEvent::ToolUseEnd { input } => {
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: std::mem::take(&mut current_tool_id),
-                    name: std::mem::take(&mut current_tool_name),
-                    input,
-                });
-            }
-            StreamEvent::ToolCallRejected { id, name, reason } => {
-                let input = serde_json::json!({
-                    crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
-                });
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
-            }
-            StreamEvent::MessageEnd {
-                stop_reason: reason,
-            } => stop_reason = reason,
-            StreamEvent::Usage(usage) => token_usage.merge_stream(&usage),
-            StreamEvent::Notice(notice) => notices.push(notice),
-            StreamEvent::Error(error) => {
-                tracing::error!("codex: stream error: {}", error);
-            }
-        }
-    }
-
-    if !current_text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text: current_text });
-    }
-
-    (
-        Message {
-            role: Role::Assistant,
-            content: content_blocks,
-        },
-        stop_reason,
-        token_usage,
-        notices,
-    )
-}
-
 #[async_trait]
-impl Provider for OpenAiCodexProvider {
+impl Provider for ChatGptSubscriptionProvider {
     async fn complete(
         &self,
         system_prompt: &str,
@@ -521,16 +463,7 @@ impl Provider for OpenAiCodexProvider {
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let reasoning_effort = self.wire_effort();
-        let body = build_request_body(
-            &self.model,
-            system_prompt,
-            messages,
-            tools,
-            reasoning_effort.as_deref(),
-            self.max_output_tokens,
-            true,
-        );
+        let body = self.build_body(system_prompt, messages, tools);
 
         let (bearer, account_id) = self.ensure_valid_credential().await?;
 
@@ -553,7 +486,7 @@ impl Provider for OpenAiCodexProvider {
     }
 
     fn name(&self) -> &str {
-        "openai-codex"
+        "chatgpt-subscription"
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -825,8 +758,8 @@ mod tests {
         }
     }
 
-    fn test_provider() -> OpenAiCodexProvider {
-        OpenAiCodexProvider::new(
+    fn test_provider() -> ChatGptSubscriptionProvider {
+        ChatGptSubscriptionProvider::new(
             test_credential(),
             "gpt-5".to_string(),
             None,
@@ -840,16 +773,36 @@ mod tests {
         .expect("provider")
     }
 
+    /// This backend keeps the `include` its API-key sibling refuses to send.
+    ///
+    /// The other half of the split asserted in `openai-responses`: there, an OpenAI extension must
+    /// never reach an endpoint that may not implement it; here, the endpoint is always ChatGPT and
+    /// the first-party Codex client asks for the same thing, so reasoning survives the stateless
+    /// round trip. Dropping it here would be silent -- the requests would still succeed, just
+    /// without reasoning carried across turns.
+    #[test]
+    fn the_subscription_asks_chatgpt_to_round_trip_its_reasoning() {
+        let body = test_provider().build_body("s", &[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        let include = body["include"].as_array().expect("include");
+        assert!(
+            include
+                .iter()
+                .any(|value| value == "reasoning.encrypted_content"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn test_provider_name() {
-        assert_eq!(test_provider().name(), "openai-codex");
+        assert_eq!(test_provider().name(), "chatgpt-subscription");
     }
 
     #[test]
     fn an_unconfigured_profile_sends_no_reasoning_effort() {
         // Effort belongs to the provider: unset means the Responses API applies its own default,
         // which meka asks for by omitting the field rather than by naming a tier.
-        let unconfigured = OpenAiCodexProvider::new(
+        let unconfigured = ChatGptSubscriptionProvider::new(
             test_credential(),
             "gpt-5.6-sol".to_string(),
             None,
@@ -863,7 +816,7 @@ mod tests {
         .expect("provider");
         assert_eq!(unconfigured.resolved_effort(), None);
 
-        let configured = OpenAiCodexProvider::new(
+        let configured = ChatGptSubscriptionProvider::new(
             test_credential(),
             "gpt-5.6-sol".to_string(),
             None,
@@ -1011,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_responses_url_user_supplied_backend_api_path_preserved() {
-        let provider = OpenAiCodexProvider::new(
+        let provider = ChatGptSubscriptionProvider::new(
             test_credential(),
             "gpt-5".to_string(),
             Some("https://example.com/backend-api/codex".to_string()),
@@ -1031,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_responses_url_strips_trailing_slash() {
-        let provider = OpenAiCodexProvider::new(
+        let provider = ChatGptSubscriptionProvider::new(
             test_credential(),
             "gpt-5".to_string(),
             Some("https://chatgpt.com/".to_string()),
@@ -1062,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_valid_credential_rejects_api_key() {
-        let provider = OpenAiCodexProvider::new(
+        let provider = ChatGptSubscriptionProvider::new(
             AuthCredential::ApiKey("sk-test".to_string()),
             "gpt-5".to_string(),
             None,
@@ -1081,7 +1034,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_valid_credential_no_refresh_token_when_expired() {
         // Token already expired, no refresh available → error.
-        let provider = OpenAiCodexProvider::new(
+        let provider = ChatGptSubscriptionProvider::new(
             AuthCredential::OAuthToken {
                 access_token: "old".to_string(),
                 refresh_token: None,
@@ -1104,9 +1057,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_aggregate_stream_folds_events_into_message() {
-        // openai-codex is streaming-only; it satisfies `complete` by folding its own SSE. Feed the
-        // event sequence a summary turn would emit and assert it aggregates into one assistant text
-        // message carrying the reported stop reason, with no spurious notices.
+        // chatgpt-subscription is streaming-only; it satisfies `complete` by folding its own SSE.
+        // Feed the event sequence a summary turn would emit and assert it aggregates into
+        // one assistant text message carrying the reported stop reason, with no spurious
+        // notices.
         let (sender, receiver) = mpsc::channel::<StreamEvent>(16);
         sender
             .send(StreamEvent::TextDelta("Summary: ".to_string()))

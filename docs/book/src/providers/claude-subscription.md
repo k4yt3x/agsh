@@ -1,6 +1,8 @@
-# Claude OAuth Provider
+# Claude subscription
 
-The `claude-oauth` provider authenticates with a Claude Code subscription via OAuth and mimics the Claude Code CLI's exact request shape, headers, and request signing. Use this when you have a Claude Code subscription instead of a per-token Claude API key. For the direct Messages API, see [`claude-api`](./claude-api.md).
+The **Anthropic Messages API** billed to a Claude subscription. Authenticates by OAuth and mimics the Claude Code CLI's exact request shape, headers and request signing. Use this instead of a per-token Anthropic API key; for that, see [`anthropic-messages`](./anthropic-messages.md), which speaks the same protocol.
+
+Named for the subscription rather than the protocol because that is what you are choosing: the endpoint is always `api.anthropic.com` and the client shape comes with the billing relationship.
 
 > **Note:** This provider replicates Claude Code's fingerprinting and attestation machinery exactly. Modifying the request body, headers, or OAuth flow will cause requests to be rejected by Anthropic. If you hit 401/403 errors, verify that no middleware is rewriting the request.
 
@@ -8,7 +10,7 @@ The `claude-oauth` provider authenticates with a Claude Code subscription via OA
 
 | Setting | Value |
 |---------|-------|
-| Profile `type` | `claude-oauth` |
+| Profile `type` | `claude-subscription` |
 | Default base URL | `https://api.anthropic.com` |
 | Credential | OAuth bundle stored in the database (acquired via `meka provider add` / `login`) |
 | Auth method | `Authorization: Bearer <oauth_token>` |
@@ -17,7 +19,7 @@ The `claude-oauth` provider authenticates with a Claude Code subscription via OA
 ### Quickest Start
 
 ```bash
-meka provider add work --type claude-oauth --model claude-opus-5
+meka provider add work --type claude-subscription --model claude-opus-5
 ```
 
 `meka provider add` opens your browser, walks you through authorization, and saves the tokens to the
@@ -31,7 +33,7 @@ local database. It also writes the `[providers.work]` profile and sets it as the
 default_provider = "work"
 
 [providers.work]
-type = "claude-oauth"
+type = "claude-subscription"
 model = "claude-opus-5"
 effort = "xhigh"         # optional; unset sends none, so Anthropic's default applies
 thinking = "adaptive"    # optional; "adaptive"|"budgeted"|"off", default "adaptive"
@@ -163,4 +165,4 @@ You can see the effect directly: `/status` reports the cache hit ratio, and read
 
 ### Streaming
 
-Server-Sent Events with the same event taxonomy as [`claude-api`](./claude-api.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a single `[redacted]` block plus a signature.
+Server-Sent Events with the same event taxonomy as [`anthropic-messages`](./anthropic-messages.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a single `[redacted]` block plus a signature.
