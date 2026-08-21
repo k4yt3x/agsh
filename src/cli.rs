@@ -258,7 +258,11 @@ pub enum ProviderAction {
 #[derive(clap::Subcommand, Debug)]
 pub enum SkillAction {
     /// List installed skills
-    List,
+    List {
+        /// Also show where each skill is on disk
+        #[arg(long)]
+        paths: bool,
+    },
     /// Print one skill's frontmatter and on-disk paths
     Get { name: String },
     /// Print the rendered skill body
@@ -267,10 +271,11 @@ pub enum SkillAction {
     ///
     /// Examples:
     ///   meka skill add demo --description "X"
+    ///   meka skill add demo --description "X" --metadata author="Jane Doe"
     ///   meka skill add custom --from-file ./template.md
     #[command(verbatim_doc_comment)]
     Add {
-        /// Unique skill name (alphanumerics, `-`, `_` only)
+        /// Unique skill name (lowercase letters, digits, hyphens)
         name: String,
 
         /// One-line description for the system prompt
@@ -281,17 +286,9 @@ pub enum SkillAction {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
 
-        /// Version label
-        #[arg(long)]
-        version: Option<String>,
-
-        /// Author, in `Name <email>` form
-        #[arg(long)]
-        author: Option<String>,
-
-        /// https:// URL `skill update` re-fetches from
-        #[arg(long = "source-url", value_name = "URL")]
-        source_url: Option<String>,
+        /// Frontmatter metadata as key=value. Repeatable
+        #[arg(long, value_name = "KEY=VALUE")]
+        metadata: Vec<String>,
 
         /// Copy this file instead of the template
         #[arg(long = "from-file", value_name = "PATH")]
@@ -307,25 +304,6 @@ pub enum SkillAction {
     },
     /// Remove a skill's directory
     Remove { name: String },
-    /// Re-fetch skills from their `source_url` and replace them on disk
-    ///
-    /// Examples:
-    ///   meka skill update my-skill
-    ///   meka skill update --all          # dry run: lists what would update
-    ///   meka skill update --all --yes    # applies the updates
-    #[command(verbatim_doc_comment)]
-    Update {
-        /// Skill name to update. Omit and pass --all to update every skill.
-        name: Option<String>,
-
-        /// Update every skill that declares a source_url
-        #[arg(long)]
-        all: bool,
-
-        /// Apply --all updates (without this, --all only lists)
-        #[arg(long)]
-        yes: bool,
-    },
 }
 
 /// Inspect and cancel the wakeups the agent scheduled for itself through the `schedule_*` tools.

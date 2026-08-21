@@ -151,6 +151,12 @@ pub enum ErrorKind {
     StreamDetached,
     RequestNotFound,
     Idempotency,
+    /// The named skill lives under a read-only root from `[skills] extra_paths`, so writing it
+    /// here would create a shadowing copy in meka's own store rather than change the file.
+    ///
+    /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
+    /// another name or edit that file directly, not to fix the payload.
+    StoreReadOnly,
     InvalidBody,
     PayloadTooLarge,
     ConcurrencyLimit,
@@ -173,6 +179,7 @@ impl ErrorKind {
             Self::StreamDetached => "https://meka.so/errors/stream-detached",
             Self::RequestNotFound => "https://meka.so/errors/request-not-found",
             Self::Idempotency => "https://meka.so/errors/idempotency",
+            Self::StoreReadOnly => "https://meka.so/errors/store-read-only",
             Self::InvalidBody => "https://meka.so/errors/invalid-body",
             Self::PayloadTooLarge => "https://meka.so/errors/payload-too-large",
             Self::ConcurrencyLimit => "https://meka.so/errors/concurrency-limit",
@@ -195,6 +202,7 @@ impl ErrorKind {
             Self::StreamDetached => "Turn outcome unavailable",
             Self::RequestNotFound => "Pending request not found",
             Self::Idempotency => "Idempotency-Key conflict",
+            Self::StoreReadOnly => "Skill is in a read-only root",
             Self::InvalidBody => "Invalid request body",
             Self::PayloadTooLarge => "Request body exceeds configured limit",
             Self::ConcurrencyLimit => "Process-wide concurrency limit reached",

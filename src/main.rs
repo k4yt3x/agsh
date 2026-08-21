@@ -128,7 +128,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     run_mcp_subcommand(&session_manager, action, cli_ref).await
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
-                cli::Command::Skill { action } => run_skill_subcommand(action).await,
+                cli::Command::Skill { action } => run_skill_subcommand(action, cli_ref).await,
                 cli::Command::Memory { action } => run_memory_subcommand(action).await,
                 cli::Command::Instructions { action } => run_instructions_subcommand(action),
                 cli::Command::Schedule { action } => {
@@ -165,12 +165,14 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
+    let mut config = ResolvedConfig::from_cli(&cli);
+
     // If --skill is set, validate and render the body upfront so an invalid name fails fast
     // before any session/MCP setup. The combined string (extra + body, mirroring the REPL's `/skill
-    // <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
-    let skill_prompt = runtime.block_on(build_skill_prompt(&cli))?;
+    // <name> [extra...]`) then takes the place of cli.prompt as the first-turn input. Resolved
+    // config comes first because `[skills] extra_paths` decides which roots the lookup sees.
+    let skill_prompt = runtime.block_on(build_skill_prompt(&cli, &config.skill_roots()))?;
 
-    let mut config = ResolvedConfig::from_cli(&cli);
     if let Some(prompt) = skill_prompt {
         config.prompt = Some(prompt);
     }
@@ -189,13 +191,21 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 /// Render a `--skill <name>` invocation into the user-message string that drives the first turn.
 /// Returns `Ok(None)` when `--skill` is not set so callers can leave `cli.prompt` untouched.
 ///
-/// Mirrors the REPL handler at `SlashCommand::SkillInvoke`: same lookup, same `user_invocable`
-/// gate, same `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
-async fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
+/// Mirrors the REPL's `SlashCommand::SkillInvoke` handler in what it composes: the same
+/// `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
+///
+/// It does *not* mirror the lookup, and the difference is deliberate. This runs before the agent
+/// exists, so it walks the roots itself; the REPL reads `agent.skills().current()`, which is the
+/// live cache. Both resolve the same name to the same file, but only the REPL's sees a skill added
+/// mid-session.
+async fn build_skill_prompt(
+    cli: &cli::Cli,
+    roots: &[std::path::PathBuf],
+) -> anyhow::Result<Option<String>> {
     let Some(name) = cli.skill.as_deref() else {
         return Ok(None);
     };
-    let skill = skills::cli::require_skill(name)?;
+    let skill = skills::cli::require_skill(name, roots)?;
     let body = skills::load_skill_body(&skill)
         .await
         .map_err(|error| anyhow::anyhow!("failed to load skill '{}': {}", name, error))?;
@@ -437,7 +447,7 @@ pub async fn build_shared_deps(
     // `disabled()` is distinct from an empty store: it keeps the subsystem's tools out of the
     // registry entirely, which is the point of the config switch.
     let skills = if config.skills_enabled {
-        crate::skills::SkillCache::discover()
+        crate::skills::SkillCache::discover(config.skills_extra_paths.clone())
     } else {
         crate::skills::SkillCache::disabled()
     };
@@ -802,7 +812,7 @@ async fn create_agent_from_config(
     // `disabled()` is distinct from an empty store: it keeps the subsystem's tools out of the
     // registry entirely, which is the point of the config switch.
     let skills = if config.skills_enabled {
-        crate::skills::SkillCache::discover()
+        crate::skills::SkillCache::discover(config.skills_extra_paths.clone())
     } else {
         crate::skills::SkillCache::disabled()
     };
@@ -1417,6 +1427,7 @@ async fn run_interactive(
         .iter()
         .map(|server| server.name.clone())
         .collect();
+    let repl_skill_roots = config.skill_roots();
     let repl_history_db_path = Some(session_manager.database_path().to_path_buf());
 
     // Live context gauge for the prompt: a shared counter the agent writes after each turn and the
@@ -1457,6 +1468,7 @@ async fn run_interactive(
             agent_event_receiver,
             repl_cwd,
             repl_mcp_server_names,
+            repl_skill_roots,
             repl_history_db_path,
             repl_wake,
             repl::CommandSpacing {
@@ -2151,7 +2163,9 @@ async fn run_interactive(
                         None => eprintln!("No active session yet."),
                     },
                     repl::SlashCommand::SkillList => {
-                        if let Err(error) = skills::cli::run_list().await {
+                        if let Err(error) =
+                            skills::cli::run_list(&config.skill_roots(), false).await
+                        {
                             render::render_error(&error);
                         }
                     }
@@ -2161,13 +2175,30 @@ async fn run_interactive(
                         // `continue` would short-circuit the outer `while let`, leaving the REPL
                         // stuck in `wait_for_agent` and never drawing the next prompt.
                         let installed = agent.skills().current().await;
-                        let Some(skill) = installed.iter().find(|s| s.name == name) else {
-                            let available: Vec<&str> =
-                                installed.iter().map(|s| s.name.as_str()).collect();
-                            render::render_error(&format!(
-                                "unknown skill '{}'; available: {:?}",
-                                name, available
-                            ));
+                        let Some(skill) = installed.find(&name) else {
+                            // Prose, not `{:?}` on a `Vec<&str>`. This is user-facing output, and
+                            // the debug rendering printed `["a", "b"]` -- quotes, brackets and all
+                            // -- for a list a person is meant to read and pick from.
+                            let message = match installed.skip_reason(&name) {
+                                // The same distinction `skill_read` draws for the model, in the
+                                // same words: a file that is there and unreadable is not a missing
+                                // skill.
+                                Some(_) => installed.unavailable(&name),
+                                None if installed.skills.is_empty() => {
+                                    format!("unknown skill '{}'; no skills are installed", name)
+                                }
+                                None => format!(
+                                    "unknown skill '{}'; available: {}",
+                                    name,
+                                    installed
+                                        .skills
+                                        .iter()
+                                        .map(|s| s.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            };
+                            render::render_error(&message);
                             break 'invoke;
                         };
                         let body = match skills::load_skill_body(skill).await {
@@ -2705,39 +2736,43 @@ async fn run_memory_subcommand(action: &cli::MemoryAction) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
+async fn run_skill_subcommand(
+    action: &cli::SkillAction,
+    cli_args: &cli::Cli,
+) -> anyhow::Result<()> {
+    // Resolved rather than defaulted: `[skills] extra_paths` decides which roots these read, and a
+    // handler that ignored it would report a store the running agent does not have.
+    let config = ResolvedConfig::from_cli(cli_args);
+    config.require_readable_config()?;
+    let roots = config.skill_roots();
     match action {
-        cli::SkillAction::List => skills::cli::run_list().await?,
-        cli::SkillAction::Get { name } => skills::cli::run_get(name).await?,
-        cli::SkillAction::Show { name } => skills::cli::run_show(name).await?,
+        cli::SkillAction::List { paths } => skills::cli::run_list(&roots, *paths).await?,
+        cli::SkillAction::Get { name } => skills::cli::run_get(name, &roots).await?,
+        cli::SkillAction::Show { name } => skills::cli::run_show(name, &roots).await?,
         cli::SkillAction::Add {
             name,
             description,
             priority,
-            version,
-            author,
-            source_url,
+            metadata,
             from_file,
             force,
             edit,
         } => {
-            skills::cli::run_add(skills::cli::AddArgs {
-                name,
-                description: description.as_deref(),
-                priority: *priority,
-                version: version.as_deref(),
-                author: author.as_deref(),
-                source_url: source_url.as_deref(),
-                from_file: from_file.as_deref(),
-                force: *force,
-                edit: *edit,
-            })
+            skills::cli::run_add(
+                skills::cli::AddArgs {
+                    name,
+                    description: description.as_deref(),
+                    priority: *priority,
+                    metadata,
+                    from_file: from_file.as_deref(),
+                    force: *force,
+                    edit: *edit,
+                },
+                &roots,
+            )
             .await?
         }
-        cli::SkillAction::Remove { name } => skills::cli::run_remove(name).await?,
-        cli::SkillAction::Update { name, all, yes } => {
-            skills::cli::run_update(name.as_deref(), *all, *yes).await?
-        }
+        cli::SkillAction::Remove { name } => skills::cli::run_remove(name, &roots).await?,
     }
     Ok(())
 }

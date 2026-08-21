@@ -1806,6 +1806,7 @@ async fn emit_available_commands(
         .collect();
     commands.extend(
         snapshot
+            .skills
             .iter()
             .filter(|skill| !LOCAL_COMMANDS.iter().any(|(name, _)| *name == skill.name))
             .map(|skill| {
@@ -1828,16 +1829,20 @@ async fn emit_available_commands(
 /// error explaining what went wrong.
 #[derive(Debug)]
 enum SlashInvocationError {
+    /// The already-composed reason from [`crate::skills::SkillIndex::unavailable`], so this path
+    /// distinguishes a name nobody wrote from a `SKILL.md` that will not parse rather than calling
+    /// both "unknown skill".
     SkillNotFound(String),
-    SkillLoadFailed { name: String, source: String },
+    SkillLoadFailed {
+        name: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for SlashInvocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SlashInvocationError::SkillNotFound(name) => {
-                write!(f, "unknown skill '{}'", name)
-            }
+            SlashInvocationError::SkillNotFound(reason) => write!(f, "{}", reason),
             SlashInvocationError::SkillLoadFailed { name, source } => {
                 write!(f, "failed to load skill '{}': {}", name, source)
             }
@@ -1868,8 +1873,9 @@ fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 ///   like `/etc/hosts` or a `//` comment): returned unchanged so the model can see it.
 /// - `/<skill-name>` matching an installed skill: returns `extra\n\n{body}` where `body` is
 ///   [`crate::skills::load_skill_body`]'s output (the skill's base-directory header followed by its
-///   body verbatim). Empty `extra` collapses to just `body`. Same composition the REPL uses at
-///   `main.rs:1004`.
+///   body verbatim). Empty `extra` collapses to just `body`. Same composition the REPL's
+///   `SlashCommand::SkillInvoke` handler uses; named rather than cited by line, because a line
+///   number is a cross-reference that rots on the next edit and this one already had.
 /// - `/<name>` with a syntactically valid skill name but no installed skill of that name: error.
 ///   The shape is too deliberate to be a paste, so a typo deserves a clear "unknown skill" rather
 ///   than silently going to the model.
@@ -1882,12 +1888,19 @@ async fn slash_to_prompt_text(
     };
     // Anything that doesn't even look like a skill identifier was never going to match. Pass
     // through so pasted paths and code comments reach the model unchanged.
-    if crate::skills::validate_skill_name(&name).is_err() {
+    //
+    // Narrower than the rule the delete doors apply, on purpose: those decide whether a name is
+    // safe to act on, and this decides whether the user meant a skill at all. A skill whose name
+    // predates the spec still resolves (`/My_Skill`), but a line like `/v1.2 of the API` stays
+    // prose rather than becoming "no such skill".
+    if !crate::skills::looks_like_skill_invocation(&name) {
         return Ok(prompt_text);
     }
     let snapshot = skills.current().await;
-    let Some(skill) = snapshot.iter().find(|skill| skill.name == name) else {
-        return Err(SlashInvocationError::SkillNotFound(name));
+    let Some(skill) = snapshot.find(&name) else {
+        return Err(SlashInvocationError::SkillNotFound(
+            snapshot.unavailable(&name),
+        ));
     };
     let body = crate::skills::load_skill_body(skill)
         .await
@@ -4592,8 +4605,37 @@ mod tests {
             .await
             .expect_err("should error");
         assert!(
-            matches!(err, SlashInvocationError::SkillNotFound(ref name) if name == "nonexistent")
+            matches!(err, SlashInvocationError::SkillNotFound(ref reason)
+                if reason == "no skill named 'nonexistent'"),
+            "an absent name reads as absent, not as an unreadable file: {err}"
         );
+    }
+
+    /// `/name` for a skill whose `SKILL.md` will not parse reports the file, not "unknown skill".
+    ///
+    /// This is a person typing a name they know exists, so answering that it does not sends them
+    /// looking for something they already have.
+    #[tokio::test]
+    async fn test_slash_to_prompt_text_reports_a_broken_skill_as_broken() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("wrecked");
+        std::fs::create_dir_all(&skill_dir).expect("mkdir skill");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: wrecked\ndescription: [unclosed\n---\nbody\n",
+        )
+        .expect("write skill");
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+
+        let err = slash_to_prompt_text("/wrecked".to_string(), &cache)
+            .await
+            .expect_err("should error");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be read"),
+            "a file that is right there is not an unknown skill: {message}"
+        );
+        assert!(message.contains("frontmatter"), "{message}");
     }
 
     #[tokio::test]

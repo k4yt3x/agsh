@@ -978,7 +978,11 @@ async fn exchange_claude_code(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("token exchange failed ({}): {}", status, body);
+        anyhow::bail!(
+            "token exchange failed ({}): {}",
+            status,
+            crate::error::render_error_body(&body)
+        );
     }
 
     let token: TokenResponse = response.json().await?;
@@ -1315,7 +1319,11 @@ async fn exchange_codex_code(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Codex token exchange failed ({}): {}", status, body);
+        anyhow::bail!(
+            "Codex token exchange failed ({}): {}",
+            status,
+            crate::error::render_error_body(&body)
+        );
     }
 
     #[derive(serde::Deserialize)]

@@ -366,7 +366,8 @@ impl ClaudeSubscriptionProvider {
             });
             return Err(MekaError::Provider(format!(
                 "OAuth token refresh failed ({}): {}",
-                status, body
+                status,
+                crate::error::render_error_body(&body)
             )));
         }
 
@@ -2582,10 +2583,16 @@ mod tests {
         // ...and the change is announced in the block that gets appended instead.
         let memories = crate::memory::MemoryIndex::default();
         let delta = crate::context::render_world_state(
-            &crate::context::WorldSnapshot::new(&after_catalogue, &[], &memories, &[], &[]),
+            &crate::context::WorldSnapshot::new(
+                &after_catalogue,
+                &crate::skills::SkillIndex::default(),
+                &memories,
+                &[],
+                &[],
+            ),
             Some(&crate::context::WorldSnapshot::new(
                 &before_catalogue,
-                &[],
+                &crate::skills::SkillIndex::default(),
                 &memories,
                 &[],
                 &[],

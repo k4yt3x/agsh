@@ -1178,7 +1178,7 @@ impl Agent {
                 };
             let current = context::WorldSnapshot::new(
                 &catalogue,
-                skills.as_slice(),
+                &skills,
                 &memories,
                 &mcp_instructions,
                 &scheduled,

@@ -598,6 +598,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/session-locked` | 409 | Another meka process holds the session's DB lock (e.g. two `meka serve` instances sharing one DB); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-cancelled` | 409 | Turn was cancelled |
+| `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
 | `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |

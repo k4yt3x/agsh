@@ -17,7 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `context_check` and `context_compact` let the agent read its own headroom and ask to compact.
 - `skill_search` greps the full text of every installed skill, bodies included.
 - `skill_write` / `skill_delete` let the agent author skills, off unless `[skills].agent_managed`.
-- Skills take an optional `priority` in frontmatter, ordering the `[Skills]` index like memory's.
+- `[skills].extra_paths` scans further directories for skills, read-only and never created.
+- Skills read the spec's `license`, `compatibility` and `allowed-tools`; `compatibility` is shown.
+- Every frontmatter key survives a rewrite, including ones neither meka nor the spec defines.
+- Skills take a `metadata.meka-priority`, ordering the `[Skills]` index like memory's.
+- `meka skill add --metadata key=value` sets any frontmatter metadata key. Repeatable.
+- `meka skill list --paths` adds a column naming where each skill is on disk.
+- HTTP: `PUT` and `DELETE /v1/skills/{name}` answer 409 for a skill meka reads but cannot write.
+- A skill's file may be named `skill.md` as well as `SKILL.md`, matching the reference parser.
+- The `[Skills]` index names directories that could not be loaded, as `[Memory]` already did.
+- HTTP: the skill views carry `compatibility`, and the detail view `license` and `allowed-tools`.
 - HTTP: compact, rewind, export and import sessions, and report context occupancy.
 - HTTP: manage scheduled jobs, background tasks, skills and memory, behind four new scopes.
 - HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
@@ -45,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `--thinking` takes `adaptive`, `budgeted` or `off` rather than a boolean.
 - **Breaking:** unset `effort` now sends no tier, so the provider's own default applies.
 - **Breaking:** an unset context window is 1000000, not a guess from the model name.
+- **Breaking:** a written `SKILL.md` conforms to the Agent Skills spec: `name`, then `metadata`.
+- **Breaking:** a skill name must follow the spec and match its directory, or it is skipped.
+- **Breaking:** `meka skill add` swaps `--version` and `--author` for a repeatable `--metadata`.
+- **Breaking:** `meka skill add --from-file` needs the `name` the spec makes mandatory.
 - **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
 - **Breaking:** `/v1/docs` and `/v1/openapi.json` are off unless `[serve].docs = true`.
 - **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
@@ -55,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
 - An unknown or stale tool name now suggests the built-in it probably meant.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
+- Skills predating the Agent Skills format still load; a rewrite migrates them to it.
+- `--skill`, `meka skill get` and `skill show` read only the file they name, not the store.
+- **Breaking:** `meka skill get` prints the spec's fields and every `metadata` key.
+- **Breaking:** `meka skill list` drops its version and path columns and gains `External`.
 - Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
 - Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
 - Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
@@ -63,6 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Breaking:** `source_url` and `meka skill update`; clone the source into `[skills].extra_paths`.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
 - The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
 
@@ -98,13 +116,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: a malformed body, a bad parameter or a re-attach race no longer answers a false 409.
 - Terminal rendering survives emoji, combining marks and invisible characters without a broken row.
 - CLI, log and help text corrected throughout: wrong keys, stale advice, leaked Rust internals.
+- Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
+- A listed skill can always be deleted. `con`, `two words` and `my:skill` had no way out but `rm`.
+- `--skill <name>` reported every broken skill in the store twice, once per discovery pass.
+- A server's error body is trimmed before it is shown, so a failed turn ends without blank lines.
 
 ### Security
 
 - Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
-- `memory_write` / `memory_delete` refuse a symlinked path instead of writing outside the store.
+- Memory and skill writes refuse a symlinked path instead of writing outside the store.
 - `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.
 - A command-output capture is created at `0600` and swept after a day.
 - `utoipa-swagger-ui` is vendored, so a build no longer downloads an unpinned, unverified zip.

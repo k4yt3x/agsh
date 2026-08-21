@@ -188,7 +188,7 @@ impl Highlighter for UserInputHighlighter {
 
 /// Tab completer for slash commands. The data needed to complete arguments (MCP server names,
 /// skill names) is snapshotted at construction because reedline re-invokes `complete()` on every
-/// keystroke while the menu is open, so a per-keystroke filesystem scan like `discover_skills`
+/// keystroke while the menu is open, so a per-keystroke filesystem scan like the skill walk
 /// (which reads every `SKILL.md`) must never live in the hot path.
 struct SlashCompleter {
     mcp_server_names: Vec<String>,
@@ -898,6 +898,10 @@ pub fn run_repl(
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
     cwd: crate::workspace::SharedCwd,
     mcp_server_names: Vec<String>,
+    // Every root `[skills] extra_paths` resolves to, so `/skill ` completes an external skill as
+    // well as a native one. Execution already honours them, so without this the completer is the
+    // only surface that pretends they are not installed.
+    skill_roots: Vec<PathBuf>,
     history_db_path: Option<PathBuf>,
     // `wake` is set by the scheduler watcher when one of this session's jobs is due. reedline
     // polls it inside `read_line` and returns `Signal::ExternalBreak`, which is what lets a wakeup
@@ -929,11 +933,12 @@ pub fn run_repl(
         }
     });
 
-    // Snapshot skill names once. `discover_skills` reads every `SKILL.md`, so it must not run per
+    // Snapshot skill names once. Discovery reads every `SKILL.md`, so it must not run per
     // keystroke inside the completer. A skill added mid-session will not autocomplete until
     // restart, but `/skill` execution rediscovers live, so a stale snapshot never yields an
     // invalid command.
-    let skill_names: Vec<String> = crate::skills::discover_skills()
+    let skill_names: Vec<String> = crate::skills::discover_skills_in_roots(&skill_roots)
+        .skills
         .into_iter()
         .map(|skill| skill.name)
         .collect();
@@ -1718,13 +1723,7 @@ fn shorten_path_with_tilde(path: &Path) -> String {
 /// completer so both apply identical `~` / `~/` rules. Returns `None` only when a tilde needs the
 /// home directory but it cannot be determined.
 fn expand_cd_target(target: &str) -> Option<PathBuf> {
-    if target.is_empty() || target == "~" {
-        dirs::home_dir()
-    } else if let Some(rest) = target.strip_prefix("~/") {
-        dirs::home_dir().map(|home| home.join(rest))
-    } else {
-        Some(PathBuf::from(target))
-    }
+    crate::config::expand_user_path(target)
 }
 
 /// Move the session's working directory, returning the failure to report and `None` on success.

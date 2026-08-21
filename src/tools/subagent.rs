@@ -393,11 +393,27 @@ impl Tool for AgentSpawnTool {
         let skill = match &skill_name {
             Some(name) => {
                 let installed = self.tool_builder_params.skills.current().await;
-                match installed.iter().find(|skill| &skill.name == name) {
+                match installed.find(name) {
                     Some(skill) => Some(skill.clone()),
+                    // A skill whose `SKILL.md` will not parse is in no index, so listing what *is*
+                    // available answers a question the caller did not ask and invites it to pick a
+                    // substitute. Name the file instead, the way `skill_read` does.
+                    None if installed.skip_reason(name).is_some() => {
+                        return Ok(ToolOutput::text(
+                            format!(
+                                "Error: {}. Tell the user; they need to fix that file. Do not \
+                                 delegate a procedure you invented in its place.",
+                                installed.unavailable(name)
+                            ),
+                            true,
+                        ));
+                    }
                     None => {
-                        let available: Vec<&str> =
-                            installed.iter().map(|skill| skill.name.as_str()).collect();
+                        let available: Vec<&str> = installed
+                            .skills
+                            .iter()
+                            .map(|skill| skill.name.as_str())
+                            .collect();
                         let hint = if available.is_empty() {
                             "No skills are installed.".to_string()
                         } else {
@@ -3067,7 +3083,11 @@ mod tests {
         .expect("write skill");
 
         let skills = crate::skills::SkillCache::for_root(Some(root.clone()));
-        assert_eq!(skills.current().await.len(), 1, "skill is discoverable");
+        assert_eq!(
+            skills.current().await.skills.len(),
+            1,
+            "skill is discoverable"
+        );
         // Making the root unreadable makes `disk_snapshot` return `None`, and `SkillCache::current`
         // then serves its cached list rather than wiping it. So the name still resolves and only
         // the body read fails -- the ordering this test is about, and a real race with a
@@ -3079,7 +3099,11 @@ mod tests {
             // Running as root, where the mode is advisory. Nothing to assert.
             return;
         }
-        assert_eq!(skills.current().await.len(), 1, "resolution still succeeds");
+        assert_eq!(
+            skills.current().await.skills.len(),
+            1,
+            "resolution still succeeds"
+        );
 
         let session_manager = test_session_manager().await;
         let parent_sid = session_manager.create_session(None).await.expect("parent");
@@ -3124,6 +3148,76 @@ mod tests {
         // Let the tempdir clean itself up.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("unseal skills root");
+    }
+
+    /// Delegating a skill whose `SKILL.md` will not parse must say so, not offer substitutes.
+    ///
+    /// The `skill_read` wording exists because a model told "not found" improvises the procedure.
+    /// `agent_spawn` is the same audience with more at stake -- the improvisation runs in a worker,
+    /// out of sight -- and it kept answering "skill 'x' not found. Available skills: ...", which
+    /// reads as an invitation to pick one of those instead.
+    #[tokio::test]
+    async fn spawning_a_broken_skill_names_the_file_rather_than_offering_alternatives() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = temporary.path().join("skills");
+        for (name, body) in [
+            (
+                "wrecked",
+                "---\nname: wrecked\ndescription: [unclosed\n---\nbody\n",
+            ),
+            (
+                "fine",
+                "---\nname: fine\ndescription: a working one\n---\nbody\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(name)).expect("skill dir");
+            std::fs::write(root.join(name).join("SKILL.md"), body).expect("write skill");
+        }
+
+        let session_manager = test_session_manager().await;
+        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let mut params = test_params(
+            session_manager.clone(),
+            Arc::new(RwLock::new(Some(parent_sid))),
+        );
+        params.skills = crate::skills::SkillCache::for_root(Some(root));
+
+        let spawn = AgentSpawnTool {
+            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("never runs"),
+            ])),
+            parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            tool_builder_params: params,
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let output = spawn
+            .execute(
+                serde_json::json!({ "skill": "wrecked" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a broken skill is a tool result, not a tool error");
+        assert!(output.is_error);
+        let text = super::super::tests::text_content(&output);
+        assert!(
+            text.contains("could not be read"),
+            "a present-but-unparseable file must not read as absent: {text}"
+        );
+        assert!(
+            !text.contains("Available skills"),
+            "naming substitutes invites the model to delegate one: {text}"
+        );
+        assert_eq!(
+            session_manager
+                .load_session_tree(parent_sid)
+                .await
+                .expect("tree")
+                .len(),
+            1,
+            "the refusal happens before any child session exists"
+        );
     }
 
     /// A session may only drive its own workers. This also covers a forked parent, whose copied

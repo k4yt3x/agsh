@@ -6,11 +6,7 @@
 //!
 //! These endpoints are *not* gated by `[skills] agent_managed` or `[memory] access`. Those flags
 //! describe what the model may do on its own initiative; a token presented to this API is the
-//! operator acting remotely, and is the wire equivalent of running `meka skill add` in a shell. The
-//! same reasoning is why the `source_url` refusal that `skill_write` and `skill_delete` apply is
-//! absent here: an *agent* edit to an upstream-managed skill is futile because the next
-//! `meka skill update` reverts it, but a person deciding to edit one anyway is making a choice the
-//! CLI has always let them make. The field is returned so a client can warn its own user.
+//! operator acting remotely, and is the wire equivalent of running `meka skill add` in a shell.
 
 use axum::{
     Extension, Json,
@@ -80,9 +76,21 @@ pub struct SkillDetail {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    /// When set, `meka skill update` re-fetches this skill and overwrites local edits.
+    /// The Agent Skills `license` field, verbatim. Informational.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>,
+    pub license: Option<String>,
+    /// The Agent Skills `compatibility` field: what the skill needs from its environment.
+    ///
+    /// Here because it is the one optional spec field that changes how the skill's instructions
+    /// should be carried out, so a client rendering a palette has a reason to show it. `meka skill
+    /// get` printed it from the moment it was parsed; this view did not, which made the HTTP
+    /// surface the only one that could not see it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+    /// The Agent Skills `allowed-tools` field, verbatim. meka never acts on it; see the skills
+    /// guide.
+    #[serde(rename = "allowed-tools", skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
     /// The `SKILL.md` body. Present on `GET /v1/skills/{name}`, absent from the collection listing
     /// so the palette stays small.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,9 +103,11 @@ impl SkillDetail {
             name: skill.name.clone(),
             description: skill.description.clone(),
             priority: skill.priority,
-            version: skill.version.clone(),
-            author: skill.author.clone(),
-            source_url: skill.source_url.clone(),
+            version: skill.version(),
+            author: skill.author(),
+            license: skill.license.clone(),
+            compatibility: skill.compatibility.clone(),
+            allowed_tools: skill.allowed_tools.clone(),
             body,
         }
     }
@@ -114,6 +124,7 @@ impl SkillDetail {
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such skill", body = ProblemDetail),
+        (status = 422, description = "The skill exists but its SKILL.md could not be parsed", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
 )]
@@ -126,10 +137,15 @@ pub async fn get_skill(
     // returns the body, which is the instruction text itself.
     scope::require(&principal, "skills:r")?;
     let installed = state.shared.skills.current().await;
-    let skill = installed
-        .iter()
-        .find(|skill| skill.name == name)
-        .ok_or_else(|| not_found("skill", &name))?;
+    let skill = installed.find(&name).ok_or_else(|| {
+        // The distinction `get_memory` already draws: a file that failed to parse is a different
+        // answer from one that never existed, and the reason is what the operator needs to fix it.
+        // A flat 404 told a caller that a `SKILL.md` sitting in the store did not exist.
+        match installed.skip_reason(&name) {
+            Some(_) => store_error(installed.unavailable(&name)),
+            None => not_found("skill", &name),
+        }
+    })?;
     // `load_skill_source`, not `load_skill_body`: the latter is what the *agent* is handed, with a
     // base-directory header prepended. Returning that here would make `GET` and `PUT` disagree, and
     // an editing client's read-modify-write would bake the header into the file, once per cycle.
@@ -165,13 +181,14 @@ pub struct WriteSkillRequest {
     put,
     path = "/v1/skills/{name}",
     tag = "skills",
-    params(("name" = String, Path, description = "Skill name, [A-Za-z0-9_-]")),
+    params(("name" = String, Path, description = "Skill name, lowercase letters, digits, hyphens")),
     request_body = WriteSkillRequest,
     responses(
         (status = 200, description = "Skill written", body = SkillDetail),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "The skill store is disabled", body = ProblemDetail),
+        (status = 409, description = "The skill lives in a read-only root from `[skills] extra_paths`", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid name, empty description, or an unwritable path", body = ProblemDetail),
     ),
@@ -203,20 +220,32 @@ pub async fn put_skill(
             crate::store::MAX_PRIORITY
         )));
     }
+    let installed = state.shared.skills.current().await;
+    let existing = installed.find(&name);
+
+    // A skill discovered under a read-only `extra_paths` root is not this endpoint's to change: the
+    // write would land in meka's own store and *shadow* it, so the caller would be told it updated
+    // a skill while the file every other client reads stayed as it was. Unlike the module note
+    // above about an operator's deliberate choices, nobody chooses a silent fork.
+    //
+    // Shared with the CLI and the tools rather than spelled out here, which is also what makes it
+    // cover a shadowed file that does not parse: asked locally, this compared against the loaded
+    // skills and let a broken one through.
+    if let Some(refusal) = crate::skills::refuse_foreign_write(&installed, &name, &root) {
+        return Err(ProblemDetail::new(
+            ErrorKind::StoreReadOnly,
+            StatusCode::CONFLICT,
+            refusal,
+        ));
+    }
+
     // Omitted means "leave it alone", the way `body` and `author` already do. Resetting to the
     // default instead would make the obvious edit -- `GET`, change the text, `PUT` it back --
     // silently demote a prioritised skill, and priority both orders the `[Skills]` index the model
     // reads and decides which entries the index cap drops. Defaults only on creation.
     let priority = match body.priority {
         Some(priority) => priority,
-        None => state
-            .shared
-            .skills
-            .current()
-            .await
-            .iter()
-            .find(|skill| skill.name == name)
-            .map_or(crate::store::DEFAULT_PRIORITY, |skill| skill.priority),
+        None => existing.map_or(crate::store::DEFAULT_PRIORITY, |skill| skill.priority),
     };
     let description = crate::store::normalize_description(&body.description);
     crate::skills::write_skill(
@@ -235,20 +264,17 @@ pub async fn put_skill(
     tracing::info!("wrote skill '{}' via HTTP", name);
 
     // Read back through the cache rather than echoing the request: the response then reports what
-    // is actually on disk, including the `author` and `source_url` a pre-existing skill kept.
+    // is actually on disk, including the `author` a pre-existing skill kept.
     let installed = state.shared.skills.current().await;
-    let skill = installed
-        .iter()
-        .find(|skill| skill.name == name)
-        .ok_or_else(|| {
-            ProblemDetail::internal_sanitized(
-                "skill vanished between write and read-back",
-                format!(
-                    "skill '{}' is not in the cache after a successful write",
-                    name
-                ),
-            )
-        })?;
+    let skill = installed.find(&name).ok_or_else(|| {
+        ProblemDetail::internal_sanitized(
+            "skill vanished between write and read-back",
+            format!(
+                "skill '{}' is not in the cache after a successful write",
+                name
+            ),
+        )
+    })?;
     Ok(Json(SkillDetail::from_skill(skill, None)))
 }
 
@@ -263,6 +289,7 @@ pub async fn put_skill(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such skill", body = ProblemDetail),
+        (status = 409, description = "The skill lives in a read-only root from `[skills] extra_paths`", body = ProblemDetail),
         (status = 422, description = "Invalid name, or a symlinked skill directory", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -282,7 +309,18 @@ pub async fn delete_skill(
     // Validated before the probe, the way `delete_memory` does. Probing first answered "does this
     // directory exist" for any string a caller sent, including one the name rules would have
     // refused, which is a filesystem oracle reachable with only `skills:w`.
-    crate::skills::validate_skill_name(&name).map_err(store_error)?;
+    crate::skills::validate_addressable_name(&name).map_err(store_error)?;
+    // The same refusal `PUT` gives, rather than the 404 the path check below would produce: `GET
+    // /v1/skills` lists this skill, so telling a caller it does not exist is a story the listing
+    // contradicts.
+    let installed = state.shared.skills.current().await;
+    if let Some(refusal) = crate::skills::refuse_foreign_delete(&installed, &name, &root) {
+        return Err(ProblemDetail::new(
+            ErrorKind::StoreReadOnly,
+            StatusCode::CONFLICT,
+            refusal,
+        ));
+    }
     // Classified on the path rather than on the error text, the way `delete_memory` does. The
     // store layer races its own existence check against `remove_dir_all`, whose ENOENT renders as
     // "No such file or directory" and would fall through a substring match for "not found" into a

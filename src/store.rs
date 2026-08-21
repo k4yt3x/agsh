@@ -2,9 +2,14 @@
 //! (`~/.config/meka/skills/<name>/SKILL.md`, [`crate::skills`]) and memories
 //! (`~/.config/meka/memory/<name>.md`, [`crate::memory`]).
 //!
-//! Both use the same `---`-fenced YAML header, the same quoting rules when meka writes one back
-//! out, and the same rules for what makes a legal entry name, so those three pieces live here
-//! rather than being reimplemented per store.
+//! Both use the same `---`-fenced YAML header, so [`split_frontmatter`] lives here, along with the
+//! description and priority handling their indexes share.
+//!
+//! They have stopped sharing the other two. Skills render frontmatter through a YAML serializer
+//! rather than [`yaml_scalar`], and answer to the Agent Skills specification's name rules rather
+//! than [`validate_entry_name`] -- both because a skill is a file format other clients also read,
+//! and a memory is meka's own. Where a rule is genuinely common it is still here; a rule that only
+//! one store applies belongs to that store.
 
 /// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
 /// valid frontmatter block is present.
@@ -26,6 +31,13 @@ pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 /// YAML-quote a scalar when it contains characters that would otherwise require structural
 /// interpretation. Plain ASCII text without leading punctuation, colons, or hash marks passes
 /// through unquoted.
+///
+/// **Safe only for a value that has already been normalised to one line.** It escapes `\` and `"`
+/// and quotes on a fixed character list, which is not the same thing as knowing when YAML needs
+/// quoting; skills moved to a real serializer after hand-rolled quoting lost content on a newline
+/// in a `license` and on a metadata *key* containing one. Its remaining caller, `render_memory`,
+/// is safe because it passes `normalize_description` output and its only other field is a `u8`.
+/// A third caller with a free-form field should use the serializer, not this.
 pub(crate) fn yaml_scalar(text: &str) -> String {
     let needs_quotes = text.is_empty()
         || text.starts_with([
@@ -197,11 +209,20 @@ pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> 
             ));
         }
     }
-    // Names become file and directory names, and Windows reserves a handful regardless of
-    // extension: `CON.md` is the console device, not a file. Creating one fails with an error that
-    // names none of this, and the same config then works on Linux and not on Windows. Rejected on
-    // every platform so a store stays portable rather than becoming valid only where it was
-    // written.
+    reject_windows_reserved(name, noun, "file")?;
+    Ok(())
+}
+
+/// Reject a name Windows reserves as a device, whatever the extension.
+///
+/// `CON.md` is the console device, not a file, and `CON/` is not a directory. Creating one fails
+/// with an error naming none of this, and the same store then works on Linux and not on Windows.
+/// Applied on every platform so a store stays portable rather than valid only where it was written.
+///
+/// Shared by both stores rather than spelled out in each, which is what it was: the list is a fact
+/// about Windows, and two copies of a fact drift. `kind` is the noun for what the name becomes
+/// there -- a memory is a file, a skill is a directory.
+pub(crate) fn reject_windows_reserved(name: &str, noun: &str, kind: &str) -> Result<(), String> {
     const WINDOWS_RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -211,8 +232,8 @@ pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> 
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         return Err(format!(
-            "{} name '{}' is reserved by Windows and cannot be a file name",
-            noun, name
+            "{} name '{}' is reserved by Windows and cannot be a {} name",
+            noun, name, kind
         ));
     }
     Ok(())

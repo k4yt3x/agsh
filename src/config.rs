@@ -64,6 +64,21 @@ pub struct SkillsConfig {
     /// Never granted to a sub-agent whatever this says; see the registration site in
     /// [`crate::tools`].
     pub agent_managed: Option<bool>,
+    /// Additional directories to scan for skills, **read-only**. Default empty.
+    ///
+    /// meka writes only to its own `skills/` directory under the config dir; these roots are never
+    /// created and never written to, so listing one that does not exist costs nothing and leaves
+    /// no trace. That is what makes it safe to point at a shared location like
+    /// `~/.agents/skills`, which other Agent Skills clients populate: meka reads what is
+    /// already there rather than putting anything in `$HOME` itself.
+    ///
+    /// Empty by default, and deliberately not defaulted to the cross-client convention: whether a
+    /// directory outside meka's own namespace should be read is the user's call, not meka's.
+    ///
+    /// A leading `~` is expanded (see [`expand_user_path`]). A relative path is resolved against
+    /// the process working directory, which is why nothing here is scanned implicitly: meka does
+    /// not auto-trust the cwd, so a project's skills are read only when a path names them.
+    pub extra_paths: Option<Vec<String>>,
 }
 
 /// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
@@ -1338,6 +1353,12 @@ pub struct ResolvedConfig {
     /// Whether `skill_write` / `skill_delete` are additionally registered. Defaults to `false`;
     /// see [`SkillsConfig::agent_managed`].
     pub skills_agent_managed: bool,
+    /// Read-only skill roots scanned in addition to meka's own; see
+    /// [`SkillsConfig::extra_paths`]. Already tilde-expanded, and empty unless configured.
+    ///
+    /// Read through [`Self::skill_roots`] rather than directly, so the "native first, then these"
+    /// order has one owner.
+    pub skills_extra_paths: Vec<std::path::PathBuf>,
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
     pub memory_enabled: bool,
@@ -1701,6 +1722,77 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
             default_input_style()
         }
     }
+}
+
+/// Expand a leading `~` or `~/` in a user-supplied path to the home directory.
+///
+/// Returns `None` only when a tilde needs the home directory but it cannot be determined, which the
+/// caller reports rather than silently treating `~` as a relative directory of that name.
+///
+/// Shared by the REPL's `/cd` (and its path completer) and by `[skills] extra_paths`, so a tilde
+/// means the same thing wherever a user types a path. Deliberately does *not* expand `~user`: that
+/// needs a password-database lookup, and no config surface here has ever accepted the form.
+pub fn expand_user_path(target: &str) -> Option<PathBuf> {
+    if target.is_empty() || target == "~" {
+        dirs::home_dir()
+    } else if let Some(rest) = target.strip_prefix("~/") {
+        dirs::home_dir().map(|home| home.join(rest))
+    } else {
+        Some(PathBuf::from(target))
+    }
+}
+
+/// Resolve `[skills] extra_paths` into the read-only roots discovery will scan.
+///
+/// A *function* rather than a chain inside `from_cli`, because each of the four things it drops has
+/// its own reason and each needs saying out loud:
+///
+/// - An empty entry, because [`expand_user_path`] maps `""` to the home directory. That is right
+///   for `/cd` (type `cd` and you go home) and catastrophic here: `$HOME` would become a skills
+///   root and warn once per subdirectory on every rediscovery.
+/// - An entry whose `~` cannot be expanded, rather than treating the tilde as a directory name.
+/// - A repeat of an earlier entry, which discovery would otherwise walk twice and then report every
+///   skill in it as shadowed *by itself* -- a warning naming one path twice, which an operator can
+///   neither act on nor dismiss.
+/// - meka's own root, for the same reason. It is always scanned first; naming it again adds a
+///   second pass and the same self-shadowing report.
+///
+/// Compared as written after expansion, not canonicalised: resolving symlinks would touch the
+/// filesystem, and the promise that a configured-but-absent root leaves no trace is worth more than
+/// catching two spellings of one directory. Discovery's own first-wins rule handles that case.
+fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<PathBuf> {
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for entry in raw {
+        if entry.trim().is_empty() {
+            tracing::warn!("[skills] extra_paths contains an empty entry; ignoring it");
+            continue;
+        }
+        let Some(path) = expand_user_path(entry) else {
+            tracing::warn!(
+                "[skills] extra_paths entry '{}' needs a home directory that could not be \
+                 determined; skipping it",
+                entry
+            );
+            continue;
+        };
+        if Some(path.as_path()) == native {
+            tracing::warn!(
+                "[skills] extra_paths entry '{}' is meka's own skills directory, which is always \
+                 scanned first; ignoring it",
+                entry
+            );
+            continue;
+        }
+        if resolved.contains(&path) {
+            tracing::warn!(
+                "[skills] extra_paths lists '{}' more than once; ignoring the repeat",
+                entry
+            );
+            continue;
+        }
+        resolved.push(path);
+    }
+    resolved
 }
 
 /// Returns the meka config directory (the directory that contains `config.toml` and `skills/`).
@@ -2369,6 +2461,10 @@ impl ResolvedConfig {
         let file_skills = config_file.skills.unwrap_or_default();
         let skills_enabled = file_skills.enabled.unwrap_or(true);
         let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
+        let skills_extra_paths = resolve_skills_extra_paths(
+            file_skills.extra_paths.as_deref().unwrap_or_default(),
+            crate::skills::skills_dir().as_deref(),
+        );
         // The two keys read as independent but are not: `enabled = false` registers no skill tools
         // at all, so the authoring pair never appears however this is set. Saying so beats leaving
         // someone to conclude that `agent_managed` is broken.
@@ -2628,6 +2724,7 @@ impl ResolvedConfig {
             provider_profiles,
             skills_enabled,
             skills_agent_managed,
+            skills_extra_paths,
             memory_enabled,
             schedule,
             background,
@@ -2658,6 +2755,15 @@ impl ResolvedConfig {
             Some(error) => Err(crate::error::MekaError::Config(error.clone())),
             None => Ok(()),
         }
+    }
+
+    /// Every directory skills are read from, in precedence order.
+    ///
+    /// A method rather than the four `skill_roots(&config.skills_extra_paths)` spellings it
+    /// replaces: the derivation is "meka's own first, then the configured extras", and a caller
+    /// that assembled it itself was a caller that could get the order wrong.
+    pub fn skill_roots(&self) -> Vec<PathBuf> {
+        crate::skills::skill_roots(&self.skills_extra_paths)
     }
 
     /// Note an unreadable `config.toml` without failing, for the commands that edit the raw
@@ -2921,6 +3027,38 @@ pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `extra_paths` resolution drops what discovery cannot use, and says so each time.
+    ///
+    /// A repeat, or meka's own root listed again, makes discovery walk the directory twice and then
+    /// report every skill in it as shadowed *by itself* -- a warning naming one path twice, which
+    /// an operator can neither act on nor dismiss. The empty entry is the dangerous one: it would
+    /// expand to `$HOME` and make the whole home directory a skills root.
+    #[test]
+    fn extra_paths_drops_repeats_the_native_root_and_empty_entries() {
+        let native = PathBuf::from("/cfg/skills");
+        let resolved = resolve_skills_extra_paths(
+            &[
+                "/a/skills".to_string(),
+                "/a/skills".to_string(),
+                "/cfg/skills".to_string(),
+                "  ".to_string(),
+                "/b/skills".to_string(),
+            ],
+            Some(native.as_path()),
+        );
+        assert_eq!(
+            resolved,
+            vec![PathBuf::from("/a/skills"), PathBuf::from("/b/skills")],
+            "order is precedence, so it has to be preserved"
+        );
+
+        // With no native root there is nothing to compare against, and the rest still applies.
+        assert_eq!(
+            resolve_skills_extra_paths(&["/a".to_string(), "/a".to_string()], None),
+            vec![PathBuf::from("/a")]
+        );
+    }
 
     /// The redacting `Debug` impls exist to keep a secret out of a log, and until this test there
     /// was nothing asserting any of them: all three could have been deleted and the suite would

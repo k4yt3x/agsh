@@ -360,7 +360,8 @@ impl ChatGptSubscriptionProvider {
             });
             return Err(MekaError::Provider(format!(
                 "Codex OAuth token refresh failed ({}): {}",
-                status, body
+                status,
+                crate::error::render_error_body(&body)
             )));
         }
 

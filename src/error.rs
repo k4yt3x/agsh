@@ -122,7 +122,7 @@ pub(crate) fn provider_http_error(
         || lower.contains("context length exceeded")
         || lower.contains("maximum context length")
         || lower.contains("exceeds the maximum context");
-    let message = format!("API returned status {status}: {body}");
+    let message = format!("API returned status {status}: {}", render_error_body(body));
     if overflow {
         MekaError::ContextOverflow(message)
     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -136,6 +136,21 @@ pub(crate) fn provider_http_error(
         MekaError::InvalidRequest(message)
     } else {
         MekaError::Provider(message)
+    }
+}
+
+/// Prepare a server's error response body for display at the tail of an error message.
+///
+/// Bodies arrive with a trailing newline more often than not, and the body is the last thing in
+/// every message that carries one, so an untrimmed one ends the console line in whitespace and
+/// prints a blank line before the next prompt. A body that is only whitespace, or that failed to
+/// read at all, is named as absent rather than left as a dangling colon.
+pub(crate) fn render_error_body(body: &str) -> &str {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "no response body"
+    } else {
+        trimmed
     }
 }
 
@@ -320,6 +335,34 @@ mod tests {
             ),
             MekaError::ContextOverflow(_)
         ));
+    }
+
+    /// The body is the tail of the message, so whitespace on it is whitespace on the console line.
+    #[test]
+    fn a_servers_error_body_reaches_the_message_without_its_surrounding_whitespace() {
+        let error = provider_http_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "{\"error\":\"model not found\"}\n\n",
+            None,
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.ends_with(r#"{"error":"model not found"}"#),
+            "trailing newlines survived into the message: {rendered:?}"
+        );
+    }
+
+    /// A body that is only whitespace would otherwise leave the message ending in a dangling colon.
+    #[test]
+    fn an_absent_error_body_is_named_rather_than_left_blank() {
+        let error = provider_http_error(reqwest::StatusCode::BAD_GATEWAY, "\n", None);
+        assert!(
+            error
+                .to_string()
+                .ends_with("502 Bad Gateway: no response body"),
+            "an empty body should be named: {:?}",
+            error.to_string()
+        );
     }
 
     #[test]

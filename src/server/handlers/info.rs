@@ -81,10 +81,14 @@ pub struct SkillView {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    /// When set, `meka skill update` re-fetches this skill and overwrites local edits. A client
-    /// offering an edit UI should say so before letting someone spend effort on one.
+    /// What the skill needs from its environment, from the Agent Skills `compatibility` field.
+    ///
+    /// The one optional spec field that changes how the skill's instructions should be carried
+    /// out, so a client rendering this palette has a reason to show it. `license` and
+    /// `allowed-tools` are per-skill detail and stay on `GET /v1/skills/{name}`, which is where
+    /// the body is too.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_url: Option<String>,
+    pub compatibility: Option<String>,
 }
 
 /// `GET /v1/skills`: installed skill palette. Mirrors what the REPL `/skill` command and
@@ -107,14 +111,15 @@ pub async fn skills(
     require_any_read_scope(&principal)?;
     let snapshot = state.shared.skills.current().await;
     let skills = snapshot
+        .skills
         .iter()
         .map(|skill| SkillView {
             name: skill.name.clone(),
             description: skill.description.clone(),
             priority: skill.priority,
-            version: skill.version.clone(),
-            author: skill.author.clone(),
-            source_url: skill.source_url.clone(),
+            version: skill.version(),
+            author: skill.author(),
+            compatibility: skill.compatibility.clone(),
         })
         .collect();
     Ok(Json(skills))

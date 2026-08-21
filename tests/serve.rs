@@ -186,6 +186,16 @@ scopes = [{scopes_str}]
             .header("Authorization", format!("Bearer {}", self.token))
     }
 
+    /// The `HOME` this server runs under, so a test can seed files a config `~/...` path names.
+    ///
+    /// `extra_config` is written before the server starts and the temp directory is chosen inside
+    /// `spawn_with`, so a config entry pointing outside meka's own store can only be seeded through
+    /// a path both sides can name. `~` is what `[skills] extra_paths` expands, and the store is
+    /// re-scanned per request, so seeding after startup is enough.
+    fn home(&self) -> &std::path::Path {
+        self._temp.path()
+    }
+
     /// Block until a turn is actually running on `id`.
     ///
     /// Every test that asserts in-flight behaviour (409, 429, cancel, delete-refusal) needs the
@@ -2841,6 +2851,53 @@ fn turn_options_unknown_skill_returns_422() {
     assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
 }
 
+/// `options.skill` naming a broken `SKILL.md` says so, rather than "unknown skill".
+///
+/// The last door to keep composing its own "not found". Both answers are a 422, so the status code
+/// hid the difference: a caller driving a turn with a skill they had just installed was told it did
+/// not exist, when the file was sitting in the store with a typo in its frontmatter. Every other
+/// lookup goes through `SkillIndex::unavailable`; a per-site mutation sweep is what showed this one
+/// had no test holding it there.
+#[test]
+fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
+    let harness =
+        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+    let broken = harness.home().join("meka").join("skills").join("wrecked");
+    std::fs::create_dir_all(&broken).expect("mkdir");
+    std::fs::write(
+        broken.join("SKILL.md"),
+        "---\nname: wrecked\ndescription: [unclosed\n---\nBODY\n",
+    )
+    .expect("seed");
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({
+            "message": "go",
+            "options": {"skill": "wrecked"},
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let body: serde_json::Value = response.json().expect("parse");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("could not be read"),
+        "a present-but-unparseable file must not read as absent: {body}"
+    );
+    assert!(detail.contains("frontmatter"), "{body}");
+}
+
 /// Unknown fields under `options` produce 422 invalid-body.
 #[test]
 fn turn_options_unknown_field_returns_422() {
@@ -5258,6 +5315,121 @@ fn skill_write_read_and_delete_round_trip() {
     assert_eq!(gone.status(), 404);
 }
 
+/// A skill under a read-only `[skills] extra_paths` root is neither writable nor deletable here,
+/// and both refusals arrive as 409 `store-read-only` naming where the file actually is.
+///
+/// Writing would not update that skill: it would put a second copy in meka's own store which wins
+/// precedence, so the caller is told it edited a procedure while every other client goes on reading
+/// the original. Both branches, the new [`ErrorKind::StoreReadOnly`] and its documented 409, had no
+/// test at all: deleting either check left the whole suite green.
+///
+/// The broken file is the half that was actually wrong. The check compared against the *loaded*
+/// skills, so a `SKILL.md` that does not parse was a name the store had no opinion about, and the
+/// write went through silently.
+#[test]
+fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
+    let harness = ServeTestHarness::spawn_with(
+        "\n[skills]\nextra_paths = [\"~/shared-skills\"]\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        STORE_SCOPES,
+    );
+    let shared = harness.home().join("shared-skills");
+    for (name, body) in [
+        (
+            "borrowed",
+            "---\nname: borrowed\ndescription: theirs\n---\nTHEIRS\n",
+        ),
+        (
+            "wrecked",
+            "---\nname: wrecked\ndescription: [unclosed\n---\nTHEIRS\n",
+        ),
+    ] {
+        std::fs::create_dir_all(shared.join(name)).expect("mkdir");
+        std::fs::write(shared.join(name).join("SKILL.md"), body).expect("seed");
+    }
+
+    for name in ["borrowed", "wrecked"] {
+        let write = harness
+            .request(reqwest::Method::PUT, &format!("/v1/skills/{}", name))
+            .json(&serde_json::json!({"description": "mine now"}))
+            .send()
+            .expect("send");
+        assert_eq!(
+            write.status(),
+            409,
+            "PUT on a read-only root must conflict, not shadow: {}",
+            write.text().unwrap_or_default()
+        );
+        let problem: serde_json::Value = harness
+            .request(reqwest::Method::PUT, &format!("/v1/skills/{}", name))
+            .json(&serde_json::json!({"description": "mine now"}))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        assert_eq!(problem["type"], "https://meka.so/errors/store-read-only");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&shared.join(name).display().to_string()),
+            "the refusal must name the file it is protecting: {}",
+            problem
+        );
+
+        let delete = harness
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .send()
+            .expect("send");
+        assert_eq!(delete.status(), 409, "DELETE must not reach a foreign root");
+    }
+
+    assert!(
+        shared.join("borrowed/SKILL.md").exists() && shared.join("wrecked/SKILL.md").exists(),
+        "neither foreign file may be touched"
+    );
+}
+
+/// `GET /v1/skills/{name}` must not report a `SKILL.md` that is present but unparseable as absent.
+///
+/// The same distinction `get_memory` already draws. A flat 404 sent an operator looking for a file
+/// sitting in the store, which is the answer they get straight after the startup warning names
+/// it.
+#[test]
+fn getting_a_broken_skill_says_why_rather_than_404() {
+    let harness =
+        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+    let broken = harness.home().join("meka").join("skills").join("wrecked");
+    std::fs::create_dir_all(&broken).expect("mkdir");
+    std::fs::write(
+        broken.join("SKILL.md"),
+        "---\nname: wrecked\ndescription: [unclosed\n---\nBODY\n",
+    )
+    .expect("seed");
+
+    let response = harness
+        .request(reqwest::Method::GET, "/v1/skills/wrecked")
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422, "a present file is not a 404");
+    let problem: serde_json::Value = response.json().expect("parse");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "{}",
+        problem
+    );
+
+    let absent = harness
+        .request(reqwest::Method::GET, "/v1/skills/never-written")
+        .send()
+        .expect("send");
+    assert_eq!(absent.status(), 404, "a name nobody wrote is still a 404");
+}
+
 /// An omitted `body` keeps the existing one. A caller correcting a description should not have to
 /// resend prose it never meant to touch, and the alternative is silently clearing it.
 #[test]
@@ -7384,25 +7556,28 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
     );
 }
 
-/// A `DELETE` of an invalid skill name is refused on the name, before the filesystem is touched.
+/// A `DELETE` of a name that could not be a skill in the store is refused before the filesystem is
+/// touched.
 ///
 /// Probing first made the endpoint answer "does this directory exist" for any string a caller sent,
-/// including one the name rules would have rejected outright: a filesystem oracle reachable with
-/// nothing but `skills:w`. `delete_memory` already validated first; this half did not. Reordering
-/// the two statements back left all four suites green, which is why this exists.
+/// including one that leaves the store entirely: a filesystem oracle reachable with nothing but
+/// `skills:w`. `delete_memory` already validated first; this half did not. Reordering the two
+/// statements back left all four suites green, which is why this exists.
 ///
-/// The distinguishing signal is the *kind* of refusal, not merely that it refuses. A name that is
-/// invalid must fail validation (422) whether or not anything is on disk under it, where a probe
-/// would have answered 404 for the same string.
+/// The property is *escaping the store*, not looking unusual. Requiring the latter made ordinary
+/// directories another client can create -- `not.a.skill`, `has space` -- impossible to delete
+/// through any door while buying no safety, since a `skills:w` token may already list and write
+/// every name in that directory. So an escaping name must fail validation (422) whether or not
+/// anything is on disk under it, and a store-local one gets the honest 404.
 #[test]
 fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
     let harness =
         ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
 
-    // Names that survive routing as a single path segment but fail the `[A-Za-z0-9_-]` rules.
+    // Names that survive routing as a single path segment but cannot name a directory in the store.
     // `..` is deliberately not among them: axum normalises it away before the handler sees it, so
     // it tests the router rather than this endpoint.
-    for name in ["not.a.skill", "bad~name", "has%20space", "tab%09name"] {
+    for name in [".hidden", "tab%09name", "null%00name"] {
         let response = harness
             .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
             .send()
@@ -7417,6 +7592,20 @@ fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
         assert_eq!(
             body["type"], "https://meka.so/errors/invalid-body",
             "'{name}' must be refused as an invalid name: {status} {body}"
+        );
+    }
+
+    // A name that *could* be a skill here answers honestly instead of being stonewalled, which is
+    // what makes such a skill removable at all.
+    for name in ["not.a.skill", "has%20space"] {
+        let response = harness
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .send()
+            .expect("send");
+        assert_eq!(
+            response.status(),
+            404,
+            "'{name}' names a directory in the store, so it has to be answerable"
         );
     }
 }

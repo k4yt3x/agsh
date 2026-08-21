@@ -22,7 +22,7 @@ use crate::{
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
-    skills::{self, Skill, SkillCache},
+    skills::{self, SkillCache},
 };
 
 pub(super) struct SkillReadTool {
@@ -67,19 +67,32 @@ impl Tool for SkillReadTool {
         let name = require_str(&input, "name", "skill_read")?;
         let skills = self.skills.current().await;
 
-        let skill = match find_skill(&skills, &name) {
+        let skill = match skills.find(&name) {
             Some(skill) => skill,
+            // "No such skill" and "it is right there and meka cannot read it" call for opposite
+            // responses, and both used to arrive as "not found" -- so a model handed a procedure
+            // whose file has a typo in its frontmatter was told the procedure does not exist, and
+            // would go on to improvise one. `memory_read` was changed to stop telling exactly this
+            // lie; this is the same fix on the sibling store.
             None => {
-                let available: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
-                let hint = if available.is_empty() {
-                    "No skills are installed.".to_string()
-                } else {
-                    format!("Available skills: {}", available.join(", "))
+                let hint = match skills.skip_reason(&name) {
+                    Some(reason) => format!(
+                        "Error: skill '{}' exists on disk but could not be read: {}. Tell the user; \
+                         they need to fix that file. Do not substitute your own version of it.",
+                        name, reason
+                    ),
+                    None => {
+                        let available: Vec<&str> =
+                            skills.skills.iter().map(|s| s.name.as_str()).collect();
+                        let hint = if available.is_empty() {
+                            "No skills are installed.".to_string()
+                        } else {
+                            format!("Available skills: {}", available.join(", "))
+                        };
+                        format!("Error: skill '{}' not found. {}", name, hint)
+                    }
                 };
-                return Ok(ToolOutput::text(
-                    format!("Error: skill '{}' not found. {}", name, hint),
-                    true,
-                ));
+                return Ok(ToolOutput::text(hint, true));
             }
         };
 
@@ -95,10 +108,6 @@ impl Tool for SkillReadTool {
     }
 }
 
-fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
-    skills.iter().find(|skill| skill.name == name)
-}
-
 /// Resolve the skills root, or fail naming the cause rather than reporting an empty store. Mirrors
 /// `require_root` in [`crate::tools::memory`].
 fn require_root(cache: &SkillCache, tool_name: &str) -> Result<std::path::PathBuf> {
@@ -112,59 +121,61 @@ fn require_root(cache: &SkillCache, tool_name: &str) -> Result<std::path::PathBu
         })
 }
 
-/// Refuse to write or delete a skill that declares a `source_url`.
-///
-/// Those are upstream-managed: `meka skill update` re-fetches and overwrites them, so an agent edit
-/// is not merely risky but *futile*, and would be reverted with no warning at the worst possible
-/// moment. Returning the reason rather than a bare refusal is the point, since the agent can act on
-/// it by choosing a different name.
-///
-/// This deliberately does not protect a hand-written skill with no `source_url`. Nothing can,
-/// without provenance in the frontmatter, which meka rejected for memory on the grounds that a
-/// store shared by a human and an agent should not sort its entries by who typed them. The real
-/// guard is `[skills] agent_managed` being off by default.
-fn reject_upstream_managed(skill: &Skill) -> Option<ToolOutput> {
-    let source_url = skill.source_url.as_deref()?;
-    Some(ToolOutput::text(
-        format!(
-            "Error: skill '{}' is managed upstream (source_url: {}). `meka skill update` \
-             re-fetches it, so any change here would be silently reverted. Write to a different \
-             name, or ask the user to change it at the source.",
-            skill.name, source_url
-        ),
-        true,
-    ))
-}
-
 /// Refuse to touch a directory that holds a `SKILL.md` discovery could not parse.
 ///
-/// Absent from the index is not the same as absent from disk. Such a file is skipped with a warning
-/// and appears in no index and no listing, so neither the model nor this tool can say what is in
-/// it, and its only copy is that file. Reporting it as "not found" while it sits in the skills
-/// directory is the confusion `[Memory]`'s skip reporting exists to prevent, so name the case
-/// instead.
+/// Absent from the index is not the same as absent from disk. Such a file is skipped, so neither
+/// the model nor this tool can say what is in it, and its only copy is that file. Reporting it as
+/// "not found" while it sits in the skills directory is the confusion [`skills::SkippedSkill`]
+/// exists to prevent, so name the case instead -- and name the *reason*, which the file cannot.
+///
+/// Answered from the index rather than by probing the filesystem. Discovery has already read every
+/// one of these files and recorded why each failed; re-deriving a weaker version of that with a
+/// `is_file()` call could say "not a valid skill" but never why, and gave a second, later answer to
+/// a question already settled.
+///
+/// The remedy is only offered when the file is one `meka skill remove` can reach. For a broken
+/// skill under a read-only `extra_paths` root that command answers "not found", so pointing the
+/// model at it sent the user round a loop; the refusal names the path instead.
 ///
 /// [`skills::write_skill`] refuses the same case independently; this exists so the refusal arrives
 /// as a readable tool result rather than a tool error, and so `skill_delete` gets it too.
 fn reject_unreadable(
-    root: &std::path::Path,
     name: &str,
-    installed: &[Skill],
+    installed: &skills::SkillIndex,
+    native_root: &std::path::Path,
 ) -> Option<ToolOutput> {
-    // The *file*, not the directory. A bare `skills/<name>/` with no `SKILL.md` is a half-finished
-    // `meka skill add`, a partly-copied folder, or the residue of an interrupted write: there is
-    // nothing in it to lose, and `write_skill` would happily create the skill. Refusing on the
-    // directory blocked a legitimate create and claimed a `SKILL.md` that was not there.
-    if find_skill(installed, name).is_some() || !root.join(name).join("SKILL.md").is_file() {
-        return None;
-    }
+    // A skill that *loaded* is not here, and that is [`skills::SkillIndex`]'s disjointness
+    // invariant rather than a check of this function's own. Without it, a working `deploy` in
+    // meka's store beside a broken `deploy/` in a read-only root put the name in both halves,
+    // and this refused to write a skill sitting in the index -- claiming its contents could not
+    // be shown, and offering `meka skill remove deploy`, which reaches the working copy.
+    // Re-checking `find` here would fix this door and leave the other readers of `skipped` to
+    // each remember the same thing.
+    //
+    // A bare `skills/<name>/` with no `SKILL.md` is not here either, because discovery skips such a
+    // directory silently rather than recording it: it is a half-finished `meka skill add`, a
+    // partly-copied folder, or the residue of an interrupted write, and `write_skill` should
+    // happily finish it. This comment claimed that was already true for a while when it was not;
+    // `a_directory_with_no_skill_file_is_not_a_broken_skill` is what makes it so.
+    let reason = installed.skip_reason(name)?;
+    let remedy = match installed.location(name) {
+        Some((root, source_dir)) if root != native_root => format!(
+            "It lives at {}, which meka reads but does not write to, so ask the user to fix or \
+             remove it there.",
+            source_dir.display()
+        ),
+        _ => format!(
+            "Use a different name, or ask the user to fix or remove it with \
+             `meka skill remove {}`.",
+            name
+        ),
+    };
     Some(ToolOutput::text(
         format!(
-            "Error: '{}' exists on disk but its SKILL.md is not a valid skill, so it is in no \
+            "Error: '{}' exists on disk but its SKILL.md is not a valid skill ({}), so it is in no \
              index and its contents cannot be shown. Leaving it untouched rather than overwriting \
-             something neither of us can see. Use a different name, or ask the user to fix or \
-             remove it with `meka skill remove {}`.",
-            name, name
+             something neither of us can see. {}",
+            name, reason, remedy
         ),
         true,
     ))
@@ -214,7 +225,7 @@ impl Tool for SkillSearchTool {
 
         let mut matches = Vec::new();
         let mut truncated = false;
-        for skill in skills.iter() {
+        for skill in skills.skills.iter() {
             let content = match tokio::fs::read_to_string(&skill.body_path).await {
                 Ok(content) => content,
                 Err(error) => {
@@ -281,7 +292,7 @@ impl Tool for SkillWriteTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Identifier, letters/digits/-/_ only (e.g. 'triage-build-failure')"
+                        "description": "Identifier: lowercase letters, digits and hyphens (e.g. 'triage-build-failure')"
                     },
                     "description": {
                         "type": "string",
@@ -341,23 +352,23 @@ impl Tool for SkillWriteTool {
         };
 
         let installed = self.skills.current().await;
-        if let Some(refusal) = reject_unreadable(&root, &name, &installed) {
+        // Unreadable first, because it is the more specific answer: a file that is both foreign and
+        // unparseable needs its parse error named, and `reject_unreadable` carries the read-only
+        // remedy for that case where the plain foreign refusal cannot carry the reason.
+        if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
         }
-        if let Some(existing) = find_skill(&installed, &name)
-            && let Some(refusal) = reject_upstream_managed(existing)
-        {
-            return Ok(refusal);
+        if let Some(refusal) = skills::refuse_foreign_write(&installed, &name, &root) {
+            return Ok(ToolOutput::text(format!("Error: {}", refusal), true));
         }
-
         // Read before the write, since the write is what makes the file exist: otherwise the
         // confirmation would claim to have kept the body of a skill that had none.
-        let kept_existing_body = body.is_none() && installed.iter().any(|s| s.name == name);
+        let kept_existing_body = body.is_none() && installed.find(&name).is_some();
 
         // On the blocking pool, for the same reason `memory_write` is: the write goes through
         // `write_file_atomic`, which `fsync`s, and a `fsync` parks the calling thread for as long
         // as the filesystem takes. On a runtime worker that is every other session's turn waiting.
-        let path = {
+        let written = {
             let root = root.clone();
             let name = name.clone();
             let description = description.clone();
@@ -388,16 +399,18 @@ impl Tool for SkillWriteTool {
         // `agent_spawn(skill:)` milliseconds later, in the same turn.
         self.skills.invalidate().await;
 
-        tracing::info!("saved skill to {}", path.display());
+        tracing::info!("saved skill to {}", written.body_path.display());
         Ok(ToolOutput::text(
-            // Deliberately promises reachability by name rather than a place in the index. The
-            // index is capped, so a low-priority skill in a large store may not be listed there,
-            // and `skill_read` / `agent_spawn` work either way.
+            // The rank the *file* now carries, read back from the bytes rather than echoed from
+            // the request. Deliberately promises reachability by name rather than a
+            // place in the index: the index is capped, so a low-priority skill in a
+            // large store may not be listed there, and `skill_read` / `agent_spawn`
+            // work either way.
             format!(
                 "Saved skill '{}' (priority {}){}. From the next turn on you can load it with \
                  skill_read, or hand it to a worker with agent_spawn(skill: \"{}\").",
                 name,
-                priority,
+                written.priority,
                 if kept_existing_body {
                     ", keeping the existing body"
                 } else {
@@ -457,27 +470,26 @@ impl Tool for SkillDeleteTool {
     ) -> Result<ToolOutput> {
         let root = require_root(&self.skills, "skill_delete")?;
         let name = require_str(&input, "name", "skill_delete")?;
-        skills::validate_skill_name(&name).map_err(|message| MekaError::ToolExecution {
+        // Lookup rules: a skill whose name predates the spec is still listed and still readable, so
+        // it has to be removable too.
+        skills::validate_addressable_name(&name).map_err(|message| MekaError::ToolExecution {
             tool_name: "skill_delete".to_string(),
             message,
         })?;
 
         let installed = self.skills.current().await;
-        if let Some(refusal) = reject_unreadable(&root, &name, &installed) {
+        // Unreadable first, for the reason `skill_write` gives.
+        if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
         }
-        match find_skill(&installed, &name) {
-            Some(existing) => {
-                if let Some(refusal) = reject_upstream_managed(existing) {
-                    return Ok(refusal);
-                }
-            }
-            None => {
-                return Ok(ToolOutput::text(
-                    format!("Error: skill '{}' not found.", name),
-                    true,
-                ));
-            }
+        if let Some(refusal) = skills::refuse_foreign_delete(&installed, &name, &root) {
+            return Ok(ToolOutput::text(format!("Error: {}", refusal), true));
+        }
+        if installed.find(&name).is_none() {
+            return Ok(ToolOutput::text(
+                format!("Error: skill '{}' not found.", name),
+                true,
+            ));
         }
 
         let dir =
@@ -564,20 +576,39 @@ mod tests {
     }
 
     #[test]
-    fn test_find_skill() {
-        let skill = Skill {
+    fn an_index_tells_absent_from_unreadable() {
+        let skill = crate::skills::Skill {
             name: "foo".to_string(),
             source_dir: std::path::PathBuf::from("/tmp"),
             description: "desc".to_string(),
-            version: None,
-            author: None,
-            source_url: None,
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
             priority: crate::store::DEFAULT_PRIORITY,
+            metadata: None,
+            extra: std::collections::BTreeMap::new(),
+            conformance: crate::skills::Conformance::default(),
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+            root: std::path::PathBuf::from("/tmp"),
         };
-        let skills = vec![skill];
-        assert!(find_skill(&skills, "foo").is_some());
-        assert!(find_skill(&skills, "bar").is_none());
+        let index = crate::skills::SkillIndex {
+            skills: vec![skill],
+            skipped: vec![crate::skills::SkippedSkill {
+                name: "broken".to_string(),
+                reason: "missing YAML frontmatter".to_string(),
+                root: std::path::PathBuf::from("/tmp"),
+            }],
+        };
+        assert!(index.find("foo").is_some());
+        assert!(index.find("bar").is_none());
+        // The distinction the whole index exists for: a name that is absent and a name whose file
+        // is unreadable are different answers, and only one of them is "no such skill".
+        assert_eq!(
+            index.skip_reason("broken"),
+            Some("missing YAML frontmatter")
+        );
+        assert_eq!(index.skip_reason("bar"), None);
+        assert!(index.find("broken").is_none());
     }
 
     #[test]
@@ -593,6 +624,268 @@ mod tests {
 
     fn cache_at(temp: &tempfile::TempDir) -> Arc<SkillCache> {
         SkillCache::for_root(Some(temp.path().to_path_buf()))
+    }
+
+    /// A skill from a read-only `extra_paths` root is not the agent's to change: the write would
+    /// land in meka's own store and shadow it, so the tool would report an update that did not
+    /// happen to the file every other client reads.
+    #[tokio::test]
+    async fn write_and_delete_refuse_a_skill_from_a_read_only_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let native = temp.path().join("native");
+        let shared = temp.path().join("shared");
+        std::fs::create_dir_all(&native).expect("native");
+        write_skill(
+            &shared,
+            "borrowed",
+            "---\ndescription: theirs\n---\nTHEIR PROCEDURE\n",
+        );
+        let skills = SkillCache::new(Some(native.clone()), vec![shared.clone()]);
+
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+        let result = run(
+            &write,
+            serde_json::json!({"name": "borrowed", "description": "mine", "body": "MINE"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            text_of(&result).contains("does not write to"),
+            "{}",
+            text_of(&result)
+        );
+
+        let delete = SkillDeleteTool {
+            skills: skills.clone(),
+        };
+        let result = run(&delete, serde_json::json!({"name": "borrowed"})).await;
+        assert!(result.is_error);
+        assert!(text_of(&result).contains("does not write to"));
+
+        // Neither refusal touched the foreign file, and neither created a shadow copy.
+        assert!(
+            std::fs::read_to_string(shared.join("borrowed/SKILL.md"))
+                .expect("still there")
+                .contains("THEIR PROCEDURE")
+        );
+        assert!(
+            !native.join("borrowed").exists(),
+            "a shadowing copy must not be created in meka's own root"
+        );
+
+        // A name meka does own is unaffected.
+        let result = run(
+            &write,
+            serde_json::json!({"name": "ours", "description": "d", "body": "b"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+    }
+
+    /// The read-only rule covers a foreign skill whose `SKILL.md` does not parse, and the refusal
+    /// sends the reader to the file rather than to a command that cannot reach it.
+    ///
+    /// Both halves were wrong. Every door compared against the *loaded* skills, so an unparseable
+    /// file in an `extra_paths` root was a name nothing had an opinion about and got shadowed
+    /// silently -- the worst case to shadow, since the original is then reported nowhere at all.
+    /// And the refusal that did fire named `meka skill remove`, which answers "not found" for a
+    /// file meka does not own.
+    #[tokio::test]
+    async fn a_broken_skill_in_a_read_only_root_is_neither_shadowed_nor_misdirected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let native = temp.path().join("native");
+        let shared = temp.path().join("shared");
+        std::fs::create_dir_all(&native).expect("native");
+        write_skill(
+            &shared,
+            "wrecked",
+            "---\ndescription: [unclosed\n---\nTHEIRS\n",
+        );
+        let skills = SkillCache::new(Some(native.clone()), vec![shared.clone()]);
+
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+        let result = run(
+            &write,
+            serde_json::json!({"name": "wrecked", "description": "mine", "body": "MINE"}),
+        )
+        .await;
+        assert!(result.is_error, "{}", text_of(&result));
+        let text = text_of(&result);
+        assert!(
+            text.contains(&shared.join("wrecked").display().to_string()),
+            "the refusal must name where the file is: {text}"
+        );
+        assert!(
+            !text.contains("meka skill remove"),
+            "that command cannot reach a read-only root: {text}"
+        );
+        assert!(
+            !native.join("wrecked").exists(),
+            "an unparseable foreign skill must not be shadowed either"
+        );
+
+        // A broken skill meka *does* own still gets the remedy that works for it.
+        write_skill(&native, "ours-wrecked", "no frontmatter\n");
+        skills.invalidate().await;
+        let result = run(
+            &write,
+            serde_json::json!({"name": "ours-wrecked", "description": "mine"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            text_of(&result).contains("meka skill remove ours-wrecked"),
+            "{}",
+            text_of(&result)
+        );
+    }
+
+    /// A name that loaded is writable, whatever a shadowed copy of it elsewhere looks like.
+    ///
+    /// Roots merge first-wins and the skip list records every failure, so meka's own working
+    /// `deploy` and a broken `deploy/` in a read-only root put one name in both halves of the
+    /// index. `reject_unreadable` answered from the skipped half alone, which refused every write
+    /// and every delete of a skill plainly in the index -- telling the model its contents could not
+    /// be shown, and offering `meka skill remove deploy`, which reaches the working copy. An agent
+    /// that authored a skill could then neither refine nor remove it, for a file in a directory it
+    /// does not own.
+    #[tokio::test]
+    async fn a_skill_that_loaded_is_writable_though_a_broken_copy_shadows_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let native = temp.path().join("native");
+        let shared = temp.path().join("shared");
+        write_skill(
+            &native,
+            "deploy",
+            "---\nname: deploy\ndescription: mine and working\n---\nMINE\n",
+        );
+        write_skill(
+            &shared,
+            "deploy",
+            "---\ndescription: [unclosed\n---\nTHEIRS\n",
+        );
+        let skills = SkillCache::new(Some(native.clone()), vec![shared.clone()]);
+        let index = skills.current().await;
+        assert!(index.find("deploy").is_some(), "the native copy wins");
+        assert_eq!(
+            index.skip_reason("deploy"),
+            None,
+            "and the shadowed broken copy must not also claim the name"
+        );
+
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+        let result = run(
+            &write,
+            serde_json::json!({"name": "deploy", "description": "refined", "body": "MINE2"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(
+            std::fs::read_to_string(native.join("deploy/SKILL.md"))
+                .expect("still there")
+                .contains("MINE2"),
+            "the write must land in meka's own root"
+        );
+        assert!(
+            std::fs::read_to_string(shared.join("deploy/SKILL.md"))
+                .expect("still there")
+                .contains("THEIRS"),
+            "and must not touch the read-only one"
+        );
+
+        skills.invalidate().await;
+        let delete = SkillDeleteTool {
+            skills: skills.clone(),
+        };
+        let result = run(&delete, serde_json::json!({"name": "deploy"})).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!native.join("deploy").exists(), "removed from meka's store");
+        assert!(shared.join("deploy").exists(), "left alone elsewhere");
+    }
+
+    /// A skill whose file is unreadable is reported as unreadable, not as absent.
+    ///
+    /// The two call for opposite responses and both used to arrive as "not found", so a model
+    /// handed a procedure with a typo in its frontmatter was told the procedure does not exist --
+    /// and the reasonable next move, improvising its own version, is the worst available one.
+    /// `memory_read` was changed to stop telling this lie; skills kept telling it because discovery
+    /// computed the reason and then threw it away.
+    #[tokio::test]
+    async fn read_says_a_broken_skill_is_broken_rather_than_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "broken", "no frontmatter at all\nKEEP ME\n");
+        write_skill(temp.path(), "fine", "---\ndescription: d\n---\nbody\n");
+        let skills = cache_at(&temp);
+
+        let read = SkillReadTool {
+            skills: skills.clone(),
+        };
+        let result = run(&read, serde_json::json!({"name": "broken"})).await;
+        assert!(result.is_error);
+        let text = text_of(&result);
+        assert!(
+            text.contains("could not be read"),
+            "reported as missing: {text}"
+        );
+        assert!(
+            !text.contains("not found"),
+            "a file that is right there is not 'not found': {text}"
+        );
+        // And the reason, which is the part the model can act on by telling the user.
+        assert!(text.contains("frontmatter"), "{text}");
+
+        // A name that really is absent still gets the plain answer, with the available list.
+        let result = run(&read, serde_json::json!({"name": "absent"})).await;
+        let text = text_of(&result);
+        assert!(text.contains("not found"), "{text}");
+        assert!(text.contains("fine"), "{text}");
+    }
+
+    /// `skill_write` surfaces the store's refusal of a `metadata` it cannot record in.
+    ///
+    /// It used to write anyway and then explain, in the model's context, that the rank it asked for
+    /// had not applied "because this skill's 'metadata' is not a map" -- a sentence about YAML
+    /// shapes that only existed because three other places had quietly done something other than
+    /// what was asked. Refusing says it once, to the party who can fix it.
+    #[tokio::test]
+    async fn write_surfaces_the_refusal_of_a_metadata_it_cannot_record_in() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "verbatim",
+            "---\nname: verbatim\ndescription: original\nmetadata: none\n---\nBODY\n",
+        );
+        let skills = cache_at(&temp);
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+
+        let error = write
+            .execute(
+                serde_json::json!({"name": "verbatim", "description": "refined", "priority": 1}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("must refuse rather than write and explain");
+        assert!(error.to_string().contains("not a map"), "{error}");
+
+        // The file is untouched, and an ordinary skill still reports the rank it was given.
+        let result = run(
+            &write,
+            serde_json::json!({"name": "ordinary", "description": "d", "priority": 1}),
+        )
+        .await;
+        assert!(
+            text_of(&result).contains("(priority 1)"),
+            "{}",
+            text_of(&result)
+        );
     }
 
     async fn run(tool: &dyn Tool, input: serde_json::Value) -> ToolOutput {
@@ -630,12 +923,13 @@ mod tests {
         // silently skipped and would look identical from the write side.
         let discovered = skills.current().await;
         let skill = discovered
+            .skills
             .iter()
             .find(|skill| skill.name == "triage")
             .expect("written skill must be discoverable");
         assert_eq!(skill.description, "How to triage a build failure");
         assert_eq!(skill.priority, 2);
-        assert_eq!(skill.author.as_deref(), Some(AGENT_AUTHOR));
+        assert_eq!(skill.author().as_deref(), Some(AGENT_AUTHOR));
 
         let read = SkillReadTool { skills };
         let body = text_of(&run(&read, serde_json::json!({"name": "triage"})).await);
@@ -676,7 +970,11 @@ mod tests {
         assert!(body.contains("PRECIOUS PROCEDURE"), "{}", body);
 
         let discovered = skills.current().await;
-        let skill = discovered.iter().find(|s| s.name == "keep").expect("keep");
+        let skill = discovered
+            .skills
+            .iter()
+            .find(|s| s.name == "keep")
+            .expect("keep");
         assert_eq!(skill.description, "second");
         assert_eq!(skill.priority, 1);
     }
@@ -728,44 +1026,6 @@ mod tests {
                 .path()
                 .parent()
                 .is_some_and(|p| p.join("escape").exists())
-        );
-    }
-
-    /// `meka skill update` re-fetches anything with a `source_url`, so an agent edit there would be
-    /// reverted with no warning. Both tools refuse, and say why.
-    #[tokio::test]
-    async fn test_write_and_delete_refuse_upstream_managed_skills() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        write_skill(
-            temp.path(),
-            "vendored",
-            "---\ndescription: x\nsource_url: https://example.com/SKILL.md\n---\nUPSTREAM\n",
-        );
-        let skills = cache_at(&temp);
-
-        let write = SkillWriteTool {
-            skills: skills.clone(),
-        };
-        let result = run(
-            &write,
-            serde_json::json!({"name": "vendored", "description": "mine", "body": "MINE"}),
-        )
-        .await;
-        assert!(result.is_error);
-        assert!(text_of(&result).contains("managed upstream"));
-
-        let delete = SkillDeleteTool {
-            skills: skills.clone(),
-        };
-        let result = run(&delete, serde_json::json!({"name": "vendored"})).await;
-        assert!(result.is_error);
-        assert!(text_of(&result).contains("managed upstream"));
-
-        // Neither refusal touched the file.
-        assert!(
-            std::fs::read_to_string(temp.path().join("vendored/SKILL.md"))
-                .expect("still there")
-                .contains("UPSTREAM")
         );
     }
 
@@ -874,7 +1134,12 @@ mod tests {
             )
             .await;
             let found = skills.current().await;
-            let skill = found.iter().find(|s| s.name == name).expect(name).clone();
+            let skill = found
+                .skills
+                .iter()
+                .find(|s| s.name == name)
+                .expect(name)
+                .clone();
             assert_eq!(skill.priority, expected, "{name}");
         }
 

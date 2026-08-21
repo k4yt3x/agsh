@@ -271,16 +271,16 @@ pub async fn submit_turn(
     let images = decode_turn_images(&body.images, state.shared.config.vision)?;
     let message = if let Some(skill_name) = body.options.skill.as_deref() {
         let snapshot = state.shared.skills.current().await;
-        let skill = snapshot
-            .iter()
-            .find(|skill| skill.name == skill_name)
-            .ok_or_else(|| {
-                ProblemDetail::new(
-                    ErrorKind::InvalidBody,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("unknown skill `{}`", skill_name),
-                )
-            })?;
+        let skill = snapshot.find(skill_name).ok_or_else(|| {
+            // `unavailable`, not a flat "unknown skill": a `SKILL.md` that will not parse is in no
+            // index, and telling the caller their skill does not exist sends them looking for a
+            // file that is sitting in the store.
+            ProblemDetail::new(
+                ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                snapshot.unavailable(skill_name),
+            )
+        })?;
         let skill_body = crate::skills::load_skill_body(skill)
             .await
             .map_err(|error| {

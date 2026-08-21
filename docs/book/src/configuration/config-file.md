@@ -1346,6 +1346,7 @@ Controls the skill store. See the [Skills](../usage/skills.md) guide.
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Register `skill_read` / `skill_search` and render the skills index |
 | `agent_managed` | bool | `false` | Additionally register `skill_write` / `skill_delete` |
+| `extra_paths` | array | `[]` | Additional directories to scan, read-only |
 
 ```toml
 [skills]
@@ -1355,6 +1356,17 @@ enabled = false
 Setting `enabled = false` keeps every skill tool's schema out of every request and renders no skills section. Files already in `~/.config/meka/skills/` are left untouched.
 
 `agent_managed = true` lets the agent author its own skills. It is off by default because you normally curate that store yourself; it exists for a long-running agent that dispatches sub-agents, where a skill is the only artifact that both survives the session and can be handed to a worker as its task. Sub-agents never receive the authoring tools whatever this is set to. See [Letting the Agent Manage Skills](../usage/skills.md#letting-the-agent-manage-skills).
+
+`extra_paths` adds directories to the scan. They are strictly read-only: meka never creates them and never writes into them, so an entry that does not exist is simply skipped and leaves nothing behind. A leading `~` is expanded.
+
+```toml
+[skills]
+extra_paths = ["~/.agents/skills"]
+```
+
+`~/.agents/skills` is the cross-client convention, so pointing at it makes skills installed by other Agent Skills clients visible here. It is not a default: reading a directory outside meka's own namespace is your call. meka's own store is searched first and wins a name collision. There is no automatic project-level scan, for the same reason meka does not read config or instructions from the working directory; name the path here if you want a project's skills read. See [Reading Skills from Other Directories](../usage/skills.md#reading-skills-from-other-directories).
+
+An entry that repeats an earlier one, or that names meka's own skills directory, is dropped with a warning: it would otherwise be scanned twice and every skill in it reported as shadowed by itself. An empty string is dropped too, since it would expand to your home directory.
 
 ## `[memory]`
 
