@@ -1197,6 +1197,11 @@ impl Tool for ScratchpadSaveFileTool {
                     "path": {
                         "type": "string",
                         "description": "The file path to write to"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Replace the file if it already exists. Without this, \
+                                        saving over an existing file is refused"
                     }
                 },
                 "required": ["name", "path"]
@@ -1257,6 +1262,35 @@ impl Tool for ScratchpadSaveFileTool {
         let (target, _write_guard) =
             super::file::resolve_write_target("scratchpad_save_file", &self.cwd, &path).await?;
 
+        // Asked *under* the write lock, so the answer is still true when the write happens.
+        //
+        // This tool reads as the scratchpad's `write_file` and its description says so, but it had
+        // none of that tool's protections: no read of the target, so no staleness check to fail; no
+        // `force`, so nothing to bypass and nothing to consult; and a confirmation that named the
+        // bytes written while never mentioning the bytes replaced. A path the model named by
+        // mistake was gone with a success message on top of it. `force` is the same escape hatch
+        // `write_file` and `edit_file` offer, spelled the same way.
+        let force = input
+            .get("force")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let replaced = tokio::fs::metadata(&target)
+            .await
+            .ok()
+            .map(|meta| meta.len());
+        if let Some(existing_bytes) = replaced
+            && !force
+        {
+            return Ok(ToolOutput::text(
+                format!(
+                    "Error: '{}' already exists ({} bytes) and saving would replace it. Read it \
+                     first if you need what it says, pick another path, or set force=true.",
+                    path, existing_bytes
+                ),
+                true,
+            ));
+        }
+
         let byte_count = content.len();
         super::file::write_file_bytes(&target, content.as_bytes())
             .await
@@ -1267,8 +1301,14 @@ impl Tool for ScratchpadSaveFileTool {
 
         Ok(ToolOutput::text(
             format!(
-                "Saved {} bytes from scratchpad entry \"{}\" to '{}'",
-                byte_count, name, path,
+                "Saved {} bytes from scratchpad entry \"{}\" to '{}'{}",
+                byte_count,
+                name,
+                path,
+                match replaced {
+                    Some(existing_bytes) => format!(", replacing {} bytes", existing_bytes),
+                    None => String::new(),
+                }
             ),
             false,
         ))
@@ -2657,9 +2697,12 @@ mod tests {
         );
 
         drop(held);
+        // `force`, because the fixture seeded `out.txt` before taking the lock and saving over an
+        // existing file is refused without it. What this test is about is the lock, not the
+        // clobber.
         let result = tool
             .execute(
-                serde_json::json!({"name": "report", "path": "out.txt"}),
+                serde_json::json!({"name": "report", "path": "out.txt", "force": true}),
                 CancellationToken::new(),
             )
             .await
@@ -2668,6 +2711,70 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&target).await.expect("read back"),
             "final analysis",
+        );
+    }
+
+    /// Saving over a file that already exists is refused, and the confirmation says what it
+    /// replaced when `force` allows it.
+    ///
+    /// This tool reads as the scratchpad's `write_file` and its description says so, but it had
+    /// none of that tool's protections: no read of the target, so no staleness check to fail; no
+    /// `force`, so nothing to consult; and a confirmation naming the bytes written while never
+    /// mentioning the bytes replaced. A path the model named by mistake was gone with a success
+    /// message on top of it.
+    #[tokio::test]
+    async fn test_scratchpad_save_file_refuses_to_replace_an_existing_file() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+        manager
+            .save_tool_output(session_id, "report", "scratchpad bytes")
+            .await
+            .expect("seed");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("out.txt");
+        tokio::fs::write(&target, "THE USER WROTE THIS")
+            .await
+            .expect("seed target");
+
+        let tool = ScratchpadSaveFileTool {
+            cwd: std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf())),
+            session_manager: manager,
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+
+        let refused = tool
+            .execute(
+                serde_json::json!({"name": "report", "path": "out.txt"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a refusal is a result, not an error");
+        assert!(refused.is_error, "got: {}", text_content(&refused));
+        assert!(
+            text_content(&refused).contains("already exists"),
+            "got: {}",
+            text_content(&refused)
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.expect("read"),
+            "THE USER WROTE THIS",
+            "the file must survive the refusal"
+        );
+
+        let forced = tool
+            .execute(
+                serde_json::json!({"name": "report", "path": "out.txt", "force": true}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("force writes");
+        assert!(!forced.is_error, "got: {}", text_content(&forced));
+        assert!(
+            text_content(&forced).contains("replacing 19 bytes"),
+            "the confirmation must say what it replaced: {}",
+            text_content(&forced)
         );
     }
 

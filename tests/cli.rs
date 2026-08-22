@@ -578,3 +578,51 @@ fn mcp_add_oauth_writes_auth_block() {
     assert!(contents.contains("read"), "{}", contents);
     assert!(contents.contains("write"), "{}", contents);
 }
+
+/// `meka skill remove` must wait on the store lock, like every other skill door.
+///
+/// It had its own `remove_dir_all` and never went through `delete_skill`, so it completed in 70 ms
+/// against a lock every other door waited on — able to delete a skill directory while a
+/// `skill_write` or `PUT /v1/skills` was composing and renaming `SKILL.md` inside it.
+#[test]
+fn skill_remove_waits_for_a_store_lock_another_process_holds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join("config");
+    let skills = config.join("skills");
+    std::fs::create_dir_all(skills.join("victim")).expect("skill dir");
+    std::fs::write(
+        skills.join("victim").join("SKILL.md"),
+        "---\nname: victim\ndescription: a skill\n---\nbody\n",
+    )
+    .expect("seed");
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(skills.join(".meka-store.lock"))
+        .expect("open the store lock");
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let guard = lock.write().expect("hold the store lock");
+
+    let mut blocked = meka()
+        .env("MEKA_CONFIG_DIR", &config)
+        .env("MEKA_DATA_DIR", dir.path().join("data"))
+        .args(["skill", "remove", "victim"])
+        .spawn()
+        .expect("spawn meka skill remove");
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    assert!(
+        blocked.try_wait().expect("try_wait").is_none(),
+        "the delete must wait for the lock this test is holding"
+    );
+    assert!(
+        skills.join("victim").join("SKILL.md").exists(),
+        "and must not have removed anything yet"
+    );
+
+    drop(guard);
+    assert!(blocked.wait().expect("wait").success(), "then it completes");
+    assert!(!skills.join("victim").exists(), "and the skill is gone");
+}

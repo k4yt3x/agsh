@@ -417,7 +417,11 @@ fn is_destructive(name: &str) -> bool {
 
 /// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
 /// over the registry is not worth optimising away.
-fn edit_distance(left: &str, right: &str) -> usize {
+///
+/// Shared with `memory_search`, whose last-resort tier is the same idea applied to memory names
+/// and descriptions instead of tool names: when full-text matching finds nothing, the query was
+/// probably misspelled rather than absent.
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
     if left.is_empty() {
@@ -1517,7 +1521,7 @@ impl ToolRegistry {
         // Whether this agent may author skills, from `[skills] agent_managed`. Always `false` for
         // a sub-agent regardless of the setting; see the registration site.
         skills_managed: bool,
-        memories: Arc<crate::memory::MemoryCache>,
+        memories: Arc<crate::memory::MemoryStore>,
         // How much of the memory store this agent may reach. Always `Write` for the primary agent;
         // for a sub-agent, whatever its `agent_spawn` call granted, which defaults to nothing.
         memory_access: crate::config::MemoryAccess,
@@ -1750,7 +1754,7 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
         skills_managed: bool,
-        memories: Arc<crate::memory::MemoryCache>,
+        memories: Arc<crate::memory::MemoryStore>,
         builtin_filter: BuiltinToolFilter,
         cwd: crate::workspace::SharedCwd,
         roots: crate::workspace::SharedRoots,
@@ -1827,7 +1831,7 @@ impl ToolRegistry {
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
-        memories: Arc<crate::memory::MemoryCache>,
+        memories: Arc<crate::memory::MemoryStore>,
         memory_access: crate::config::MemoryAccess,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
@@ -1976,7 +1980,7 @@ pub(crate) mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             skills_managed,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             filter,
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -2835,7 +2839,7 @@ pub(crate) mod tests {
             Arc::new(RwLock::new(None)),
             crate::skills::SkillCache::disabled(),
             false,
-            crate::memory::MemoryCache::disabled(),
+            crate::memory::MemoryStore::disabled(),
             BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -3363,7 +3367,7 @@ pub(crate) mod tests {
             session_manager,
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::config::MemoryAccess::Write,
             None,
             Vec::new(),
@@ -3429,7 +3433,7 @@ pub(crate) mod tests {
             session_manager,
             Arc::new(RwLock::new(None)),
             crate::skills::SkillCache::for_root(None),
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             memory_access,
             None,
             Vec::new(),

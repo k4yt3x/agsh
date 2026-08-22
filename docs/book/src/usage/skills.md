@@ -113,7 +113,12 @@ meka renders such a value as text where it needs one (`meka skill list`, `meka s
 
 ### Why `allowed-tools` Is Ignored
 
-`allowed-tools` is experimental in the spec, and the spec itself notes that support varies. meka parses it, preserves it across a rewrite, and shows it in `meka skill get`, but never grants anything from it. The spec defines the field as a space-separated string and that is what meka writes, so a skill that spelled it as a YAML list comes back as `Read Bash` rather than a list. That is the only reshaping meka does to a field it did not author.
+`allowed-tools` is experimental in the spec, and the spec itself notes that support varies. meka parses it, preserves it across a rewrite, and shows it in `meka skill get`, but never grants anything from it. The spec defines the field as a space-separated string and that is what meka writes, so a skill that spelled it as a YAML list comes back joined: `[Read, Bash]` becomes `Read Bash`.
+
+Two things meka does not preserve across a rewrite, both worth knowing before you hand-edit a `SKILL.md` that meka will later write to:
+
+- **A joined `allowed-tools` entry containing a space cannot be told apart from two entries.** `["Bash(git diff:*)", "Read"]` comes back as `Bash(git diff:*) Read`, which no longer says where one entry ends. Prefer the spec's string form for these.
+- **Comments in the frontmatter block are dropped.** The header is rebuilt through a YAML serializer, which does not carry them. Keys, values and nested structure all survive; `# notes` beside them do not. Put anything you need to keep in the body, which is passed through untouched.
 
 A skill file is content, and content does not get to widen what the agent may run. meka's [permission mode](./permissions.md) is the authority for that, and a `SKILL.md` dropped into the skills directory (or synced from a repository, or written by an agent) must not be able to pre-approve `Bash(rm:*)` on its own say-so.
 
@@ -284,8 +289,9 @@ Notes on how it behaves:
   one narrow task should not rewrite the instructions its siblings run on.
 - Writing to an existing name updates it. Omitting `body` keeps whatever the skill already
   documented, so a call that only changes the description or priority does not erase the procedure.
-  Note that `meka skill add --force` is a *replace*, not an update: it deletes the skill directory
-  and rebuilds it from the template, taking the body and any bundled files with it.
+  Note that `meka skill add --force` is a *replace*, not an update: it rewrites `SKILL.md` from the
+  template and removes any bundled files alongside it. The new `SKILL.md` is written first, so a
+  failure to clear a bundled file leaves the skill intact and says which files it could not remove.
 - Skills the agent *creates* are stamped `metadata.author: meka (agent-authored)`, so
   `meka skill list` shows where an entry came from. An existing `author` is kept, so an agent
   refining a skill you wrote does not reassign it to itself. Informational, not a guard.

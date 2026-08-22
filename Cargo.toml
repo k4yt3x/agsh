@@ -83,6 +83,9 @@ windows-sys = { version = "0.61", features = [
 winres = "0.1"
 
 [dev-dependencies]
+# Also a runtime dependency; here so `tests/cli.rs` can hold a store's `flock` from outside the
+# binary and prove the CLI actually waits on it.
+fd-lock = "4"
 filetime = "0.2.29"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"

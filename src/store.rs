@@ -1,15 +1,16 @@
-//! Shared plumbing for the two on-disk Markdown stores meka owns: skills
-//! (`~/.config/meka/skills/<name>/SKILL.md`, [`crate::skills`]) and memories
-//! (`~/.config/meka/memory/<name>.md`, [`crate::memory`]).
+//! Shared plumbing for the two entry stores meka owns: skills
+//! (`~/.config/meka/skills/<name>/SKILL.md`, [`crate::skills`]) and memories (the `memories` table
+//! in `MEKA_DATA_DIR`, [`crate::memory`]).
 //!
-//! Both use the same `---`-fenced YAML header, so [`split_frontmatter`] lives here, along with the
-//! description and priority handling their indexes share.
+//! What they still share is the vocabulary of an *indexed entry*: a name, a one-line description
+//! and a priority, rendered into a per-turn index the model reads. That is why
+//! [`normalize_description`], [`parse_priority`] and [`validate_entry_name`] live here.
 //!
-//! They have stopped sharing the other two. Skills render frontmatter through a YAML serializer
-//! rather than [`yaml_scalar`], and answer to the Agent Skills specification's name rules rather
-//! than [`validate_entry_name`] -- both because a skill is a file format other clients also read,
-//! and a memory is meka's own. Where a rule is genuinely common it is still here; a rule that only
-//! one store applies belongs to that store.
+//! What they no longer share is storage. Memories are rows, so [`lock_store`],
+//! [`reject_symlinked_path`] and [`check_case_collision`] are the skill store's alone -- a `UNIQUE
+//! COLLATE NOCASE` column and a transaction do all three jobs on the database side.
+//! [`split_frontmatter`] and [`yaml_scalar`] survive for skills, and for `meka memory export`,
+//! which is now the only place memory touches YAML at all.
 
 /// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
 /// valid frontmatter block is present.
@@ -35,13 +36,33 @@ pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 /// **Safe only for a value that has already been normalised to one line.** It escapes `\` and `"`
 /// and quotes on a fixed character list, which is not the same thing as knowing when YAML needs
 /// quoting; skills moved to a real serializer after hand-rolled quoting lost content on a newline
-/// in a `license` and on a metadata *key* containing one. Its remaining caller, `render_memory`,
-/// is safe because it passes `normalize_description` output and its only other field is a `u8`.
-/// A third caller with a free-form field should use the serializer, not this.
+/// in a `license` and on a metadata *key* containing one.
+///
+/// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes three
+/// kinds of value and is safe for three separate reasons: a `description` that has been through
+/// [`normalize_description`], a `recorded` that is RFC 3339 rendered from a `SystemTime`, and
+/// `tags` whose elements have all passed `crate::memory::validate_tag` and so cannot contain a
+/// newline. (`priority` is a `u8` and never reaches here.)
+///
+/// That list is the safety argument, so a *fifth* kind of value invalidates it. Anything free-form
+/// -- anything that could arrive holding a newline -- needs the serializer, not this.
 pub(crate) fn yaml_scalar(text: &str) -> String {
+    // The leading set is every YAML indicator character, `[`, `{`, `]`, `}` and `,` included. They
+    // were missing, and a description beginning `[` produced a file with an unterminated flow
+    // sequence: `meka memory export` reported success, and the importer then refused that one file
+    // and moved on, so a backup silently lost a memory. `null`, `true`, `~` and anything numeric
+    // are quoted for the adjacent reason -- unquoted they come back as a type rather than a
+    // string, so meka and every real YAML tool disagree about the same file.
+    let looks_typed = matches!(
+        text.to_ascii_lowercase().as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+    ) || text.parse::<f64>().is_ok();
     let needs_quotes = text.is_empty()
+        || text.trim() != text
+        || looks_typed
         || text.starts_with([
-            '-', '?', ':', '!', '&', '*', '#', '|', '>', '%', '@', '`', '"', '\'',
+            '-', '?', ':', '!', '&', '*', '#', '|', '>', '%', '@', '`', '"', '\'', '[', ']', '{',
+            '}', ',',
         ])
         || text.contains(':')
         || text.contains('#')
@@ -54,16 +75,133 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
     }
 }
 
+/// Build the command that opens `path` in the user's editor, or `None` when neither `$VISUAL` nor
+/// `$EDITOR` is set to anything.
+///
+/// The whole value is tried as a program name first, and only split on whitespace if nothing is
+/// there. Both halves are needed and each breaks the other's case:
+///
+/// - `$EDITOR` is conventionally a command *line*, so `code --wait`, `emacsclient -nw` and `subl
+///   -w` are ordinary settings that `Command::new(whole_string)` looks up as a binary literally
+///   called `code --wait`.
+/// - An editor whose path contains a space is equally ordinary, and splitting alone turned `/opt/my
+///   editor/bin/ed` into a missing binary called `/opt/my`. That worked before this helper existed,
+///   so splitting unconditionally was a regression for `meka skill add --edit`.
+///
+/// Deliberately not a shell: a value holding a quote, a `;` or a `$` must not come to mean
+/// something the user did not write.
+///
+/// `$VISUAL` first, matching the convention: it names the full-screen editor, and `$EDITOR` is the
+/// line-mode fallback for a terminal that cannot run one.
+/// Serialises tests that set `$EDITOR` / `$VISUAL`, which are process-global.
+///
+/// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
+/// never need to be held together. Exists because `meka memory edit` had no test at all until its
+/// scratch-file handling destroyed a user's edit twice.
+#[cfg(test)]
+pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) fn editor_command(path: &std::path::Path) -> Option<std::process::Command> {
+    let configured = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())?;
+    let configured = configured.trim();
+    let mut command = if std::path::Path::new(configured).is_file() {
+        std::process::Command::new(configured)
+    } else {
+        let mut parts = configured.split_whitespace();
+        let mut command = std::process::Command::new(parts.next()?);
+        command.args(parts);
+        command
+    };
+    command.arg(path);
+    Some(command)
+}
+
+/// Name of the lock file the skill store keeps in its root. Ignored by discovery, which walks
+/// directories.
+const STORE_LOCK_FILE: &str = ".meka-store.lock";
+
+/// An exclusive `flock` on one store root, held until dropped.
+///
+/// A skill write is read-modify-write -- read `SKILL.md`, compose the new contents from what was
+/// read, write it back -- and until this existed nothing serialised them across processes.
+/// `config.toml` has had [`crate::config::lock_config_file`] and sessions have `SessionLock`; the
+/// store an agent writes to constantly had an in-process mutex at best. Two `meka skill add` runs,
+/// or `meka serve` racing a CLI edit, therefore each read the same file and the loser's change
+/// vanished with both reporting success. Memory needs none of this now: its write is one statement
+/// in one transaction, and SQLite serialises writers across processes.
+///
+/// Unique temp names in [`crate::config::write_file_atomic`] stopped the *splice*, where the
+/// published file was a mixture of two documents. They cannot stop a lost update, because both
+/// writers are behaving correctly at the file level and simply disagree about what was there.
+pub(crate) struct StoreLock {
+    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+    _lock: Box<fd_lock::RwLock<std::fs::File>>,
+}
+
+/// Take [`StoreLock`] on `root`. Blocks until any other holder releases it.
+///
+/// Blocking rather than failing, for the reason [`crate::config::lock_config_file`] blocks: the
+/// contended window is one small file write, and failing a `skill_write` because a `meka skill add`
+/// happened to be in flight would trade a rare lost update for a common spurious error.
+///
+/// Must not nest. No path takes this twice, so there is no ordering to get wrong; a future caller
+/// that wants to nest needs the depth counting [`crate::config::ConfigFileLock`] does.
+pub(crate) fn lock_store(root: &std::path::Path) -> std::io::Result<StoreLock> {
+    // 0700 straight from `mkdir(2)`, matching [`crate::config::write_file_atomic`]. A plain
+    // `create_dir_all` takes the umask, and this runs *before* that function on every write path --
+    // and is the only thing that runs at all on a delete-only one, such as `skill_delete` or
+    // `DELETE /v1/skills/{name}` against a store that does not exist yet -- so a first-ever write
+    // left `<config>/skills` at 0755 permanently, where the store's own entry names became
+    // listable to every local user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(root)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(root)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    // The lock file is meka's own bookkeeping and sits inside the store; no reason for it to be
+    // the one world-readable thing in a 0700 directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(root.join(STORE_LOCK_FILE))?;
+
+    let mut lock = Box::new(fd_lock::RwLock::new(file));
+    let guard = lock.write()?;
+    // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
+    // lock's heap address is stable for as long as the box lives, and the field order above drops
+    // `_guard` before `_lock`. Same shape as `ConfigFileLock` and `SessionLock`.
+    let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
+        unsafe { std::mem::transmute(guard) };
+    Ok(StoreLock {
+        _guard: guard,
+        _lock: lock,
+    })
+}
+
 /// Refuse a store path that is a symlink, so a write stays inside the store it was aimed at.
 ///
 /// [`validate_entry_name`] keeps a *name* from escaping the root, but it cannot see what is already
 /// on disk under that name: a symlink planted at `<root>/<entry>` redirects the write wherever it
 /// points, while the path meka checked still looks local. Archives preserve symlinks, so unpacking
-/// a downloaded skill or memory bundle is enough to plant one, with no code execution involved.
+/// a downloaded skill bundle is enough to plant one, with no code execution involved.
 ///
-/// This matters because these stores are writable at [`crate::permission::Permission::Read`], whose
-/// whole contract is that nothing outside meka's own directory changes. Following a symlink out of
-/// the store breaks exactly that. Checked with `symlink_metadata`, which does not follow the link.
+/// This matters because the skill store is writable at [`crate::permission::Permission::Read`],
+/// whose whole contract is that nothing outside meka's own directory changes. Following a symlink
+/// out of the store breaks exactly that. Checked with `symlink_metadata`, which does not follow the
+/// link.
 pub(crate) fn reject_symlinked_path(path: &std::path::Path, noun: &str) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -263,6 +401,41 @@ pub(crate) fn check_case_collision<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store root is created at 0700, and its lock file at 0600.
+    ///
+    /// This is the only thing that runs on a delete-only path, and it runs before
+    /// [`crate::config::write_file_atomic`] on every write path, so a `create_dir_all` taking the
+    /// umask left `<config>/skills` at 0755 permanently on a fresh install -- and a store's entry
+    /// names are exactly what it should not be publishing to every local user.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_root_and_its_lock_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("store");
+        let guard = lock_store(&root).expect("lock a store that does not exist yet");
+
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&root), 0o700, "store root created world-listable");
+        assert_eq!(
+            mode(&root.join(STORE_LOCK_FILE)),
+            0o600,
+            "the lock file is meka's own bookkeeping inside a 0700 directory"
+        );
+        drop(guard);
+
+        // Idempotent: locking an existing root neither fails nor loosens it.
+        drop(lock_store(&root).expect("lock again"));
+        assert_eq!(mode(&root), 0o700);
+    }
 
     /// A name becomes a file name, and Windows reserves these regardless of extension. Rejected on
     /// every platform so a store written on Linux still opens on Windows.

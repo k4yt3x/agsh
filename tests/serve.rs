@@ -5393,9 +5393,8 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
 
 /// `GET /v1/skills/{name}` must not report a `SKILL.md` that is present but unparseable as absent.
 ///
-/// The same distinction `get_memory` already draws. A flat 404 sent an operator looking for a file
-/// sitting in the store, which is the answer they get straight after the startup warning names
-/// it.
+/// A flat 404 sent an operator looking for a file sitting in the store, which is the answer they
+/// get straight after the startup warning names it.
 #[test]
 fn getting_a_broken_skill_says_why_rather_than_404() {
     let harness =
@@ -5564,7 +5563,6 @@ fn memory_write_read_list_and_delete_round_trip() {
         "{}",
         listed
     );
-    assert_eq!(listed["ignored_over_cap"], 0);
 
     let detail: serde_json::Value = harness
         .request(reqwest::Method::GET, "/v1/memory/deploy-policy")
@@ -5589,6 +5587,23 @@ fn memory_write_read_list_and_delete_round_trip() {
     assert_eq!(
         harness
             .request(reqwest::Method::GET, "/v1/memory/deploy-policy")
+            .send()
+            .expect("send")
+            .status(),
+        404
+    );
+
+    // A second delete is a 404, not another 204. The distinction is `rows_affected`: a handler
+    // that ignores it reports every delete as having removed something, so a client cannot tell
+    // "gone now" from "was never there" and a typo in a name reads as success.
+    let again = harness
+        .request(reqwest::Method::DELETE, "/v1/memory/deploy-policy")
+        .send()
+        .expect("send");
+    assert_eq!(again.status(), 404, "{}", again.text().unwrap_or_default());
+    assert_eq!(
+        harness
+            .request(reqwest::Method::DELETE, "/v1/memory/never-existed")
             .send()
             .expect("send")
             .status(),

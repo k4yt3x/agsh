@@ -2,7 +2,7 @@
 //!
 //! Both are process-wide rather than per-session, which is why they carry their own scopes
 //! (`skills:r` / `skills:w`, `memory:r` / `memory:w`) instead of riding on `sessions:*`. A bridge
-//! token that should be able to run turns has no business emptying the memory directory.
+//! token that should be able to run turns has no business emptying the memory store.
 //!
 //! These endpoints are *not* gated by `[skills] agent_managed` or `[memory] access`. Those flags
 //! describe what the model may do on its own initiative; a token presented to this API is the
@@ -248,15 +248,32 @@ pub async fn put_skill(
         None => existing.map_or(crate::store::DEFAULT_PRIORITY, |skill| skill.priority),
     };
     let description = crate::store::normalize_description(&body.description);
-    crate::skills::write_skill(
-        &root,
-        &name,
-        &description,
-        priority,
-        body.author.as_deref(),
-        body.body.as_deref(),
-    )
-    .map_err(store_error)?;
+    // On the blocking pool, like every other caller of this function. It takes a cross-process
+    // `flock` and then `fsync`s, so on a runtime worker it parks one that cannot poll anything
+    // else meanwhile -- and the `flock` has no bound: a `meka skill add --edit` with an editor open
+    // holds it for as long as the editor lives. Enough concurrent requests parked that way and the
+    // router itself stops answering, health check included. Observed: 40 parallel PUTs against a
+    // held lock made `GET /v1/health` time out until the lock dropped.
+    {
+        let root = root.clone();
+        let name = name.clone();
+        let description = description.clone();
+        let author = body.author.clone();
+        let skill_body = body.body.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::skills::write_skill(
+                &root,
+                &name,
+                &description,
+                priority,
+                author.as_deref(),
+                skill_body.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("write task failed", error))?
+        .map_err(store_error)?;
+    }
     // Before the read-back below, which goes through the same cache: without this a second write
     // inside one mtime tick that renders to the same length is invisible, and this response would
     // echo the *previous* values as though they had been applied.
@@ -326,13 +343,22 @@ pub async fn delete_skill(
     // "No such file or directory" and would fall through a substring match for "not found" into a
     // 422 for what is plainly a 404.
     let missing = !root.join(&name).is_dir();
-    crate::skills::delete_skill(&root, &name).map_err(|message| {
-        if missing {
-            not_found("skill", &name)
-        } else {
-            store_error(message)
-        }
-    })?;
+    // On the blocking pool, for the reason `put_skill` is: `delete_skill` takes the store's
+    // cross-process `flock`, whose wait is unbounded.
+    {
+        let root = root.clone();
+        let owned = name.clone();
+        tokio::task::spawn_blocking(move || crate::skills::delete_skill(&root, &owned))
+            .await
+            .map_err(|error| ProblemDetail::internal_sanitized("delete task failed", error))?
+            .map_err(|message| {
+                if missing {
+                    not_found("skill", &name)
+                } else {
+                    store_error(message)
+                }
+            })?;
+    }
     state.shared.skills.invalidate().await;
     tracing::info!("deleted skill '{}' via HTTP", name);
     Ok(StatusCode::NO_CONTENT)
@@ -349,9 +375,16 @@ pub struct MemoryDetail {
     /// 0..=9, lower first. Unlike a skill's, a memory's priority *is* shown to the model, because
     /// it says how heavily to weigh a note the model is already reasoning from.
     pub priority: u8,
-    /// Last-modified time, RFC 3339. Breaks priority ties (newest first) and is rendered to the
-    /// model as a human-readable age.
+    /// Last-modified time, RFC 3339. When the file was last written, which a metadata-only edit
+    /// moves; see `recorded_at` for when the note was made.
     pub updated_at: String,
+    /// When the memory was recorded, RFC 3339. Stamped once, at creation.
+    ///
+    /// The one the model is shown as an age, and the one ties are broken by. Distinct from
+    /// `updated_at` because a description edit moves that without the note saying anything new.
+    pub recorded_at: String,
+    /// Lowercase labels for grouping and filtering.
+    pub tags: Vec<String>,
     /// Present on `GET /v1/memory/{name}`, absent from the collection listing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -360,20 +393,6 @@ pub struct MemoryDetail {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MemoryListResponse {
     pub memories: Vec<MemoryDetail>,
-    /// Files in the memory root that could not be parsed into a memory, with the reason.
-    ///
-    /// Reported rather than omitted because the failure mode is silence: from inside a session a
-    /// skipped file is indistinguishable from a memory nobody wrote, so someone can drop in a
-    /// standing rule and believe it is in force.
-    pub skipped: Vec<SkippedMemoryView>,
-    /// Valid memories the discovery cap dropped. Distinct from `skipped`: these parsed fine.
-    pub ignored_over_cap: usize,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SkippedMemoryView {
-    pub file: String,
-    pub reason: String,
 }
 
 fn memory_detail(memory: &crate::memory::Memory, body: Option<String>) -> MemoryDetail {
@@ -381,9 +400,16 @@ fn memory_detail(memory: &crate::memory::Memory, body: Option<String>) -> Memory
         name: memory.name.clone(),
         description: memory.description.clone(),
         priority: memory.priority,
-        updated_at: chrono::DateTime::<chrono::Utc>::from(memory.mtime).to_rfc3339(),
+        updated_at: chrono::DateTime::<chrono::Utc>::from(memory.updated_at).to_rfc3339(),
+        recorded_at: chrono::DateTime::<chrono::Utc>::from(memory.recorded_at).to_rfc3339(),
+        tags: memory.tags.clone(),
         body,
     }
+}
+
+/// Turn a store error into a 500 that says which call failed without leaking the query.
+fn memory_failure(error: crate::error::MekaError) -> ProblemDetail {
+    ProblemDetail::internal_sanitized("memory store unavailable", error)
 }
 
 /// `GET /v1/memory`: the memory index, most important first.
@@ -403,22 +429,17 @@ pub async fn list_memories(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<MemoryListResponse>, ProblemDetail> {
     scope::require(&principal, "memory:r")?;
-    let index = state.shared.memories.current().await;
+    let index = state
+        .shared
+        .memories
+        .index()
+        .await
+        .map_err(memory_failure)?;
     Ok(Json(MemoryListResponse {
         memories: index
-            .memories
             .iter()
             .map(|memory| memory_detail(memory, None))
             .collect(),
-        skipped: index
-            .skipped
-            .iter()
-            .map(|skipped| SkippedMemoryView {
-                file: skipped.file.clone(),
-                reason: skipped.reason.clone(),
-            })
-            .collect(),
-        ignored_over_cap: index.ignored_over_cap,
     }))
 }
 
@@ -433,7 +454,6 @@ pub async fn list_memories(
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "No such memory", body = ProblemDetail),
-        (status = 422, description = "The file exists but could not be parsed as a memory", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
 )]
@@ -443,26 +463,17 @@ pub async fn get_memory(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<MemoryDetail>, ProblemDetail> {
     scope::require(&principal, "memory:r")?;
-    let index = state.shared.memories.current().await;
-    let memory = index
+    // Deliberately not `record_read`: an operator reading through the HTTP API is not the agent
+    // recalling anything, and moving the ranking the agent gets would be a lie about its own use.
+    let memory = state
+        .shared
         .memories
-        .iter()
-        .find(|memory| memory.name == name)
-        .ok_or_else(|| {
-            // A file that failed to parse is a different answer from one that never existed, and
-            // the reason is what the operator needs to fix it.
-            match index.skip_reason(&name) {
-                Some(reason) => store_error(format!(
-                    "memory '{}' exists on disk but could not be parsed: {}",
-                    name, reason
-                )),
-                None => not_found("memory", &name),
-            }
-        })?;
-    let body = crate::memory::load_memory_body(memory)
+        .get(&name)
         .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to read memory body", error))?;
-    Ok(Json(memory_detail(memory, Some(body))))
+        .map_err(memory_failure)?
+        .ok_or_else(|| not_found("memory", &name))?;
+    let body = memory.body.clone().unwrap_or_default();
+    Ok(Json(memory_detail(&memory, Some(body))))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -473,6 +484,10 @@ pub struct WriteMemoryRequest {
     /// 0..=9, lower first. Omit to keep an existing memory's priority; defaults to 5 on creation.
     #[serde(default)]
     pub priority: Option<u8>,
+    /// Lowercase labels (`[a-z0-9-]`, at most 10). Omit to keep an existing memory's tags; send
+    /// `[]` to clear them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
     /// Omit to keep the existing body when updating; send `""` to clear it.
     #[serde(default)]
     pub body: Option<String>,
@@ -489,7 +504,6 @@ pub struct WriteMemoryRequest {
         (status = 200, description = "Memory written", body = MemoryDetail),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
-        (status = 404, description = "The memory store is disabled", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid name, empty description, or an unwritable path", body = ProblemDetail),
     ),
@@ -504,13 +518,10 @@ pub async fn put_memory(
     scope::require(&principal, "memory:w")?;
     let body: WriteMemoryRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| store_error(format!("invalid memory request body: {}", error)))?;
-    let root = state
-        .shared
-        .memories
-        .root()
-        .ok_or_else(|| store_disabled("memory"))?
-        .to_path_buf();
-
+    crate::memory::validate_memory_name(&name).map_err(store_error)?;
+    if body.description.trim().is_empty() {
+        return Err(store_error("description cannot be empty".to_string()));
+    }
     if body
         .priority
         .is_some_and(|priority| priority > crate::store::MAX_PRIORITY)
@@ -521,54 +532,30 @@ pub async fn put_memory(
             crate::store::MAX_PRIORITY
         )));
     }
-    // Preserved on omission, as in `put_skill`; a memory's priority is rendered to the model, so
-    // resetting it silently changes how heavily a standing note is weighed.
-    let priority = match body.priority {
-        Some(priority) => priority,
-        None => state
-            .shared
-            .memories
-            .current()
-            .await
-            .memories
-            .iter()
-            .find(|memory| memory.name == name)
-            .map_or(crate::store::DEFAULT_PRIORITY, |memory| memory.priority),
+    let tags = match &body.tags {
+        Some(tags) => Some(crate::memory::normalize_tags(tags).map_err(store_error)?),
+        None => None,
     };
-    let description = crate::store::normalize_description(&body.description);
-    crate::memory::write_memory(&root, &name, &description, priority, body.body.as_deref())
-        .map_err(store_error)?;
-    // See the note on `put_skill`: the read-back below must not be served a stale snapshot.
-    state.shared.memories.invalidate().await;
-    tracing::info!("wrote memory '{}' via HTTP", name);
 
-    let index = state.shared.memories.current().await;
-    let memory = index
+    // One upsert, one transaction, and no lock. This door used to take the store's `flock` and run
+    // on the blocking pool because the write was a read-modify-write over a file: two overlapping
+    // PUTs to one name gave last-writer-wins over a stale read, and 113 of 2,400 concurrent ones
+    // failed outright on the temp file. Omit-to-keep now lives in the SQL, so there is no read to
+    // go stale and SQLite serialises the writers.
+    let written = state
+        .shared
         .memories
-        .iter()
-        .find(|memory| memory.name == name)
-        .ok_or_else(|| {
-            // The one way a successful write can be missing from the index: discovery caps the
-            // store and this entry sorted below the cut. The file is on disk and the write did
-            // happen, so reporting a 500 would be both the wrong class and the wrong story.
-            if index.ignored_over_cap > 0 {
-                store_error(format!(
-                    "memory '{}' was written, but the store is over its discovery cap ({} entries \
-                     ignored) and this one sorted below the cut, so no session will load it. \
-                     Delete or re-prioritise some memories.",
-                    name, index.ignored_over_cap
-                ))
-            } else {
-                ProblemDetail::internal_sanitized(
-                    "memory vanished between write and read-back",
-                    format!(
-                        "memory '{}' is not in the index after a successful write",
-                        name
-                    ),
-                )
-            }
-        })?;
-    Ok(Json(memory_detail(memory, None)))
+        .write(crate::memory::store::WriteRequest {
+            name: name.clone(),
+            description: crate::store::normalize_description(&body.description),
+            tags,
+            body: body.body.clone(),
+            priority: body.priority,
+        })
+        .await
+        .map_err(memory_failure)?;
+    tracing::info!("wrote memory '{}' via HTTP", name);
+    Ok(Json(memory_detail(&written, None)))
 }
 
 /// `DELETE /v1/memory/{name}`: remove a memory.
@@ -592,25 +579,19 @@ pub async fn delete_memory(
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
     scope::require(&principal, "memory:w")?;
-    let root = state
+    crate::memory::validate_memory_name(&name).map_err(store_error)?;
+    // 404 from `rows_affected`, not from a pre-check. The two used to be separate statements, and
+    // between them a name could stop existing: this endpoint then answered 422 `invalid-body` for
+    // something already gone, which a client switching on `type` reads as "fix your request".
+    if !state
         .shared
         .memories
-        .root()
-        .ok_or_else(|| store_disabled("memory"))?
-        .to_path_buf();
-    crate::memory::validate_memory_name(&name).map_err(store_error)?;
-    let path = crate::memory::memory_file_in(&root, &name);
-    // Before the `is_file` check, which follows symlinks: a link pointing at a real file would pass
-    // it, and `remove_file` would then take the link and leave the target. Same order as
-    // `memory_delete`; see `crate::store::reject_symlinked_path`.
-    crate::store::reject_symlinked_path(&path, "memory").map_err(store_error)?;
-    if !path.is_file() {
+        .delete(&name)
+        .await
+        .map_err(memory_failure)?
+    {
         return Err(not_found("memory", &name));
     }
-    tokio::fs::remove_file(&path)
-        .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to delete memory", error))?;
-    state.shared.memories.invalidate().await;
     tracing::info!("deleted memory '{}' via HTTP", name);
     Ok(StatusCode::NO_CONTENT)
 }

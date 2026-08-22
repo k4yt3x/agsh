@@ -149,6 +149,10 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 /// Literal-substring (case-insensitive) or regex matcher for one query.
+///
+/// Local rather than shared: `memory_search` is the only tool that ever wanted the same thing, and
+/// it now ranks through an FTS index instead of scanning lines, which is a different job. A helper
+/// lifted for one other caller and then left with none is worse than a local one.
 enum Matcher {
     Substring(String),
     Regex(regex::Regex),

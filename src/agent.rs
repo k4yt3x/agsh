@@ -49,7 +49,7 @@ use crate::{
     conversation::Conversation,
     error::{MekaError, Result},
     frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
-    memory::MemoryCache,
+    memory::MemoryStore,
     permission::SharedPermission,
     provider::{
         ContentBlock, ImageSource, Message, Provider, Role, StopReason, StreamEvent,
@@ -312,7 +312,7 @@ pub struct Agent {
     skills: Arc<SkillCache>,
     /// Shared memory cache, same contract as `skills`: re-checked at the top of each turn so a
     /// memory the agent writes mid-turn appears in the very next turn's index.
-    memories: Arc<MemoryCache>,
+    memories: Arc<MemoryStore>,
     /// Where streaming output, todo-list renders, token-usage summaries,
     /// and tool-approval requests flow. Concrete impls today:
     /// [`crate::repl::ReplFrontend`], [`crate::acp::AcpFrontend`],
@@ -698,7 +698,7 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
-        memories: Arc<MemoryCache>,
+        memories: Arc<MemoryStore>,
         frontend: Arc<dyn Frontend>,
         cwd: SharedCwd,
         roots: SharedRoots,
@@ -790,7 +790,7 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
-        memories: Arc<MemoryCache>,
+        memories: Arc<MemoryStore>,
         parent_cwd: &SharedCwd,
         parent_roots: &SharedRoots,
         frontend: Arc<dyn Frontend>,
@@ -1114,7 +1114,22 @@ impl Agent {
 
         let catalogue = self.tool_registry.tool_catalogue();
         let skills = self.skills.current().await;
-        let memories = self.memories.current().await;
+        // A store that cannot be read degrades rather than failing the turn: this runs on every
+        // prompt, and a transient `SQLITE_BUSY` should not cost the turn itself.
+        //
+        // `memories_readable` is what stops that degradation becoming a lie. An empty `Vec` here is
+        // indistinguishable from an empty *store*, so the world-state diff read it as every memory
+        // having been deleted and told the model so -- by name -- and then, on the next turn that
+        // read successfully, announced them all as "saved or updated" when nothing had been
+        // written. A store that cannot be read is not a store that is empty, and the model acts on
+        // the difference.
+        let (memories, memories_readable) = match self.memories.index().await {
+            Ok(memories) => (memories, true),
+            Err(error) => {
+                tracing::warn!("could not read the memory index: {}", error);
+                (Vec::new(), false)
+            }
+        };
         let mcp_instructions = self
             .mcp_manager
             .as_ref()
@@ -1176,7 +1191,7 @@ impl Agent {
                         }),
                     None => Vec::new(),
                 };
-            let current = context::WorldSnapshot::new(
+            let mut current = context::WorldSnapshot::new(
                 &catalogue,
                 &skills,
                 &memories,
@@ -1184,6 +1199,15 @@ impl Agent {
                 &scheduled,
             );
             let mut last = self.last_rendered_world.write().await;
+            // An unreadable store carries the previous snapshot's memories forward, so the diff
+            // compares that half against itself and says nothing about it. Advancing to an empty
+            // list instead announced the whole store as deleted, by name, and then re-announced it
+            // as written on the next turn that succeeded. Nothing to carry (the first turn of a
+            // session) leaves the list empty, which renders no `[Memory]` section at all -- silence
+            // is the honest answer when meka does not know.
+            if !memories_readable && let Some((previous, _)) = last.as_ref() {
+                current.carry_memories_from(previous);
+            }
             // Treat a render that has scrolled out of the API window as never having happened. The
             // window keeps the last `context_messages` entries, so a render at index `i` is gone
             // once the conversation grows past `i + limit`. Rendering in full then puts a fresh
@@ -3939,7 +3963,7 @@ mod tests {
             crate::tools::todo::SharedTodoList::default(),
             Arc::new(tokio::sync::RwLock::new(None)),
             crate::skills::SkillCache::disabled(),
-            crate::memory::MemoryCache::disabled(),
+            crate::memory::MemoryStore::disabled(),
             Arc::new(crate::frontend::SilentFrontend),
             Arc::new(RwLock::new(std::env::temp_dir())),
             Arc::new(RwLock::new(Vec::new())),

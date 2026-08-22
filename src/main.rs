@@ -129,7 +129,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action, cli_ref).await,
-                cli::Command::Memory { action } => run_memory_subcommand(action).await,
+                cli::Command::Memory { action } => {
+                    run_memory_subcommand(&session_manager, action).await
+                }
                 cli::Command::Instructions { action } => run_instructions_subcommand(action),
                 cli::Command::Schedule { action } => {
                     crate::schedule::cli::run(&session_manager, action).await
@@ -359,7 +361,7 @@ pub struct SharedDeps {
     pub mcp_manager: Option<Arc<mcp::McpClientManager>>,
     pub mcp_context: Arc<mcp::McpClientContext>,
     pub skills: Arc<skills::SkillCache>,
-    pub memories: Arc<memory::MemoryCache>,
+    pub memories: Arc<memory::MemoryStore>,
     pub builtin_filter: crate::tools::BuiltinToolFilter,
     pub sandbox_capability: crate::sandbox::SandboxCapability,
     pub sandboxed_shell: bool,
@@ -451,11 +453,10 @@ pub async fn build_shared_deps(
     } else {
         crate::skills::SkillCache::disabled()
     };
-    let memories = if config.memory_enabled {
-        crate::memory::MemoryCache::discover()
-    } else {
-        crate::memory::MemoryCache::disabled()
-    };
+    // Always connected, `enabled` carrying the config switch: it gates the agent's tools, not the
+    // operator's access to a store that already exists.
+    let memories = session_manager.memory_store(config.memory_enabled);
+    crate::memory::warn_about_an_unimported_file_store(&memories).await;
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
         config.builtin_disabled_tools.clone(),
@@ -518,7 +519,7 @@ struct AgentAssembly<'a> {
     /// Whether this agent gets `skill_write` / `skill_delete`, from `[skills] agent_managed`.
     /// Never reaches a sub-agent registry; see `ToolRegistry::register_session_scoped_tools`.
     skills_agent_managed: bool,
-    memories: Arc<memory::MemoryCache>,
+    memories: Arc<memory::MemoryStore>,
     builtin_filter: crate::tools::BuiltinToolFilter,
     agent_options: AgentOptions,
     session_stats: Arc<stats::SessionStats>,
@@ -816,11 +817,10 @@ async fn create_agent_from_config(
     } else {
         crate::skills::SkillCache::disabled()
     };
-    let memories = if config.memory_enabled {
-        crate::memory::MemoryCache::discover()
-    } else {
-        crate::memory::MemoryCache::disabled()
-    };
+    // Always connected, `enabled` carrying the config switch: it gates the agent's tools, not the
+    // operator's access to a store that already exists.
+    let memories = session_manager.memory_store(config.memory_enabled);
+    crate::memory::warn_about_an_unimported_file_store(&memories).await;
 
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
@@ -2080,14 +2080,19 @@ async fn run_interactive(
                         }
                     }
                     repl::SlashCommand::MemoryList => {
-                        if let Err(error) =
-                            memory::cli::run_list(memory::cli::ListDetail::TableOnly).await
+                        if let Err(error) = memory::cli::run_list(
+                            &session_manager.memory_store(true),
+                            memory::cli::ListDetail::TableOnly,
+                        )
+                        .await
                         {
                             render::render_error(&error);
                         }
                     }
                     repl::SlashCommand::MemoryShow { name } => {
-                        if let Err(error) = memory::cli::run_show(&name).await {
+                        if let Err(error) =
+                            memory::cli::run_show(&session_manager.memory_store(true), &name).await
+                        {
                             render::render_error(&error);
                         }
                     }
@@ -2574,9 +2579,9 @@ async fn run_tools_subcommand(
                 },
                 config.skills_agent_managed,
                 if config.memory_enabled {
-                    crate::memory::MemoryCache::for_root(None)
+                    crate::memory::MemoryStore::detached()
                 } else {
-                    crate::memory::MemoryCache::disabled()
+                    crate::memory::MemoryStore::disabled()
                 },
                 crate::tools::BuiltinToolFilter::default(),
                 std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
@@ -2706,32 +2711,51 @@ fn display_path(path: Option<std::path::PathBuf>) -> String {
         .unwrap_or_else(|| "<no config directory>".to_string())
 }
 
-async fn run_memory_subcommand(action: &cli::MemoryAction) -> anyhow::Result<()> {
+async fn run_memory_subcommand(
+    session_manager: &SessionManager,
+    action: &cli::MemoryAction,
+) -> anyhow::Result<()> {
+    // Deliberately not gated on `[memory] enabled`. That switch decides whether an *agent* keeps
+    // memories; it is not a reason to refuse to show, back up or delete what is already stored.
+    let store = session_manager.memory_store(true);
+    // Said here as well as on the agent path, because this is where a user looks after an upgrade.
+    // `meka memory list` answered "No memories saved." with two hundred unimported files sitting in
+    // the config directory, and `meka memory get <name>` answered "not found" for a standing rule
+    // that was right there.
+    crate::memory::warn_about_an_unimported_file_store(&store).await;
     match action {
         cli::MemoryAction::List => {
-            memory::cli::run_list(memory::cli::ListDetail::WithDistribution).await?
+            memory::cli::run_list(&store, memory::cli::ListDetail::WithDistribution).await?
         }
-        cli::MemoryAction::Get { name } => memory::cli::run_get(name).await?,
-        cli::MemoryAction::Show { name } => memory::cli::run_show(name).await?,
+        cli::MemoryAction::Get { name } => memory::cli::run_get(&store, name).await?,
+        cli::MemoryAction::Show { name } => memory::cli::run_show(&store, name).await?,
         cli::MemoryAction::Add {
             name,
             description,
             priority,
+            tags,
             body,
             from_file,
             force,
         } => {
-            memory::cli::run_add(memory::cli::AddArgs {
+            memory::cli::run_add(&store, memory::cli::AddArgs {
                 name,
                 description,
                 priority: *priority,
+                tags,
                 body: body.as_deref(),
                 from_file: from_file.as_deref(),
                 force: *force,
             })
             .await?
         }
-        cli::MemoryAction::Remove { name } => memory::cli::run_remove(name).await?,
+        cli::MemoryAction::Edit { name } => memory::cli::run_edit(&store, name).await?,
+        cli::MemoryAction::Remove { name } => memory::cli::run_remove(&store, name).await?,
+        cli::MemoryAction::Verify { rebuild } => memory::cli::run_verify(&store, *rebuild).await?,
+        cli::MemoryAction::Export { dir } => {
+            let directory = dir.clone().unwrap_or_else(memory::cli::default_export_dir);
+            memory::cli::run_export(&store, &directory).await?
+        }
     }
     Ok(())
 }

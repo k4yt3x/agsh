@@ -299,46 +299,84 @@ pub async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> Result<
 
     // ---- nothing above this line has changed the filesystem ----
 
-    if dir.exists() {
-        tokio::fs::remove_dir_all(&dir).await.map_err(|error| {
-            MekaError::Config(format!("failed to remove {}: {}", dir.display(), error))
-        })?;
-    }
-
-    tokio::fs::create_dir_all(&dir).await.map_err(|error| {
-        MekaError::Config(format!(
-            "failed to create skill dir {}: {}",
-            dir.display(),
-            error
-        ))
-    })?;
+    // The store lock `write_skill` takes, which this path does not go through: it renders its own
+    // bytes and writes them directly, so it inherited none of that function's guards.
+    let native_root = roots.first().cloned().unwrap_or_else(|| dir.clone());
+    let _store_lock = crate::store::lock_store(&native_root)
+        .map_err(|error| MekaError::Config(format!("failed to lock the skill store: {error}")))?;
 
     let skill_md = dir.join("SKILL.md");
-    // Atomic, like every other writer of this store. `fs::write` truncates in place, so an
-    // interrupted write leaves a half-file that discovery rejects and `write_skill` then refuses to
-    // overwrite.
+    // The replacement lands *first*, and the old bundled files are cleared afterwards.
+    //
+    // This used to be `remove_dir_all` and then write, which is a destructive step with no
+    // guarantee anything follows it. A skill directory holding a read-only subdirectory -- an
+    // ordinary shape for vendored data -- had its `SKILL.md` unlinked and then the removal failed
+    // partway, leaving nothing written, nothing to roll back to, and an error reading "failed to
+    // remove" as though nothing had happened. Observed.
+    //
+    // `write_file_atomic` creates the parents, so no separate `create_dir_all` is needed; and
+    // because it publishes by rename, the directory never holds a partial `SKILL.md`.
     crate::config::write_file_atomic(&skill_md, &body).map_err(|error| {
         MekaError::Config(format!("failed to write {}: {}", skill_md.display(), error))
     })?;
 
+    // `--force` on a name that exists replaces the *skill*, bundled files included -- that is what
+    // the flag has always meant and what the docs say. Failing to clear one is now a warning
+    // rather than a lost skill: the procedure the user asked for is already on disk, and a
+    // leftover script beside it is a smaller problem than no skill at all.
+    let mut kept: Vec<String> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name() == "SKILL.md" {
+                continue;
+            }
+            let path = entry.path();
+            let removed = match entry.file_type().await {
+                // Not `remove_dir_all` on a symlinked directory: that would follow nothing but
+                // would still take the link, where `remove_file` is what a link wants.
+                Ok(file_type) if file_type.is_dir() => tokio::fs::remove_dir_all(&path).await,
+                _ => tokio::fs::remove_file(&path).await,
+            };
+            if let Err(error) = removed {
+                tracing::warn!("could not remove {}: {}", path.display(), error);
+                kept.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !kept.is_empty() {
+        // Printed, not logged: the user asked for a replacement and did not entirely get one, and
+        // the exit code says success.
+        kept.sort();
+        crate::render::render_hint(&format!(
+            "the skill was written, but these files from the previous version could not be \
+             removed and are still in the directory: {}",
+            kept.join(", ")
+        ));
+    }
+
     tracing::info!("created skill '{}'", args.name);
     println!("{}", skill_md.display());
 
+    // Released before the editor runs. The lock exists to protect the *write*, which is finished;
+    // holding it across an interactive session blocked every other meka skill write in every other
+    // process for as long as the editor stayed open, and made a concurrent `PUT /v1/skills` wait
+    // 16 seconds. `lock_store`'s own justification for blocking rather than failing is that "the
+    // contended window is one small file write" -- which is only true if this drop happens.
+    drop(_store_lock);
+
     if args.edit {
-        if let Some(editor) = std::env::var_os("EDITOR")
-            && !editor.is_empty()
-        {
-            let status = std::process::Command::new(&editor)
-                .arg(&skill_md)
-                .status()
-                .map_err(|error| {
-                    MekaError::Config(format!("failed to launch $EDITOR: {}", error))
-                })?;
+        // Through the shared builder, which splits `$EDITOR` on whitespace: `code --wait` is an
+        // ordinary setting, and passing the whole string as a program name looks for a binary
+        // literally called that.
+        if let Some(mut command) = crate::store::editor_command(&skill_md) {
+            let status = command.status().map_err(|error| {
+                MekaError::Config(format!("failed to launch your editor: {error}"))
+            })?;
             if !status.success() {
-                tracing::warn!("$EDITOR exited abnormally: {}", status);
+                tracing::warn!("your editor exited abnormally: {}", status);
             }
         } else {
-            tracing::warn!("--edit was requested but $EDITOR is unset; skipping");
+            tracing::warn!("--edit was requested but neither $VISUAL nor $EDITOR is set; skipping");
         }
     }
 
@@ -421,9 +459,20 @@ pub async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Result<()> 
     // loses the link and keeps whatever it pointed at, and reporting that as a deleted skill is a
     // lie about what happened.
     crate::store::reject_symlinked_path(&dir, "skill").map_err(MekaError::Config)?;
-    tokio::fs::remove_dir_all(&dir).await.map_err(|error| {
-        MekaError::Config(format!("failed to remove {}: {}", dir.display(), error))
-    })?;
+    // The store lock, which this door skipped. `run_add` was given it explicitly because it does
+    // not go through `write_skill`; this one has exactly the same property and was missed, so it
+    // could `remove_dir_all` a skill directory while `skill_write` or `PUT /v1/skills` was
+    // composing and renaming `SKILL.md` inside it. Measured: it completed in 70 ms against a lock
+    // every other skill door waited on.
+    let root = native_root.clone();
+    let target = dir.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let _store_lock = crate::store::lock_store(&root)?;
+        std::fs::remove_dir_all(&target)
+    })
+    .await
+    .map_err(|error| MekaError::Config(format!("remove task failed: {}", error)))?
+    .map_err(|error| MekaError::Config(format!("failed to remove {}: {}", dir.display(), error)))?;
     tracing::info!("removed skill '{}'", name);
     Ok(())
 }

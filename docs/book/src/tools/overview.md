@@ -30,7 +30,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`skill_delete`](./overview.md#the-skill_-tools) | Read | Delete a skill and its directory |
 | [`memory_write`](../usage/memory.md) | Read | Save a durable note that outlives the session |
 | [`memory_read`](../usage/memory.md) | Read | Load one saved memory in full |
-| [`memory_search`](../usage/memory.md) | Read | Regex over the full text of every memory |
+| [`memory_search`](../usage/memory.md) | Read | Ranked full-text search over every memory |
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
 | [`context_check`](./overview.md#context_check--context_compact) | Read | Measure the context window live: occupancy, headroom, compaction count |
@@ -57,8 +57,8 @@ Tools are grouped by the minimum permission level required:
   store is meka's own under its config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
 - All scratchpad tools
-- All memory tools. Writing a memory needs only read permission: the store is meka's own, under
-  its config directory, not your working tree
+- All memory tools. Writing a memory needs only read permission: the store is meka's own, in
+  meka's database, not your working tree.
 
 **Write permission** (only available in write mode):
 - `edit_file`, `write_file`, `execute_command` (unsandboxed)

@@ -121,11 +121,12 @@ pub struct Skill {
 
 /// A directory in a skills root that discovery could not turn into a [`Skill`].
 ///
-/// Recorded rather than only logged, for the reason [`crate::memory::SkippedMemory`] spells out:
-/// the log is not a channel the model can read. From inside a session an unparseable `SKILL.md` is
-/// indistinguishable from a skill nobody ever wrote -- the index omits it and `skill_read` reports
-/// it missing -- so someone can drop in a procedure and believe it is available for as long as it
-/// takes them to look at stderr. Skills reached that conclusion later than memory did.
+/// Recorded rather than only logged, because the log is not a channel the model can read. From
+/// inside a session an unparseable `SKILL.md` is indistinguishable from a skill nobody ever wrote
+/// -- the index omits it and `skill_read` reports it missing -- so someone can drop in a procedure
+/// and believe it is available for as long as it takes them to look at stderr. Memory reached that
+/// conclusion first, and no longer needs it: a memory is a database row, so there is no file to be
+/// unreadable. Skills stay on files because a `SKILL.md` is a shared spec other clients read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedSkill {
     /// The directory name as it appears on disk. Callers render it with `escape_debug`, since one
@@ -895,14 +896,18 @@ pub fn parse_skill_definition(
         name: name.to_string(),
         description: crate::store::sanitize_stored_description(&description),
         license: frontmatter.license,
-        // Sanitised but *not* truncated. The 500-character ceiling is applied where the value is
-        // rendered for the model, because this is the only copy the process holds and a write
-        // rebuilds the file from it: cutting here would persist the cut, which is the exact mistake
-        // `store::sanitize_stored_description` was changed to stop making for descriptions.
-        compatibility: frontmatter
-            .compatibility
-            .as_deref()
-            .map(crate::store::sanitize_stored_description),
+        // Verbatim: neither truncated nor sanitised. The reasoning that kept the ceiling out of
+        // here applies just as much to the filter, and only half of it was followed. This is the
+        // only copy the process holds and a write rebuilds the file from it, so *any* edit made at
+        // parse time is persisted on the next rewrite -- and `sanitize_text` filters the whole `Cf`
+        // category, which is not decoration in every script: a `compatibility` reading
+        // `می‌خواهم uv و 👨‍👩‍👧` came back from one unrelated description edit as `میخواهم uv و 👨👩👧`,
+        // the ZWNJ that spells the Persian word and the ZWJ sequences that join the emoji gone from
+        // the only copy. A block scalar likewise came back as one line.
+        //
+        // Sanitising is a property of the path into the *model's context*, which is where
+        // [`skill_context_header`] applies it, alongside the ceiling.
+        compatibility: frontmatter.compatibility,
         allowed_tools: frontmatter.allowed_tools,
         priority: parse_priority(priority_raw, "skill", name),
         metadata,
@@ -1043,8 +1048,10 @@ where
 
 /// Render a YAML value as display text.
 ///
-/// Lossy by design and used only where a *string* is what the caller needs: a table cell, a log
-/// line, `meka skill get`. The file's own copy keeps its type; see [`Skill::metadata`].
+/// Lossy by design and used where a *string* is what the caller needs: a table cell, a log line,
+/// `meka skill get`, and the two frontmatter keys that must accept any shape rather than cost the
+/// file its whole header ([`string_or_list`] here, [`crate::memory::Memory::tags`] there). The
+/// file's own copy keeps its type; see [`Skill::metadata`].
 pub fn yaml_value_to_string(value: &serde_norway::Value) -> String {
     match value {
         serde_norway::Value::String(text) => text.clone(),
@@ -1123,12 +1130,13 @@ fn skill_context_header(skill: &Skill) -> String {
         skill.source_dir.display()
     );
     if let Some(compatibility) = skill.compatibility.as_deref() {
-        // Bounded here rather than at parse: this is the render path, so a cut costs the model a
-        // few words and costs the file nothing. Capping on the way in would make the truncated
-        // form the only copy in the process, and `write_skill` rebuilds the file from that copy --
-        // the mistake `store::sanitize_stored_description` was changed to stop making for
-        // descriptions.
-        let shown: String = compatibility
+        // Bounded *and* sanitised here rather than at parse: this is the render path, so both cost
+        // the model a few characters and cost the file nothing. Doing either on the way in would
+        // make the edited form the only copy in the process, and `write_skill` rebuilds the file
+        // from that copy -- the mistake `store::sanitize_stored_description` was changed to stop
+        // making for descriptions, and which the sanitiser here went on making until it was found
+        // stripping the joiners out of Persian text on an unrelated edit.
+        let shown: String = crate::store::sanitize_stored_description(compatibility)
             .chars()
             .take(MAX_COMPATIBILITY_CHARS)
             .collect();
@@ -1376,7 +1384,31 @@ pub fn write_skill(
     crate::store::reject_symlinked_path(&dir, "skill")?;
     crate::store::reject_symlinked_path(&skill_file, "skill")?;
 
-    let existing = std::fs::read_to_string(&skill_file).ok();
+    // Held across the read-modify-write below, and across processes. Everything under here reads
+    // the existing `SKILL.md`, composes the new one from what it read, and writes it back; nothing
+    // serialised two of those against each other, so `meka skill add` in a shell and a turn's
+    // `skill_write` each kept their own view and the loser's edit vanished.
+    let _store_lock = crate::store::lock_store(root)
+        .map_err(|error| format!("failed to lock the skill store: {error}"))?;
+
+    // `read_to_string(...).ok()` collapsed every read *error* into "there is no file here", so the
+    // clobber guard below -- which only ever saw files that decoded -- never fired for one that did
+    // not. A `SKILL.md` in Latin-1 (an ordinary editor artefact) or at mode 000 was replaced by a
+    // five-line stub and the write reported success, because `body: None` then means "there was no
+    // body" rather than "the body could not be read". Distinguished here so both cases refuse.
+    let existing = match std::fs::read_to_string(&skill_file) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "{} exists but could not be read ({}), so a write would replace contents meka \
+                 cannot see. Repair the file directly, or remove the skill first if you mean to \
+                 start over.",
+                skill_file.display(),
+                error
+            ));
+        }
+    };
     let existing_skill = match existing.as_deref() {
         Some(content) => match parse_skill_definition(name, root, &dir, &skill_file, content) {
             Ok(skill) => Some(skill),
@@ -1494,6 +1526,8 @@ pub fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
     // whatever it pointed at. Reporting that as a deleted skill is a lie about what happened, and
     // the user planted the link for a reason.
     crate::store::reject_symlinked_path(&dir, "skill")?;
+    let _store_lock = crate::store::lock_store(root)
+        .map_err(|error| format!("failed to lock the skill store: {error}"))?;
     if !dir.is_dir() {
         return Err(format!("skill '{}' not found", name));
     }
@@ -3544,6 +3578,42 @@ mod tests {
                 .expect("read")
                 .contains("PROCEDURE THE USER CARES ABOUT"),
             "the file must be untouched"
+        );
+    }
+
+    /// The same refusal for a `SKILL.md` that could not be *read*, not merely not parsed.
+    ///
+    /// `read_to_string(...).ok()` collapsed every read error into "there is no file here", so the
+    /// clobber guard above never saw it: a Latin-1 `SKILL.md` (an ordinary editor artefact) or one
+    /// at mode 000 was replaced by a five-line stub and the write reported success, because
+    /// `body: None` then means "there was no body" rather than "the body could not be read".
+    #[test]
+    fn write_skill_refuses_a_file_it_could_not_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("triage");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("SKILL.md");
+        // Invalid UTF-8: present, and undecodable.
+        std::fs::write(
+            &path,
+            b"---\ndescription: d\n---\nPROCEDURE \xff\xfe HERE\n",
+        )
+        .expect("seed");
+        let before = std::fs::read(&path).expect("read raw");
+
+        for body in [None, Some("replacement")] {
+            let error = super::write_skill(temp.path(), "triage", "new desc", 5, None, body)
+                .expect_err("must refuse a file it cannot read");
+            assert!(error.contains("could not be read"), "{error}");
+            assert!(
+                error.contains("remove the skill first"),
+                "must name the way out: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("read raw"),
+            before,
+            "not one byte may change"
         );
     }
 

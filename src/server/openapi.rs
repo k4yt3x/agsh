@@ -112,7 +112,6 @@ use crate::server::{handlers, state::ServerState};
         crate::server::handlers::stores::WriteSkillRequest,
         crate::server::handlers::stores::MemoryDetail,
         crate::server::handlers::stores::MemoryListResponse,
-        crate::server::handlers::stores::SkippedMemoryView,
         crate::server::handlers::stores::WriteMemoryRequest,
         crate::server::handlers::stores::ToolView,
         crate::server::handlers::stores::ToolsResponse,

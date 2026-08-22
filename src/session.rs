@@ -545,6 +545,24 @@ impl SessionManager {
                     .unwrap_or(0)
                     > 0;
                 if has_old_schema {
+                    // Said out loud, because it is a deletion the user cannot undo and would
+                    // otherwise learn about only when a resumed session's scratchpad reference
+                    // resolves to nothing. The old shape keyed rows by an autoincrementing id
+                    // where the current one keys them by name, and there is no name to synthesise
+                    // from, so the rows genuinely cannot be carried across -- but "cannot be
+                    // migrated" is a thing to report, not a reason to be quiet about it.
+                    let doomed: i64 = connection
+                        .query_row("SELECT COUNT(*) FROM tool_outputs", [], |row| row.get(0))
+                        .unwrap_or(0);
+                    if doomed > 0 {
+                        tracing::warn!(
+                            "dropping {} stored tool output(s) from a pre-0.30 database: they \
+                             predate the name column and cannot be carried forward. Older \
+                             sessions will resume without their spilled command output and \
+                             sub-agent reports.",
+                            doomed
+                        );
+                    }
                     connection.execute_batch("DROP TABLE tool_outputs")?;
                 }
 
@@ -915,6 +933,12 @@ impl SessionManager {
                     CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
                         ON background_tasks(session_id, status);",
                 )?;
+
+                // The memory store (see `crate::memory::store`). Its DDL lives with the code that
+                // queries it, but runs here so the whole schema is created in one place, under one
+                // lock, with one completion stamp. No foreign key to `sessions`: a memory outlives
+                // every session and belongs to the meka instance, not to a conversation.
+                crate::memory::store::create_tables(connection)?;
 
                 // Stamped last, so it means "everything above ran to completion". A kill partway
                 // through leaves the stamp unwritten and the next open re-runs the whole sequence,
@@ -2768,6 +2792,13 @@ impl SessionManager {
 
     pub fn schedule_store(&self) -> crate::schedule::ScheduleStore {
         crate::schedule::ScheduleStore::new(Arc::clone(&self.connection))
+    }
+
+    /// Handle on the memory store. See [`crate::memory::store`] for why it shares this database
+    /// rather than owning one: meka has one database, and a second would be a new thing to back
+    /// up, lock and explain for the sake of two tables.
+    pub fn memory_store(&self, enabled: bool) -> Arc<crate::memory::MemoryStore> {
+        crate::memory::MemoryStore::from_connection(Arc::clone(&self.connection), enabled)
     }
 
     pub fn background_store(&self) -> crate::background::BackgroundStore {

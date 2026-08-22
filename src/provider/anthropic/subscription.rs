@@ -2268,7 +2268,7 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             false,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::tools::BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -2400,7 +2400,7 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             false,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::tools::BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -2543,7 +2543,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             crate::skills::SkillCache::for_root(None),
             false,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::tools::BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -2581,7 +2581,7 @@ mod tests {
         );
 
         // ...and the change is announced in the block that gets appended instead.
-        let memories = crate::memory::MemoryIndex::default();
+        let memories: Vec<crate::memory::Memory> = Vec::new();
         let delta = crate::context::render_world_state(
             &crate::context::WorldSnapshot::new(
                 &after_catalogue,
@@ -2666,7 +2666,7 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             false,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::tools::BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),
@@ -2778,7 +2778,7 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             false,
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             crate::tools::BuiltinToolFilter::default(),
             crate::workspace::test_cwd(),
             crate::workspace::test_roots(),

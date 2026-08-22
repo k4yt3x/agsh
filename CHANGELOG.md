@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Memory is ranked and tiered search: several phrasings at once, word endings, typos, CJK.
+- Memory search results carry a description, an excerpt, and short bodies in full.
+- Priority-0 memories render their body in the per-turn context, not just their description.
+- Memories take tags, filterable in search and summarised for the entries the index omits.
+- A memory carries a `recorded` date, stamped once, so an edit no longer restamps it.
+- `memory_write` names a near-duplicate without refusing; `memory_read` suggests a misspelt name.
+- `meka memory export`, `edit`, `verify` and `add --tag` manage the store by hand.
+- `import-memory-store.py`, a one-shot release download, moves a file store into the database.
 - `openai-responses`, a backend for the OpenAI Responses API, authenticated with an API key.
 - `openai-responses` sends no encrypted-reasoning `include`; `chatgpt-subscription` still does.
 - `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
@@ -18,15 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `skill_search` greps the full text of every installed skill, bodies included.
 - `skill_write` / `skill_delete` let the agent author skills, off unless `[skills].agent_managed`.
 - `[skills].extra_paths` scans further directories for skills, read-only and never created.
-- Skills read the spec's `license`, `compatibility` and `allowed-tools`; `compatibility` is shown.
-- Every frontmatter key survives a rewrite, including ones neither meka nor the spec defines.
+- Skills read the spec's `license`, `compatibility` and `allowed-tools`, and keep every other key.
 - Skills take a `metadata.meka-priority`, ordering the `[Skills]` index like memory's.
 - `meka skill add --metadata key=value` sets any frontmatter metadata key. Repeatable.
-- `meka skill list --paths` adds a column naming where each skill is on disk.
-- HTTP: `PUT` and `DELETE /v1/skills/{name}` answer 409 for a skill meka reads but cannot write.
+- `meka skill list --paths` names where each skill is; the index names ones that failed to load.
 - A skill's file may be named `skill.md` as well as `SKILL.md`, matching the reference parser.
-- The `[Skills]` index names directories that could not be loaded, as `[Memory]` already did.
-- HTTP: the skill views carry `compatibility`, and the detail view `license` and `allowed-tools`.
 - HTTP: compact, rewind, export and import sessions, and report context occupancy.
 - HTTP: manage scheduled jobs, background tasks, skills and memory, behind four new scopes.
 - HTTP: read a session's tools, instructions and providers; list and reconnect MCP servers.
@@ -36,18 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[[serve.webhooks]]` posts signed, content-free notifications for turns, tasks and jobs.
 - `trust_read_only_hint` refuses an MCP server's `readOnlyHint`, keeping the tool out of read mode.
 - `meka mcp add --auth-token-stdin` / `--client-secret-stdin` keep secrets out of `ps` and history.
-- `meka provider add` offers an optional advanced step for thinking, context window and effort.
-- `meka provider add --thinking` / `--context-window` / `--effort` set those non-interactively.
+- `meka provider add` gains an advanced step and flags for thinking, context window and effort.
 - `[display].tool_params` shows a tool call's full arguments as an indented block, or hides them.
 - `[display].max_width` pins the width meka renders to; unset, it follows the terminal.
 - `[schedule].max_consecutive_fires` interleaves one session's due backlog with other sessions'.
 
 ### Changed
 
-- **Breaking:** `claude-api` has been renamed to `anthropic-messages`.
-- **Breaking:** `claude-oauth` has been renamed to `claude-subscription`.
-- **Breaking:** `openai-api` has been renamed to `openai-chat-completions`.
-- **Breaking:** `openai-codex` has been renamed to `chatgpt-subscription`.
+- **Breaking:** memories are rows in `MEKA_DATA_DIR`, not files under `MEKA_CONFIG_DIR`.
+- **Breaking:** a config-directory backup no longer captures memories; back up the data dir.
+- **Breaking:** `memory_search` takes `queries` (a list) instead of `pattern`, and drops regex.
+- **Breaking:** `GET /v1/memory` carries `recorded_at` and `tags`, drops `skipped`, 404s cleanly.
+- Memory has no discovery cap and no per-turn directory walk; the index is one indexed query.
+- Memory search is an external-content FTS5 index kept by triggers, rebuildable at any time.
+- A memory write is one upsert in one transaction, so no write door needs a cross-process lock.
+- **Breaking:** `claude-api` → `anthropic-messages`, `claude-oauth` → `claude-subscription`.
+- **Breaking:** `openai-api` → `openai-chat-completions`, `openai-codex` → `chatgpt-subscription`.
 - **Breaking:** HTTP `GET /v1/providers` reports the new backend names in each profile's `type`.
 - **Breaking:** `[thinking].enabled` is retired; the per-profile `thinking` mode replaces it.
 - **Breaking:** pre-4.6 Claude profiles need `thinking = "budgeted"`; the default is now adaptive.
@@ -59,6 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `meka skill add` swaps `--version` and `--author` for a repeatable `--metadata`.
 - **Breaking:** `meka skill add --from-file` needs the `name` the spec makes mandatory.
 - **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
+- **Breaking:** `meka skill get` prints the spec's fields and every `metadata` key.
+- **Breaking:** `meka skill list` drops its version and path columns and gains `External`.
 - **Breaking:** `/v1/docs` and `/v1/openapi.json` are off unless `[serve].docs = true`.
 - **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
 - `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
@@ -70,8 +80,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - Skills predating the Agent Skills format still load; a rewrite migrates them to it.
 - `--skill`, `meka skill get` and `skill show` read only the file they name, not the store.
-- **Breaking:** `meka skill get` prints the spec's fields and every `metadata` key.
-- **Breaking:** `meka skill list` drops its version and path columns and gains `External`.
 - Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
 - Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
 - Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
@@ -81,16 +89,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **Breaking:** `source_url` and `meka skill update`; clone the source into `[skills].extra_paths`.
+- **Breaking:** the file-backed memory store and its YAML frontmatter; import it once, then delete.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
 - The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
+- `contrib/migrate-memory-recorded.py`; the release's `import-memory-store.py` subsumes it.
 
 ### Fixed
 
+- A turn that could not read the memory store told the model every memory had been deleted.
+- `memory_search` was case-sensitive, and stopped at 100 matches mid-walk, hiding the rest.
+- Memory text reached the model unsanitised; only descriptions were filtered before.
+- A memory's rendered age was its edit time, so a priority change made an old note "today".
+- `memory_write` and `skill_write` reset an omitted priority to 5 rather than keeping the current.
+- Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
+- A listed skill can always be deleted. `con`, `two words` and `my:skill` had no way out but `rm`.
+- Writing a skill meka could not read replaced it; it now refuses and points at the file.
+- `meka skill add --force` deleted the skill before writing, losing it if the write never happened.
+- A skill's `compatibility` was stored sanitised, so a rewrite persisted the stripped text.
+- `scratchpad_save_file` replaced an existing file silently; it now refuses without `force`.
+- Store writes take a cross-process lock and release it before `$EDITOR`; edits could be lost.
+- Store files and roots are created private, and a rewrite no longer re-modes a file or its target.
+- Concurrent writes to one file could publish a splice of both; every store shared one temp name.
+- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
+- `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
+- HTTP store writes run off the runtime, so a held store lock cannot stall every other request.
+- `$EDITOR` may carry arguments, and `$VISUAL` is honoured; `code --wait` was looked up as a binary.
+- `load_tool` promised a schema "on your next turn" even when every name failed to resolve.
 - **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
 - **Breaking:** a stdio MCP server gets a curated environment; declare its secrets in `env`.
 - **Breaking:** ACP's sticky options read "Always allow any `<tool>`", matching their real scope.
-- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
-- `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
 - Schema migration is serialised and gated on `user_version`, never rebuilt on a failed probe.
 - Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
 - Retention spares a session that owns a scheduled job, and its ancestors.
@@ -98,8 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A stalled provider, token endpoint or MCP server no longer parks a turn for the process's life.
 - ACP `session/close` and `session/cancel` no longer deadlock or strand an `fs/*` round trip.
 - Shutdown drains in-flight turns, scheduled fires and background tasks instead of abandoning them.
-- MCP servers are closed on exit on every surface; the handshake was previously unreachable.
-- MCP shutdown is bounded, so a server that will not close cannot hold up a `serve` or `acp` exit.
+- MCP servers are closed on exit on every surface, and the close is bounded so it cannot hang exit.
 - Blocking work moved off the async runtime, where it stalled other sessions under `meka serve`.
 - Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
 - A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
@@ -116,9 +142,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP: a malformed body, a bad parameter or a re-attach race no longer answers a false 409.
 - Terminal rendering survives emoji, combining marks and invisible characters without a broken row.
 - CLI, log and help text corrected throughout: wrong keys, stale advice, leaked Rust internals.
-- Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
-- A listed skill can always be deleted. `con`, `two words` and `my:skill` had no way out but `rm`.
-- `--skill <name>` reported every broken skill in the store twice, once per discovery pass.
 - A server's error body is trimmed before it is shown, so a failed turn ends without blank lines.
 
 ### Security
@@ -126,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
-- Memory and skill writes refuse a symlinked path instead of writing outside the store.
+- Skill writes refuse a symlinked path instead of writing outside the store.
 - `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.
 - A command-output capture is created at `0600` and swept after a day.
 - `utoipa-swagger-ui` is vendored, so a build no longer downloads an unpinned, unverified zip.

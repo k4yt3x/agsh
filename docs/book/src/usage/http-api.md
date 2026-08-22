@@ -495,7 +495,7 @@ Each token carries a set of scopes that control what it can access:
 
 Discovery endpoints (`/v1/info`, `/v1/skills`, `/v1/mcp`, `/v1/providers`) accept any token with at least one read scope. Two deliberately do not: `GET /v1/skills/{name}` needs `skills:r` and `GET /v1/instructions` needs `sessions:r`, because both return instruction *text* rather than a listing.
 
-Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the other. Operations *on a conversation* stay under `sessions:*`, because the thing being read or changed is one session. The process-wide stores carry their own scopes so a bridge token that runs turns cannot also empty the memory directory or plant an unattended scheduled job.
+Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the other. Operations *on a conversation* stay under `sessions:*`, because the thing being read or changed is one session. The process-wide stores carry their own scopes so a bridge token that runs turns cannot also empty the memory store or plant an unattended scheduled job.
 
 An unrecognised scope logs a warning at startup and grants nothing, so a typo like `sessions:write` is visible rather than silently inert.
 
@@ -557,7 +557,7 @@ Idempotency keys are **ignored for streaming responses**; streaming clients shou
 | `POST /turn` (blocking, with a key) | yes | cached response returned |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}` | yes | already-done is the same state |
 | `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure — treat it as success if you are retrying blind |
-| `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same file |
+| `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
 | `POST /compact` | mostly | a second compaction summarises the summary; fidelity drops, nothing is lost |
 | `POST /rewind` | **no** | drops another turn. A client that retries on a connection error loses conversation |
 | `POST /sessions/import` | **no** | creates a second copy of the tree under new ids |
@@ -854,6 +854,14 @@ Key points:
 | GET | `/v1/docs` | None, and off unless `[serve].docs` is set | Swagger UI |
 
 `GET /v1/sessions` takes `include_children=true` to list sub-agent sessions alongside top-level ones, and `cwd=<path>` to filter by working directory. Every session record carries `parent_id`, which is what reconnects a spawned worker to the session that dispatched it.
+
+A memory record carries both `updated_at` (when the row last changed) and `recorded_at` (when the memory was made, stamped once at creation), plus its `tags`. The two timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, and it is `recorded_at` that the model is shown as an age. `PUT /v1/memory/{name}` accepts `tags` with the same omit-to-keep rule as `body` — omit to leave an existing memory's labels alone, send `[]` to clear them.
+
+`GET /v1/memory/{name}` answers **404** for a name that is not stored, with no 422 case: a memory is a row, so there is no file to be present but unparseable. Reading through this endpoint deliberately does *not* increment the memory's read count — an operator is not the agent recalling anything, and the count feeds search ranking.
+
+Descriptions and bodies are returned **exactly as stored**, not as they are rendered into a model's context: this endpoint is a backup and inspection door, like `meka memory export`, and stripping characters out of a note on the way through would make a restore lossy. JSON escaping keeps that safe in transit, but a client that decodes and prints the text to a terminal should neutralise it, as meka does at its own render boundaries.
+
+These four endpoints are **not** gated by `[memory] enabled`. That switch decides whether an agent keeps memories; a token is the operator, so it reaches a store that already exists exactly as `meka memory list` does in a shell.
 
 A scheduled job's optional `gate` is the sharpest grant on this API. The command runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. It therefore requires `sessions:w` in addition to `schedule:w`, and the session must be at `write`. A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a shell. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
 

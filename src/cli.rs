@@ -349,7 +349,7 @@ pub enum InstructionsAction {
 pub enum MemoryAction {
     /// List saved memories and the priority distribution
     List,
-    /// Print one memory's frontmatter and on-disk facts
+    /// Print one memory's stored fields
     Get { name: String },
     /// Print a memory's body
     Show { name: String },
@@ -371,6 +371,10 @@ pub enum MemoryAction {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
 
+        /// Label for grouping and filtering; repeatable
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         /// Detail loaded only on memory_read
         #[arg(long)]
         body: Option<String>,
@@ -379,12 +383,46 @@ pub enum MemoryAction {
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
 
-        /// Overwrite the memory if it already exists
+        /// Update an existing memory instead of refusing
         #[arg(long)]
         force: bool,
     },
+    /// Open a memory's body in $EDITOR
+    ///
+    /// The body only. To change a description, priority or tags, use
+    /// `meka memory add <name> --force`, which keeps whatever it does
+    /// not mention.
+    #[command(verbatim_doc_comment)]
+    Edit {
+        /// Name of the memory to edit
+        name: String,
+    },
     /// Delete a memory permanently
     Remove { name: String },
+    /// Check the search index against the stored memories
+    ///
+    /// The index is derived from the memories and can be regenerated,
+    /// so neither answer here risks losing a note.
+    #[command(verbatim_doc_comment)]
+    Verify {
+        /// Regenerate the index instead of only checking it
+        #[arg(long)]
+        rebuild: bool,
+    },
+    /// Write every memory out as Markdown, one file per memory
+    ///
+    /// The backup, grep and git answer now that memories live in
+    /// meka's database. Read back with the release's import-memory-store.py.
+    ///
+    /// Examples:
+    ///   meka memory export
+    ///   meka memory export --dir ~/backup/memory
+    #[command(verbatim_doc_comment)]
+    Export {
+        /// Directory to write into; must be new or empty
+        #[arg(long, value_name = "PATH")]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 /// Read-only account introspection, for scripting (e.g. an i3blocks status bar). Both subcommands

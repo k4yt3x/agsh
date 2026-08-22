@@ -6,54 +6,40 @@ Without it, an agent's only state is its context window. When a long session com
 
 ## How memory works
 
-- Memories live in `~/.config/meka/memory/` (platform-specific config dir), one Markdown file per memory.
-- The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_CONFIG_DIR` shares one memory; pointing a deployment at its own config dir gives it its own.
+- Memories are rows in the `memories` table of meka's database (`~/.local/share/meka/meka.db`, or `MEKA_DATA_DIR`), one row per memory.
+- The store is scoped to the **meka instance**, not to a session or a directory. Everything sharing a `MEKA_DATA_DIR` shares one memory; pointing a deployment at its own data dir gives it its own.
 - On every prompt, meka lists each memory's `description` in the per-turn context. Bodies are **not** loaded automatically; the agent calls `memory_read` when a description suggests it needs the detail.
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - Memories are available in **read**, **ask**, and **write** permission modes (not in **none**). Writing a memory does *not* require write permission: the store belongs to meka, not to your working tree.
 
-## File format
+> **Memories moved out of the config directory.** They used to be Markdown files in `~/.config/meka/memory/`. They now live in `MEKA_DATA_DIR` alongside sessions, so a backup of your config directory no longer captures them. See [Moving an existing store](#moving-an-existing-store).
 
-```
-~/.config/meka/memory/
-├── k4yt3x-prefers-terse-replies.md
-└── mekabridge-deploy-host.md
-```
+## Fields
 
-Each file begins with YAML frontmatter, followed by the body:
+| Field | Meaning |
+|---|---|
+| `name` | Unique identifier, `[A-Za-z0-9_-]`. Case-insensitive: `NOTE` and `note` are one memory. |
+| `description` | One line, shown in every session's index. Make it stand on its own. |
+| `priority` | `0`–`9`, default `5`. See [Priority](#priority). |
+| `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
+| `body` | Detail, loaded on demand by `memory_read`. |
+| `recorded` | When the memory was made. Stamped once, at creation. |
+| `updated` | When the row last changed. |
+| `read count` | How many times `memory_read` has opened it. Feeds search ranking. Only `memory_read` increments it: a search hit is weaker evidence, and reading through the CLI or the HTTP API is the operator rather than the agent. |
 
-```markdown
----
-description: K4YT3X prefers terse replies with no trailing summary.
-priority: 2
----
+### `recorded` versus `updated`
 
-Asked for this after several responses that restated the diff. Applies to
-chat replies, not to commit messages or documentation.
-```
+These answer different questions, and conflating them was a bug. A `memory_write` that changes only a description or a priority moves `updated`, and reading that as the observation date made a years-old note render as "today", sort to the top of its priority band, and arrive through `memory_read` captioned "Saved today. This is what you recorded then".
 
-| Field | Required | Meaning |
-|---|---|---|
-| `description` | yes | One line, shown in every session's index. Make it stand on its own. |
-| `priority` | no | `0`–`9`, default `5`. See below. |
+`recorded` is stamped once, when the memory is created, and carried forward untouched by every later write. It is what the index renders as an age, what ties are broken by, and what freshness weighting reads. `updated` is reported by `meka memory get` and the HTTP API and takes no part in ordering or ranking.
 
-Unknown keys are ignored, so extra metadata is harmless.
+The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself, which never assigns `recorded_at` on the update path, rather than by each write door remembering to preserve it.
 
-### Files that cannot be read
+### Omitting a field keeps what is there
 
-A file missing its frontmatter, missing `description`, or carrying a name outside `[A-Za-z0-9_-]` is not a memory, and discovery skips it. Skipped files are **named in the index**, with the reason:
+`memory_write`'s `body`, `tags` and `priority` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update — a reworded description, say — a single call that cannot cost the note its contents, its labels or its rank. To clear the first two, pass `""` and `[]` explicitly.
 
-```
-2 files in your memory directory could not be read, so they are not in the
-index above and nothing they say is in effect:
-
-- **house-style.md**: missing YAML frontmatter
-- **tone.md**: missing required field 'description'
-```
-
-This is why the section renders even when nothing readable is saved. A store whose every file fails to parse would otherwise produce no `[Memory]` section at all, which reads as "memory is switched off" rather than "your notes are right there and unreadable" — and someone who drops a standing rule into the directory has no way to tell the two apart.
-
-`memory_read` on such a name says the same thing rather than reporting the memory as missing, as do `meka memory get` and `meka memory show`. `meka memory list` prints the skipped files after the table.
+`PUT /v1/memory/{name}` and `meka memory add <name> --force` follow the same rule.
 
 ## Priority
 
@@ -66,19 +52,63 @@ This is why the section renders even when nothing readable is saved. A store who
 | 5 | Default |
 | 6–9 | Situational or short-lived notes |
 
-Within one priority band, the most recently updated memory sorts first — so a fresh note never displaces a standing rule just for being new.
+Within one priority band, the most recently *recorded* memory sorts first — so a fresh note never displaces a standing rule just for being new.
 
-Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. `meka memory list` prints the distribution so you can see that happening and rebalance.
+Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. `meka memory list` prints the distribution so you can see that happening and rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
+
+**Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
 
 ## The index budget
 
-The index is capped at 8 KB and 200 entries. When more memories exist than fit, the section ends with a line stating how many were left out:
+The index is capped at 8 KB and 200 entries. When more memories exist than fit, the section ends with a line stating how many were left out — and, when they carry tags, what they are about:
 
 ```
-18 more memories not shown here — use `memory_search` to find them.
+4910 more memories not shown here, most common tags infra (820), people (611),
+decisions (405) — use `memory_search` to find them.
 ```
 
-Nothing is lost: `memory_search` runs a regular expression over the full text of every memory, including the ones the index omitted.
+A bare count is not a usable signal once it runs to thousands: it says something is missing without saying what. The tag distribution is something the agent can turn into a query, which is most of what tags are for.
+
+Nothing is lost. `memory_search` covers the whole store, including the entries the index omitted.
+
+## Search
+
+`memory_search` is the primary way to reach a store larger than the index can show. It is backed by a SQLite FTS5 index over the same table.
+
+**Ranking** combines three things, so the result is what you probably meant rather than merely what matched:
+
+- **relevance** — BM25, weighting a hit on the name above the description, and the description above the body.
+- **importance** — the declared priority, blended with how often you have actually read the memory. A memory opened forty times is important whatever it was labelled two years ago, which is the counterweight to priority drift.
+- **freshness** — a gentle decay on `recorded`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
+
+**Fuzzy matching** works in four senses, and the result says which one answered so a guess is not mistaken for a recalled fact:
+
+| Kind | Example | How |
+|---|---|---|
+| Word endings | `preference` finds `prefers` | Porter stemmer, always on |
+| Typos and truncation | `Tokoy`, `Tok` | Retried as a prefix match, then by spelling distance |
+| Word *beginnings* | `deployment` finds `deploy` | The prefix retry also works the other way |
+| Unsegmented text | `深圳` inside `办公室在深圳南山区` | Retried as a literal substring |
+| Different wording | `verbosity` for `terse` | Pass several phrasings in `queries` |
+
+The second and third rows are the two the stemmer alone does not cover. SQLite's Porter strips inflections (`deploys`, `shipping`, `running`) but not every derivation: `deployment` does not stem to `deploy`, so a search for it used to miss a memory whose body says `Deploys`. The prefix retry therefore runs in both directions — shortening the *query* as well as matching the start of the stored word — and says it was a prefix match either way.
+
+The fourth row is why word-splitting is not the whole story. The tokenizer divides on non-alphanumerics, so Chinese, Japanese and Thai prose — and a long identifier, path or URL — arrive as a single token that only matches in full. When nothing else answers, meka scans for the query as plain text instead, and says that is what it did.
+
+The last row is the important one: `queries` is a **list**, and supplying synonyms costs nothing. `["terse", "brevity", "verbosity"]` in one call finds a memory that used any of them, which is the answer to "the agent has to guess the words it used months ago" — it does not have to guess right, only to guess several times.
+
+Results carry enough to act on without a follow-up read: name, priority, age, read count, description, and the body itself when it is short.
+
+### The search index
+
+The FTS index is an [external-content](https://sqlite.org/fts5.html#external_content_tables) table over `memories`, kept in step by three triggers. It is **derived and disposable** even though the memories themselves are not:
+
+```bash
+meka memory verify              # check the index
+meka memory verify --rebuild    # regenerate it from the table
+```
+
+`verify` checks two things: that the index is structurally sound, and that it holds exactly as many documents as the store does. It deliberately does not claim more. FTS5's own `integrity-check` does **not** compare an external-content index against its content table, so a memory whose text changed while a trigger was not firing leaves both checks happy — only searching for the new wording reveals it. If search is missing something you know is there, rebuild; it is one pass over the table and cannot lose a memory, because the index is derived.
 
 ## Agent tools
 
@@ -86,12 +116,23 @@ Nothing is lost: `memory_search` runs a regular expression over the full text of
 |---|---|
 | `memory_write` | Save a memory, or update one by writing to the same name |
 | `memory_read` | Load one memory's body in full |
-| `memory_search` | Regex over the full text of every memory |
+| `memory_search` | Ranked full-text search over every memory |
 | `memory_delete` | Remove a memory permanently |
 
-`memory_read` states how old the memory is and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against.
+`memory_read` states how old the memory is and notes that it is a point-in-time observation. A memory recorded months ago is not live state, and an old note asserted as current fact is the failure this guards against. It is also the only thing that increments the read count: a search hit is weaker evidence, and an operator reading through the HTTP API is not the agent recalling anything.
 
-`memory_write`'s `body` is optional, and omitting it **keeps whatever the memory already said**. That makes a metadata-only update — a new priority, a reworded description — a single call that cannot cost the note its contents. To empty a body, pass `""` explicitly.
+`memory_write` also names an existing memory whose description says close to the same thing, when there is one:
+
+```
+Saved memory 'alice-tz' (priority 5). It is in your memory store from the next
+turn on, and memory_search will find it whatever the index has room to list.
+
+Note: 'alice-timezone' already says something very similar. If this is the same
+fact, call memory_write on 'alice-timezone' instead and delete 'alice-tz' — two
+near-copies both stay in the index for ever and neither supersedes the other.
+```
+
+This never blocks the write. The failure worth preventing is the silent one, where a store grows a hundred near-copies because nothing ever mentioned the ninety-nine.
 
 ## What not to save
 
@@ -103,15 +144,63 @@ What belongs in memory: who someone is and how they prefer to work, guidance you
 
 ```bash
 meka memory list                                    # index order, plus the priority distribution
-meka memory get k4yt3x-prefers-terse-replies        # frontmatter and on-disk facts
+meka memory get k4yt3x-prefers-terse-replies        # every stored field
 meka memory show k4yt3x-prefers-terse-replies       # the body
-meka memory add tz --description "K4YT3X is in UTC+8" --priority 2
+meka memory add tz --description "K4YT3X is in UTC+8" --priority 2 --tag people
+meka memory add tz --force --description "K4YT3X is in UTC+9"   # keeps body, tags, priority
+meka memory edit stale-note                         # $EDITOR on the body
 meka memory remove stale-note
+meka memory export --dir ~/backup/memory            # one Markdown file per memory
 ```
 
 In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body. The listing is the table alone; the priority distribution is reserved for `meka memory list`, where you have gone looking for it.
 
-Because memories are plain Markdown files in one directory, everything else works too: `grep` them, edit them in `$EDITOR`, keep the directory in git, or back it up with the rest of your config.
+`meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
+
+## Export, backup, and git
+
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority`, `recorded`, `tags` and `read_count`, followed by the body. That is the `grep`, git and backup answer now that the store is a database.
+
+`read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
+
+```bash
+meka memory export --dir ~/notes/memory        # must be new or empty
+```
+
+The directory must be new or empty. An export is a snapshot, and merging into an existing one would leave a stale file behind for every memory deleted since, so it would never quite match the store. An export that fails partway removes what it had written rather than leaving a truncated snapshot, which would otherwise restore as a plausible fraction of your store.
+
+The export directory is created at mode `0700` and each file at `0600`, and an existing empty directory is tightened to `0700`. A memory body is a private note and the database it came from is `0600`; publishing the same text world-readable because that is what the umask said would be a strange way to take a backup.
+
+The round trip is byte-exact: bodies, tags, priorities and recorded dates come back exactly as stored, including zero-width joiners, CRLF line endings and leading or trailing blank lines. `read_count` rides along too. `updated_at` does not: a restore is a write, and stamps now.
+
+Descriptions are the one field normalised rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file the importer would skip.
+
+To read an export back, or to migrate an old file-backed store, use `import-memory-store.py`. It is a one-shot migration tool rather than part of meka, so it is attached to the release you upgraded to rather than shipped in the binary or the repository. Download it from that release's assets:
+
+```bash
+python3 import-memory-store.py --root ~/notes/memory --apply
+```
+
+## Moving an existing store
+
+If you are upgrading from a version that kept memories as files in `~/.config/meka/memory/`, one script moves them. Download `import-memory-store.py` from the release's assets; it needs only Python 3.9 or newer and the standard library:
+
+```bash
+python3 import-memory-store.py            # dry run against the default locations
+python3 import-memory-store.py --apply
+```
+
+Run meka once first so it creates the `memories` table. The script:
+
+- reads `<config>/memory/*.md`, parsing `description`, `priority`, `recorded`, `tags` and (from an export) `read_count`;
+- falls back to each file's modification time when it declares no `recorded:` (this subsumes the old `contrib/migrate-memory-recorded.py`, which has been removed);
+- carries `read_count` across from the legacy `memory_usage` table when one is present, then drops it and `memory_fts`;
+- refuses the whole run if two files' names differ only in case, naming them: memory names are case-insensitive, so `Note.md` and `note.md` would become one memory holding one file's contents;
+- **never modifies or deletes the files**, and reports the ones it could not parse.
+
+It is idempotent and runs in one transaction, so an interrupted run imports nothing rather than half a store. Once `meka memory list` shows what you expect, delete `~/.config/meka/memory/` yourself, or keep it as a backup — meka no longer reads it either way.
+
+Until every file is imported, `meka` and `meka memory ...` warn and say how many are still missing. The warning is keyed on which names are absent from the store, so it does not go quiet the moment the agent saves its first memory.
 
 ## Configuration
 
@@ -122,6 +211,6 @@ Memory is on by default. To turn it off:
 enabled = false
 ```
 
-Disabling it keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Files already on disk are left alone.
+Disabling it keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing if you run lean sessions that will never use it. Memories already stored are left alone, and both the `meka memory` subcommands and the `/v1/memory` endpoints still reach them: whether an *agent* keeps memories is a different question from whether you can inspect or back up what is already there.
 
 There is deliberately no environment variable and no CLI flag: whether an agent keeps memories is a property of the installation, not something to vary per run.

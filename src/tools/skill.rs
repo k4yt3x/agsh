@@ -340,18 +340,28 @@ impl Tool for SkillWriteTool {
         })?;
         let description = require_str(&input, "description", "skill_write")?;
         let body = input.get("body").and_then(serde_json::Value::as_str);
-        let priority = match input.get("priority") {
-            Some(serde_json::Value::Null) | None => crate::store::DEFAULT_PRIORITY,
+        let requested_priority = match input.get("priority") {
+            Some(serde_json::Value::Null) | None => None,
             Some(value) => {
                 let raw = value.as_i64().ok_or_else(|| MekaError::ToolExecution {
                     tool_name: "skill_write".to_string(),
                     message: format!("'priority' must be a whole number, got {}", value),
                 })?;
-                crate::store::parse_priority(Some(raw), "skill", &name)
+                Some(crate::store::parse_priority(Some(raw), "skill", &name))
             }
         };
 
         let installed = self.skills.current().await;
+        // Omitted means "leave it alone", the rule `PUT /v1/skills` already applies and this tool's
+        // own description promises ("omit body and whatever the skill already documented is kept").
+        // Reading the absence as the default silently demoted a prioritised skill every time the
+        // agent refined its text -- and priority both orders the `[Skills]` index the model reads
+        // and decides which entries the index cap drops, so the demotion can remove it from view.
+        let priority = requested_priority.unwrap_or_else(|| {
+            installed
+                .find(&name)
+                .map_or(crate::store::DEFAULT_PRIORITY, |skill| skill.priority)
+        });
         // Unreadable first, because it is the more specific answer: a file that is both foreign and
         // unparseable needs its parse error named, and `reject_unreadable` carries the read-only
         // remedy for that case where the plain foreign refusal cannot carry the reason.
@@ -1207,5 +1217,45 @@ mod tests {
             .await
             .expect_err("a rootless cache has nowhere to write");
         assert!(error.to_string().contains("disabled"), "{}", error);
+    }
+
+    /// An omitted priority keeps the one the skill already has, matching `PUT /v1/skills` and this
+    /// tool's own "omit body and whatever the skill already documented is kept".
+    ///
+    /// Reading the absence as the default demoted a prioritised skill every time the agent refined
+    /// its text. Priority orders the `[Skills]` index the model reads *and* decides which entries
+    /// the index cap drops, so the demotion can take the skill out of view entirely.
+    #[tokio::test]
+    async fn test_skill_write_keeps_an_omitted_priority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = cache_at(&temp);
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+
+        run(
+            &write,
+            serde_json::json!({"name": "ranked", "description": "first", "priority": 1}),
+        )
+        .await;
+        let result = run(
+            &write,
+            serde_json::json!({"name": "ranked", "description": "refined"}),
+        )
+        .await;
+        assert!(
+            text_of(&result).contains("(priority 1)"),
+            "the confirmation must state what landed: {}",
+            text_of(&result)
+        );
+
+        let discovered = skills.current().await;
+        let skill = discovered
+            .skills
+            .iter()
+            .find(|skill| skill.name == "ranked")
+            .expect("skill");
+        assert_eq!(skill.priority, 1, "a refinement must not demote it");
+        assert_eq!(skill.description, "refined");
     }
 }

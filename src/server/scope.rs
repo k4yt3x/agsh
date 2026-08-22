@@ -20,7 +20,7 @@ use super::{
 /// Session-scoped operations (turns, compaction, rewind, export, background tasks) sit under
 /// `sessions:*`, because the thing being read or changed is one conversation. The stores meka owns
 /// process-wide get their own pairs, so an operator can hand a bridge the ability to run turns
-/// without also handing it the ability to empty the memory directory.
+/// without also handing it the ability to empty the memory store.
 ///
 /// Kept sorted, and kept in lockstep with the scope table in the HTTP API docs and the `bearerAuth`
 /// description in [`crate::server::openapi`].

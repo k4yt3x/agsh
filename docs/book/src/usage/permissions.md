@@ -203,11 +203,11 @@ Read mode means the agent cannot modify **your tree**. It can still write to sto
 
 | Store | Location | Tools |
 |-------|----------|-------|
-| Memory | `~/.config/meka/memory/` | `memory_write`, `memory_delete` |
+| Memory | the `memories` table in `MEKA_DATA_DIR` | `memory_write`, `memory_delete` |
 | Skills | `~/.config/meka/skills/` | `skill_write`, `skill_delete` (only with [`[skills] agent_managed`](../configuration/config-file.md#skills)) |
 | Scratchpad, todos, scheduled jobs, background tasks | the session database | various |
 
-No **built-in** tool other than those reaches the filesystem for writing in read mode. That boundary is enforced in two places: entry names are restricted to `[A-Za-z0-9_-]`, so a name cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the store. `write_file`, `edit_file` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require write mode.
+Of those, only the skill tools reach the filesystem at all; memory is a database table. That boundary is enforced in two places: entry names are restricted to `[A-Za-z0-9_-]`, so a name cannot contain `..` or a path separator, and a symlink sitting at that name is refused rather than followed, so an existing link cannot redirect a write out of the store. `write_file`, `edit_file` and `scratchpad_save_file` are the only built-ins that touch your tree, and all three require write mode.
 
 #### MCP tools are the exception
 

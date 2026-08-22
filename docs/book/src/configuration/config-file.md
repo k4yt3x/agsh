@@ -1381,7 +1381,7 @@ Controls the agent's durable note store. See the [Memory](../usage/memory.md) gu
 enabled = false
 ```
 
-Setting `enabled = false` keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing for lean sessions that will never use it. Files already in `~/.config/meka/memory/` are left untouched.
+Setting `enabled = false` keeps the four `memory_*` tool schemas out of every request and renders no memory section, which is worth doing for lean sessions that will never use it. Memories already stored are left untouched, and `meka memory` still reaches them.
 
 There is deliberately no environment variable and no CLI flag here: whether an agent keeps memories is a property of the installation, not something to vary per run.
 

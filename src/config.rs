@@ -2002,14 +2002,14 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
     })
 }
 
-/// Write `content` to `path` atomically: serialise to `<path>.tmp` in the same directory,
+/// Write `content` to `path` atomically: serialise to a `<name>.<pid>.<seq>.tmp` beside it,
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
-/// Unix) and chmods the final file to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
-/// world-readable regardless of the user's umask.
+/// Unix, unless a symlink redirected the write out of meka's own tree) and holds the final file to
+/// at most 0600 on Unix, so `auth_token` / OAuth-derived secrets aren't group- or world-readable
+/// regardless of the user's umask or of what mode the target already had.
 ///
 /// Not config-specific despite living here: the same durability and permission guarantees are what
-/// the Markdown stores under the config dir want, so `meka skill` bodies and [`crate::memory`]
-/// entries go through it too.
+/// the skill store under the config dir wants, so `meka skill` bodies go through it too.
 ///
 /// A symlinked target is followed (see [`resolve_symlink_target`]), so writing through a
 /// dotfile-manager link updates the tracked file instead of replacing the link.
@@ -2029,6 +2029,12 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     // Only the link itself is resolved, not the whole path: `canonicalize` would also resolve
     // symlinked parent directories, which changes where the temp file lands for no benefit here.
     let resolved = resolve_symlink_target(path);
+    // Whether the write is still landing inside meka's own tree. The 0700 tightening below is a
+    // statement about a directory meka owns, and following a link takes the write somewhere it does
+    // not: a dotfile manager's `~/dotfiles/config.toml` meant one `meka mcp disable` re-moded the
+    // whole repository directory to 0700 and every unrelated file in it stayed put but newly
+    // hidden -- a permission fact meka never established and cannot restore. Observed.
+    let redirected = resolved.as_path() != path;
     let path = resolved.as_path();
 
     if let Some(parent) = path.parent() {
@@ -2047,7 +2053,7 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
         std::fs::create_dir_all(parent)?;
 
         #[cfg(unix)]
-        {
+        if !redirected {
             use std::os::unix::fs::PermissionsExt;
             // Pre-existing dirs may have a different mode (e.g. user pre-created `~/.config` at
             // 0755). Best-effort tighten to 0700; failure here gets a warning rather than aborting
@@ -2071,23 +2077,85 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
-    let mut tmp_name = file_name.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp_path = path.with_file_name(tmp_name);
-
-    // Create the tmp file with restrictive perms on Unix before any bytes land on disk, so a
-    // concurrent reader never sees the partial content with a looser mode.
+    // Unique per writer, and created exclusively. A fixed `<file>.tmp` is shared by every writer of
+    // the same path: both `open(O_TRUNC)` the same inode, both write from offset zero, and whoever
+    // renames last publishes a byte-level splice of two documents as a success. Reproduced -- 4 MiB
+    // of one body with 64 KiB of another laid over its front, renamed into place, `Ok(())` returned
+    // to both. The pid separates processes and the counter separates threads within one;
+    // `create_new` is what makes the pair a guarantee rather than a strong hope.
+    //
+    // `write_file_bytes` in `crate::tools::file` already carried the pid half of this for the same
+    // reason. This is the primitive every *store* writes through, and it had neither half.
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp_path)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
+    let (tmp_path, mut file) = loop {
+        let mut tmp_name = file_name.to_os_string();
+        tmp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let candidate = path.with_file_name(tmp_name);
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            // Only a name collision is worth retrying; anything else is the real error.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    // Every failure arm removes the temp file. A unique name means a leftover is never reused, so
+    // without this each interrupted write leaves one behind for ever.
+    let write = (|| -> std::io::Result<()> {
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    })();
     drop(file);
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+
+    // An existing file keeps whatever mode it had, *narrowed* to at most 0600.
+    //
+    // Two failures meet here and only this rule avoids both. Handing the target the temp's fresh
+    // 0600 unconditionally re-moded a file meka did not create, which is wrong for a `config.toml`
+    // a dotfile manager owns. But simply carrying the old mode across is worse: it left
+    // `auth_token = "sk-..."` sitting in a world-readable file after an ordinary `meka mcp add`,
+    // because the write follows the symlink out of meka's 0700 directory and the group and other
+    // bits came along. Narrowing keeps a deliberately *tighter* mode like 0400 and refuses to
+    // publish a looser one into a file meka is putting secrets in.
+    //
+    // Said out loud when it bites, because it is a change to something the user set.
+    #[cfg(unix)]
+    if let Ok(existing) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let existing_mode = existing.permissions().mode() & 0o777;
+        let narrowed = existing_mode & 0o600;
+        if narrowed != existing_mode {
+            tracing::warn!(
+                "tightening '{}' from {:o} to {:o}: meka writes credentials through this path and \
+                 will not leave them group- or world-readable",
+                path.display(),
+                existing_mode,
+                narrowed
+            );
+        }
+        if let Err(error) =
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(narrowed))
+        {
+            tracing::warn!(
+                "failed to set the mode of '{}' on the replacement: {}",
+                path.display(),
+                error
+            );
+        }
+    }
 
     std::fs::rename(&tmp_path, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp_path);
@@ -5159,6 +5227,131 @@ thinking = "budgeted"
         drop(reacquired);
 
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+    }
+
+    /// Concurrent writers of one path must not splice their contents together.
+    ///
+    /// A fixed `<file>.tmp` is shared by every writer: both `open(O_TRUNC)` the same inode, both
+    /// write from offset zero, and whoever renames last publishes a mixture of the two as a
+    /// success. Reproduced before the fix at 4 MiB against 64 KiB; the sizes here are the same
+    /// shape, small enough to stay quick.
+    #[test]
+    fn write_file_atomic_never_publishes_two_writers_spliced_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("contended.txt");
+        let long = "A".repeat(512 * 1024);
+        let short = "B".repeat(4 * 1024);
+
+        for _ in 0..40 {
+            std::thread::scope(|scope| {
+                for content in [&long, &short] {
+                    let path = &path;
+                    scope.spawn(move || {
+                        write_file_atomic(path, content).expect("write");
+                    });
+                }
+            });
+            let published = std::fs::read_to_string(&path).expect("read back");
+            assert!(
+                published == long || published == short,
+                "published a splice: {} bytes, {} A and {} B",
+                published.len(),
+                published.matches('A').count(),
+                published.matches('B').count(),
+            );
+        }
+        // And no temp files are left behind by a run that succeeded.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    /// An existing file's mode is preserved, but never left looser than 0600.
+    ///
+    /// Two failures meet here. Handing the target the temp's fresh 0600 unconditionally re-modes a
+    /// file meka did not create. Carrying the old mode across verbatim is worse: it left an
+    /// `auth_token` in a world-readable `config.toml` after an ordinary `meka mcp add`, because the
+    /// write follows a dotfile manager's symlink out of meka's 0700 directory and the group and
+    /// other bits came with it. Narrowing keeps a deliberately tighter mode and refuses a looser
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_never_leaves_a_rewritten_file_looser_than_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (seeded, expected) in [
+            (0o644, 0o600),
+            (0o400, 0o400),
+            (0o600, 0o600),
+            (0o660, 0o600),
+        ] {
+            let path = dir.path().join(format!("f{seeded:o}.toml"));
+            std::fs::write(&path, "old\n").expect("seed");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(seeded))
+                .expect("chmod");
+
+            write_file_atomic(&path, "new\n").expect("rewrite");
+
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+                expected,
+                "seeded {seeded:o}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
+        }
+
+        // A file meka creates still gets the restrictive mode.
+        let fresh = dir.path().join("fresh.toml");
+        write_file_atomic(&fresh, "new\n").expect("create");
+        assert_eq!(
+            std::fs::metadata(&fresh)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    /// Following a link out of meka's tree must not re-mode the directory it lands in.
+    ///
+    /// One `meka mcp disable` against a `config.toml` symlinked into `~/dotfiles` set that whole
+    /// directory to 0700, hiding every unrelated file in it. Observed.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_does_not_tighten_a_directory_it_was_redirected_into() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).expect("dotfiles");
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let target = dotfiles.join("config.toml");
+        std::fs::write(&target, "old\n").expect("seed");
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        write_file_atomic(&link, "new\n").expect("write through the link");
+
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "new\n",
+            "the write must still land on the target"
+        );
+        assert_eq!(
+            std::fs::metadata(&dotfiles)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "a directory meka was redirected into is not one it owns"
+        );
     }
 
     // Unix-only: the body calls `std::os::unix::fs::symlink`, so without this the file does not

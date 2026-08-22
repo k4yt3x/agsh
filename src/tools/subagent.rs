@@ -41,7 +41,7 @@ pub struct ToolBuilderParams {
     pub skills: Arc<crate::skills::SkillCache>,
     /// Shared memory cache, reached at whatever level `memory_access` allows. The cache itself is
     /// shared because memory is scoped to the meka instance, not to a conversation.
-    pub memories: Arc<crate::memory::MemoryCache>,
+    pub memories: Arc<crate::memory::MemoryStore>,
     /// How much of the store the agent doing the spawning holds, which is the ceiling on what it
     /// can grant. `Write` for the primary agent; for a worker, whatever its own spawn call
     /// granted. A grant is clamped against this, so authority only ever narrows going down the
@@ -1384,7 +1384,12 @@ async fn build_subagent(
     // memories it has no tool to open is pure cost. This mirrors how the primary agent's index is
     // gated on the same tool being in its catalogue.
     let memory_index = if sub_registry.get("memory_read").is_some() {
-        render_subagent_memory_index(params.memories.current().await.as_ref())
+        render_subagent_memory_index(&params.memories.index().await.unwrap_or_else(|error| {
+            // Search still works, and the worker is told what it has. A store that cannot be read
+            // is not a reason to refuse to spawn.
+            tracing::warn!("could not read the memory index for a sub-agent: {}", error);
+            Vec::new()
+        }))
     } else {
         String::new()
     };
@@ -1562,8 +1567,8 @@ const SUBAGENT_MEMORY_INDEX_MAX_BYTES: usize = 4_096;
 /// world state the parent's index rides in. And the parent's header tells the reader to call
 /// `memory_write` when it learns something durable, which a worker cannot do -- pointing it at a
 /// tool it does not have is how a model burns a turn discovering the tool is missing.
-fn render_subagent_memory_index(memories: &crate::memory::MemoryIndex) -> String {
-    if memories.memories.is_empty() {
+fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
+    if memories.is_empty() {
         return String::new();
     }
     let mut out = String::from(
@@ -1573,8 +1578,14 @@ fn render_subagent_memory_index(memories: &crate::memory::MemoryIndex) -> String
          keeping, say so in your report and let the agent that spawned you decide.\n\n",
     );
     let mut shown = 0;
-    for memory in &memories.memories {
-        let line = format!("- **{}**: {}\n", memory.name, memory.description);
+    for memory in memories {
+        // Sanitised at the boundary, like the primary agent's index: the store hands back stored
+        // bytes, and this is a worker's context.
+        let line = format!(
+            "- **{}**: {}\n",
+            memory.name,
+            crate::memory::render_description_for_model(&memory.description)
+        );
         if out.len() + line.len() > SUBAGENT_MEMORY_INDEX_MAX_BYTES {
             break;
         }
@@ -1583,7 +1594,7 @@ fn render_subagent_memory_index(memories: &crate::memory::MemoryIndex) -> String
     }
     // Same reason the parent states its remainder: a silently truncated index reads as "this is
     // everything", which is what turns a full store into a confidently incomplete answer.
-    let remaining = memories.memories.len() - shown;
+    let remaining = memories.len() - shown;
     if remaining > 0 {
         out.push_str(&format!(
             "\n{} more not listed here. Use `memory_search` to reach them.\n",
@@ -1953,7 +1964,7 @@ mod tests {
             test_session_manager().await,
             Arc::new(tokio::sync::RwLock::new(None)),
             crate::skills::SkillCache::for_root(None),
-            crate::memory::MemoryCache::for_root(None),
+            crate::memory::MemoryStore::detached(),
             MemoryAccess::Write,
             None,
             Vec::new(),
@@ -2170,7 +2181,7 @@ mod tests {
             },
             builtin_filter: BuiltinToolFilter::default(),
             skills: crate::skills::SkillCache::for_root(None),
-            memories: crate::memory::MemoryCache::for_root(None),
+            memories: crate::memory::MemoryStore::detached(),
             // A root agent: holds the whole store, and has instructions it could pass on.
             memory_access: MemoryAccess::Write,
             config_denials: ToolDenials::default(),
@@ -2792,33 +2803,28 @@ mod tests {
     }
 
     /// A `memory: "read"` grant has to arrive with an index, or it is only half a grant:
+    fn test_memory(name: &str, priority: u8, description: &str) -> crate::memory::Memory {
+        crate::memory::Memory {
+            name: name.to_string(),
+            description: description.to_string(),
+            priority,
+            tags: Vec::new(),
+            recorded_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            read_count: 0,
+            body: None,
+        }
+    }
+
     /// `memory_read` takes an exact name, and a sub-agent never receives the per-turn world state
     /// the primary agent's `[Memory]` section rides in. Without this the worker holds two tools and
     /// no idea what to call them with.
     #[test]
     fn test_a_granted_worker_gets_a_usable_memory_index() {
-        use std::time::SystemTime;
-
-        let index = crate::memory::MemoryIndex {
-            memories: vec![
-                crate::memory::Memory {
-                    name: "build-incantation".to_string(),
-                    description: "How this project is built".to_string(),
-                    priority: 1,
-                    path: std::path::PathBuf::from("/x/build-incantation.md"),
-                    mtime: SystemTime::UNIX_EPOCH,
-                },
-                crate::memory::Memory {
-                    name: "review-style".to_string(),
-                    description: "What the user wants from a review".to_string(),
-                    priority: 2,
-                    path: std::path::PathBuf::from("/x/review-style.md"),
-                    mtime: SystemTime::UNIX_EPOCH,
-                },
-            ],
-            skipped: Vec::new(),
-            ignored_over_cap: 0,
-        };
+        let index = [
+            test_memory("build-incantation", 1, "How this project is built"),
+            test_memory("review-style", 2, "What the user wants from a review"),
+        ];
 
         let rendered = render_subagent_memory_index(&index);
         assert!(rendered.contains("build-incantation"));
@@ -2834,29 +2840,23 @@ mod tests {
         assert!(rendered.contains("report"), "it reports instead");
 
         // An empty store contributes nothing at all rather than an empty heading.
-        assert!(render_subagent_memory_index(&crate::memory::MemoryIndex::default()).is_empty());
+        assert!(render_subagent_memory_index(&[]).is_empty());
     }
 
     /// A truncated index must say so. Reading as "this is everything" is what turns a full store
     /// into a confidently incomplete answer.
     #[test]
     fn test_a_truncated_memory_index_states_its_remainder() {
-        use std::time::SystemTime;
-
-        let memories = (0..400)
-            .map(|n| crate::memory::Memory {
-                name: format!("memory-{n:03}"),
-                description: "a description long enough to make the budget bite".repeat(3),
-                priority: 1,
-                path: std::path::PathBuf::from("/x"),
-                mtime: SystemTime::UNIX_EPOCH,
+        let memories: Vec<crate::memory::Memory> = (0..400)
+            .map(|n| {
+                test_memory(
+                    &format!("memory-{n:03}"),
+                    1,
+                    &"a description long enough to make the budget bite".repeat(3),
+                )
             })
             .collect();
-        let rendered = render_subagent_memory_index(&crate::memory::MemoryIndex {
-            memories,
-            skipped: Vec::new(),
-            ignored_over_cap: 0,
-        });
+        let rendered = render_subagent_memory_index(&memories);
         assert!(
             rendered.len() <= SUBAGENT_MEMORY_INDEX_MAX_BYTES + 200,
             "budget respected"
