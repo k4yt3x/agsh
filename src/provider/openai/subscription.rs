@@ -39,13 +39,6 @@ const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// tool so OpenAI can attribute traffic.
 const ORIGINATOR: &str = "meka_cli";
 
-fn now_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub struct ChatGptSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -245,7 +238,7 @@ impl ChatGptSubscriptionProvider {
             if !crate::provider::oauth_needs_refresh(
                 *expires_at,
                 refresh_token.is_some(),
-                now_epoch_millis(),
+                crate::provider::now_epoch_millis(),
             ) {
                 return Ok((access_token.clone(), account_id.clone()));
             }
@@ -256,6 +249,18 @@ impl ChatGptSubscriptionProvider {
         // refresh gate meant a provider endpoint that went silent wedged every reader in the
         // process, not just the task refreshing. See the Claude provider for the same contract.
         let _refreshing = self.refresh_gate.lock().await;
+
+        // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
+        // serialises the tasks in *this* process and says nothing about the meka in the next
+        // terminal, which is holding the same refresh token and is just as due. Bounded, and
+        // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
+        // not this is held.
+        let _across_processes = match &self.token_store {
+            Some(store) => {
+                crate::provider::await_credential_lock(store, &self.credential_key).await
+            }
+            None => None,
+        };
 
         // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
         // refresh, and a sibling meka process may have rotated ours since startup. Without this
@@ -276,7 +281,10 @@ impl ChatGptSubscriptionProvider {
 
         // Double-check after the DB re-read: another caller (in this process or a sibling meka) may
         // already have rotated to a still-valid access token.
-        let refresh_token = {
+        // Cloned whole, not just its refresh token: the swap below has to name the exact credential
+        // this refresh is derived from, and anything less cannot tell "the row still holds what I
+        // read" from "the row holds something equivalent".
+        let derived_from = {
             let credential = self.credential.read().await;
             if let AuthCredential::OAuthToken {
                 access_token,
@@ -287,16 +295,16 @@ impl ChatGptSubscriptionProvider {
                 && !crate::provider::oauth_needs_refresh(
                     *expires_at,
                     refresh_token.is_some(),
-                    now_epoch_millis(),
+                    crate::provider::now_epoch_millis(),
                 )
             {
                 return Ok((access_token.clone(), account_id.clone()));
             }
-
-            match &*credential {
-                AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
-                _ => None,
-            }
+            credential.clone()
+        };
+        let refresh_token = match &derived_from {
+            AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
+            _ => None,
         };
         let Some(refresh_token) = refresh_token else {
             return Err(MekaError::Provider(
@@ -304,28 +312,40 @@ impl ChatGptSubscriptionProvider {
             ));
         };
 
-        let new_credential = self.refresh_oauth_token(&refresh_token).await?;
+        let refreshed = self.refresh_oauth_token(&refresh_token).await?;
+
+        // A refresh rotates the refresh token, so the one in the database is now dead -- but only
+        // if the database still holds the one this was derived from. Where it does not, what comes
+        // back is the newer credential to use instead of this one.
+        let new_credential = match &self.token_store {
+            Some(store) => {
+                crate::provider::store_refreshed_credential(
+                    store,
+                    &self.credential_key,
+                    &derived_from,
+                    refreshed,
+                )
+                .await
+            }
+            None => refreshed,
+        };
+
         let (token_value, account_id) = match &new_credential {
             AuthCredential::OAuthToken {
                 access_token,
                 account_id,
                 ..
             } => (access_token.clone(), account_id.clone()),
-            _ => unreachable!("refresh always returns OAuthToken"),
+            // Unreachable as things stand, and kept anyway. `store_refreshed_credential` only
+            // hands back a credential of the same kind this refresh was derived from, and that is
+            // an `OAuthToken` at every path reaching here. If that ever stops being true this is
+            // the difference between a clear refusal and an empty bearer token on the wire.
+            _ => {
+                return Err(MekaError::Provider(
+                    "the stored credential for this profile is not an OAuth token".to_string(),
+                ));
+            }
         };
-
-        if let Some(store) = &self.token_store
-            && let Err(error) = store
-                .save_provider_credential(&self.credential_key, &new_credential)
-                .await
-        {
-            tracing::warn!(
-                "failed to persist the refreshed Codex OAuth token ({}); this session continues, \
-                 but the stored token is now stale and the next launch will need `meka provider \
-                 login`",
-                error
-            );
-        }
 
         *self.credential.write().await = new_credential;
         Ok((token_value, account_id))
@@ -395,7 +415,7 @@ impl ChatGptSubscriptionProvider {
             // A token carrying no readable `exp` gets an assumed lifetime rather than `None`, which
             // reads as due and would send every later request back through this whole path,
             // rotating the refresh token each time.
-            _ => crate::provider::oauth_assumed_expiry(now_epoch_millis()),
+            _ => crate::provider::oauth_assumed_expiry(crate::provider::now_epoch_millis()),
         });
 
         Ok(AuthCredential::OAuthToken {
@@ -754,7 +774,7 @@ mod tests {
             access_token: "access-test".to_string(),
             refresh_token: Some("refresh-test".to_string()),
             // 1 day in the future to avoid the refresh path during construction.
-            expires_at: Some(now_epoch_millis() + 86_400_000),
+            expires_at: Some(crate::provider::now_epoch_millis() + 86_400_000),
             account_id: Some("workspace-test".to_string()),
         }
     }
@@ -1039,7 +1059,7 @@ mod tests {
             AuthCredential::OAuthToken {
                 access_token: "old".to_string(),
                 refresh_token: None,
-                expires_at: Some(now_epoch_millis() - 1_000),
+                expires_at: Some(crate::provider::now_epoch_millis() - 1_000),
                 account_id: None,
             },
             "gpt-5".to_string(),

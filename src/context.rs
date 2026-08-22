@@ -157,6 +157,18 @@ pub fn background_index_is_live(catalogue: &[ToolCatalogueEntry]) -> bool {
     catalogue_has(catalogue, TASK_INDEX_TOOL)
 }
 
+/// Whether the `[Memory]` index has a tool to open it, and therefore whether the caller needs to
+/// read the store at all. [`WorldSnapshot::new`] already declines to *render* the index without it;
+/// this lets `Agent::run_turn` decline to *fetch* it too.
+///
+/// `index()` materialises every row and carries the standing band's bodies, so an installation with
+/// `[memory] enabled = false` was paying a full-table read on every single turn to build a list
+/// that was then dropped on the floor. The store keeps its connection when disabled -- that is what
+/// leaves `meka memory ...` working for the operator -- so nothing further down notices.
+pub fn memory_index_is_live(catalogue: &[ToolCatalogueEntry]) -> bool {
+    catalogue_has(catalogue, MEMORY_INDEX_TOOL)
+}
+
 /// Whether `name` is registered, deferred or not. A deferred tool still counts: its schema is
 /// withheld until `load_tool` fetches it, but the model can reach it.
 fn catalogue_has(catalogue: &[ToolCatalogueEntry], name: &str) -> bool {
@@ -1226,7 +1238,8 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         .iter()
         .map(|entry| (entry.name.as_str(), entry))
         .collect();
-    let changed_memories: Vec<String> = current
+    // Name alongside line, so an entry the budget cuts can still be named rather than counted.
+    let changed_memories: Vec<(String, String)> = current
         .memories
         .iter()
         .filter(|entry| {
@@ -1277,7 +1290,7 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
                     clip_chars(body, MEMORY_INLINE_ENTRY_MAX_CHARS).replace('\n', "\n  ")
                 );
             }
-            line
+            (entry.name.clone(), line)
         })
         .collect();
     let removed_memories: Vec<&String> = previous
@@ -1295,31 +1308,50 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         // Budgeted like every other memory render. The entry count is unbounded -- a compaction
         // checkpoint writes several standing memories at once -- and each may carry a whole
         // priority-0 body, so without a ceiling this one line can outweigh the 8 KB the index
-        // itself is held to. Cut entries are named as a count rather than dropped in silence.
+        // itself is held to.
         let mut shown = 0;
         let mut bytes = 0;
-        for entry in &changed_memories {
+        for (_, entry) in &changed_memories {
             if shown > 0 && bytes + entry.len() > MEMORY_INLINE_MAX_BYTES {
                 break;
             }
             bytes += entry.len();
             shown += 1;
         }
-        let hidden = changed_memories.len() - shown;
+        let rendered = changed_memories[..shown]
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        // The cut ones are *named*, not counted and waved at the index. They were sent to the
+        // `[Memory]` index instead, which is the last full render and therefore predates the very
+        // writes being announced: eight priority-0 directives written in one turn rendered three
+        // and told the model the other five were somewhere they were not. Names are what a
+        // `memory_read` needs, and they are short -- it is the bodies that spent the budget.
         lines.push(format!(
             "- Memories saved or updated: {}{}",
-            changed_memories[..shown].join("; "),
-            if hidden > 0 {
-                format!("; and {hidden} more, listed in the memory index rather than restated here")
+            rendered,
+            if shown < changed_memories.len() {
+                let cut: Vec<&String> = changed_memories[shown..]
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                format!(
+                    "; and {}, not restated here -- `memory_read` them",
+                    name_some_of(&cut)
+                )
             } else {
                 String::new()
             }
         ));
     }
     if !removed_memories.is_empty() {
+        // Bounded like the line above it. This one had no ceiling whatsoever -- not the inline
+        // budget, not a count -- so 501 deletions between two turns rendered 501 names and 8,854
+        // bytes with nothing elided.
         lines.push(format!(
             "- Memories deleted: {}",
-            join_names(removed_memories.into_iter())
+            name_some_of(&removed_memories)
         ));
     }
 
@@ -1411,6 +1443,34 @@ fn join_names<'a>(names: impl Iterator<Item = &'a String>) -> String {
         .map(|name| format!("`{}`", name))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// How many memory names the world-state diff spells out before it starts counting instead.
+///
+/// Names are short, which is why the diff names cut entries at all rather than pointing at an index
+/// that predates the very writes being announced. Short is not the same as free. A restore loop
+/// through `PUT /v1/memory`, a `meka memory` sweep from a second terminal, or an
+/// `execute_command` shelling out to one -- all of which move rows behind a host's back -- put
+/// thousands of names on one line. Measured before this bound: 5,000 memories appearing between
+/// two turns rendered a 336,939-byte tail naming 4,955 of them, inside a `<context>` block of
+/// 341,447 bytes. That is roughly 85k tokens, on a single line, in the section whose own index
+/// render is held to 8 KB; the deletion list had no ceiling at all, not even the inline one.
+///
+/// Forty is enough to act on and enough to recognise a bulk change for what it is. Past that the
+/// count is the information.
+const MEMORY_NAMES_MAX: usize = 40;
+
+/// Name up to [`MEMORY_NAMES_MAX`] memories, then say how many are not named.
+///
+/// The same shape the `[Skills]` branch above uses for unloadable skills, and for the same reason:
+/// a list that silently stops reads as the whole list.
+fn name_some_of(names: &[&String]) -> String {
+    let shown = names.len().min(MEMORY_NAMES_MAX);
+    let named = join_names(names[..shown].iter().copied());
+    match names.len() - shown {
+        0 => named,
+        hidden => format!("{}, and {} more", named, hidden),
+    }
 }
 
 /// Build the per-turn `[Permission context]` block. Names the current permission level plus a
@@ -3005,6 +3065,106 @@ mod tests {
         assert!(!diff.contains("[Available tools]"), "got: {}", diff);
     }
 
+    /// A diff that cannot restate every changed memory must *name* the ones it cut.
+    ///
+    /// It used to send them to the `[Memory]` index instead, which is the last full render and so
+    /// predates the very writes being announced. Eight priority-0 directives written in one turn
+    /// rendered three and told the model the other five were somewhere they were not; a model that
+    /// went looking found the pre-write index and read the superseded text as current.
+    #[test]
+    fn a_diff_that_cuts_a_memory_names_it_rather_than_pointing_at_the_index() {
+        // Eight standing directives written in one turn, which is what a compaction checkpoint
+        // does and what the probe that found this used. Each body is clipped to
+        // `MEMORY_INLINE_ENTRY_MAX_CHARS`, so the inline budget runs out partway through.
+        let body = "x".repeat(MEMORY_INLINE_ENTRY_MAX_CHARS);
+        let written: Vec<Memory> = (0..8)
+            .map(|n| standing_memory(&format!("rule-{n}"), "A standing rule", &body))
+            .collect();
+        let before = WorldSnapshot::new(
+            &catalogue_with(MEMORY_INDEX_TOOL),
+            &no_skills(),
+            &[],
+            &[],
+            &[],
+        );
+        let after = WorldSnapshot::new(
+            &catalogue_with(MEMORY_INDEX_TOOL),
+            &no_skills(),
+            &written,
+            &[],
+            &[],
+        );
+        let diff = render_world_state(&after, Some(&before));
+
+        let unnamed: Vec<&Memory> = written
+            .iter()
+            .filter(|memory| !diff.contains(&format!("`{}`", memory.name)))
+            .filter(|memory| !diff.contains(&format!("{} (p0:", memory.name)))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "every changed memory must be either restated or named, missing {:?}: {diff}",
+            unnamed
+                .iter()
+                .map(|memory| &memory.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diff.contains("not restated here"),
+            "and the budget must actually have cut some, or this proves nothing: {diff}"
+        );
+        assert!(
+            diff.contains("memory_read"),
+            "and the model told how to reach them: {diff}"
+        );
+        assert!(
+            !diff.contains("listed in the memory index"),
+            "the index predates these writes, so it cannot be where they are: {diff}"
+        );
+    }
+
+    /// A bulk change between two turns must not put the whole store on one line.
+    ///
+    /// This was the only unbudgeted memory render, and it was unbudgeted in two places. The
+    /// "saved or updated" line bounded the entries it *restated* and then named every one it had
+    /// cut, with no ceiling; the "deleted" line had no ceiling at all, not even that one. Measured
+    /// through a live server: 5,000 memories appearing between two turns rendered a 336,939-byte
+    /// tail naming 4,955 of them, in a `<context>` block of 341,447 bytes -- around 85k tokens on
+    /// a single line, in the section whose full index render is held to 8 KB and comes out at
+    /// 12,159 for the same store. 501 deletions rendered 501 names.
+    ///
+    /// Reachable without anything exotic: a restore loop through `PUT /v1/memory`, a
+    /// `meka memory` sweep from a second terminal, or `execute_command` -- which gates at `read` --
+    /// shelling out to one.
+    #[test]
+    fn a_bulk_memory_change_is_counted_rather_than_listed_entry_by_entry() {
+        let catalogue = catalogue_with(MEMORY_INDEX_TOOL);
+        let many: Vec<Memory> = (0..5_000)
+            .map(|n| sample_memory(&format!("directive-{n:04}"), 3, "a standing rule", 1))
+            .collect();
+        let empty = WorldSnapshot::new(&catalogue, &no_skills(), &[], &[], &[]);
+        let full = WorldSnapshot::new(&catalogue, &no_skills(), &many, &[], &[]);
+
+        for (before, after, expected) in [
+            (&empty, &full, "Memories saved or updated"),
+            (&full, &empty, "Memories deleted"),
+        ] {
+            let diff = render_world_state(after, Some(before));
+            assert!(diff.contains(expected), "the premise: {expected}");
+            assert!(
+                diff.contains("more"),
+                "a list that stops without saying so reads as the whole list: {}",
+                clip_chars(&diff, 400)
+            );
+            assert!(
+                diff.len() < 16 * 1024,
+                "{expected} rendered {} bytes; the index over the same store renders ~12 KB, and \
+                 this line is not entitled to more than the section it announces",
+                diff.len()
+            );
+        }
+    }
+
     /// `None` is how compaction asks for a re-statement: the turns carrying the earlier rendering
     /// are behind the boundary and may have been summarized away, so the model needs the whole
     /// picture again rather than a delta against something it can no longer see.
@@ -3034,6 +3194,13 @@ mod tests {
     /// Doubles as a drift guard. A field added to [`WorldSnapshot`] without a matching branch in
     /// `render_world_state_diff` makes some pair differ while rendering nothing, and this fails
     /// rather than the model silently working from stale facts.
+    ///
+    /// One field is exempt, and it is exempt on purpose rather than by omission:
+    /// [`MemoryIndexEntry::recorded`] is in the snapshot because it decides ordering the next time
+    /// the index renders in full, and out of the diff because rewriting a memory with identical
+    /// content is not news. The pair proving that is
+    /// [`a_rewritten_memory_with_nothing_new_to_say_is_not_announced`], deliberately kept out of
+    /// the fixture list below so this loop's invariant stays unqualified.
     #[test]
     fn test_world_state_diff_never_advances_silently() {
         let tool = |name: &str, summary: &str, deferred: bool| {
@@ -3228,6 +3395,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The one exemption from the loop above, stated rather than left as a hole in it.
+    ///
+    /// `recorded` is in the snapshot and out of the diff comparison, so two snapshots differing
+    /// only in it are unequal and render nothing. That is the intent -- re-saving a memory whose
+    /// content has not changed is not something to announce -- but the drift guard's promise reads
+    /// as unconditional, so the exception needs a test of its own or the next person adding a
+    /// field learns the wrong rule from it.
+    #[test]
+    fn a_rewritten_memory_with_nothing_new_to_say_is_not_announced() {
+        let catalogue = catalogue_with(MEMORY_INDEX_TOOL);
+        let snapshot = |age_days: u64| {
+            WorldSnapshot::new(
+                &catalogue,
+                &no_skills(),
+                &[sample_memory("note", 3, "a fact", age_days)],
+                &[],
+                &[],
+            )
+        };
+        let before = snapshot(30);
+        let after = snapshot(1);
+
+        assert_ne!(
+            before, after,
+            "the premise: the snapshots differ, in `recorded` and nothing else"
+        );
+        assert!(
+            render_world_state(&after, Some(&before)).is_empty(),
+            "and re-saving a memory whose content is unchanged says nothing"
+        );
     }
 
     /// Every snapshot difference must produce something for the model to read. A change that

@@ -571,11 +571,15 @@ async fn authenticate_oauth_authorization_code(
             message: format!("failed to initialize OAuth manager: {}", error),
         })?;
 
-    // Set up persistent credential storage if available
+    // Set up persistent credential storage if available. The cell is held here as well as inside
+    // the adapter, so the interactive flow below can clear it; see the reset after
+    // `initialize_from_store`.
+    let last_read = std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing));
     if let Some(store) = token_store {
         manager.set_credential_store(SqliteCredentialStore {
             token_store: store.clone(),
             server_name: server_name.to_string(),
+            last_read: std::sync::Arc::clone(&last_read),
         });
     }
 
@@ -597,7 +601,15 @@ async fn authenticate_oauth_authorization_code(
         return Ok(manager);
     }
 
-    // No stored credentials; run the interactive browser flow
+    // No stored credentials; run the interactive browser flow.
+    //
+    // Cleared first, and this is load-bearing. `initialize_from_store` can itself write -- on an
+    // issuer change it loads, saves cleared tokens, and returns `false` -- and if that write loses
+    // its swap the adapter is left `Superseded`, which refuses every later write. The interactive
+    // flow performs no further `load`, so the credential the user is about to authorise in a
+    // browser would be silently dropped and the next launch would ask again. Nothing this flow
+    // mints is derived from a stored value, so there is nothing here for a swap to protect.
+    forget_what_was_read(&last_read);
     tracing::info!(
         "starting OAuth authorization flow for MCP server '{}'",
         server_name
@@ -1036,9 +1048,69 @@ fn parse_callback_query(
     Ok((code, state))
 }
 
+/// What this adapter knows about the row it writes to, which is what decides how it writes.
+///
+/// rmcp's `CredentialStore` is a `load`/`save` pair with nothing in between, so a refresh arrives
+/// as a bare "store this" with no way to say what it was derived from. Tracking the read is what
+/// supplies that.
+#[derive(Debug, Clone)]
+enum LastRead {
+    /// Nothing has been read, so there is nothing to conflict with: the interactive authorisation
+    /// flow, where replacing whatever is there is the point of it.
+    Nothing,
+    /// The JSON last handed to rmcp. A save compares against it and replaces only that.
+    Json(String),
+    /// A save found the row holding something else.
+    ///
+    /// Distinct from [`Self::Nothing`], and the distinction is the whole of it. Both mean "there
+    /// is nothing to compare against", but they want opposite writes: `Nothing` wants an
+    /// unconditional one, and this wants none at all. Collapsing the two -- which is what
+    /// recording a lost swap as "unread" did -- meant a process reverted to blind upserts for the
+    /// rest of its run after losing a single race, quietly undoing the guarantee the swap exists
+    /// for. Every token rmcp mints from here descends from a credential another process has
+    /// already superseded, and that is true of the next one and the one after it, not just the one
+    /// that lost.
+    Superseded,
+}
+
 struct SqliteCredentialStore {
     token_store: TokenStore,
     server_name: String,
+    /// What this adapter last saw in the row. See [`LastRead`].
+    last_read: std::sync::Arc<std::sync::Mutex<LastRead>>,
+}
+
+/// Put a credential cell back to "nothing has been read", for a flow that is about to mint a
+/// credential from scratch rather than derive one from what is stored.
+///
+/// A poisoned mutex is recovered from for the same reason [`SqliteCredentialStore::remember`]
+/// recovers: the cell holds one value that every writer replaces whole.
+fn forget_what_was_read(cell: &std::sync::Arc<std::sync::Mutex<LastRead>>) {
+    match cell.lock() {
+        Ok(mut cell) => *cell = LastRead::Nothing,
+        Err(poisoned) => *poisoned.into_inner() = LastRead::Nothing,
+    }
+}
+
+impl SqliteCredentialStore {
+    /// Record what the row holds, after a read, a write that did not land, or a clear.
+    ///
+    /// A poisoned mutex is recovered from rather than propagated: the cell holds one value that
+    /// every writer replaces whole, and refusing to track a read because an unrelated thread
+    /// panicked would only make the next save unconditional.
+    fn remember(&self, last: LastRead) {
+        match self.last_read.lock() {
+            Ok(mut cell) => *cell = last,
+            Err(poisoned) => *poisoned.into_inner() = last,
+        }
+    }
+
+    fn last_read(&self) -> LastRead {
+        match self.last_read.lock() {
+            Ok(cell) => cell.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -1057,9 +1129,16 @@ impl CredentialStore for SqliteCredentialStore {
                             error
                         ))
                     })?;
+                self.remember(LastRead::Json(json));
                 Ok(Some(credentials))
             }
-            Ok(None) => Ok(None),
+            // Nothing stored means nothing to conflict with, and that has to be *recorded*: a
+            // `Superseded` left over from a swap this adapter lost would otherwise outlive the row
+            // it was about, and refuse to write to a profile that is now empty.
+            Ok(None) => {
+                self.remember(LastRead::Nothing);
+                Ok(None)
+            }
             Err(error) => Err(AuthError::InternalError(format!(
                 "failed to load credentials from database: {}",
                 error
@@ -1072,18 +1151,64 @@ impl CredentialStore for SqliteCredentialStore {
             AuthError::InternalError(format!("failed to serialize credentials: {}", error))
         })?;
 
-        self.token_store
-            .save_mcp_credentials(&self.server_name, &json)
-            .await
-            .map_err(|error| {
-                AuthError::InternalError(format!(
-                    "failed to save credentials to database: {}",
-                    error
-                ))
-            })
+        let stored = match self.last_read() {
+            LastRead::Json(expected) => self
+                .token_store
+                .replace_mcp_credentials(&self.server_name, &expected, &json)
+                .await
+                .map_err(|error| {
+                    AuthError::InternalError(format!(
+                        "failed to save credentials to database: {}",
+                        error
+                    ))
+                })?,
+            LastRead::Nothing => {
+                self.token_store
+                    .save_mcp_credentials(&self.server_name, &json)
+                    .await
+                    .map_err(|error| {
+                        AuthError::InternalError(format!(
+                            "failed to save credentials to database: {}",
+                            error
+                        ))
+                    })?;
+                true
+            }
+            // Nothing this adapter can mint is writable any more: it all descends from a
+            // credential the row has already moved past. Saying so once was enough; repeating it
+            // per refresh would turn one fact into a line an hour.
+            LastRead::Superseded => {
+                tracing::debug!(
+                    "not persisting a refreshed token for MCP server '{}': it descends from a \
+                     credential the store has moved past",
+                    self.server_name
+                );
+                return Ok(());
+            }
+        };
+
+        if stored {
+            self.remember(LastRead::Json(json));
+        } else {
+            // Reported rather than raised. rmcp holds the token it just minted whatever this says,
+            // and failing the save would abort a connection that is otherwise working; what matters
+            // is that the *stored* credential stays the newest one, which is what the next process
+            // to start will load.
+            tracing::info!(
+                "MCP server '{}' was re-authenticated elsewhere while this token was being \
+                 refreshed; the stored credential was left as it is, and this process will not \
+                 write to it again",
+                self.server_name
+            );
+            self.remember(LastRead::Superseded);
+        }
+        Ok(())
     }
 
     async fn clear(&self) -> std::result::Result<(), AuthError> {
+        // Back to `Nothing` rather than to `Superseded`: a clear is this process deciding the row
+        // should hold nothing, so a fresh authorisation after it is entitled to write.
+        self.remember(LastRead::Nothing);
         self.token_store
             .clear_mcp_credentials(&self.server_name)
             .await
@@ -1099,6 +1224,75 @@ impl CredentialStore for SqliteCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Losing one compare-and-swap must not turn every later write into an unconditional one.
+    ///
+    /// The state after a lost swap used to be recorded as "nothing was read", which is also the
+    /// state the interactive authorisation flow is in -- and that state takes the blind-upsert
+    /// arm. So a process that lost a single race went back to overwriting the row for the rest of
+    /// its run, with every token it wrote descended from a credential another process had already
+    /// superseded. The invariant [`TokenStore::replace_mcp_credentials`] states -- that the stored
+    /// credential never moves backwards -- held only until the first race.
+    #[tokio::test]
+    async fn a_lost_swap_does_not_return_the_adapter_to_blind_writes() {
+        let manager = crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let token_store = manager.token_store();
+        // Built by deserializing rather than by a struct literal: `StoredCredentials` is
+        // `#[non_exhaustive]`, so rmcp reserves the right to add a field and only its own crate may
+        // name them all.
+        let credentials = |client_id: &str| -> StoredCredentials {
+            serde_json::from_value(serde_json::json!({ "client_id": client_id }))
+                .expect("the shape rmcp stores")
+        };
+        let json =
+            |client_id: &str| serde_json::to_string(&credentials(client_id)).expect("serialize");
+        token_store
+            .save_mcp_credentials("docs", &json("original"))
+            .await
+            .expect("seed");
+
+        let adapter = SqliteCredentialStore {
+            token_store: token_store.clone(),
+            server_name: "docs".to_string(),
+            last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
+        };
+        adapter.load().await.expect("load").expect("seeded");
+
+        // Another process re-authenticates while this adapter holds what it read.
+        token_store
+            .save_mcp_credentials("docs", &json("theirs"))
+            .await
+            .expect("the other process writes");
+
+        adapter
+            .save(credentials("ours"))
+            .await
+            .expect("a lost swap is reported, not raised");
+        assert_eq!(
+            token_store
+                .load_mcp_credentials("docs")
+                .await
+                .expect("load")
+                .as_deref(),
+            Some(json("theirs").as_str()),
+            "the swap must lose"
+        );
+
+        // The next refresh in the same run. Its token descends from the same superseded
+        // credential, so it is no more writable than the one that lost.
+        adapter.save(credentials("ours-again")).await.expect("save");
+        assert_eq!(
+            token_store
+                .load_mcp_credentials("docs")
+                .await
+                .expect("load")
+                .as_deref(),
+            Some(json("theirs").as_str()),
+            "and every write after it must lose too, rather than reverting to a blind upsert"
+        );
+    }
 
     #[test]
     fn test_parse_callback_query_valid() {

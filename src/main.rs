@@ -286,14 +286,24 @@ async fn async_main(
     // ago. `warn!` rather than `info!` because a deletion the user configured is still a deletion
     // they should see at the default log level.
     if let Some(retention_days) = config.retention_days {
-        let deleted = session_manager
+        let sweep = session_manager
             .delete_expired_sessions(retention_days)
             .await?;
-        if deleted > 0 {
+        if sweep.deleted > 0 {
             tracing::warn!(
                 "deleted {} session(s) not updated in {} days ([session].retention_days)",
-                deleted,
+                sweep.deleted,
                 retention_days
+            );
+        }
+        // Only turns bump `updated_at`, so a REPL idle past the window looks expired while a human
+        // is sitting in front of it. Saying nothing here would leave an operator wondering why
+        // their retention setting never takes: the answer is that it did, and spared the one
+        // session that was in use.
+        if sweep.attached_elsewhere > 0 {
+            tracing::info!(
+                "spared {} session(s) another meka process has open",
+                sweep.attached_elsewhere
             );
         }
     }
@@ -456,7 +466,6 @@ pub async fn build_shared_deps(
     // Always connected, `enabled` carrying the config switch: it gates the agent's tools, not the
     // operator's access to a store that already exists.
     let memories = session_manager.memory_store(config.memory_enabled);
-    crate::memory::warn_about_an_unimported_file_store(&memories).await;
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
         config.builtin_disabled_tools.clone(),
@@ -794,6 +803,21 @@ async fn create_agent_from_config(
         .session_stats(Some(Arc::clone(&session_stats)))
         .build()?;
 
+    // Debug-only, and the same swap `run_acp` and `run_serve` make after `build_shared_deps`. It
+    // reaches the REPL and `--oneshot` because the questions two `meka` processes raise about each
+    // other -- who holds a session's lock while a first turn runs, whose background task the other
+    // sweeps -- are questions about the CLI entry point, and no harness could ask them while the
+    // only scriptable surfaces were ACP and HTTP.
+    #[cfg(debug_assertions)]
+    let provider = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+        let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
+        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
+        Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds))
+            as Arc<dyn provider::Provider>
+    } else {
+        provider
+    };
+
     let sandbox_capability: crate::sandbox::SandboxCapability = match &config.backend_probe {
         crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
         _ => crate::sandbox::SandboxCapability::Unavailable,
@@ -820,7 +844,6 @@ async fn create_agent_from_config(
     // Always connected, `enabled` carrying the config switch: it gates the agent's tools, not the
     // operator's access to a store that already exists.
     let memories = session_manager.memory_store(config.memory_enabled);
-    crate::memory::warn_about_an_unimported_file_store(&memories).await;
 
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
@@ -1355,7 +1378,7 @@ async fn run_interactive(
 
     // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
     // before the first prompt.
-    let (mut session_id, mut messages, mut session_lock) =
+    let (mut session_id, mut messages, resumed_lock) =
         resolve_session_resume(&session_manager, &config).await?;
 
     if !messages.is_empty() {
@@ -1530,6 +1553,13 @@ async fn run_interactive(
     // Point the agent's live context counter at the same atomic the REPL prompt holds, so the
     // prompt gauge tracks what the agent writes after each turn (and the resume seed above).
     agent.set_context_tokens(Arc::clone(&context_tokens));
+
+    // One slot for the session lock from here on, whichever way the session was reached: the agent
+    // fills it the moment it creates one, and a resumed session's lock -- taken above, before the
+    // REPL thread existed -- moves into the same place. `/fork` replaces what is in it and the exit
+    // path empties it, so neither has to know which of the two put it there.
+    let session_lock = agent.session_lock_slot();
+    hold_session_lock(&session_lock, resumed_lock);
 
     // Mirrors the loop's `session_id` for the watcher below, which runs on another task and cannot
     // borrow it. Written after every event, which is the only thing that can change it.
@@ -1769,17 +1799,6 @@ async fn run_interactive(
                     }
                 }
 
-                // The first turn creates the session if one wasn't resumed; claim the file lock as
-                // soon as the ID is known so a second meka invocation can't attach to it.
-                if session_lock.is_none()
-                    && let Some(id) = session_id
-                {
-                    match session_manager.lock_session(id) {
-                        Ok(lock) => session_lock = Some(lock),
-                        Err(error) => render::render_error(&error),
-                    }
-                }
-
                 if agent_event_sender
                     .send(repl::AgentToReplEvent::Done)
                     .is_err()
@@ -1903,10 +1922,10 @@ async fn run_interactive(
                             .await
                         {
                             Ok(crate::session::cli::ForkHandoff::Switched { id, lock }) => {
-                                // Assigning over `session_lock` drops the original guard only now
+                                // Replacing the slot's contents drops the original guard only now
                                 // that the new one is held; see
                                 // `crate::session::cli::fork_and_lock`.
-                                session_lock = Some(lock);
+                                hold_session_lock(&session_lock, Some(lock));
                                 session_id = Some(id);
                                 // `messages` is deliberately untouched, so the branch happens at
                                 // the current head and the next turn continues in the copy.
@@ -2321,9 +2340,11 @@ async fn run_interactive(
     {
         render::render_session_id("Leaving session", &id.to_string());
     }
-    // Drop after the "Leaving session" message so the lock is held until the very end; the OS
-    // releases the underlying flock when the FD closes.
-    drop(session_lock);
+    // Emptied after the "Leaving session" message so the lock is held until the very end; the OS
+    // releases the underlying flock when the FD closes. Emptied rather than dropped: the slot is
+    // shared with the agent, which is still alive here, so letting this handle fall out of scope
+    // would release nothing.
+    hold_session_lock(&session_lock, None);
 
     // Stop this process's background tasks on the way out.
     //
@@ -2718,11 +2739,6 @@ async fn run_memory_subcommand(
     // Deliberately not gated on `[memory] enabled`. That switch decides whether an *agent* keeps
     // memories; it is not a reason to refuse to show, back up or delete what is already stored.
     let store = session_manager.memory_store(true);
-    // Said here as well as on the agent path, because this is where a user looks after an upgrade.
-    // `meka memory list` answered "No memories saved." with two hundred unimported files sitting in
-    // the config directory, and `meka memory get <name>` answered "not found" for a standing rule
-    // that was right there.
-    crate::memory::warn_about_an_unimported_file_store(&store).await;
     match action {
         cli::MemoryAction::List => {
             memory::cli::run_list(&store, memory::cli::ListDetail::WithDistribution).await?
@@ -2846,6 +2862,13 @@ async fn resolve_credential(
     config: &ResolvedConfig,
     token_store: &TokenStore,
 ) -> anyhow::Result<AuthCredential> {
+    // Debug-only, matching `server::resolve_serve_credential`: the scripted provider replaces
+    // whatever this returns, so the harness needn't seed a credential it will never use.
+    #[cfg(debug_assertions)]
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+        return Ok(AuthCredential::ApiKey("mock-provider".to_string()));
+    }
+
     let Some(profile) = config.active_profile.as_deref() else {
         anyhow::bail!("no provider configured. Run `meka provider add <name>` to set one up.");
     };
@@ -2893,13 +2916,30 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
     eprintln!();
 }
 
+/// Move a lock into the slot the agent and its host share, replacing whatever was there.
+///
+/// The replacement is what `/fork` depends on: the new lock is already held by the time this is
+/// called, and the old guard is dropped only once the new one is in place, so the session is never
+/// momentarily unheld. Passing `None` releases outright, which is how the REPL lets go on the way
+/// out.
+///
+/// A poisoned mutex is recovered from rather than propagated. The slot holds one value and every
+/// writer replaces it whole, so a panic cannot have left it half-updated -- and refusing to release
+/// a lock because some unrelated thread panicked would be the worse failure.
+fn hold_session_lock(slot: &session::SessionLockSlot, lock: Option<session::FileLock>) {
+    match slot.lock() {
+        Ok(mut held) => *held = lock,
+        Err(poisoned) => *poisoned.into_inner() = lock,
+    }
+}
+
 async fn resolve_session_resume(
     session_manager: &SessionManager,
     config: &ResolvedConfig,
 ) -> anyhow::Result<(
     Option<uuid::Uuid>,
     conversation::Conversation,
-    Option<session::SessionLock>,
+    Option<session::FileLock>,
 )> {
     let resolved = match &config.session_resume {
         None => return Ok((None, conversation::Conversation::new(), None)),

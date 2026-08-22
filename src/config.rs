@@ -1960,6 +1960,15 @@ pub(crate) enum ConfigFileLock {
 
 thread_local! {
     /// How many [`ConfigFileLock`]s this thread currently holds.
+    ///
+    /// Thread-local while the `flock` underneath it is per open file description, and that pairing
+    /// only holds because no `ConfigFileLock` is ever held across an `.await` on a task that can
+    /// migrate. Every acquisition today runs inside `runtime.block_on` on the main thread, which
+    /// never moves. If one were ever held across an await inside a `tokio::spawn`, the task could
+    /// resume on a different worker and both halves of this would break at once: a nested
+    /// acquisition there would see depth 0 and block on an `flock` this process already holds, and
+    /// the guard would decrement the wrong thread's counter, leaving the original stuck above zero
+    /// so every later acquisition on it silently took no lock at all.
     static CONFIG_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1992,7 +2001,7 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
     let guard = lock.write()?;
     // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
     // lock's heap address is stable for as long as the box lives, and the field order above drops
-    // `_guard` before `_lock`. Same shape as `SessionLock` in `crate::session`.
+    // `_guard` before `_lock`. Same shape as `FileLock` in `crate::session`.
     let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
         unsafe { std::mem::transmute(guard) };
     CONFIG_LOCK_DEPTH.with(|depth| depth.set(1));

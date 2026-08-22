@@ -305,6 +305,18 @@ pub struct Agent {
     /// than once per turn.
     last_rendered_world: tokio::sync::RwLock<Option<(crate::context::WorldSnapshot, usize)>>,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
+    /// The lock on a session *this agent created*, taken the moment the row exists.
+    ///
+    /// Empty for every agent that is handed a session id, which is most of them: `meka serve` and
+    /// `meka acp` lock at `POST /v1/sessions` and `session/new`, and a sub-agent's row is created
+    /// by the spawning tool. It fills for the REPL's first turn, for a fresh `--oneshot`, and
+    /// for an isolated scheduled fire -- the three places where [`Self::run_turn_retaining`]
+    /// is the thing that creates the session.
+    ///
+    /// Shared with the host through [`Self::session_lock_slot`] rather than held privately,
+    /// because the host outlives the turn and has to be able to replace the lock (`/fork`) and
+    /// choose when it is released. See [`crate::session::SessionLockSlot`].
+    session_lock: crate::session::SessionLockSlot,
     /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
     /// when something changed, so adds / removes / frontmatter edits land without restart.
     /// Body-only edits take effect even sooner; `load_skill_body` re-reads from disk on every
@@ -714,6 +726,9 @@ impl Agent {
             last_rendered_todo: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
             shared_session_id,
+            // Fresh per agent, including sub-agents: a lock belongs to the session that was
+            // created, and every agent creates at most its own.
+            session_lock: crate::session::SessionLockSlot::default(),
             skills,
             memories,
             frontend,
@@ -739,13 +754,23 @@ impl Agent {
     }
 
     /// Swap the provider after construction. Used by the ACP integration test path
-    /// (`MEKA_ACP_MOCK_PROVIDER=1`) so the test can drive a scripted
+    /// (`MEKA_MOCK_PROVIDER=1`) so the test can drive a scripted
     /// [`crate::provider::mock::MockProvider`] without going through the credential / HTTP-client
     /// setup that `create_agent_from_config` performs for real providers. Debug builds only;
     /// release builds don't include it.
     #[cfg(debug_assertions)]
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+    }
+
+    /// The slot holding the lock on a session this agent created, for a host that has to outlive
+    /// the turn that took it.
+    ///
+    /// The REPL needs all three of what this allows: to leave the lock held between turns, to
+    /// replace it when `/fork` moves the conversation to a copy, and to drop it after its last
+    /// message rather than whenever the agent happens to fall out of scope.
+    pub fn session_lock_slot(&self) -> crate::session::SessionLockSlot {
+        Arc::clone(&self.session_lock)
     }
 
     /// Shared handle to the agent's session-scoped working directory. Public so frontends can
@@ -1045,6 +1070,27 @@ impl Agent {
         .await
     }
 
+    /// Park the lock on a session this agent has just created where the host can reach it.
+    ///
+    /// The REPL used to claim the lock in its post-turn block, which measured out as: no lock file
+    /// at all for the six seconds of a first turn, and a second `meka -c --oneshot` in that window
+    /// writing into the same conversation. The stored log came out
+    /// `user, user, assistant, assistant`, which the Anthropic Messages API then refuses for
+    /// non-alternating roles -- so the session was not merely muddled but unusable from that point
+    /// on. `--oneshot` had no claim at any point.
+    ///
+    /// `None` means the claim could not be made at all, which
+    /// [`crate::session::SessionManager::create_session_locked`] has already warned about. The turn
+    /// runs regardless: the only way to get here is a filesystem problem with the lock directory,
+    /// and refusing to run over that would break installations that work today. What it costs is
+    /// the guarantee, not the turn.
+    fn hold_the_lock_on_a_created_session(&self, lock: Option<crate::session::FileLock>) {
+        match self.session_lock.lock() {
+            Ok(mut slot) => *slot = lock,
+            Err(poisoned) => *poisoned.into_inner() = lock,
+        }
+    }
+
     /// One turn whose caller decides what a failure leaves behind.
     ///
     /// For a scheduled fire, that decision belongs to the job rather than the host: see
@@ -1064,10 +1110,15 @@ impl Agent {
         self.await_mcp_ready().await?;
 
         if session_id.is_none() {
-            let id = self
+            // Created and locked in one step, the lock taken first. See
+            // [`crate::session::SessionManager::create_session_locked`] for why the order is the
+            // whole of it.
+            let (created, lock) = self
                 .session_manager
-                .create_session(Some(cwd_snapshot(&self.cwd)))
+                .create_session_locked(Some(cwd_snapshot(&self.cwd)), None, None, None)
                 .await?;
+            let id = created.id;
+            self.hold_the_lock_on_a_created_session(lock.ok());
             *session_id = Some(id);
             self.frontend
                 .emit(FrontendEvent::SessionStarted { id })
@@ -1123,12 +1174,21 @@ impl Agent {
         // read successfully, announced them all as "saved or updated" when nothing had been
         // written. A store that cannot be read is not a store that is empty, and the model acts on
         // the difference.
-        let (memories, memories_readable) = match self.memories.index().await {
-            Ok(memories) => (memories, true),
-            Err(error) => {
-                tracing::warn!("could not read the memory index: {}", error);
-                (Vec::new(), false)
-            }
+        // Skipped outright when no tool can open the index, exactly as the schedule and background
+        // reads are. `index()` materialises every row and carries the standing band's bodies, and
+        // `WorldSnapshot::new` then declines to render any of it -- so an installation with
+        // `[memory] enabled = false` was paying a full-table read per turn for a list it dropped.
+        // "Readable" for a store nobody asked about is `true`: nothing failed, so there is nothing
+        // for the diff to carry forward.
+        let (memories, memories_readable) = match context::memory_index_is_live(&catalogue) {
+            false => (Vec::new(), true),
+            true => match self.memories.index().await {
+                Ok(memories) => (memories, true),
+                Err(error) => {
+                    tracing::warn!("could not read the memory index: {}", error);
+                    (Vec::new(), false)
+                }
+            },
         };
         let mcp_instructions = self
             .mcp_manager
@@ -3970,6 +4030,142 @@ mod tests {
             Arc::new(crate::stats::SessionStats::default()),
         );
         (agent, session_manager)
+    }
+
+    /// The wiring, not the method: deleting the call in `run_turn` used to pass every test.
+    ///
+    /// `WorldSnapshot::carry_memories_from` had a test that called it directly, so the branch that
+    /// decides *when* to call it was uncovered and a mutation removing it survived. What it guards
+    /// is the failure the `[Memory]` section exists to prevent in its sharpest form: a store that
+    /// cannot be read for one turn looks like a store that is empty, and the diff announces every
+    /// memory as deleted, by name, then re-announces them all as written on the next turn that
+    /// succeeds.
+    ///
+    /// The store is broken by dropping the table under a live connection, which is a real error
+    /// through the real path rather than a stubbed one.
+    #[tokio::test]
+    async fn a_turn_whose_store_breaks_does_not_announce_every_memory_as_deleted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_manager = SessionManager::open(Some(&temp.path().join("meka.db")))
+            .await
+            .expect("open");
+        let memories = session_manager.memory_store(true);
+        memories
+            .write(crate::memory::store::WriteRequest {
+                name: "deploy-policy".to_string(),
+                description: "Never deploy on Fridays".to_string(),
+                tags: None,
+                body: None,
+                priority: Some(3),
+            })
+            .await
+            .expect("write");
+
+        // The index only renders when something can open it, so the registry has to carry a tool by
+        // that name. A fixture rather than the real one, which lives in a private module.
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(MemoryReadFixture))
+            .expect("register memory_read");
+        let provider = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            text_round("first"),
+            text_round("second"),
+        ]));
+        let (mut agent, _unused) =
+            test_agent_with_registry(provider as Arc<dyn Provider>, registry).await;
+        agent.session_manager = session_manager.clone();
+        agent.memories = memories.clone();
+        // The harness builds sub-agent-shaped agents, and a `system_prompt_override` skips the
+        // per-turn world state entirely -- which is the block under test.
+        agent.options.system_prompt_override = None;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "first".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first turn");
+        assert!(
+            messages
+                .as_slice()
+                .iter()
+                .any(|message| message.text_content().contains("deploy-policy")),
+            "the premise: the first turn told the model about the memory"
+        );
+
+        // Broken under the agent, between turns, through a second connection to the same file:
+        // a real failure on the real read path rather than a stub that returns an error.
+        rusqlite::Connection::open(temp.path().join("meka.db"))
+            .expect("second connection")
+            .execute_batch("DROP TABLE memories;")
+            .expect("drop the table");
+        assert!(
+            memories.index().await.is_err(),
+            "the premise: the store now fails to read"
+        );
+
+        let before = messages.len();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "second".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second turn");
+
+        let second: String = messages.as_slice()[before..]
+            .iter()
+            .map(|message| message.text_content())
+            .collect();
+        assert!(
+            !second.contains("Memories deleted"),
+            "a store that cannot be read is not a store that is empty: {second}"
+        );
+        assert!(
+            !second.contains("deploy-policy"),
+            "and it says nothing about memory at all rather than restating a guess: {second}"
+        );
+    }
+
+    /// Stands in for `memory_read` so the catalogue reports the index as live. Only the name
+    /// matters: `context::memory_index_is_live` asks whether anything can open a memory, not what.
+    struct MemoryReadFixture;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for MemoryReadFixture {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: "Load one memory in full.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "description": "Memory name"}},
+                    "required": ["name"]
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> crate::permission::Permission {
+            crate::permission::Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text(String::new(), false))
+        }
     }
 
     fn image_source() -> ImageSource {

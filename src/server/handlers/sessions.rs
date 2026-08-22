@@ -344,10 +344,14 @@ pub async fn create_session(
     // Persist `permission` and `capabilities` so a GC-evicted session re-attaches with the
     // same shape the client created it with.
     let capabilities_json = serde_json::to_string(&capabilities).ok();
-    let created = state
+    // Created and locked in one step, the lock taken *before* the row exists. A row committed
+    // ahead of its lock is visible to `meka session delete --all`, which enumerates at delete
+    // time, takes the lock nobody holds yet, and cascades the session away underneath this
+    // handler. See `SessionManager::create_session_locked`.
+    let (created, created_lock) = state
         .shared
         .session_manager
-        .create_session_with_metadata(
+        .create_session_locked(
             Some(cwd_path.clone()),
             Some(permission.to_string()),
             capabilities_json,
@@ -363,10 +367,10 @@ pub async fn create_session(
         .unwrap_or_else(|_| chrono::Utc::now());
     // Arm the rollback guard: every `?` below will clean up the orphan DB row on failure.
     let rollback = SessionRollback::new(session_uuid, state.shared.session_manager.clone());
-    let session_lock = state
-        .shared
-        .session_manager
-        .lock_session(session_uuid)
+    // `None` means the claim could not be made at all -- an unwritable lock directory, descriptors
+    // exhausted -- never that somebody else holds it, since no other process can know this id yet.
+    // A served session that cannot be held alone is one this server must not admit.
+    let session_lock = created_lock
         .map_err(|error| ProblemDetail::internal_sanitized("failed to lock session", error))?;
 
     // Build the per-session Agent + ToolRegistry.
@@ -513,6 +517,18 @@ pub async fn fork_session(
         validate_cwd(path)?;
     }
 
+    // Deliberately the *unlocked* fork, unlike the REPL's and ACP's. `ensure_session_loaded` below
+    // takes the lock itself, and `flock` is per open file description, so a lock held here would
+    // make this handler refuse its own copy. That leaves the same commit-then-claim window the
+    // other two doors closed -- but this one fails safe: `ensure_session_loaded` checks
+    // `session_info` before locking, so a copy swept before that check surfaces as a 404 rather
+    // than a session whose next turn dies on a foreign-key violation.
+    //
+    // Not "cannot happen": a sweep landing between re-attach's `session_info` and its
+    // `lock_session` still builds a runtime on a vanished row, answers 201, and leaves the first
+    // turn to hit the foreign key. There is no `.await` between those two, so the window is far
+    // narrower than the one this door still has -- but it is the same outcome, and closing either
+    // properly means teaching re-attach to adopt a lock it did not take.
     let forked = state
         .shared
         .session_manager
@@ -1025,7 +1041,7 @@ pub async fn delete_session(
     // in the process: `POST /cancel`, `GET /stream`, the GC scan, the background poller.
     //
     // Shortening it is safe because the map lock is not what serialises this against a concurrent
-    // re-attach: the removed entry still owns the session's cross-process `SessionLock`, and holds
+    // re-attach: the removed entry still owns the session's cross-process `FileLock`, and holds
     // it until the end of this function. A request arriving in the gap finds no map entry, loads
     // the row, fails to take the file lock, and gets `session-locked` -- never a second live entry
     // for a session being deleted.

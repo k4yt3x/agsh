@@ -3,7 +3,7 @@
 //! handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and `scheduled_jobs`
 //! and `background_tasks` for work the agent starts and does not wait for.
 //!
-//! Per-session mutual exclusion is provided by an OS-level file lock ([`SessionLock`]) so the
+//! Per-session mutual exclusion is provided by an OS-level file lock ([`FileLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
 //!
 //! On Unix the data directory (`0700`), lock directory (`0700`), and the database file itself
@@ -201,7 +201,7 @@ struct EphemeralLockDir(PathBuf);
 
 impl Drop for EphemeralLockDir {
     fn drop(&mut self) {
-        // Any `.lock` files still inside belong to this manager's own sessions; a `SessionLock`
+        // Any `.lock` files still inside belong to this manager's own sessions; a `FileLock`
         // that outlives the manager keeps working, because unlinking an open file on Unix doesn't
         // invalidate the descriptor the `flock` is held on.
         if let Err(error) = std::fs::remove_dir_all(&self.0) {
@@ -214,20 +214,23 @@ impl Drop for EphemeralLockDir {
     }
 }
 
-/// RAII handle for an exclusive per-session OS file lock. Holding this value keeps the underlying
-/// lock file descriptor open; dropping it (including when the process exits or panics) closes the
-/// FD, which causes the kernel to release the `flock`/`LockFileEx` lock automatically. There is no
-/// "stale lock" failure mode; even `SIGKILL` is safe.
+/// RAII handle for an exclusive OS file lock in the store's lock directory. Holding this value
+/// keeps the underlying descriptor open; dropping it (including when the process exits or panics)
+/// closes the FD, which causes the kernel to release the `flock`/`LockFileEx` lock automatically.
+/// There is no "stale lock" failure mode; even `SIGKILL` is safe.
+///
+/// Two things are locked this way: a session, so only one meka is ever attached to a conversation,
+/// and a provider profile's credential, so only one meka at a time is rotating its refresh token.
 ///
 /// Internally this is a self-referential struct: `guard` borrows from `*lock` (a `Box` for stable
 /// heap address). The explicit [`Drop`] impl drops `guard` before `lock` regardless of field
 /// declaration order, the safety invariant of the lifetime transmute used during construction.
-pub struct SessionLock {
+pub struct FileLock {
     guard: std::mem::ManuallyDrop<FdRwLockWriteGuard<'static, File>>,
     lock: std::mem::ManuallyDrop<Box<FdRwLock<File>>>,
 }
 
-impl Drop for SessionLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
         // SAFETY: `guard` borrows from `*lock`; drop it first so the borrow never outlives the
         // borrowee. This ordering is explicit here and does not depend on the field declaration
@@ -239,11 +242,167 @@ impl Drop for SessionLock {
     }
 }
 
+/// Where a session's lock lives while a host and its agent both need to reach it.
+///
+/// The lock has to be taken the instant the row exists, and for a session the agent creates that
+/// instant is inside `Agent::run_turn_retaining` -- seconds or minutes before the host gets control
+/// back. Claiming it afterwards, which is what the REPL used to do, left a fresh session unlocked
+/// for the whole of its first turn, and a second `meka` invocation attached to it and interleaved
+/// its own messages into the same conversation.
+///
+/// The host still owns the lifetime: the lock outlives any one turn, `/fork` replaces it, and it is
+/// dropped last on the way out so the session stays held until the process really ends. Sharing a
+/// slot rather than moving the lock either way is what lets both of those be true at once.
+///
+/// `std::sync::Mutex` rather than tokio's: every access is a move in or out with nothing awaited in
+/// between, and a blocking lock keeps the drop order at process exit obvious.
+pub type SessionLockSlot = std::sync::Arc<std::sync::Mutex<Option<FileLock>>>;
+
+/// What became of a compare-and-swap on a provider's stored credential.
+///
+/// No equality derive: comparing credentials is not something callers should be doing, and
+/// [`AuthCredential`]'s own `Debug` redacts, so this stays printable without leaking a token.
+#[derive(Debug, Clone)]
+pub enum CredentialWrite {
+    /// The row still held what this write was derived from, and now holds the new value.
+    Stored,
+    /// Something else wrote first. This is what the row holds now.
+    ///
+    /// Newer in *write order*, which is the only thing this type knows and less than it sounds: it
+    /// is neither necessarily unexpired nor necessarily the same kind of credential. Whether it is
+    /// worth switching to is the caller's question -- see `provider::is_worth_adopting` -- and
+    /// retrying is never the answer, because the value this write was derived from is gone.
+    Superseded(Box<AuthCredential>),
+    /// The profile has no stored credential at all -- removed while this write was in flight.
+    /// Re-creating it would resurrect an account the user just disconnected.
+    Gone,
+}
+
+/// What a sweep over many sessions did, so its caller can say what it left behind.
+///
+/// A bare count reads as "everything that matched was deleted", and that reading is what made the
+/// retention sweep destructive: it announced `deleted 1 session(s)` in an unrelated terminal and
+/// said nothing about the conversation an operator had open in another one. A sweep that spares
+/// something has to be able to say so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionSweep {
+    pub deleted: u64,
+    /// Sessions that matched but were left alone, because another meka process has them open or
+    /// because their lock could not be established either way.
+    pub attached_elsewhere: u64,
+}
+
+/// Open `path` (creating it) and take its exclusive `flock`.
+///
+/// `Ok(None)` means somebody else holds it; an `Err` means the question could not be asked at all
+/// -- an unwritable lock directory, descriptors exhausted -- which is a different answer and
+/// callers treat it differently.
+///
+/// A free function rather than a method because two stores need it: [`SessionManager`] locks
+/// conversations, [`TokenStore`] locks provider profiles, and both live in the same directory.
+fn try_lock_file(path: &std::path::Path) -> Result<Option<FileLock>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| {
+            MekaError::Database(format!(
+                "failed to open lock file '{}': {}",
+                path.display(),
+                error
+            ))
+        })?;
+
+    let mut lock = Box::new(FdRwLock::new(file));
+    let guard = match lock.try_write() {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => {
+            return Err(MekaError::Database(format!(
+                "failed to acquire lock '{}': {}",
+                path.display(),
+                error
+            )));
+        }
+    };
+
+    // SAFETY: `guard` borrows from `*lock`. We move the box (not the RwLock inside it) into the
+    // returned `FileLock`, so the RwLock's heap address is stable for as long as the box lives. The
+    // explicit `Drop` impl on `FileLock` drops `guard` before `lock`, so the borrow never outlives
+    // the borrowee.
+    let guard: FdRwLockWriteGuard<'static, File> = unsafe { std::mem::transmute(guard) };
+
+    Ok(Some(FileLock {
+        guard: std::mem::ManuallyDrop::new(guard),
+        lock: std::mem::ManuallyDrop::new(lock),
+    }))
+}
+
+/// How long to keep trying to convert a rollback-journal database to WAL before giving up.
+///
+/// A deadline rather than an attempt count, because the two failure modes it spans cost wildly
+/// different amounts of time. When SQLite skips the busy handler for this pragma an attempt returns
+/// at once, and what is wanted is many of them across the contention window; when it consults the
+/// handler an attempt blocks for the full `busy_timeout` first, and ten of those would turn a
+/// five-second startup failure into a fifty-second one. Counting time bounds both.
+///
+/// Only a first run on a fresh install can need any of this: once the database is in WAL mode the
+/// pragma takes no exclusive lock and cannot contend.
+const WAL_CONVERSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pause between those attempts. Blocking rather than async because the whole pragma batch runs on
+/// the connection's own thread, where a sleep costs nothing else.
+const WAL_CONVERSION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// File stem of the process-wide schema lock, which lives beside the per-session ones.
 ///
 /// Named rather than spelled inline at both sites, because the prune below has to exclude exactly
 /// this file and a literal in two places is how that pairing gets broken.
 const SCHEMA_LOCK_STEM: &str = "schema";
+
+/// File-stem prefix of the per-provider-profile credential locks, which also live in the lock
+/// directory.
+///
+/// Excluded from the prune for the same reason as [`SCHEMA_LOCK_STEM`]: a hashed profile name does
+/// not parse as a UUID, and relying on that accident is how the next lock shaped like one inherits
+/// the hazard.
+const PROVIDER_LOCK_PREFIX: &str = "provider-";
+
+/// Sessions a scheduled job still depends on, as a `WHERE` fragment over `sessions`.
+///
+/// A session with a job ahead of it is *not* expired, whatever `updated_at` says. Only turns bump
+/// that column -- [`ScheduleStore::claim_by_advancing`] and
+/// [`ScheduleStore::stamp_scheduled_job_fired`] touch `scheduled_jobs` alone -- so a gated watcher
+/// that evaluates every tick and rarely fires looks untouched for exactly as long as it is
+/// working. The cascade then took the job with the session, and the sweep reported
+/// `deleted 1 session(s)` without ever mentioning that a schedule went with it.
+///
+/// Sparing only the row that *owns* the job is not enough. `parent_session_id` carries
+/// `ON DELETE CASCADE`, so deleting a stale parent silently takes its sub-agent children -- and a
+/// job created against a child (reachable over HTTP, whose only gate is that the session exists)
+/// goes with them. The recursive term walks parent links up from every job-owning session and
+/// spares that whole chain.
+///
+/// A constant because it is applied twice, in two statements, and the pair is only sound while
+/// they agree: see [`SessionManager::delete_the_unattached_among`].
+///
+/// [`ScheduleStore::claim_by_advancing`]: crate::schedule::ScheduleStore::claim_by_advancing
+/// [`ScheduleStore::stamp_scheduled_job_fired`]: crate::schedule::ScheduleStore::stamp_scheduled_job_fired
+const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session_id FROM scheduled_jobs) \
+     AND id NOT IN ( \
+         WITH RECURSIVE ancestors(id) AS ( \
+             SELECT parent_session_id FROM sessions \
+               WHERE parent_session_id IS NOT NULL \
+                 AND id IN (SELECT session_id FROM scheduled_jobs) \
+             UNION \
+             SELECT s.parent_session_id FROM sessions s \
+               JOIN ancestors a ON s.id = a.id \
+              WHERE s.parent_session_id IS NOT NULL \
+         ) \
+         SELECT id FROM ancestors \
+     )";
 
 /// Stamped into `PRAGMA user_version` once [`SessionManager::initialize_schema`] has run to
 /// completion.
@@ -415,14 +574,40 @@ impl SessionManager {
         // transaction to take effect.
         connection
             .call(|connection| -> rusqlite::Result<_> {
-                // WAL lets the REPL's history connection read without blocking the agent's writes;
-                // `busy_timeout` makes both connections wait briefly instead of erroring under
-                // contention. (On `:memory:` the journal_mode request is silently ignored.)
+                // Restated rather than established: `rusqlite::Connection::open` already installs a
+                // five-second busy timeout before any of this runs, so this pragma pins the value
+                // meka wants against a future change in that default rather than supplying one.
+                // Ordered before the WAL conversion below because that is where it would matter if
+                // it were ever the only source.
                 connection.execute_batch(
-                    "PRAGMA journal_mode = WAL;\n\
-                     PRAGMA busy_timeout = 5000;\n\
+                    "PRAGMA busy_timeout = 5000;\n\
                      PRAGMA foreign_keys = ON;",
                 )?;
+                // The retry is the part that fixes something. Converting a rollback-journal
+                // database to WAL takes an exclusive lock, and SQLite does not
+                // always route *that* pragma's acquisition through the busy handler
+                // -- so with a handler installed and waiting, the conversion still
+                // returned `database is locked` outright. Measured at 2 to 9
+                // failures per 200-1200 launches of several meka processes starting together, each
+                // one a process exiting with `failed to set connection pragmas: database is
+                // locked`. An already-WAL database takes no exclusive lock here and never contends,
+                // so this only ever bit a first run on a fresh install -- a systemd unit and a
+                // shell coming up together, which is the ordinary case.
+                //
+                // WAL is what lets the REPL's history connection read without blocking the agent's
+                // writes, so a database left in rollback mode is a live contention problem rather
+                // than a cosmetic one: worth several attempts before giving up. (On `:memory:` the
+                // request is silently ignored and the first attempt always succeeds.)
+                let giving_up_at = std::time::Instant::now() + WAL_CONVERSION_DEADLINE;
+                loop {
+                    match connection.execute_batch("PRAGMA journal_mode = WAL;") {
+                        Ok(()) => break,
+                        Err(error) if std::time::Instant::now() >= giving_up_at => {
+                            return Err(error);
+                        }
+                        Err(_) => std::thread::sleep(WAL_CONVERSION_RETRY_DELAY),
+                    }
+                }
                 Ok(())
             })
             .await
@@ -459,7 +644,7 @@ impl SessionManager {
         //
         // A SQLite transaction cannot be the mechanism: the cascade rebuild needs
         // `PRAGMA foreign_keys = OFF`, which is a no-op inside one. So the lock is an OS file lock,
-        // the same primitive `SessionLock` uses, held for the whole of the schema work. The loser
+        // the same primitive `FileLock` uses, held for the whole of the schema work. The loser
         // waits, then re-runs its probes against the winner's finished schema and no-ops.
         let lock_path = self.lock_dir.join(format!("{}.lock", SCHEMA_LOCK_STEM));
         let mut lock_file = FdRwLock::new(
@@ -484,6 +669,21 @@ impl SessionManager {
             ))
         })?;
 
+        // Deliberately *not* short-circuited on `PRAGMA user_version`, though the temptation is
+        // real: everything below is `CREATE TABLE IF NOT EXISTS` and probe-then-`ALTER`, so every
+        // open takes a write lock to change nothing, and a long-running writer elsewhere therefore
+        // fails commands that only read. An external `BEGIN IMMEDIATE` held for eight seconds kills
+        // `meka --oneshot` at 5.1 seconds with `failed to initialize schema: database is locked`,
+        // and `meka session list` -- a pure read -- dies the same way because opening the store
+        // writes.
+        //
+        // Skipping on the stamp would trade that for a worse failure. `SCHEMA_VERSION` is not a
+        // migration ladder (see its doc); it marks one destructive step as already done, and the
+        // probes below are what decide what to add. A stamp-gated skip would silently stop those
+        // probes running on every database already stamped, so the next release that adds a column
+        // or a table would leave every existing installation without it -- and nothing in the build
+        // would notice, because the constant only fails to be bumped, it never fails to compile. A
+        // rare, loud, retryable startup error is the better half of that trade.
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
                 connection.execute_batch(
@@ -567,7 +767,7 @@ impl SessionManager {
                 }
 
                 // Migration: drop the legacy `sessions.locked_by` column. Locks are now OS file
-                // locks managed via `SessionLock`, so any value left in this column is meaningless
+                // locks managed via `FileLock`, so any value left in this column is meaningless
                 // and a stale PID can permanently lock a session if the column survives.
                 let has_locked_by: bool = connection
                     .query_row(
@@ -955,8 +1155,11 @@ impl SessionManager {
 
     /// Create a new session, optionally recording its working directory. `cwd` is persisted as an
     /// absolute path string; pass `None` only for code paths that genuinely have no cwd context
-    /// (legacy/test fixtures, `meka tools list`). Production paths (the REPL and `meka acp`) pass
-    /// the agent's current cwd so `session/list` can surface it later.
+    /// (legacy/test fixtures, `meka tools list`).
+    ///
+    /// Leaves the row unlocked, so a sweep can reach it before anyone claims it. Every host that
+    /// creates a session a turn will run against wants [`Self::create_session_locked`] instead;
+    /// this one is reached from tests.
     pub async fn create_session(&self, cwd: Option<std::path::PathBuf>) -> Result<Uuid> {
         self.create_session_with_metadata(cwd, None, None, None)
             .await
@@ -965,9 +1168,12 @@ impl SessionManager {
 
     /// Like [`Self::create_session`] but also persists the HTTP API's per-session metadata
     /// (`permission` level, `capabilities_json` blob, and `token_id` fingerprint). The REPL
-    /// and ACP paths derive permission from process config and don't have a bearer token, so
-    /// they keep calling the unparameterised `create_session`; only the HTTP server's
-    /// `POST /v1/sessions` handler reaches for this overload.
+    /// and ACP paths derive permission from process config and don't have a bearer token.
+    ///
+    /// No production caller: every host that creates a session now goes through
+    /// [`Self::create_session_locked`], which takes the lock before the row exists. This and
+    /// [`Self::create_session`] remain as the unlocked doors, reached from tests and from callers
+    /// that genuinely want a row nobody is holding.
     pub async fn create_session_with_metadata(
         &self,
         cwd: Option<std::path::PathBuf>,
@@ -975,7 +1181,78 @@ impl SessionManager {
         capabilities_json: Option<String>,
         token_id: Option<String>,
     ) -> Result<CreatedSession> {
+        self.insert_session_row(Uuid::new_v4(), cwd, permission, capabilities_json, token_id)
+            .await
+    }
+
+    /// Create a session and take its lock, in that order: the lock **before** the row.
+    ///
+    /// The ordering is the entire point, and it is the reverse of what every caller used to do.
+    /// Committing the row first leaves a window -- microseconds wide, but real -- in which the
+    /// session is visible to `SELECT id FROM sessions` and held by nobody.
+    /// [`Self::delete_all_sessions`] enumerates at delete time, so it lands inside that window,
+    /// takes the lock legitimately, and cascades the conversation away underneath the process
+    /// creating it. Measured at **42 lost turns in 11,948** with four creators against two
+    /// `meka session delete --all` loops: each one ends `FOREIGN KEY constraint failed` with the
+    /// user's prompt gone. Targeted `meka session delete <id>` never reproduced it, because its id
+    /// list is gathered before the creator exists -- which is what identifies the window as
+    /// belonging to creation rather than to deletion.
+    ///
+    /// Locking first closes it with nothing left over: a sweeper either cannot see the row yet, or
+    /// sees it and finds the lock held. A lock file whose row never lands is swept by
+    /// [`Self::prune_orphan_lock_files`] like any other orphan.
+    ///
+    /// An `Err` in the second half means the claim could not be *made* -- an unwritable lock
+    /// directory, descriptors exhausted -- and never that somebody else holds it, because no other
+    /// process can know this id yet. It is returned rather than logged-and-dropped so a caller that
+    /// refuses can report the reason it actually hit. Callers differ on what it is worth: a host
+    /// that must be alone refuses, and the agent's own path warns and runs the turn regardless
+    /// rather than breaking installations that work today.
+    pub async fn create_session_locked(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        permission: Option<String>,
+        capabilities_json: Option<String>,
+        token_id: Option<String>,
+    ) -> Result<(CreatedSession, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
+        let lock = self.claim_a_fresh_id(session_id);
+        let created = self
+            .insert_session_row(session_id, cwd, permission, capabilities_json, token_id)
+            .await?;
+        Ok((created, lock))
+    }
+
+    /// Take the lock on an id that is about to become a row.
+    ///
+    /// The ordering rule in one place, because there are four doors that mint a session and each of
+    /// them had it wrong in the same way: commit, then claim. A row visible to
+    /// `SELECT id FROM sessions` and held by nobody is one a concurrent
+    /// [`Self::delete_all_sessions`] enumerates, locks and cascades away underneath its creator.
+    ///
+    /// The `Err` is carried rather than logged and dropped so a caller that refuses can name the
+    /// reason it hit. It never means "somebody else holds it": no other process can know this id.
+    fn claim_a_fresh_id(&self, session_id: Uuid) -> std::result::Result<FileLock, MekaError> {
+        self.lock_session(session_id).inspect_err(|error| {
+            tracing::warn!(
+                "could not lock session {} as it was created: {}; another meka process could \
+                 attach to it or sweep it mid-turn",
+                session_id,
+                error
+            );
+        })
+    }
+
+    /// The row half of session creation, shared by the locked and unlocked doors so the columns
+    /// are written in one place.
+    async fn insert_session_row(
+        &self,
+        session_id: Uuid,
+        cwd: Option<std::path::PathBuf>,
+        permission: Option<String>,
+        capabilities_json: Option<String>,
+        token_id: Option<String>,
+    ) -> Result<CreatedSession> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
 
@@ -1020,8 +1297,15 @@ impl SessionManager {
         parent: Uuid,
         cwd: Option<std::path::PathBuf>,
         subagent_spec_json: Option<String>,
-    ) -> Result<Uuid> {
+    ) -> Result<(Uuid, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
+        // Locked before the row, like every other door that mints one -- and the exposure here is
+        // not the microsecond window the others had. A sub-agent's row was never locked at any
+        // point, so it sat claimable for the whole of the worker's run, which is seconds to
+        // minutes. A concurrent `meka session delete --all` enumerates it, takes the lock nobody
+        // holds, and cascades it away; the worker's next message insert then dies on
+        // `FOREIGN KEY constraint failed` with its work gone. Demonstrated, not theorised.
+        let lock = self.claim_a_fresh_id(session_id);
         let now = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
 
@@ -1047,7 +1331,7 @@ impl SessionManager {
                 MekaError::Database(format!("failed to create child session: {}", error))
             })?;
 
-        Ok(session_id)
+        Ok((session_id, lock))
     }
 
     /// The recorded spawn terms for a sub-agent session, or `None` when the row has none (a
@@ -1104,7 +1388,52 @@ impl SessionManager {
         source: Uuid,
         overrides: ForkOverrides,
     ) -> Result<Option<CreatedSession>> {
+        self.fork_session_into(Uuid::new_v4(), source, overrides)
+            .await
+    }
+
+    /// Fork, taking the copy's lock *before* its row exists.
+    ///
+    /// The door every host should use. A fork committed the copy and then locked it, which is the
+    /// same commit-then-claim window [`Self::create_session_locked`] was written to close, in the
+    /// same width: a concurrent `meka session delete --all` enumerates the copy, takes the lock
+    /// nobody holds, and deletes it -- and `fork_and_lock` then locks the vanished id successfully
+    /// and hands the caller a session whose next turn dies on a foreign-key violation. Under ACP it
+    /// is quieter still, because `load_events` returns empty and the editor is handed a silently
+    /// blank fork.
+    ///
+    /// `Ok(None)` still means the source is gone; the claim is released *and* its file removed,
+    /// since nothing was written for it to protect.
+    pub async fn fork_session_locked(
+        &self,
+        source: Uuid,
+        overrides: ForkOverrides,
+    ) -> Result<Option<(CreatedSession, std::result::Result<FileLock, MekaError>)>> {
         let new_id = Uuid::new_v4();
+        let lock = self.claim_a_fresh_id(new_id);
+        let Some(created) = self.fork_session_into(new_id, source, overrides).await? else {
+            // Nothing was written, so the file this claim created is garbage the moment it exists.
+            // Left behind it accumulates once per fork of an unknown id -- reachable from a client,
+            // since ACP's `session/fork` answers `invalid_params` on that path -- and the sweep
+            // that would collect it only runs at `open()` and after a delete. The id is
+            // a fresh v4, so nothing else can be holding this file.
+            drop(lock);
+            let path = self.lock_dir.join(format!("{}.lock", new_id));
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::debug!("could not remove {}: {}", path.display(), error);
+            }
+            return Ok(None);
+        };
+        Ok(Some((created, lock)))
+    }
+
+    /// The copy itself, on an id the caller has already minted (and may already have locked).
+    async fn fork_session_into(
+        &self,
+        new_id: Uuid,
+        source: Uuid,
+        overrides: ForkOverrides,
+    ) -> Result<Option<CreatedSession>> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_override = overrides.cwd.map(|path| path.display().to_string());
         // A flag rather than a nested `Option`: "inherit" and "override with no roots" both encode
@@ -1185,52 +1514,14 @@ impl SessionManager {
         }))
     }
 
-    /// Acquire an exclusive OS file lock on the session. Returns a [`SessionLock`] handle whose
+    /// Acquire an exclusive OS file lock on the session. Returns a [`FileLock`] handle whose
     /// lifetime owns the lock; drop it (or let the process exit) to release.
     ///
     /// The session must already exist in the database. Returns [`MekaError::SessionLocked`] if
     /// another live process holds the lock.
-    pub fn lock_session(&self, session_id: Uuid) -> Result<SessionLock> {
+    pub fn lock_session(&self, session_id: Uuid) -> Result<FileLock> {
         let path = self.lock_dir.join(format!("{}.lock", session_id));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| {
-                MekaError::Database(format!(
-                    "failed to open session lock file '{}': {}",
-                    path.display(),
-                    error
-                ))
-            })?;
-
-        let mut lock = Box::new(FdRwLock::new(file));
-        let guard = match lock.try_write() {
-            Ok(guard) => guard,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(MekaError::SessionLocked(session_id));
-            }
-            Err(error) => {
-                return Err(MekaError::Database(format!(
-                    "failed to acquire session lock '{}': {}",
-                    path.display(),
-                    error
-                )));
-            }
-        };
-
-        // SAFETY: `guard` borrows from `*lock`. We move the box (not the RwLock inside it) into the
-        // returned `SessionLock`, so the RwLock's heap address is stable for as long as the box
-        // lives. The explicit `Drop` impl on `SessionLock` drops `guard` before `lock`, so the
-        // borrow never outlives the borrowee.
-        let guard: FdRwLockWriteGuard<'static, File> = unsafe { std::mem::transmute(guard) };
-
-        Ok(SessionLock {
-            guard: std::mem::ManuallyDrop::new(guard),
-            lock: std::mem::ManuallyDrop::new(lock),
-        })
+        try_lock_file(&path)?.ok_or(MekaError::SessionLocked(session_id))
     }
 
     /// Best-effort removal of `<lock_dir>/<uuid>.lock` files whose session no longer exists.
@@ -1242,10 +1533,46 @@ impl SessionManager {
     /// (`warn!`); a per-file unlink failure (e.g. a root-owned file left by a container run) is
     /// expected and logged at `debug!`.
     ///
-    /// Deleting a *held* lock file for an already-deleted session is benign (no process starts a
-    /// deleted session), and the sweep never races a live one: a session's row is committed before
-    /// its lock file is acquired (see `main.rs`), so a live UUID is always in the set this query
-    /// returns.
+    /// Nothing is unlinked without first taking its lock. The rule used to be "unlink any file
+    /// whose id is not in the live set", justified by a session's row being committed before its
+    /// lock file is acquired -- which constrains the *creator*, not the sweeper: this `SELECT` can
+    /// finish before a row commits while the `read_dir` below runs after that session's lock file
+    /// exists. Measured against a running `meka serve`, **21 of 401** live sessions had their lock
+    /// file unlinked, after which `meka -r <id> --oneshot` attached to a session `serve` still held
+    /// and wrote a full turn into it. Unlinking does not release a held `flock`, so the two
+    /// processes then held locks on different inodes and neither could see the other.
+    ///
+    /// Taking the lock answers the question directly rather than inferring it, and it is the only
+    /// thing here that does. An earlier version of this comment argued that a lock file comes into
+    /// existence only *after* its row has committed, so a fresh `session_exists` was the whole
+    /// answer. That is no longer true and was not worth relying on:
+    /// [`Self::create_session_locked`] now takes the lock *before* the insert, precisely so a row
+    /// cannot be visible to a sweep while unheld. A file with no row is therefore either genuine
+    /// garbage from an earlier run or a session being created this instant, and only the `flock`
+    /// can tell them apart.
+    ///
+    /// `session_exists` runs first anyway, because it is the cheaper question and the common answer
+    /// is "the row is there, leave it alone" -- no reason to open and lock a file to learn that.
+    ///
+    /// One window is left and is accepted rather than closed. [`try_lock_file`] opens and then
+    /// locks, two syscalls with nothing between; a sweep that `read_dir`s inside that gap can take
+    /// a creator's lock and unlink its file, leaving that session to run unheld. It is
+    /// sub-microsecond and it needs the sweep to be running at that instant (only at
+    /// [`SessionManager::open`] and after a delete, with a `session_exists` round trip between its
+    /// `read_dir` and the `flock`).
+    ///
+    /// What it costs is not merely a guarantee. A creator whose file is unlinked keeps its `flock`
+    /// on an inode with no name and then commits its row, so from that moment the session has a
+    /// visible row and nothing on disk to claim it -- and the next sweep re-creates the path, locks
+    /// it, and deletes the row mid-turn. That is the same loss, reached one step later. The trade
+    /// is still strongly favourable, because the window it replaced was thousands of times wider
+    /// and needed no second coincidence at all, but it is a smaller chance of the same outcome
+    /// rather than a lesser outcome.
+    ///
+    /// Those counts are from Unix. Windows `LockFileEx` will not let an open file be unlinked, so
+    /// the same bug takes a different shape there -- the `remove_file` fails rather than succeeding
+    /// and stranding two holders on separate inodes. Proving the file is unheld before unlinking it
+    /// is the right answer on both.
     async fn prune_orphan_lock_files(&self) {
         let live_ids: std::collections::HashSet<String> = match self
             .connection
@@ -1293,12 +1620,31 @@ impl SessionManager {
             // schema lock would let the next process create a different inode and both would enter
             // the migration believing they held it. Named explicitly so a future lock called
             // anything UUID-shaped does not quietly inherit the hazard.
-            if stem == SCHEMA_LOCK_STEM {
+            if stem == SCHEMA_LOCK_STEM || stem.starts_with(PROVIDER_LOCK_PREFIX) {
                 continue;
             }
-            if Uuid::parse_str(stem).is_err() || live_ids.contains(stem) {
+            let Ok(id) = Uuid::parse_str(stem) else {
+                continue;
+            };
+            if live_ids.contains(stem) {
                 continue;
             }
+            // Re-read, because the snapshot was taken before `read_dir` and a row committed since
+            // would not be in it. Before the lock rather than after, so a creator that has opened
+            // this file and not yet locked it is not raced for it. Cheap: only a genuinely
+            // orphaned file gets this far, and `unwrap_or(true)` keeps a failed read on the
+            // sparing side.
+            if self.session_exists(id).await.unwrap_or(true) {
+                continue;
+            }
+            // The claim, not a guess about one. A file whose lock is held belongs to a live
+            // process whatever the `sessions` table says about its row.
+            let Ok(claim) = self.lock_session(id) else {
+                continue;
+            };
+            // Released before the unlink so the descriptor this process holds is not the one being
+            // removed from under it.
+            drop(claim);
             if let Err(error) = std::fs::remove_file(&path) {
                 tracing::debug!(
                     "lock-file prune: cannot remove {}: {}",
@@ -2132,7 +2478,21 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
+    /// Sweep sessions no turn has touched inside the retention window, leaving alone any that
+    /// another meka process currently has open.
+    ///
+    /// The lock check is not a nicety. `updated_at` is bumped by turns only, and resuming a session
+    /// does not touch it, so a REPL left sitting at its prompt past the window is a perfect
+    /// candidate for deletion while a human is looking at it. Any start that goes through
+    /// `async_main` runs this sweep, so a completely unrelated `meka` in another terminal used to
+    /// announce `deleted 1 session(s)` and destroy the live one. What the operator saw was their
+    /// next turn running against the provider and *then* failing on a foreign-key violation, with
+    /// the answer paid for and lost, and every later turn in that REPL failing the same way.
+    ///
+    /// A locked *child* is not separately checked. The cascade would take one with its parent, but
+    /// children are sub-agent rows and nothing ever locks those; a child that could be locked would
+    /// need its own claim on the parent, which is not a shape that exists.
+    pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<SessionSweep> {
         // Both steps can blow up on an absurd `retention_days`, and this takes user input straight
         // from `--older-than-days`, so a run of digits must not panic. `TimeDelta` overflows around
         // 10^11 days; subtracting from `Utc::now()` overflows far sooner, around 96.4 million. Both
@@ -2150,7 +2510,7 @@ impl SessionManager {
             .unwrap_or(fallback);
         let cutoff_str = cutoff.to_rfc3339();
 
-        let deleted = self
+        let expired: Vec<Uuid> = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // FK CASCADE sweeps messages, tool_outputs, and any sub-agent child sessions of the
@@ -2158,7 +2518,7 @@ impl SessionManager {
                 //
                 // A session with a scheduled job still ahead of it is *not* expired, whatever
                 // `updated_at` says. Only turns bump that column -- `stamp_scheduled_job_fired` and
-                // `reschedule_scheduled_job` touch `scheduled_jobs` alone -- so a gated watcher
+                // `claim_by_advancing` touch `scheduled_jobs` alone -- so a gated watcher
                 // that evaluates every tick but rarely fires looks untouched for as
                 // long as it stays quiet, which is exactly when it is working. The
                 // cascade then took the job with the session, and the sweep
@@ -2170,31 +2530,105 @@ impl SessionManager {
                 // sub-agent children -- and a job created against a child (reachable over HTTP,
                 // whose only gate is that the session exists) goes with them. The recursive term
                 // walks parent links up from every job-owning session and spares that whole chain.
-                let deleted = connection.execute(
-                    "DELETE FROM sessions WHERE updated_at < ?1 \
-                       AND id NOT IN (SELECT session_id FROM scheduled_jobs) \
-                       AND id NOT IN ( \
-                           WITH RECURSIVE ancestors(id) AS ( \
-                               SELECT parent_session_id FROM sessions \
-                                 WHERE parent_session_id IS NOT NULL \
-                                   AND id IN (SELECT session_id FROM scheduled_jobs) \
-                               UNION \
-                               SELECT s.parent_session_id FROM sessions s \
-                                 JOIN ancestors a ON s.id = a.id \
-                                WHERE s.parent_session_id IS NOT NULL \
-                           ) \
-                           SELECT id FROM ancestors \
-                       )",
-                    rusqlite::params![cutoff_str],
-                )?;
-                Ok(deleted as u64)
+                //
+                // Selected rather than deleted outright, because which of these rows may go is not
+                // a question the database can answer: it depends on which of them another process
+                // has open. [`Self::delete_the_unattached_among`] re-applies the same condition
+                // inside the delete, so splitting one statement into two does not open a window
+                // where a job created in between is cascaded away by a decision taken before it
+                // existed.
+                let mut statement = connection.prepare(&format!(
+                    "SELECT id FROM sessions WHERE updated_at < ?1 AND {}",
+                    NOT_SPOKEN_FOR_BY_A_SCHEDULE
+                ))?;
+                let ids = statement
+                    .query_map(rusqlite::params![cutoff_str], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
             })
             .await
             .map_err(|error| {
-                MekaError::Database(format!("failed to delete expired sessions: {}", error))
-            })?;
+                MekaError::Database(format!("failed to list expired sessions: {}", error))
+            })?
+            .into_iter()
+            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .collect();
+
+        self.delete_the_unattached_among(&expired, NOT_SPOKEN_FOR_BY_A_SCHEDULE)
+            .await
+    }
+
+    /// Delete every one of `candidates` whose lock this process can take, and report what it left.
+    ///
+    /// The lock is held across the delete rather than probed and released, because the window
+    /// between a probe and a `DELETE` is exactly long enough for another process to attach and
+    /// start a turn on a row that is about to vanish underneath it.
+    ///
+    /// `still_eligible` is a SQL predicate re-applied inside the delete, so the statement decides
+    /// on the rows as they are rather than on a list read earlier. Selecting candidates and then
+    /// deleting them by id is two statements where there used to be one, and a condition checked
+    /// only in the first is a condition that can stop being true in between: the retention sweep's
+    /// "no schedule ahead of it" is the case that matters, because a job created against a
+    /// sub-agent child in that gap would be cascaded away with a parent nothing has locked. A
+    /// `&'static str` and never anything derived from input; `""` for a caller with no further
+    /// condition, which is `--all`.
+    ///
+    /// Chunked because a lock is an open file descriptor: a sweep over ten thousand expired
+    /// sessions would otherwise hold ten thousand at once and hit the process limit, turning a
+    /// housekeeping pass into a hard failure. The chunk is the unit of both locking and deleting,
+    /// so no lock is held longer than its own statement.
+    async fn delete_the_unattached_among(
+        &self,
+        candidates: &[Uuid],
+        still_eligible: &'static str,
+    ) -> Result<SessionSweep> {
+        /// Sessions locked and deleted per statement. Well under SQLite's parameter ceiling
+        /// (32,766) and well under any sane descriptor limit.
+        const CHUNK: usize = 100;
+
+        let mut sweep = SessionSweep::default();
+        for chunk in candidates.chunks(CHUNK) {
+            let mut held = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                match self.lock_session(*id) {
+                    Ok(lock) => held.push((*id, lock)),
+                    // Not "someone has it" but "we could not ask", which is the same answer here:
+                    // a session this process cannot establish a claim on is one it must not
+                    // delete. Counted as attached so the caller still reports incomplete coverage.
+                    Err(_) => sweep.attached_elsewhere += 1,
+                }
+            }
+            if held.is_empty() {
+                continue;
+            }
+            let ids: Vec<String> = held.iter().map(|(id, _)| id.to_string()).collect();
+            let deleted = self
+                .connection
+                .call(move |connection| -> rusqlite::Result<_> {
+                    let placeholders = vec!["?"; ids.len()].join(",");
+                    connection.execute(
+                        &format!(
+                            "DELETE FROM sessions WHERE id IN ({}){}",
+                            placeholders,
+                            match still_eligible {
+                                "" => String::new(),
+                                predicate => format!(" AND {}", predicate),
+                            }
+                        ),
+                        rusqlite::params_from_iter(ids.iter()),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    MekaError::Database(format!("failed to delete sessions: {}", error))
+                })?;
+            sweep.deleted += deleted as u64;
+            // Before the sweep below, not after: `prune_orphan_lock_files` refuses to unlink a
+            // file whose lock it cannot take, and this process is holding every one of these.
+            drop(held);
+        }
         self.prune_orphan_lock_files().await;
-        Ok(deleted)
+        Ok(sweep)
     }
 
     /// Update the persisted cwd for an existing session. Called by the ACP `session/load` /
@@ -2380,9 +2814,28 @@ impl SessionManager {
             .map_err(|error| MekaError::Database(format!("failed to clear messages: {}", error)))
     }
 
+    /// Delete a session this caller already owns.
+    ///
+    /// Deliberately does *not* consult the session lock, because every caller here is holding it
+    /// already or is acting on a row nothing can have locked: the HTTP handler evicting its own
+    /// entry, the GC dropping a session it served, a sub-agent tool removing a child row it
+    /// created moments ago. Taking the lock in those cases would *refuse* the caller its own
+    /// session -- `flock` is per open file description rather than per process, so a second
+    /// descriptor contends with the first -- and `try_write` is non-blocking, so what it produces
+    /// is a spurious [`MekaError::SessionLocked`] rather than a hang.
+    ///
+    /// A caller acting on a session it has never met wants
+    /// [`Self::delete_session_unless_attached`] instead.
     pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
-        let deleted = self
-            .connection
+        let deleted = self.delete_session_row(session_id).await?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
+    }
+
+    /// The row half of a delete, without the lock-directory sweep, so a caller holding this
+    /// session's lock can drop it before the sweep runs rather than blocking its own cleanup.
+    async fn delete_session_row(&self, session_id: Uuid) -> Result<bool> {
+        self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // ON DELETE CASCADE on `messages.session_id`, `tool_outputs.session_id`, and
                 // `sessions.parent_session_id` sweeps own-session rows + any sub-agent children +
@@ -2394,25 +2847,46 @@ impl SessionManager {
                 Ok(deleted > 0)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to delete session: {}", error)))?;
+            .map_err(|error| MekaError::Database(format!("failed to delete session: {}", error)))
+    }
+
+    /// Delete a session, refusing with [`MekaError::SessionLocked`] if another meka process has it
+    /// open. The door for a caller acting on a session it does not hold: `meka session delete`.
+    ///
+    /// `meka session delete <id>` against a live REPL used to exit 0 having said nothing at all --
+    /// the count goes through `tracing::info!`, invisible at the default level -- while the row and
+    /// its messages cascaded away underneath a conversation that carried on as if nothing had
+    /// happened, until its next turn failed on a foreign-key violation.
+    pub async fn delete_session_unless_attached(&self, session_id: Uuid) -> Result<bool> {
+        let lock = self.lock_session(session_id)?;
+        let deleted = self.delete_session_row(session_id).await?;
+        // Released before the sweep: it will not unlink a file it cannot lock, and that file is
+        // this one.
+        drop(lock);
         self.prune_orphan_lock_files().await;
         Ok(deleted)
     }
 
-    pub async fn delete_all_sessions(&self) -> Result<u64> {
-        let deleted = self
+    /// Delete every session no other meka process has open, and report what was left behind.
+    pub async fn delete_all_sessions(&self) -> Result<SessionSweep> {
+        let ids: Vec<Uuid> = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // FK CASCADE clears messages and tool_outputs.
-                let deleted = connection.execute("DELETE FROM sessions", [])?;
-                Ok(deleted as u64)
+                let mut statement = connection.prepare("SELECT id FROM sessions")?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
             })
             .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to delete all sessions: {}", error))
-            })?;
-        self.prune_orphan_lock_files().await;
-        Ok(deleted)
+            .map_err(|error| MekaError::Database(format!("failed to list sessions: {}", error)))?
+            .into_iter()
+            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .collect();
+        // No further condition: `--all` means every session nobody else has open, schedules
+        // included. Sparing a job-owning session here would make the command quietly not mean what
+        // it says.
+        self.delete_the_unattached_among(&ids, "").await
     }
 
     pub async fn save_tool_output(
@@ -2587,9 +3061,50 @@ impl SessionManager {
 #[derive(Clone)]
 pub struct TokenStore {
     connection: Arc<Connection>,
+    /// Where the per-profile credential locks live, shared with the session locks because they are
+    /// the same kind of thing: a claim one process makes on a name, released by the OS when it
+    /// exits. See [`TokenStore::try_lock_provider_credential`].
+    lock_dir: PathBuf,
+    /// Keeps an in-memory store's lock directory alive for as long as any handle on that store is,
+    /// exactly as [`SessionManager`] does. Without it a `TokenStore` outliving its manager would
+    /// be locking files under a directory that had already been removed.
+    _ephemeral_lock_dir: Option<Arc<EphemeralLockDir>>,
 }
 
 impl TokenStore {
+    /// Try to take the lock that serialises one provider profile's credential rotation across
+    /// processes. `None` means another meka is already refreshing that profile.
+    ///
+    /// Separate from the session locks beside it because the thing being protected is different: a
+    /// session lock says who owns a conversation, this says who is allowed to spend a refresh
+    /// token. Two processes refreshing the same profile both present the token the other is about
+    /// to invalidate, and against an issuer with a reuse window both succeed -- leaving the
+    /// database holding the *older* of the two, superseded, with the next launch getting
+    /// `invalid_grant` and nothing naming why.
+    ///
+    /// The profile name is hashed rather than used directly: it is a TOML table key with no charset
+    /// rule behind it, so `[providers."a/b"]` would otherwise name a path. A readable prefix is
+    /// kept so an operator listing the directory can see what these files are.
+    pub fn try_lock_provider_credential(&self, profile: &str) -> Result<Option<FileLock>> {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(profile.as_bytes());
+        let readable: String = profile
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+            .take(24)
+            .collect();
+        let path = self.lock_dir.join(format!(
+            "{}{}-{:x}.lock",
+            PROVIDER_LOCK_PREFIX,
+            readable,
+            // The digest's leading four bytes: injective on `u32`, so two profiles never share a
+            // file, and short enough that the name stays readable. Rendered by `{:x}`, which drops
+            // leading zeros, so this is up to eight hex digits rather than always eight.
+            u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+        ));
+        try_lock_file(&path)
+    }
+
     /// Load the stored credential (API key or OAuth bundle) for a provider profile, keyed by the
     /// user-chosen profile name. The credential is stored as a serialized [`AuthCredential`].
     pub async fn load_provider_credential(&self, profile: &str) -> Result<Option<AuthCredential>> {
@@ -2627,7 +3142,76 @@ impl TokenStore {
         }
     }
 
+    /// Replace a provider's credential only if the stored one is still what the caller derived its
+    /// new value from.
+    ///
+    /// This is the door a *refresh* goes through, and the reason it is a compare-and-swap is that a
+    /// refresh is not an assignment: it is a value computed from the old one, over a network round
+    /// trip long enough for something else to have written. Two of those somethings are real. Two
+    /// meka processes refreshing at once both present the same refresh token, and against an issuer
+    /// with a reuse window *both* succeed -- so the blind upsert left the database holding
+    /// whichever finished last, which is the token the issuer has already superseded. The next
+    /// launch got `invalid_grant` with nothing naming why. And a `meka provider login`
+    /// completing during a slow refresh was simply overwritten, silently, by a credential
+    /// minted before it.
+    ///
+    /// Returns [`CredentialWrite::Superseded`] with what the row holds now, so the caller can
+    /// decide whether to switch to it. Newer in write order is not the same as usable; see
+    /// `provider::is_worth_adopting`.
+    ///
+    /// The comparison is on the stored JSON rather than a version column, for the same reason the
+    /// memory store's body write is: every writer serialises through the same `serde` impl, so
+    /// re-serialising a value read back out of the column reproduces its bytes exactly.
+    pub async fn replace_provider_credential(
+        &self,
+        profile: &str,
+        expected: &AuthCredential,
+        credential: &AuthCredential,
+    ) -> Result<CredentialWrite> {
+        let expected_json = serde_json::to_string(expected).map_err(|error| {
+            MekaError::Database(format!(
+                "failed to serialize provider credential: {}",
+                error
+            ))
+        })?;
+        let json = serde_json::to_string(credential).map_err(|error| {
+            MekaError::Database(format!(
+                "failed to serialize provider credential: {}",
+                error
+            ))
+        })?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let profile_for_db = profile.to_string();
+        let changed = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE provider_credentials SET credentials_json = ?3, updated_at = ?4 \
+                     WHERE profile = ?1 AND credentials_json = ?2",
+                    rusqlite::params![profile_for_db, expected_json, json, now],
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save provider credential: {}", error))
+            })?;
+        if changed == 1 {
+            return Ok(CredentialWrite::Stored);
+        }
+        // Zero rows means the row moved, or that there is no row at all -- a profile whose
+        // credential was deleted mid-refresh. Both are "somebody else decided what this profile
+        // holds", and in neither case may a token minted from a superseded one be written back.
+        match self.load_provider_credential(profile).await? {
+            Some(current) => Ok(CredentialWrite::Superseded(Box::new(current))),
+            None => Ok(CredentialWrite::Gone),
+        }
+    }
+
     /// Persist (or replace) the credential for a provider profile, keyed by profile name.
+    ///
+    /// The unconditional door, for a caller whose credential is not derived from a stored one: a
+    /// fresh `meka provider login` or `provider add`, where overwriting whatever is there is the
+    /// point. A refresh wants [`Self::replace_provider_credential`].
     pub async fn save_provider_credential(
         &self,
         profile: &str,
@@ -2721,6 +3305,43 @@ impl TokenStore {
             })
     }
 
+    /// Replace an MCP server's credentials only if the stored ones are still the ones the caller
+    /// last read. Returns whether the write landed.
+    ///
+    /// The same compare-and-swap as [`Self::replace_provider_credential`], for the same reason: two
+    /// meka processes refreshing one server's OAuth token both write, and a blind upsert leaves the
+    /// database holding whichever finished last rather than the one the issuer considers current.
+    /// It arbitrates less here because rmcp owns the refresh and hands this adapter only a
+    /// `load`/`save` pair, so the losing process keeps using its own token for the rest of its run.
+    /// What it does guarantee is that the *stored* credential is never moved backwards, which is
+    /// what the next process to start will load.
+    pub async fn replace_mcp_credentials(
+        &self,
+        server_name: &str,
+        expected_json: &str,
+        json: &str,
+    ) -> Result<bool> {
+        let server_name = server_name.to_string();
+        let expected_json = expected_json.to_string();
+        let json = json.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE mcp_oauth_credentials SET credentials_json = ?3, updated_at = ?4 \
+                     WHERE server_name = ?1 AND credentials_json = ?2",
+                    rusqlite::params![server_name, expected_json, json, now],
+                )
+            })
+            .await
+            .map(|changed| changed == 1)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save MCP credentials: {}", error))
+            })
+    }
+
+    /// Persist (or replace) an MCP server's credentials unconditionally, for a caller whose
+    /// credentials are not derived from a stored set: the interactive authorisation flow.
     pub async fn save_mcp_credentials(&self, server_name: &str, json: &str) -> Result<()> {
         let server_name = server_name.to_string();
         let json = json.to_string();
@@ -2787,6 +3408,8 @@ impl SessionManager {
     pub fn token_store(&self) -> TokenStore {
         TokenStore {
             connection: Arc::clone(&self.connection),
+            lock_dir: self.lock_dir.clone(),
+            _ephemeral_lock_dir: self._ephemeral_lock_dir.clone(),
         }
     }
 
@@ -3180,7 +3803,7 @@ mod tests {
             .delete_expired_sessions(90)
             .await
             .expect("retention sweep");
-        assert_eq!(deleted, 1, "only the stale source is swept");
+        assert_eq!(deleted.deleted, 1, "only the stale source is swept");
         assert!(
             manager.session_exists(forked.id).await.expect("exists"),
             "the fork must survive the sweep that removes its stale source"
@@ -3193,7 +3816,10 @@ mod tests {
     async fn fork_does_not_copy_sub_agent_children() {
         let manager = test_manager().await;
         let source = seeded_session(&manager).await;
-        manager
+        // Bound rather than discarded only because the tuple's second element is a `Result` that
+        // must be used. Nothing here needs the child's lock: `fork_session` and `load_session_tree`
+        // take none.
+        let _child = manager
             .create_child_session(source, None, None)
             .await
             .expect("child");
@@ -4071,6 +4697,87 @@ mod tests {
         assert!(stray.exists(), "non-UUID file must be left untouched");
     }
 
+    /// Opening a fresh database while another connection holds its write lock must wait, and must
+    /// come out of it in WAL: converting a rollback journal takes an exclusive lock, and a database
+    /// left unconverted is a permanent contention problem, not a slow start.
+    ///
+    /// What this does *not* isolate is the retry loop, and the reason is worth stating rather than
+    /// leaving to be rediscovered. `rusqlite` installs a five-second busy timeout at open, so any
+    /// hold shorter than that is waited out on the first attempt and the retry never runs. The case
+    /// the retry exists for is the one where SQLite declines to consult the busy handler for this
+    /// pragma at all -- observed at a couple of launches per few hundred, and not reproducible on
+    /// demand. So this pins the property (a contended open waits and gets WAL) and the retry's own
+    /// arm is covered by argument, not by a test.
+    ///
+    /// The writer is a plain `rusqlite` connection holding `BEGIN EXCLUSIVE`, which is what an
+    /// unrelated process mid-transaction looks like from outside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_first_open_waits_out_a_writer_instead_of_failing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("meka.db");
+
+        // A rollback-journal database with something in it, so the open below has a real conversion
+        // to do rather than a no-op on an empty file.
+        let blocker = rusqlite::Connection::open(&db_path).expect("open");
+        blocker
+            .execute_batch("CREATE TABLE placeholder (id INTEGER);")
+            .expect("seed");
+        blocker.execute_batch("BEGIN EXCLUSIVE;").expect("hold");
+
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            blocker.execute_batch("COMMIT;").expect("release");
+        });
+
+        let manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("a contended first open must wait, not fail");
+        released.join().expect("the writer thread finishes");
+
+        let mode: String = manager
+            .connection
+            .call(|connection| {
+                connection.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            })
+            .await
+            .expect("read the journal mode");
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "and must actually get WAL, not settle for the rollback journal"
+        );
+    }
+
+    /// The prune's own question, asked of the lock rather than inferred from a snapshot.
+    ///
+    /// The old rule -- unlink any file whose id is not in the live set -- was justified by a
+    /// session's row being committed before its lock file is acquired. That constrains the
+    /// creator, not the sweeper: the `SELECT` can finish before a row commits while the `read_dir`
+    /// runs after that session's lock file exists. Against a running `meka serve`, 21 of 401 live
+    /// sessions lost their lock file, after which a second process attached to a session `serve`
+    /// still held and wrote a whole turn into it.
+    ///
+    /// The id here is deliberately absent from `sessions`, which is exactly what the old rule
+    /// called an orphan. Holding the lock is the only thing standing between it and deletion.
+    #[tokio::test]
+    async fn test_prune_spares_a_lock_file_that_is_held() {
+        let manager = test_manager().await;
+        let unrecorded = Uuid::new_v4();
+        let path = manager.lock_dir.join(format!("{}.lock", unrecorded));
+        let held = manager.lock_session(unrecorded).expect("take the lock");
+
+        manager.prune_orphan_lock_files().await;
+        assert!(
+            path.exists(),
+            "a file whose lock is held belongs to a live process, whatever the sessions table says"
+        );
+
+        // And the same file, once nobody holds it, is the garbage the sweep exists for.
+        drop(held);
+        manager.prune_orphan_lock_files().await;
+        assert!(!path.exists(), "an unheld orphan is still swept");
+    }
+
     #[tokio::test]
     async fn test_delete_session_removes_lock_file() {
         let manager = test_manager().await;
@@ -4083,6 +4790,228 @@ mod tests {
             !lock_path.exists(),
             "deleting a session must remove its lock file"
         );
+    }
+
+    /// A session another meka process has open is not one this process may delete.
+    ///
+    /// `meka session delete <id>` against a live REPL exited 0 having said nothing at all: the
+    /// count goes through `tracing::info!`, invisible at the default level. The row and its
+    /// messages cascaded away underneath a conversation that carried on as though nothing had
+    /// happened, until its next turn ran against the provider and *then* failed on a foreign-key
+    /// violation -- tokens spent, answer lost, and every later turn in that REPL failing the same
+    /// way with no recovery.
+    #[tokio::test]
+    async fn test_deleting_a_session_another_process_holds_is_refused() {
+        let manager = test_manager().await;
+        let session = manager.create_session(None).await.expect("create");
+        let _held = manager.lock_session(session).expect("hold the session");
+
+        match manager.delete_session_unless_attached(session).await {
+            Err(MekaError::SessionLocked(id)) => assert_eq!(id, session),
+            other => panic!("expected SessionLocked, got {:?}", other.map(|_| "Ok(_)")),
+        }
+        assert!(
+            manager.session_exists(session).await.expect("exists"),
+            "the refusal must leave the conversation alone, not merely report one"
+        );
+    }
+
+    /// The sweep that runs on every start, against a session someone is sitting in.
+    ///
+    /// Only turns bump `updated_at` -- resuming does not touch it -- so a REPL left at its prompt
+    /// past the retention window looks expired while a human is looking at it. Any `meka` start
+    /// that goes through `async_main` runs this sweep, so an unrelated invocation in another
+    /// terminal announced `deleted 1 session(s)` and destroyed the live one.
+    #[tokio::test]
+    async fn test_the_retention_sweep_spares_a_session_that_is_open() {
+        let manager = test_manager().await;
+        let open = manager.create_session(None).await.expect("create");
+        let stale = manager.create_session(None).await.expect("create");
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        for session in [open, stale] {
+            manager
+                .set_session_updated_at_for_test(session, &long_ago)
+                .await
+                .expect("backdate");
+        }
+        let _held = manager.lock_session(open).expect("hold the session");
+
+        let sweep = manager
+            .delete_expired_sessions(30)
+            .await
+            .expect("retention sweep");
+
+        assert_eq!(sweep.deleted, 1, "the session nobody has open still goes");
+        assert_eq!(
+            sweep.attached_elsewhere, 1,
+            "and the sweep has to be able to say what it left, or a count of deletions reads as \
+             'everything matched went'"
+        );
+        assert!(manager.session_exists(open).await.expect("exists"));
+        assert!(!manager.session_exists(stale).await.expect("exists"));
+    }
+
+    /// A session's lock is taken *before* its row is written, not after.
+    ///
+    /// The window between the two is what `meka session delete --all` fell into: it enumerates
+    /// `SELECT id FROM sessions` at delete time, so it saw a row committed microseconds earlier
+    /// whose creator had not yet reached `flock`, took the lock nobody held, and cascaded the
+    /// conversation away underneath the process creating it. A contention run measured **42 lost
+    /// turns in 11,948** with four creators against two sweep loops, each ending
+    /// `FOREIGN KEY constraint failed` with the user's prompt gone.
+    ///
+    /// Observed by ordering rather than by racing, deliberately. The window is microseconds wide,
+    /// so a test that waits for the row and then sweeps passes just as happily with the fix
+    /// reverted -- the first version of this test did exactly that. Volume does find it, but at
+    /// roughly one event per six hundred turns, which is a coin flip rather than a guard. Breaking
+    /// the insert instead makes the ordering directly visible: if the lock comes first, the
+    /// attempt leaves a lock file behind even though no row was ever written, and if it comes
+    /// second there is nothing in the directory at all.
+    #[tokio::test]
+    async fn a_session_is_locked_before_its_row_is_written() {
+        let manager = test_manager().await;
+        let locks_before = std::fs::read_dir(&manager.lock_dir)
+            .expect("read the lock dir")
+            .count();
+        // Renamed rather than dropped, so the failure is a plain "no such table" from the insert
+        // rather than anything the foreign keys have an opinion about.
+        manager
+            .connection
+            .call(|connection| connection.execute_batch("ALTER TABLE sessions RENAME TO hidden;"))
+            .await
+            .expect("hide the table");
+
+        let refused = manager.create_session_locked(None, None, None, None).await;
+
+        assert!(
+            refused.is_err(),
+            "the premise: with no `sessions` table the row cannot be written"
+        );
+        assert_eq!(
+            std::fs::read_dir(&manager.lock_dir)
+                .expect("read the lock dir")
+                .count(),
+            locks_before + 1,
+            "a creation that never wrote a row must still have taken its lock first; nothing in \
+             the lock directory means the row went first, and a row that lands before its lock is \
+             one a sweep can take"
+        );
+    }
+
+    /// A fork takes the copy's lock before the copy's row exists.
+    ///
+    /// Forking committed the copy and *then* locked it, which is the same commit-then-claim window
+    /// [`SessionManager::create_session_locked`] closed, in the same width. A concurrent
+    /// `meka session delete --all` enumerates the copy, takes the lock nobody holds, and deletes
+    /// it -- after which the fork locks the vanished id successfully and hands its caller a session
+    /// whose next turn dies on a foreign-key violation. Under ACP it is quieter still:
+    /// `load_events` returns empty and the editor gets a silently blank fork.
+    ///
+    /// Observed by ordering rather than by racing, for the same reason
+    /// [`a_session_is_locked_before_its_row_is_written`] is: the window is microseconds and nothing
+    /// that polls can see it. Breaking the copy makes the order visible -- if the claim comes
+    /// first, a lock file is left behind for a row that was never written, and if it comes second
+    /// there is nothing in the directory at all.
+    ///
+    /// Deliberately *not* the missing-source path, which would be the more obvious probe: that one
+    /// now removes its own file, precisely because a fork of an unknown id is client-reachable and
+    /// would otherwise accumulate one per attempt.
+    #[tokio::test]
+    async fn a_fork_is_locked_before_the_copy_exists() {
+        let manager = test_manager().await;
+        let source = manager.create_session(None).await.expect("create");
+        let locks_before = std::fs::read_dir(&manager.lock_dir)
+            .expect("read the lock dir")
+            .count();
+        // Renamed rather than dropped, so the copy fails on a plain "no such table" rather than on
+        // anything the foreign keys have an opinion about.
+        manager
+            .connection
+            .call(|connection| connection.execute_batch("ALTER TABLE sessions RENAME TO hidden;"))
+            .await
+            .expect("hide the table");
+
+        let refused = manager
+            .fork_session_locked(source, ForkOverrides::default())
+            .await;
+
+        assert!(
+            refused.is_err(),
+            "the premise: with no `sessions` table the copy cannot be written"
+        );
+        assert_eq!(
+            std::fs::read_dir(&manager.lock_dir)
+                .expect("read the lock dir")
+                .count(),
+            locks_before + 1,
+            "a fork that never wrote a row must still have claimed its id first; nothing in the \
+             lock directory means the row would have gone first, and a copy that lands before its \
+             lock is one a sweep can take"
+        );
+    }
+
+    /// The sweep decides on the rows as they are, not on a list read a moment earlier.
+    ///
+    /// Selecting candidates and then deleting them by id is two statements where there was one, so
+    /// a condition checked only in the first can stop being true in between. The one that matters
+    /// is "no schedule ahead of it": `parent_session_id` cascades, so a job created against a
+    /// sub-agent child in that gap would be swept away with a parent nothing has locked, and the
+    /// lock cannot stand in for the check because it is the *parent* being deleted and the
+    /// *child* that acquired the job.
+    ///
+    /// Driven through [`SessionManager::delete_the_unattached_among`] directly, with a candidate
+    /// that already owns a job, because the gap itself is microseconds wide and not something a
+    /// test can sit inside. What it pins is the property that closes it: the predicate is in the
+    /// delete, not only in the select.
+    #[tokio::test]
+    async fn the_sweep_re_checks_its_own_condition_inside_the_delete() {
+        let manager = test_manager().await;
+        let scheduled = manager.create_session(None).await.expect("create");
+        let ordinary = manager.create_session(None).await.expect("create");
+        manager
+            .schedule_store()
+            .create_scheduled_job(&crate::schedule::ScheduledJob {
+                id: "job-1".to_string(),
+                session_id: scheduled,
+                schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
+                prompt: "check the thing".to_string(),
+                gate: None,
+                isolated: false,
+                created_at: chrono::Utc::now(),
+                last_fired_at: None,
+                next_fire_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            })
+            .await
+            .expect("create the job");
+
+        let sweep = manager
+            .delete_the_unattached_among(&[scheduled, ordinary], NOT_SPOKEN_FOR_BY_A_SCHEDULE)
+            .await
+            .expect("sweep");
+
+        assert_eq!(sweep.deleted, 1, "only the one with nothing ahead of it");
+        assert!(
+            manager.session_exists(scheduled).await.expect("exists"),
+            "a session a job still depends on must survive a delete it was listed for"
+        );
+        assert!(!manager.session_exists(ordinary).await.expect("exists"));
+    }
+
+    /// `meka session delete --all` is the same rule with no window: everything except what someone
+    /// else is using.
+    #[tokio::test]
+    async fn test_delete_all_spares_a_session_that_is_open() {
+        let manager = test_manager().await;
+        let open = manager.create_session(None).await.expect("create");
+        let other = manager.create_session(None).await.expect("create");
+        let _held = manager.lock_session(open).expect("hold the session");
+
+        let sweep = manager.delete_all_sessions().await.expect("delete all");
+
+        assert_eq!(sweep.deleted, 1);
+        assert_eq!(sweep.attached_elsewhere, 1);
+        assert!(manager.session_exists(open).await.expect("exists"));
+        assert!(!manager.session_exists(other).await.expect("exists"));
     }
 
     #[tokio::test]
@@ -4167,7 +5096,7 @@ mod tests {
             .delete_expired_sessions(30)
             .await
             .expect("failed to delete");
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted.deleted, 1);
         assert!(!manager.session_exists(session_id).await.expect("failed"));
 
         let messages = manager.load_messages(session_id).await.expect("failed");
@@ -4191,7 +5120,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("create child");
+            .expect("create child")
+            .0;
 
         let job = crate::schedule::ScheduledJob {
             id: uuid::Uuid::new_v4().to_string(),
@@ -4317,7 +5247,7 @@ mod tests {
             .delete_expired_sessions(30)
             .await
             .expect("failed to delete");
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted.deleted, 1);
         assert!(!manager.session_exists(old_session).await.expect("failed"));
         assert!(manager.session_exists(new_session).await.expect("failed"));
     }
@@ -4339,7 +5269,7 @@ mod tests {
                 .delete_expired_sessions(days)
                 .await
                 .expect("must not panic or error");
-            assert_eq!(deleted, 0, "{days} days should match nothing");
+            assert_eq!(deleted.deleted, 0, "{days} days should match nothing");
         }
         assert!(manager.session_exists(session_id).await.expect("exists"));
     }
@@ -4987,7 +5917,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("create child");
+            .expect("create child")
+            .0;
 
         // Cross-check the column via list_sessions(include_children=true).
         let (summaries, _next_cursor) = manager
@@ -5006,7 +5937,8 @@ mod tests {
         let _child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("create child");
+            .expect("create child")
+            .0;
 
         let (default_view, _) = manager
             .list_sessions(10, false, None, None)
@@ -5157,7 +6089,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("create child");
+            .expect("create child")
+            .0;
 
         // Populate the child with a message and a tool_output so the cascade has something to clean
         // up. This proves the descendant deletions run, not just the parent row.
@@ -5453,6 +6386,237 @@ mod tests {
             .delete_provider_credential("work")
             .await
             .expect("delete missing is a no-op");
+    }
+
+    /// A refresh may only replace the credential it was derived from.
+    ///
+    /// Two meka processes refreshing at once both present the same refresh token, and against an
+    /// issuer with a reuse window both succeed. The blind upsert this replaces left the database
+    /// holding whichever finished last -- the token the issuer had already superseded -- and the
+    /// symptom arrived at the *next* launch as `invalid_grant` with nothing naming the cause. The
+    /// loser adopts the winner's credential instead, so the store and the issuer agree.
+    #[tokio::test]
+    async fn test_a_refresh_cannot_overwrite_a_credential_it_did_not_read() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+        let original = AuthCredential::ApiKey("original".to_string());
+        store
+            .save_provider_credential("work", &original)
+            .await
+            .expect("save");
+
+        // The winner: still holds what it read, so its write lands.
+        let winner = AuthCredential::ApiKey("winner".to_string());
+        match store
+            .replace_provider_credential("work", &original, &winner)
+            .await
+            .expect("swap")
+        {
+            CredentialWrite::Stored => {}
+            other => panic!("expected the first write to land, got {:?}", other),
+        }
+
+        // The loser: derived from the same original, which the row no longer holds.
+        let loser = AuthCredential::ApiKey("loser".to_string());
+        match store
+            .replace_provider_credential("work", &original, &loser)
+            .await
+            .expect("swap")
+        {
+            CredentialWrite::Superseded(current) => match *current {
+                AuthCredential::ApiKey(key) => assert_eq!(
+                    key, "winner",
+                    "the loser must be handed what the row holds, to adopt rather than retry"
+                ),
+                other => panic!("expected an ApiKey, got {:?}", other),
+            },
+            other => panic!("expected the second write to be refused, got {:?}", other),
+        }
+
+        match store
+            .load_provider_credential("work")
+            .await
+            .expect("load")
+            .expect("still stored")
+        {
+            AuthCredential::ApiKey(key) => assert_eq!(key, "winner"),
+            other => panic!("expected an ApiKey, got {:?}", other),
+        }
+    }
+
+    /// A profile disconnected mid-refresh must stay disconnected. Re-creating the row would put
+    /// back an account the user had just removed, and it would come back working.
+    #[tokio::test]
+    async fn test_a_refresh_does_not_resurrect_a_removed_profile() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+        let original = AuthCredential::ApiKey("original".to_string());
+        store
+            .save_provider_credential("work", &original)
+            .await
+            .expect("save");
+        store
+            .delete_provider_credential("work")
+            .await
+            .expect("remove");
+
+        match store
+            .replace_provider_credential("work", &original, &AuthCredential::ApiKey("new".into()))
+            .await
+            .expect("swap")
+        {
+            CredentialWrite::Gone => {}
+            other => panic!(
+                "expected the write to find nothing to replace, got {:?}",
+                other
+            ),
+        }
+        assert!(
+            store
+                .load_provider_credential("work")
+                .await
+                .expect("load")
+                .is_none(),
+            "the profile must stay removed"
+        );
+    }
+
+    /// The MCP half of the same rule. rmcp hands the adapter a bare `save`, so what it compares
+    /// against is the credentials it last *read* -- and a write derived from something the row no
+    /// longer holds would move the stored credential backwards onto a token another process has
+    /// already replaced.
+    #[tokio::test]
+    async fn test_an_mcp_refresh_cannot_overwrite_credentials_it_did_not_read() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+        store
+            .save_mcp_credentials("docs", "{\"token\":\"original\"}")
+            .await
+            .expect("save");
+
+        assert!(
+            store
+                .replace_mcp_credentials(
+                    "docs",
+                    "{\"token\":\"original\"}",
+                    "{\"token\":\"first\"}"
+                )
+                .await
+                .expect("swap"),
+            "the writer that still holds what it read wins"
+        );
+        assert!(
+            !store
+                .replace_mcp_credentials(
+                    "docs",
+                    "{\"token\":\"original\"}",
+                    "{\"token\":\"second\"}"
+                )
+                .await
+                .expect("swap"),
+            "and the writer holding a superseded copy is refused"
+        );
+        assert_eq!(
+            store
+                .load_mcp_credentials("docs")
+                .await
+                .expect("load")
+                .as_deref(),
+            Some("{\"token\":\"first\"}"),
+            "the stored credential must never move backwards"
+        );
+    }
+
+    /// The lock that keeps two processes from spending the same refresh token at once.
+    ///
+    /// Per profile, not per store: one profile refreshing must not stall an unrelated one, which is
+    /// the whole reason the file is named after the profile rather than the database.
+    #[tokio::test]
+    async fn test_the_credential_lock_is_per_profile() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let held = store
+            .try_lock_provider_credential("work")
+            .expect("ask")
+            .expect("nobody holds it");
+        assert!(
+            store
+                .try_lock_provider_credential("work")
+                .expect("ask")
+                .is_none(),
+            "a second holder of the same profile must be refused"
+        );
+        assert!(
+            store
+                .try_lock_provider_credential("personal")
+                .expect("ask")
+                .is_some(),
+            "a different profile is a different lock"
+        );
+
+        drop(held);
+        assert!(
+            store
+                .try_lock_provider_credential("work")
+                .expect("ask")
+                .is_some(),
+            "and it is released when the holder goes"
+        );
+    }
+
+    /// A profile name is a TOML table key with no charset rule behind it, so it cannot be a file
+    /// name directly: `[providers."../../etc/passwd"]` would otherwise name a path. Stripping is
+    /// what keeps the file inside the lock directory, and the hash is what keeps two names that
+    /// strip alike from sharing a lock -- one profile's refresh blocking an unrelated one's, for as
+    /// long as it takes.
+    #[tokio::test]
+    async fn test_the_credential_lock_handles_a_profile_name_that_is_not_a_file_name() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let _escaping = store
+            .try_lock_provider_credential("../../etc/passwd")
+            .expect("ask")
+            .expect("nobody holds it");
+        let inside: Vec<_> = std::fs::read_dir(&manager.lock_dir)
+            .expect("read the lock dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PROVIDER_LOCK_PREFIX)
+            })
+            .collect();
+        assert_eq!(
+            inside.len(),
+            1,
+            "a path-shaped profile name must still land inside the lock directory"
+        );
+
+        // `a/b` and `a.b` both strip to `ab`, so without the hash they would be one lock.
+        let _first = store
+            .try_lock_provider_credential("a/b")
+            .expect("ask")
+            .expect("nobody holds it");
+        assert!(
+            store
+                .try_lock_provider_credential("a.b")
+                .expect("ask")
+                .is_some(),
+            "two profiles that strip to the same readable name must not share a lock"
+        );
     }
 
     /// The listing queries exist so a credential whose config entry was deleted by hand can still
@@ -5924,10 +7088,10 @@ mod tests {
         assert_eq!(later.len(), 1);
     }
 
-    /// The anchoring rule at the storage layer: stamping a fire records both when it fired and when
-    /// it is next due, and a subsequent read reconstructs the same anchor the in-memory scheduler
-    /// held. Without the `last_fired_at` half, a restart would re-anchor on `created_at` and replay
-    /// every occurrence since.
+    /// The anchoring rule at the storage layer: claiming an occurrence records when the job is next
+    /// due and stamping the fire records when it fired, and a subsequent read reconstructs the same
+    /// anchor the in-memory scheduler held. Without the `last_fired_at` half, a restart would
+    /// re-anchor on `created_at` and replay every occurrence since.
     #[tokio::test]
     async fn test_stamping_a_fire_persists_the_anchor_for_the_next_process() {
         let manager = test_manager().await;
@@ -5942,6 +7106,14 @@ mod tests {
 
         let fired_at = chrono::Utc::now();
         let next = job.schedule.next_after(fired_at).expect("has a next fire");
+        assert!(
+            manager
+                .schedule_store()
+                .claim_by_advancing(&job.id, job.next_fire_at, next)
+                .await
+                .expect("claim the occurrence"),
+            "the occurrence is unclaimed, so this process takes it"
+        );
         manager
             .schedule_store()
             .stamp_scheduled_job_fired(&job.id, fired_at, next)

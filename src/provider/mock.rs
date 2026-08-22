@@ -2,10 +2,12 @@
 //! integration test can drive a multi-round `Agent::run_turn` (tool-use round → tool-result round →
 //! final text round) without touching the network.
 //!
-//! Activated by `meka acp` only when the `MEKA_ACP_MOCK_PROVIDER` environment variable is set to
-//! `1`. The variable also names the file containing the JSON-encoded script (see
-//! [`crate::provider::mock::load_script_from_env`]). Anything else (production, REPL, oneshot) is
-//! unaffected; this module is only reachable via the env-gated path.
+//! Activated when `MEKA_MOCK_PROVIDER` is set to `1`, which every surface honours: `meka acp`,
+//! `meka serve`, and the CLI entry point behind the REPL and `--oneshot`. That last one is what
+//! lets a test ask what two `meka` processes do to each other's sessions. A second variable,
+//! `MEKA_MOCK_PROVIDER_SCRIPT`, names the file holding the JSON-encoded script (see
+//! [`crate::provider::mock::load_script_from_env`]). Nothing here is reachable without them, and
+//! the whole module is compiled out of a release build.
 //!
 //! The mock is intentionally minimal: text deltas, thinking deltas, tool-use lifecycle,
 //! `MessageEnd`, plus a synthetic `Fail` event that returns an error from [`Provider::stream`] so
@@ -436,22 +438,22 @@ impl Provider for MockProvider {
     }
 }
 
-/// Read the JSON script from the path named in `MEKA_ACP_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)`
+/// Read the JSON script from the path named in `MEKA_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)`
 /// when the env var is unset; `Err` only on actual parse failure (so the meka startup path can
 /// choose to log+abort vs proceed).
 pub fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
-    let Ok(path) = std::env::var("MEKA_ACP_MOCK_PROVIDER_SCRIPT") else {
+    let Ok(path) = std::env::var("MEKA_MOCK_PROVIDER_SCRIPT") else {
         return Ok(None);
     };
     let body = std::fs::read_to_string(&path).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "MEKA_ACP_MOCK_PROVIDER_SCRIPT='{}' could not be read: {}",
+            "MEKA_MOCK_PROVIDER_SCRIPT='{}' could not be read: {}",
             path, error,
         ))
     })?;
     let rounds: Vec<Vec<MockEvent>> = serde_json::from_str(&body).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "MEKA_ACP_MOCK_PROVIDER_SCRIPT='{}' is not valid JSON: {}",
+            "MEKA_MOCK_PROVIDER_SCRIPT='{}' is not valid JSON: {}",
             path, error,
         ))
     })?;

@@ -37,13 +37,6 @@ use crate::{
 /// Claude Code system prompt prefix.
 const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-fn now_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -242,7 +235,7 @@ impl ClaudeSubscriptionProvider {
                     if !crate::provider::oauth_needs_refresh(
                         *expires_at,
                         refresh_token.is_some(),
-                        now_epoch_millis(),
+                        crate::provider::now_epoch_millis(),
                     ) {
                         return Ok(("Authorization", format!("Bearer {}", access_token)));
                     }
@@ -252,6 +245,18 @@ impl ClaudeSubscriptionProvider {
 
         // Token expired: attempt refresh. Only refreshers queue here; readers are untouched.
         let _refreshing = self.refresh_gate.lock().await;
+
+        // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
+        // serialises the tasks in *this* process and says nothing about the meka in the next
+        // terminal, which is holding the same refresh token and is just as due. Bounded, and
+        // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
+        // not this is held.
+        let _across_processes = match &self.token_store {
+            Some(store) => {
+                crate::provider::await_credential_lock(store, &self.credential_key).await
+            }
+            None => None,
+        };
 
         // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
         // refresh, and a sibling meka process (or `meka mcp login` flow) may have rotated ours
@@ -275,7 +280,10 @@ impl ClaudeSubscriptionProvider {
 
         // Double-check after the DB re-read: another task or process may have already rotated and
         // persisted a new access token that is still valid.
-        let (refresh_token, prior_account_id) = {
+        // Cloned whole, not just its refresh token: the swap below has to name the exact credential
+        // this refresh is derived from, and anything less cannot tell "the row still holds what I
+        // read" from "the row holds something equivalent".
+        let derived_from = {
             let credential = self.credential.read().await;
             if let AuthCredential::OAuthToken {
                 access_token,
@@ -286,20 +294,20 @@ impl ClaudeSubscriptionProvider {
                 && !crate::provider::oauth_needs_refresh(
                     *expires_at,
                     refresh_token.is_some(),
-                    now_epoch_millis(),
+                    crate::provider::now_epoch_millis(),
                 )
             {
                 return Ok(("Authorization", format!("Bearer {}", access_token)));
             }
-
-            match &*credential {
-                AuthCredential::OAuthToken {
-                    refresh_token,
-                    account_id,
-                    ..
-                } => (refresh_token.clone(), account_id.clone()),
-                _ => (None, None),
-            }
+            credential.clone()
+        };
+        let (refresh_token, prior_account_id) = match &derived_from {
+            AuthCredential::OAuthToken {
+                refresh_token,
+                account_id,
+                ..
+            } => (refresh_token.clone(), account_id.clone()),
+            _ => (None, None),
         };
 
         let Some(refresh_token) = refresh_token else {
@@ -308,27 +316,43 @@ impl ClaudeSubscriptionProvider {
             ));
         };
 
-        let new_credential = self
+        let refreshed = self
             .refresh_oauth_token(&refresh_token, prior_account_id)
             .await?;
-        let (header_name, header_value) = new_credential.auth_header();
 
-        // A refresh rotates the refresh token, so the one in the database is now dead. If the write
-        // fails, this process carries on with the new pair in memory but the next launch will load
-        // the dead one and get `invalid_grant` with nothing naming why, so name it here.
-        if let Some(store) = &self.token_store
-            && let Err(error) = store
-                .save_provider_credential(&self.credential_key, &new_credential)
+        // A refresh rotates the refresh token, so the one in the database is now dead -- but only
+        // if the database still holds the one this was derived from. Where it does not, what comes
+        // back is the newer credential to use instead of this one.
+        let new_credential = match &self.token_store {
+            Some(store) => {
+                crate::provider::store_refreshed_credential(
+                    store,
+                    &self.credential_key,
+                    &derived_from,
+                    refreshed,
+                )
                 .await
-        {
-            tracing::warn!(
-                "failed to persist the refreshed Claude OAuth token ({}); this session continues, \
-                 but the stored token is now stale and the next launch will need \
-                 `meka provider login`",
-                error
-            );
-        }
+            }
+            None => refreshed,
+        };
 
+        // Re-checked, because `new_credential` need not be the one this refresh minted: a swap the
+        // row has moved past hands back what the row holds instead, and the check at the top of
+        // this function saw the credential as it was on entry.
+        //
+        // Unreachable as things stand -- `store_refreshed_credential` adopts only a credential of
+        // the same kind this refresh was derived from, and that is an `OAuthToken` on every path
+        // that reaches here -- and kept for what it costs if that stops being true: `auth_header`
+        // would otherwise put an API key in an `x-api-key` header on a subscription endpoint that
+        // does not take one, which is the shape this backend refuses outright a hundred lines
+        // above. The Codex provider has the same guard; the asymmetry was the oversight.
+        let AuthCredential::OAuthToken { .. } = &new_credential else {
+            return Err(MekaError::Provider(
+                "claude-subscription requires an OAuth token, not an API key".to_string(),
+            ));
+        };
+
+        let (header_name, header_value) = new_credential.auth_header();
         *self.credential.write().await = new_credential;
         Ok((header_name, header_value))
     }
@@ -395,7 +419,7 @@ impl ClaudeSubscriptionProvider {
         // same reason: `None` reads as due, so a token whose issuer never states an expiry sent
         // every later request back through this whole path, rotating the refresh token each time.
         let expires_at = Some(data.expires_in.map_or_else(
-            || crate::provider::oauth_assumed_expiry(now_epoch_millis()),
+            || crate::provider::oauth_assumed_expiry(crate::provider::now_epoch_millis()),
             |seconds| {
                 // `try_from` rather than `as`: the cast wraps, and it happens *before* the
                 // `checked_mul` that was supposed to make this saturating, so an `expires_in` past
@@ -404,7 +428,9 @@ impl ClaudeSubscriptionProvider {
                 i64::try_from(seconds)
                     .ok()
                     .and_then(|seconds| seconds.checked_mul(1000))
-                    .map_or(i64::MAX, |millis| now_epoch_millis().saturating_add(millis))
+                    .map_or(i64::MAX, |millis| {
+                        crate::provider::now_epoch_millis().saturating_add(millis)
+                    })
             },
         ));
 
@@ -2058,7 +2084,7 @@ mod tests {
 
     #[test]
     fn test_now_epoch_millis_reasonable() {
-        let ms = now_epoch_millis();
+        let ms = crate::provider::now_epoch_millis();
         assert!(ms > 1_577_836_800_000);
         assert!(ms < 4_102_444_800_000);
     }
@@ -3402,7 +3428,7 @@ mod tests {
         let credential = AuthCredential::OAuthToken {
             access_token: "stale".to_string(),
             refresh_token: Some("rt".to_string()),
-            expires_at: Some(now_epoch_millis()),
+            expires_at: Some(crate::provider::now_epoch_millis()),
             account_id: None,
         };
 
@@ -3482,7 +3508,7 @@ mod tests {
         let credential = AuthCredential::OAuthToken {
             access_token: "stale".to_string(),
             refresh_token: Some("rt".to_string()),
-            expires_at: Some(now_epoch_millis()),
+            expires_at: Some(crate::provider::now_epoch_millis()),
             account_id: None,
         };
         let provider = ClaudeSubscriptionProvider::new(

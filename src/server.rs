@@ -43,7 +43,7 @@ use crate::{
 
 /// Resolve the provider credential for `meka serve` from the active profile's database entry.
 ///
-/// Debug-only: when the integration harness sets `MEKA_ACP_MOCK_PROVIDER=1`, `run_serve` swaps in a
+/// Debug-only: when the integration harness sets `MEKA_MOCK_PROVIDER=1`, `run_serve` swaps in a
 /// scripted provider and discards the real one built from this credential, so a placeholder is
 /// returned and the harness needn't seed a credential into the database.
 async fn resolve_serve_credential(
@@ -51,9 +51,9 @@ async fn resolve_serve_credential(
     session_manager: &SessionManager,
 ) -> anyhow::Result<crate::provider::AuthCredential> {
     #[cfg(debug_assertions)]
-    if std::env::var("MEKA_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         return Ok(crate::provider::AuthCredential::ApiKey(
-            "mock-acp-provider".to_string(),
+            "mock-provider".to_string(),
         ));
     }
 
@@ -119,7 +119,7 @@ pub async fn run_serve(
     );
 
     #[cfg(debug_assertions)]
-    let shared = if std::env::var("MEKA_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+    let shared = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         let rounds = crate::provider::mock::load_script_from_env()
             .map_err(|error| anyhow::anyhow!("load mock provider script: {}", error))?
             .unwrap_or_default();
@@ -128,7 +128,7 @@ pub async fn run_serve(
             provider: mock,
             ..(*shared).clone()
         };
-        tracing::info!("MEKA_ACP_MOCK_PROVIDER=1: using scripted mock provider");
+        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
         Arc::new(new_inner)
     } else {
         shared

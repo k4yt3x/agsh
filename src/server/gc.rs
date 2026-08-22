@@ -1,6 +1,6 @@
 //! Background session GC. Periodically scans the in-memory session map and evicts entries
 //! whose `last_turn_at` is older than the configured `idle_timeout`. Eviction drops the
-//! `SessionEntry` (which in turn drops the `SessionLock`, releasing the OS file lock) but
+//! `SessionEntry` (which in turn drops the `FileLock`, releasing the OS file lock) but
 //! leaves the SQLite row in place by default; a later request with the same session ID can
 //! re-attach (mirroring ACP's `session/load` semantics).
 //!
@@ -54,11 +54,15 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
     // per-row deletion logic.
     let candidates: Vec<uuid::Uuid> = {
         let sessions = state.sessions.read().await;
-        sessions
-            .iter()
-            .filter(|(_, entry)| entry.is_idle(idle_timeout))
-            .map(|(id, _)| *id)
-            .collect()
+        // A loop rather than `filter`, because `is_idle` has to await the background-task registry
+        // to answer whether this session still owns detached work.
+        let mut candidates = Vec::new();
+        for (id, entry) in sessions.iter() {
+            if entry.is_idle(idle_timeout).await {
+                candidates.push(*id);
+            }
+        }
+        candidates
     };
     if candidates.is_empty() {
         return;
@@ -72,10 +76,10 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
     {
         let mut sessions = state.sessions.write().await;
         for id in &candidates {
-            let still_idle = sessions
-                .get(id)
-                .map(|entry| entry.is_idle(idle_timeout))
-                .unwrap_or(false);
+            let still_idle = match sessions.get(id) {
+                Some(entry) => entry.is_idle(idle_timeout).await,
+                None => false,
+            };
             if still_idle && let Some(entry) = sessions.remove(id) {
                 evicted.push((*id, entry));
             }
@@ -99,7 +103,7 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
     // Read off the hoisted handle, not through `runtime`. Out-of-band turns now mark themselves
     // busy, so `is_idle` keeps one from being evicted mid-run, but this loop still must not wait
     // on a mutex it does not need: anything blocking here stalls the rest of the batch, including
-    // the `SessionLock`s of sessions already removed from the map but still held by `evicted`,
+    // the `FileLock`s of sessions already removed from the map but still held by `evicted`,
     // whose owners would get `session-locked` for the duration.
     // `DELETE /v1/sessions/{id}` reads the same handle.
     if let Some(manager) = state.shared.mcp_manager.as_ref() {

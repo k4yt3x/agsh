@@ -133,7 +133,7 @@ pub async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
 /// `meka memory add <name> --description <text> [flags]`: write a memory by hand.
 pub async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()> {
     memory::validate_memory_name(args.name).map_err(MekaError::Config)?;
-    if args.description.trim().is_empty() {
+    if !memory::description_says_something(args.description) {
         return Err(MekaError::Config("description cannot be empty".to_string()));
     }
     if store.get(args.name).await?.is_some() && !args.force {
@@ -437,7 +437,9 @@ fn edit_in(scratch: &Path, original: &str) -> Result<String> {
 
 /// `meka memory remove <name>`: delete the memory.
 pub async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
-    memory::validate_memory_name(name).map_err(MekaError::Config)?;
+    // The lookup rule, not the write rule. Refusing to *delete* a name this store would not have
+    // written is what left a row nothing meka ships could remove.
+    memory::validate_memory_lookup(name).map_err(MekaError::Config)?;
     if !store.delete(name).await? {
         return Err(MekaError::Config(format!("memory '{}' not found", name)));
     }
@@ -447,9 +449,8 @@ pub async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
 
 /// `meka memory export --dir <path>`: one `<name>.md` per memory, frontmatter and body.
 ///
-/// This is what replaced the store being a directory of files: `grep`, a git repository, a backup
-/// that is not a database. The format is the one the file-backed store used, so
-/// `import-memory-store.py` reads an export and a legacy store with one parser.
+/// The answer for `grep`, a git repository, or a backup that is not a database. Frontmatter and
+/// body, so what comes out is readable and editable on its own terms rather than a dump.
 ///
 /// Refuses to write into a directory that already holds files, rather than merging into it. An
 /// export is a snapshot, and silently leaving a stale `<name>.md` behind from a memory since
@@ -484,10 +485,10 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
 
     // Every memory checked before a single file is written, both for a name a filesystem cannot
     // take and for a description the file cannot carry. This is the one place a name becomes a
-    // path, and a row can carry one meka would not have accepted -- an older importer was looser
-    // than `validate_entry_name`, so a legacy `nul.md` or `-old.md` landed in the table. Validating
-    // inside the loop half-wrote the export and then aborted, and the retry hit "directory is not
-    // empty", which names neither the cause nor the remedy.
+    // path, and a row can carry one meka's own write doors would have refused: anything writing
+    // straight to the column can land a `nul.md` or a `-old.md`. Validating inside the loop
+    // half-wrote the export and then aborted, and the retry hit "directory is not empty", which
+    // names neither the cause nor the remedy.
     let unusable: Vec<String> = memories
         .iter()
         .filter_map(|memory| {
@@ -510,8 +511,10 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
         .collect();
     if !unusable.is_empty() {
         return Err(MekaError::Config(format!(
-            "{} memor{} cannot be written out, so nothing was exported: {}. Fix {} with `meka \
-             memory add <name> --force --description ...`, then re-run.",
+            "{} memor{} cannot be written out, so nothing was exported: {}. A bad description is \
+             fixable with `meka memory add <name> --force --description ...`; a bad *name* is not \
+             -- that command validates the name too -- so remove {} with \
+             `meka memory remove <name>`, then re-run.",
             unusable.len(),
             if unusable.len() == 1 { "y" } else { "ies" },
             unusable.join(", "),
@@ -527,8 +530,8 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
         create_private_export_dir(directory)?;
     }
 
-    // Through `write_file_atomic`, which is what the file-backed store wrote through before this
-    // change, for the two properties `std::fs::write` does not have. It creates the file at 0600
+    // Through `write_file_atomic`, for the two properties `std::fs::write` does not have. It
+    // creates the file at 0600
     // inside a 0700 directory: an export is somebody's private notes, the database it came from is
     // 0600, and at the default umask this wrote the lot at 0644 for every local user to read. And
     // it `fsync`s before renaming into place, so "exported N memories" survives a power loss --
@@ -1191,10 +1194,10 @@ mod tests {
 
     /// A name the store holds but a filesystem cannot take stops the export before it writes.
     ///
-    /// An earlier importer was looser than `validate_entry_name`, so a legacy `nul.md` landed in
-    /// the table; `meka memory export` then wrote some files, hit that row, and aborted -- and the
-    /// retry answered "directory is not empty", naming neither the cause nor the remedy. Checked
-    /// as a set, before anything is written.
+    /// Anything writing straight to the column can land a name `validate_entry_name` would have
+    /// refused, such as `nul.md`; `meka memory export` then wrote some files, hit that row, and
+    /// aborted -- and the retry answered "directory is not empty", naming neither the cause nor
+    /// the remedy. Checked as a set, before anything is written.
     #[tokio::test]
     async fn an_unexportable_name_stops_the_export_before_it_writes_anything() {
         let store = MemoryStore::in_memory().await.expect("store");
@@ -1238,10 +1241,10 @@ mod tests {
     /// An export is readable only by its owner, as the store it came from is.
     ///
     /// `std::fs::write` and `create_dir_all` take the umask, which at the default 022 published
-    /// every memory body at 0644 inside a 0755 directory. The database is 0600, the file-backed
-    /// store this replaced wrote 0600 files in a 0700 directory, and `run_edit` two functions above
-    /// goes to the trouble of 0700/0600 for a scratch file that exists for the length of an editing
-    /// session -- while the command whose whole job is to be a backup published the lot.
+    /// every memory body at 0644 inside a 0755 directory. The database is 0600, and `run_edit` two
+    /// functions above goes to the trouble of 0700/0600 for a scratch file that exists for the
+    /// length of an editing session -- while the command whose whole job is to be a backup
+    /// published the lot.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_export_is_readable_only_by_its_owner() {

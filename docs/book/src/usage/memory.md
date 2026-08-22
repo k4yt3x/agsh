@@ -12,7 +12,7 @@ Without it, an agent's only state is its context window. When a long session com
 - The index is re-stated in full at the start of a session, after every compaction, and whenever it scrolls out of the context window. This is what makes memory survive compaction.
 - Memories are available in **read**, **ask**, and **write** permission modes (not in **none**). Writing a memory does *not* require write permission: the store belongs to meka, not to your working tree.
 
-> **Memories moved out of the config directory.** They used to be Markdown files in `~/.config/meka/memory/`. They now live in `MEKA_DATA_DIR` alongside sessions, so a backup of your config directory no longer captures them. See [Moving an existing store](#moving-an-existing-store).
+> **Memories live in `MEKA_DATA_DIR`**, alongside sessions, rather than in the config directory. A backup of your config directory does not capture them; `meka memory export` is what does.
 
 ## Fields
 
@@ -171,36 +171,11 @@ The directory must be new or empty. An export is a snapshot, and merging into an
 
 The export directory is created at mode `0700` and each file at `0600`, and an existing empty directory is tightened to `0700`. A memory body is a private note and the database it came from is `0600`; publishing the same text world-readable because that is what the umask said would be a strange way to take a backup.
 
-The round trip is byte-exact: bodies, tags, priorities and recorded dates come back exactly as stored, including zero-width joiners, CRLF line endings and leading or trailing blank lines. `read_count` rides along too. `updated_at` does not: a restore is a write, and stamps now.
+What lands on disk is byte-exact: bodies, tags, priorities and recorded dates are written exactly as stored, including zero-width joiners, CRLF line endings and leading or trailing blank lines. `read_count` rides along too, because it is the one value the rest of the file cannot reconstruct.
 
-Descriptions are the one field normalised rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file the importer would skip.
+Descriptions are the one field normalised rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file whose frontmatter would not parse.
 
-To read an export back, or to migrate an old file-backed store, use `import-memory-store.py`. It is a one-shot migration tool rather than part of meka, so it is attached to the release you upgraded to rather than shipped in the binary or the repository. Download it from that release's assets:
-
-```bash
-python3 import-memory-store.py --root ~/notes/memory --apply
-```
-
-## Moving an existing store
-
-If you are upgrading from a version that kept memories as files in `~/.config/meka/memory/`, one script moves them. Download `import-memory-store.py` from the release's assets; it needs only Python 3.9 or newer and the standard library:
-
-```bash
-python3 import-memory-store.py            # dry run against the default locations
-python3 import-memory-store.py --apply
-```
-
-Run meka once first so it creates the `memories` table. The script:
-
-- reads `<config>/memory/*.md`, parsing `description`, `priority`, `recorded`, `tags` and (from an export) `read_count`;
-- falls back to each file's modification time when it declares no `recorded:` (this subsumes the old `contrib/migrate-memory-recorded.py`, which has been removed);
-- carries `read_count` across from the legacy `memory_usage` table when one is present, then drops it and `memory_fts`;
-- refuses the whole run if two files' names differ only in case, naming them: memory names are case-insensitive, so `Note.md` and `note.md` would become one memory holding one file's contents;
-- **never modifies or deletes the files**, and reports the ones it could not parse.
-
-It is idempotent and runs in one transaction, so an interrupted run imports nothing rather than half a store. Once `meka memory list` shows what you expect, delete `~/.config/meka/memory/` yourself, or keep it as a backup — meka no longer reads it either way.
-
-Until every file is imported, `meka` and `meka memory ...` warn and say how many are still missing. The warning is keyed on which names are absent from the store, so it does not go quiet the moment the agent saves its first memory.
+An export reads back with any tool that understands YAML frontmatter; meka itself has no import command, because a store you can rebuild from a directory is a second source of truth and this subsystem deliberately has one.
 
 ## Configuration
 

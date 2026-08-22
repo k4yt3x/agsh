@@ -108,8 +108,8 @@ scopes = [{scopes_str}]
                 .env("MEKA_CONFIG_DIR", &config_dir)
                 .env("MEKA_DATA_DIR", &data_dir)
                 .env("HOME", temp.path())
-                .env("MEKA_ACP_MOCK_PROVIDER", "1")
-                .env("MEKA_ACP_MOCK_PROVIDER_SCRIPT", &script_path)
+                .env("MEKA_MOCK_PROVIDER", "1")
+                .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
                 .env("RUST_LOG", "meka=info")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -5536,6 +5536,7 @@ fn memory_write_read_list_and_delete_round_trip() {
             "description": "Never deploy on Fridays",
             "priority": 1,
             "body": "Ship Monday to Thursday only.",
+            "tags": ["deploy", "policy"],
         }))
         .send()
         .expect("send");
@@ -5577,6 +5578,47 @@ fn memory_write_read_list_and_delete_round_trip() {
             .contains("Monday to Thursday"),
         "{}",
         detail
+    );
+    // The three fields the storage move promised on this surface, none of which anything asserted.
+    // `recorded_at` and `updated_at` are distinct concepts -- when the note was made, and when the
+    // row was last written -- so a handler serving one for both would satisfy any test that only
+    // checked they were present.
+    assert!(
+        detail["recorded_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().is_ok()),
+        "recorded_at must be an RFC 3339 stamp: {}",
+        detail
+    );
+    assert!(
+        detail["updated_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().is_ok()),
+        "updated_at must be an RFC 3339 stamp: {}",
+        detail
+    );
+    assert_eq!(
+        detail["tags"],
+        serde_json::json!(["deploy", "policy"]),
+        "tags round-trip through the write: {}",
+        detail
+    );
+    let listed_entry = listed["memories"]
+        .as_array()
+        .expect("memories")
+        .iter()
+        .find(|m| m["name"] == "deploy-policy")
+        .expect("the memory is listed");
+    assert_eq!(
+        listed_entry["tags"],
+        serde_json::json!(["deploy", "policy"]),
+        "and the list carries them too: {}",
+        listed_entry
+    );
+    assert!(
+        listed_entry["recorded_at"].as_str().is_some(),
+        "{}",
+        listed_entry
     );
 
     let delete = harness
@@ -6496,6 +6538,91 @@ fn cancelling_a_running_background_task_stops_it() {
     );
 }
 
+/// A session with a detached command still running is not idle, however long since its last turn.
+///
+/// The GC counted in-flight *turns* only, so a session whose turn had finished but whose background
+/// command had not was evicted on schedule. Eviction drops the `SessionEntry`, which drops the
+/// session's file lock, while the detached task keeps running -- and the next thing to open the
+/// session sweeps it: the model is told the work "was interrupted", and when the command really
+/// finishes `finish_background_task`'s `AND status = 'running'` guard discards the real outcome.
+/// A false report and a silent loss out of one eviction.
+///
+/// Written against a single server because that reaches it too: evict on the timer, re-attach on
+/// the next turn, sweep your own live task.
+#[test]
+fn a_session_with_a_running_background_task_is_not_evicted() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 30", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "second turn" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n\n[background]\nenabled = true\n",
+        script,
+    );
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let tasks = |harness: &ServeTestHarness| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if tasks(&harness)["tasks"]
+            .as_array()
+            .is_some_and(|tasks| tasks.iter().any(|task| task["status"] == "running"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Well past `idle_timeout` and many scans, with no turn running and the command still going.
+    std::thread::sleep(Duration::from_millis(3500));
+    // A second turn is what re-attaches, and re-attaching is what runs the sweep.
+    let second = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "still there?"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        second.status(),
+        200,
+        "second turn failed: {}",
+        second.text().unwrap_or_default()
+    );
+
+    let after = tasks(&harness);
+    let task = after["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.first())
+        .expect("the task must still be listed");
+    assert_eq!(
+        task["status"], "running",
+        "a command that is still running must not be reported as interrupted: {}",
+        after
+    );
+}
+
 /// A `task.finished` delivery must not carry the task's label. For `execute_command` that is the
 /// shell command line, which is exactly where a pasted credential ends up.
 #[test]
@@ -6605,7 +6732,7 @@ scopes = ["sessions:r"]
         .env("MEKA_CONFIG_DIR", &config_dir)
         .env("MEKA_DATA_DIR", temp.path().join("data"))
         .env("HOME", temp.path())
-        .env("MEKA_ACP_MOCK_PROVIDER", "1")
+        .env("MEKA_MOCK_PROVIDER", "1")
         .output()
         .expect("run meka serve");
     assert!(!output.status.success(), "startup must fail");
@@ -7200,7 +7327,7 @@ fn zero_valued_serve_knobs_are_rejected_at_startup() {
             .env("MEKA_CONFIG_DIR", &config_dir)
             .env("MEKA_DATA_DIR", temp.path().join("data"))
             .env("HOME", temp.path())
-            .env("MEKA_ACP_MOCK_PROVIDER", "1")
+            .env("MEKA_MOCK_PROVIDER", "1")
             .output()
             .expect("run meka serve");
         assert!(!output.status.success(), "{} must fail startup", probe);

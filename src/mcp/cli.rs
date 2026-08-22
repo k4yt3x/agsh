@@ -716,9 +716,10 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     }
     let resolved = resolve_add_args(args)?;
 
-    // Held to the end of the function, so this read and the write below cannot interleave with
-    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
-    let _config_lock = crate::config::lock_config_file()
+    // Held across this read and the write below, so the two cannot interleave with another
+    // editor's -- including `device_id::persist`, which runs on an ordinary launch -- and released
+    // the moment the write lands. See the `drop` below for why it does not simply stay held.
+    let config_lock = crate::config::lock_config_file()
         .map_err(|error| config_err(format!("failed to lock config: {}", error)))?;
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
@@ -772,6 +773,16 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     crate::config::write_file_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
     tracing::info!("added '{}' to {}", resolved.name, path.display());
+
+    // Released before anything that talks to a network or waits on a human.
+    //
+    // `lock_config_file` blocks with no timeout, so holding it across the OAuth flow below meant
+    // that while this command sat waiting for a browser login, *any* other meka launch that touches
+    // `config.toml` hung indefinitely -- and `device_id::persist` touches it on every ordinary
+    // start for a `claude-subscription` profile without one. The read-modify-write above is what
+    // the lock exists for, and it is finished. `purge_server` takes the lock again for the rollback
+    // below, which is the only other write this function makes.
+    drop(config_lock);
 
     // Decide whether to probe and/or auto-login. Stdio has no auth surface; HTTP servers with a
     // pre-configured static bearer don't need one either. Everything else gets the probe. These

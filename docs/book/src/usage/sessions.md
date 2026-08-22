@@ -53,6 +53,7 @@ Because the second kind is unknowable from meka's side, the first turn after a r
 
 Only one meka instance can be attached to a session at a time. This prevents race conditions from concurrent writes.
 
+- The lock is taken the moment the session row exists, which for a brand-new session is at the start of its first turn rather than the end. A second invocation launched while that turn is still running is refused like any other.
 - If you try to resume a session that is locked by a running meka process, you will get an error.
 - If the locking process has exited (crashed or was killed), meka detects this and allows you to take over the lock.
 - Under ACP (`meka acp`), the lock is released as soon as the editor disconnects: closing the connection (stdin EOF) or sending SIGTERM/Ctrl-C makes `meka acp` exit, so the session can be reopened immediately.
@@ -127,6 +128,10 @@ meka session delete --all                  # everything
 ```
 
 Deleting a session also removes its messages, scratchpad entries, and any sub-agent children.
+
+A session is locked from the moment it exists — the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, and for forks made by the REPL or an editor. Copying a conversation holds it still too: `meka session fork` and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
+
+No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp — resuming does not — so a REPL left at its prompt past the window looks expired while somebody is sitting in front of it.
 
 See [Config File](../configuration/config-file.md#session) for details.
 

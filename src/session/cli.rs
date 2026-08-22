@@ -222,7 +222,7 @@ pub(crate) enum ForkHandoff {
     /// releases the original only once the new one is owned.
     Switched {
         id: uuid::Uuid,
-        lock: crate::session::SessionLock,
+        lock: crate::session::FileLock,
     },
     /// The copy exists but its lock could not be taken, so the caller stays where it is. The id is
     /// carried so the user can still be told where the copy went.
@@ -244,13 +244,17 @@ pub(crate) async fn fork_and_lock(
     session_manager: &SessionManager,
     source: uuid::Uuid,
 ) -> anyhow::Result<ForkHandoff> {
-    let Some(forked) = session_manager
-        .fork_session(source, crate::session::ForkOverrides::default())
+    // Locked before the copy's row exists, not after: a row committed ahead of its lock is one a
+    // concurrent `session delete --all` enumerates and deletes, after which this function would
+    // lock the vanished id successfully and hand the REPL a session whose next turn dies on a
+    // foreign-key violation. See `SessionManager::fork_session_locked`.
+    let Some((forked, lock)) = session_manager
+        .fork_session_locked(source, crate::session::ForkOverrides::default())
         .await?
     else {
         return Ok(ForkHandoff::SourceGone);
     };
-    match session_manager.lock_session(forked.id) {
+    match lock {
         Ok(lock) => Ok(ForkHandoff::Switched {
             id: forked.id,
             lock,
@@ -262,6 +266,36 @@ pub(crate) async fn fork_and_lock(
     }
 }
 
+/// Hold a session still while its conversation is copied out of it.
+///
+/// Both CLI doors that copy a conversation read a run of rows that a concurrent turn may be halfway
+/// through writing. `Agent::run_turn` persists the user message *eagerly*, before the provider has
+/// answered, so a copy taken mid-turn ends on an unanswered user message: the fork reads
+/// `user, user, assistant` from its first resumed turn onward, and an exported snapshot reproduces
+/// that shape through `meka session import`. Measured 10/10 and 30/30 across two runs -- this is
+/// not a race that sometimes bites, it is what happens every time you fork a session that is
+/// thinking.
+///
+/// `meka session rewind` already took this lock and was correspondingly never affected; fork and
+/// export did not, which is the whole of the difference.
+///
+/// Deliberately *not* pushed down into `fork_session` or [`export_session`]: the REPL's `/fork` and
+/// `/export` act on the session the REPL is already holding, and `flock` is per open file
+/// description, so asking again inside the same process would refuse a session that is
+/// legitimately ours.
+fn hold_still_for_a_copy(
+    session_manager: &SessionManager,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<crate::session::FileLock> {
+    session_manager.lock_session(session_id).map_err(|error| {
+        anyhow::anyhow!(
+            "{}. A conversation cannot be copied while it is being written; close the meka that \
+             has it open and try again",
+            error
+        )
+    })
+}
+
 /// `meka session fork <id>`: copy a session's conversation into a new one and print the new ID.
 ///
 /// Output split mirrors [`import_session`]: the bare ID on stdout so `id=$(meka session fork …)`
@@ -270,6 +304,7 @@ pub(crate) async fn fork_session_command(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
+    let _source = hold_still_for_a_copy(session_manager, session_id)?;
     let forked = session_manager
         .fork_session(session_id, crate::session::ForkOverrides::default())
         .await?
@@ -416,6 +451,10 @@ pub(crate) async fn run_session_subcommand(
             output,
             format,
         } => {
+            // Held for the same reason `fork` holds it: an export is a snapshot, and a snapshot of
+            // a conversation mid-turn carries an unanswered user message that `meka session
+            // import` then restores as an unusable session. See `hold_still_for_a_copy`.
+            let _source = hold_still_for_a_copy(session_manager, *session_id)?;
             // The written path is only interesting to the REPL; out here the shell (and the `-o`
             // the user typed) already knows where it went.
             export_session(session_manager, *session_id, output.as_deref(), *format).await?;
@@ -519,8 +558,9 @@ pub(crate) async fn delete_sessions(
     older_than_days: Option<u64>,
 ) -> anyhow::Result<()> {
     if all {
-        let deleted = session_manager.delete_all_sessions().await?;
-        tracing::info!("deleted {} session(s)", deleted);
+        let sweep = session_manager.delete_all_sessions().await?;
+        tracing::info!("deleted {} session(s)", sweep.deleted);
+        report_sessions_left_open(sweep);
         return Ok(());
     }
 
@@ -535,12 +575,13 @@ pub(crate) async fn delete_sessions(
                 "--older-than-days 0 would delete every session; use --all if you mean that"
             );
         }
-        let deleted = session_manager.delete_expired_sessions(days).await?;
+        let sweep = session_manager.delete_expired_sessions(days).await?;
         tracing::info!(
             "deleted {} session(s) not updated in {} days",
-            deleted,
+            sweep.deleted,
             days
         );
+        report_sessions_left_open(sweep);
         return Ok(());
     }
 
@@ -549,18 +590,59 @@ pub(crate) async fn delete_sessions(
     }
 
     let mut deleted = 0u64;
+    // Reported at the end rather than returned at the first refusal. Every id the user named is a
+    // separate request, and one of them being in use is no reason to leave the rest of the list
+    // untried -- nor to swallow the count of what did go, which returning early also did.
+    let mut refused = Vec::new();
     for session_id in session_ids {
-        if session_manager.delete_session(*session_id).await? {
-            deleted += 1;
-        } else {
+        // The refusing door, not the plain one: this is a session this process has never had open,
+        // and deleting one another meka is mid-conversation on cascades its messages away
+        // underneath a live agent, which then fails every remaining turn on a foreign-key
+        // violation.
+        match session_manager
+            .delete_session_unless_attached(*session_id)
+            .await
+        {
+            Ok(true) => deleted += 1,
             // User-facing error: they asked to delete a specific ID and we couldn't find it, so
             // stderr (not silent) is right.
-            eprintln!("Session not found: {}", session_id);
+            Ok(false) => eprintln!("Session not found: {}", session_id),
+            Err(error) => {
+                eprintln!("Cannot delete {}: {}", session_id, error);
+                refused.push(*session_id);
+            }
         }
     }
 
     tracing::info!("deleted {} session(s)", deleted);
+    // A non-zero exit, because the user named these and a silent skip is indistinguishable from
+    // success. The per-id reasons are already on stderr; this is what a script reads.
+    if !refused.is_empty() {
+        // Does not name a cause. Every `Err` lands here, and `delete_session_unless_attached`
+        // returns a database error as readily as a lock refusal -- so claiming "another meka has
+        // them open" would report a full disk as a busy session. The per-id lines above carry the
+        // real reason; this is the summary a script reads.
+        anyhow::bail!(
+            "{} of {} session(s) could not be deleted; see the errors above",
+            refused.len(),
+            session_ids.len()
+        );
+    }
     Ok(())
+}
+
+/// Say what a sweep spared, because a count of deletions alone reads as "everything matched went".
+///
+/// `warn!` rather than `info!`: the user asked for these to be gone and some of them are not, which
+/// is a fallback they should see at the default level rather than a lifecycle signpost.
+fn report_sessions_left_open(sweep: crate::session::SessionSweep) {
+    if sweep.attached_elsewhere > 0 {
+        tracing::warn!(
+            "left {} session(s) alone: another meka process has them open. Close it and run this \
+             again",
+            sweep.attached_elsewhere
+        );
+    }
 }
 
 pub(crate) fn format_timestamp(rfc3339: &str) -> String {
@@ -822,7 +904,8 @@ mod tests {
         let child = manager
             .create_child_session(root, None, Some(child_spec.to_string()))
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         for event in [
             Event::Append(Message::user("sub task")),
             Event::Append(Message::assistant_text("sub done")),
@@ -920,6 +1003,41 @@ mod tests {
                 .await
                 .expect("load outputs"),
             vec![("tool_1_output".to_string(), "big output".to_string())],
+        );
+    }
+
+    /// One id being refused must not cost the user the rest of the list.
+    ///
+    /// Each id on the command line is a separate request, and a session another meka has open is a
+    /// refusal about that one. Returning at the first refusal skipped every id after it -- and
+    /// swallowed the count of what *had* been deleted on the way, so the run reported nothing at
+    /// all about work it had actually done.
+    #[tokio::test]
+    async fn a_refused_session_does_not_abandon_the_rest_of_the_list() {
+        use std::path::Path;
+
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("open");
+        let held = manager.create_session(None).await.expect("create");
+        let after = manager.create_session(None).await.expect("create");
+        let _lock = manager
+            .lock_session(held)
+            .expect("another process holds it");
+
+        let outcome = delete_sessions(&manager, &[held, after], false, None).await;
+
+        assert!(
+            outcome.is_err(),
+            "a refusal the user named has to reach the exit code"
+        );
+        assert!(
+            manager.session_exists(held).await.expect("exists"),
+            "the conversation somebody is having survives"
+        );
+        assert!(
+            !manager.session_exists(after).await.expect("exists"),
+            "and the id listed after it is still deleted rather than skipped"
         );
     }
 
@@ -1071,7 +1189,8 @@ mod tests {
             manager
                 .delete_expired_sessions(90)
                 .await
-                .expect("retention sweep"),
+                .expect("retention sweep")
+                .deleted,
             0,
             "a freshly imported archive must not be swept on the next launch"
         );

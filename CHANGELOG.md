@@ -16,7 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A memory carries a `recorded` date, stamped once, so an edit no longer restamps it.
 - `memory_write` names a near-duplicate without refusing; `memory_read` suggests a misspelt name.
 - `meka memory export`, `edit`, `verify` and `add --tag` manage the store by hand.
-- `import-memory-store.py`, a one-shot release download, moves a file store into the database.
 - `openai-responses`, a backend for the OpenAI Responses API, authenticated with an API key.
 - `openai-responses` sends no encrypted-reasoning `include`; `chatgpt-subscription` still does.
 - `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
@@ -89,14 +88,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **Breaking:** `source_url` and `meka skill update`; clone the source into `[skills].extra_paths`.
-- **Breaking:** the file-backed memory store and its YAML frontmatter; import it once, then delete.
+- **Breaking:** the file-backed memory store; memories are rows in the database under MEKA_DATA_DIR.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
 - The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
-- `contrib/migrate-memory-recorded.py`; the release's `import-memory-store.py` subsumes it.
 
 ### Fixed
 
 - A turn that could not read the memory store told the model every memory had been deleted.
+- A memory the per-turn diff could not restate was said to be in an index written before it existed.
+- The literal search tier's excerpt did not have to contain the term it said the text contained.
+- `memory_read` had no size bound, and said nothing at all for a memory that has only a description.
+- `memory_search` advised raising a `limit` that was already at, or clamped to, its maximum.
+- A single long description could empty a sub-agent's whole memory index.
+- A pasted paragraph as a search query returned a raw SQLite expression-depth error.
+- A memory dated in the future rendered as "today", sorting first in its band while saying nothing.
+- The per-turn memory index was read on every turn even with `[memory] enabled = false`.
 - `memory_search` was case-sensitive, and stopped at 100 matches mid-walk, hiding the rest.
 - Memory text reached the model unsanitised; only descriptions were filtered before.
 - A memory's rendered age was its edit time, so a priority change made an old note "today".
@@ -132,6 +138,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
 - `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
 - `[session].context_messages` applies every round; a tool loop cannot carry the window past it.
+- `session delete --all` destroyed a session another meka was creating; the lock now precedes it.
+- A sub-agent's session was locked by nothing at all, so a concurrent sweep could delete it mid-run.
+- `agent_followup` is refused while another process is running a turn on the same sub-agent.
+- Forking committed the copy before locking it, so a sweep in the gap produced an empty session.
+- `meka session fork` and `export` copied a conversation mid-turn, producing an unusable session.
+- The per-turn diff listed every changed memory by name, unbounded; a bulk change is now counted.
+- A memory whose name meka would not write could not be read or deleted through any door at all.
+- `memory_search`'s spelling tier measured a near-miss in bytes against a character threshold.
+- A description of only formatting characters was stored and then rendered as nothing.
+- Two hosts on one database both fired every scheduled job; an occurrence is now claimed atomically.
+- A deferred job's restore overwrote another host's claim, so one occurrence came due again at once.
+- A new session was unlocked for its whole first turn, so a second meka attached and interleaved it.
+- `meka serve` evicted a session with a background task still running, then swept its own live task.
+- **Breaking:** deleting a session another meka process has open is refused, not silently done.
+- The retention sweep and `session delete --all` skip sessions in use, and say how many they spared.
+- The lock-file sweep unlinked locks live processes were holding, letting two attach to one session.
+- A first launch racing another for a fresh database could die converting it to WAL; it retries now.
+- `meka mcp add` held the config lock across the browser login, hanging every other meka launch.
 - A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
 - An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
 - `cron` parses the documented five fields, and a job whose next fire is years out is kept.
@@ -146,9 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A token refresh replaces only the credential it read, so a concurrent one cannot store a dead one.
+- A refresh no longer overwrites a `provider login` that completed while it was in flight.
 - Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
+- Stored memory tags are filtered on read, the last field reaching a render without that guard.
 - Skill writes refuse a symlinked path instead of writing outside the store.
 - `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.
 - A command-output capture is created at `0600` and swept after a day.

@@ -2000,7 +2000,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "captured", "parent payload")
@@ -2033,7 +2034,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "shared", "parent value")
@@ -2069,7 +2071,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "secret", "do not leak")
@@ -2101,7 +2104,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "shared_research", "p1")
@@ -2152,7 +2156,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "private", "do not leak")
@@ -2183,7 +2188,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "build_log", "p")
@@ -2232,7 +2238,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "captured", "parent data")
@@ -2273,7 +2280,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "captured", "parent data")
@@ -2308,7 +2316,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "captured", "parent data")
@@ -2347,7 +2356,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         manager
             .save_tool_output(parent, "shared", "parent original")
@@ -2785,7 +2795,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("input.txt");
         tokio::fs::write(&path, "irrelevant")
@@ -2934,7 +2945,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         manager
             .save_tool_output(parent, "build_log", "parent-only payload")
             .await
@@ -3098,7 +3110,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         manager
             .save_tool_output(parent, "captured", "parent-data")
             .await
@@ -3134,7 +3147,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         manager
             .save_tool_output(child, "mine", "child-data")
             .await
@@ -3261,7 +3275,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         manager
             .save_tool_output(child, "src", "data")
             .await
@@ -3295,7 +3310,8 @@ mod tests {
         let child = manager
             .create_child_session(parent, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         manager
             .save_tool_output(parent, "shared", "parent payload")
             .await

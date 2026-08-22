@@ -55,9 +55,9 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 /// session's lock. Declining one here would leave it to whichever host holds the lock, and neither
 /// the REPL nor ACP honours `isolated` -- both run it in the conversation they have open, with a
 /// warning. The exemption keeps serve eligible so the flag can be honoured at all; it does not make
-/// serve the winner. Isolated jobs have no cross-host arbitration, so with a REPL open on the same
-/// session which host takes a given occurrence is a race between their two tickers. That gap
-/// predates this and is not closed here.
+/// serve the winner. Which host takes a given occurrence is a race between their tickers, but only
+/// a race for *which*: `prepare` claims the occurrence with a compare-and-swap
+/// (`ScheduleStore::claim_by_advancing`), so the hosts that lose it return before running the gate.
 ///
 /// Otherwise there are two ways to be runnable, and the order matters. A resident session is
 /// runnable by definition, and has to be checked first because *this* process is the one holding

@@ -11,9 +11,10 @@
 mod anthropic;
 /// `meka provider` subcommand suite (add/list/use/remove/login) and the provider OAuth login flows.
 pub mod cli;
-/// Scripted provider used by the ACP integration test. Available in debug builds only; release
-/// builds don't pay the binary-size cost. Activated by the `MEKA_ACP_MOCK_PROVIDER` env var inside
-/// `acp::run_acp`; never reachable from production paths otherwise.
+/// Scripted provider used by the integration tests. Available in debug builds only; release builds
+/// don't pay the binary-size cost. Activated by the `MEKA_MOCK_PROVIDER` env var inside
+/// `acp::run_acp`, `server::run_serve` and `create_agent_from_config`; never reachable from
+/// production paths otherwise.
 #[cfg(debug_assertions)]
 pub(crate) mod mock;
 pub(crate) mod openai;
@@ -173,6 +174,157 @@ pub(crate) fn oauth_needs_refresh(
     match expires_at {
         Some(expiry) => now_millis.saturating_add(OAUTH_REFRESH_SKEW_MILLIS) >= expiry,
         None => has_refresh_token,
+    }
+}
+
+/// Milliseconds since the Unix epoch, the unit [`oauth_needs_refresh`] and every stored
+/// `expires_at` are in.
+///
+/// Clamped at zero for a clock before 1970 rather than propagating: every caller is asking "is
+/// this token due", and a machine that far out of step has already answered yes.
+pub(crate) fn now_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a refresh that lost its swap should switch to what the row holds instead.
+///
+/// Two conditions, and both are about the request in hand rather than about write order.
+///
+/// It has to be the same *kind* of credential. A row that held an OAuth token and now holds an API
+/// key is a profile somebody repurposed with `meka provider add --api-key`, not a token this
+/// refresh has been overtaken by, and a subscription backend cannot authenticate with it at all.
+///
+/// And it has to be *live*. The winner may have stored a token and then sat idle past its
+/// lifetime, so adopting on write order alone would authenticate this very request with a token
+/// that is already dead, having thrown away the good one this refresh just minted. Neither
+/// outcome writes to the row -- what it holds is not this process's to change -- so the only
+/// question is which token to spend the turn on.
+fn is_worth_adopting(derived_from: &AuthCredential, current: &AuthCredential) -> bool {
+    match (derived_from, current) {
+        (AuthCredential::ApiKey(_), AuthCredential::ApiKey(_)) => true,
+        (
+            AuthCredential::OAuthToken { .. },
+            AuthCredential::OAuthToken {
+                expires_at,
+                refresh_token,
+                ..
+            },
+        ) => !oauth_needs_refresh(*expires_at, refresh_token.is_some(), now_epoch_millis()),
+        _ => false,
+    }
+}
+
+/// How long to wait for another process to finish rotating a profile's credential before going
+/// ahead anyway.
+///
+/// Bounded rather than blocking, because a wedged holder must not wedge every other meka on the
+/// machine. Going ahead is safe: [`store_refreshed_credential`]'s compare-and-swap is what makes
+/// the outcome correct, and this only spares the wasted refresh in the common case.
+const CREDENTIAL_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait, briefly, for exclusive use of a profile's credential across processes.
+///
+/// `None` means the wait ran out or the lock could not be asked for at all. The caller proceeds
+/// either way: this reduces contention, it does not establish correctness.
+pub(crate) async fn await_credential_lock(
+    store: &TokenStore,
+    profile: &str,
+) -> Option<crate::session::FileLock> {
+    let deadline = tokio::time::Instant::now() + CREDENTIAL_LOCK_WAIT;
+    loop {
+        match store.try_lock_provider_credential(profile) {
+            Ok(Some(lock)) => return Some(lock),
+            Ok(None) => {}
+            // Not "someone has it" but "we could not ask": an unwritable lock directory, or
+            // descriptors exhausted. Retrying would not help and refusing to refresh would be
+            // worse than refreshing unserialised, so stop waiting and let the swap arbitrate.
+            Err(error) => {
+                tracing::debug!(
+                    "could not take the credential lock for '{}': {}",
+                    profile,
+                    error
+                );
+                return None;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                "another process has been refreshing '{}' for {:?}; going ahead",
+                profile,
+                CREDENTIAL_LOCK_WAIT
+            );
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Persist a refreshed credential, and answer with the one that should actually be used.
+///
+/// A refresh is derived from the credential it read, so it may only replace *that* credential.
+/// Where the row has moved on -- another process refreshed first, or a `meka provider login`
+/// completed while this round trip was in flight -- the stored value is newer than what this
+/// refresh produced, and adopting it is both correct and what keeps the issuer's live token and the
+/// database in agreement. The blind upsert this replaces left them disagreeing silently, and the
+/// symptom arrived at the *next* launch as `invalid_grant` with nothing naming the cause.
+///
+/// A write that cannot be made at all is a warning rather than an error: the session in hand still
+/// has a working token, and failing the turn over a persistence problem would be the worse trade.
+pub(crate) async fn store_refreshed_credential(
+    store: &TokenStore,
+    profile: &str,
+    derived_from: &AuthCredential,
+    refreshed: AuthCredential,
+) -> AuthCredential {
+    match store
+        .replace_provider_credential(profile, derived_from, &refreshed)
+        .await
+    {
+        Ok(crate::session::CredentialWrite::Stored) => refreshed,
+        // Adopted only when it is worth adopting: "newer" here means newer in *write order*, which
+        // is neither "unexpired" nor "the same kind of credential". See [`is_worth_adopting`].
+        Ok(crate::session::CredentialWrite::Superseded(current))
+            if is_worth_adopting(derived_from, &current) =>
+        {
+            tracing::info!(
+                "'{}' was re-authenticated elsewhere while this refresh was in flight; adopting \
+                 the stored credential",
+                profile
+            );
+            *current
+        }
+        Ok(crate::session::CredentialWrite::Superseded(_)) => {
+            tracing::warn!(
+                "'{}' was written by something else while this refresh was in flight, and what it \
+                 holds now cannot authenticate this session; continuing on the token just minted \
+                 and leaving the stored credential alone",
+                profile
+            );
+            refreshed
+        }
+        // The profile's credential was removed mid-refresh, which is `meka provider remove` or a
+        // `logout`. Writing this token back would resurrect an account the user just disconnected;
+        // this process finishes its turn on what it has and the next launch asks for a login.
+        Ok(crate::session::CredentialWrite::Gone) => {
+            tracing::warn!(
+                "'{}' has no stored credential any more, so the refreshed token was not persisted",
+                profile
+            );
+            refreshed
+        }
+        Err(error) => {
+            tracing::warn!(
+                "failed to persist the refreshed token for '{}' ({}); this session continues, but \
+                 the stored token is now stale and the next launch will need \
+                 `meka provider login`",
+                profile,
+                error
+            );
+            refreshed
+        }
     }
 }
 
@@ -1148,6 +1300,70 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refresh that loses its swap adopts what the row holds only when that can authenticate the
+    /// request in hand.
+    ///
+    /// "Superseded" is a statement about write order and nothing else, and adopting on write order
+    /// alone throws away a token the issuer has just minted in favour of one that may be dead or
+    /// may not even be the same kind of credential. The failure is quiet in both directions: an
+    /// expired adoption 401s the very request it was fetched for, and an API key adopted into a
+    /// subscription profile is sent as a bearer token that endpoint has never accepted.
+    #[tokio::test]
+    async fn a_superseding_credential_is_adopted_only_when_it_can_authenticate() {
+        let manager = crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+        let oauth = |access: &str, expires_at: Option<i64>| AuthCredential::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at,
+            account_id: None,
+        };
+        let hour = 3_600_000;
+        let derived_from = oauth("original", Some(now_epoch_millis() - hour));
+        let minted = || oauth("just-minted", Some(now_epoch_millis() + hour));
+        // Every case below is a lost swap, which is what the row holding something other than
+        // `derived_from` produces.
+        let plant = async |credential: AuthCredential| {
+            store
+                .save_provider_credential("work", &credential)
+                .await
+                .expect("plant what the winner left");
+        };
+        let access_token = |credential: &AuthCredential| match credential {
+            AuthCredential::OAuthToken { access_token, .. } => access_token.clone(),
+            AuthCredential::ApiKey(key) => key.clone(),
+        };
+
+        plant(oauth("theirs", Some(now_epoch_millis() + hour))).await;
+        assert_eq!(
+            access_token(
+                &store_refreshed_credential(&store, "work", &derived_from, minted()).await
+            ),
+            "theirs",
+            "the premise: a live credential from the winner is the one to use"
+        );
+
+        plant(oauth("stale", Some(now_epoch_millis() - hour))).await;
+        assert_eq!(
+            access_token(
+                &store_refreshed_credential(&store, "work", &derived_from, minted()).await
+            ),
+            "just-minted",
+            "a token that won the write and then expired cannot authenticate this request"
+        );
+
+        plant(AuthCredential::ApiKey("repurposed".to_string())).await;
+        assert_eq!(
+            access_token(
+                &store_refreshed_credential(&store, "work", &derived_from, minted()).await
+            ),
+            "just-minted",
+            "and a profile somebody repurposed to an API key is not a newer version of this token"
+        );
+    }
 
     /// `AuthCredential` derived `Debug` over its plaintext, and a provider struct holding one is
     /// exactly the kind of thing that lands in a `{:?}` during a bad afternoon.

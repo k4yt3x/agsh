@@ -411,8 +411,8 @@ pub enum MemoryAction {
     },
     /// Write every memory out as Markdown, one file per memory
     ///
-    /// The backup, grep and git answer now that memories live in
-    /// meka's database. Read back with the release's import-memory-store.py.
+    /// The backup, grep and git answer for a store that lives in
+    /// meka's database.
     ///
     /// Examples:
     ///   meka memory export

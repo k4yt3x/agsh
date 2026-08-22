@@ -375,7 +375,7 @@ pub struct MemoryDetail {
     /// 0..=9, lower first. Unlike a skill's, a memory's priority *is* shown to the model, because
     /// it says how heavily to weigh a note the model is already reasoning from.
     pub priority: u8,
-    /// Last-modified time, RFC 3339. When the file was last written, which a metadata-only edit
+    /// Last-modified time, RFC 3339. When the row was last written, which a metadata-only edit
     /// moves; see `recorded_at` for when the note was made.
     pub updated_at: String,
     /// When the memory was recorded, RFC 3339. Stamped once, at creation.
@@ -519,7 +519,7 @@ pub async fn put_memory(
     let body: WriteMemoryRequest = serde_json::from_slice(&raw_body)
         .map_err(|error| store_error(format!("invalid memory request body: {}", error)))?;
     crate::memory::validate_memory_name(&name).map_err(store_error)?;
-    if body.description.trim().is_empty() {
+    if !crate::memory::description_says_something(&body.description) {
         return Err(store_error("description cannot be empty".to_string()));
     }
     if body
@@ -579,7 +579,7 @@ pub async fn delete_memory(
     AxumPath(name): AxumPath<String>,
 ) -> Result<StatusCode, ProblemDetail> {
     scope::require(&principal, "memory:w")?;
-    crate::memory::validate_memory_name(&name).map_err(store_error)?;
+    crate::memory::validate_memory_lookup(&name).map_err(store_error)?;
     // 404 from `rows_affected`, not from a pre-check. The two used to be separate statements, and
     // between them a name could stop existing: this endpoint then answered 422 `invalid-body` for
     // something already gone, which a client switching on `type` reads as "fix your request".

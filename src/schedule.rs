@@ -731,10 +731,10 @@ where
         // its gate baseline, and for a one-shot deletes the row outright, so nothing short of the
         // original can put it back.
         let original = job.clone();
-        if let Some(wakeup) = prepare(session_manager, config, job, now).await? {
+        if let Some((claim, wakeup)) = prepare(session_manager, config, job, now).await? {
             if fire(wakeup).await == FireOutcome::Deferred {
                 tracing::debug!("job {} deferred; restoring it", original.short_id());
-                store.restore_scheduled_job(&original).await?;
+                store.restore_scheduled_job(&original, claim).await?;
             } else {
                 // Counted only once a turn has actually been spent. A job `prepare` retired (a
                 // declining gate, a one-shot past its grace period) and a job the host handed back
@@ -784,6 +784,33 @@ fn clear_permission_decline(job_id: &str) {
     };
 }
 
+/// What claiming an occurrence wrote to the row.
+///
+/// Carried out of [`prepare`] so a host that turns out to be unable to run the job puts back
+/// exactly what it took, and so every write that follows the claim can be scoped to the claim *this
+/// process* won rather than to the job id alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// The row survives, advanced to this next fire time.
+    Advanced(DateTime<Utc>),
+    /// The row was deleted: a one-shot's moment is spent, and a cron pattern with nothing left in
+    /// range has no future to be scheduled for.
+    Retired,
+}
+
+impl Claim {
+    /// The fire time this claim wrote, or `None` for a claim that retired the row.
+    ///
+    /// Every write after the claim needs it twice over: as the value to guard on, and as the answer
+    /// to "is there still a row to write to at all".
+    fn advanced_to(self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Advanced(next) => Some(next),
+            Self::Retired => None,
+        }
+    }
+}
+
 /// Decide what to do with one due job: retire it, reschedule it quietly, or produce the [`Wakeup`]
 /// that spends a turn.
 async fn prepare(
@@ -791,7 +818,7 @@ async fn prepare(
     config: &crate::config::ResolvedScheduleConfig,
     job: ScheduledJob,
     now: DateTime<Utc>,
-) -> crate::error::Result<Option<Wakeup>> {
+) -> crate::error::Result<Option<(Claim, Wakeup)>> {
     let store = session_manager.schedule_store();
     let late_by = now - job.next_fire_at;
     let recurring = job.schedule.is_recurring();
@@ -804,12 +831,15 @@ async fn prepare(
             .map(|grace| late_by > grace)
             .unwrap_or(false)
     {
-        tracing::warn!(
-            "dropping one-shot job {}: due {} ago, past the missed-job grace period",
-            job.short_id(),
-            format_late(late_by)
-        );
-        store.delete_scheduled_job(&job.id).await?;
+        // Claimed rather than deleted outright, so the announcement is made once by whichever host
+        // actually removed the row rather than once per host that had it in its due list.
+        if store.claim_by_retiring(&job.id, job.next_fire_at).await? {
+            tracing::warn!(
+                "dropping one-shot job {}: due {} ago, past the missed-job grace period",
+                job.short_id(),
+                format_late(late_by)
+            );
+        }
         return Ok(None);
     }
 
@@ -817,15 +847,41 @@ async fn prepare(
     // crashes the process would otherwise be re-selected on every restart, turning one bad job into
     // a boot loop in the daemon that is supposed to stay up. Paying for it with one missed
     // occurrence is the cheaper failure.
+    //
+    // This write is also what arbitrates between hosts, which is why it is conditional. Every
+    // `meka serve`, REPL and ACP session polls the same table, so one occurrence is in several
+    // hosts' due lists at once; whoever moves the row off the value they all read owns it, and the
+    // rest return here having neither evaluated the gate nor spent the occurrence.
     let coalesced = occurrences_between(&job.schedule, job.next_fire_at, now);
     // `Some` only for a job that lives on. A one-shot's moment is spent, and a cron pattern with
     // nothing left in range has no future to be scheduled for; both are retired here and every
     // write below then has nothing to update.
     let next_fire_at = job.schedule.next_after(now).filter(|_| recurring);
-    match next_fire_at {
-        Some(next) => store.reschedule_scheduled_job(&job.id, next).await?,
-        None => store.delete_scheduled_job(&job.id).await?,
-    }
+    let claim = match next_fire_at {
+        Some(next) => match store
+            .claim_by_advancing(&job.id, job.next_fire_at, next)
+            .await?
+        {
+            true => Claim::Advanced(next),
+            false => {
+                tracing::debug!(
+                    "job {} was claimed for this occurrence by another host",
+                    job.short_id()
+                );
+                return Ok(None);
+            }
+        },
+        None => match store.claim_by_retiring(&job.id, job.next_fire_at).await? {
+            true => Claim::Retired,
+            false => {
+                tracing::debug!(
+                    "job {} was claimed for this occurrence by another host",
+                    job.short_id()
+                );
+                return Ok(None);
+            }
+        },
+    };
 
     // Looked up only when there is a gate to run, so an ungated job costs no query. One lookup
     // serves both the working directory and the live permission the re-check below needs.
@@ -915,9 +971,9 @@ async fn prepare(
                     // `on-change` gate stops firing once it has seen the new value. A retired job
                     // has no row left to write to, and needs none -- it will
                     // not be evaluated again.
-                    if next_fire_at.is_some()
+                    if let Some(claimed) = claim.advanced_to()
                         && let Err(error) = store
-                            .update_scheduled_job_gate_output(&job.id, &outcome.output)
+                            .update_scheduled_job_gate_output(&job.id, claimed, &outcome.output)
                             .await
                     {
                         tracing::warn!(
@@ -944,10 +1000,12 @@ async fn prepare(
     };
 
     // Only a surviving job has an anchor worth recording. Recomputing the next fire here rather
-    // than reusing `next_fire_at` would be the same value today, but it is the kind of duplicated
-    // derivation that drifts: the reschedule above is the single writer of that column.
-    if let Some(next) = next_fire_at {
-        store.stamp_scheduled_job_fired(&job.id, now, next).await?;
+    // than reusing the claim would be the same value today, but it is the kind of duplicated
+    // derivation that drifts: the claim above is the single writer of that column.
+    if let Some(claimed) = claim.advanced_to() {
+        store
+            .stamp_scheduled_job_fired(&job.id, now, claimed)
+            .await?;
     }
 
     tracing::info!(
@@ -955,12 +1013,12 @@ async fn prepare(
         job.short_id(),
         job.schedule.describe()
     );
-    Ok(Some(Wakeup {
+    Ok(Some((claim, Wakeup {
         job,
         gate_output,
         late_by,
         coalesced,
-    }))
+    })))
 }
 
 /// Parse a humantime duration, via the same re-export `crate::config` uses so `every = "30m"` in a
@@ -1191,25 +1249,111 @@ impl ScheduleStore {
             })
     }
 
-    /// Record that a job fired and when it is next due.
+    /// Take an occurrence for this process by advancing the job to its next fire time. Returns
+    /// whether the claim was won.
     ///
-    /// Written *before* the turn runs, not after: a prompt that reliably crashes or hangs the
-    /// process would otherwise re-fire on every restart, turning one bad job into a boot loop in
-    /// the daemon that is supposed to stay up. Stamping first costs one missed occurrence instead.
-    pub async fn stamp_scheduled_job_fired(
+    /// This is the write that arbitrates between hosts, which is why it is a compare-and-swap on
+    /// `next_fire_at` rather than the plain update it used to be. Every `meka serve`, REPL and ACP
+    /// session polls the same table, so one occurrence sits in several hosts' due lists at once;
+    /// before this, each of them evaluated the job's gate and fired it. Two servers sharing a
+    /// database ran one hourly job's gate command three times and its agent turn twice, for a
+    /// single occurrence, with nothing said on either side.
+    ///
+    /// `occurrence` is the value that host read into its due list, so exactly one of them can move
+    /// the row off it. The losers change no rows, and [`prepare`] evaluates the gate only after
+    /// this has returned `true`, so a lost claim costs a process spawn nobody asked for.
+    ///
+    /// `last_fired_at` is deliberately not written here. A gated job that evaluates to "no change"
+    /// has been *considered*, not fired, and recording it as fired would both mislead
+    /// `meka schedule list` and re-anchor an interval schedule on evaluations rather than on fires.
+    /// [`Self::stamp_scheduled_job_fired`] adds it once the turn is really going to happen.
+    pub(crate) async fn claim_by_advancing(
         &self,
         id: &str,
-        fired_at: chrono::DateTime<chrono::Utc>,
+        occurrence: chrono::DateTime<chrono::Utc>,
         next_fire_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<bool> {
         let id = id.to_string();
-        let fired_at = fired_at.to_rfc3339();
+        let occurrence = occurrence.to_rfc3339();
         let next_fire_at = next_fire_at.to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE scheduled_jobs SET last_fired_at = ?2, next_fire_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, fired_at, next_fire_at],
+                    &format!(
+                        "UPDATE scheduled_jobs SET next_fire_at = ?3 WHERE id = ?1 AND {}",
+                        SAME_OCCURRENCE
+                    ),
+                    rusqlite::params![id, occurrence, next_fire_at],
+                )
+            })
+            .await
+            .map(|changed| changed == 1)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to claim scheduled job: {}", error))
+            })
+    }
+
+    /// Take an occurrence for this process by deleting the job outright, for a one-shot whose
+    /// moment has come and for a cron pattern with nothing left in range. Returns whether the claim
+    /// was won.
+    ///
+    /// The delete half of [`Self::claim_by_advancing`]. What arbitrates here is the affected-row
+    /// count: a `DELETE ... WHERE id = ?` that discards it reports success to every host that
+    /// issues it, so all of them go on to deliver a reminder exactly one of them removed. The
+    /// occurrence is in the `WHERE` to keep the delete scoped to the row this host read, which
+    /// matters if the row is ever re-pointed underneath a sweep rather than merely removed.
+    pub(crate) async fn claim_by_retiring(
+        &self,
+        id: &str,
+        occurrence: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<bool> {
+        let id = id.to_string();
+        let occurrence = occurrence.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    &format!(
+                        "DELETE FROM scheduled_jobs WHERE id = ?1 AND {}",
+                        SAME_OCCURRENCE
+                    ),
+                    rusqlite::params![id, occurrence],
+                )
+            })
+            .await
+            .map(|changed| changed == 1)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to retire scheduled job: {}", error))
+            })
+    }
+
+    /// Record that a job fired.
+    ///
+    /// Written *before* the turn runs, not after: a prompt that reliably crashes or hangs the
+    /// process would otherwise re-fire on every restart, turning one bad job into a boot loop in
+    /// the daemon that is supposed to stay up. Stamping first costs one missed occurrence instead.
+    ///
+    /// `claimed` is the fire time [`Self::claim_by_advancing`] wrote, and is the guard rather than
+    /// a value to write: the column already holds it. For a short interval with a slow gate the
+    /// claimed time can itself be in the past by the time the gate returns, so another host may
+    /// have legitimately claimed the *following* occurrence in between -- and an unguarded stamp
+    /// would drag `next_fire_at` back onto an occurrence that host is already running.
+    pub async fn stamp_scheduled_job_fired(
+        &self,
+        id: &str,
+        fired_at: chrono::DateTime<chrono::Utc>,
+        claimed: chrono::DateTime<chrono::Utc>,
+    ) -> crate::error::Result<()> {
+        let id = id.to_string();
+        let fired_at = fired_at.to_rfc3339();
+        let claimed = claimed.to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    &format!(
+                        "UPDATE scheduled_jobs SET last_fired_at = ?3 WHERE id = ?1 AND {}",
+                        SAME_OCCURRENCE
+                    ),
+                    rusqlite::params![id, claimed, fired_at],
                 )?;
                 Ok(())
             })
@@ -1219,97 +1363,157 @@ impl ScheduleStore {
             })
     }
 
-    /// Move a job's next due time without claiming it fired.
+    /// Put a job back exactly as it was, for a host that turned out to be unable to run it after
+    /// [`prepare`] had already claimed the occurrence.
     ///
-    /// Separate from [`Self::stamp_scheduled_job_fired`] because a gated job that evaluates to "no change" has been *considered* but not fired, and recording it as fired would both mislead `schedule list` and, for an interval schedule, silently re-anchor the cadence on evaluations rather than on fires.
-    pub async fn reschedule_scheduled_job(
+    /// Scoped to `claim`, which is the whole substance. This used to be an `INSERT OR REPLACE` of
+    /// the row as it stood *before* the claim, applied by id alone, and that made a lost race
+    /// permanent: two hosts both claimed an occurrence, the loser was refused the session lock, and
+    /// its restore overwrote the winner's `next_fire_at`, `last_fired_at` and `gate_last_output` --
+    /// putting the job back in the past so it came due again on the very next tick, while the
+    /// winner was still running the turn. The blind upsert also resurrected a job the user had
+    /// cancelled during the turn; an id-and-claim scoped update leaves that deletion alone.
+    ///
+    /// A retired job is re-inserted rather than updated, because claiming one *deletes* the row: a
+    /// one-shot has no next occurrence, so an `UPDATE` would match nothing while still reporting
+    /// success, losing the reminder outright. `OR IGNORE` because a row back under that id is one
+    /// this process no longer has any claim on.
+    pub(crate) async fn restore_scheduled_job(
+        &self,
+        job: &ScheduledJob,
+        claim: Claim,
+    ) -> crate::error::Result<()> {
+        let id = job.id.clone();
+        let short_id = job.short_id().to_string();
+        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
+        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
+        let next_fire_at = job.next_fire_at.to_rfc3339();
+
+        let restored = match claim {
+            Claim::Advanced(claimed) => {
+                let claimed = claimed.to_rfc3339();
+                self.connection
+                    .call(move |connection| -> rusqlite::Result<_> {
+                        connection.execute(
+                            &format!(
+                                "UPDATE scheduled_jobs SET next_fire_at = ?3, last_fired_at = ?4, \
+                                 gate_last_output = ?5 WHERE id = ?1 AND {}",
+                                SAME_OCCURRENCE
+                            ),
+                            rusqlite::params![
+                                id,
+                                claimed,
+                                next_fire_at,
+                                last_fired_at,
+                                gate_last_output
+                            ],
+                        )
+                    })
+                    .await
+            }
+            Claim::Retired => {
+                let session_id = job.session_id.to_string();
+                let kind = job.schedule.kind_str().to_string();
+                let spec = job.schedule.spec();
+                let prompt = job.prompt.clone();
+                let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
+                let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
+                let gate_permission = job.gate.as_ref().map(|gate| gate.permission.to_string());
+                let isolated = i64::from(job.isolated);
+                let created_at = job.created_at.to_rfc3339();
+                self.connection
+                    .call(move |connection| -> rusqlite::Result<_> {
+                        connection.execute(
+                            "INSERT OR IGNORE INTO scheduled_jobs (id, session_id, kind, spec, \
+                             prompt, gate_command, gate_fire, gate_last_output, gate_permission, \
+                             isolated, created_at, last_fired_at, next_fire_at) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                            rusqlite::params![
+                                id,
+                                session_id,
+                                kind,
+                                spec,
+                                prompt,
+                                gate_command,
+                                gate_fire,
+                                gate_last_output,
+                                gate_permission,
+                                isolated,
+                                created_at,
+                                last_fired_at,
+                                next_fire_at
+                            ],
+                        )
+                    })
+                    .await
+            }
+        }
+        .map_err(|error| {
+            MekaError::Database(format!("failed to restore scheduled job: {}", error))
+        })?;
+
+        // Not an error. The row can have moved on for reasons that are all fine -- the job was
+        // cancelled while the turn was being declined, or a later occurrence has since been claimed
+        // -- and in every one of them the right answer is to leave what is there alone.
+        if restored == 0 {
+            tracing::debug!(
+                "job {} was not restored: its row has moved on since the claim",
+                short_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Write `next_fire_at` verbatim, bypassing the `to_rfc3339` rendering every real writer goes
+    /// through.
+    ///
+    /// Exists so a test can plant the shape [`SAME_OCCURRENCE`]'s second arm is for. Nothing in
+    /// meka can produce a timestamp in any other form, so without this the fallback would be
+    /// unreachable from the test suite and its guarantee would rest on the comment alone.
+    #[cfg(test)]
+    pub(crate) async fn set_next_fire_at_verbatim_for_test(
         &self,
         id: &str,
-        next_fire_at: chrono::DateTime<chrono::Utc>,
+        raw: &str,
     ) -> crate::error::Result<()> {
         let id = id.to_string();
-        let next_fire_at = next_fire_at.to_rfc3339();
+        let raw = raw.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "UPDATE scheduled_jobs SET next_fire_at = ?2 WHERE id = ?1",
-                    rusqlite::params![id, next_fire_at],
+                    rusqlite::params![id, raw],
                 )?;
                 Ok(())
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to reschedule job: {}", error)))
-    }
-
-    /// Put a job back exactly as it was, for a host that turned out to be unable to run it after
-    /// the scheduler had already claimed the occurrence.
-    ///
-    /// An upsert of the whole row rather than an update of the columns that moved, because claiming
-    /// a job can *delete* it: a one-shot has no next occurrence, so it is retired the moment it
-    /// comes due, and an `UPDATE` would then match nothing while still reporting success -- losing
-    /// the reminder outright. Restoring every column also puts back `gate_last_output`, without
-    /// which a deferred `on-change` watcher would have already absorbed the very change it exists
-    /// to report.
-    pub async fn restore_scheduled_job(&self, job: &ScheduledJob) -> crate::error::Result<()> {
-        let id = job.id.clone();
-        let session_id = job.session_id.to_string();
-        let kind = job.schedule.kind_str().to_string();
-        let spec = job.schedule.spec();
-        let prompt = job.prompt.clone();
-        let gate_command = job.gate.as_ref().map(|gate| gate.command.clone());
-        let gate_fire = job.gate.as_ref().map(|gate| gate.fire.as_str().to_string());
-        let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
-        let gate_permission = job.gate.as_ref().map(|gate| gate.permission.to_string());
-        let isolated = i64::from(job.isolated);
-        let created_at = job.created_at.to_rfc3339();
-        let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
-        let next_fire_at = job.next_fire_at.to_rfc3339();
-
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT OR REPLACE INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
-                     gate_command, gate_fire, gate_last_output, gate_permission, isolated, \
-                     created_at, last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    rusqlite::params![
-                        id,
-                        session_id,
-                        kind,
-                        spec,
-                        prompt,
-                        gate_command,
-                        gate_fire,
-                        gate_last_output,
-                        gate_permission,
-                        isolated,
-                        created_at,
-                        last_fired_at,
-                        next_fire_at
-                    ],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to restore scheduled job: {}", error))
-            })
+            .map_err(|error| MekaError::Database(format!("failed to plant a timestamp: {}", error)))
     }
 
     /// Persist the gate's latest stdout so the next `on-change` evaluation has something to compare
     /// against.
-    pub async fn update_scheduled_job_gate_output(
+    ///
+    /// Guarded on the claim for the same reason [`Self::stamp_scheduled_job_fired`] is: a late
+    /// write here would overwrite the baseline a host running the *following* occurrence has
+    /// already recorded, and an `on-change` gate whose baseline goes backwards reports a change
+    /// that has already been reported.
+    pub(crate) async fn update_scheduled_job_gate_output(
         &self,
         id: &str,
+        claimed: chrono::DateTime<chrono::Utc>,
         output: &str,
     ) -> crate::error::Result<()> {
         let id = id.to_string();
+        let claimed = claimed.to_rfc3339();
         let output = output.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE scheduled_jobs SET gate_last_output = ?2 WHERE id = ?1",
-                    rusqlite::params![id, output],
+                    &format!(
+                        "UPDATE scheduled_jobs SET gate_last_output = ?3 WHERE id = ?1 AND {}",
+                        SAME_OCCURRENCE
+                    ),
+                    rusqlite::params![id, claimed, output],
                 )?;
                 Ok(())
             })
@@ -1319,6 +1523,19 @@ impl ScheduleStore {
             })
     }
 }
+
+/// The `next_fire_at` half of every claim-scoped `WHERE`, comparing `?2` against the stored column.
+///
+/// Textual equality is the fast path and is what matches in practice: every writer renders the
+/// column with `DateTime::<Utc>::to_rfc3339`, and re-rendering a value parsed back out of it
+/// reproduces the same bytes. The `julianday` arm is there so a row that reached the database any
+/// other way -- a hand-edited timestamp, a `Z` suffix, a non-UTC offset -- is still claimable
+/// rather than silently unclaimable forever, which is the shape this failure would take: the
+/// compare-and-swap would match nothing, on every sweep, and the job would simply never fire again
+/// with nothing logged. `julianday` returns `NULL` for anything it cannot parse and `NULL = NULL`
+/// is not true, so an unreadable timestamp fails closed. It compares instants at millisecond
+/// resolution, which cannot conflate two occurrences: [`MIN_EVERY`] is a second.
+const SAME_OCCURRENCE: &str = "(next_fire_at = ?2 OR julianday(next_fire_at) = julianday(?2))";
 
 /// Raw `scheduled_jobs` row, decoded into a [`ScheduledJob`] outside the database closure so parse
 /// failures can be logged and skipped individually.
@@ -2739,6 +2956,388 @@ mod tests {
                 .and_then(|gate| gate.last_output.as_deref()),
             Some("original"),
             "the baseline must be as it was, so the change still fires for the next host"
+        );
+    }
+
+    /// The arbitration between hosts, at the primitive. Two `meka serve` instances sharing a
+    /// database both read the same occurrence into their due lists; exactly one of them may move
+    /// the row off it. Before this the write was unconditional, so both advanced the row and both
+    /// went on to fire.
+    #[tokio::test]
+    async fn test_only_one_host_can_claim_an_occurrence() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+        let store = harness.manager.schedule_store();
+        let next = job.next_fire_at + chrono::Duration::hours(1);
+
+        assert!(
+            store
+                .claim_by_advancing(&job.id, job.next_fire_at, next)
+                .await
+                .expect("claim"),
+            "the first host to reach the row takes the occurrence"
+        );
+        assert!(
+            !store
+                .claim_by_advancing(&job.id, job.next_fire_at, next)
+                .await
+                .expect("claim"),
+            "and the second, still holding the copy it listed, is refused"
+        );
+        assert_eq!(
+            harness
+                .jobs()
+                .await
+                .first()
+                .map(|job| job.next_fire_at)
+                .expect("job survives"),
+            next,
+            "one advance, not two"
+        );
+    }
+
+    /// The one-shot half. Claiming "remind me in 20 minutes" is a delete, and an unconditional
+    /// `DELETE ... WHERE id = ?` reports success to every host that issues it -- so all of them
+    /// deliver the reminder one of them removed.
+    #[tokio::test]
+    async fn test_only_one_host_can_retire_a_one_shot() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+                None,
+                chrono::Duration::minutes(1),
+            )
+            .await;
+        let store = harness.manager.schedule_store();
+
+        assert!(
+            store
+                .claim_by_retiring(&job.id, job.next_fire_at)
+                .await
+                .expect("claim")
+        );
+        assert!(
+            !store
+                .claim_by_retiring(&job.id, job.next_fire_at)
+                .await
+                .expect("claim"),
+            "the row is gone, and the host that did not remove it must know"
+        );
+    }
+
+    /// What a lost claim must cost: nothing. `prepare` evaluates the gate only after the claim is
+    /// won, so a host that arrives second neither spawns the command nor produces a wakeup -- and
+    /// leaves the winner's schedule exactly as the winner wrote it.
+    ///
+    /// Observed through a side effect on the filesystem for the same reason
+    /// [`test_a_held_over_job_does_not_run_its_gate`] is: a gate that ran and was then discarded
+    /// leaves every column identical to one that never ran.
+    #[tokio::test]
+    async fn test_a_lost_claim_runs_no_gate_and_produces_no_wakeup() {
+        let harness = SchedulerHarness::new().await;
+        struct Probe(std::path::PathBuf);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
+        let guard =
+            Probe(std::env::temp_dir().join(format!("meka-claim-probe-{}", uuid::Uuid::new_v4())));
+        let probe = guard.0.clone();
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate(
+                    &format!("touch '{}'", probe.display()),
+                    GateFire::OnSuccess,
+                    None,
+                )),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+
+        // The other host gets there first, while this one is still holding the copy it listed.
+        let theirs = job.next_fire_at + chrono::Duration::hours(1);
+        assert!(
+            harness
+                .manager
+                .schedule_store()
+                .claim_by_advancing(&job.id, job.next_fire_at, theirs)
+                .await
+                .expect("the other host claims")
+        );
+
+        let wakeup = prepare(&harness.manager, &harness.config, job, Utc::now())
+            .await
+            .expect("prepare runs");
+
+        assert!(wakeup.is_none(), "a host that lost the claim does not fire");
+        assert!(!probe.exists(), "and never ran the gate command");
+        assert_eq!(
+            harness
+                .jobs()
+                .await
+                .first()
+                .map(|job| job.next_fire_at)
+                .expect("job survives"),
+            theirs,
+            "the winner's schedule is untouched"
+        );
+    }
+
+    /// The one-shot half of a lost claim. Claiming a reminder is a delete, so the host that did not
+    /// perform it holds a row that no longer exists -- and firing from that copy delivers "remind
+    /// me in 20 minutes" twice.
+    #[tokio::test]
+    async fn test_a_lost_one_shot_claim_produces_no_wakeup() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::At(Utc::now() - chrono::Duration::minutes(1)),
+                None,
+                chrono::Duration::minutes(1),
+            )
+            .await;
+        assert!(
+            harness
+                .manager
+                .schedule_store()
+                .claim_by_retiring(&job.id, job.next_fire_at)
+                .await
+                .expect("the other host claims")
+        );
+
+        let wakeup = prepare(&harness.manager, &harness.config, job, Utc::now())
+            .await
+            .expect("prepare runs");
+
+        assert!(
+            wakeup.is_none(),
+            "the reminder belongs to the host that removed it"
+        );
+    }
+
+    /// A deferral hands back the occurrence *this* host took, and nothing else. The restore used to
+    /// be a whole-row upsert applied by id, so a host that lost the claim and was then refused the
+    /// session lock overwrote the winner's `next_fire_at` with a time already in the past -- and
+    /// the job came due again on the very next tick while the winner was still running the
+    /// turn. One hourly occurrence produced three gate runs and two agent turns that way.
+    #[tokio::test]
+    async fn test_a_deferral_does_not_reach_past_its_own_claim() {
+        let harness = SchedulerHarness::new().await;
+        let planted = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+        let manager = harness.manager.clone();
+        // Where the row ends up if the restore respects the claim: a later occurrence, taken by
+        // another host while this one was deciding it could not run the turn.
+        let theirs = planted.next_fire_at + chrono::Duration::hours(9);
+
+        run_due(
+            &harness.manager,
+            &harness.config,
+            &SchedulerScope::every_job(),
+            &move |wakeup: Wakeup| {
+                let manager = manager.clone();
+                async move {
+                    let store = manager.schedule_store();
+                    let ours = store
+                        .list_all_scheduled_jobs()
+                        .await
+                        .expect("list jobs")
+                        .first()
+                        .map(|job| job.next_fire_at)
+                        .expect("the claim advanced the row");
+                    assert!(
+                        store
+                            .claim_by_advancing(&wakeup.job.id, ours, theirs)
+                            .await
+                            .expect("the other host claims the following occurrence")
+                    );
+                    FireOutcome::Deferred
+                }
+            },
+        )
+        .await
+        .expect("tick runs");
+
+        assert_eq!(
+            harness
+                .jobs()
+                .await
+                .first()
+                .map(|job| job.next_fire_at)
+                .expect("job survives"),
+            theirs,
+            "the deferral must not drag the row back onto an occurrence another host owns"
+        );
+    }
+
+    /// The two writes that come *after* a claim carry the claimed time as a guard, and this is what
+    /// that guard buys. A short interval with a slow gate leaves the claimed time already in the
+    /// past by the time the gate returns, so another host can legitimately be running the following
+    /// occurrence -- and an unguarded write would stamp this host's fire onto that host's row and
+    /// drag the `on-change` baseline back to a value it has already reported on.
+    #[tokio::test]
+    async fn test_a_late_write_does_not_land_on_another_hosts_occurrence() {
+        let harness = SchedulerHarness::new().await;
+        let planted = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate("echo state", GateFire::OnChange, None)),
+                chrono::Duration::minutes(5),
+            )
+            .await;
+        let store = harness.manager.schedule_store();
+
+        let ours = planted.next_fire_at + chrono::Duration::hours(1);
+        assert!(
+            store
+                .claim_by_advancing(&planted.id, planted.next_fire_at, ours)
+                .await
+                .expect("claim")
+        );
+        // The following occurrence, taken by another host while this one's gate is still running.
+        let theirs = ours + chrono::Duration::hours(1);
+        assert!(
+            store
+                .claim_by_advancing(&planted.id, ours, theirs)
+                .await
+                .expect("the other host claims")
+        );
+        store
+            .update_scheduled_job_gate_output(&planted.id, theirs, "theirs")
+            .await
+            .expect("the other host records its baseline");
+
+        // This host finally finishes, and writes against the occurrence it claimed.
+        store
+            .stamp_scheduled_job_fired(&planted.id, Utc::now(), ours)
+            .await
+            .expect("stamp");
+        store
+            .update_scheduled_job_gate_output(&planted.id, ours, "ours")
+            .await
+            .expect("record baseline");
+
+        let jobs = harness.jobs().await;
+        let job = jobs.first().expect("job survives");
+        assert_eq!(
+            job.gate
+                .as_ref()
+                .and_then(|gate| gate.last_output.as_deref()),
+            Some("theirs"),
+            "a late baseline must not overwrite the one the current occurrence's host recorded"
+        );
+        assert!(
+            job.last_fired_at.is_none(),
+            "and a late stamp must not land on a row another host owns"
+        );
+    }
+
+    /// The fallback arm of [`SAME_OCCURRENCE`]. Every writer in meka renders the column with
+    /// `to_rfc3339`, so the textual comparison matches in practice -- but a row that reached the
+    /// database any other way must still be claimable. The failure this guards against is the
+    /// quietest one available: a compare-and-swap that matches nothing on every sweep, forever,
+    /// with the job simply never firing again and not a line said about it.
+    #[tokio::test]
+    async fn test_a_timestamp_stored_in_another_shape_is_still_claimable() {
+        let harness = SchedulerHarness::new().await;
+        let planted = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::minutes(5),
+            )
+            .await;
+        let store = harness.manager.schedule_store();
+        // The same instant, written the way something that is not meka would write it.
+        let raw = planted
+            .next_fire_at
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        store
+            .set_next_fire_at_verbatim_for_test(&planted.id, &raw)
+            .await
+            .expect("plant the timestamp");
+
+        let due = store
+            .list_due_scheduled_jobs(Utc::now())
+            .await
+            .expect("list due");
+        let job = due.first().expect("still due");
+        assert!(
+            store
+                .claim_by_advancing(
+                    &job.id,
+                    job.next_fire_at,
+                    job.next_fire_at + chrono::Duration::hours(1)
+                )
+                .await
+                .expect("claim"),
+            "a job whose timestamp is not in meka's own shape must still be claimable"
+        );
+    }
+
+    /// A job that really fires records that it fired, and a recurring one past the grace period is
+    /// rescheduled rather than deleted.
+    ///
+    /// Two mutations survived the whole suite, including the cross-process tests. Emptying the
+    /// `stamp_scheduled_job_fired` call at the end of `prepare` changed nothing any test could see
+    /// -- the store method has its own test, and nothing checked that `prepare` calls it -- so
+    /// every job would have read as never-fired in `meka schedule list` and an interval schedule
+    /// would re-anchor on `created_at` after a restart and replay everything since.
+    ///
+    /// And `if !recurring && past_grace` still passed with the `!recurring` term forced true. The
+    /// comment says "Recurring jobs need no equivalent rule"; `DEFAULT_MISSED_GRACE` is 24 hours
+    /// and the latest fixture in the suite is 6 hours overdue, so the term was never the deciding
+    /// factor. A laptop shut for a weekend would have had every recurring job silently retired.
+    #[tokio::test]
+    async fn a_fire_is_recorded_and_a_long_outage_does_not_retire_a_recurring_job() {
+        let harness = SchedulerHarness::new().await;
+        // Well past `DEFAULT_MISSED_GRACE`, which is what makes the `!recurring` term the only
+        // thing standing between this job and deletion.
+        let planted = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::days(3),
+            )
+            .await;
+
+        let wakeup = prepare(&harness.manager, &harness.config, planted, Utc::now())
+            .await
+            .expect("prepare runs");
+
+        assert!(
+            wakeup.is_some(),
+            "a recurring job is never past a grace period: its occurrences are one interval apart"
+        );
+        let job = harness
+            .jobs()
+            .await
+            .first()
+            .cloned()
+            .expect("and the row survives rather than being retired");
+        assert!(
+            job.last_fired_at.is_some(),
+            "a job that fires has to record it, or a restart re-anchors on `created_at` and \
+             replays every occurrence since"
+        );
+        assert!(
+            job.next_fire_at > Utc::now(),
+            "and be scheduled forward rather than left due"
         );
     }
 

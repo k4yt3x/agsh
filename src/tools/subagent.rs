@@ -605,7 +605,7 @@ impl Tool for AgentSpawnTool {
 
         // Create the sub-agent's own DB session, linked back to the parent via `parent_session_id`.
         // Cascade-on-delete in `delete_session` sweeps it when the parent is removed.
-        let sub_session_id = self
+        let (sub_session_id, sub_session_lock) = self
             .tool_builder_params
             .session_manager
             .create_child_session(parent_sid, Some(sub_cwd_snapshot.clone()), Some(spec_json))
@@ -614,6 +614,23 @@ impl Tool for AgentSpawnTool {
                 tool_name: "agent_spawn".to_string(),
                 message: format!("failed to create sub-agent session: {}", error),
             })?;
+        // Held for the whole of the worker's run, then released with this scope. A sub-agent's row
+        // used to be locked by nothing at all, so a concurrent `meka session delete --all` could
+        // take it and cascade the conversation away mid-turn. A failure to claim is a warning
+        // rather than a refusal, matching the primary agent's own creation path: the id is one
+        // nobody else can be holding, so the only way here is a filesystem problem, and refusing to
+        // spawn over that would break installations that work today.
+        let _sub_session_lock = match sub_session_lock {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                tracing::warn!(
+                    "sub-agent session {} is running unlocked: {}",
+                    sub_session_id,
+                    error
+                );
+                None
+            }
+        };
         tracing::info!(
             "spawning sub-agent {} for parent {}",
             sub_session_id,
@@ -1152,6 +1169,25 @@ impl Tool for AgentFollowupTool {
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
 
+        // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
+        // against a row nothing else claims, so without this the worker sat unlocked for seconds to
+        // minutes and a concurrent `meka session delete --all` could take it and cascade the
+        // conversation away mid-run -- the same exposure `create_child_session` closed for spawn,
+        // still open on the sibling door.
+        //
+        // A refusal here, where spawn only warns, and the asymmetry is the point: spawn's id is
+        // brand new, so a failure can only be a filesystem problem, while this id already exists
+        // and a refusal genuinely means somebody else is running a turn on this worker. Two turns
+        // interleaved into one conversation is the thing the lock is for.
+        let _worker_lock = self
+            .tool_builder_params
+            .session_manager
+            .lock_session(agent_id)
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: format!("cannot follow up on sub-agent {}: {}", agent_id, error),
+            })?;
+
         let mut session_id_opt = Some(agent_id);
         crate::provider::scope_subagent(sub_agent.run_turn(
             &mut session_id_opt,
@@ -1581,12 +1617,22 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
     for memory in memories {
         // Sanitised at the boundary, like the primary agent's index: the store hands back stored
         // bytes, and this is a worker's context.
+        //
+        // Elided too, which the parent's index and both search renderers already did and this one
+        // did not. Descriptions are unbounded at the write door, so a single 4,000-character one
+        // at the top of the store exceeded the whole budget on its own.
         let line = format!(
             "- **{}**: {}\n",
             memory.name,
-            crate::memory::render_description_for_model(&memory.description)
+            crate::store::elide_description_for_index(
+                &crate::memory::render_description_for_model(&memory.description)
+            )
         );
-        if out.len() + line.len() > SUBAGENT_MEMORY_INDEX_MAX_BYTES {
+        // Always emit the first, for the same reason `render_hits` does. The elide above is what
+        // actually makes a collapse to zero entries unreachable -- `MAX_DESCRIPTION_CHARS` bounds
+        // one line far below this budget -- so this branch is the belt to that brace, and holds if
+        // that bound ever moves. It is deliberately not something the tests can distinguish.
+        if shown > 0 && out.len() + line.len() > SUBAGENT_MEMORY_INDEX_MAX_BYTES {
             break;
         }
         out.push_str(&line);
@@ -2329,6 +2375,73 @@ mod tests {
 
     /// End to end: a worker spawned while the session was at Write must not still be at Write after
     /// the user restricts the session to Read. Asserted through the worker's registry rather than
+    /// A follow-up holds the worker's session for the length of its turn.
+    ///
+    /// `agent_spawn` gained this and `agent_followup` did not, which left the exposure open on the
+    /// door that reaches an *existing* worker: a follow-up runs a full turn against a row nothing
+    /// claims, for seconds to minutes, and a concurrent `meka session delete --all` takes the lock
+    /// nobody holds and cascades the conversation away. The follow-up's next message insert then
+    /// dies on a foreign-key violation with the worker's output lost.
+    ///
+    /// Refused rather than warned, unlike spawn: this id already exists, so a lock it cannot take
+    /// genuinely means somebody else is running a turn on this worker, and two turns interleaved
+    /// into one conversation is the thing the lock is for.
+    #[tokio::test]
+    async fn a_followup_is_refused_while_something_else_holds_the_worker() {
+        let session_manager = test_session_manager().await;
+        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
+        let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
+        // Never reached: the refusal happens before any turn runs, which is the point.
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("unreachable"),
+            ]));
+        // The claim `create_child_session` takes *is* the contention: holding it here is exactly
+        // what a second meka looks like from the follow-up's side, since `flock` conflicts across
+        // open file descriptions rather than across processes.
+        // A real spec, or the follow-up refuses at the resumability check before it ever reaches
+        // the lock.
+        let spec = SubagentSpec {
+            permission: Permission::Read,
+            enabled_permissions: vec![Permission::Read],
+            denied_servers: Vec::new(),
+            denied_tools: Vec::new(),
+            memory: MemoryAccess::None,
+            instructions: InstructionAccess::None,
+            inherited_scratchpad: Vec::new(),
+            remaining_depth: 0,
+            absolute_depth: 1,
+        };
+        let (worker, held) = session_manager
+            .create_child_session(
+                parent_sid,
+                None,
+                Some(serde_json::to_string(&spec).expect("serialize the spec")),
+            )
+            .await
+            .expect("child");
+        let _held = held.expect("the spawn's own claim");
+
+        let followup = AgentFollowupTool {
+            provider: Arc::clone(&provider),
+            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            tool_builder_params: params.clone(),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        let refused = followup
+            .execute(
+                serde_json::json!({ "agent": worker.to_string(), "prompt": "carry on" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a worker somebody else is running must not be run again");
+        assert!(
+            refused.to_string().contains("cannot follow up"),
+            "and the refusal has to name the worker: {refused}"
+        );
+    }
+
     /// its spec, since the registry is what actually decides what it can do.
     #[tokio::test]
     async fn test_followup_drops_a_worker_when_the_session_is_restricted() {
@@ -2380,7 +2493,8 @@ mod tests {
                 Some(serde_json::to_string(&spec).expect("encode")),
             )
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         // The session is then restricted to Read, as `/permission` or Shift+Tab would.
         let restricted = SharedPermission::new(
@@ -2463,7 +2577,8 @@ mod tests {
                 Some(serde_json::to_string(&spec).expect("encode")),
             )
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         let followup = AgentFollowupTool {
             provider,
@@ -2865,6 +2980,41 @@ mod tests {
         assert!(rendered.contains("memory_search"), "and how to reach them");
     }
 
+    /// One enormous description must not empty a granted worker's whole index.
+    ///
+    /// Descriptions are unbounded at the write door, and this was the one memory render that did
+    /// not elide them. With the budget checked before *every* push and nothing exempt, a single
+    /// 4,000-character description at the top of the store produced a header promising memories
+    /// followed by "N more not listed here" -- in a worker that had been deliberately granted
+    /// access to them. The parent's index and both search renderers already guarded both halves.
+    #[test]
+    fn one_enormous_description_does_not_empty_the_subagent_index() {
+        let mut memories = vec![test_memory("enormous", 1, &"x".repeat(4_000))];
+        memories.extend(
+            (0..3).map(|n| test_memory(&format!("ordinary-{n}"), 3, "a short description")),
+        );
+
+        let rendered = render_subagent_memory_index(&memories);
+
+        assert!(
+            rendered.contains("**enormous**"),
+            "the first entry is always emitted: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&"x".repeat(4_000)),
+            "and its description is elided rather than carried whole"
+        );
+        assert!(
+            rendered.contains("**ordinary-0**"),
+            "which leaves room for the rest of the store: {rendered}"
+        );
+        assert!(
+            rendered.len() <= SUBAGENT_MEMORY_INDEX_MAX_BYTES + 200,
+            "budget still respected: {} bytes",
+            rendered.len()
+        );
+    }
+
     /// The grant reaches the prompt, and its absence leaves no trace of the section.
     #[test]
     fn test_system_prompt_carries_instructions_only_when_granted() {
@@ -2956,7 +3106,8 @@ mod tests {
                 Some(r#"{"permission":"read"}"#.to_string()),
             )
             .await
-            .expect("child");
+            .expect("child")
+            .0;
         let params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
@@ -3018,7 +3169,8 @@ mod tests {
                 Some(r#"{"permission":"read"}"#.to_string()),
             )
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         let tool_result = Event::Append(Message {
             role: Role::User,
@@ -3233,7 +3385,8 @@ mod tests {
         let child = session_manager
             .create_child_session(owner, None, Some("{\"permission\":\"read\"}".to_string()))
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
@@ -3293,7 +3446,8 @@ mod tests {
         let child = session_manager
             .create_child_session(parent_sid, None, None)
             .await
-            .expect("child");
+            .expect("child")
+            .0;
 
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![

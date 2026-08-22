@@ -136,9 +136,9 @@ pub struct SessionEntry {
     /// cancellation is the worse failure of the two.
     pub cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Held only for its Drop side-effect (releasing the per-session OS file lock on session
-    /// eviction). See `SessionLock` at `src/session.rs:76`.
+    /// eviction). See `FileLock` at `src/session.rs:76`.
     #[allow(dead_code, reason = "RAII guard: held for Drop, never read")]
-    pub session_lock: Arc<crate::session::SessionLock>,
+    pub session_lock: Arc<crate::session::FileLock>,
     /// Number of turns currently executing on this session. Bumped + decremented via
     /// [`TurnGuard`]. The GC scanner consults this so a long-running turn whose previous
     /// `last_turn_at` is older than the idle timeout can't be evicted out from under itself.
@@ -184,15 +184,28 @@ impl SessionEntry {
         *super::poisoned::write(&self.updated_at, "session::touch::updated_at") = now_wall;
     }
 
-    /// True iff `last_turn_at` is older than the configured idle timeout *and* no turn is
-    /// currently in flight. Used by the GC scanner. `0` timeout disables eviction (always
-    /// returns false). The in-flight check ensures a long-running turn whose previous
-    /// `last_turn_at` is stale never gets evicted out from under itself.
-    pub fn is_idle(&self, timeout: Duration) -> bool {
+    /// True iff `last_turn_at` is older than the configured idle timeout, no turn is currently in
+    /// flight, and no background task this session started is still running. Used by the GC
+    /// scanner. `0` timeout disables eviction (always returns false).
+    ///
+    /// The in-flight check keeps a long-running turn whose previous `last_turn_at` is stale from
+    /// being evicted out from under itself. The background check is the same idea for work that
+    /// outlives the turn that started it: a session with no turn running still owns every detached
+    /// command it launched, and evicting the entry drops its [`crate::session::FileLock`] while
+    /// those keep going. What follows is not a leak but a lie -- the next host to open the session
+    /// finds `running` rows with no live holder, tells the model the work "was interrupted", and
+    /// then discards the real outcome when it arrives, because
+    /// `BackgroundStore::finish_background_task` only writes a terminal state over `running`.
+    /// Measured with two servers: task reported interrupted, `outcome` null, and the command's own
+    /// proof file on disk saying it had finished.
+    pub async fn is_idle(&self, timeout: Duration) -> bool {
         if timeout.is_zero() {
             return false;
         }
         if self.in_flight.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        if self.background_tasks.running_count(self.session_uuid).await > 0 {
             return false;
         }
         let last = *super::poisoned::read(&self.last_turn_at, "session::is_idle");

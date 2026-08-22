@@ -121,6 +121,16 @@ it is the only host that honours the flag. If you have a REPL open on the same s
 time, though, either host may take a given occurrence, and the REPL will run it in your conversation
 with a warning. Run isolated jobs under `meka serve` alone if you want the flag respected every time.
 
+### More than one host on the same database
+
+Several meka processes pointed at one data directory — two `meka serve` instances, or a daemon and
+a terminal — all poll the same table, so the same occurrence appears in several due lists at once.
+Each occurrence is nevertheless run once. A host takes it by moving the job's next fire time off
+the value it read, in a single conditional write, and the hosts that lose that write stop before
+evaluating the gate: no duplicate shell command, no duplicate turn, no duplicate isolated session.
+Which host wins is a race between their tickers and is not something you can pin down; that only
+one wins is.
+
 Under ACP the editor is a live client, which changes one thing: `ask`-mode approvals genuinely
 round-trip, so a scheduled job can prompt you in the editor rather than being denied for want of
 anybody to ask. Stopping a scheduled turn works the same as stopping any other.

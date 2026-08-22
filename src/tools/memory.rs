@@ -6,9 +6,16 @@
 //! read permission permanently. Gating them at `Write` would mean an agent that can never remember
 //! anything, which defeats the feature.
 //!
-//! [`crate::memory::validate_memory_name`] is still checked at every door. The name is no longer a
-//! path, so it is no longer a file-write primitive, but it is what `meka memory export` turns into
-//! a file name and it is text the model reads in every turn's index.
+//! [`crate::memory::validate_memory_name`] is checked at every door that *writes* a name. The name
+//! is no longer a path, so it is no longer a file-write primitive, but it is what
+//! `meka memory export` turns into a file name and it is text the model reads in every turn's
+//! index.
+//!
+//! The doors that only *look a name up* -- `memory_read` and `memory_delete` -- check
+//! [`crate::memory::validate_memory_lookup`] instead, which bounds the length and nothing else.
+//! Applying the write rule to them meant a row that reached the column past the tools was listed
+//! to the model in the `[Memory]` index and then refused by every door that could have opened or
+//! removed it, with `meka memory export` refusing the whole store on its account.
 
 use std::sync::Arc;
 
@@ -122,6 +129,17 @@ impl Tool for MemoryWriteTool {
             message,
         })?;
         let description = require_str(&input, "description", "memory_write")?;
+        // `require_str` rejects whitespace, which is not the same question. Format characters are
+        // not whitespace, so a description of three zero-width spaces got past every write door and
+        // then rendered as nothing at all -- the model would be told it had saved a note whose
+        // description is blank in the index it reads every turn.
+        if !memory::description_says_something(description) {
+            return Err(MekaError::ToolExecution {
+                tool_name: "memory_write".to_string(),
+                message: "'description' renders as nothing once formatting characters are stripped"
+                    .to_string(),
+            });
+        }
         // An absent `body` means "leave it alone", not "make it empty". The schema has always
         // marked the field optional, so the call that changes only a priority is one the tool
         // invites -- and rendering the absence as `""` made that call silently delete everything
@@ -380,7 +398,7 @@ impl Tool for MemoryReadTool {
         // per stored name with no bound on the argument -- measured at 11 s for a 200,000-character
         // name against 200 memories, and 48 s against 20,000, synchronously on a runtime worker
         // with the cancellation token ignored. Capping the name at 64 characters closes that.
-        memory::validate_memory_name(name).map_err(|message| MekaError::ToolExecution {
+        memory::validate_memory_lookup(name).map_err(|message| MekaError::ToolExecution {
             tool_name: "memory_read".to_string(),
             message,
         })?;
@@ -430,6 +448,26 @@ impl Tool for MemoryReadTool {
         // observation, and detail that was true months ago is exactly what gets asserted as
         // current fact without a nudge.
         let age = memory::render_age(entry.recorded_at, std::time::SystemTime::now());
+        // Bounded, and said when it is. This was the one memory render with no ceiling on it, so a
+        // 200 KB note arrived whole into the window -- and the two search tiers both go to the
+        // trouble of excerpting precisely so this call is the deliberate way to spend that. A cut
+        // the reader is not told about is the worse half: a truncated note reads as a complete one
+        // whose author simply stopped.
+        let body = memory::render_for_model(entry.body.as_deref().unwrap_or_default());
+        let body = body.trim();
+        let rendered = match body.chars().count() {
+            // Not an error and not silence. A memory whose whole content is its description is a
+            // normal thing to write; rendering nothing after the header left the model to read the
+            // gap as a failed load and call again.
+            0 => "(no body: this memory's description is all of it)".to_string(),
+            length if length > READ_BODY_MAX_CHARS => format!(
+                "{}\n\n[Body truncated: {} of {} characters shown.]",
+                crate::context::clip_chars(body, READ_BODY_MAX_CHARS),
+                READ_BODY_MAX_CHARS,
+                length
+            ),
+            _ => body.to_string(),
+        };
         Ok(ToolOutput::text(
             format!(
                 "# {}\n\n{}\n\nSaved {}. This is what you recorded then, not live state; verify \
@@ -437,7 +475,7 @@ impl Tool for MemoryReadTool {
                 entry.name,
                 memory::render_description_for_model(&entry.description),
                 age,
-                memory::render_for_model(entry.body.as_deref().unwrap_or_default()).trim()
+                rendered
             ),
             false,
         ))
@@ -458,6 +496,14 @@ const MAX_SEARCH_LIMIT: usize = 25;
 /// Most memories are shorter than this, which is the point: the common recall becomes one round
 /// trip rather than a search followed by a `memory_read` per hit.
 const INLINE_BODY_MAX_CHARS: usize = 800;
+
+/// Ceiling on a body `memory_read` renders.
+///
+/// Generous, because this call is how the agent deliberately spends context on one note and a
+/// bound that fights that is worse than none. It exists because *no* bound at all was the one
+/// unbudgeted memory render: both search tiers excerpt so that this is the considered way to load a
+/// note in full, and a 200 KB body reaching the window through it undid the whole arrangement.
+const READ_BODY_MAX_CHARS: usize = 16_000;
 
 /// Ceiling on the whole rendered result, inlined bodies included.
 const SEARCH_RESULT_MAX_BYTES: usize = 6_144;
@@ -516,7 +562,7 @@ impl Tier {
             Tier::Substring => {
                 "No word matches. These contain what you asked for as a literal \
                              substring, which is how text the word splitter does not divide -- \
-                             Chinese, Japanese, Thai, an identifier, a URL -- is found.\n\n"
+                             Chinese, Japanese, Thai, an identifier, a serial number -- is found.\n\n"
             }
             Tier::Fuzzy => {
                 "No full-text matches. These are the closest memory names and \
@@ -550,6 +596,10 @@ impl MemorySearchTool {
             let mut best = usize::MAX;
             for term in terms {
                 let threshold = fuzzy_threshold(term);
+                // Hoisted: this is invariant across the word loop, and the pre-filter below exists
+                // precisely to be O(1) per pair. Computing it inside cost ~13x on the path whose
+                // own comment cites 14 s and 93 s measurements.
+                let term_chars = term.chars().count();
                 for word in haystack.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     if word.is_empty() {
                         continue;
@@ -559,7 +609,15 @@ impl MemorySearchTool {
                     // pasted blob -- a stack trace, base64, a URL, exactly what produces an
                     // all-tiers miss and reaches this code -- cost 14 s against 200 memories and
                     // 93 s against 20,000, on a runtime worker, uncancellable.
-                    if term.len().abs_diff(word.len()) > threshold {
+                    //
+                    // Counted in *characters*, because `fuzzy_threshold` and `edit_distance` both
+                    // are. Comparing `len()` measured bytes against a character threshold, which
+                    // is the same number only for ASCII: for any other script the filter threw
+                    // away candidates that were inside the threshold. `東京都` against a stored
+                    // `東京` is one edit apart and three bytes apart, so a store holding it
+                    // answered "No memories matched" where the same shape in Latin script found
+                    // its near-miss.
+                    if term_chars.abs_diff(word.chars().count()) > threshold {
                         continue;
                     }
                     let distance = crate::tools::edit_distance(term, word);
@@ -713,7 +771,10 @@ impl Tool for MemorySearchTool {
 
         let now = std::time::SystemTime::now();
         if !results.hits.is_empty() {
-            return Ok(ToolOutput::text(render_hits(tier, &results, now), false));
+            return Ok(ToolOutput::text(
+                render_hits(tier, &results, limit, now),
+                false,
+            ));
         }
 
         // Only now is the whole index loaded: the tiers above answer from SQL, and this one is
@@ -742,7 +803,12 @@ impl Tool for MemorySearchTool {
 }
 
 /// Render ranked hits: one entry per memory, with its body inlined when short enough.
-fn render_hits(tier: Tier, results: &SearchResults, now: std::time::SystemTime) -> String {
+fn render_hits(
+    tier: Tier,
+    results: &SearchResults,
+    limit: usize,
+    now: std::time::SystemTime,
+) -> String {
     use std::fmt::Write as _;
 
     let hits = &results.hits;
@@ -841,11 +907,16 @@ fn render_hits(tier: Tier, results: &SearchResults, now: std::time::SystemTime) 
             } else {
                 ""
             },
-            // Naming the constraint that actually bound. "raise `limit`" was printed even when
-            // `limit` was already at its maximum and the byte budget had done the cutting, which
-            // hands the model a remedy that provably returns the identical result.
+            // Naming the constraint that actually bound, and only offering a remedy that can
+            // work. "raise `limit`" was printed when the byte budget had done the cutting, and
+            // again when `limit` was already at `MAX_SEARCH_LIMIT` -- both times handing the model
+            // a remedy that provably returns the identical result. A `limit` above the maximum is
+            // clamped on the way in, so a caller who asked for 100 and got 25 is in the second
+            // case without having done anything wrong.
             if budget_bound {
                 "; the result hit its size limit, so narrow the query."
+            } else if limit >= MAX_SEARCH_LIMIT {
+                "; `limit` is already at its maximum, so narrow the query."
             } else {
                 "; raise `limit` or narrow the query."
             }
@@ -941,7 +1012,7 @@ impl Tool for MemoryDeleteTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_delete")?;
-        memory::validate_memory_name(name).map_err(|message| MekaError::ToolExecution {
+        memory::validate_memory_lookup(name).map_err(|message| MekaError::ToolExecution {
             tool_name: "memory_delete".to_string(),
             message,
         })?;
@@ -990,33 +1061,159 @@ mod tests {
             .collect()
     }
 
-    /// `memory_read` refuses a name meka would not accept, rather than searching for it.
+    /// The spelling tier's length pre-filter counts characters, as the distance it guards does.
     ///
-    /// The module doc claims `validate_memory_name` is checked at every door; this was the one that
-    /// did not. Two consequences: an invalid name was reported as merely absent, and the miss path
-    /// loads the whole index and runs an edit distance per stored name against an unbounded
-    /// argument -- 11 s for a 200,000-character name against 200 memories, 48 s against 20,000,
-    /// synchronously on a runtime worker with the cancellation token ignored.
+    /// It compared `term.len()` -- bytes -- against a threshold `fuzzy_threshold` and
+    /// `edit_distance` both express in characters. The two are the same number only for ASCII, so
+    /// for every other script the filter discarded candidates that were inside the threshold and
+    /// the tier answered "No memories matched". `東京都` is one edit from a stored `東京` and three
+    /// bytes from it; the Latin-script shape of the same query found its near-miss all along,
+    /// which is what made this invisible.
     #[tokio::test]
-    async fn a_read_of_an_impossible_name_is_refused_rather_than_searched_for() {
+    async fn the_spelling_tier_measures_a_near_miss_in_characters_not_bytes() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        for (name, description) in [("office", "東京 rollout plan"), ("abc-note", "abc rollout")]
+        {
+            write
+                .execute(
+                    serde_json::json!({ "name": name, "description": description }),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("write");
+        }
+        let search = MemorySearchTool { memories };
+
+        // The Latin control: one edit, one byte, found before and after.
+        let latin = output_text(
+            &search
+                .execute(
+                    serde_json::json!({"queries": ["abcd"]}),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("search"),
+        );
+        assert!(latin.contains("abc-note"), "the premise: {latin}");
+
+        // One edit, three bytes. Every earlier tier is blind to it: `unicode61` makes a CJK run a
+        // single token so no `MATCH` can reach it, and `LIKE '%東京都%'` cannot match a shorter
+        // stored string. The spelling tier is the only thing left.
+        let cjk = output_text(
+            &search
+                .execute(
+                    serde_json::json!({"queries": ["東京都"]}),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("search"),
+        );
+        assert!(
+            cjk.contains("office"),
+            "a near-miss must be measured in the same unit as the threshold that admits it: {cjk}"
+        );
+    }
+
+    /// A description made only of formatting characters is not a description.
+    ///
+    /// Every write door asked `trim().is_empty()`, which is a question about whitespace; zero-width
+    /// spaces are not whitespace. Three of them were accepted, reported as a plain success, and
+    /// then rendered as nothing at all -- `- **name** (p5, today): ` in the index the model reads
+    /// every turn, a blank cell in `meka memory list`, a blank line in `memory_search`. The model
+    /// is told it saved a note that says nothing.
+    #[tokio::test]
+    async fn a_description_of_only_formatting_characters_is_refused() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+
+        let refused = write
+            .execute(
+                serde_json::json!({"name": "invisible", "description": "\u{200b}\u{200b}\u{200b}"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a description that renders as nothing must not be stored");
+        assert!(
+            refused.to_string().contains("renders as nothing"),
+            "and the refusal has to name the reason: {refused}"
+        );
+        assert!(
+            memories.get("invisible").await.expect("get").is_none(),
+            "nothing was written"
+        );
+    }
+
+    /// `memory_read` bounds the name it is given, and finds a row whose name meka would not write.
+    ///
+    /// Two rules that used to be one. The bound is real work: the miss path loads the whole index
+    /// and runs an edit distance per stored name, measured at 11 s for a 200,000-character
+    /// argument against 200 memories and 48 s against 20,000 -- synchronously, on a runtime
+    /// worker, ignoring the cancellation token.
+    ///
+    /// The *character class* is not this door's business, and applying it here wedged the store.
+    /// A row whose name reached the column past the tools is listed to the model in the `[Memory]`
+    /// index every turn, and was then refused by `memory_read`, `memory_delete`,
+    /// `meka memory remove` and `DELETE /v1/memory/{name}` alike, while `meka memory export`
+    /// refused the whole store on its account -- and the remedy that refusal printed validated the
+    /// name too, so it failed identically. Nothing meka shipped could open or remove it.
+    #[tokio::test]
+    async fn memory_read_bounds_a_name_without_demanding_one_it_would_have_written() {
         let memories = store().await;
         let read = MemoryReadTool {
             memories: memories.clone(),
         };
-        for name in ["../../etc/passwd", &"x".repeat(200_000)] {
-            let error = read
+
+        let refused = read
+            .execute(
+                serde_json::json!({ "name": "x".repeat(200_000) }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an unbounded name must be refused before it reaches the miss path");
+        assert!(
+            !refused.to_string().contains("no memory named"),
+            "the bound has to refuse, not search: {refused}"
+        );
+
+        // Straight at the column, which is the only way to produce this.
+        memories
+            .plant_row_for_test("legacy.note", "from an older meka")
+            .await
+            .expect("plant the row");
+
+        let found = output_text(
+            &read
                 .execute(
-                    serde_json::json!({ "name": name }),
+                    serde_json::json!({ "name": "legacy.note" }),
                     CancellationToken::new(),
                 )
                 .await
-                .expect_err("an impossible name must be refused");
-            let message = error.to_string();
-            assert!(
-                !message.contains("no memory named"),
-                "an invalid name is not the same answer as an absent one: {message}"
-            );
-        }
+                .expect("a row the index shows the model must be one it can open"),
+        );
+        assert!(found.contains("from an older meka"), "{found}");
+
+        // And it can be got rid of, which is what makes the store unwedgeable.
+        assert!(
+            MemoryDeleteTool {
+                memories: memories.clone(),
+            }
+            .execute(
+                serde_json::json!({ "name": "legacy.note" }),
+                CancellationToken::new()
+            )
+            .await
+            .is_ok(),
+            "and one it can remove"
+        );
+        assert!(
+            memories.get("legacy.note").await.expect("get").is_none(),
+            "the row is really gone, not merely reported gone"
+        );
     }
 
     /// `memory_write` stores a one-line description, as the CLI and the HTTP door do.
@@ -1234,13 +1431,13 @@ mod tests {
     ///
     /// `Hit` is built straight from the columns rather than through the store's row reader, so
     /// `memory_search` was the one door where a description reached the model unfiltered -- and a
-    /// description is exactly what `import-memory-store.py` will carry in verbatim from a
-    /// hand-authored file. The index, the search tiers and the spelling tier are three separate
-    /// renderers and each needs its own guard.
+    /// description is exactly the field a row written past the tools carries verbatim. The index,
+    /// the search tiers and the spelling tier are three separate renderers, each needing its own
+    /// guard.
     #[tokio::test]
     async fn no_render_path_lets_an_unsanitised_description_reach_the_model() {
         let memories = store().await;
-        // Written past the tools, the way the import script writes: provenance is the point.
+        // Written past the tools, straight to the column: provenance is the point.
         memories
             .write(crate::memory::store::WriteRequest {
                 name: "planted".to_string(),
@@ -1385,28 +1582,42 @@ mod tests {
         }
     }
 
+    /// `memory_delete` bounds the name it is given, and reports a name it simply does not hold as
+    /// absent rather than malformed.
+    ///
+    /// This used to assert that `../escape` was *rejected*, which is a rule the lookup/write split
+    /// deliberately removed -- a name meka would not write must still be removable, or the row is
+    /// unreachable through every door at once. The assertion kept passing afterwards, but through
+    /// the missing-row branch its own second half already covered, so deleting the bound outright
+    /// left the suite green. What is left is the half that is still a rule.
     #[tokio::test]
-    async fn test_delete_rejects_traversal_and_missing() {
+    async fn memory_delete_bounds_its_name_and_reports_a_miss_as_a_miss() {
         let delete = MemoryDeleteTool {
             memories: store().await,
         };
+
+        let unbounded = delete
+            .execute(
+                serde_json::json!({ "name": "x".repeat(200_000) }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an unbounded name must be refused");
         assert!(
-            delete
-                .execute(
-                    serde_json::json!({"name": "../escape"}),
-                    CancellationToken::new()
-                )
-                .await
-                .is_err()
+            unbounded.to_string().contains("exceeds"),
+            "and refused for its length, not reported as merely absent: {unbounded}"
         );
+
+        let absent = delete
+            .execute(
+                serde_json::json!({"name": "../escape"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a name the store does not hold is still an error");
         assert!(
-            delete
-                .execute(
-                    serde_json::json!({"name": "absent"}),
-                    CancellationToken::new()
-                )
-                .await
-                .is_err()
+            absent.to_string().contains("no memory named"),
+            "but it is a miss, not a malformed name: {absent}"
         );
     }
 
@@ -1499,6 +1710,132 @@ mod tests {
             output_text(&hit).contains("output-style"),
             "{:?}",
             hit.content
+        );
+    }
+
+    /// Every remedy the search offers has to be one that can work.
+    ///
+    /// "raise `limit`" was printed when `limit` was already at [`MAX_SEARCH_LIMIT`], and a caller
+    /// who asked for more than that is clamped on the way in -- so the model was handed an action
+    /// that provably returns the identical result, and a model that follows instructions takes it.
+    #[tokio::test]
+    async fn a_capped_search_does_not_advise_raising_a_limit_that_is_already_at_its_maximum() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        for index in 0..(MAX_SEARCH_LIMIT + 5) {
+            write
+                .execute(
+                    serde_json::json!({
+                        "name": format!("note-{index:02}"),
+                        "description": format!("deployment note {index}"),
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("write");
+        }
+        let search = MemorySearchTool { memories };
+
+        // Asking for more than the maximum is clamped, so this caller is at the ceiling without
+        // having typed the ceiling.
+        let capped = search
+            .execute(
+                serde_json::json!({"queries": ["deployment"], "limit": 100}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        let text = output_text(&capped);
+        assert!(
+            text.contains("further match"),
+            "the premise: something was cut: {text}"
+        );
+        assert!(
+            !text.contains("raise `limit`"),
+            "`limit` is already at its maximum, so raising it is not a remedy: {text}"
+        );
+
+        // Below the ceiling it still is one.
+        let room = search
+            .execute(
+                serde_json::json!({"queries": ["deployment"], "limit": 2}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("search");
+        assert!(
+            output_text(&room).contains("raise `limit`"),
+            "{:?}",
+            room.content
+        );
+    }
+
+    /// `memory_read` is the one memory render with no ceiling on it, which is the whole reason both
+    /// search tiers excerpt: this call is meant to be the deliberate way to spend context on a
+    /// note. Unbounded, a 200 KB body arrived whole. A cut nobody is told about is the worse half:
+    /// a truncated note reads as a complete one whose author stopped writing.
+    #[tokio::test]
+    async fn memory_read_bounds_a_long_body_and_says_when_there_is_none() {
+        let memories = store().await;
+        let write = MemoryWriteTool {
+            memories: memories.clone(),
+        };
+        write
+            .execute(
+                serde_json::json!({
+                    "name": "enormous",
+                    "description": "a very long note",
+                    "body": "y".repeat(READ_BODY_MAX_CHARS * 2),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write");
+        write
+            .execute(
+                serde_json::json!({"name": "terse", "description": "all of it is the description"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write");
+        let read = MemoryReadTool {
+            memories: memories.clone(),
+        };
+
+        let long = output_text(
+            &read
+                .execute(
+                    serde_json::json!({"name": "enormous"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("read"),
+        );
+        assert!(
+            long.chars().count() < READ_BODY_MAX_CHARS * 2,
+            "the body must be bounded, got {} chars",
+            long.chars().count()
+        );
+        assert!(
+            long.contains("Body truncated"),
+            "and the cut said out loud: {}",
+            &long[long.len().saturating_sub(200)..]
+        );
+
+        let empty = output_text(
+            &read
+                .execute(
+                    serde_json::json!({"name": "terse"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("read"),
+        );
+        assert!(
+            empty.contains("no body"),
+            "a memory with no body must say so rather than trail off into nothing: {empty}"
         );
     }
 

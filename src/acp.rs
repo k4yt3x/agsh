@@ -1965,7 +1965,7 @@ struct SessionEntry {
     /// Held purely for its `Drop` side-effect: dropping releases the OS file lock on the persisted
     /// session row. Without this, a second `meka` process could attach to the same id.
     #[allow(dead_code)]
-    session_lock: Arc<crate::session::SessionLock>,
+    session_lock: Arc<crate::session::FileLock>,
     /// When this session was last used, for the idle sweep.
     ///
     /// `session/close` is optional in ACP, and an editor is entitled never to send one. Every
@@ -2315,7 +2315,7 @@ pub async fn run_acp(
     // provider built above is dropped unused. Only compiled in debug builds. We rebuild SharedDeps
     // with the mock provider before installing it.
     #[cfg(debug_assertions)]
-    let shared = if std::env::var("MEKA_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+    let shared = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
         let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds));
         // Replace just the provider field, inheriting the rest from the real SharedDeps.
@@ -2325,7 +2325,7 @@ pub async fn run_acp(
             provider: mock,
             ..(*shared).clone()
         };
-        tracing::info!("MEKA_ACP_MOCK_PROVIDER=1: using scripted mock provider");
+        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
         Arc::new(new_inner)
     } else {
         shared
@@ -2459,13 +2459,17 @@ pub async fn run_acp(
                     if let Err(error) = validate_additional_roots(&req.additional_directories) {
                         return responder.respond_with_error(error);
                     }
-                    let session_uuid = match state
+                    // Created and locked in one step, the lock taken *before* the row exists: a
+                    // row committed ahead of its lock is one `meka session delete --all` can
+                    // enumerate and sweep out from under this handler. See
+                    // `SessionManager::create_session_locked`.
+                    let (session_uuid, session_lock) = match state
                         .shared
                         .session_manager
-                        .create_session(Some(req.cwd.clone()))
+                        .create_session_locked(Some(req.cwd.clone()), None, None, None)
                         .await
                     {
-                        Ok(uuid) => uuid,
+                        Ok((created, lock)) => (created.id, lock),
                         Err(error) => {
                             return responder.respond_with_error(
                                 agent_client_protocol::util::internal_error(format!(
@@ -2490,10 +2494,11 @@ pub async fn run_acp(
                         );
                     }
 
-                    // Take the OS file lock on the newly created session row so a second `meka acp`
-                    // process (or an `meka repl`) can't open the same id and interleave events.
-                    let session_lock = match state.shared.session_manager.lock_session(session_uuid)
-                    {
+                    // The lock taken above, which a second `meka acp` process (or a REPL) needs to
+                    // be unable to take. `None` means the claim could not be made at all -- an
+                    // unwritable lock directory -- and an editor session that cannot be held alone
+                    // is one this host must not open.
+                    let session_lock = match session_lock {
                         Ok(lock) => Arc::new(lock),
                         Err(error) => {
                             return responder.respond_with_error(
@@ -3453,10 +3458,13 @@ async fn handle_fork_session(
         return responder.respond_with_error(error);
     }
 
-    let forked = match state
+    // Locked before the copy's row exists. Otherwise a sweep between the two takes the copy, this
+    // handler locks the vanished id successfully, `load_events` returns empty, and the editor is
+    // handed a silently blank fork. See `SessionManager::fork_session_locked`.
+    let (forked, forked_lock) = match state
         .shared
         .session_manager
-        .fork_session(source_uuid, crate::session::ForkOverrides {
+        .fork_session_locked(source_uuid, crate::session::ForkOverrides {
             cwd: Some(req.cwd.clone()),
             // Always `Some`: per the spec an omitted or empty list means "no additional roots are
             // activated", which is an override to none rather than a request to inherit.
@@ -3465,7 +3473,7 @@ async fn handle_fork_session(
         })
         .await
     {
-        Ok(Some(forked)) => forked,
+        Ok(Some(pair)) => pair,
         Ok(None) => {
             return responder.respond_with_error(invalid_params_error(format!(
                 "unknown sessionId: {}",
@@ -3483,7 +3491,7 @@ async fn handle_fork_session(
     let session_id_str = session_uuid.to_string();
     let session_id: SessionId = session_id_str.clone().into();
 
-    let session_lock = match state.shared.session_manager.lock_session(session_uuid) {
+    let session_lock = match forked_lock {
         Ok(lock) => Arc::new(lock),
         Err(error) => {
             discard_failed_fork(&state, session_uuid).await;
@@ -3781,11 +3789,11 @@ async fn resolve_credential_for_acp(
     config: &ResolvedConfig,
     token_store: &crate::session::TokenStore,
 ) -> anyhow::Result<AuthCredential> {
-    // Debug-only: when the integration harness sets `MEKA_ACP_MOCK_PROVIDER=1`, `run_acp` swaps in
+    // Debug-only: when the integration harness sets `MEKA_MOCK_PROVIDER=1`, `run_acp` swaps in
     // a scripted provider and discards the real one built from this credential. Return a
     // placeholder so the harness needn't seed a credential into the database.
     #[cfg(debug_assertions)]
-    if std::env::var("MEKA_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         return Ok(AuthCredential::ApiKey("mock-acp-provider".to_string()));
     }
 

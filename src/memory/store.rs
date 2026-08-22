@@ -63,7 +63,7 @@ use crate::{
     store::{DEFAULT_PRIORITY, MAX_PRIORITY},
 };
 
-/// Column indices in `memory_fts`, in declaration order. Named because `snippet()` and `bm25()`
+/// Column indices in `memories_fts`, in declaration order. Named because `snippet()` and `bm25()`
 /// take positional column arguments and a bare `3` at a call site is unreadable and unsearchable.
 const COLUMN_BODY: i64 = 3;
 
@@ -116,17 +116,79 @@ const FRESHNESS_FLOOR: f64 = 0.5;
 const PREFIX_TRIM_CHARS: usize = 5;
 const PREFIX_MIN_CHARS: usize = 4;
 
+/// Distinct terms one search may carry.
+///
+/// The substring tier builds one `OR` clause per term against four columns, and SQLite caps an
+/// expression tree at depth 1000; the full-text tiers OR the same terms into one `MATCH`. Far more
+/// than any real question needs -- the tool asks for synonyms, not for a document -- and low enough
+/// that pasting five paragraphs in as a "query" degrades to searching its first hundred words
+/// rather than erroring.
+const MAX_TERMS: usize = 100;
+
 /// How much of a body [`MemoryStore::substring_search`] carries as its excerpt. FTS5's `snippet()`
 /// is only available under a `MATCH`, and this scan is what runs when there is none.
 const SUBSTRING_SNIPPET_CHARS: usize = 160;
 
+/// A window of `chars` characters from `body` containing the first of `terms` that appears in it.
+///
+/// The renderer presents this under a preamble saying the text contains the search term, so an
+/// excerpt that does not is a statement the tool makes and the body contradicts. Taking the body's
+/// opening satisfied that only when the match happened to be near the start, and reliably failed
+/// for the case this tier exists for: a long CJK body, which `unicode61` tokenises as a single
+/// token so `MATCH` cannot reach it, where the match sits wherever the author put it.
+///
+/// A quarter of the window leads the match, so what comes back reads as an excerpt rather than as
+/// a fragment starting mid-word. When no term is in the body -- the row matched on its name,
+/// description or tags -- the opening is the honest answer and there is nothing to centre on.
+///
+/// Case-insensitively, and specifically *ASCII* case-insensitively, because that is what SQLite's
+/// `LIKE` did to select this row. Anything else would look for a match the query never made.
+fn excerpt_around_a_match(body: &str, terms: &[String], chars: usize) -> String {
+    // The first term that hits, not the earliest hit among all of them: both satisfy the contract,
+    // and only one of them stops scanning.
+    //
+    // Every term is tried, with no cap. A cap was here briefly and was a mistake: `Terms::parse`
+    // preserves query order across all `queries` entries, so three phrasings ending in the one
+    // non-ASCII word put that word past any small ceiling -- and a row whose body is entirely CJK
+    // reaches this tier precisely because no full-text tier can see it, matches on `LIKE`, and
+    // then got an excerpt from the body's opening under a preamble asserting it contained the
+    // term. The cost the cap was buying back is real but bounded by `MAX_TERMS`, and it is the
+    // wrong thing to spend a false statement on.
+    let found = terms
+        .iter()
+        .find_map(|term| find_ignoring_ascii_case(body, term));
+    let lead = chars / 4;
+    let start = match found {
+        Some(offset) => body[..offset].chars().count().saturating_sub(lead),
+        None => 0,
+    };
+    body.chars().skip(start).take(chars).collect()
+}
+
+/// Byte offset of the first ASCII-case-insensitive occurrence of `needle`, at a character
+/// boundary.
+///
+/// Byte-wise rather than lowercasing the haystack, because the haystack is a whole memory body and
+/// this runs once per candidate row: a store of 200 KB notes would otherwise allocate a second copy
+/// of each one to answer a question about a 160-character window. The boundary check is what keeps
+/// the offset sliceable -- an ASCII needle cannot match inside a multi-byte character, but a
+/// non-ASCII one can start part-way through.
+fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let (hay, need) = (haystack.as_bytes(), needle.as_bytes());
+    if need.is_empty() || need.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - need.len()).find(|&start| {
+        haystack.is_char_boundary(start)
+            && hay[start..start + need.len()].eq_ignore_ascii_case(need)
+    })
+}
+
 /// Create the memory tables. Idempotent, and invoked from
 /// [`crate::session::SessionManager::initialize_schema`] so schema ownership stays in one place.
 ///
-/// The legacy `memory_fts` / `memory_usage` pair from the file-backed design is deliberately left
-/// alone: `import-memory-store.py` reads the counters out of it during the one-time move
-/// and drops both afterwards. Dropping them here would destroy read counts before anything had a
-/// chance to carry them, and this file does not do migrations.
+/// Creation only: this file does no migrations, and a table it does not name is one it leaves
+/// alone.
 pub(crate) fn create_tables(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         // `id` rather than an implicit rowid because the FTS index anchors to it by name, and an
@@ -210,10 +272,17 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
         // the one operation a large memory performs most often.
         //
         // Every indexed column has to appear in the `WHEN` or an edit to the one left out stops
-        // reaching the index. `name` is compared `COLLATE BINARY` because `IS NOT` otherwise
-        // inherits the column's `NOCASE` and a case-only rename would not fire. `id` is
-        // deliberately absent: it is the `content_rowid`, and the module header forbids updating
-        // it at all.
+        // reaching the index. `id` is deliberately absent: it is the `content_rowid`, and the
+        // module header forbids updating it at all.
+        //
+        // `name` is compared `COLLATE BINARY` because `IS NOT` otherwise inherits the column's
+        // `NOCASE` and a case-only rename would not fire. That is defence in depth rather than a
+        // live guarantee, and worth saying so: `unicode61` folds case when it tokenises, so
+        // `Policy` and `policy` produce identical index entries and skipping the re-index for a
+        // case-only change is currently unobservable through search or `integrity-check`. It stays
+        // because the comparison should follow the *content*, not the tokenizer's opinion of it --
+        // a future tokenizer change, or a case-sensitive column added beside this one, would make
+        // the difference real, and nothing would fail in between.
         "memories_au",
         "CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
          WHEN old.name COLLATE BINARY IS NOT new.name COLLATE BINARY
@@ -304,7 +373,14 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     }
 
     tracing::info!("replacing the memory search index triggers with this build's definitions");
-    let transaction = connection.unchecked_transaction()?;
+    // `Immediate`, matching [`MemoryStore::write`] and for the same reason it gives: a deferred
+    // transaction takes its write lock on the first write rather than at `BEGIN`, and under WAL
+    // that upgrade can return `SQLITE_BUSY` without consulting the busy handler at all. This one
+    // drops three triggers and rebuilds the whole index, so the process it would lose to is a
+    // `meka serve` mid-write -- not another process's schema work, which the schema `flock`
+    // already excludes. Rare path, clean rollback, and no reason to differ from its sibling.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
     for (name, _) in TRIGGER_DEFINITIONS {
         transaction.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
     }
@@ -371,13 +447,22 @@ pub(crate) struct Terms(Vec<String>);
 
 impl Terms {
     /// Tokenize one or more phrasings into a single term set. Duplicate tokens collapse, so
-    /// supplying "terse", "terseness" and "be terse" does not trIple-count the shared word.
+    /// supplying "terse", "terseness" and "be terse" does not triple-count the shared word.
+    ///
+    /// Capped at [`MAX_TERMS`]. The tool tells the model that supplying synonyms costs nothing,
+    /// which is true of a handful and not of a thousand: the substring tier builds one `OR` clause
+    /// per term, and a few pasted paragraphs pushed the expression past SQLite's depth limit so the
+    /// model got a raw `Expression tree is too large (maximum depth 1000)` back from what it had
+    /// been encouraged to do.
     pub(crate) fn parse(queries: &[String]) -> Self {
         let mut terms: Vec<String> = Vec::new();
         for query in queries {
             for token in query.split(|character: char| {
                 !character.is_alphanumeric() && character != '_' && character != '\''
             }) {
+                if terms.len() >= MAX_TERMS {
+                    return Self(terms);
+                }
                 let token = token.trim_matches('\'');
                 if token.is_empty() {
                     continue;
@@ -602,7 +687,8 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         description: row.get(1)?,
         tags: tags
             .split_whitespace()
-            .map(str::to_string)
+            .map(keepable_tag)
+            .filter(|tag| !tag.is_empty())
             .collect::<Vec<_>>(),
         priority: clamp_priority(row.get(3)?),
         recorded_at: parse_stamp(&row.get::<_, String>(4)?),
@@ -610,6 +696,31 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         read_count: clamp_read_count(row.get(6)?),
         body: row.get(7)?,
     })
+}
+
+/// Reduce a stored tag to the characters a tag is allowed to hold.
+///
+/// The same shape as [`clamp_priority`] and [`clamp_read_count`], and against the same threat: a
+/// row that reached this table without going through meka's write doors. Tags were the one field
+/// with no such guard, and unlike the others they are *rendered* -- into the tag histogram and the
+/// world-state diff, both of which reach the model's context and the operator's terminal.
+/// `split_whitespace` already stops a newline, but an ANSI escape, a bidi override or a zero-width
+/// character is not whitespace and went through untouched.
+///
+/// Dropping rather than refusing: a tag is a label, and a label with something odd in it is still
+/// worth showing with the odd part gone. Refusing would hide the memory instead.
+///
+/// A tag left with nothing at all -- `UPPER`, a run of CJK, a lone escape -- is dropped by the
+/// caller rather than kept as an empty string. Keeping it put a nameless entry in the tag
+/// histogram (`most common tags  (3)`) and a stray separator in the diff's `[deploy, ]`, which is
+/// the render this guard exists to protect.
+fn keepable_tag(stored: &str) -> String {
+    stored
+        .chars()
+        .filter(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || *character == '-'
+        })
+        .collect()
 }
 
 /// Clamp a stored priority into the band. Stored values come from meka's own validated write door,
@@ -776,67 +887,57 @@ impl MemoryStore {
             .map_err(|error| MekaError::Database(format!("failed to read memories: {error}")))
     }
 
-    /// Which of `candidates` the store does not hold, compared case-insensitively as the `name`
-    /// column is.
+    /// Insert a row straight at the column, past every write door.
     ///
-    /// For [`crate::memory::warn_about_an_unimported_file_store`], which asks it of the file names
-    /// in a legacy directory. One query with a bound `IN` list rather than a probe per name or a
-    /// load of the whole table: [`Self::index`] materialises every row, parses two RFC 3339 stamps
-    /// each and carries the standing band's bodies, which cost ~115 ms at every process start on a
-    /// 20,000-memory store to answer a question this shape.
-    pub async fn names_not_stored(&self, candidates: &[String]) -> Result<Vec<String>> {
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Exists so a test can produce the state the read guards are for: a name, description or tag
+    /// that meka's own doors would have refused, which is what a row written by something other
+    /// than this build looks like. Nothing in meka can create one, so without this the guards would
+    /// be unreachable from the test suite and rest on their comments alone.
+    #[cfg(test)]
+    pub(crate) async fn plant_row_for_test(&self, name: &str, description: &str) -> Result<()> {
         let Some(connection) = self.connection.as_deref() else {
-            // No database is not "everything is imported": it is a store that holds nothing, so
-            // every candidate is missing from it.
-            return Ok(candidates.to_vec());
+            return Err(MekaError::Database(
+                "memory store has no database".to_string(),
+            ));
         };
-        let candidates = candidates.to_vec();
+        let name = name.to_string();
+        let description = description.to_string();
         connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // Chunked, because the `IN` list is one bound parameter per file on disk and
-                // SQLite caps those at 32,766. A legacy directory that large is exactly the store
-                // whose owner most needs the warning, and unchunked it got none: `prepare` failed,
-                // and the caller had nothing to say.
-                const CHUNK: usize = 500;
-                // A set, not a `Vec` scanned per candidate. The chunking below removed the
-                // `prepare` failure that used to cap this at 32,766 candidates, which turned a
-                // linear scan nobody had measured into a quadratic one that actually runs:
-                // measured at 29.3 s for a single `meka memory get` against a 40,000-file
-                // directory that was *fully imported*, so the command printed nothing and took
-                // half a minute to do it.
-                let mut stored: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for chunk in candidates.chunks(CHUNK) {
-                    let placeholders = std::iter::repeat_n("?", chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut statement = connection.prepare(&format!(
-                        "SELECT name FROM memories WHERE name IN ({placeholders})"
-                    ))?;
-                    let parameters: Vec<&dyn rusqlite::ToSql> = chunk
-                        .iter()
-                        .map(|name| name as &dyn rusqlite::ToSql)
-                        .collect();
-                    let found = statement
-                        .query_map(parameters.as_slice(), |row| row.get::<_, String>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    // Folded on the way in, so the membership test below is a hash lookup rather
-                    // than a scan. `IN` uses the column's `NOCASE` collation, which is ASCII-only,
-                    // and `to_ascii_lowercase` is the same rule -- a name stored in a different
-                    // case must not read as missing.
-                    stored.extend(found.iter().map(|name| name.to_ascii_lowercase()));
-                }
-                Ok(candidates
-                    .iter()
-                    .filter(|candidate| !stored.contains(&candidate.to_ascii_lowercase()))
-                    .cloned()
-                    .collect())
+                connection.execute(
+                    "INSERT INTO memories (name, description, recorded_at, updated_at) \
+                     VALUES (?1, ?2, '2024-01-01T00:00:00+00:00', '2024-01-01T00:00:00+00:00')",
+                    rusqlite::params![name, description],
+                )?;
+                Ok(())
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to probe the store: {error}")))
+            .map_err(|error| MekaError::Database(format!("failed to plant a row: {error}")))
+    }
+
+    /// Rename a row straight at the column.
+    ///
+    /// No meka door renames a memory, which is exactly why this exists: `memories_au`'s `WHEN`
+    /// carries a `COLLATE BINARY` on `name` so a case-only rename fires against a `NOCASE` column,
+    /// and without a seam that guarantee is unreachable from the suite and rests on its comment.
+    #[cfg(test)]
+    pub(crate) async fn rename_for_test(&self, from: &str, to: &str) -> Result<()> {
+        let Some(connection) = self.connection.as_deref() else {
+            return Err(MekaError::Database(
+                "memory store has no database".to_string(),
+            ));
+        };
+        let (from, to) = (from.to_string(), to.to_string());
+        connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE memories SET name = ?2 WHERE name = ?1",
+                    rusqlite::params![from, to],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to rename: {error}")))
     }
 
     /// One memory by name, body included. `None` when there is none.
@@ -1124,6 +1225,9 @@ impl MemoryStore {
             .collect::<Vec<_>>()
             .join(" OR ");
         let pool = i64::try_from(CANDIDATE_POOL).unwrap_or(i64::MAX);
+        // The raw terms, not the `LIKE` patterns: the excerpt has to find in the body what SQLite
+        // matched, and the patterns carry `%` wrappers and backslash escapes it never sees.
+        let excerpt_terms: Vec<String> = terms.to_vec();
         let mut hits = connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(&format!(
@@ -1152,10 +1256,19 @@ impl MemoryStore {
                     Ok(Hit {
                         name: row.get(0)?,
                         description: row.get(1)?,
-                        // No `snippet()` outside a `MATCH`, so the excerpt is the body's opening.
-                        // The renderer bounds it either way; what matters is that it is text from
-                        // the memory rather than an empty string.
-                        snippet: body.chars().take(SUBSTRING_SNIPPET_CHARS).collect(),
+                        // There is no `snippet()` outside a `MATCH`, so the window is chosen
+                        // here. It has to contain the match: the renderer presents this under a
+                        // preamble saying the text contains the search term, and the body's
+                        // *opening* satisfies that only by accident. It reliably failed for the
+                        // case this tier exists for -- a long CJK body, which `unicode61` makes
+                        // one token, so `MATCH` never sees it and the literal scan is the only
+                        // thing that finds it -- where the match is as likely to be at the end as
+                        // anywhere.
+                        snippet: excerpt_around_a_match(
+                            &body,
+                            &excerpt_terms,
+                            SUBSTRING_SNIPPET_CHARS,
+                        ),
                         body,
                         priority: clamp_priority(row.get(3)?),
                         recorded: parse_stamp(&row.get::<_, String>(4)?),
@@ -1342,11 +1455,11 @@ mod tests {
     /// The shape everything else in this module assumes, asserted against the real build rather
     /// than against the SQL as read.
     ///
-    /// Four claims, each of which was a defect in the file-backed store that the schema now makes
-    /// unrepresentable: a metadata-only write keeps the body, the tags and the priority it did not
-    /// mention; `recorded_at` is stamped once and survives every later write; the triggers carry an
-    /// update and a delete into the external-content index; and `COLLATE NOCASE` makes `POLICY` and
-    /// `policy` the same row rather than two memories that shadow each other.
+    /// Four claims, each of them a mistake the schema makes unrepresentable rather than one the
+    /// code has to remember: a metadata-only write keeps the body, the tags and the priority it did
+    /// not mention; `recorded_at` is stamped once and survives every later write; the triggers
+    /// carry an update and a delete into the external-content index; and `COLLATE NOCASE` makes
+    /// `POLICY` and `policy` the same row rather than two memories that shadow each other.
     #[tokio::test]
     async fn the_schema_keeps_what_a_write_does_not_mention() {
         let store = MemoryStore::in_memory().await.expect("store");
@@ -1658,84 +1771,115 @@ mod tests {
         store.integrity_check().await.expect("and it is in step");
     }
 
-    /// The probe behind the unimported-file-store warning reports what is still missing, whatever
-    /// else the store holds.
+    /// Tags reach the search index, and a tags-only edit reaches it too.
     ///
-    /// It replaced a gate on the store being *empty*, which the agent's first `memory_write`
-    /// switched off for good: a user who upgraded with two hundred files saw the warning once, the
-    /// agent saved one note on its first turn as it is told to, and the standing rules among those
-    /// files stayed out of force with nothing ever mentioning them again.
+    /// Two mutations survived the whole suite here: blanking `tags` in all three triggers, and
+    /// dropping the `tags` arm from `memories_au`'s `WHEN`. The suite writes tags and renders them,
+    /// and never once *searches* by one -- so the column could have been unindexed since the day it
+    /// was added and every test would still be green. The module's own doc says "Every indexed
+    /// column has to appear in the `WHEN` or an edit to the one left out stops reaching the index";
+    /// this is what makes that sentence checkable.
     #[tokio::test]
-    async fn names_not_stored_reports_the_ones_still_missing() {
-        let store = store_with(&[("imported", 5, "d", "b")]).await;
-        assert_eq!(
-            store
-                .names_not_stored(&[
-                    "imported".to_string(),
-                    "IMPORTED".to_string(),
-                    "left-behind".to_string(),
-                ])
-                .await
-                .expect("probe"),
-            ["left-behind"],
-            "a name stored in another case is stored, as the NOCASE column says"
-        );
-        assert!(
-            !store
-                .names_not_stored(&["left-behind".to_string()])
-                .await
-                .expect("probe")
-                .is_empty(),
-            "a non-empty store must still report what is not in it"
-        );
-        assert!(store.names_not_stored(&[]).await.expect("probe").is_empty());
+    async fn a_tag_reaches_the_index_when_it_is_written_and_when_it_is_changed() {
+        let store = MemoryStore::in_memory().await.expect("store");
+        store
+            .write(WriteRequest {
+                name: "runbook".to_string(),
+                description: "how to restart the thing".to_string(),
+                tags: Some(vec!["infra".to_string()]),
+                body: None,
+                priority: Some(5),
+            })
+            .await
+            .expect("write");
 
-        // Past SQLITE_MAX_VARIABLE_NUMBER (32,766), which an unchunked `IN` list hits. The store
-        // whose legacy directory is that large is the one whose owner most needs the warning, and
-        // unchunked it got none: `prepare` failed and the caller had nothing to say.
-        //
-        // Against a store holding *every* candidate, which is the case that matters and the one an
-        // earlier version of this test missed: it ran 40,000 names against a one-row store, so the
-        // set being probed was empty and a per-candidate scan looked linear. With the rows present,
-        // scanning is quadratic -- 29.3 s for a single `meka memory get`, on a directory that was
-        // fully imported and therefore printed nothing at all.
-        let mut bulk = MemoryStore::in_memory().await.expect("store");
-        let many: Vec<String> = (0..40_000).map(|n| format!("name{n:05}")).collect();
-        {
-            let store = Arc::get_mut(&mut bulk).expect("sole owner");
-            let connection = store.writable().expect("connected");
-            let rows = many.clone();
-            connection
-                .call(move |connection| -> rusqlite::Result<_> {
-                    let transaction = connection.unchecked_transaction()?;
-                    for name in &rows {
-                        transaction.execute(
-                            "INSERT INTO memories (name, description, recorded_at, updated_at)
-                             VALUES (?1, 'd', '2024-01-01T00:00:00+00:00',
-                                     '2024-01-01T00:00:00+00:00')",
-                            rusqlite::params![name],
-                        )?;
-                    }
-                    transaction.commit()
-                })
+        let by_tag = store
+            .search(Terms::parse(&["infra".to_string()]).match_expression(), 5)
+            .await
+            .expect("search");
+        assert_eq!(
+            by_tag.hits.first().map(|hit| hit.name.as_str()),
+            Some("runbook"),
+            "a tag has to be findable, or indexing it is decoration"
+        );
+
+        // A tags-only edit: same description, different labels. `memories_au`'s `WHEN` decides
+        // whether the index hears about it at all.
+        store
+            .write(WriteRequest {
+                name: "runbook".to_string(),
+                description: "how to restart the thing".to_string(),
+                tags: Some(vec!["deploy".to_string()]),
+                body: None,
+                priority: None,
+            })
+            .await
+            .expect("retag");
+
+        let after = store
+            .search(Terms::parse(&["deploy".to_string()]).match_expression(), 5)
+            .await
+            .expect("search");
+        assert_eq!(
+            after.hits.first().map(|hit| hit.name.as_str()),
+            Some("runbook"),
+            "the new tag has to be findable"
+        );
+        let stale = store
+            .search(Terms::parse(&["infra".to_string()]).match_expression(), 5)
+            .await
+            .expect("search");
+        assert!(
+            stale.hits.is_empty(),
+            "and the old one gone: an index holding a tag the row no longer has is a search that \
+             answers with a memory that does not match"
+        );
+        store.integrity_check().await.expect("and still in step");
+    }
+
+    /// A rename reaches the index, including one that changes only case.
+    ///
+    /// Nothing in meka renames a memory today, so this is latent rather than live -- but dropping
+    /// the `name` arm from `memories_au`'s `WHEN` survived the whole suite, and a rename that never
+    /// reaches the index is a search that cannot find a memory by the name it now has.
+    ///
+    /// The case-only rename is exercised but *not* asserted on, and the distinction is the point.
+    /// `unicode61` folds case when it tokenises, so `guideline` and `GUIDELINE` index identically
+    /// and skipping the re-index for a case-only change cannot be observed through search. The
+    /// `COLLATE BINARY` that makes the trigger fire for one is defence in depth; claiming a test
+    /// covers it would be the fake guard this suite has been burned by before. What the second
+    /// round does check is that a rename through a case change leaves the index in step at all.
+    #[tokio::test]
+    async fn a_rename_reaches_the_index_even_when_only_the_case_changes() {
+        let store = MemoryStore::in_memory().await.expect("store");
+        store
+            .write(WriteRequest {
+                name: "policy".to_string(),
+                description: "the retention window".to_string(),
+                tags: None,
+                body: None,
+                priority: Some(5),
+            })
+            .await
+            .expect("write");
+
+        for (from, to) in [("policy", "guideline"), ("guideline", "GUIDELINE")] {
+            store
+                .rename_for_test(from, to)
                 .await
-                .expect("seed");
+                .expect("rename straight at the column");
+            let hits = store
+                .search(Terms::parse(&[to.to_lowercase()]).match_expression(), 5)
+                .await
+                .expect("search");
+            assert_eq!(
+                hits.hits.first().map(|hit| hit.name.as_str()),
+                Some(to),
+                "a rename to {to} has to reach the index"
+            );
+            // Holds under both spellings of the `WHEN`, for the reason in the doc above.
+            store.integrity_check().await.expect("and stay in step");
         }
-        let started = std::time::Instant::now();
-        assert!(
-            bulk.names_not_stored(&many)
-                .await
-                .expect("probe")
-                .is_empty(),
-            "every candidate is stored, so none is missing"
-        );
-        // Generous by two orders of magnitude against the quadratic shape, which took 29.3 s here.
-        // This is a guard against a scan creeping back, not a benchmark.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "probing an imported store must not be quadratic: took {:?}",
-            started.elapsed()
-        );
     }
 
     /// Both document counts come from one snapshot, so a concurrent commit cannot make a healthy
@@ -2394,6 +2538,135 @@ mod tests {
         }
     }
 
+    /// The tool tells the model that supplying synonyms costs nothing. It has to stay true.
+    ///
+    /// It is true of a handful and was not of a thousand: the substring tier builds one `OR` clause
+    /// per term over four columns, and a few pasted paragraphs pushed the expression past SQLite's
+    /// depth limit -- so the model got a raw `Expression tree is too large (maximum depth 1000)`
+    /// back from doing exactly what the description encouraged.
+    #[tokio::test]
+    async fn a_query_of_pasted_prose_degrades_rather_than_erroring() {
+        let store =
+            store_with(&[("policy", 5, "the retention window", "keep for thirty days")]).await;
+        let prose: Vec<String> = (0..2_000).map(|n| format!("word{n}")).collect();
+        let terms = Terms::parse(&[prose.join(" ")]);
+
+        assert!(
+            terms.words().len() <= MAX_TERMS,
+            "the term set has to be bounded before it reaches a query: {}",
+            terms.words().len()
+        );
+        // Both tiers answer rather than erroring, which is the whole claim.
+        store
+            .search(terms.match_expression(), 5)
+            .await
+            .expect("a long query must not fail the full-text tier");
+        store
+            .substring_search(terms.words(), 5)
+            .await
+            .expect("nor the literal scan");
+    }
+
+    /// Tags are read back through the same kind of guard the other stored values have.
+    ///
+    /// `clamp_priority` and `clamp_read_count` both exist against a row that reached this table
+    /// without going through meka's write doors; tags were the one field with none, and unlike
+    /// those two they are *rendered* -- into the tag histogram and the world-state diff, both of
+    /// which reach the model's context and the operator's terminal. `split_whitespace` already
+    /// stopped a newline, but an escape sequence or a bidi override is not whitespace.
+    #[tokio::test]
+    async fn a_tag_written_past_the_write_door_is_still_safe_to_render() {
+        let store = MemoryStore::in_memory().await.expect("store");
+        store
+            .write(full("note", 5, "a fact", "body"))
+            .await
+            .expect("write");
+        // Straight at the column, which is the only way to produce this.
+        store
+            .writable()
+            .expect("connected")
+            .call(|connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE memories SET tags = ?1 WHERE name = 'note'",
+                    rusqlite::params!["in\u{1b}[31mfra dep\u{202e}loy UPPER"],
+                )
+            })
+            .await
+            .expect("plant the tags");
+
+        let tags = &store.index().await.expect("index")[0].tags;
+        // Filtered, not repaired: the printable remains of an escape sequence stay, and the point
+        // is that nothing outside the alphabet a tag is validated against survives. `UPPER` is
+        // gone entirely rather than reduced to an empty tag -- a tag is lowercase, which is the
+        // same rule `validate_tag` applies, and a label with nothing left in it is not a label. An
+        // empty one rendered as a nameless bucket in the tag histogram and a stray separator in
+        // the world-state diff, which are the two renders this guard exists for.
+        assert_eq!(tags, &["in31mfra".to_string(), "deploy".to_string()]);
+        for tag in tags {
+            assert!(
+                crate::memory::validate_tag(tag).is_ok(),
+                "every rendered tag must be one a write door would have accepted: {tag:?}"
+            );
+        }
+    }
+
+    /// The excerpt has to contain the thing it says it contains.
+    ///
+    /// There is no `snippet()` outside a `MATCH`, so this tier chose the body's *opening* and the
+    /// renderer presented it under a preamble asserting the text held the search term. It was true
+    /// only when the match happened to be near the start, and reliably false for the case the tier
+    /// exists for: a long CJK body, one token to `unicode61`, whose match sits wherever the author
+    /// put it.
+    #[tokio::test]
+    async fn a_substring_excerpt_contains_the_term_it_matched() {
+        // A body far longer than the excerpt window, with the match at the very end.
+        let filler = "以下是一段很长的背景说明。".repeat(60);
+        let body = format!("{filler}办公室在深圳南山区的科技园");
+        let store = store_with(&[("office", 5, "办公室位置", &body)]).await;
+
+        let hits = store
+            .substring_search(&["深圳".to_string()], 5)
+            .await
+            .expect("scan")
+            .hits;
+        let snippet = &hits.first().expect("one hit").snippet;
+        assert!(
+            snippet.contains("深圳"),
+            "the excerpt must hold the match, not the body's opening: {snippet:?}"
+        );
+        assert!(
+            snippet.chars().count() <= SUBSTRING_SNIPPET_CHARS,
+            "and stay inside its window: {} chars",
+            snippet.chars().count()
+        );
+
+        // ASCII case-insensitively, matching the `LIKE` that selected the row in the first place.
+        let ascii = format!("{}NEEDLE-HERE", "padding. ".repeat(120));
+        let store = store_with(&[("notes", 5, "d", &ascii)]).await;
+        let hits = store
+            .substring_search(&["needle-here".to_string()], 5)
+            .await
+            .expect("scan")
+            .hits;
+        assert!(
+            hits.first()
+                .expect("one hit")
+                .snippet
+                .contains("NEEDLE-HERE"),
+            "a case-insensitive match must be excerpted where it actually is"
+        );
+
+        // A row matched on its description rather than its body has nothing to centre on, and the
+        // opening is the honest answer rather than an empty string.
+        let store = store_with(&[("policy", 5, "the retention window", "body text")]).await;
+        let hits = store
+            .substring_search(&["retention".to_string()], 5)
+            .await
+            .expect("scan")
+            .hits;
+        assert_eq!(hits.first().expect("one hit").snippet, "body text");
+    }
+
     /// The tokenizer's blind spot. `unicode61` splits only on non-alphanumerics, so a contiguous
     /// CJK run is one token and is unreachable at every full-text tier. The literal scan is what
     /// keeps this from being a plain regression against the regex search it replaced.
@@ -2543,8 +2816,7 @@ mod tests {
     /// Kept in the tree rather than done by hand once, because "the per-turn read stays cheap at
     /// ten thousand" is a claim the design rests on, and claims that are not executable go stale.
     /// Measured at 10,001 memories: `index()` 177 ms and a search 0.8 ms in debug; the release
-    /// binary runs the whole of `meka memory list`, table formatting included, in 60 ms. The
-    /// file-backed store's equivalent walk took 18.9 s, which is the comparison this exists for.
+    /// binary runs the whole of `meka memory list`, table formatting included, in 60 ms.
     #[tokio::test]
     #[ignore = "writes 10000 rows; run explicitly"]
     async fn a_store_of_thousands_stays_whole_and_searchable() {

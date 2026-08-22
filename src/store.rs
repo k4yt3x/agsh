@@ -127,7 +127,7 @@ const STORE_LOCK_FILE: &str = ".meka-store.lock";
 ///
 /// A skill write is read-modify-write -- read `SKILL.md`, compose the new contents from what was
 /// read, write it back -- and until this existed nothing serialised them across processes.
-/// `config.toml` has had [`crate::config::lock_config_file`] and sessions have `SessionLock`; the
+/// `config.toml` has had [`crate::config::lock_config_file`] and sessions have `FileLock`; the
 /// store an agent writes to constantly had an in-process mutex at best. Two `meka skill add` runs,
 /// or `meka serve` racing a CLI edit, therefore each read the same file and the loser's change
 /// vanished with both reporting success. Memory needs none of this now: its write is one statement
@@ -182,7 +182,7 @@ pub(crate) fn lock_store(root: &std::path::Path) -> std::io::Result<StoreLock> {
     let guard = lock.write()?;
     // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
     // lock's heap address is stable for as long as the box lives, and the field order above drops
-    // `_guard` before `_lock`. Same shape as `ConfigFileLock` and `SessionLock`.
+    // `_guard` before `_lock`. Same shape as `ConfigFileLock` and `FileLock`.
     let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
         unsafe { std::mem::transmute(guard) };
     Ok(StoreLock {
@@ -310,6 +310,38 @@ pub fn parse_priority(raw: Option<i64>, noun: &str, name: &str) -> u8 {
 /// readable and per-line bounded.
 pub(crate) const MAX_ENTRY_NAME_LEN: usize = 64;
 
+/// Bound a name a caller is *looking up*, without demanding it be one this store would write.
+///
+/// [`validate_entry_name`] is a write-door rule: it decides what may enter a store, and rejecting
+/// everything outside `[A-Za-z0-9_-]` is what makes a name safe to put in a path or a prompt.
+/// Applied to a lookup it decides something else entirely -- what may be *found* -- and there it
+/// wedges. A row whose name reached the column past the tools is listed to the model in the
+/// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
+/// `DELETE /v1/memory/{name}` alike, while `meka memory export` refuses the whole run on its
+/// account. Nothing meka ships could remove it; the only exit was raw `sqlite3`, which is what this
+/// store was built to stop needing.
+///
+/// The length cap stays, because it is not a well-formedness rule. `memory_read`'s miss path runs
+/// an edit distance per stored name, measured at 48 s for a 200,000-character argument against
+/// 20,000 memories -- synchronously, on a runtime worker, ignoring the cancellation token.
+pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{} name cannot be empty", noun));
+    }
+    // Characters, not bytes. [`validate_entry_name`] may use `len()` because its character class
+    // is ASCII-only and the two are then the same number; this function deliberately has no
+    // character class, so they diverge. Counting bytes left a name of 30 CJK characters -- 90
+    // bytes, well inside the documented cap -- refused by every lookup door, which is precisely
+    // the wedge this function exists to end.
+    if name.chars().count() > MAX_ENTRY_NAME_LEN {
+        return Err(format!(
+            "{} name '{}' exceeds {} characters",
+            noun, name, MAX_ENTRY_NAME_LEN
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that `name` is a safe filesystem-and-prompt-embeddable identifier for a store entry:
 /// `[A-Za-z0-9][A-Za-z0-9_-]*`, at most [`MAX_ENTRY_NAME_LEN`] characters. `noun` names the store
 /// in the error text ("skill", "memory").
@@ -318,6 +350,11 @@ pub(crate) const MAX_ENTRY_NAME_LEN: usize = 64;
 /// paths, and dot-files *by construction* rather than by enumerating the attacks. That matters most
 /// for memory, whose tools run at [`crate::permission::Permission`] `Read`: without this check
 /// `memory_write` would be an arbitrary-file-write primitive reachable in read-only mode.
+///
+/// This is the *write* rule, and the character class is the whole of why it is safe to put a name
+/// that passed it into a path. A caller that only needs to find a row wants
+/// [`validate_lookup_name`], which shares the length cap and nothing else -- and must never be
+/// mistaken for this one.
 pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{} name cannot be empty", noun));

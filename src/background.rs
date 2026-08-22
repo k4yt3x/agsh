@@ -562,6 +562,13 @@ impl BackgroundStore {
 
     /// A session's finished-but-unreported tasks, oldest first. The delivery poll's query; served
     /// by `idx_background_tasks_session_status`.
+    ///
+    /// This and [`Self::mark_background_tasks_delivered`] are two statements, not one transaction,
+    /// so two processes that both list before either marks would each render the same outcome. That
+    /// is currently unreachable -- delivery only happens inside a session, and a session is held by
+    /// one process at a time from the moment its row exists -- so the pair rests on the session
+    /// lock rather than on its own atomicity. Anything that ever lets two hosts open one
+    /// session at once has to make this a transaction first.
     pub async fn list_undelivered_background_tasks(
         &self,
         session_id: Uuid,

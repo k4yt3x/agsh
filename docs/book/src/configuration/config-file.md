@@ -714,6 +714,8 @@ context_messages = 100
 
 Delete sessions older than this many days, at agent startup. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
+Two kinds of session are spared whatever their timestamp says, and the sweep reports how many it left behind. A session another meka process has open is skipped — only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+
 **Default: unset, meaning nothing is deleted.** Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
 
 ```toml

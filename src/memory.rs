@@ -11,17 +11,11 @@
 //! age is rendered, and how a memory is written out for `meka memory export`. Storage and retrieval
 //! are [`store`], which is the source of truth.
 //!
-//! # Why this is not a directory of Markdown files
+//! One row is the whole of a memory: there is no second copy to keep in step, and a transaction is
+//! what makes a write atomic rather than a lock. `meka memory export` is the answer for anyone who
+//! wants `$EDITOR`, `grep` or a git-able directory over the same content.
 //!
-//! It was, with the database as a derived mirror, and keeping two mutable copies of the same truth
-//! in step is where this subsystem's defects lived: mtime precision, a dirty set that reached
-//! discovery but not the index, a sync-versus-publish race, usage counters pruned against the wrong
-//! set, cross-process locking, and an entire apparatus for reporting files that would not parse.
-//! One copy removes all of it, and a transaction replaces the lock. What the files bought --
-//! `$EDITOR`, `grep`, a git-able directory -- is `meka memory export` plus
-//! `import-memory-store.py`, which is the trade this subsystem is sized for.
-//!
-//! [`crate::skills`] deliberately did *not* follow. A `SKILL.md` is a shared spec format other
+//! [`crate::skills`] is deliberately not built this way. A `SKILL.md` is a shared spec format other
 //! clients read, and a skill directory carries bundled scripts and assets, so files are right
 //! there.
 //!
@@ -195,6 +189,15 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
     validate_entry_name(name, "memory")
 }
 
+/// Bound a name being *looked up*, without demanding it be one this store would write.
+///
+/// The lookup half of [`validate_memory_name`]; see [`crate::store::validate_lookup_name`] for why
+/// a store that applies its write rule to reads and deletes cannot get rid of a row it should never
+/// have accepted.
+pub fn validate_memory_lookup(name: &str) -> Result<(), String> {
+    crate::store::validate_lookup_name(name, "memory")
+}
+
 /// Clamp a caller-supplied `priority` for a memory. Thin wrapper over
 /// [`crate::store::parse_priority`] that supplies this store's noun, mirroring
 /// [`validate_memory_name`].
@@ -216,19 +219,19 @@ pub struct MemoryFrontmatter {
     pub tags: Vec<String>,
     /// How many times the memory has been read, emitted only when non-zero.
     ///
-    /// Not a field the file-backed store ever had, and not content: it is what the agent has
-    /// *done* with the note. It rides along because it is the one value an export cannot
-    /// reconstruct -- descriptions, bodies and dates are all in the file, but a restored store
-    /// with every counter at zero has silently lost every memory's accumulated ranking weight.
-    /// An older meka reading this file ignores the key, as it ignores any it does not model.
+    /// Not content but usage: what the agent has *done* with the note. It rides along in an export
+    /// because it is the one value the rest of the file cannot reconstruct -- descriptions, bodies
+    /// and dates are all there, but a store restored with every counter at zero has silently lost
+    /// each memory's accumulated ranking weight. A reader that does not model the key ignores it,
+    /// as it ignores any other it does not model.
     pub read_count: u32,
 }
 
 /// Render one memory as a Markdown file: frontmatter followed by the body.
 ///
-/// The export format, and the only place meka still writes YAML for this store. It is deliberately
-/// the shape the file-backed store used, so `import-memory-store.py` reads an export and a
-/// legacy directory with one parser and the round trip is real rather than nominal.
+/// The export format, and the only place meka writes YAML for this store. Frontmatter rather than
+/// JSON because the point of an export is to be read and edited by a person, and to be greppable
+/// in a directory the way the rest of a notes tree is.
 ///
 /// `priority` is emitted only when it differs from [`DEFAULT_PRIORITY`], `recorded` only when
 /// known, and `tags` only when non-empty, so the common case stays a two-line header.
@@ -300,13 +303,32 @@ fn yaml_printable(text: &str) -> String {
         .collect()
 }
 
+/// Whether a description will still say something by the time the model reads it.
+///
+/// Every write door asked `trim().is_empty()`, which is a question about whitespace. Format
+/// characters -- zero-width spaces, joiners, bidi controls -- are not whitespace, so three of them
+/// passed as a description and then rendered as nothing: a blank cell in `meka memory list`, a
+/// blank line in `memory_search`, and `- **name** (p5, today): ` in the index the model reads every
+/// turn. [`render_description_for_model`] strips exactly that class at the render boundary, so
+/// asking it is asking the question the store actually has.
+///
+/// Distinct from [`description_survives_export`], which asks whether YAML can carry the text. A
+/// description can fail either check independently.
+pub fn description_says_something(description: &str) -> bool {
+    !render_description_for_model(description).trim().is_empty()
+}
+
 /// Whether a description would still say something once written to an export file.
 ///
 /// [`render_memory`] drops what YAML cannot carry, and a description made only of such characters
 /// becomes `description: ""` -- which the importer treats as no description at all and skips,
-/// losing the memory through the one path that is supposed to preserve it. The write doors let such
-/// a description through because `trim().is_empty()` is false for a control character, so
-/// `meka memory export` asks this before it writes anything.
+/// losing the memory through the one path that is supposed to preserve it. `meka memory export`
+/// asks this before it writes anything, and refuses the whole run rather than write a file that
+/// would come back empty.
+///
+/// Distinct from [`description_says_something`], which asks whether the *model* would see anything.
+/// A description can fail either check independently: YAML carries a zero-width space fine, and the
+/// render boundary strips it.
 pub fn description_survives_export(description: &str) -> bool {
     !normalize_description(&yaml_printable(description))
         .trim()
@@ -325,83 +347,6 @@ pub fn export_memory(memory: &Memory) -> String {
         },
         memory.body.as_deref().unwrap_or_default(),
     )
-}
-
-/// Warn when a file-backed store is sitting unimported, naming the script that moves it.
-///
-/// Detection, not migration: the binary deliberately does no file-to-database import, because one
-/// that runs on every start is one nobody ever finishes and nobody can see fail. But an upgrade
-/// that finds two hundred `*.md` files and renders an empty `[Memory]` section is the maximal
-/// version of the failure this subsystem is built against -- a store that silently drops a
-/// standing rule -- and the only other signal is a changelog line.
-///
-/// **Gated on which files are actually unimported, not on the store being empty.** The empty-store
-/// gate erased the warning the first time the agent saved anything, which it is told to do on its
-/// first turn: the user saw the warning once, the agent wrote one note, and two hundred memories
-/// including the standing rules stayed out of force with nothing ever mentioning them again.
-/// Comparing names instead still goes quiet for the user who imported and kept the directory as a
-/// backup, which is what the docs suggest and what the gate was for.
-pub async fn warn_about_an_unimported_file_store(store: &MemoryStore) {
-    let Some(legacy) = crate::config::meka_config_dir().map(|dir| dir.join("memory")) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&legacy) else {
-        return;
-    };
-    // The file stem is the memory name the importer would use, which is what makes this comparable
-    // against the table at all.
-    //
-    // Filtered by [`validate_memory_name`] for the same reason: the importer skips a file whose
-    // stem meka could not address, so counting one here produces a warning that no amount of
-    // importing can silence. A `README.md` sitting beside the memories nagged on every process
-    // start for ever, offering a remedy that could not work.
-    let candidates: Vec<String> = entries
-        .flatten()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "md")
-                && !entry.file_name().to_string_lossy().starts_with('.')
-        })
-        .filter_map(|entry| {
-            entry
-                .path()
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .filter(|stem| validate_memory_name(stem).is_ok())
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    let unimported = match store.names_not_stored(&candidates).await {
-        Ok(unimported) => unimported,
-        // Said out loud, not filed at `debug!`. The user is looking at a directory of memories
-        // that may be entirely out of force, and "meka could not check" is the one thing they
-        // need to hear; burying it meant the largest stores -- the ones this matters most for --
-        // got silence.
-        Err(error) => {
-            tracing::warn!(
-                "could not check whether the {} memory file(s) in {} are imported: {}",
-                candidates.len(),
-                legacy.display(),
-                error
-            );
-            return;
-        }
-    };
-    if !unimported.is_empty() {
-        tracing::warn!(
-            "{} of the {} memory file(s) in {} are not in your memory store, which is now the \
-             database in MEKA_DATA_DIR; nothing in them is in effect. Import them once with \
-             import-memory-store.py, downloadable from the meka release you upgraded to, then \
-             delete the directory or keep it as a backup.",
-            unimported.len(),
-            candidates.len(),
-            legacy.display(),
-        );
-    }
 }
 
 /// Make stored memory text safe to render into a model's context or a terminal.
@@ -436,11 +381,15 @@ pub fn render_description_for_model(description: &str) -> String {
 /// rendering if it answers "how old is what this says"; an edit date dressed up as an observation
 /// date is worse than no date, because it reads as a fact the model can rely on.
 pub fn render_age(recorded: SystemTime, now: SystemTime) -> String {
-    let days = now
-        .duration_since(recorded)
-        .map(|elapsed| elapsed.as_secs() / 86_400)
-        .unwrap_or(0);
-    match days {
+    // A stamp in the future is its own answer, not "today". `duration_since` fails for one, and
+    // folding that to zero told the model a note dated next year had been written this morning --
+    // while the same row sorts to the top of its priority band, so the memory most likely to be
+    // wrong is also the most prominent. Reachable through clock skew between two machines sharing a
+    // data directory, or a hand-written date. Saying so is what lets the model discount it.
+    let Ok(elapsed) = now.duration_since(recorded) else {
+        return "at a future date".to_string();
+    };
+    match elapsed.as_secs() / 86_400 {
         0 => "today".to_string(),
         1 => "yesterday".to_string(),
         n => format!("{} days ago", n),
@@ -528,8 +477,8 @@ mod tests {
         assert!(normalize_tags(&["has space".to_string()]).is_err());
     }
 
-    /// The export format has to parse back as YAML frontmatter, or the round trip through
-    /// `import-memory-store.py` is nominal rather than real.
+    /// An export has to parse back as YAML frontmatter, or `meka memory export` produces files
+    /// that only look like the format they claim.
     #[test]
     fn test_export_round_trips_through_frontmatter() {
         let memory = Memory {
@@ -600,10 +549,12 @@ mod tests {
             render_age(now - std::time::Duration::from_secs(47 * 86_400), now),
             "47 days ago"
         );
-        // A clock that went backwards must not panic or render a negative age.
+        // A stamp in the future must not panic, and must not read as "today" either: such a row
+        // sorts to the top of its priority band, so the memory most likely to be wrong would also
+        // be the most prominent, with nothing saying why.
         assert_eq!(
             render_age(now + std::time::Duration::from_secs(86_400), now),
-            "today"
+            "at a future date"
         );
     }
 }
