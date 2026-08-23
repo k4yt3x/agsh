@@ -136,7 +136,7 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// reaching an arbitrary Anthropic-compatible endpoint needs, since meka cannot tell which of the
 /// two forms that endpoint implements.
 ///
-/// No `display` field is set: real Claude Code 2.1.219 sends `{type:"adaptive"}` with no `display`
+/// No `display` field is set: real Claude Code 2.1.241 sends `{type:"adaptive"}` with no `display`
 /// (verified by wire capture), so the model default applies.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
@@ -184,7 +184,7 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 }
 
 /// Whether a Claude model accepts the `temperature` sampling parameter. Mirrors Claude Code
-/// 2.1.219's `mro`, which is an **allowlist** of the older models that still accept sampling
+/// 2.1.241's `rQo`, which is an **allowlist** of the older models that still accept sampling
 /// params: the Claude 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, and Haiku 4.5. Everything
 /// newer (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) rejects `temperature` with a 400.
 ///
@@ -212,17 +212,75 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
     }
 }
 
+/// Whether a Claude model accepts `output_config.effort`.
+///
+/// A denylist mirroring Claude Code 2.1.241's own gate, which excludes the Claude 3.x line, Opus
+/// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
+/// endpoint. Same reasoning and same single caller as
+/// [`model_supports_mid_conversation_system`]: an unrecognised name here is one *newer* than the
+/// list, and effort is what those models are for.
+pub(super) fn model_supports_effort(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude-3-") {
+        return false;
+    }
+    let Some(version) = parse_model_version(&lower) else {
+        return true;
+    };
+    if lower.contains("opus") {
+        !matches!(version, (4, 0) | (4, 1))
+    } else if lower.contains("sonnet") {
+        !matches!(version, (4, 0) | (4, 5))
+    } else if lower.contains("haiku") {
+        version != (4, 5)
+    } else {
+        true
+    }
+}
+
+/// The effort `claude-subscription` sends when the profile configures none.
+///
+/// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
+/// it to what that model accepts; almost every effort-capable model in the 2.1.241 table comes out
+/// of that as `high`, and `high` is also the value Claude Code falls back to for any model the
+/// table does not list.
+///
+/// One constant, and deliberately not a transcription of that table. A per-model figure would be a
+/// fact about someone else's data that goes stale on their release schedule with nothing in the
+/// build to notice, and it would buy nothing: the server cannot tell a default meka chose from a
+/// value the user configured, so the only thing a wrong entry could produce is meka quietly asking
+/// for the wrong tier. Anyone who wants a different one sets `effort` on the profile.
+pub(super) const DEFAULT_EFFORT: &str = "high";
+
 /// Whether a Claude model supports mid-conversation system messages (the
-/// `mid-conversation-system-2026-04-07` beta). Claude Code sends this for Opus 4.8, Opus 5, Sonnet
-/// 5, and the Fable/Mythos 5 family, but not for Opus 4.7, Sonnet 4.6, or Haiku 4.5 (verified
-/// against Claude Code 2.1.219's `_er` gate plus the per-model `mid_conv_system` capability).
+/// `mid-conversation-system-2026-04-07` beta).
+///
+/// A **denylist**, mirroring Claude Code 2.1.241's gate model for model: the Claude 3.x line, Opus
+/// 4.0/4.1/4.5/4.6/4.7, Sonnet 4.0/4.5/4.6 and Haiku 4.5 are excluded, and everything else on the
+/// first-party endpoint is sent it. The direction is the opposite of
+/// [`model_supports_temperature`]'s and deliberately so, because the two fail in opposite ways: an
+/// unrecognised model here is one *newer* than the list, which Claude Code sends the beta to, and
+/// withholding it would silently drop the mid-conversation system messages meka relies on. It is
+/// safe only because this gate has exactly one caller, `claude-subscription`, whose endpoint is
+/// always Anthropic's -- so an unrecognised name there is necessarily a real Claude. Do not reach
+/// for it from a backend a `base_url` can point anywhere.
 pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("opus-4-8")
-        || lower.contains("opus-5")
-        || lower.contains("sonnet-5")
-        || lower.contains("fable-5")
-        || lower.contains("mythos-5")
+    if lower.contains("claude-3-") {
+        return false;
+    }
+    let Some(version) = parse_model_version(&lower) else {
+        return true;
+    };
+    if lower.contains("opus") {
+        !matches!(version, (4, 0) | (4, 1) | (4, 5) | (4, 6) | (4, 7))
+    } else if lower.contains("sonnet") {
+        !matches!(version, (4, 0) | (4, 5) | (4, 6))
+    } else if lower.contains("haiku") {
+        version != (4, 5)
+    } else {
+        true
+    }
 }
 
 pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -1718,7 +1776,8 @@ mod tests {
 
     #[test]
     fn test_model_supports_mid_conversation_system() {
-        // Opus 4.8, Opus 5, Sonnet 5, and the Fable/Mythos 5 family send the beta.
+        // Everything outside Claude Code's denylist sends the beta, which is every current model
+        // and every future one.
         for model in [
             "claude-opus-4-8",
             "claude-opus-5",
@@ -1726,15 +1785,20 @@ mod tests {
             "claude-sonnet-5",
             "claude-fable-5",
             "claude-mythos-5",
+            "claude-opus-7",
+            "claude-something-new",
         ] {
             assert!(model_supports_mid_conversation_system(model), "{model}");
         }
-        // Opus 4.7, Sonnet 4.6, Haiku 4.5, and older do not.
+        // The denylist itself: Opus 4.7 and down, Sonnet 4.6 and down, Haiku 4.5, Claude 3.x.
         for model in [
             "claude-opus-4-7",
             "claude-opus-4-6-20250514",
+            "claude-opus-4-0",
             "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
             "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
         ] {
             assert!(!model_supports_mid_conversation_system(model), "{model}");
         }

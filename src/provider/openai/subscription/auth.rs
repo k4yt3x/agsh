@@ -7,7 +7,7 @@
 //!
 //! The id_token's payload nests ChatGPT-specific claims under the namespaced key
 //! `https://api.openai.com/auth`, matching Codex's own parsing in
-//! `temp/codex/codex-rs/login/src/token_data.rs:71-99`.
+//! `codex-rs/login/src/token_data.rs`.
 //!
 //! No signature verification: the auth server's TLS handshake provides integrity for the
 //! in-transit token, and the API server validates the token on every request. Local validation

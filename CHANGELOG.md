@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory has no discovery cap and no per-turn directory walk; the index is one indexed query.
 - Memory search is an external-content FTS5 index kept by triggers, rebuildable at any time.
 - A memory write is one upsert in one transaction, so no write door needs a cross-process lock.
+- **Breaking:** `claude-subscription` matches Claude Code 2.1.241; unset `effort` now sends `high`.
 - **Breaking:** `claude-api` → `anthropic-messages`, `claude-oauth` → `claude-subscription`.
 - **Breaking:** `openai-api` → `openai-chat-completions`, `openai-codex` → `chatgpt-subscription`.
 - **Breaking:** HTTP `GET /v1/providers` reports the new backend names in each profile's `type`.

@@ -182,6 +182,14 @@ pub struct StreamRequest {
     pub system_prompt: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    /// The prompt this request was attributed to, read the way a real provider reads it while
+    /// building its billing header.
+    ///
+    /// Recorded for the same reason the fields above are, with the sharpest version of it: the
+    /// streaming path hands `stream` to `tokio::spawn`, task-locals do not cross a spawn, and
+    /// nothing in the response reveals whether the attribution made it. Without this the wrapper
+    /// that carries it over can be deleted and every test still passes.
+    pub prompt_id: Option<uuid::Uuid>,
 }
 
 impl MockProvider {
@@ -332,6 +340,7 @@ impl Provider for MockProvider {
                 system_prompt: system_prompt.to_string(),
                 messages: messages.to_vec(),
                 tools: tools.to_vec(),
+                prompt_id: crate::provider::current_prompt_id(),
             });
 
         let events = {

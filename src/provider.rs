@@ -31,6 +31,7 @@ pub use openai::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     error::{MekaError, Result},
@@ -41,7 +42,7 @@ pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
     "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the first-party CLI at
-/// `temp/codex/codex-rs/login/src/auth/manager.rs:869`.
+/// `codex-rs/login/src/auth/manager.rs`.
 pub(crate) const DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 pub const SUPPORTED_PROVIDERS: &[&str] = &[
@@ -328,25 +329,164 @@ pub(crate) async fn store_refreshed_credential(
     }
 }
 
-tokio::task_local! {
-    /// True while a sub-agent's turn is running. The Claude OAuth provider is shared across the
-    /// main agent and its sub-agents via a single `Arc`, so per-request sub-agent attribution can't
-    /// live on the provider; it rides this task-local instead. Mirrors Claude Code's
-    /// `AsyncLocalStorage`-based `cc_is_subagent` attribution. Set via [`scope_subagent`] around the
-    /// sub-agent run; read via [`is_subagent`] when building the billing header.
-    static IS_SUBAGENT: bool;
+/// The slot a conversation keeps its most recent provider request id in, so the next request can
+/// name it. Held by the [`crate::agent::Agent`] and handed to each turn via [`scope_turn`].
+pub(crate) type PreviousRequestSlot = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Who a request is for, as the billing header has to describe it.
+///
+/// None of this can live on the provider: one `Arc<dyn Provider>` serves the main agent and every
+/// sub-agent at once, so the answer differs between two requests it is handling concurrently. It
+/// rides a task-local instead, mirroring the `AsyncLocalStorage` Claude Code threads the same three
+/// facts through.
+///
+/// Every field is optional in the same way the wire segment is: absent means the request genuinely
+/// has no such attribution, which is how meka's own side queries come out bare and how a
+/// conversation's first request omits `cc_prev_req`.
+#[derive(Clone, Default)]
+pub(crate) struct Attribution {
+    /// Whether this is a sub-agent's request (`cc_is_subagent`).
+    subagent: bool,
+    /// The prompt this request serves (`cc_prompt_id`).
+    prompt_id: Option<Uuid>,
+    /// Where the last response's id is kept, for `cc_prev_req`. Shared with the conversation that
+    /// owns it, which is why it is a handle and not a value: turn two has to be able to name turn
+    /// one's last response. Claude Code reads that off the last assistant message in its history
+    /// (`t0E`); meka's conversation doesn't carry request ids, so the provider deposits them here.
+    previous_request: Option<PreviousRequestSlot>,
 }
 
-/// Whether the current task is executing a sub-agent's turn. Returns `false` outside any
+tokio::task_local! {
+    static ATTRIBUTION: Attribution;
+}
+
+fn attribution() -> Attribution {
+    ATTRIBUTION.try_with(Attribution::clone).unwrap_or_default()
+}
+
+/// Whether the current task is executing a sub-agent's turn. `false` outside any
 /// [`scope_subagent`] (the main agent, tests, etc.).
 pub(crate) fn is_subagent() -> bool {
-    IS_SUBAGENT.try_with(|flag| *flag).unwrap_or(false)
+    ATTRIBUTION
+        .try_with(|current| current.subagent)
+        .unwrap_or(false)
 }
 
-/// Run `future` with the sub-agent attribution flag set. `tokio::task_local` scopes the value to
-/// this specific future, so parallel sub-agents (and the main agent) stay isolated.
+/// The current prompt's id, or `None` outside any [`scope_turn`].
+pub(crate) fn current_prompt_id() -> Option<Uuid> {
+    ATTRIBUTION
+        .try_with(|current| current.prompt_id)
+        .ok()
+        .flatten()
+}
+
+/// The id of the most recent response in this conversation, if one has arrived and a turn is in
+/// scope.
+pub(crate) fn previous_request_id() -> Option<String> {
+    ATTRIBUTION
+        .try_with(|current| {
+            current
+                .previous_request
+                .as_ref()
+                .map(|slot| match slot.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                })
+        })
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+/// Record the id a provider response arrived with, for the next request in this conversation.
+///
+/// Anything that isn't shaped like an Anthropic request id is dropped rather than forwarded:
+/// Claude Code gates the segment on `^req_[A-Za-z0-9_-]{1,36}$` and a value that fails it would be
+/// a claim about a response that doesn't exist.
+pub(crate) fn record_request_id(request_id: &str) {
+    if !is_anthropic_request_id(request_id) {
+        tracing::debug!("ignoring malformed provider request id '{}'", request_id);
+        return;
+    }
+    let _ = ATTRIBUTION.try_with(|current| {
+        if let Some(slot) = &current.previous_request {
+            match slot.lock() {
+                Ok(mut guard) => *guard = Some(request_id.to_string()),
+                Err(poisoned) => *poisoned.into_inner() = Some(request_id.to_string()),
+            }
+        }
+    });
+}
+
+fn is_anthropic_request_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("req_") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 36
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Run `future` with the sub-agent attribution flag set, keeping whatever else is in scope.
 pub(crate) async fn scope_subagent<F: std::future::Future>(future: F) -> F::Output {
-    IS_SUBAGENT.scope(true, future).await
+    ATTRIBUTION
+        .scope(
+            Attribution {
+                subagent: true,
+                ..attribution()
+            },
+            future,
+        )
+        .await
+}
+
+/// Run one turn's work with its prompt id and its conversation's request-id slot in scope.
+///
+/// An already-scoped prompt id is kept rather than replaced, which is what makes a sub-agent
+/// inherit its spawner's: the sub-agent's turn runs nested inside the parent's, and Claude Code
+/// falls back to `agentContext.parentPromptId` for exactly this case. The request-id slot is not
+/// inherited -- every agent passes its own -- because a sub-agent's requests belong to its own
+/// conversation.
+pub(crate) async fn scope_turn<F: std::future::Future>(
+    previous_request: PreviousRequestSlot,
+    future: F,
+) -> F::Output {
+    let current = attribution();
+    ATTRIBUTION
+        .scope(
+            Attribution {
+                prompt_id: Some(current.prompt_id.unwrap_or_else(Uuid::new_v4)),
+                previous_request: Some(previous_request),
+                ..current
+            },
+            future,
+        )
+        .await
+}
+
+/// Carry the current attribution into a `tokio::spawn`.
+///
+/// A task-local does not cross a spawn, and the streaming path spawns the provider call. Without
+/// this pair every streamed request goes out with no prompt id and no previous response, which is
+/// indistinguishable from a side query.
+///
+/// `subagent` rides along for a reason that is about the future rather than today: sub-agents run
+/// with `streaming: false` and reach the provider through the awaited `complete`, so their flag has
+/// never crossed a spawn. Carrying all three together means the day one of them does stream, it
+/// does not quietly bill as the main agent.
+///
+/// Capture on the calling side, re-establish as the first thing the spawned future does.
+pub(crate) fn capture_attribution() -> Attribution {
+    attribution()
+}
+
+pub(crate) async fn scope_attribution<F: std::future::Future>(
+    captured: Attribution,
+    future: F,
+) -> F::Output {
+    ATTRIBUTION.scope(captured, future).await
 }
 
 /// Strip trailing slashes so a provider can append its own path with a leading `/`.
@@ -1314,6 +1454,103 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_nested_turn_keeps_the_prompt_it_was_spawned_from() {
+        // Claude Code gives a sub-agent's requests its spawner's prompt id
+        // (`agentContext.parentPromptId`), and a sub-agent's turn runs nested inside the turn that
+        // spawned it, so keeping an already-scoped id is the whole mechanism. Minting a fresh one
+        // per scope would look identical in every single-turn test.
+        let outer_slot = PreviousRequestSlot::default();
+        let (outer, inner) = scope_turn(outer_slot, async {
+            let outer = current_prompt_id();
+            let inner = scope_turn(PreviousRequestSlot::default(), async {
+                current_prompt_id()
+            })
+            .await;
+            (outer, inner)
+        })
+        .await;
+        assert!(outer.is_some());
+        assert_eq!(outer, inner);
+    }
+
+    #[tokio::test]
+    async fn attribution_survives_the_spawn_the_streaming_path_makes() {
+        // The streaming path hands `provider.stream(...)` to `tokio::spawn`, and a task-local does
+        // not cross that. Every assertion about the billing header that runs inline passes whether
+        // or not the carry-over exists, so this is the one that fails when it is dropped. All three
+        // fields are checked together because they travel together: `subagent` has no streaming
+        // caller today, and this is what keeps it correct when it gets one.
+        let slot = PreviousRequestSlot::default();
+        let spawned = scope_subagent(scope_turn(Arc::clone(&slot), async {
+            let expected = current_prompt_id();
+            record_request_id("req_before_the_spawn");
+            let captured = capture_attribution();
+            tokio::spawn(scope_attribution(captured, async move {
+                (is_subagent(), current_prompt_id(), previous_request_id())
+            }))
+            .await
+            .expect("spawned task")
+                == (true, expected, Some("req_before_the_spawn".to_string()))
+        }))
+        .await;
+        assert!(spawned, "the spawned request lost its attribution");
+    }
+
+    #[tokio::test]
+    async fn a_nested_turn_records_its_own_responses() {
+        // The other half: the request-id slot is *not* inherited, because a sub-agent's responses
+        // belong to its own conversation. A sub-agent recording into its spawner's slot would make
+        // the parent's next request name a response it never received.
+        let outer_slot = PreviousRequestSlot::default();
+        let inner_seen = scope_turn(Arc::clone(&outer_slot), async {
+            record_request_id("req_outer");
+            scope_turn(PreviousRequestSlot::default(), async {
+                let before = previous_request_id();
+                record_request_id("req_inner");
+                before
+            })
+            .await
+        })
+        .await;
+        assert_eq!(inner_seen, None, "the sub-agent starts with a clean slot");
+        assert_eq!(
+            outer_slot.lock().expect("slot").as_deref(),
+            Some("req_outer"),
+            "the sub-agent's response must not land in its spawner's slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_well_formed_request_id_is_carried_forward() {
+        // A value that fails Claude Code's `^req_[A-Za-z0-9_-]{1,36}$` would be a claim about a
+        // response that doesn't exist, so it is dropped rather than forwarded.
+        for rejected in [
+            "011CeJwF1NDYzXkUu6cyFJp2",
+            "req_",
+            "req_has spaces",
+            "req_has;semicolon",
+            "req_0123456789012345678901234567890123456789",
+        ] {
+            let slot = PreviousRequestSlot::default();
+            scope_turn(Arc::clone(&slot), async { record_request_id(rejected) }).await;
+            assert_eq!(
+                slot.lock().expect("slot").as_deref(),
+                None,
+                "'{rejected}' must not reach the billing header"
+            );
+        }
+        let slot = PreviousRequestSlot::default();
+        scope_turn(Arc::clone(&slot), async {
+            record_request_id("req_011CeJwF1NDYzXkUu6cyFJp2")
+        })
+        .await;
+        assert_eq!(
+            slot.lock().expect("slot").as_deref(),
+            Some("req_011CeJwF1NDYzXkUu6cyFJp2")
+        );
+    }
 
     /// A refresh that loses its swap adopts what the row holds only when that can authenticate the
     /// request in hand.

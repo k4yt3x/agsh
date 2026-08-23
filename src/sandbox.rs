@@ -281,8 +281,8 @@ const BWRAP_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(5
 const BWRAP_STDERR_LIMIT: usize = 64 * 1024;
 
 /// Stderr substrings that indicate the kernel refused the user namespace request rather than some
-/// other transient failure. Mirrors the fingerprint list Codex uses
-/// (`temp/codex/codex-rs/sandboxing/src/bwrap.rs:30-35`).
+/// other transient failure. Mirrors the fingerprint list Codex uses in
+/// `codex-rs/sandboxing/src/bwrap.rs`.
 #[cfg(target_os = "linux")]
 const USER_NAMESPACE_FAILURE_MARKERS: &[&str] = &[
     "loopback: Failed RTM_NEWADDR",

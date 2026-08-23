@@ -2,10 +2,14 @@
 //! header synthesis, and Stainless-SDK-matching HTTP headers. All of this is OAuth-specific.
 //! Direct API-key requests (`anthropic-messages`) don't send billing headers, so there's no caller.
 //!
-//! References:
-//! - Claude Code source: `src/constants/system.ts`, `src/utils/fingerprint.ts`,
-//!   `src/services/api/claude.ts`
-//! - Notes: `temp/claude-code-cch.md`, `temp/claude-code-fingerprinting.md`
+//! Every constant here is a fact about Claude Code's wire, recovered from the shipped binary rather
+//! than guessed, and each is re-checked against a fresh capture when the pinned version moves. To
+//! recapture, point the real client at a logging reverse proxy and set
+//! `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`, which is what re-enables the attestation through
+//! a host that is not `api.anthropic.com`; then diff one of its requests against one of meka's.
+//!
+//! Claude Code ships minified, so nothing here cites a line in its source. What it cites instead is
+//! the minified symbol a reader can actually grep the binary for.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -18,7 +22,7 @@ use crate::{
 /// Claude Code version string. Single source of truth defined in `build.rs`.
 pub(super) const CC_VERSION: &str = env!("CC_VERSION");
 
-/// Fingerprint salt. Must match claude-code `src/utils/fingerprint.ts`.
+/// Fingerprint salt. `MHE` in the shipped 2.1.241 binary.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 /// `SHA256(SALT + msg[4] + msg[7] + msg[20] + version)[:3]`.
@@ -56,7 +60,7 @@ fn extract_first_user_message_text(messages: &[Message]) -> String {
 }
 
 /// Computes the fingerprint from the first user message. Matches Claude
-/// Code's `computeFingerprintFromMessages` (`utils/fingerprint.ts:71-76`):
+/// Code's `Kph`, which reads `$HE` (the first non-meta user message) and hashes it with `zzl`:
 /// the fingerprint varies per conversation but is stable across all turns
 /// of the same conversation since the first user message text doesn't
 /// change.
@@ -66,26 +70,37 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 }
 
 /// Generates the billing header with a `cch=00000` placeholder. The 3-char fingerprint suffix is
-/// derived from the first user message per Claude Code's behaviour (`services/api/claude.ts:1325`).
-/// The `cch` is replaced with the real attestation by [`patch_request_body`] after serialization.
+/// derived from the first user message per Claude Code's behaviour. The `cch` is replaced with the
+/// real attestation by [`patch_request_body`] after serialization.
+///
+/// The optional segments follow in the order Claude Code's builder emits them (2.1.241, verified
+/// against a wire capture): `cch`, then `cc_workload`, `cc_is_subagent`, `cc_prev_req`,
+/// `cc_prompt_id`. meka never has a workload, so that one is always absent; the rest appear
+/// exactly when their source does.
 pub(super) fn generate_billing_header(messages: &[Message]) -> String {
-    // Claude Code appends `cc_is_subagent=true;` after the `cch` segment for sub-agent requests
-    // (`qun()` in the CLI). meka tracks this via the [`crate::provider::is_subagent`] task-local.
     let subagent = if crate::provider::is_subagent() {
         " cc_is_subagent=true;"
     } else {
         ""
     };
+    let previous_request = crate::provider::previous_request_id()
+        .map(|id| format!(" cc_prev_req={};", id))
+        .unwrap_or_default();
+    let prompt = crate::provider::current_prompt_id()
+        .map(|id| format!(" cc_prompt_id={};", id))
+        .unwrap_or_default();
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}",
         CC_VERSION,
         compute_fingerprint_from_messages(messages),
         subagent,
+        previous_request,
+        prompt,
     )
 }
 
-// xxHash64 and the `cch` attestation token. Algorithm derivation and reverse-engineering notes live
-// in `temp/cc-re/cch/`.
+// xxHash64 and the `cch` attestation token. The seed and the preimage filter below are the whole
+// of it; the module header says how they were recovered.
 
 const XXH64_PRIME1: u64 = 0x9e3779b185ebca87;
 const XXH64_PRIME2: u64 = 0xc2b2ae3d27d4eb4f;
@@ -318,16 +333,71 @@ fn digits_end(body: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// Replaces the `cch=00000` placeholder with the attestation token. The placeholder search is
-/// anchored to the billing header to avoid false matches in messages; the hash is taken over
+/// Byte index just past the colon of the request body's *top-level* `"system"` key.
+///
+/// The scan is structural rather than a substring search: it tracks string boundaries (with
+/// backslash escapes) and brace/bracket depth, and only considers a quoted token a key when it sits
+/// at the root object's own level and is followed by a colon. Anything inside a message is
+/// therefore invisible to it.
+///
+/// That is the whole point. The body puts `messages` ahead of `system`, matching Claude Code's key
+/// order, so a conversation that quotes a billing header -- which is exactly what a session about
+/// this code does -- would otherwise let a message win the search and take the attestation with it.
+fn top_level_system_value(body: &[u8]) -> Option<usize> {
+    let mut i = body.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    if body.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+
+    let mut depth = 0usize;
+    while i < body.len() {
+        match body[i] {
+            b'"' => {
+                let end = json_string_end(body, i + 1)?;
+                if depth == 0 {
+                    let mut after = end + 1;
+                    while body.get(after).is_some_and(u8::is_ascii_whitespace) {
+                        after += 1;
+                    }
+                    if body.get(after) == Some(&b':') && &body[i + 1..end] == b"system" {
+                        return Some(after + 1);
+                    }
+                }
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                // Depth 0 here is the root object's own closing brace: no top-level `system`.
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
+}
+
+/// Replaces the `cch=00000` placeholder with the attestation token. The search starts at the
+/// top-level `system` array so no message can supply the match; the hash is taken over
 /// [`filtered_preimage`] of the body.
 pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
     const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
     const PLACEHOLDER: &str = "cch=00000";
 
-    let billing_start = body_json.find(BILLING_PREFIX).ok_or_else(|| {
-        MekaError::Provider("x-anthropic-billing-header not found in request body".into())
-    })?;
+    let system_start = top_level_system_value(body_json.as_bytes())
+        .ok_or_else(|| MekaError::Provider("no top-level system array in request body".into()))?;
+
+    let billing_start = body_json[system_start..]
+        .find(BILLING_PREFIX)
+        .map(|relative| system_start + relative)
+        .ok_or_else(|| {
+            MekaError::Provider("x-anthropic-billing-header not found in request body".into())
+        })?;
 
     let idx = body_json[billing_start..]
         .find(PLACEHOLDER)
@@ -359,7 +429,7 @@ fn claude_user_agent() -> String {
 /// (Bun's Node.js compat layer) with a fixed version string.
 const STAINLESS_RUNTIME: &str = "node";
 const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
-const STAINLESS_SDK_VERSION: &str = "0.94.0";
+const STAINLESS_SDK_VERSION: &str = "0.112.1";
 
 /// Maps `std::env::consts::ARCH` to Node.js/Bun `process.arch` names.
 fn stainless_arch() -> &'static str {
@@ -384,8 +454,18 @@ fn stainless_os() -> &'static str {
     }
 }
 
-/// Applies all HTTP headers in the order the Stainless SDK + Claude Code would produce on the wire.
-/// See `buildHeaders` in `@anthropic-ai/sdk`.
+/// Applies all HTTP headers Claude Code sends, in the order it sends them.
+///
+/// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
+/// values are. What the 2.1.241 wire capture shows is the Stainless SDK's `Headers` object
+/// serialised in a case-sensitive sort (uppercase before lowercase), then the transport's own
+/// `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it. `reqwest`'s `HeaderMap`
+/// iterates in insertion order, so inserting in that order reproduces it.
+///
+/// Two parts of it are outside meka's reach and stay different. Header *names* go out lowercased
+/// (`http::HeaderName` normalises, and HTTP/2 requires it anyway, so this is invisible on the real
+/// wire), and `reqwest` places `Accept-Encoding` first because its decompression layer installs it
+/// before any per-request header.
 pub(super) fn apply_headers(
     request: reqwest::RequestBuilder,
     auth_header_name: &str,
@@ -393,38 +473,36 @@ pub(super) fn apply_headers(
     session_id: &str,
     betas: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    // Mirrors the Claude SDK's `buildDefaultHeaders()`.
     let mut request = request
-        .header("accept", "application/json")
-        .header("User-Agent", claude_user_agent())
-        .header("x-stainless-retry-count", "0")
-        .header("x-stainless-timeout", "600")
-        .header("x-stainless-lang", "js")
-        .header("x-stainless-package-version", STAINLESS_SDK_VERSION)
-        .header("x-stainless-os", stainless_os())
-        .header("x-stainless-arch", stainless_arch())
-        .header("x-stainless-runtime", STAINLESS_RUNTIME)
-        .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
-        .header("anthropic-version", "2023-06-01")
-        // Set by the SDK; observed on real Claude Code 2.1.219 CLI requests.
-        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("Accept", "application/json")
         // From the SDK's `authHeaders()`.
         .header(auth_header_name, auth_header_value)
-        // From Claude Code's `defaultHeaders()` (User-Agent updates in place above).
-        .header("x-app", "cli")
-        .header("X-Claude-Code-Session-Id", session_id)
         // From the SDK's `bodyHeaders()`.
-        .header("content-type", "application/json")
-        // Per-request headers (not from SDK helpers).
-        .header("x-client-request-id", Uuid::new_v4().to_string())
-        .header("Connection", "keep-alive")
-        .header("Accept-Encoding", "gzip, deflate, br, zstd");
+        .header("Content-Type", "application/json")
+        .header("User-Agent", claude_user_agent())
+        // From Claude Code's `defaultHeaders()`.
+        .header("X-Claude-Code-Session-Id", session_id)
+        .header("X-Stainless-Arch", stainless_arch())
+        .header("X-Stainless-Lang", "js")
+        .header("X-Stainless-OS", stainless_os())
+        .header("X-Stainless-Package-Version", STAINLESS_SDK_VERSION)
+        .header("X-Stainless-Retry-Count", "0")
+        .header("X-Stainless-Runtime", STAINLESS_RUNTIME)
+        .header("X-Stainless-Runtime-Version", STAINLESS_RUNTIME_VERSION)
+        .header("X-Stainless-Timeout", "600");
 
     if let Some(betas) = betas {
         request = request.header("anthropic-beta", betas);
     }
 
     request
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-app", "cli")
+        // Per-request, not from an SDK helper.
+        .header("x-client-request-id", Uuid::new_v4().to_string())
+        .header("Connection", "keep-alive")
+        .header("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 
 #[cfg(test)]

@@ -15,9 +15,9 @@
 //! The on-the-wire request shape is documented at
 //! <https://platform.openai.com/docs/guides/function-calling?api-mode=responses>. Verified against
 //! the first-party Codex client:
-//! - request shape: `temp/codex/codex-rs/codex-api/src/common.rs:163`
-//! - input items:   `temp/codex/codex-rs/protocol/src/models.rs:686`
-//! - SSE events:    `temp/codex/codex-rs/codex-api/src/sse/responses.rs:283`
+//! - request shape: `codex-rs/codex-api/src/common.rs`
+//! - input items:   `codex-rs/protocol/src/models.rs`
+//! - SSE events:    `codex-rs/codex-api/src/sse/responses.rs`
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;

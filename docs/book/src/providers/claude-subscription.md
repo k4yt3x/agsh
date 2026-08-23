@@ -35,7 +35,7 @@ default_provider = "work"
 [providers.work]
 type = "claude-subscription"
 model = "claude-opus-5"
-effort = "xhigh"         # optional; unset sends none, so Anthropic's default applies
+effort = "xhigh"         # optional; unset sends "high", as Claude Code does
 thinking = "adaptive"    # optional; "adaptive"|"budgeted"|"off", default "adaptive"
 redact_thinking = true   # optional; default on, matching Claude Code
 # device_id, oauth_token_url, client_id are all optional overrides
@@ -47,7 +47,7 @@ See [Configuration → Config File](../configuration/config-file.md) for the ful
 
 ### `effort`
 
-Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, both the field and the beta are omitted and Anthropic applies its own default (`high`). An explicit value is absolute: sent verbatim, with no validation or clamping, whatever model it is aimed at. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
+Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, meka sends `high`, which is what Claude Code does; only a model that takes no effort at all gets neither the field nor the beta. An explicit value is absolute: sent verbatim, with no validation or clamping, whatever model it is aimed at. Typical values: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. See [Reasoning effort](#reasoning-effort).
 
 ### `thinking`
 
@@ -97,7 +97,7 @@ The OAuth client ID defaults to Claude Code's client ID but can be overridden pe
 
 Any model your Claude Code subscription exposes. For the current line-up and their retirement dates, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) - `meka provider add` suggests `claude-opus-5` for new Claude profiles.
 
-meka forwards the model string verbatim; it doesn't gate which strings are valid, and it no longer picks request parameters from it: `effort` and `thinking` come from the profile, and are omitted or defaulted rather than inferred. What remains model-derived is the small set of gates whose wrong guess would draw a 400, and those are allowlists so an unrecognised model omits the field rather than being handed one - `temperature` goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older), and the `claude-code-20250219` beta is skipped for the Haiku tier. See [Beta header](#beta-header).
+meka forwards the model string verbatim and doesn't gate which strings are valid. What is model-derived is a small set of gates, each pointed the way Claude Code points it. `temperature` is an allowlist, so an unrecognised model omits the field rather than earning a 400: it goes only to the models that still accept sampling params (Opus 4.6, Sonnet 4.6, Haiku 4.5, and older). `mid-conversation-system-2026-04-07` and `output_config.effort` are denylists, so an unrecognised model gets both: withholding the first would silently drop mid-conversation system messages, and effort is what a newer model is for. The `claude-code-20250219` beta is skipped for the Haiku tier. See [Beta header](#beta-header) and [Reasoning effort](#reasoning-effort).
 
 ## API Details
 
@@ -115,7 +115,7 @@ meka forwards the model string verbatim; it doesn't gate which strings are valid
 
 ### Beta header
 
-Composed dynamically from the model + thinking settings, mirroring Claude Code's `getAllModelBetas`. Order is significant; the list below matches the Claude Code 2.1.219 interactive-CLI wire capture (opus-4-8, tools present) exactly:
+Composed dynamically from the model + thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.241 interactive-CLI wire capture (tools present, thinking on) exactly:
 
 | Beta | When |
 |------|------|
@@ -126,34 +126,64 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `thinking-token-count-2026-05-13` | Any modern Claude (4.x+) |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
-| `mid-conversation-system-2026-04-07` | Opus 4.8 / Opus 5 / Sonnet 5 / Fable 5 / Mythos 5 |
+| `mid-conversation-system-2026-04-07` | Everything except Claude 3.x, Opus 4.7 and older, Sonnet 4.6 and older, and Haiku 4.5 |
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
-| `effort-2025-11-24` | Whenever `output_config.effort` is sent: effort-capable models by default (Claude 4.6+ and Opus 4.5), or any explicit `effort` override on any model |
+| `effort-2025-11-24` | Every model that takes an effort at all, whether or not the profile set one |
+| `fallback-credit-2026-06-01` | Always. Claude Code latches it on every interactive turn; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
 | `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
 
-meka does **not** send `context-1m-2025-08-07`: Claude Code 2.1.219 does not send it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
+meka does **not** send `context-1m-2025-08-07`: Claude Code stopped sending it after 2.1.185, because 1M is the default context window (no beta header) on the current large-context models.
 
 ### System prompt
 
 Sent as an array of three `text` blocks:
 
-1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of the entire serialized request body, computed and patched in just before send.
+1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` plus, when they apply, ` cc_is_subagent=true;`, ` cc_prev_req=<request id>;` and ` cc_prompt_id=<uuid>;`, in that order. The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of a filtered copy of the serialized request body, computed and patched in just before send.
+
+   `cc_prompt_id` identifies one human prompt and stays the same across every request that prompt produces, including the whole tool loop; a sub-agent inherits its spawner's. `cc_prev_req` names the `request-id` of the previous response in the same conversation, so it is absent on a conversation's first request. Both are absent from meka's own side queries, which is where Claude Code omits them too.
 2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix).
 3. Your own system prompt, which carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
 
-Only block 3 is marked for caching, matching the captured Claude Code CLI wire shape ("boundary mode" in `utils/api.ts:362-409`); `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix). Blocks 1 and 2 must come first so the `cch=00000` placeholder is the first occurrence in the serialized JSON, which is what `patch_request_body` looks for when computing the attestation.
+Only block 3 is marked for caching, matching the captured Claude Code CLI wire; `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix).
+
+### Body key order
+
+Keys are serialized in Claude Code's own order, which HTTP preserves:
+
+```
+model, messages, system, tools, metadata, max_tokens, thinking,
+[temperature], [context_management], [output_config], stream
+```
+
+Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000` placeholder by walking the JSON structurally to the *top-level* `system` key rather than by searching for the billing header, so a conversation that quotes one - which any session about this code does - cannot capture the attestation.
 
 ### Other body fields
 
-- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "", "session_id": "..."}` (`device_id` from the profile's `device_id`; `session_id` is per-process).
+- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "...", "session_id": "..."}` (`device_id` from the profile's `device_id`; `account_uuid` from the OAuth token, empty until one is known; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
-- `output_config.effort`: present only when the profile sets `effort`; otherwise omitted, along with its beta.
+- `output_config.effort`: see [Reasoning effort](#reasoning-effort).
 - `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
 - `max_tokens`: `64_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`.
 
+### Reasoning effort
+
+Claude Code never leaves `output_config.effort` to the server on a model that takes one: it looks the model up in a table bundled in its binary, reads that model's `default_effort`, clamps it to what the model supports, and sends the result. meka also always sends a value, but one value rather than a per-model one, and sends the `effort-2025-11-24` beta alongside it.
+
+| | sent |
+|---|---|
+| profile sets `effort` | that value, verbatim |
+| profile sets nothing | `high` |
+| model takes no effort | nothing, and no beta; a configured value is dropped with a warning |
+
+One value for every model, not a copy of that table. `high` is what Claude Code's own resolution produces for almost every effort-capable model in the 2.1.241 table once the clamps have run, and it is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
+
+A value you configure is absolute. Claude Code silently lowers `xhigh` or `max` to `high` on a model whose bundled entry lacks the capability; meka does not, because that table is a snapshot of someone else's system and quietly overriding what you asked for on the strength of it is worse than letting the API answer.
+
+Only `claude-subscription` does this. `anthropic-messages` still omits `effort` when the profile sets none, because it can point at any Anthropic-compatible endpoint and has no standing to assert a default there.
+
 ### Cache control
 
-The most recent message's last content block, the last tool definition, and the user system prompt all carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL matches Claude Code's `getCacheControl` for OAuth subscribers (`should1hCacheTTL` in `claude.ts:358-374`).
+The most recent message's last content block, the last tool definition, and the user system prompt all carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire.
 
 Caching is prefix-based: the system prompt precedes the tools array, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 

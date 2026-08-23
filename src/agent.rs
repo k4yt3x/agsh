@@ -386,6 +386,11 @@ pub struct Agent {
     /// the primary agent; false for sub-agents, which share the parent's `SessionStats` Arc but
     /// own a child session row (so only the primary writes the parent-inclusive totals).
     persist_session_stats: bool,
+    /// Where this conversation's most recent provider request id waits for the next request to
+    /// name it. Per-`Agent`, so a sub-agent reports its own last response rather than its
+    /// spawner's. Read and written only by the Claude subscription provider, which is the one
+    /// backend that puts it on the wire (`cc_prev_req`); every other backend leaves it empty.
+    previous_request: crate::provider::PreviousRequestSlot,
     /// Conversation length at the time of the most recent request the provider *accepted*, or
     /// [`LAST_ACCEPTED_UNKNOWN`] before the first one. Everything appended past it is what a
     /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
@@ -749,6 +754,9 @@ impl Agent {
             mcp_manager: None,
             session_stats,
             persist_session_stats: true,
+            // Fresh per agent for the same reason `session_lock` is: it describes one
+            // conversation, and a sub-agent's requests are not its spawner's.
+            previous_request: crate::provider::PreviousRequestSlot::default(),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
         }
     }
@@ -1097,6 +1105,37 @@ impl Agent {
     /// [`crate::schedule::ScheduledJob::prompt_retention`], which every host defers to so the rule
     /// lives in one place instead of three.
     pub async fn run_turn_retaining(
+        &self,
+        session_id: &mut Option<Uuid>,
+        messages: &mut Conversation,
+        user_input: String,
+        images: Vec<ImageSource>,
+        cancellation: CancellationToken,
+        retention: PromptRetention,
+    ) -> Result<TurnOutcome> {
+        crate::provider::scope_turn(
+            Arc::clone(&self.previous_request),
+            self.run_attributed_turn(
+                session_id,
+                messages,
+                user_input,
+                images,
+                cancellation,
+                retention,
+            ),
+        )
+        .await
+    }
+
+    /// The turn itself, with its prompt identity already in scope.
+    ///
+    /// Split out only so [`Self::run_turn_retaining`] can wrap the whole thing, compaction and the
+    /// checkpoint turn included. Those are work the prompt caused, so attributing them to it is
+    /// right; what must stay bare is a query no prompt asked for, which in Claude Code is a
+    /// separate builder that passes no prompt id at all. meka has no equivalent inside a turn, and
+    /// its own side queries run outside one, so they come out bare without anything here.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_attributed_turn(
         &self,
         session_id: &mut Option<Uuid>,
         messages: &mut Conversation,
@@ -1973,17 +2012,24 @@ impl Agent {
 
         let provider = Arc::clone(&self.provider);
         let cancellation_clone = cancellation.clone();
+        // Task-locals do not cross a spawn, and everything the billing header says about who this
+        // request is for lives in one, so without this the streamed request would name neither its
+        // prompt nor the response before it. See [`crate::provider::capture_attribution`].
+        let attribution = crate::provider::capture_attribution();
 
         let stream_handle = tokio::spawn(async move {
-            provider
-                .stream(
-                    &system_prompt,
-                    &messages,
-                    &tools,
-                    event_sender,
-                    cancellation_clone,
-                )
-                .await
+            crate::provider::scope_attribution(attribution, async move {
+                provider
+                    .stream(
+                        &system_prompt,
+                        &messages,
+                        &tools,
+                        event_sender,
+                        cancellation_clone,
+                    )
+                    .await
+            })
+            .await
         });
 
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -4178,6 +4224,45 @@ mod tests {
     const REJECTION: &str = "API returned status 400 Bad Request: the image was specified using \
                              the image/png media type, but the image appears to be a image/jpeg \
                              image";
+
+    /// A streamed request reaches the provider still knowing which prompt it serves.
+    ///
+    /// `run_streaming_attempt` hands `provider.stream(...)` to `tokio::spawn`, and a task-local
+    /// does not cross a spawn. Deleting the `scope_attribution` wrapper compiles, streams, and
+    /// answers identically; the only visible effect is on the wire, where `claude-subscription`'s
+    /// billing header quietly loses `cc_prompt_id` and `cc_prev_req` and every turn starts looking
+    /// like a side query. Recording the attribution the mock provider *saw* is the only way to see
+    /// it from a test.
+    #[tokio::test]
+    async fn a_streamed_request_knows_which_prompt_it_serves() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![MockEvent::Text {
+            text: "ok".to_string(),
+        }]]));
+        let provider_handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (agent, _session_manager) = test_agent(provider_handle).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+
+        let requests = provider.streams();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].prompt_id.is_some(),
+            "the spawned request lost the prompt it was serving"
+        );
+    }
 
     /// An overflow the agent cannot compact away has to surface once, not loop.
     ///

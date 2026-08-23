@@ -20,9 +20,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::shared::{
-    self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, model_is_haiku, model_supports_mid_conversation_system,
-    model_supports_modern_features, model_supports_temperature, parse_non_streaming_response,
+    self, DEFAULT_EFFORT, convert_messages_to_claude_content, convert_tools_to_claude_tools,
+    drive_claude_sse_stream, model_is_haiku, model_supports_effort,
+    model_supports_mid_conversation_system, model_supports_modern_features,
+    model_supports_temperature, parse_non_streaming_response,
 };
 use crate::{
     error::{MekaError, Result},
@@ -62,10 +63,10 @@ pub struct ClaudeSubscriptionProvider {
     /// Set while an internal turn (compaction) runs, so its summary doesn't pay for reasoning.
     /// Only ever suppresses; it cannot turn thinking on for a profile that asked for none.
     thinking_suppressed: AtomicBool,
-    /// The settled `output_config.effort` for the request body, resolved once at construction from
-    /// the profile's override. `None` - the unconfigured case - omits the field, so Anthropic
-    /// applies its own default. Both the body field and the `effort-2025-11-24` beta gate read
-    /// this one slot, so they stay in lockstep.
+    /// The settled `output_config.effort` for the request body, resolved once at construction: the
+    /// profile's value if it set one, otherwise [`DEFAULT_EFFORT`]. `None` only where the model
+    /// takes no effort at all, and then the `effort-2025-11-24` beta is withheld too -- both read
+    /// this one slot, so they stay in lockstep the way Claude Code's `KHE` keeps them.
     resolved_effort: Option<String>,
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
@@ -103,7 +104,22 @@ impl ClaudeSubscriptionProvider {
             AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
             _ => String::new(),
         };
-        let resolved_effort = crate::provider::resolve_effort_level(effort.as_deref());
+        let configured_effort = crate::provider::resolve_effort_level(effort.as_deref());
+        // Settled once, because it is a property of the profile and the model rather than of a
+        // request. A model that takes no effort drops a configured one rather than earning a 400
+        // for it, which is what Claude Code's `KHE` does, and says so once instead of per turn.
+        let resolved_effort = if model_supports_effort(&model) {
+            Some(configured_effort.unwrap_or_else(|| DEFAULT_EFFORT.to_string()))
+        } else {
+            if let Some(configured) = &configured_effort {
+                tracing::warn!(
+                    "model '{}' takes no reasoning effort; ignoring the profile's effort = '{}'",
+                    model,
+                    configured
+                );
+            }
+            None
+        };
         Ok(Self {
             client: crate::provider::build_http_client("claude-subscription", |builder| builder)?,
             credential: tokio::sync::RwLock::new(credential),
@@ -144,16 +160,30 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.clone()
     }
 
-    /// Mirrors Claude Code 2.1.219's CLI `getAllModelBetas`, validated against a live wire capture
-    /// (`temp/cc-re/capture/FINDINGS.md`): first-party OAuth subscriber, opus-4-8 with tools and
-    /// thinking. `has_tools` gates `advanced-tool-use-2025-11-20` (sent only when the request
-    /// carries tools). Adaptive thinking is GA, selected via the body `thinking` param (no beta).
+    /// Whether this model takes `output_config.effort` at all, which is also what decides the
+    /// `effort-2025-11-24` beta. Reads [`Self::resolved_effort`], which is `None` only in that
+    /// case, so the two can never disagree.
+    fn model_takes_effort(&self) -> bool {
+        self.resolved_effort.is_some()
+    }
+
+    /// Mirrors Claude Code 2.1.241's CLI beta assembly, validated against a live wire capture:
+    /// first-party OAuth subscriber, opus-5 with tools and thinking, twelve betas in this
+    /// order.
     ///
-    /// No `context-1m-2025-08-07`: current Claude Code no longer sends it (the 2.1.185 CLI did;
-    /// 2.1.219 does not). On the current 1M models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5) the 1M
-    /// window is the default with no beta header, so the beta is redundant. Verified by the 2.1.219
-    /// interactive-CLI wire capture (opus-4-8 turn sends 11 betas, no `context-1m`), matching
-    /// the anthropic-messages path.
+    /// `has_tools` gates `advanced-tool-use-2025-11-20`. Claude Code's own gate is narrower -- it
+    /// sends that beta when its *tool search* is active rather than merely when tools are present
+    /// -- but tool search is on for every agentic CLI turn, so the wire is the same, and meka has
+    /// tools on every turn anyway.
+    ///
+    /// No `context-1m-2025-08-07`: Claude Code stopped sending it after 2.1.185. On the current 1M
+    /// models the window is the default, so the beta is redundant; this matches the
+    /// anthropic-messages path.
+    ///
+    /// `fallback-credit-2026-06-01` is sent unconditionally. Claude Code latches it whenever a
+    /// model is visible in its UI, which is every interactive turn, and it only advertises that the
+    /// server may answer with a fallback credit -- meka sends no `fallbacks` or
+    /// `fallback_credit_token` of its own, exactly like the captured turns that carry the beta.
     ///
     /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
     /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
@@ -162,7 +192,7 @@ impl ClaudeSubscriptionProvider {
     /// [`crate::provider::ContentBlock::RedactedThinking`]).
     fn compute_betas(&self, has_tools: bool) -> Option<String> {
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(11);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(12);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
@@ -191,12 +221,13 @@ impl ClaudeSubscriptionProvider {
         }
 
         // Keep the beta in lockstep with the body field: both read the same settled effort slot, so
-        // the beta fires exactly when `output_config.effort` will be sent, which is only when the
-        // profile configured one. An unconfigured profile advertises neither.
-        if self.wire_effort().is_some() {
+        // the beta fires exactly when `output_config.effort` will be sent, which is on every model
+        // that takes an effort at all. Only a model that takes none advertises neither.
+        if self.model_takes_effort() {
             parts.push("effort-2025-11-24");
         }
 
+        parts.push("fallback-credit-2026-06-01");
         parts.push("extended-cache-ttl-2025-04-11");
 
         Some(parts.join(","))
@@ -464,16 +495,26 @@ impl ClaudeSubscriptionProvider {
         })
         .to_string();
 
-        // `system` must precede `messages` so the billing header's `cch=00000` is always the first
-        // occurrence in the serialized JSON.
+        // Keys go in Claude Code's order, which `serde_json`'s `preserve_order` feature carries
+        // through to the wire:
+        //
+        //     model, messages, system, tools, metadata, max_tokens, thinking,
+        //     [temperature], [context_management], [output_config], stream
+        //
+        // Nothing depends on this ordering, which is the point: the attestation locates its
+        // placeholder structurally (see [`attestation::patch_request_body`]) rather than by
+        // assuming `system` comes first, so the order is free to match the capture exactly.
         let mut body = serde_json::Map::new();
+
+        body.insert("model".to_string(), serde_json::json!(self.model));
+        body.insert("messages".to_string(), serde_json::json!(claude_messages));
 
         if !system_prompt.is_empty() {
             let billing_header = attestation::generate_billing_header(messages);
             // Matches recent Claude Code wire shape: only the user system prompt carries
             // `cache_control`. Billing header and identity prefix are unmarked; the source's
-            // "boundary mode" (`utils/api.ts:362-409`) assigns `cacheScope: null` to both. ttl `1h`
-            // matches Claude Code's `getCacheControl` for OAuth subscribers (`claude.ts:358-374`).
+            // Billing header and identity prefix are unmarked, and the `1h` ttl is what an OAuth
+            // subscriber's turn carries.
             // `scope: "global"` mirrors the captured CLI breakpoint (the
             // `prompt-caching-scope-2026-01-05` beta), sharing the cached prefix across sessions.
             body.insert(
@@ -496,8 +537,17 @@ impl ClaudeSubscriptionProvider {
             );
         }
 
-        body.insert("model".to_string(), serde_json::json!(self.model));
-        body.insert("messages".to_string(), serde_json::json!(claude_messages));
+        if !tools.is_empty() {
+            body.insert(
+                "tools".to_string(),
+                serde_json::json!(convert_tools_to_claude_tools(tools)),
+            );
+        }
+
+        body.insert(
+            "metadata".to_string(),
+            serde_json::json!({ "user_id": metadata_user_id }),
+        );
 
         shared::insert_thinking_fields(
             &mut body,
@@ -506,10 +556,15 @@ impl ClaudeSubscriptionProvider {
             self.max_output_tokens,
         );
 
-        // Mirrors `getAPIContextManagement` (`compact/apiMicrocompact.ts:64-92`) for the
-        // OAuth-without-ant-tool-clearing case: when thinking is on and the model supports context
-        // management, preserve thinking blocks across previous assistant turns via
-        // `clear_thinking_20251015`.
+        // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
+        // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
+        // Fable/Mythos reject `temperature` with a 400.
+        if !self.effective_thinking().is_on() && model_supports_temperature(&self.model) {
+            body.insert("temperature".to_string(), serde_json::json!(1));
+        }
+
+        // Mirrors `Yph`, which returns exactly this edit when thinking is on and nothing
+        // otherwise: it preserves thinking blocks across previous assistant turns.
         if self.effective_thinking().is_on() && model_supports_modern_features(&self.model) {
             body.insert(
                 "context_management".to_string(),
@@ -517,13 +572,6 @@ impl ClaudeSubscriptionProvider {
                     "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }]
                 }),
             );
-        }
-
-        // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
-        // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
-        // Fable/Mythos reject `temperature` with a 400.
-        if !self.effective_thinking().is_on() && model_supports_temperature(&self.model) {
-            body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
         if let Some(effort) = self.wire_effort() {
@@ -534,17 +582,6 @@ impl ClaudeSubscriptionProvider {
         }
 
         body.insert("stream".to_string(), serde_json::json!(stream));
-        body.insert(
-            "metadata".to_string(),
-            serde_json::json!({ "user_id": metadata_user_id }),
-        );
-
-        if !tools.is_empty() {
-            body.insert(
-                "tools".to_string(),
-                serde_json::json!(convert_tools_to_claude_tools(tools)),
-            );
-        }
 
         serde_json::Value::Object(body)
     }
@@ -594,6 +631,7 @@ impl Provider for ClaudeSubscriptionProvider {
 
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
+        remember_request_id(response.headers());
         let response_text = response
             .text()
             .await
@@ -649,8 +687,7 @@ impl Provider for ClaudeSubscriptionProvider {
 
         let request = attestation::apply_headers(
             self.client
-                .post(format!("{}/v1/messages?beta=true", self.base_url))
-                .header("accept-encoding", "identity"),
+                .post(format!("{}/v1/messages?beta=true", self.base_url)),
             auth_header_name,
             &auth_header_value,
             &self.session_id,
@@ -665,6 +702,7 @@ impl Provider for ClaudeSubscriptionProvider {
             ))
         })?;
 
+        remember_request_id(response.headers());
         drive_claude_sse_stream(response, event_sender, cancellation).await
     }
 
@@ -873,6 +911,23 @@ impl OAuthUsageResponse {
     }
 }
 
+/// Hand the response's `request-id` to the conversation, so the next request can name it as
+/// `cc_prev_req`.
+///
+/// Called the moment the response head arrives rather than after the body is read, because on the
+/// streaming path the body outlives this function by the whole length of the turn -- and because
+/// Claude Code stamps the id onto the assistant message as soon as the request resolves, error or
+/// not. A response with no `request-id` (a proxy that drops it) simply leaves the previous value in
+/// place, which is what Claude Code's "last assistant message that has one" does too.
+fn remember_request_id(headers: &reqwest::header::HeaderMap) {
+    if let Some(request_id) = headers
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        crate::provider::record_request_id(request_id);
+    }
+}
+
 /// Normalize Anthropic's `extra_usage` block into [`ExtraUsage`]. `used` is `used_credits` in
 /// dollars; `balance` is the remaining allowance (`monthly_limit - used_credits`) in dollars.
 fn oauth_extra_usage(extra_usage: Option<OAuthExtraUsage>) -> Option<ExtraUsage> {
@@ -972,6 +1027,17 @@ mod tests {
     use super::{attestation::CC_VERSION, *};
     use crate::provider::{ContentBlock, Role, ToolResultContent};
 
+    /// The body's keys in the order they will be serialized, which is the order they go on the
+    /// wire: `serde_json`'s `preserve_order` feature makes `Map` insertion-ordered, and Claude
+    /// Code's own order is what meka reproduces.
+    fn claude_code_key_order(body: &serde_json::Value) -> Vec<&str> {
+        body.as_object()
+            .expect("body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
     fn test_provider() -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
@@ -1015,8 +1081,7 @@ mod tests {
 
         assert_eq!(system[1]["type"], "text");
         assert_eq!(system[1]["text"], CC_SYSTEM_PROMPT_PREFIX);
-        // Identity prefix carries no cache_control, which matches recent Claude Code wire shape
-        // (boundary mode in `utils/api.ts:362-409`).
+        // Identity prefix carries no cache_control, matching the captured Claude Code wire.
         assert!(system[1].get("cache_control").is_none());
 
         assert_eq!(system[2]["type"], "text");
@@ -1028,10 +1093,18 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"})
         );
 
-        let body_json = serde_json::to_string(&body).unwrap();
-        let system_pos = body_json.find("\"system\"").unwrap();
-        let messages_pos = body_json.find("\"messages\"").unwrap();
-        assert!(system_pos < messages_pos);
+        assert_eq!(claude_code_key_order(&body), vec![
+            "model",
+            "messages",
+            "system",
+            "metadata",
+            "max_tokens",
+            // No `thinking`: this profile has it off, and meka omits the key where Claude Code
+            // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
+            // with the `anthropic-messages` backend and its arbitrary endpoints.
+            "temperature",
+            "stream",
+        ]);
 
         let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
         let user_id_parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
@@ -1348,8 +1421,19 @@ mod tests {
         assert!(body.get("tools").is_some());
         assert_eq!(body["stream"], true);
 
-        let json = serde_json::to_string(&body).unwrap();
-        assert!(json.find("\"system\"").unwrap() < json.find("\"messages\"").unwrap());
+        assert_eq!(claude_code_key_order(&body), vec![
+            "model",
+            "messages",
+            "system",
+            "tools",
+            "metadata",
+            "max_tokens",
+            // No `thinking`: this profile has it off, and meka omits the key where Claude Code
+            // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
+            // with the `anthropic-messages` backend and its arbitrary endpoints.
+            "temperature",
+            "stream",
+        ]);
 
         let tools_array = body["tools"].as_array().unwrap();
         assert!(tools_array.last().unwrap().get("cache_control").is_none());
@@ -1735,9 +1819,9 @@ mod tests {
 
     #[test]
     fn test_betas_modern_thinking_model_full_set() {
-        // opus-4-8 with tools + thinking + redact_thinking on: matches the live Claude Code 2.1.219
-        // CLI wire capture exactly (11 betas, no `context-1m`; `redact-thinking-2026-02-12`
-        // present, which CC sends by default).
+        // Tools + thinking + redact_thinking on: matches the live Claude Code 2.1.241 interactive
+        // CLI wire capture exactly (12 betas in this order, no `context-1m`;
+        // `redact-thinking-2026-02-12` present, which CC sends by default).
         let betas = provider_full("claude-opus-4-8", true, "high", true)
             .compute_betas(true)
             .unwrap();
@@ -1755,9 +1839,10 @@ mod tests {
                 "mid-conversation-system-2026-04-07",
                 "advanced-tool-use-2025-11-20",
                 "effort-2025-11-24",
+                "fallback-credit-2026-06-01",
                 "extended-cache-ttl-2025-04-11",
             ],
-            "opus-4-8 CLI beta set"
+            "Claude Code 2.1.241 CLI beta set"
         );
     }
 
@@ -1776,7 +1861,7 @@ mod tests {
 
     #[test]
     fn test_betas_never_send_context_1m() {
-        // Current Claude Code (2.1.219) does not send `context-1m-2025-08-07`; 1M is the default
+        // Current Claude Code (2.1.241) does not send `context-1m-2025-08-07`; 1M is the default
         // (no beta) on the current 1M models, so meka never sends it either, across the
         // lineup.
         for model in [
@@ -1879,30 +1964,58 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfigured_profile_sends_no_output_config_and_no_effort_beta() {
-        // Anthropic owns the effort default; meka asks for it by omitting the field. The beta
-        // header reads the same settled slot, so it must fall away with the body field rather than
-        // advertising a capability the request never uses.
+    fn an_unconfigured_profile_sends_claude_codes_default_effort() {
+        // Claude Code never leaves `output_config.effort` to the server on a model that takes one:
+        // it resolves a default and sends that. meka sends one value for all of them, and that
+        // uniformity is the assertion -- a per-model table would pass a laxer version of this test
+        // while adding a fact about Anthropic's data that nothing here would notice going stale.
         for model in [
             "claude-opus-4-8",
             "claude-opus-4-6-20250514",
             "claude-opus-5",
+            "claude-sonnet-5",
+            // Claude Code's bundled table happens to give this one `xhigh`. meka does not carry
+            // per-model figures: the server cannot tell meka's default from a configured value, so
+            // a table would only add something to go stale.
+            "claude-opus-4-7",
         ] {
             let provider = provider_effort(model, None);
             let body = provider.build_request_body("s", &[Message::user("hi")], &[], false);
-            assert!(body.get("output_config").is_none(), "{model}");
+            assert_eq!(body["output_config"]["effort"], "high", "{model}");
             assert!(
-                !provider
+                provider
                     .compute_betas(true)
                     .unwrap_or_default()
                     .contains("effort-2025-11-24"),
-                "{model}"
+                "{model} takes an effort, so the beta rides with it"
             );
         }
-        // A configured value is absolute, and the beta accompanies it.
-        let forced = provider_effort("claude-sonnet-4-20250514", Some("high"));
+
+        // A model that takes no effort gets neither the field nor the beta, however the profile is
+        // configured -- sending it would be a 400 rather than a stronger request.
+        for model in ["claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] {
+            for configured in [None, Some("high")] {
+                let provider = provider_effort(model, configured);
+                let body = provider.build_request_body("s", &[Message::user("hi")], &[], false);
+                assert!(
+                    body.get("output_config").is_none(),
+                    "{model} {configured:?}"
+                );
+                assert!(
+                    !provider
+                        .compute_betas(true)
+                        .unwrap_or_default()
+                        .contains("effort-2025-11-24"),
+                    "{model} {configured:?}"
+                );
+            }
+        }
+
+        // A configured value is absolute: it replaces the default and is never clamped down to what
+        // a bundled table thinks the model supports.
+        let forced = provider_effort("claude-sonnet-4-6", Some("max"));
         let body = forced.build_request_body("system prompt", &[Message::user("hi")], &[], false);
-        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["output_config"]["effort"], "max");
         assert!(
             forced
                 .compute_betas(true)
@@ -1952,8 +2065,8 @@ mod tests {
 
     #[test]
     fn test_betas_mid_conversation_system_gated_on_model() {
-        // Opus 4.8, Opus 5, and Sonnet 5 get it; opus-4-6 and haiku do not (capture-confirmed
-        // against Claude Code 2.1.219).
+        // The gate is a denylist, so the newer models get it and the named older ones do not
+        // (mirrors Claude Code 2.1.241's own list).
         for model in ["claude-opus-4-8", "claude-opus-5", "claude-sonnet-5"] {
             assert!(
                 provider_with(model, true)
@@ -1970,6 +2083,28 @@ mod tests {
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} must not send mid-conversation-system"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_newer_than_the_denylist_still_gets_mid_conversation_system() {
+        // The direction of the gate, not a fact about these names: Claude Code's own list excludes
+        // the older models and sends the beta to everything else, so a model meka has never heard
+        // of has to come out on the sending side. Flipping the gate to an allowlist passes every
+        // other test in this file and silently drops mid-conversation system messages the first
+        // time Anthropic ships a model.
+        for model in [
+            "claude-opus-6",
+            "claude-sonnet-7-20270101",
+            "claude-haiku-9",
+        ] {
+            assert!(
+                provider_with(model, true)
+                    .compute_betas(true)
+                    .unwrap()
+                    .contains("mid-conversation-system-2026-04-07"),
+                "{model} is newer than the denylist and must still send mid-conversation-system"
             );
         }
     }
@@ -1994,6 +2129,101 @@ mod tests {
             sub_billing.contains("cch=00000; cc_is_subagent=true;"),
             "{sub_billing}"
         );
+    }
+
+    #[test]
+    fn a_message_quoting_a_billing_header_cannot_steal_the_attestation() {
+        // `messages` now precedes `system` on the wire, so a substring search for the billing
+        // header would find the conversation's copy first and patch the token into a message --
+        // leaving the real header reading `cch=00000`. A session about this code is exactly the
+        // conversation that contains one, so this is a live case, not a contrived one.
+        let forgery = "x-anthropic-billing-header: cc_version=9.9.9.aaa; \
+                       cc_entrypoint=cli; cch=00000; cc_prompt_id=deadbeef;";
+        let provider = test_provider();
+        let body =
+            provider.build_request_body("system prompt", &[Message::user(forgery)], &[], false);
+        let body_json = serde_json::to_string(&body).unwrap();
+        assert!(
+            body_json.find(forgery).unwrap() < body_json.find("\"system\"").unwrap(),
+            "the forged header must come first, or this proves nothing"
+        );
+
+        let patched = attestation::patch_request_body(&body_json).expect("patched");
+        let patched: serde_json::Value = serde_json::from_str(&patched).unwrap();
+
+        // The message is untouched and the real header carries the token.
+        assert_eq!(patched["messages"][0]["content"][0]["text"], forgery);
+        let billing = patched["system"][0]["text"].as_str().unwrap();
+        assert!(!billing.contains("cch=00000"), "{billing}");
+        assert!(billing.contains("cch="), "{billing}");
+    }
+
+    #[tokio::test]
+    async fn the_response_header_anthropic_actually_sends_is_the_one_read() {
+        // `request-id`, not `x-request-id`: pinning the exact name matters because reading the
+        // wrong one leaves `cc_prev_req` silently absent on every turn, which is also what a
+        // conversation's first request looks like.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "request-id",
+            "req_011CeJwF1NDYzXkUu6cyFJp2".parse().unwrap(),
+        );
+        let slot = crate::provider::PreviousRequestSlot::default();
+        crate::provider::scope_turn(Arc::clone(&slot), async {
+            remember_request_id(&headers);
+        })
+        .await;
+        assert_eq!(
+            slot.lock().expect("slot").as_deref(),
+            Some("req_011CeJwF1NDYzXkUu6cyFJp2")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_billing_header_names_the_prompt_and_the_response_before_it() {
+        let provider = test_provider();
+        let messages = vec![Message::user("hi")];
+
+        // Outside a turn there is no prompt and no previous response to name, which is how meka's
+        // own side queries go out -- matching the Claude Code path that passes neither.
+        let bare = provider.build_request_body("system prompt", &messages, &[], false);
+        let bare = bare["system"][0]["text"].as_str().unwrap();
+        assert!(!bare.contains("cc_prompt_id"), "{bare}");
+        assert!(!bare.contains("cc_prev_req"), "{bare}");
+
+        let slot = crate::provider::PreviousRequestSlot::default();
+        let (first, second) = crate::provider::scope_turn(slot, async {
+            let first = provider.build_request_body("system prompt", &messages, &[], false);
+            let first = first["system"][0]["text"].as_str().unwrap().to_string();
+            // What the provider does when a response head arrives.
+            crate::provider::record_request_id("req_011CeJwF1NDYzXkUu6cyFJp2");
+            let second = provider.build_request_body("system prompt", &messages, &[], false);
+            let second = second["system"][0]["text"].as_str().unwrap().to_string();
+            (first, second)
+        })
+        .await;
+
+        // The conversation's first request has a prompt but no response behind it.
+        let prompt_id = crate::provider::current_prompt_id();
+        assert!(prompt_id.is_none(), "the scope must not outlive the turn");
+        assert!(first.contains("cch=00000; cc_prompt_id="), "{first}");
+        assert!(!first.contains("cc_prev_req"), "{first}");
+
+        // The next one names it, in Claude Code's segment order.
+        assert!(
+            second.contains("cch=00000; cc_prev_req=req_011CeJwF1NDYzXkUu6cyFJp2; cc_prompt_id="),
+            "{second}"
+        );
+
+        // And it is the same prompt throughout, because it is the same prompt.
+        let id_of = |header: &str| {
+            header
+                .split("cc_prompt_id=")
+                .nth(1)
+                .and_then(|rest| rest.split(';').next())
+                .map(str::to_string)
+        };
+        assert_eq!(id_of(&first), id_of(&second));
     }
 
     #[test]
