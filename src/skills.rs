@@ -290,25 +290,31 @@ pub struct Conformance {
 }
 
 impl Skill {
-    /// Attribution, by the spec's conventional key. `None` when the skill does not claim one.
+    /// Attribution, by the spec's conventional key or the top-level one.
     pub fn author(&self) -> Option<String> {
         self.metadata_text(META_AUTHOR)
-            .or_else(|| self.pre_spec_text("author"))
+            .or_else(|| self.top_level_text("author"))
     }
 
-    /// Free-form version label, by the spec's conventional key.
+    /// Free-form version label, by the spec's conventional key or the top-level one.
     pub fn version(&self) -> Option<String> {
         self.metadata_text(META_VERSION)
-            .or_else(|| self.pre_spec_text("version"))
+            .or_else(|| self.top_level_text("version"))
     }
 
-    /// The pre-spec top-level spelling, for a file [`migrate_pre_spec_keys`] could not migrate.
+    /// A top-level frontmatter key, read as display text.
     ///
-    /// It bails out when `metadata` is not a map, because meka will not overwrite what the file put
-    /// there. That is right for the *file* and wrong for the reader: the value is still on disk, so
-    /// a `meka skill list` that showed a dash, and an HTTP view that omitted `author` entirely,
-    /// were hiding an attribution the skill plainly makes.
-    fn pre_spec_text(&self, key: &str) -> Option<String> {
+    /// Permanent, not a waiting room. Claude Code's plugin skills write `version:` at the top level
+    /// rather than under `metadata`, and the skill that documents skill authoring tells authors to
+    /// put it there, so the spelling is one meka reads from other people's files forever. `author`
+    /// is read the same way because a hand-written claim is still the file saying who wrote it, and
+    /// [`write_skill`] must see it to avoid signing over a human.
+    ///
+    /// meka writes only the spec's spelling. The surfaces differ per key, which is why this is
+    /// worth stating: `version` is read only by the two HTTP views, because `meka skill get`
+    /// replays every unmodelled key anyway and would print `extra.version` regardless. `author`
+    /// additionally fills a column in `meka skill list`.
+    fn top_level_text(&self, key: &str) -> Option<String> {
         self.extra.get(key).map(yaml_value_to_string)
     }
 
@@ -335,9 +341,8 @@ impl Skill {
 /// The six fields the spec defines, plus whatever else the file happened to carry.
 ///
 /// The `flatten`ed [`Self::extra`] is what makes a rewrite non-destructive: anything not named
-/// here lands there as parsed YAML and is written straight back out. It is also where the pre-spec
-/// top-level `version` / `author` / `priority` / `source_url` arrive, so the migration reads them
-/// from one place rather than each needing its own field.
+/// here lands there as parsed YAML and is written straight back out. It is also where a top-level
+/// `version` or `author` arrives, so [`Skill::top_level_text`] has one place to look.
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
     name: Option<String>,
@@ -869,7 +874,7 @@ pub fn parse_skill_definition(
         ));
     }
 
-    let mut extra = frontmatter.extra;
+    let extra = frontmatter.extra;
     let mut metadata = frontmatter.metadata;
     if metadata.as_ref().is_some_and(|value| !value.is_mapping()) {
         tracing::warn!(
@@ -878,8 +883,7 @@ pub fn parse_skill_definition(
             name
         );
     }
-    migrate_pre_spec_keys(&mut metadata, &mut extra);
-    let priority_raw = take_priority(&mut metadata, &mut extra, name);
+    let priority_raw = take_priority(&mut metadata, name);
     canonicalize_empty_metadata(&mut metadata);
 
     let conformance = Conformance {
@@ -918,91 +922,39 @@ pub fn parse_skill_definition(
     })
 }
 
-/// Move a pre-spec top-level `version` / `author` into the `metadata` map the spec defines.
+/// Take the listing rank out of `metadata`, so [`Skill::priority`] is its only owner.
 ///
-/// The migration happens once, here, rather than leaving the value in two places for a later
-/// rewrite to disagree about. A file carrying both spellings resolves toward the newer location.
-/// Anything else in `extra` -- `source_url`, Claude Code's `when_to_use`, a key nobody has invented
-/// yet -- stays put and is written back untouched.
+/// Removed here and re-inserted by [`render_skill_file`], because a value living in both the struct
+/// and the map invites a rewrite that persists whichever copy the renderer happened to read.
 ///
-/// The top-level key is removed only when the map actually takes it, and only when `metadata` is a
-/// map at all. A rewrite that consumed neither reading of the value destroyed an attribution
-/// nothing else records.
-fn migrate_pre_spec_keys(
-    metadata: &mut Option<serde_norway::Value>,
-    extra: &mut BTreeMap<String, serde_norway::Value>,
-) {
-    let map = match metadata {
-        Some(serde_norway::Value::Mapping(map)) => map,
-        // Absent: the migration is what creates the map, so a pre-spec skill still gets one.
-        None => match metadata.insert(serde_norway::Value::Mapping(serde_norway::Mapping::new())) {
-            serde_norway::Value::Mapping(map) => map,
-            // Unreachable: this is the value inserted on the line above.
-            _ => return,
-        },
-        // Present but not a map: meka will not overwrite what the file put there, so there is
-        // nowhere to migrate *to* and the top-level key keeps being the only copy.
-        Some(_) => return,
+/// The asymmetry is deliberate and hard-won: a value meka *cannot read* is left exactly where it
+/// is. Deleting it would mean the rewrite that failed to understand a rank is also the one that
+/// threw it away, and the user's `meka-priority: high` is the only copy of itself.
+///
+/// A bare top-level `priority:` is not a rank. It belongs to whoever wrote it, so it stays in
+/// [`Skill::extra`] and is replayed verbatim like any other key meka does not model.
+fn take_priority(metadata: &mut Option<serde_norway::Value>, name: &str) -> Option<i64> {
+    let key = serde_norway::Value::from(META_PRIORITY);
+    let serde_norway::Value::Mapping(map) = metadata.as_mut()? else {
+        return None;
     };
-    for (legacy, key) in [("version", META_VERSION), ("author", META_AUTHOR)] {
-        let key = serde_norway::Value::from(key);
-        if !map.contains_key(&key)
-            && let Some(value) = extra.remove(legacy)
-        {
-            map.insert(key, value);
+    let text = map.get(&key).map(yaml_value_to_string)?;
+    match text.trim().parse::<i64>() {
+        Ok(number) => {
+            map.remove(&key);
+            Some(number)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "skill '{}' has a non-numeric {}: {:?}; using the default rank and leaving the \
+                 value alone",
+                name,
+                META_PRIORITY,
+                crate::store::sanitize_stored_description(&text)
+            );
+            None
         }
     }
-    if map.is_empty() {
-        // Nothing migrated, so leave `metadata` absent rather than rendering an empty key.
-        *metadata = None;
-    }
-}
-
-/// Take the listing rank out of the frontmatter, so [`Skill::priority`] is its only owner.
-///
-/// Removed from wherever it was found and re-inserted by [`render_skill_file`], because a value
-/// living in both the struct and the map invites a rewrite that persists whichever copy the
-/// renderer happened to read.
-///
-/// The asymmetry in each branch is deliberate and hard-won: a value meka *cannot read* is left
-/// exactly where it is. Deleting it would mean the rewrite that failed to understand a rank is also
-/// the one that threw it away, and the user's `meka-priority: high` is the only copy of itself.
-fn take_priority(
-    metadata: &mut Option<serde_norway::Value>,
-    extra: &mut BTreeMap<String, serde_norway::Value>,
-    name: &str,
-) -> Option<i64> {
-    let key = serde_norway::Value::from(META_PRIORITY);
-    if let Some(serde_norway::Value::Mapping(map)) = metadata
-        && let Some(text) = map.get(&key).map(yaml_value_to_string)
-    {
-        return match text.trim().parse::<i64>() {
-            Ok(number) => {
-                map.remove(&key);
-                Some(number)
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "skill '{}' has a non-numeric {}: {:?}; using the default rank and leaving the \
-                     value alone",
-                    name,
-                    META_PRIORITY,
-                    crate::store::sanitize_stored_description(&text)
-                );
-                None
-            }
-        };
-    }
-
-    // The pre-spec spelling, consumed so the value has one owner. No gate on what `metadata`
-    // happens to be: [`write_skill`] refuses a file whose `metadata` is not a map, so the case that
-    // gate existed for cannot reach a rewrite.
-    let number = yaml_value_to_string(extra.get("priority")?)
-        .trim()
-        .parse::<i64>()
-        .ok()?;
-    extra.remove("priority");
-    Some(number)
 }
 
 /// Collapse a `metadata` map that extraction emptied back to "absent".
@@ -1174,20 +1126,19 @@ pub fn validate_skill_name(name: &str) -> Result<(), String> {
 
 /// Whether `name` is a skill meka can *address*: one path component, rendered as itself.
 ///
-/// The single predicate behind two questions that have to have the same answer:
+/// Deliberately weaker than [`skill_name_problem`], which is the spec's rule and decides what
+/// *loads*. This one decides what can be *named*, and it has to say yes more often: a directory
+/// discovery skipped is still on disk, still warned about by name, and still has to be removable.
 ///
-/// - discovery asks it of a directory it found, and refuses the skill when it fails, and
-/// - every read and delete door asks it of a name a caller supplied.
-///
-/// Sharing it is the point. While the two differed, every name in the gap was a dead end: `con`,
-/// `two words` and `my:skill` were all loaded, listed, and served by `skill_read`, and then refused
-/// by `meka skill remove`, `skill_delete` and `DELETE /v1/skills/{name}` alike, leaving `rm -rf` as
-/// the only way out. Now "listed" implies "removable" by construction rather than by two character
-/// classes being kept in step by hand.
+/// Every read and delete door asks this one of a name a caller supplied. While the two rules were
+/// one, every name in the gap was a dead end: `con`, `two words` and `my:skill` were all loaded,
+/// listed, and served by `skill_read`, and then refused by `meka skill remove`, `skill_delete` and
+/// `DELETE /v1/skills/{name}` alike, leaving `rm -rf` as the only way out. Conforming names are a
+/// subset of addressable ones, so "listed" still implies "removable" by construction.
 ///
 /// It is *not* [`validate_skill_name`]. That is the spec, and it applies where meka creates a name;
-/// a store written by an older meka (whose `--help` advertised `_`) or by another client is full of
-/// names it refuses, and upgrading must not strand them. Windows' reserved names are likewise a
+/// a skills root is a directory anything can write into, so it fills with names the spec refuses
+/// and a refusal to *load* one must never strand it. Windows' reserved names are likewise a
 /// create-time rule and deliberately absent here.
 ///
 /// Two things it does check, each closing a different hole:
@@ -1237,8 +1188,10 @@ pub fn validate_addressable_name(name: &str) -> Result<(), String> {
 /// with prose and pasted text as often as with commands, and answering "no such skill" to
 /// `/v1.2 of the API` would be worse than passing the line through untouched.
 ///
-/// The set is what meka has ever written plus what the spec allows: an alphanumeric first
-/// character, then alphanumerics, hyphens and underscores.
+/// Wider than the spec's name rules on purpose. A directory anything can write into holds names
+/// [`skill_name_problem`] refuses, and those still reach the user's fingers: answering "no such
+/// skill" beats passing `/My_Skill` through as prose when a directory by that name is sitting in
+/// the store, skipped.
 pub fn looks_like_skill_invocation(name: &str) -> bool {
     let mut characters = name.chars();
     characters.next().is_some_and(char::is_alphanumeric)
@@ -1479,18 +1432,20 @@ pub fn write_skill(
     // The struct is about to be rendered and parsed back, and the parse-back is what every caller
     // reads. Leaving stale conformance on it would be a `Skill` that contradicts its own file.
     merged.conformance = Conformance::default();
-    // Only when the skill does not already claim one: overwriting a human's attribution because an
-    // agent edited their file loses information nothing else records. The map is always a map here,
-    // because the guard above refused anything else.
+    // Only when the skill does not already claim one, in *either* spelling: overwriting a human's
+    // attribution because an agent edited their file loses information nothing else records.
+    //
+    // [`Skill::author`] rather than a look in `metadata` alone, because a hand-written file keeps
+    // its claim at the top level and that is still the file saying who wrote it. Reading only the
+    // nested spelling let an agent rewriting a hand-written skill sign it.
+    let claims_an_author = merged.author().is_some();
     if let Some(author) = author
+        && !claims_an_author
         && let serde_norway::Value::Mapping(map) = merged
             .metadata
             .get_or_insert_with(|| serde_norway::Value::Mapping(serde_norway::Mapping::new()))
     {
-        let key = serde_norway::Value::from(META_AUTHOR);
-        if !map.contains_key(&key) {
-            map.insert(key, author.into());
-        }
+        map.insert(serde_norway::Value::from(META_AUTHOR), author.into());
     }
 
     let rendered = render_skill_file(&merged, &body);
@@ -1518,8 +1473,9 @@ pub fn write_skill(
 /// leaving them behind would turn a delete into a broken half-skill that discovery keeps warning
 /// about. Matches `meka skill remove`.
 pub fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
-    // Lookup rules, not write rules: a skill whose name predates the spec still loads and still
-    // shows up everywhere, so it has to be removable. See `validate_addressable_name`.
+    // Lookup rules, not write rules. A name the spec refuses does not load, but it is still named
+    // by the startup warning and by the skipped list, so the door that removes it must accept what
+    // the user was just told to remove. See `validate_addressable_name`.
     validate_addressable_name(name)?;
     let dir = root.join(name);
     // `remove_dir_all` does not follow the link, so a symlinked entry would lose the link and keep
@@ -1902,7 +1858,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create skill dir");
         let render = |priority: u8| {
             format!(
-                "---\ndescription: a description\npriority: {}\n---\n\nbody\n",
+                "---\ndescription: a description\nmetadata:\n  meka-priority: {}\n---\n\nbody\n",
                 priority
             )
         };
@@ -2230,26 +2186,35 @@ mod tests {
         );
     }
 
-    /// Skills meka wrote before it carried a `metadata` map keep working, and migrate the first
-    /// time anything rewrites them.
+    /// `version` and `author` are read from wherever the file put them. A bare `priority` is not:
+    /// it is nobody's rank, so it keeps the default and stays in `extra` for the file to keep.
     #[test]
-    fn a_pre_spec_skill_reads_from_its_top_level_keys() {
+    fn top_level_version_and_author_are_read_but_priority_is_not() {
         let skill = parse(
             "legacy",
             "---\n\
-             description: an older file\n\
+             description: a hand-written file\n\
              priority: 3\n\
              version: \"1.0\"\n\
              author: Jane Doe <jane@example.com>\n\
              ---\nbody\n",
         )
-        .expect("a pre-spec file must still load");
+        .expect("the file must still load");
 
-        assert_eq!(skill.priority, 3);
         assert_eq!(skill.version().as_deref(), Some("1.0"));
         assert_eq!(
             skill.author().as_deref(),
             Some("Jane Doe <jane@example.com>")
+        );
+        assert_eq!(
+            skill.priority,
+            crate::store::DEFAULT_PRIORITY,
+            "a bare `priority` is not `meka-priority`"
+        );
+        assert!(
+            skill.extra.contains_key("priority"),
+            "and it is left where the file put it: {:?}",
+            skill.extra
         );
     }
 
@@ -2375,6 +2340,13 @@ mod tests {
                 "---\nname: weird-metadata-key\ndescription: d\nmetadata:\n  \"a: b\": v\n  ? |-\n    x\n    y\n  : z\n---\nb\n",
             ),
             (
+                // The one unmodelled key with a modelled counterpart at render time. `extra` goes
+                // into the top-level map and the rank into the nested one, so a fixed point here
+                // is what says the two cannot collide.
+                "bare-priority-beside-a-rank",
+                "---\nname: bare-priority-beside-a-rank\ndescription: d\npriority: 3\nmetadata:\n  meka-priority: '2'\n---\nb\n",
+            ),
+            (
                 "unknown-keys",
                 "---\nname: unknown-keys\ndescription: d\nwhen_to_use: x\nnested:\n  a: 1\n  b: [2, 3]\n---\nb\n",
             ),
@@ -2441,14 +2413,14 @@ mod tests {
         }
     }
 
-    /// A pre-spec top-level `author` is kept when the migration does not consume it.
+    /// A file carrying both spellings keeps both across a rewrite.
     ///
-    /// The removal was unconditional while the insert was `or_insert`, so a file carrying both
-    /// spellings lost the older value on the next rewrite: `metadata.author` won, `author:` was
-    /// deleted, and the deleted one was the only copy of itself. Resolving toward the newer
-    /// location is right; destroying the other reading of it is not.
+    /// Nothing in the binary consumes the top-level key, so this pins that `extra` carries it back
+    /// out untouched. Losing it would be silent and unrecoverable: the top-level line is the only
+    /// copy of itself, and a rewrite that dropped it while `metadata.author` won would delete a
+    /// human's attribution to make room for an agent's.
     #[test]
-    fn a_pre_spec_author_survives_when_the_newer_spelling_wins() {
+    fn a_top_level_author_survives_when_the_newer_spelling_wins() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -2506,13 +2478,13 @@ mod tests {
         assert_eq!(skill.allowed_tools, None);
     }
 
-    /// A pre-spec `author:` is still shown when the migration could not consume it.
+    /// A top-level `author:` is shown even when `metadata` is unusable.
     ///
-    /// `migrate_pre_spec_keys` bails out on a `metadata` it may not replace, which keeps the value
-    /// safe on disk and, without a fallback, hid it from every reader: `meka skill list` showed a
-    /// dash and `GET /v1/skills/{name}` omitted the field, for a skill that plainly claims one.
+    /// A `metadata` that is not a map has nowhere to read from, and without this fallback the claim
+    /// was hidden from every reader: `meka skill list` showed a dash and `GET /v1/skills/{name}`
+    /// omitted the field, for a file that states it plainly.
     #[test]
-    fn a_pre_spec_author_is_shown_even_when_it_cannot_be_migrated() {
+    fn a_top_level_author_is_shown_wherever_the_file_keeps_it() {
         let skill = parse(
             "legacy",
             "---\nname: legacy\ndescription: d\nauthor: Jane\nversion: '2'\nmetadata: none\n---\nb\n",
@@ -2737,10 +2709,12 @@ mod tests {
         );
     }
 
-    /// A name meka's previous release advertised has to stay removable. Discovery loads it, the
-    /// index lists it, so a delete door that refused it would leave `rm -rf` as the only way out.
+    /// A name meka will not author has to stay removable. A skills root is a directory anything can
+    /// write into, so such a name arrives; discovery skips it rather than loading it, but the user
+    /// is told it is there, and a delete door that refused it would leave `rm -rf` as the only way
+    /// out.
     #[test]
-    fn a_legacy_name_can_still_be_deleted_even_though_it_cannot_be_written() {
+    fn a_name_meka_cannot_write_can_still_be_deleted() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "My_Skill", "---\ndescription: d\n---\nbody\n");
 
@@ -3274,7 +3248,7 @@ mod tests {
             "cc-skill",
             "---\n\
              description: A CC-shaped skill\n\
-             when_to_use: legacy field\n\
+             when_to_use: a key Claude Code writes\n\
              allowed-tools: [read_file]\n\
              user-invocable: false\n\
              ---\nBody\n",
@@ -3487,12 +3461,12 @@ mod tests {
         write_skill(
             temp.path(),
             "ranked",
-            "---\ndescription: x\npriority: 1\n---\nbody\n",
+            "---\ndescription: x\nmetadata:\n  meka-priority: 1\n---\nbody\n",
         );
         write_skill(
             temp.path(),
             "nonsense",
-            "---\ndescription: x\npriority: 99\n---\nbody\n",
+            "---\ndescription: x\nmetadata:\n  meka-priority: 99\n---\nbody\n",
         );
 
         let skills = discover_skills_in(temp.path());
@@ -3517,7 +3491,7 @@ mod tests {
         write_skill(
             temp.path(),
             "zzz",
-            "---\ndescription: x\npriority: 0\n---\n",
+            "---\ndescription: x\nmetadata:\n  meka-priority: 0\n---\n",
         );
         write_skill(temp.path(), "aaa", &valid_frontmatter("x"));
         write_skill(temp.path(), "bbb", &valid_frontmatter("x"));

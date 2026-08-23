@@ -73,7 +73,7 @@ Everything else loads: an over-long description (warned, since refusing would ta
 
 A name containing characters meka cannot render -- a newline, a zero-width space -- is refused by the same rule, and additionally cannot be reached by `meka skill remove`: the name meka would echo back is a *different* directory, which may itself exist. Rename it in a shell.
 
-Keys meka does not model are **kept, not dropped**. A skill carrying Claude Code's `when_to_use`, or a `source_url` from a meka older than this one, still has them after an agent edits its description.
+Keys meka does not model are **kept, not dropped**. A skill carrying Claude Code's `when_to_use`, or a `source_url` naming where it was fetched from, still has them after an agent edits its description.
 
 Frontmatter that is not valid YAML is **not** repaired. The client guide suggests quoting unquoted prose colons (`description: Extract text. Use when: the user mentions PDFs`) as a fallback, and meka deliberately does not: the reference implementation does no repair either, one repair rule is an arbitrary pick out of the many ways YAML can be malformed, and a file meka silently fixed on the way in is one that keeps working here and nowhere else. The skill is skipped instead, and [said so out loud](#how-the-agent-uses-skills) with the parser's own line and column. Fix the file once and every client can read it.
 
@@ -110,6 +110,17 @@ meka renders such a value as text where it needs one (`meka skill list`, `meka s
 | `meka-priority` | `5` | Listing rank `0`-`9`, lower first. Orders the `[Skills]` index and decides which skills its cap drops. Not shown to the model; see [How the Agent Uses Skills](#how-the-agent-uses-skills). |
 
 `meka-priority` carries a prefix because it is meka's own concept and the spec has nothing like it; another client could reasonably read a bare `priority` the opposite way round. `author` and `version` do not, because the spec demonstrates exactly those keys.
+
+### Frontmatter Written Before the Spec
+
+A `SKILL.md` written before meka followed the spec carries `author`, `version` and `priority` at the top level of the frontmatter, where the spec has no place for them. The [one-shot upgrade script](../getting-started/upgrading.md) moves all three under `metadata:`, and the three are not equally optional:
+
+- `author` and `version` keep their names, and meka reads either spelling permanently (see below), so moving them changes nothing but tidiness.
+- `priority` is **renamed** to `meka-priority` as it moves, because that is the key a rank is read from and there is no other. A top-level `priority:` left where it is, or hand-moved under `metadata:` under its own name, is a key nothing reads: the skill takes the default rank of 5, the `[Skills]` index comes out in a different order, its cap drops different skills, and nothing says so. This is the part of the move that has to happen.
+
+meka does not rewrite a file it is only reading, so a skill it never writes to keeps the frontmatter you gave it until the script runs.
+
+Reading a top-level `author` or `version` is permanent, not a transition. Claude Code's plugin skills declare `version` at the top level, and the skill that documents skill authoring tells authors to put it there, so a reader that looked only under `metadata:` would print a dash for a version the file plainly states. meka reads both spellings and writes only the spec's, which is what lets the move be a script you run once rather than something the binary does to your files behind your back.
 
 ### Why `allowed-tools` Is Ignored
 

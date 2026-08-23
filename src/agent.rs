@@ -2008,7 +2008,7 @@ impl Agent {
                         .emit(FrontendEvent::ThinkingProgress { estimated_tokens })
                         .await;
                 }
-                StreamEvent::ThinkingComplete { signature } => {
+                StreamEvent::ThinkingComplete { opaque } => {
                     let content = std::mem::take(&mut current_thinking);
                     if content.is_empty() {
                         // Nothing to render, but the block is over: say so, so a frontend showing a
@@ -2016,22 +2016,22 @@ impl Agent {
                         // event that may never come.
                         self.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     }
-                    // Keep the block whenever it carries replayable state: visible text and/or a
-                    // signature. Under `redact-thinking` the text is empty but the signature must
-                    // survive to continue the reasoning chain on the next turn.
-                    if !content.is_empty() || signature.is_some() {
+                    // Keep the block whenever it carries replayable state: visible text and/or
+                    // something opaque. Under `redact-thinking` the text is empty but the signature
+                    // must survive to continue the reasoning chain on the next turn, and under the
+                    // Responses API the sealed reasoning is the whole of what can be replayed.
+                    if !content.is_empty() || opaque.is_some() {
                         if !content.is_empty() {
                             *content_started = true;
                             self.frontend
                                 .emit(FrontendEvent::ThinkingBlock {
                                     content: content.clone(),
-                                    signature: signature.clone(),
                                 })
                                 .await;
                         }
                         content_blocks.push(ContentBlock::Thinking {
                             thinking: content,
-                            signature,
+                            opaque,
                         });
                     }
                 }
@@ -2040,7 +2040,6 @@ impl Agent {
                     self.frontend
                         .emit(FrontendEvent::ThinkingBlock {
                             content: "[redacted thinking]".to_string(),
-                            signature: None,
                         })
                         .await;
                     content_blocks.push(ContentBlock::RedactedThinking { data });
@@ -4864,7 +4863,9 @@ mod tests {
             // No `ThinkingDelta`: the block produces a signature and nothing readable, which is
             // every block under `redact-thinking`.
             MockEvent::ThinkingComplete {
-                signature: Some("sig".to_string()),
+                opaque: Some(crate::provider::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
             },
             MockEvent::Text {
                 text: "done".to_string(),
@@ -4900,6 +4901,72 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, FrontendEvent::ThinkingBlock { .. })),
             "there is no text to render, so no block event belongs here: {events:?}",
+        );
+    }
+
+    /// Reasoning the turn was handed has to reach the conversation, or the next request cannot
+    /// replay it.
+    ///
+    /// The Responses backend carries two opaque values on a thinking block: `encrypted_content` as
+    /// the signature, and the reasoning item's `rs_...` as the id. Neither is readable and neither
+    /// is reconstructible, so dropping either here is invisible until the model's chain of thought
+    /// quietly stops carrying across tool calls.
+    #[tokio::test]
+    async fn a_turn_records_the_opaque_reasoning_it_was_handed() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::ThinkingDelta {
+                text: "weighing it up".to_string(),
+            },
+            MockEvent::ThinkingComplete {
+                opaque: Some(crate::provider::OpaqueReasoning::Sealed {
+                    encrypted_content: "OPAQUE".to_string(),
+                    id: Some("rs_1".to_string()),
+                }),
+            },
+            MockEvent::Text {
+                text: "done".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (agent, _frontend) = test_agent_recording(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "hello".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn succeeds");
+
+        let recorded = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::Thinking { thinking, opaque } => {
+                    Some((thinking.clone(), opaque.clone()))
+                }
+                _ => None,
+            })
+            .expect("the turn must record its thinking block");
+
+        assert_eq!(
+            recorded,
+            (
+                "weighing it up".to_string(),
+                Some(crate::provider::OpaqueReasoning::Sealed {
+                    encrypted_content: "OPAQUE".to_string(),
+                    id: Some("rs_1".to_string()),
+                })
+            )
         );
     }
 
@@ -4951,7 +5018,9 @@ mod tests {
                 text: "weighing the options".to_string(),
             },
             MockEvent::ThinkingComplete {
-                signature: Some("sig".to_string()),
+                opaque: Some(crate::provider::OpaqueReasoning::Signed {
+                    signature: "sig".to_string(),
+                }),
             },
             MockEvent::Text {
                 text: "done".to_string(),
@@ -5942,7 +6011,7 @@ mod tests {
         assert!(!has_visible_text(&[]));
         assert!(!has_visible_text(&[ContentBlock::Thinking {
             thinking: "pondering".to_string(),
-            signature: None,
+            opaque: None,
         }]));
         // Whitespace-only text is not visible output.
         assert!(!has_visible_text(&[ContentBlock::Text {
@@ -5960,7 +6029,7 @@ mod tests {
         assert!(has_visible_text(&[
             ContentBlock::Thinking {
                 thinking: "pondering".to_string(),
-                signature: None,
+                opaque: None,
             },
             ContentBlock::Text {
                 text: "answer".to_string(),
@@ -7536,7 +7605,7 @@ mod prompt_retention_tests {
                 MockEvent::ThinkingDelta {
                     text: "hmm".to_string(),
                 },
-                MockEvent::ThinkingComplete { signature: None },
+                MockEvent::ThinkingComplete { opaque: None },
                 MockEvent::MessageEnd {
                     stop_reason: MockStopReason::EndTurn,
                 },

@@ -844,7 +844,7 @@ mod tests {
             .expect("open");
 
         // Root session with a representative mix of events: plain text, an input image, a
-        // tool_use/tool_result pair, and a compaction boundary.
+        // reasoning block, a tool_use/tool_result pair, and a compaction boundary.
         let root = manager.create_session(None).await.expect("root");
         let image = ImageSource {
             source_type: "base64".to_string(),
@@ -856,11 +856,23 @@ mod tests {
             Event::Append(Message::user_with_images("look", vec![image])),
             Event::Append(Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "u1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({"path": "/x"}),
-                }],
+                // Both opaque halves of a Responses reasoning block. Neither is readable and
+                // neither is reconstructible, so an export that dropped them would leave the
+                // imported session unable to replay its own reasoning, silently.
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "weighing it up".to_string(),
+                        opaque: Some(provider::OpaqueReasoning::Sealed {
+                            encrypted_content: "OPAQUE".to_string(),
+                            id: Some("rs_1".to_string()),
+                        }),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "u1".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({"path": "/x"}),
+                    },
+                ],
             }),
             Event::Append(Message {
                 role: Role::User,
@@ -980,6 +992,19 @@ mod tests {
                 _ => false,
             }),
             "the input image must survive the round trip",
+        );
+        assert!(
+            imported.iter().any(|event| match event {
+                Event::Append(message) => message.content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Thinking {
+                        opaque: Some(provider::OpaqueReasoning::Sealed { encrypted_content, id }),
+                        ..
+                    } if encrypted_content == "OPAQUE" && id.as_deref() == Some("rs_1")
+                )),
+                _ => false,
+            }),
+            "and so must the opaque reasoning, or the imported session cannot replay it",
         );
 
         // Child events, stats, and tool_outputs are preserved.

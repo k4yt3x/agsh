@@ -326,7 +326,6 @@ mod tests {
     fn translate_thinking_block_drops_when_capability_disabled() {
         let event = FrontendEvent::ThinkingBlock {
             content: "musing".into(),
-            signature: None,
         };
         let capabilities = SessionCapabilities {
             supports_reasoning_stream: false,
@@ -339,7 +338,6 @@ mod tests {
     fn translate_thinking_block_emits_when_capability_enabled() {
         let event = FrontendEvent::ThinkingBlock {
             content: "musing".into(),
-            signature: None,
         };
         let capabilities = SessionCapabilities {
             supports_reasoning_stream: true,

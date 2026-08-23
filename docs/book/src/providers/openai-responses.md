@@ -76,8 +76,14 @@ Request body fields meka sets: `model`, `input`, `instructions` (the system prom
 `reasoning.effort` (only when `effort` is set), and `max_output_tokens` (only when
 `max_output_tokens` is set).
 
-What it deliberately does **not** send is `include: ["reasoning.encrypted_content"]`. That is an
-OpenAI extension for round-tripping reasoning across stateless turns. `chatgpt-subscription` sends it
-because its endpoint is always ChatGPT; here the endpoint is whatever `base_url` names, meka has no
-way to know whether it is understood, and an unrecognised field is a rejected request rather than a
-degraded one. Nothing depends on it, since meka replays whole conversations regardless.
+What it deliberately does **not** send is `include: ["reasoning.encrypted_content"]` or
+`reasoning.summary`. Both are OpenAI extensions: the first round-trips reasoning across stateless
+turns, the second asks for the human-readable digest meka renders as a thinking block.
+`chatgpt-subscription` sends both because its endpoint is always ChatGPT; here the endpoint is
+whatever `base_url` names, meka has no way to know whether either is understood, and an unrecognised
+field is a rejected request rather than a degraded one.
+
+The trade-off, stated plainly: against OpenAI itself this backend shows no thinking and carries no
+reasoning between a turn's own tool calls. Use `chatgpt-subscription` if you want either. Endpoints
+that stream reasoning unprompted (vLLM and Ollama emit `response.reasoning_text.delta` without
+being asked) still render their thinking here.

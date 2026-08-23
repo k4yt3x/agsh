@@ -5941,18 +5941,21 @@ mod tests {
             .expect("serde must take the alias the flag and the env var already took");
         assert_eq!(parsed.render_mode, RenderMode::Termimad);
         assert_eq!(RenderMode::Syntect.to_string(), "syntect");
-        // `bat` is no longer accepted (the alias was removed).
+        // A name that isn't a mode errors rather than silently falling back to the default, so a
+        // user who asks for a renderer meka doesn't have hears about it.
         assert!("bat".parse::<RenderMode>().is_err());
         assert!("nope".parse::<RenderMode>().is_err());
     }
 
+    /// The config tier rejects the same names the flag tier does. A `render_mode` that isn't a mode
+    /// has to fail at load rather than deserialize into the default, which would leave the user
+    /// staring at a renderer they didn't ask for with nothing to explain it.
     #[test]
-    fn test_render_mode_config_rejects_bat() {
+    fn test_render_mode_config_rejects_unknown_names() {
         assert_eq!(
             serde_json::from_str::<RenderMode>("\"syntect\"").unwrap(),
             RenderMode::Syntect,
         );
-        // `render_mode = "bat"` no longer deserializes after the rename.
         assert!(serde_json::from_str::<RenderMode>("\"bat\"").is_err());
     }
 
@@ -6398,7 +6401,7 @@ mod tests {
                 content: vec![
                     ContentBlock::Thinking {
                         thinking: "I should call read_file.".to_string(),
-                        signature: None,
+                        opaque: None,
                     },
                     ContentBlock::RedactedThinking {
                         data: "opaque".to_string(),

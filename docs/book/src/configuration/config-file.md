@@ -89,11 +89,9 @@ A backend names the wire protocol it speaks, not a vendor. See [Providers Overvi
 
 ### `model`
 
-The model identifier to send to the provider. Examples:
+The model identifier to send to the provider, forwarded verbatim. meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
 
-- `gpt-4o`, `gpt-4o-mini`, `gpt-5` (OpenAI)
-- `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5` (Claude)
-- Any model supported by an OpenAI-compatible endpoint
+`meka provider add` suggests `claude-opus-5` for a Claude profile and `gpt-5.6-sol` for an OpenAI one. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
 
 Override per-run with `--model`.
 
@@ -253,7 +251,7 @@ config file.
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
 
 ```console
-$ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-chat-completions --model gpt-4o --api-key-stdin
+$ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-chat-completions --model gpt-5.6-sol --api-key-stdin
 ```
 
 ### Leftover credentials
@@ -301,7 +299,7 @@ $ meka provider add anthropic --type anthropic-messages --model claude-opus-5
 ### `openai-chat-completions`
 
 ```console
-$ meka provider add openai --type openai-chat-completions --model gpt-4o
+$ meka provider add openai --type openai-chat-completions --model gpt-5.6-sol
 # Prompts for your OpenAI API key (sk-...).
 ```
 
@@ -316,7 +314,7 @@ $ meka provider add openai --type openai-responses --model gpt-5.6-sol
 ### `chatgpt-subscription`
 
 ```console
-$ meka provider add chatgpt --type chatgpt-subscription --model gpt-5
+$ meka provider add chatgpt --type chatgpt-subscription --model gpt-5.6-sol
 # Opens the browser for the ChatGPT OAuth login.
 ```
 
@@ -480,7 +478,7 @@ One residual caveat: the `... N more lines`, `... N more rows` and `... N more a
 ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
 does not let an argument run anything, but it can mislead a reader who is not expecting it.
 
-Applies to the REPL, to one-shot runs (`meka -p`), and to replayed history (`/history`,
+Applies to the REPL, to one-shot runs (`meka --oneshot`), and to replayed history (`/history`,
 `resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
 events already carry the raw input, so neither is affected.
 

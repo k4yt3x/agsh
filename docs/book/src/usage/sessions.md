@@ -70,10 +70,12 @@ Sessions are stored in a SQLite database at a platform-specific location:
 
 ## Database Schema
 
-The three tables below are the conversation itself. The database holds four more, which the
+The three tables below are the conversation itself. The database holds seven more, which the
 features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)), `background_tasks`
-([background work](./background.md)), and `provider_credentials` and `mcp_oauth_credentials`
-(secrets, never in `config.toml`).
+([background work](./background.md)), `memories` and its `memories_fts` full-text index
+([memory](./memory.md)), `prompt_history` (the REPL's
+[input history](./interactive-mode.md#input-history)), and `provider_credentials` and
+`mcp_oauth_credentials` (secrets, never in `config.toml`).
 
 **sessions**, one row per session:
 
@@ -82,8 +84,17 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `id` | TEXT (UUID) | Primary key |
 | `created_at` | TEXT (RFC 3339) | When the session was created |
 | `updated_at` | TEXT (RFC 3339) | When the session was last updated |
-| `locked_by` | TEXT (PID) | PID of the process holding the lock, or NULL |
-| `metadata` | TEXT | Reserved for future use |
+| `parent_session_id` | TEXT (UUID) | The session that spawned this sub-agent, or NULL |
+| `cwd` | TEXT | Working directory the session was last used in |
+| `permission` | TEXT | Permission mode a re-attached session resumes with |
+| `capabilities_json` | TEXT | Per-session capability flags, for HTTP re-attach |
+| `token_id` | TEXT | Bearer token that created the session, for HTTP |
+| `additional_roots_json` | TEXT | Workspace roots beyond `cwd` |
+| `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
+| `stat_*` | INTEGER | Eight cumulative counters behind `/status` |
+
+Locks are OS file locks under the data directory, not a column: a row cannot record a crashed
+process's PID and lock a session forever.
 
 **messages**, one row per message in a session:
 
@@ -191,7 +202,7 @@ There is one rung in between: if the checkpoint turn ends without calling `conte
 compact_checkpoint = true   # default
 ```
 
-Turning it off restores the pre-0.42 behaviour and saves one model call per compaction, at the cost of the agent having no say in what survives.
+Turning it off leaves the standalone summarizer to write every summary, which saves one model call per compaction at the cost of the agent having no say in what survives.
 
 ### Auto-Compact
 
@@ -366,6 +377,8 @@ The cut lands on a turn boundary, so a tool call is never separated from its res
 The command takes the session lock, so it refuses to run while a REPL, `meka serve`, or `meka acp` holds the session; that process has its own copy of the conversation in memory and would write over the rewind on its next turn. In the REPL use `/rewind` instead. Under ACP or the HTTP API there is no in-session equivalent, so close the session in the editor (or stop the server) and run this command.
 
 Its main use is recovering a session a provider has started refusing. A provider validates the whole conversation on every request, so one piece of content it rejects fails every later turn too. meka repairs a rejection caused by content it added during the current turn, and repairs a mislabelled image on resume, but anything older than that needs rewinding past.
+
+One cause of that refusal has its own fix. A session recorded by 0.41 can hold a `tool_result` whose content is a bare JSON string, a shape meka does not read: the row is dropped as the session loads, which leaves the `tool_use` it answered unanswered, and the provider rejects the next turn over the mismatch. Run the [one-shot upgrade script](../getting-started/upgrading.md), which converts those rows in place, rather than rewinding past a turn you wanted to keep.
 
 ## Deleting Sessions
 

@@ -6,17 +6,24 @@
 //! which implement the same endpoint. The wire format lives in [`super::responses_wire`].
 //!
 //! What this backend deliberately does *not* send is
-//! [`super::responses_wire::include_encrypted_reasoning`]. That `include` is an OpenAI extension,
-//! and `chatgpt-subscription` may assume it because its endpoint is always ChatGPT. Here the
-//! endpoint is whatever `base_url` names, meka has no way to know whether it is understood, and
-//! guessing wrong costs a rejected request rather than a degraded one. meka only replays whole
-//! conversations anyway, so nothing depends on the server round-tripping reasoning.
+//! [`super::responses_wire::include_encrypted_reasoning`] or
+//! [`super::responses_wire::request_reasoning_summary`]. Both are OpenAI extensions, and
+//! `chatgpt-subscription` may assume them because its endpoint is always ChatGPT. Here the endpoint
+//! is whatever `base_url` names, meka has no way to know whether either is understood, and guessing
+//! wrong costs a rejected request rather than a degraded one.
+//!
+//! The cost of that choice is real and worth naming: without the `include` there is no encrypted
+//! reasoning to replay, so a turn here carries no reasoning chain between its own tool calls, and
+//! without the summary the reasoning stays invisible. An endpoint that serves reasoning of its own
+//! accord -- vLLM and Ollama emit `response.reasoning_text.delta` unprompted -- still renders.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::responses_wire::{aggregate_stream, build_request_body, drive_responses_sse_stream};
+use super::responses_wire::{
+    aggregate_stream, build_request_body, drive_responses_sse_stream, drop_replayed_reasoning,
+};
 use crate::{
     error::{MekaError, Result},
     provider::{Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
@@ -75,16 +82,16 @@ impl OpenAiResponsesProvider {
     ///
     /// A named method rather than inline in `stream`, and the *only* body builder this backend has,
     /// so a test asserting what is on the wire is asserting the shipping path. A `#[cfg(test)]`
-    /// parallel copy would not: adding `include_encrypted_reasoning` here is the one regression the
-    /// protocol/endpoint split exists to prevent, and against a duplicate builder that change is
-    /// invisible to every test in the suite.
+    /// parallel copy would not: adding `include_encrypted_reasoning` or `request_reasoning_summary`
+    /// here is the regression the protocol/endpoint split exists to prevent, and against a
+    /// duplicate builder that change is invisible to every test in the suite.
     fn build_body(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> serde_json::Value {
-        build_request_body(
+        let mut body = build_request_body(
             &self.model,
             system_prompt,
             messages,
@@ -92,7 +99,9 @@ impl OpenAiResponsesProvider {
             self.wire_effort().as_deref(),
             self.max_output_tokens,
             true,
-        )
+        );
+        drop_replayed_reasoning(&mut body);
+        body
     }
 }
 
@@ -206,23 +215,70 @@ mod tests {
         }
     }
 
-    /// This backend must never send `include: ["reasoning.encrypted_content"]`.
+    /// This backend must never send `include: ["reasoning.encrypted_content"]`, nor ask for a
+    /// `reasoning.summary`.
     ///
-    /// It is an OpenAI extension, and this backend reaches Ollama, vLLM, LM Studio and OpenRouter,
-    /// where an unrecognised field is a rejected request. `chatgpt-subscription` sends it because
-    /// its endpoint is always ChatGPT; the split is the whole reason the `include` was lifted out
-    /// of the shared body builder, so it is asserted on both sides.
+    /// Both are OpenAI extensions, and this backend reaches Ollama, vLLM, LM Studio and OpenRouter,
+    /// where an unrecognised field is a rejected request. `chatgpt-subscription` sends them because
+    /// its endpoint is always ChatGPT; the split is the whole reason they were lifted out of the
+    /// shared body builder, so it is asserted on both sides.
     #[test]
     fn an_openai_extension_is_never_sent_to_an_endpoint_that_may_not_know_it() {
         // Even with effort set, which is the condition that used to pull `include` in.
         let body = provider(Some("high"), None).build_body("s", &[Message::user("hi")], &[]);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert!(body.get("include").is_none(), "{body}");
+        assert!(body["reasoning"].get("summary").is_none(), "{body}");
 
         // And the protocol-level fields every implementation understands are still there.
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["instructions"], "s");
+    }
+
+    /// Sealed reasoning recorded elsewhere must not be replayed to whatever `base_url` names.
+    ///
+    /// A session is not bound to the provider that recorded it, so `meka -c -p local` after a
+    /// `chatgpt-subscription` turn hands this backend a history full of ChatGPT's sealed blobs.
+    /// Shipping those to Ollama or OpenRouter leaks them to a third party that cannot read them,
+    /// and puts an item shape on the wire that the endpoint never agreed to -- the same argument
+    /// that keeps the `include` and the `summary` off it.
+    #[test]
+    fn sealed_reasoning_from_another_endpoint_is_never_replayed() {
+        let history = vec![
+            Message::user("hi"),
+            Message {
+                role: crate::provider::Role::Assistant,
+                content: vec![
+                    crate::provider::ContentBlock::Thinking {
+                        thinking: "summary".to_string(),
+                        opaque: Some(crate::provider::OpaqueReasoning::Sealed {
+                            encrypted_content: "CHATGPT_SEALED".to_string(),
+                            id: Some("rs_1".to_string()),
+                        }),
+                    },
+                    crate::provider::ContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+            },
+            Message::user("go on"),
+        ];
+        let body = provider(Some("high"), None).build_body("s", &history, &[]);
+        let serialized = serde_json::to_string(&body).expect("serialize");
+
+        assert!(!serialized.contains("CHATGPT_SEALED"), "{serialized}");
+        assert!(!serialized.contains("rs_1"), "{serialized}");
+        assert!(
+            !body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .any(|item| item["type"] == "reasoning"),
+            "{serialized}"
+        );
+        // And the turn it belonged to is still there, so nothing but the item was dropped.
+        assert!(serialized.contains("answer"), "{serialized}");
     }
 
     /// Effort follows the same rule as every other backend: sent only when the profile asks.

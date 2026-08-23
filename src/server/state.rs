@@ -57,8 +57,9 @@ pub struct SessionEntry {
     /// idempotency cache keying and observability. Not the raw token: the SHA-256 fingerprint
     /// already on [`crate::server::auth::Principal::token_id`], safe to log.
     ///
-    /// Persisted to the `sessions` row at create time and restored on re-attach. `None` only
-    /// on legacy rows written before the `token_id` column existed.
+    /// Persisted to the `sessions` row at create time and restored on re-attach. `None` for every
+    /// session not created through an authenticated HTTP request: the REPL, ACP, sub-agents, and
+    /// `meka session import`.
     #[allow(
         dead_code,
         reason = "persisted at create time and restored on re-attach for observability"

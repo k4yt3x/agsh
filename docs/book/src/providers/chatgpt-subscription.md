@@ -20,7 +20,7 @@ For the same protocol with an API key, against OpenAI or any server that serves 
 ## Initial Setup
 
 ```bash
-meka provider add chatgpt --type chatgpt-subscription --model gpt-5
+meka provider add chatgpt --type chatgpt-subscription --model gpt-5.6-sol
 # A browser opens; sign in to ChatGPT and approve.
 # Tokens are saved to ~/.local/share/meka/meka.db (chmod 0600).
 ```
@@ -46,7 +46,7 @@ The `effort` field maps to the Responses API `reasoning.effort` knob. When unset
 
 ## Supported Models
 
-Whatever your ChatGPT subscription tier exposes: typically `gpt-5`, `gpt-5-codex`, `o3`, `o4-mini`, etc. The model field on the request body is forwarded verbatim; meka doesn't gate which model strings are valid.
+Whatever your ChatGPT subscription tier exposes. For the current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models) - `meka provider add` suggests `gpt-5.6-sol` for new OpenAI profiles. The model field on the request body is forwarded verbatim; meka doesn't gate which model strings are valid.
 
 ## How It Works
 
@@ -54,8 +54,16 @@ Each request:
 
 1. **Auth header set**: `Authorization: Bearer <access_token>`, `ChatGPT-Account-ID: <workspace_id>` (extracted from the JWT id_token at login), `originator: meka_cli`, plus a `User-Agent` identifying meka.
 2. **Cookie jar enabled**: `chatgpt.com` is fronted by Cloudflare; bot-clearance cookies (`__cf_bm` etc.) persist across requests automatically.
-3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`.
-4. **Stream**: SSE events: `response.output_text.delta` for text, `response.output_item.added` / `…done` for tool calls, `response.reasoning_text.delta` for thinking, `response.completed` for end-of-turn with token usage.
+3. **Body**: standard Responses API JSON: `instructions`, `input` (an array of `message` / `reasoning` / `function_call` / `function_call_output` items), `tools`, optional `reasoning.effort`, plus the two reasoning parameters Codex also sends: `reasoning.summary: "auto"` and `include: ["reasoning.encrypted_content"]`. Both are sent on every request, whether or not `effort` is configured.
+4. **Stream**: SSE events: `response.output_text.delta` for text, `response.output_item.added` / `…done` for tool calls, `response.reasoning_summary_text.delta` (and `response.reasoning_text.delta`) for thinking, `response.reasoning_summary_part.added` for the break between summary sections, `response.completed` for end-of-turn with token usage.
+
+### Reasoning across turns
+
+Requests are stateless (`store: false`), so the reasoning a model produced is only available to the next request if meka sends it back. It does: each reasoning item is recorded with its `rs_…` id and its `encrypted_content`, and replayed verbatim as a `reasoning` input item immediately before the output it produced. This is what lets a multi-step tool-calling turn keep one chain of thought instead of restarting it at every call, and it mirrors what the first-party Codex client does.
+
+The encrypted content is opaque: meka cannot read it, only replay it. It is stored under a shape that records which provider it came from, so a session recorded here and resumed against Claude does not hand Claude an OpenAI blob (nor the reverse); a block from the wrong provider is simply not replayed. The summary is the readable part, and what the REPL shows as a thinking block (see [`[thinking]`](../configuration/config-file.md) for `show_content`).
+
+A session recorded by 0.41 holds its thinking blocks under a shape that names no provider, and meka does not reshape them when it opens a session. The [one-shot upgrade script](../getting-started/upgrading.md) does it, in a pass over the database you can watch finish, for the same reason the [memory import](../usage/memory.md#coming-from-a-file-backed-store) is a script: a migration that runs on every start is one nobody can see fail. Until it runs, such a block keeps its readable summary and loses its encrypted half, so that reasoning is not replayed.
 5. **Token refresh**: when the access token is within 5 minutes of expiry, meka transparently refreshes it against `auth.openai.com/oauth/token` before the next request.
 
 ## Limitations

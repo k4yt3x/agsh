@@ -109,8 +109,8 @@ pub struct SessionCapabilities {
     /// notice), which is the same outcome without the stall and legible in the response rather
     /// than only in the timing.
     ///
-    /// Defaults to `true`, so existing clients and sessions persisted before this field existed
-    /// keep parking as before.
+    /// Defaults to `true`, so a client that declares nothing and an imported `capabilities_json`
+    /// that omits the flag both park rather than auto-deny.
     pub supports_permission_prompts: bool,
 }
 
@@ -859,14 +859,16 @@ mod tests {
         );
     }
 
-    /// Sessions persisted before this field existed deserialize without it, and must keep the
-    /// old parking behaviour rather than silently switching to auto-deny.
+    /// `meka session import` stores `capabilities_json` verbatim from a user-supplied archive, so
+    /// a hand-written or third-party one can be missing a flag. An absent flag has to mean parking:
+    /// silently auto-denying every gated call in an imported session is a worse failure than a
+    /// stall the operator can see.
     #[test]
-    fn capabilities_from_legacy_json_default_to_supporting_prompts() {
-        let legacy: SessionCapabilities =
+    fn capabilities_json_missing_a_flag_defaults_to_supporting_prompts() {
+        let partial: SessionCapabilities =
             serde_json::from_str(r#"{"supports_reasoning_stream":true}"#).expect("deserialize");
-        assert!(legacy.supports_reasoning_stream);
-        assert!(legacy.supports_permission_prompts);
+        assert!(partial.supports_reasoning_stream);
+        assert!(partial.supports_permission_prompts);
     }
 
     #[tokio::test]
@@ -968,7 +970,6 @@ mod tests {
         frontend
             .emit(FrontendEvent::ThinkingBlock {
                 content: "musing".into(),
-                signature: None,
             })
             .await;
         frontend
@@ -1006,7 +1007,6 @@ mod tests {
         frontend
             .emit(FrontendEvent::ThinkingBlock {
                 content: "musing".into(),
-                signature: None,
             })
             .await;
         frontend.end_stream();

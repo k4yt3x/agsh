@@ -43,7 +43,7 @@ meka provider add work --type claude-subscription --model claude-opus-5
 The profile pins a backend `type` plus a model. A backend names the wire protocol it speaks - `anthropic-messages`, `openai-chat-completions`, `openai-responses` - or, for the two subscription backends, the account it bills: `claude-subscription`, `chatgpt-subscription`. Add several profiles and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
 
 ```bash
-meka provider add openrouter --type openai-chat-completions --model anthropic/claude-opus-4.6 \
+meka provider add openrouter --type openai-chat-completions --model anthropic/claude-opus-5 \
     --base-url https://openrouter.ai/api/v1
 ```
 

@@ -452,9 +452,9 @@ pub enum ThinkingMode {
     /// The model sets its own budget. Claude 4.6 and newer.
     ///
     /// Sends the adaptive thinking block, and is the default because it is what the current models
-    /// want. These variant docs are also the clap help text, so they avoid backticks and braces,
-    /// which render literally in `-h`; the wire shapes each mode produces live in
-    /// `anthropic::shared::insert_thinking_fields`.
+    /// want. `--thinking` hides its possible-values list to keep `meka -h` to one line, so these
+    /// variant docs no longer reach a terminal and that flag's own help summarises the three modes;
+    /// the wire shapes each mode produces live in `anthropic::shared::insert_thinking_fields`.
     #[default]
     Adaptive,
     /// A fixed budget, from the thinking budget_tokens setting. Required by pre-4.6 Claude.
@@ -598,6 +598,34 @@ pub struct ImageSource {
     pub data: String,
 }
 
+/// The half of a thinking block meka cannot read, and which provider it belongs to.
+///
+/// The two backends that emit reasoning hand back different things, and the difference decides both
+/// what may be replayed and what the readable half is worth. Holding them as one nullable
+/// `signature` made wrong states representable, and one of them shipped: `chatgpt-subscription`
+/// stored OpenAI's `encrypted_content` in that field, and resuming such a session under Claude
+/// replayed it verbatim as Claude's `signature`, a blob from the wrong cryptosystem presented as
+/// authentication for text it does not authenticate.
+///
+/// The mirror of that was only ever unreachable by omission: the Responses encoder dropped every
+/// thinking block, so nothing Claude wrote could reach OpenAI. This release starts replaying
+/// reasoning there, which is exactly what would have opened the other direction. Naming the two
+/// shapes makes both a type error instead of a thing to remember.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpaqueReasoning {
+    /// Anthropic. The reasoning is in the block's `thinking` text; this authenticates it, and the
+    /// API wants both back together.
+    Signed { signature: String },
+    /// The Responses API. This *is* the reasoning, sealed, and the block's `thinking` holds only
+    /// the summary the server chose to show. Replayed under `id` when the server issued one.
+    Sealed {
+        encrypted_content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -611,8 +639,14 @@ pub enum ContentBlock {
         source: ImageSource,
     },
     Thinking {
+        /// The readable half, and only the readable half. How much of the reasoning it is depends
+        /// on `opaque`: under [`OpaqueReasoning::Signed`] this is the reasoning, under
+        /// [`OpaqueReasoning::Sealed`] it is a summary of reasoning kept elsewhere.
         thinking: String,
-        signature: Option<String>,
+        /// What the provider wants handed back to carry this reasoning into the next request.
+        /// `None` when it gave nothing to carry, which makes the block display-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opaque: Option<OpaqueReasoning>,
     },
     /// Encrypted reasoning the API declines to return in the clear (the `redact-thinking` beta).
     /// `data` is opaque: it cannot be read, only replayed verbatim on later turns so the model can
@@ -628,31 +662,9 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        #[serde(deserialize_with = "deserialize_tool_result_content")]
         content: Vec<ToolResultContent>,
         is_error: bool,
     },
-}
-
-/// Deserializes ToolResult content from either a string (legacy format) or an array of
-/// ToolResultContent (new format).
-fn deserialize_tool_result_content<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<ToolResultContent>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrVec {
-        String(String),
-        Vec(Vec<ToolResultContent>),
-    }
-
-    match StringOrVec::deserialize(deserializer)? {
-        StringOrVec::String(text) => Ok(vec![ToolResultContent::Text { text }]),
-        StringOrVec::Vec(vec) => Ok(vec),
-    }
 }
 
 impl ContentBlock {
@@ -797,7 +809,9 @@ pub enum StreamEvent {
         estimated_tokens: Option<u64>,
     },
     ThinkingComplete {
-        signature: Option<String>,
+        /// Whatever the provider gave to carry this reasoning forward, in its own shape. Passed
+        /// through to [`ContentBlock::Thinking`] untouched.
+        opaque: Option<OpaqueReasoning>,
     },
     /// A complete `redacted_thinking` block (the `redact-thinking` beta). `data` is opaque and
     /// arrives whole in the `content_block_start` event, so there is no delta/complete pair.
@@ -1589,6 +1603,66 @@ mod tests {
         assert_eq!(Message::user_with_images("hi", vec![]).content.len(), 1);
     }
 
+    /// A `tool_result` whose `content` is a bare string is refused, not silently wrapped.
+    ///
+    /// `content` is a list, and it used to accept a string too, which was the shape meka persisted
+    /// before the field could hold images. Nothing pinned that, so this pins its removal: the
+    /// release script rewrites those rows, and if this ever passes again the script has quietly
+    /// become optional while still being the only thing that converts them.
+    #[test]
+    fn a_tool_result_content_written_as_a_string_no_longer_parses() {
+        let stored =
+            r#"{"type":"tool_result","tool_use_id":"toolu_1","content":"bare","is_error":false}"#;
+        assert!(
+            serde_json::from_str::<ContentBlock>(stored).is_err(),
+            "the string form must not resurrect as a silent wrap"
+        );
+
+        let converted = r#"{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"bare"}],"is_error":false}"#;
+        let block: ContentBlock = serde_json::from_str(converted).expect("the converted shape");
+        assert!(matches!(
+            block,
+            ContentBlock::ToolResult { ref content, .. } if content.len() == 1
+        ));
+    }
+
+    /// Both shapes survive a round trip, and `Sealed` omits an id it does not have.
+    ///
+    /// Named for what it can actually check. There is no backward compatibility to test: 0.42 reads
+    /// only this shape, and a store written by an earlier release is brought forward by the
+    /// migration script, not by serde. The `skip_serializing_if` is the part worth pinning -- drop
+    /// it and every id-less sealed block starts writing `"id":null` into the log.
+    #[test]
+    fn both_opaque_shapes_round_trip_and_an_absent_id_is_not_written() {
+        for (stored, expected) in [
+            (
+                r#"{"type":"thinking","thinking":"hmm","opaque":{"kind":"signed","signature":"SIG"}}"#,
+                OpaqueReasoning::Signed {
+                    signature: "SIG".to_string(),
+                },
+            ),
+            (
+                r#"{"type":"thinking","thinking":"s","opaque":{"kind":"sealed","encrypted_content":"E"}}"#,
+                OpaqueReasoning::Sealed {
+                    encrypted_content: "E".to_string(),
+                    id: None,
+                },
+            ),
+        ] {
+            let block: ContentBlock = serde_json::from_str(stored).expect("must load");
+            assert!(
+                matches!(&block, ContentBlock::Thinking { opaque: Some(opaque), .. }
+                    if *opaque == expected),
+                "got {block:?}"
+            );
+            assert_eq!(
+                serde_json::to_string(&block).expect("serialize"),
+                stored,
+                "an absent id must not be written back as null"
+            );
+        }
+    }
+
     #[test]
     fn test_without_tool_use_keeps_text_and_thinking_drops_tool_use() {
         let message = Message {
@@ -1596,7 +1670,7 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "hmm".to_string(),
-                    signature: None,
+                    opaque: None,
                 },
                 ContentBlock::Text {
                     text: "let me check".to_string(),

@@ -43,7 +43,7 @@ Provider configuration is layered as follows; higher-priority layers override lo
 2. **Config file**: persistent profiles in `~/.config/meka/config.toml`.
 3. **Built-in defaults**: permission defaults to `read`, streaming defaults to on.
 
-For example, `--model gpt-4o-mini` on the command line overrides the active profile's `model` for
+For example, `--model gpt-5.6-sol` on the command line overrides the active profile's `model` for
 that run. There is **no environment-variable tier** for provider configuration; an ambient
 `OPENAI_API_KEY` or `MEKA_PROVIDER` has no effect (see [Environment Variables](./environment-variables.md)).
 

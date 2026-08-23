@@ -113,7 +113,7 @@ pub struct CapabilitiesBody {
     pub supports_reasoning_stream: bool,
     /// When `false`, mid-turn permission requests are denied immediately with a notice instead of
     /// parking on the SSE channel. Streaming clients with no approval interface set this. Default
-    /// `true`, which is the historical behaviour.
+    /// `true`, so a client that says nothing keeps the chance to approve.
     #[serde(default = "default_true")]
     pub supports_permission_prompts: bool,
 }
@@ -645,8 +645,9 @@ pub async fn list_sessions(
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to list sessions", error))?;
 
-    // Enrich DB rows with live in-memory metadata where available; GC-evicted sessions fall
-    // back to persisted columns (which may be empty for legacy rows).
+    // Enrich DB rows with live in-memory metadata where available; sessions with no in-memory entry
+    // fall back to persisted columns, which are NULL for rows the HTTP server did not create (REPL,
+    // ACP, sub-agent, imported).
     let in_memory = state.sessions.read().await;
     let sessions = rows
         .into_iter()

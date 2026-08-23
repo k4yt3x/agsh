@@ -18,7 +18,7 @@ For the same key against OpenAI's newer protocol, see [`openai-responses`](./ope
 ### Quickest Start
 
 ```bash
-meka provider add openai --type openai-chat-completions --model gpt-4o
+meka provider add openai --type openai-chat-completions --model gpt-5.6-sol
 ```
 
 `meka provider add` prompts for your OpenAI API key, stores it in the database, and writes the
@@ -34,17 +34,12 @@ default_provider = "openai"
 
 [providers.openai]
 type = "openai-chat-completions"
-model = "gpt-4o"
+model = "gpt-5.6-sol"
 ```
 
 ## Supported Models
 
-Any model available through the OpenAI Chat Completions API (or compatible endpoint) that supports tool calling:
-
-- `gpt-4o`, `gpt-4o-mini`
-- `gpt-4-turbo`
-- `o1`, `o3-mini`
-- Third-party models via compatible APIs
+Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models) - `meka provider add` suggests `gpt-5.6-sol` for new OpenAI profiles. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
 
 ## Custom Base URL
 

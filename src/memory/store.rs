@@ -187,8 +187,12 @@ fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
 /// Create the memory tables. Idempotent, and invoked from
 /// [`crate::session::SessionManager::initialize_schema`] so schema ownership stays in one place.
 ///
-/// Creation only: this file does no migrations, and a table it does not name is one it leaves
-/// alone.
+/// Not creation alone. The `CREATE`s are followed by [`sync_triggers`], which replaces the FTS
+/// triggers and rebuilds the index when the stored definitions differ from this build's, and then
+/// by [`repair_a_desynced_index`] -- unless that rebuild just ran, in which case the probe would
+/// only re-ask a question one pass of the table has already answered. Both reconcile a derived
+/// index against the table it is derived from, which is why they sit on the open path instead of in
+/// a command the user has to remember to run. Nothing beyond the objects named here is touched.
 pub(crate) fn create_tables(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         // `id` rather than an implicit rowid because the FTS index anchors to it by name, and an
@@ -224,13 +228,12 @@ pub(crate) fn create_tables(connection: &rusqlite::Connection) -> rusqlite::Resu
     // The triggers are created by [`sync_triggers`] and nowhere else.
     //
     // A `CREATE TRIGGER IF NOT EXISTS` pass here first looked harmless and was the opposite: a
-    // trigger that had gone *missing* -- the state this module's own history says an interrupted
-    // older build leaves behind -- was silently put back before `sync_triggers` read
-    // `sqlite_master`, so the comparison matched, no rebuild ran, and every write that landed while
-    // it was absent stayed out of the index for good. `repair_a_desynced_index` cannot see that
-    // either, because a missed *update* leaves the document counts equal. Reproduced end to end: an
-    // edit made with `memories_au` dropped was still unfindable after a normal restart, with
-    // `meka memory verify` reporting the store sound.
+    // trigger that had gone *missing*, however it went missing, was silently put back before
+    // `sync_triggers` read `sqlite_master`, so the comparison matched, no rebuild ran, and every
+    // write that landed while it was absent stayed out of the index for good.
+    // `repair_a_desynced_index` cannot see that either, because a missed *update* leaves the
+    // document counts equal. Reproduced end to end: an edit made with `memories_au` dropped was
+    // still unfindable after a normal restart, with `meka memory verify` reporting the store sound.
     //
     // Letting `sync_triggers` own creation costs nothing on a fresh database -- it finds none of
     // the three, takes the replacement path, and creates all three plus a rebuild of an empty table
@@ -414,10 +417,9 @@ fn document_counts(connection: &rusqlite::Connection) -> rusqlite::Result<(i64, 
 /// Rebuild the index at open when it does not hold one document per stored memory.
 ///
 /// The index is derived and disposable, so a disagreement has exactly one correct response and no
-/// reason to wait for a human to run `meka memory verify`. This catches the cases
-/// [`sync_triggers`] cannot: a `memories_fts` dropped and recreated empty by a partial restore, and
-/// a crash in an older build's window between its DDL and its rebuild. Both are otherwise silent
-/// and permanent -- search simply stops finding things.
+/// reason to wait for a human to run `meka memory verify`. This catches the case [`sync_triggers`]
+/// cannot: a `memories_fts` dropped and recreated empty by a partial restore, which is otherwise
+/// silent and permanent -- search simply stops finding things.
 ///
 /// Cheap enough to run unconditionally: measured at 20,000 memories, the two counts are 0.27 ms and
 /// 0.11 ms, against 280 ms for the rebuild that only a genuinely broken store pays.
@@ -1672,12 +1674,11 @@ mod tests {
     /// A trigger that has gone *missing* is restored, and the writes it slept through reach the
     /// index.
     ///
-    /// The sibling above plants a *different* trigger; this one plants none, which is the state an
-    /// interrupted older build leaves and the one a `CREATE TRIGGER IF NOT EXISTS` pass in
-    /// `create_tables` silently papered over -- putting the trigger back before anything noticed it
-    /// had been gone, so no rebuild ran and the edit stayed unfindable for good. Neither
-    /// `repair_a_desynced_index` nor `meka memory verify` can see it: a missed update leaves the
-    /// document counts equal.
+    /// The sibling above plants a *different* trigger; this one plants none, which is the state a
+    /// `CREATE TRIGGER IF NOT EXISTS` pass in `create_tables` silently papered over -- putting the
+    /// trigger back before anything noticed it had been gone, so no rebuild ran and the edit stayed
+    /// unfindable for good. Neither `repair_a_desynced_index` nor `meka memory verify` can see it:
+    /// a missed update leaves the document counts equal.
     #[tokio::test]
     async fn a_missing_trigger_is_restored_and_the_writes_it_slept_through_reindexed() {
         let store = store_with(&[("note", 5, "a note", "xylophone")]).await;
@@ -1728,9 +1729,9 @@ mod tests {
     /// An index holding the wrong number of documents is rebuilt when the store is opened.
     ///
     /// The case [`sync_triggers`] cannot reach, because the triggers are correct: a `memories_fts`
-    /// dropped and recreated empty by a partial restore, or a crash in an older build's window.
-    /// Both are otherwise permanent and silent -- `meka memory verify` is the only thing that would
-    /// say so, and nothing prompts a user to run it.
+    /// dropped and recreated empty by a partial restore. It is otherwise permanent and silent --
+    /// `meka memory verify` is the only thing that would say so, and nothing prompts a user to run
+    /// it.
     #[tokio::test]
     async fn an_index_that_lost_its_documents_is_rebuilt_at_open() {
         let store = store_with(&[("note", 5, "a note", "xylophone")]).await;

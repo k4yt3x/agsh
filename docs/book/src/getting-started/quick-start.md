@@ -13,7 +13,7 @@ meka provider add work --type claude-subscription --model claude-opus-5
 meka provider add work --type anthropic-messages --model claude-opus-5
 
 # or OpenAI
-meka provider add work --type openai-chat-completions --model gpt-4o
+meka provider add work --type openai-chat-completions --model gpt-5.6-sol
 ```
 
 `add` prompts for any of `--type` / `--model` you omit, acquires the secret (browser OAuth for
@@ -27,12 +27,6 @@ per-run `--provider <name>` flag.
 ## 2. Start Using meka
 
 After setup, you will see a prompt:
-
-```text
-meka [r] >
-```
-
-You will see a prompt:
 
 ```text
 meka [r] >

@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Role, StopReason, StreamEvent, ThinkingMode, TokenUsage,
-        ToolDefinition, ToolResultContent,
+        ContentBlock, Message, OpaqueReasoning, Role, StopReason, StreamEvent, ThinkingMode,
+        TokenUsage, ToolDefinition, ToolResultContent,
     },
 };
 
@@ -279,16 +279,17 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                                 "is_error": is_error,
                             })
                         }
-                        ContentBlock::Thinking {
-                            thinking,
-                            signature,
-                        } => {
+                        // Only a signature belongs on this wire. A `Sealed` block reaches here
+                        // when a session recorded against the Responses API is resumed under
+                        // Claude, and its encrypted content is not a Claude signature -- so the
+                        // block goes out unsigned rather than carrying a foreign blob.
+                        ContentBlock::Thinking { thinking, opaque } => {
                             let mut obj = serde_json::json!({
                                 "type": "thinking",
                                 "thinking": thinking
                             });
-                            if let Some(sig) = signature {
-                                obj["signature"] = serde_json::json!(sig);
+                            if let Some(OpaqueReasoning::Signed { signature }) = opaque {
+                                obj["signature"] = serde_json::json!(signature);
                             }
                             obj
                         }
@@ -453,7 +454,7 @@ pub(super) fn parse_non_streaming_response(
                         .map(|s| s.to_string());
                     content_blocks.push(ContentBlock::Thinking {
                         thinking: thinking.to_string(),
-                        signature,
+                        opaque: signature.map(|signature| OpaqueReasoning::Signed { signature }),
                     });
                 }
             }
@@ -736,7 +737,10 @@ pub(super) async fn drive_claude_sse_stream(
                                     in_thinking = false;
                                     let signature = current_thinking_signature.take();
                                     if event_sender
-                                        .send(StreamEvent::ThinkingComplete { signature })
+                                        .send(StreamEvent::ThinkingComplete {
+                                            opaque: signature
+                                                .map(|signature| OpaqueReasoning::Signed { signature }),
+                                        })
                                         .await
                                         .is_err()
                                     {
@@ -1476,6 +1480,41 @@ mod tests {
         assert!(block.get("signature").is_none());
     }
 
+    /// The mirror of the Responses encoder's refusal, for a session recorded against OpenAI and
+    /// resumed under Claude. Sealed reasoning is not a Claude signature, so it must not be
+    /// serialized as one; the block goes out with its summary text and unsigned.
+    #[test]
+    fn sealed_reasoning_is_never_sent_to_claude_as_a_signature() {
+        let message = crate::provider::Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "a summary".to_string(),
+                    opaque: Some(OpaqueReasoning::Sealed {
+                        encrypted_content: "OPENAI_SEALED".to_string(),
+                        id: Some("rs_1".to_string()),
+                    }),
+                },
+                // Trailing thinking is stripped from the last assistant message, so the block has
+                // to be followed by something for this to be testing the encoder at all.
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message]);
+        let block = &converted[0]["content"].as_array().expect("content")[0];
+
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "a summary");
+        assert!(block.get("signature").is_none(), "{block}");
+        assert!(
+            !serde_json::to_string(&converted)
+                .expect("serialize")
+                .contains("OPENAI_SEALED")
+        );
+    }
+
     #[test]
     fn test_empty_thinking_block_with_signature_serializes_signature() {
         let message = crate::provider::Message {
@@ -1483,7 +1522,9 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: String::new(),
-                    signature: Some("SIG620".to_string()),
+                    opaque: Some(OpaqueReasoning::Signed {
+                        signature: "SIG620".to_string(),
+                    }),
                 },
                 ContentBlock::Text {
                     text: "answer".to_string(),

@@ -1,6 +1,6 @@
 # Interactive Mode
 
-Start meka without the `-p` flag to enter interactive mode:
+Start meka without `--oneshot` to enter interactive mode:
 
 ```bash
 meka
@@ -195,7 +195,7 @@ Use it to take back a prompt that sent the agent down the wrong path without pay
 
 Providers validate the whole conversation on every request, so one piece of content they refuse would otherwise fail every later turn as well, permanently. When that happens, meka strips the offending content from what it added this turn, retries once, and hands the model the provider's own complaint as a failed tool result so it can adapt rather than silently losing the data. If the retry is refused too, the original content goes back untouched and the turn reports the provider's error.
 
-A session that already holds such content from an older meka is repaired when you resume it, without a provider round trip. For anything further back, use `/rewind`.
+A mislabelled image already committed to the session is repaired when you resume it, without a provider round trip. For anything further back, use `/rewind`.
 
 ### `/fork`
 

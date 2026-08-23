@@ -42,11 +42,14 @@ pub enum MockEvent {
     ThinkingDelta {
         text: String,
     },
-    /// Caps an in-flight thinking block. `signature` mirrors the real Claude wire shape but is
-    /// `None` in every test today; the agent treats it as opaque pass-through (see
-    /// [`crate::frontend::FrontendEvent::ThinkingBlock`]).
+    /// Caps an in-flight thinking block. `opaque` carries whichever wire shape the script is
+    /// standing in for -- a Claude signature, or a Responses reasoning item's sealed content. The
+    /// agent treats it as pass-through (see [`crate::frontend::FrontendEvent::ThinkingBlock`]), so
+    /// a script sets it to check that the turn it records can be replayed. Defaulted so existing
+    /// scripts keep loading.
     ThinkingComplete {
-        signature: Option<String>,
+        #[serde(default)]
+        opaque: Option<crate::provider::OpaqueReasoning>,
     },
     ToolUseStart {
         id: String,
@@ -402,8 +405,8 @@ impl Provider for MockProvider {
                         }
                         MockEvent::Text { text } => StreamEvent::TextDelta(text),
                         MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
-                        MockEvent::ThinkingComplete { signature } => {
-                            StreamEvent::ThinkingComplete { signature }
+                        MockEvent::ThinkingComplete { opaque } => {
+                            StreamEvent::ThinkingComplete { opaque }
                         }
                         MockEvent::ToolUseStart { id, name } => {
                             StreamEvent::ToolUseStart { id, name }
@@ -654,7 +657,7 @@ mod tests {
             MockEvent::ThinkingDelta {
                 text: "let me think...".into(),
             },
-            MockEvent::ThinkingComplete { signature: None },
+            MockEvent::ThinkingComplete { opaque: None },
             MockEvent::Text {
                 text: "done".into(),
             },
@@ -674,7 +677,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(StreamEvent::ThinkingComplete { signature: None })
+            Some(StreamEvent::ThinkingComplete { opaque: None })
         ));
         assert!(matches!(
             rx.recv().await,

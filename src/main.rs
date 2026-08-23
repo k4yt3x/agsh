@@ -3010,13 +3010,13 @@ async fn load_session_messages(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
 ) -> anyhow::Result<conversation::Conversation> {
-    // Hydrate the event log directly. Legacy databases (rows predating the event-log refactor)
-    // decode their `user`/`assistant`/`tool_results` rows as `Event::Append` so resume is forward-
-    // and backward- compatible without a schema migration.
     // Retire whatever the last process left running before hydrating anything else; see
     // `crate::background::claim_session`.
     crate::background::claim_session(session_manager, session_id).await;
 
+    // Hydrate the event log directly: `load_events` decodes each stored row back into the `Event`
+    // that wrote it, so resume rebuilds the log the last process ended with rather than a flattened
+    // approximation of it.
     let events = session_manager.load_events(session_id).await?;
     let mut log = conversation::Conversation::from_events(events);
 
@@ -3043,9 +3043,8 @@ async fn load_session_messages(
 
     // Materializing the log also replaces images whose bytes contradict their declared media type.
     // Providers sniff and reject those with a 400, and since the block is already in the log that
-    // 400 would repeat on every request, leaving the session unusable. Sessions written by a meka
-    // old enough to have trusted a filename extension or a `Content-Type` heal here, for free; all
-    // that is left to do is say so.
+    // 400 would repeat on every request, leaving the session unusable. A stored session carrying
+    // such a block heals on the way in, for free; all that is left to do is say so.
     let replaced = log.invalid_images_replaced();
     if replaced > 0 {
         tracing::warn!(

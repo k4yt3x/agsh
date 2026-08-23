@@ -153,9 +153,9 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     }
     // Namespaced, like the `metadata.` lines above and unlike the bare `key: value` these used to
     // print. A frontmatter key is chosen by whoever wrote the file, so a bare replay collided with
-    // the modelled lines: a pre-spec skill carrying `priority: 3` printed `priority` twice with two
-    // values, and a hostile one could add a second `source_dir:` or `body:` line contradicting the
-    // real one. This is stdout, which the project treats as parseable data.
+    // the modelled lines: a skill carrying a top-level `priority: 3` printed `priority` twice with
+    // two values, and a hostile one could add a second `source_dir:` or `body:` line
+    // contradicting the real one. This is stdout, which the project treats as parseable data.
     for (key, value) in &skill.extra {
         println!(
             "extra.{}: {}",
@@ -434,8 +434,9 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
 /// `meka skill remove <name>`: delete the skill directory. No prompt; matches `meka mcp remove`'s
 /// convention.
 pub async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
-    // Lookup rules, not write rules: `meka skill list` shows names that predate the spec, and a
-    // remove that refused them would leave `rm -rf` as the only way out.
+    // Lookup rules, not write rules. A name the spec refuses is skipped rather than listed, but
+    // the startup warning names it, and a remove that refused it would leave `rm -rf` as the only
+    // way out.
     skills::validate_addressable_name(name).map_err(MekaError::Config)?;
 
     let native_root = skills::skills_dir()

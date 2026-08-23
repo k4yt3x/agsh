@@ -33,8 +33,8 @@ use crate::provider::STREAM_IDLE_TIMEOUT as RESPONSES_STREAM_IDLE_TIMEOUT;
 use crate::{
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Notice, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-        ToolResultContent,
+        ContentBlock, Message, Notice, OpaqueReasoning, Role, StopReason, StreamEvent, TokenUsage,
+        ToolDefinition, ToolResultContent,
     },
 };
 
@@ -114,13 +114,10 @@ pub(super) async fn aggregate_stream(
         match event {
             StreamEvent::TextDelta(text) => current_text.push_str(&text),
             StreamEvent::ThinkingDelta(text) => current_thinking.push_str(&text),
-            StreamEvent::ThinkingComplete { signature } => {
+            StreamEvent::ThinkingComplete { opaque } => {
                 let thinking = std::mem::take(&mut current_thinking);
-                if !thinking.is_empty() || signature.is_some() {
-                    content_blocks.push(ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    });
+                if !thinking.is_empty() || opaque.is_some() {
+                    content_blocks.push(ContentBlock::Thinking { thinking, opaque });
                 }
             }
             StreamEvent::RedactedThinking { data } => {
@@ -184,6 +181,9 @@ pub(super) async fn aggregate_stream(
 /// Ask the server to round-trip its reasoning as `reasoning.encrypted_content`.
 ///
 /// A no-op unless the request already asks for reasoning, since there would be nothing to encrypt.
+/// The one caller settles that with [`request_reasoning_summary`] first, so the guard is really a
+/// refusal to be used out of order rather than a live branch; the ordering is asserted by
+/// `an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning`.
 ///
 /// This is *not* in [`build_request_body`] because it is a fact about one endpoint rather than
 /// about the protocol. `include` is an OpenAI extension; `chatgpt-subscription` sends it because
@@ -194,6 +194,44 @@ pub(super) fn include_encrypted_reasoning(body: &mut serde_json::Value) {
     if body.get("reasoning").is_some() {
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
     }
+}
+
+/// Drop every replayed `reasoning` item from a built body.
+///
+/// The encoder is protocol-level and replays sealed reasoning for any backend, which is right for
+/// the protocol and wrong for one endpoint: `openai-responses` never asks for encrypted reasoning,
+/// so the only way its history holds any is a session recorded under `chatgpt-subscription` and
+/// resumed against a `base_url` -- Ollama, vLLM, LM Studio, OpenRouter. Replaying it there ships
+/// ChatGPT's sealed blob and `rs_...` id to a third party that cannot decrypt it and may reject the
+/// item shape outright.
+///
+/// The same refusal the Claude encoder makes by matching only [`OpaqueReasoning::Signed`], one
+/// level up: an endpoint drops what it could not have produced.
+pub(super) fn drop_replayed_reasoning(body: &mut serde_json::Value) {
+    if let Some(input) = body.get_mut("input").and_then(|input| input.as_array_mut()) {
+        input.retain(|item| item.get("type").and_then(|kind| kind.as_str()) != Some("reasoning"));
+    }
+}
+
+/// Ask the server for a reasoning summary, the only part of its reasoning it will show a person.
+///
+/// Without this the model still reasons, but `summary` comes back empty and there is nothing for
+/// the REPL to render, so a long think looks like a hang. Codex asks for `auto` by default
+/// (`ReasoningSummary::Auto`, and its `supports_reasoning_summary_parameter` defaults to true), so
+/// this is what the first-party client's own users see.
+///
+/// Establishes the `reasoning` object when the profile configured no effort, which is deliberate:
+/// it is also what makes [`include_encrypted_reasoning`] apply to a default profile. Codex likewise
+/// sends `reasoning` on every request and omits only the fields it has no value for.
+///
+/// Endpoint-specific for the same reason as [`include_encrypted_reasoning`]: `summary` is an
+/// OpenAI parameter, and only `chatgpt-subscription` knows it is talking to OpenAI.
+///
+/// Takes the body [`build_request_body`] returns, where `reasoning` is either an object or absent;
+/// indexing promotes an absent key through a null to an object, which is how the no-effort case
+/// gets its `reasoning` block.
+pub(super) fn request_reasoning_summary(body: &mut serde_json::Value) {
+    body["reasoning"]["summary"] = serde_json::json!("auto");
 }
 
 /// Build the `output` field of a `function_call_output` item from a slice of `ToolResultContent`.
@@ -282,34 +320,115 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// Encode one assistant turn as `input` items, in the order its blocks arrived.
+///
+/// Order is load-bearing here in a way it is not for the user encoder. A `reasoning` item must be
+/// followed by the output that reasoning produced, or the API rejects the whole request: `Item
+/// '<id>' of type 'reasoning' was provided without its required following item`. Emitting all the
+/// text first and then all the calls, as this did before reasoning was replayed at all, breaks that
+/// pairing as soon as a turn thinks twice.
 fn encode_assistant_message(message: &Message, input: &mut Vec<serde_json::Value>) {
-    let text = message.text_content();
-    if !text.is_empty() {
-        input.push(serde_json::json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-            }],
-        }));
-    }
+    let mut pending_text = String::new();
 
-    for block in &message.content {
-        if let ContentBlock::ToolUse {
-            id,
-            name,
-            input: arguments,
-        } = block
-        {
-            input.push(serde_json::json!({
-                "type": "function_call",
-                "name": name,
-                "call_id": id,
-                "arguments": arguments.to_string(),
-            }));
+    for (index, block) in message.content.iter().enumerate() {
+        match block {
+            ContentBlock::Text { text } => pending_text.push_str(text),
+            // Replayed only when it carries `encrypted_content`, which is the reasoning itself and
+            // the only part the model can resume from. A summary without it is a digest written
+            // for a human, so sending one back buys nothing and would put an item shape on the wire
+            // for endpoints that were never asked for reasoning in the first place.
+            ContentBlock::Thinking {
+                thinking,
+                opaque:
+                    Some(OpaqueReasoning::Sealed {
+                        encrypted_content,
+                        id,
+                    }),
+            } if an_emitted_item_follows(&message.content, index) => {
+                flush_assistant_text(&mut pending_text, input);
+                input.push(reasoning_input_item(
+                    id.as_deref(),
+                    thinking,
+                    encrypted_content,
+                ));
+            }
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input: arguments,
+            } => {
+                flush_assistant_text(&mut pending_text, input);
+                input.push(serde_json::json!({
+                    "type": "function_call",
+                    "name": name,
+                    "call_id": id,
+                    "arguments": arguments.to_string(),
+                }));
+            }
+            _ => {}
         }
     }
+
+    flush_assistant_text(&mut pending_text, input);
+}
+
+/// Emit the assistant text accumulated so far as one `message` item, and clear it.
+fn flush_assistant_text(pending: &mut String, input: &mut Vec<serde_json::Value>) {
+    if pending.is_empty() {
+        return;
+    }
+    input.push(serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": std::mem::take(pending),
+        }],
+    }));
+}
+
+/// Whether anything this encoder will actually emit follows `index` in the same turn.
+///
+/// A reasoning item left dangling is a rejected request, and meka's own history reaches that shape
+/// without any help from the model: [`Message::without_tool_use`] drops an interrupted turn's calls
+/// but keeps its thinking, and a rewind can cut anywhere.
+///
+/// Only output counts, so a run of reasoning items is carried by whatever follows the run rather
+/// than by each other -- which is the order the server produced them in, and so the order they may
+/// be replayed in. What this refuses is a turn that ends in reasoning with no output at all.
+fn an_emitted_item_follows(content: &[ContentBlock], index: usize) -> bool {
+    content.iter().skip(index + 1).any(|block| match block {
+        ContentBlock::Text { text } => !text.is_empty(),
+        ContentBlock::ToolUse { .. } => true,
+        _ => false,
+    })
+}
+
+/// A `reasoning` item, shaped as the server sent it so it can be replayed verbatim.
+///
+/// meka flattens a multi-part summary into one string as it streams (the parts are display
+/// sections, separated by a blank line), and does not try to reconstruct the original parts here:
+/// splitting back on the separator would invent boundaries wherever a single part contained a
+/// paragraph break. The whole text goes back as one part, which preserves what was said.
+fn reasoning_input_item(
+    id: Option<&str>,
+    summary: &str,
+    encrypted_content: &str,
+) -> serde_json::Value {
+    let summary = if summary.is_empty() {
+        serde_json::json!([])
+    } else {
+        serde_json::json!([{ "type": "summary_text", "text": summary }])
+    };
+    let mut item = serde_json::json!({
+        "type": "reasoning",
+        "summary": summary,
+        "encrypted_content": encrypted_content,
+    });
+    if let Some(id) = id {
+        item["id"] = serde_json::Value::String(id.to_string());
+    }
+    item
 }
 
 fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
@@ -400,6 +519,17 @@ pub(super) fn process_event(
             }
         }
 
+        // A reasoning summary arrives as several parts, each its own section with its own heading,
+        // and the deltas carry no separator of their own. Codex renders a break here
+        // (`on_reasoning_section_break`); meka's thinking is flat text, so the break is a blank
+        // line. The first part opens the block rather than separating anything, which is what
+        // `in_reasoning` distinguishes.
+        "response.reasoning_summary_part.added" => {
+            if state.in_reasoning {
+                out.push(StreamEvent::ThinkingDelta("\n\n".to_string()));
+            }
+        }
+
         "response.output_item.added" => {
             let Some(item) = data.get("item") else {
                 return Ok(out);
@@ -487,13 +617,34 @@ pub(super) fn process_event(
                         });
                     }
                 }
-            } else if item_type == "reasoning" && state.in_reasoning {
+            } else if item_type == "reasoning" {
+                // True when this item streamed anything readable, by either spelling: a requested
+                // summary, or the raw reasoning text a local server emits unprompted.
+                let showed_its_reasoning = state.in_reasoning;
                 state.in_reasoning = false;
-                let signature = item
+                let encrypted_content = item
                     .get("encrypted_content")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                out.push(StreamEvent::ThinkingComplete { signature });
+                // Deliberately not gated on that. `encrypted_content` is what the next request
+                // replays, and it arrives whether or not summaries were requested -- so gating its
+                // capture on visible text silently threw the reasoning chain away for exactly the
+                // configuration that asked for it. An item with neither is worth nothing to either
+                // the reader or the next turn, so it makes no block.
+                if showed_its_reasoning || encrypted_content.is_some() {
+                    let id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    out.push(StreamEvent::ThinkingComplete {
+                        opaque: encrypted_content.map(|encrypted_content| {
+                            OpaqueReasoning::Sealed {
+                                encrypted_content,
+                                id,
+                            }
+                        }),
+                    });
+                }
             }
         }
 
@@ -1448,6 +1599,7 @@ mod tests {
             &serde_json::json!({
                 "item": {
                     "type": "reasoning",
+                    "id": "rs_123",
                     "summary": [],
                     "encrypted_content": "OPAQUE"
                 }
@@ -1457,12 +1609,100 @@ mod tests {
         .expect("ok");
         assert_eq!(events.len(), 1);
         match &events[0] {
-            StreamEvent::ThinkingComplete { signature } => {
-                assert_eq!(signature.as_deref(), Some("OPAQUE"));
+            StreamEvent::ThinkingComplete {
+                opaque:
+                    Some(OpaqueReasoning::Sealed {
+                        encrypted_content,
+                        id,
+                    }),
+            } => {
+                assert_eq!(encrypted_content, "OPAQUE");
+                assert_eq!(id.as_deref(), Some("rs_123"));
             }
             other => panic!("expected ThinkingComplete, got {:?}", other),
         }
         assert!(!state.in_reasoning);
+    }
+
+    /// The defect this whole path had: `encrypted_content` arrives whether or not a summary was
+    /// asked for, and gating its capture on having seen a summary delta threw the reasoning chain
+    /// away for every request that did not also ask for summaries.
+    #[test]
+    fn encrypted_reasoning_is_captured_without_a_summary_to_show_for_it() {
+        let mut state = SseState::default();
+        let events = process_event(
+            "response.output_item.done",
+            &serde_json::json!({
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_silent",
+                    "summary": [],
+                    "encrypted_content": "OPAQUE"
+                }
+            }),
+            &mut state,
+        )
+        .expect("ok");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [StreamEvent::ThinkingComplete {
+                    opaque: Some(OpaqueReasoning::Sealed {
+                        encrypted_content,
+                        id,
+                    }),
+                }] if id.as_deref() == Some("rs_silent") && encrypted_content == "OPAQUE"
+            ),
+            "silent reasoning must still be captured, got {:?}",
+            events
+        );
+    }
+
+    /// A reasoning item with neither summary nor encrypted content has nothing to render and
+    /// nothing to replay, so it should not manufacture a block.
+    #[test]
+    fn an_empty_reasoning_item_produces_no_event() {
+        let mut state = SseState::default();
+        let events = process_event(
+            "response.output_item.done",
+            &serde_json::json!({ "item": { "type": "reasoning", "summary": [] } }),
+            &mut state,
+        )
+        .expect("ok");
+        assert!(events.is_empty(), "got {:?}", events);
+    }
+
+    /// Each summary part is its own section. Without a break between them the parts run together
+    /// into one paragraph, and the first part must not be preceded by one.
+    #[test]
+    fn summary_parts_are_separated_but_the_first_one_is_not() {
+        let mut state = SseState::default();
+        let opening = process_event(
+            "response.reasoning_summary_part.added",
+            &serde_json::json!({ "summary_index": 0 }),
+            &mut state,
+        )
+        .expect("ok");
+        assert!(opening.is_empty(), "got {:?}", opening);
+
+        process_event(
+            "response.reasoning_summary_text.delta",
+            &serde_json::json!({ "delta": "**First**\nthinking" }),
+            &mut state,
+        )
+        .expect("ok");
+
+        let between = process_event(
+            "response.reasoning_summary_part.added",
+            &serde_json::json!({ "summary_index": 1 }),
+            &mut state,
+        )
+        .expect("ok");
+        assert!(
+            matches!(between.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "\n\n"),
+            "got {:?}",
+            between
+        );
     }
 
     fn image_content(media_type: &str, data: &str) -> ToolResultContent {
@@ -1550,5 +1790,276 @@ mod tests {
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "input_image");
         assert_eq!(output[0]["image_url"], "data:image/png;base64,QkFTRTY0");
+    }
+
+    fn thinking(summary: &str, encrypted: Option<&str>, id: Option<&str>) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: summary.to_string(),
+            opaque: encrypted.map(|encrypted_content| OpaqueReasoning::Sealed {
+                encrypted_content: encrypted_content.to_string(),
+                id: id.map(str::to_string),
+            }),
+        }
+    }
+
+    fn tool_call(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    fn input_of(messages: &[Message]) -> Vec<serde_json::Value> {
+        build_request_body("gpt-5", "", messages, &[], Some("high"), None, true)["input"]
+            .as_array()
+            .expect("input array")
+            .clone()
+    }
+
+    /// The whole point of the `include`: reasoning meka asked the server to encrypt has to go back
+    /// out on the next request, or the model restarts its chain of thought at every tool call.
+    #[test]
+    fn encrypted_reasoning_is_replayed_on_the_next_request() {
+        let input = input_of(&[
+            Message::user("hi"),
+            assistant(vec![
+                thinking("weighing it up", Some("OPAQUE"), Some("rs_1")),
+                tool_call("call_1"),
+            ]),
+        ]);
+
+        let reasoning = input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("the reasoning item must survive the round trip");
+        assert_eq!(reasoning["id"], "rs_1");
+        assert_eq!(reasoning["encrypted_content"], "OPAQUE");
+        assert_eq!(reasoning["summary"][0]["type"], "summary_text");
+        assert_eq!(reasoning["summary"][0]["text"], "weighing it up");
+    }
+
+    /// The API pairs a reasoning item with the output it produced and rejects one left dangling
+    /// ("was provided without its required following item"). `without_tool_use` reaches that shape
+    /// on any interrupted turn, so the encoder has to refuse it rather than the server.
+    #[test]
+    fn reasoning_with_nothing_after_it_is_not_sent() {
+        let interrupted = assistant(vec![
+            thinking("weighing it up", Some("OPAQUE"), Some("rs_1")),
+            tool_call("call_1"),
+        ])
+        .without_tool_use();
+        let input = input_of(&[Message::user("hi"), interrupted]);
+
+        assert!(
+            !input.iter().any(|item| item["type"] == "reasoning"),
+            "a dangling reasoning item would be rejected: {:?}",
+            input
+        );
+    }
+
+    /// What the API wants after a reasoning item is the output that reasoning produced. Another
+    /// reasoning item is not that, so a turn cut down to nothing but thinking sends none of it --
+    /// otherwise the last one still dangles and takes the whole request down with it.
+    #[test]
+    fn reasoning_does_not_count_as_another_reasoning_item_s_follower() {
+        let input = input_of(&[
+            Message::user("hi"),
+            assistant(vec![
+                thinking("first", Some("ONE"), Some("rs_1")),
+                thinking("second", Some("TWO"), Some("rs_2")),
+            ]),
+        ]);
+
+        assert!(
+            !input.iter().any(|item| item["type"] == "reasoning"),
+            "got {:?}",
+            input
+        );
+    }
+
+    /// Reasoning has to precede the output it produced, which the old encoder could not express:
+    /// it emitted every text block first and every call after, so a turn that thought twice came
+    /// back in an order the API rejects.
+    #[test]
+    fn reasoning_precedes_the_output_it_produced_across_two_thinking_rounds() {
+        let input = input_of(&[
+            Message::user("hi"),
+            assistant(vec![
+                ContentBlock::Text {
+                    text: "let me look".to_string(),
+                },
+                thinking("first", Some("ONE"), Some("rs_1")),
+                tool_call("call_1"),
+                thinking("second", Some("TWO"), Some("rs_2")),
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+            ]),
+        ]);
+
+        let shape: Vec<&str> = input
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(shape, [
+            // The user turn, then text the model wrote before it thought, then each round of
+            // reasoning immediately ahead of what that reasoning produced.
+            "message",
+            "message",
+            "reasoning",
+            "function_call",
+            "reasoning",
+            "message"
+        ]);
+        assert_eq!(input[2]["encrypted_content"], "ONE");
+        assert_eq!(input[4]["encrypted_content"], "TWO");
+    }
+
+    /// A session is not bound to the provider that recorded it: `meka -c -p other` resumes one
+    /// under anything. A Claude thinking block reaching this encoder must not be replayed, because
+    /// its signature is a MAC from another cryptosystem and its `thinking` is the reasoning itself
+    /// -- sending them as `encrypted_content` and a `summary` hands OpenAI a blob it cannot
+    /// decrypt and leaks the whole Claude reasoning beside it. This was live before the two shapes
+    /// were named apart.
+    #[test]
+    fn a_claude_signature_is_never_replayed_to_openai() {
+        let claude_turn = assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "the full Claude reasoning".to_string(),
+                opaque: Some(OpaqueReasoning::Signed {
+                    signature: "CLAUDE_MAC".to_string(),
+                }),
+            },
+            ContentBlock::Text {
+                text: "answer".to_string(),
+            },
+        ]);
+        let serialized = serde_json::to_string(&serde_json::Value::Array(input_of(&[
+            Message::user("hi"),
+            claude_turn,
+        ])))
+        .expect("serialize");
+
+        assert!(!serialized.contains("CLAUDE_MAC"), "{serialized}");
+        assert!(!serialized.contains("\"reasoning\""), "{serialized}");
+    }
+
+    /// A summary is a digest written for a person; without `encrypted_content` there is no
+    /// reasoning to resume, so replaying it would only put an unexpected item shape on the wire of
+    /// an endpoint that was never asked for reasoning.
+    #[test]
+    fn a_summary_without_encrypted_content_is_not_replayed() {
+        let input = input_of(&[
+            Message::user("hi"),
+            assistant(vec![thinking("visible only", None, None), tool_call("c1")]),
+        ]);
+
+        assert!(
+            !input.iter().any(|item| item["type"] == "reasoning"),
+            "got {:?}",
+            input
+        );
+    }
+
+    /// A reasoning item that never carried an id is still replayable; the id is optional upstream
+    /// too (`Option<ResponseItemId>`, skipped when absent).
+    #[test]
+    fn a_reasoning_item_without_an_id_is_still_replayed() {
+        let input = input_of(&[
+            Message::user("hi"),
+            assistant(vec![thinking("", Some("OPAQUE"), None), tool_call("c1")]),
+        ]);
+
+        let reasoning = input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("present");
+        assert!(reasoning.get("id").is_none(), "got {:?}", reasoning);
+        assert_eq!(reasoning["summary"], serde_json::json!([]));
+    }
+
+    /// Without this the model still reasons and the user sees nothing, which reads as a hang.
+    /// Codex asks for `auto`; so does meka, on the one backend whose endpoint is always OpenAI.
+    #[test]
+    fn the_two_asks_compose_into_a_reasoning_block_even_with_no_effort_set() {
+        let mut body = build_request_body("gpt-5", "", &[], &[], None, None, true);
+        assert!(body.get("reasoning").is_none(), "no effort, no reasoning");
+
+        request_reasoning_summary(&mut body);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // And settling `reasoning` is what lets the `include` apply to a default profile, which is
+        // the configuration that previously asked for no encrypted reasoning at all.
+        include_encrypted_reasoning(&mut body);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    /// The two halves composed: a real ChatGPT reasoning turn off the wire, folded into a message,
+    /// and handed straight back to the request builder.
+    ///
+    /// Each half is pinned on its own above, but the thing that actually has to hold is that what
+    /// the parser produces is what the encoder can replay. A field renamed on one side and not the
+    /// other passes every unit test here and still loses the reasoning chain in production.
+    #[tokio::test]
+    async fn reasoning_survives_the_wire_and_goes_straight_back_out() {
+        let (events, outcome) = decode_sse(concat!(
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Plan**\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"summary_index\":1}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Act**\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\
+             \"id\":\"rs_live\",\"summary\":[],\"encrypted_content\":\"OPAQUE\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"here you go\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
+             \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        ))
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        for event in events {
+            sender.send(event).await.expect("buffered");
+        }
+        drop(sender);
+        let (message, _stop, _usage, _notices) = aggregate_stream(receiver).await;
+
+        let input = input_of(&[Message::user("hi"), message]);
+        let reasoning = input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("the turn's reasoning must reach the next request");
+        assert_eq!(reasoning["id"], "rs_live");
+        assert_eq!(reasoning["encrypted_content"], "OPAQUE");
+        assert_eq!(reasoning["summary"][0]["text"], "**Plan**\n\n**Act**");
+        // And ahead of the answer it produced, which is what the API pairs it with.
+        let shape: Vec<&str> = input
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+        assert_eq!(shape, ["message", "reasoning", "message"]);
+    }
+
+    /// The summary request must stay out of the shared body for the same reason the `include`
+    /// does: `openai-responses` reaches endpoints that never agreed to an OpenAI parameter.
+    #[test]
+    fn the_shared_body_never_asks_for_a_reasoning_summary() {
+        let body = build_request_body("gpt-5", "", &[], &[], Some("high"), None, true);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(
+            body["reasoning"].get("summary").is_none(),
+            "got {:?}",
+            body["reasoning"]
+        );
     }
 }

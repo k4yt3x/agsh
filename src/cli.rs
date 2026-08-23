@@ -210,10 +210,11 @@ pub enum ProviderAction {
         /// API base URL, for any endpoint serving the chosen protocol.
         #[arg(long = "base-url")]
         base_url: Option<String>,
-        /// Thinking mode (Anthropic Messages backends only)
+        /// Extended thinking mode: adaptive, budgeted, or off
         ///
-        /// Skips the advanced prompt for this setting. Defaults to `adaptive`.
-        #[arg(long, value_enum)]
+        /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
+        /// ignore it. Defaults to adaptive.
+        #[arg(long, value_enum, hide_possible_values = true)]
         thinking: Option<crate::provider::ThinkingMode>,
         /// Context window in tokens
         ///
@@ -688,7 +689,7 @@ pub struct Cli {
     pub permission: Option<Permission>,
 
     /// Provider profile to use this run (overrides default_provider)
-    #[arg(long = "provider")]
+    #[arg(short = 'p', long = "provider")]
     pub provider: Option<String>,
 
     /// Override the active profile's model for this run
@@ -711,8 +712,13 @@ pub struct Cli {
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
 
-    /// Thinking mode (Anthropic Messages backends only)
-    #[arg(long = "thinking", value_enum)]
+    /// Extended thinking mode: adaptive, budgeted, or off
+    ///
+    /// Anthropic Messages backends only; the rest ignore it. adaptive lets the model size its own
+    /// budget and suits Claude 4.6 and newer; budgeted sends the fixed --thinking-budget that
+    /// older Claude and most third-party servers require; off asks for none. Overrides the active
+    /// profile's thinking setting for this run.
+    #[arg(long = "thinking", value_enum, hide_possible_values = true)]
     pub thinking: Option<crate::provider::ThinkingMode>,
 
     /// Thinking token budget (Anthropic Messages, thinking = budgeted)
@@ -872,6 +878,13 @@ mod tests {
         assert!(cli.no_stream);
         assert!(cli.continue_last);
         assert_eq!(cli.verbosity, 2);
+    }
+
+    #[test]
+    fn test_cli_provider_short_form() {
+        let cli = Cli::parse_from(["meka", "-p", "work", "fix the bug"]);
+        assert_eq!(cli.provider.as_deref(), Some("work"));
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
     }
 
     #[test]

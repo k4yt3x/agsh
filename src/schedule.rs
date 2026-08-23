@@ -126,13 +126,11 @@ impl Schedule {
                 .map(|absolute| Self::At(absolute.with_timezone(&Utc)))
                 .map_err(|error| format!("stored 'at' spec '{}' is not RFC 3339: {}", spec, error)),
             "every" => Self::parse_every(spec),
-            // Rehydrates through `parse_cron`, not `Cron::from_str`, so a stored spec is read with
-            // the same five-field grammar it was created under. Using the permissive parser here
-            // meant the seconds-field fix only ever applied to *new* jobs: every six-field row
-            // already on disk -- the entire affected population -- kept firing every ten seconds,
-            // with no migration and no warning, and `restore_scheduled_job` re-persisted it after
-            // each deferral. A row that no longer parses is surfaced as an error rather than
-            // silently reinterpreted.
+            // Rehydrates through `parse_cron`, not `Cron::from_str`, so a stored spec is read back
+            // under the same five-field grammar that accepted it. The permissive parser would read
+            // a six-field pattern's first field as seconds, giving a stored job a different meaning
+            // on reload than it had at creation. A spec that does not parse under those rules is
+            // surfaced as an error rather than silently reinterpreted.
             "cron" => Self::parse_cron(spec)
                 .map_err(|error| format!("stored cron spec '{}' is invalid: {}", spec, error)),
             other => Err(format!("unknown schedule kind '{}'", other)),
@@ -926,15 +924,16 @@ async fn prepare(
         // `recorded == Write` for every job that exists. The comparison could not fail, and the
         // case it was written for -- the session cycles down to `read`, or a
         // `meka serve --permission read` restarts and inherits the row -- went unnoticed. The live
-        // level is what makes the withdrawal real; the recorded one still matters because a row
-        // predating the column decodes as `Permission::None` and must stay refused.
+        // level is what makes the withdrawal real; the recorded one still matters because a
+        // hand-edited or unparseable `gate_permission` decodes as `Permission::None` and must stay
+        // refused.
         //
         // The occurrence is declined, exactly as a gate that ran and said no is declined. A gate
         // is the condition on the job, so a gate that could not be evaluated has not passed, and
-        // firing anyway converts a conditional job into an unconditional one. The shape that
-        // makes this concrete is `every = "1m"` with an `on-change` gate: on a row predating the
-        // `gate_permission` column it went from near-silent to a turn a minute, which is the
-        // opposite of what the row asks for and expensive besides.
+        // firing anyway converts a conditional job into an unconditional one. The shape that makes
+        // this concrete is `every = "1m"` with an `on-change` gate: firing it unconditionally turns
+        // a near-silent job into a turn a minute, which is the opposite of what the row asks for
+        // and expensive besides.
         Some(gate)
             if !matches!(gate.permission, crate::permission::Permission::Write)
                 || !matches!(live_permission, crate::permission::Permission::Write) =>
@@ -1569,11 +1568,11 @@ impl ScheduledJobRow {
                 command,
                 fire: GateFire::parse(&fire)?,
                 last_output: self.gate_last_output,
-                // A row written before `gate_permission` existed carries no level. Reading that as
-                // `Write` would restore exactly the behaviour this column was added to stop, so an
-                // absent level resolves to `None` -- the gate is refused at fire time and the user
-                // is told to recreate the job. Failing closed on a pre-migration row costs one
-                // re-creation; failing open costs the guarantee.
+                // Every write path stores a level alongside the gate, so an absent or unparseable
+                // one means a hand-edited or damaged row. Reading that as `Write` would hand an
+                // arbitrary shell command the authority the column exists to record, so it resolves
+                // to `None`: the gate is refused at fire time and the user is told to recreate the
+                // job. Failing closed costs one re-creation; failing open costs the guarantee.
                 permission: self
                     .gate_permission
                     .as_deref()

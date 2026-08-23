@@ -137,10 +137,12 @@ pub async fn ensure_session_loaded(
             .with("session_id", id.to_string())
         })?;
 
-    // Resolve persisted permission. NULL on legacy rows (REPL / ACP / pre-0.27 HTTP): fall back
-    // to the process default. The HTTP `create_session` handler validates against the enabled set
-    // at insert time, but a stored permission could in principle become disabled by an operator
-    // editing config; defensively re-check.
+    // Resolve persisted permission. NULL for REPL, ACP and sub-agent rows, which carry no
+    // per-session level and derive permission from process config instead, and for an imported
+    // session whose archive omitted one: fall back to the process default. The HTTP
+    // `create_session` handler validates against the enabled set at insert time, but a stored
+    // permission could in principle become disabled by an operator editing config; defensively
+    // re-check.
     let enabled = state.shared.config.enabled_permissions;
     let permission: Permission = match summary.permission.as_deref() {
         Some(value) => value.parse().unwrap_or(state.shared.config.permission),
@@ -170,8 +172,9 @@ pub async fn ensure_session_loaded(
         None => SessionCapabilities::default(),
     };
 
-    // When no persisted `cwd` exists (legacy rows), default to the server's process working
-    // directory. Propagate `current_dir()` failure as 500: the operator can fix it.
+    // A row can carry no `cwd`: `meka session import` stores the archive's value verbatim, and an
+    // archive may omit it. Default to the server's process working directory, and propagate
+    // `current_dir()` failure as 500 so the operator can fix it.
     let cwd_path = match summary.cwd.clone() {
         Some(path) => path,
         None => std::env::current_dir().map_err(|error| {
@@ -269,7 +272,8 @@ pub async fn ensure_session_loaded(
         .unwrap_or(now);
     let new_entry = SessionEntry {
         session_uuid: id,
-        // Restore persisted `token_id`. `None` only for legacy rows that predate the column.
+        // Restore persisted `token_id`. `None` for every session not created through an
+        // authenticated HTTP request: REPL, ACP, sub-agent and imported rows.
         token_id: summary.token_id.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         permission: shared_permission,

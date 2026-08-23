@@ -56,11 +56,11 @@ Within one priority band, the most recently *recorded* memory sorts first — so
 
 Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. `meka memory list` prints the distribution so you can see that happening and rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
 
-**Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
+**Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
 
 ## The index budget
 
-The index is capped at 8 KB and 200 entries. When more memories exist than fit, the section ends with a line stating how many were left out — and, when they carry tags, what they are about:
+The index is capped at 8 KiB and 200 entries. When more memories exist than fit, the section ends with a line stating how many were left out, and, when they carry tags, what they are about:
 
 ```
 4910 more memories not shown here, most common tags infra (820), people (611),
@@ -176,6 +176,10 @@ What lands on disk is byte-exact: bodies, tags, priorities and recorded dates ar
 Descriptions are the one field normalised rather than preserved: every write door collapses a description to a single line before storing it, so what comes back is what was stored. A description made only of characters YAML cannot carry has no such form, and `meka memory export` refuses the whole run and names it rather than writing a file whose frontmatter would not parse.
 
 An export reads back with any tool that understands YAML frontmatter; meka itself has no import command, because a store you can rebuild from a directory is a second source of truth and this subsystem deliberately has one.
+
+## Coming from a file-backed store
+
+Memories used to be Markdown files in `<config>/memory/`. If you are upgrading from 0.41, the one-shot migration script attached to the 0.42 release imports them into the database; run it once, check `meka memory list`, then remove the directory yourself. meka never reads those files again and does not migrate them on startup, deliberately: a migration that runs on every start is one nobody can see fail.
 
 ## Configuration
 

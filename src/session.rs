@@ -1,7 +1,9 @@
-//! SQLite-backed session store, over seven tables: `sessions` and `messages` for the conversation,
-//! `tool_outputs` for results too large to keep inline (referenced from the conversation by
-//! handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and `scheduled_jobs`
-//! and `background_tasks` for work the agent starts and does not wait for.
+//! SQLite-backed session store. The tables this module owns are `sessions` and `messages` for the
+//! conversation, `tool_outputs` for results too large to keep inline (referenced from the
+//! conversation by handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and
+//! `scheduled_jobs` and `background_tasks` for work the agent starts and does not wait for. They
+//! are not the whole database: `initialize_schema` also calls
+//! `crate::memory::store::create_tables`, whose DDL lives with the code that queries it.
 //!
 //! Per-session mutual exclusion is provided by an OS-level file lock ([`FileLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
@@ -64,11 +66,10 @@ pub struct SessionMetaRow {
     pub cwd: Option<String>,
     pub permission: Option<String>,
     pub capabilities_json: Option<String>,
-    /// Workspace roots beyond `cwd`. Empty for every non-ACP session and for rows written before
-    /// the column existed, both of which were single-root.
+    /// Workspace roots beyond `cwd`. Empty for every non-ACP session, all of which are
+    /// single-root.
     pub additional_roots: Vec<PathBuf>,
-    /// The terms a sub-agent was spawned under, as stored JSON. `None` on every top-level session
-    /// and on sub-agent rows written before the column existed.
+    /// The terms a sub-agent was spawned under, as stored JSON. `None` on every top-level session.
     pub subagent_spec_json: Option<String>,
 }
 
@@ -119,23 +120,27 @@ pub struct SessionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub preview: String,
-    /// Working directory captured at `create_session` time. `None` for legacy rows from before the
-    /// `cwd` column was added; ACP-facing code falls back to the process cwd for display.
+    /// Working directory captured at session creation. `None` when an archive omitted one and
+    /// [`SessionManager::import_sessions`] stored that absence verbatim; ACP-facing code falls
+    /// back to the process cwd for display.
     pub cwd: Option<std::path::PathBuf>,
-    /// Permission level captured at session creation, or `None` for legacy rows / sessions created
-    /// without a per-session permission (the REPL and ACP paths derive permission from process
-    /// config, not per-session). The HTTP API persists this so `POST /v1/sessions` with an
-    /// explicit `permission` field survives GC-eviction + re-attach.
+    /// Permission level captured at session creation. NULL for REPL, ACP and sub-agent rows -- the
+    /// first two derive permission from process config, and a sub-agent's level travels in
+    /// `subagent_spec_json` instead -- and for an imported row whose archive omitted one. The HTTP
+    /// API persists this so `POST /v1/sessions` with an explicit `permission` field survives
+    /// GC-eviction + re-attach.
     pub permission: Option<String>,
-    /// JSON-encoded per-session capability flags (currently just
-    /// `{"supports_reasoning_stream": bool}`). Same NULL-for-legacy semantics as `permission`.
+    /// Per-session capability flags, as a serialized
+    /// [`crate::server::http_frontend::SessionCapabilities`]. Deliberately not enumerated here:
+    /// the flag set has grown twice, and each restatement went stale silently. NULL on the
+    /// same sessions as `permission`, and for the same reason.
     pub capabilities_json: Option<String>,
-    /// Workspace roots beyond `cwd`, from an ACP client's `additionalDirectories`. Empty for every
-    /// non-ACP session and for legacy rows written before the column existed, both of which were
-    /// single-root.
+    /// Workspace roots beyond `cwd`, from an ACP client's `additionalDirectories`. Empty whenever
+    /// a session carries no extra roots, which is every non-ACP session.
     pub additional_roots: Vec<PathBuf>,
-    /// SHA-256 fingerprint of the bearer token that created this session. `None` for legacy
-    /// rows and for sessions not created via the HTTP API.
+    /// SHA-256 fingerprint of the bearer token that created this session. `None` for every session
+    /// not created via the HTTP API, including sub-agents, whose row omits the column entirely. A
+    /// fork through the HTTP API does carry one: the token doing the forking, never the source's.
     pub token_id: Option<String>,
     /// The session this one was spawned from, for a sub-agent. `None` for a top-level session.
     /// Surfaced so a client listing with `include_children` can rebuild the spawn tree rather than
@@ -158,23 +163,6 @@ pub enum RenameOutcome {
     NotFound,
     TargetExists,
 }
-
-/// Per-session counters carried on the `sessions` row so `/status` totals survive a resume.
-///
-/// Listed once here because `initialize_schema` adds them one at a time and needs to name each; the
-/// list is the migration's unit of work, not a formatting detail. These are compile-time literals,
-/// so interpolating them into an `ALTER TABLE` is not a SQL-injection surface -- no caller supplies
-/// a column name, and there is no bound-parameter form for a DDL identifier.
-const STAT_COLUMNS: [&str; 8] = [
-    "stat_turns",
-    "stat_input_tokens",
-    "stat_output_tokens",
-    "stat_cache_creation_input_tokens",
-    "stat_cache_read_input_tokens",
-    "stat_redactions",
-    "stat_redacted_images",
-    "stat_redacted_bytes",
-];
 
 #[derive(Clone)]
 pub struct SessionManager {
@@ -404,16 +392,6 @@ const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session_id FROM sc
          SELECT id FROM ancestors \
      )";
 
-/// Stamped into `PRAGMA user_version` once [`SessionManager::initialize_schema`] has run to
-/// completion.
-///
-/// One number, not a migration ladder: the per-step probes are idempotent and stay the mechanism
-/// for deciding what to add. This exists for the one step that is *not* safe to re-run -- the
-/// cascade rebuild, which recreates `sessions` from a column list that omits everything added
-/// since. Its guard is a `LIKE` over generated SQL, and this makes that guard unreachable for any
-/// database that has already been initialised rather than trusting it a second time.
-const SCHEMA_VERSION: i32 = 1;
-
 fn default_database_path() -> Result<PathBuf> {
     // `MEKA_DATA_DIR` is the cross-platform override, the only env var that works on every OS,
     // mirroring how `MEKA_CONFIG_DIR` overrides the config directory. The value points at the
@@ -569,8 +547,8 @@ impl SessionManager {
         }
 
         // SQLite defaults foreign-key enforcement to OFF per-connection; the `FOREIGN KEY` clauses
-        // in `CREATE TABLE` are decorative without this. Set before `initialize_schema` so the
-        // migration's DELETE/ALTER statements run with enforcement active. Must run outside any
+        // in `CREATE TABLE` are decorative without this. Set before `initialize_schema` so every
+        // statement it runs, and every one after, sees enforcement active. Must run outside any
         // transaction to take effect.
         connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -635,17 +613,18 @@ impl SessionManager {
     async fn initialize_schema(&self) -> Result<()> {
         // Serialise schema work across processes.
         //
-        // The migrations below are a sequence of check-then-`ALTER` steps, and two meka processes
-        // opening the same database in the same window both see "not migrated" and both issue the
-        // same `ALTER`; the loser dies with `duplicate column name`. That is not an upgrade-only
-        // hazard: `CREATE TABLE sessions` does not declare the `stat_*` columns, so *every* fresh
-        // database runs those eight `ALTER`s on first open, which is exactly when a systemd unit
-        // and a shell REPL are most likely to start together.
+        // Everything below is `CREATE TABLE IF NOT EXISTS`, which SQLite makes safe on its own --
+        // but not everything below is only that. `memory::store::create_tables` reconciles the FTS
+        // triggers, and the `sqlite_master` read that decides whether they have drifted sits
+        // *outside* the transaction that replaces them. The replacement itself is a single
+        // immediate transaction, so no process ever sees a half-applied trigger set; what a second
+        // process can see is a snapshot the winner is about to invalidate, and it then acts on that
+        // answer after it has stopped being true. A systemd unit and a shell REPL starting together
+        // is exactly when that happens.
         //
-        // A SQLite transaction cannot be the mechanism: the cascade rebuild needs
-        // `PRAGMA foreign_keys = OFF`, which is a no-op inside one. So the lock is an OS file lock,
-        // the same primitive `FileLock` uses, held for the whole of the schema work. The loser
-        // waits, then re-runs its probes against the winner's finished schema and no-ops.
+        // An OS file lock rather than a SQLite transaction, the same primitive `FileLock` uses,
+        // held for the whole of the schema work so the check and the write it authorises cannot be
+        // split. The loser waits, then re-runs against the winner's finished schema and no-ops.
         let lock_path = self.lock_dir.join(format!("{}.lock", SCHEMA_LOCK_STEM));
         let mut lock_file = FdRwLock::new(
             std::fs::OpenOptions::new()
@@ -669,21 +648,18 @@ impl SessionManager {
             ))
         })?;
 
-        // Deliberately *not* short-circuited on `PRAGMA user_version`, though the temptation is
-        // real: everything below is `CREATE TABLE IF NOT EXISTS` and probe-then-`ALTER`, so every
-        // open takes a write lock to change nothing, and a long-running writer elsewhere therefore
-        // fails commands that only read. An external `BEGIN IMMEDIATE` held for eight seconds kills
-        // `meka --oneshot` at 5.1 seconds with `failed to initialize schema: database is locked`,
-        // and `meka session list` -- a pure read -- dies the same way because opening the store
-        // writes.
+        // Declaration only: this creates what is missing and changes nothing that exists. meka
+        // carries no migration code at all -- a store from an older release is brought forward by
+        // the one-shot script shipped with the release that needs it, so nothing here has to guess
+        // what shape it is arriving in, and no user pays a scan on every start for a rewrite that
+        // happens once.
         //
-        // Skipping on the stamp would trade that for a worse failure. `SCHEMA_VERSION` is not a
-        // migration ladder (see its doc); it marks one destructive step as already done, and the
-        // probes below are what decide what to add. A stamp-gated skip would silently stop those
-        // probes running on every database already stamped, so the next release that adds a column
-        // or a table would leave every existing installation without it -- and nothing in the build
-        // would notice, because the constant only fails to be bumped, it never fails to compile. A
-        // rare, loud, retryable startup error is the better half of that trade.
+        // What that costs, and it is real: opening the store takes a write lock to change nothing,
+        // so a long-running writer elsewhere fails commands that only read. An external
+        // `BEGIN IMMEDIATE` held for eight seconds kills `meka --oneshot` at 5.1 seconds with
+        // `failed to initialize schema: database is locked`, and `meka session list` -- a pure
+        // read -- dies the same way. A rare, loud, retryable startup error is the accepted half of
+        // that trade.
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
                 connection.execute_batch(
@@ -697,7 +673,15 @@ impl SessionManager {
                         capabilities_json TEXT,
                         token_id TEXT,
                         additional_roots_json TEXT,
-                        subagent_spec_json TEXT
+                        subagent_spec_json TEXT,
+                        stat_turns INTEGER NOT NULL DEFAULT 0,
+                        stat_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        stat_output_tokens INTEGER NOT NULL DEFAULT 0,
+                        stat_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        stat_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        stat_redactions INTEGER NOT NULL DEFAULT 0,
+                        stat_redacted_images INTEGER NOT NULL DEFAULT 0,
+                        stat_redacted_bytes INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
@@ -715,11 +699,7 @@ impl SessionManager {
                         ON messages(session_id);
 
                     -- Provider credentials (API keys and OAuth bundles) are keyed by the
-                    -- user-chosen profile name and stored as a serialized AuthCredential. The
-                    -- pre-0.27 `oauth_tokens` table is dropped; users re-authenticate via
-                    -- `meka provider add`.
-                    DROP TABLE IF EXISTS oauth_tokens;
-
+                    -- user-chosen profile name and stored as a serialized AuthCredential.
                     CREATE TABLE IF NOT EXISTS provider_credentials (
                         profile TEXT PRIMARY KEY,
                         credentials_json TEXT NOT NULL,
@@ -735,52 +715,6 @@ impl SessionManager {
                     ",
                 )?;
 
-                // Migration: recreate tool_outputs if it has the old integer-ID schema.
-                let has_old_schema: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('tool_outputs') WHERE name = 'id'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if has_old_schema {
-                    // Said out loud, because it is a deletion the user cannot undo and would
-                    // otherwise learn about only when a resumed session's scratchpad reference
-                    // resolves to nothing. The old shape keyed rows by an autoincrementing id
-                    // where the current one keys them by name, and there is no name to synthesise
-                    // from, so the rows genuinely cannot be carried across -- but "cannot be
-                    // migrated" is a thing to report, not a reason to be quiet about it.
-                    let doomed: i64 = connection
-                        .query_row("SELECT COUNT(*) FROM tool_outputs", [], |row| row.get(0))
-                        .unwrap_or(0);
-                    if doomed > 0 {
-                        tracing::warn!(
-                            "dropping {} stored tool output(s) from a pre-0.30 database: they \
-                             predate the name column and cannot be carried forward. Older \
-                             sessions will resume without their spilled command output and \
-                             sub-agent reports.",
-                            doomed
-                        );
-                    }
-                    connection.execute_batch("DROP TABLE tool_outputs")?;
-                }
-
-                // Migration: drop the legacy `sessions.locked_by` column. Locks are now OS file
-                // locks managed via `FileLock`, so any value left in this column is meaningless
-                // and a stale PID can permanently lock a session if the column survives.
-                let has_locked_by: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'locked_by'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if has_locked_by {
-                    connection.execute_batch("ALTER TABLE sessions DROP COLUMN locked_by")?;
-                }
-
                 connection.execute_batch(
                     "CREATE TABLE IF NOT EXISTS tool_outputs (
                         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -788,286 +722,25 @@ impl SessionManager {
                         content TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         PRIMARY KEY (session_id, name)
-                    );
-
-                    DROP TABLE IF EXISTS mcp_auth_cache;
-
-                    DROP TABLE IF EXISTS model_context_cache;
-
-                    DROP TABLE IF EXISTS model_metadata_cache;",
+                    );",
                 )?;
 
-                // Migration: add `sessions.parent_session_id` so sub-agent sessions can be linked
-                // back to the parent that spawned them. Primary sessions store NULL. The cascade-FK
-                // is attached later in the rebuild migration below; this step only guarantees the
-                // column exists. Index is created unconditionally afterwards so fresh DBs (column
-                // from CREATE TABLE) and migrated DBs (column from ALTER TABLE) both end up with
-                // it.
-                let has_parent_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_parent_col {
-                    connection
-                        .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")?;
-                }
                 connection.execute_batch(
                     "CREATE INDEX IF NOT EXISTS idx_sessions_parent
                          ON sessions(parent_session_id)",
                 )?;
 
-                // Migration: add `sessions.cwd` so ACP's `session/list` can report each session's
-                // working directory and `session/load` has a stored cwd to validate the client's
-                // request against. Existing rows get NULL; the ACP handlers fall back to the
-                // process cwd for those entries so legacy sessions stay listable.
-                let has_cwd_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'cwd'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_cwd_col {
-                    connection.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT")?;
-                }
-
-                // Migration: drop the legacy `sessions.metadata` column. It was reserved for future
-                // use but never populated by any codepath, so it's pure schema noise.
-                let has_metadata: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'metadata'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if has_metadata {
-                    connection.execute_batch("ALTER TABLE sessions DROP COLUMN metadata")?;
-                }
-
-                // Migration: rebuild sessions / messages / tool_outputs so their
-                // session-referencing FKs carry `ON DELETE CASCADE`, and so `parent_session_id` has
-                // a FK at all (it was added as a plain TEXT column). SQLite can't ALTER a column's
-                // constraints, so we follow the documented redefinition procedure: disable FK
-                // enforcement, recreate each table with the final schema, copy rows, drop old,
-                // rename, then re-enable enforcement. Wrapped in a transaction so a crash
-                // mid-migration leaves the original tables intact.
-                //
-                // Detection key: the `messages` table SQL contains the literal `ON DELETE CASCADE`
-                // after the migration runs.
-                // Propagated, never defaulted. `.unwrap_or(0)` here would read *any* failure of this
-                // probe -- `SQLITE_BUSY` past the busy_timeout, an I/O error on a network mount --
-                // as "not migrated", and the branch it guards is destructive: the rebuild recreates
-                // `sessions` from a column list that omits `permission`, `capabilities_json`,
-                // `token_id`, `additional_roots_json`, `subagent_spec_json` and all eight `stat_*`
-                // counters, so running it against an already-migrated database silently empties them
-                // for every session. A probe that cannot answer must abort the open.
-                //
-                // Gated on `PRAGMA user_version` as well, and that is the belt to this brace. The
-                // `LIKE` is a heuristic over generated SQL text: it answers correctly today, but it
-                // is the kind of check that a later schema change quietly invalidates, and what it
-                // guards destroys data. A database this process has already taken through
-                // initialisation carries the stamp, so the probe -- and the branch under it -- is
-                // never consulted for it again. Databases predating the stamp still get the text
-                // probe, which is what they have.
-                let schema_version: i32 = connection
-                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-                    .unwrap_or(0);
-                let has_cascade: bool = schema_version >= SCHEMA_VERSION
-                    || connection.query_row(
-                        "SELECT COUNT(*) FROM sqlite_master \
-                         WHERE type = 'table' AND name = 'messages' \
-                           AND sql LIKE '%ON DELETE CASCADE%'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )? > 0;
-                if !has_cascade {
-                    // PRAGMA foreign_keys only takes effect outside any transaction. Toggle, run
-                    // rebuild, restore (even on failure) so the connection isn't left in a state
-                    // where FKs are silently off for subsequent queries.
-                    connection.execute_batch("PRAGMA foreign_keys = OFF")?;
-                    let migration_result = (|| -> rusqlite::Result<()> {
-                        let txn = connection.transaction()?;
-                        txn.execute_batch(
-                            "CREATE TABLE sessions_new (
-                                 id TEXT PRIMARY KEY,
-                                 created_at TEXT NOT NULL,
-                                 updated_at TEXT NOT NULL,
-                                 parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
-                                 cwd TEXT
-                             );
-                             INSERT INTO sessions_new(id, created_at, updated_at, parent_session_id, cwd)
-                                 SELECT id, created_at, updated_at, parent_session_id, cwd FROM sessions;
-                             DROP TABLE sessions;
-                             ALTER TABLE sessions_new RENAME TO sessions;
-                             CREATE INDEX idx_sessions_updated_at ON sessions(updated_at);
-                             CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
-
-                             CREATE TABLE messages_new (
-                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                                 role TEXT NOT NULL,
-                                 content TEXT NOT NULL,
-                                 created_at TEXT NOT NULL
-                             );
-                             INSERT INTO messages_new(id, session_id, role, content, created_at)
-                                 SELECT id, session_id, role, content, created_at FROM messages;
-                             DROP TABLE messages;
-                             ALTER TABLE messages_new RENAME TO messages;
-                             CREATE INDEX idx_messages_session_id ON messages(session_id);
-
-                             CREATE TABLE tool_outputs_new (
-                                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                                 name TEXT NOT NULL,
-                                 content TEXT NOT NULL,
-                                 created_at TEXT NOT NULL,
-                                 PRIMARY KEY (session_id, name)
-                             );
-                             INSERT INTO tool_outputs_new(session_id, name, content, created_at)
-                                 SELECT session_id, name, content, created_at FROM tool_outputs;
-                             DROP TABLE tool_outputs;
-                             ALTER TABLE tool_outputs_new RENAME TO tool_outputs;",
-                        )?;
-                        txn.commit()
-                    })();
-                    connection.execute_batch("PRAGMA foreign_keys = ON")?;
-                    migration_result?;
-                }
-
-                // Migration: add `sessions.permission` and `sessions.capabilities_json`. Both back
-                // the HTTP API's per-session permission / capability flags so a GC-evicted session
-                // can be re-attached with the same shape the client originally created it with.
-                // Legacy rows (REPL / ACP / pre-0.27 HTTP) get NULL, and the re-attach helper falls
-                // back to the process default. Runs after the cascade-FK rebuild because the
-                // rebuild's `sessions_new` schema doesn't include these columns; the ALTER ADD
-                // here applies to both fresh DBs (no-op) and rebuilt DBs alike.
-                let has_permission_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'permission'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_permission_col {
-                    connection
-                        .execute_batch("ALTER TABLE sessions ADD COLUMN permission TEXT")?;
-                }
-                let has_capabilities_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'capabilities_json'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_capabilities_col {
-                    connection.execute_batch(
-                        "ALTER TABLE sessions ADD COLUMN capabilities_json TEXT",
-                    )?;
-                }
-
-                // Migration: add `sessions.token_id` to attribute HTTP-created sessions back
-                // to their creating bearer token. NULL for legacy rows and for REPL/ACP
-                // sessions.
-                let has_token_id_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'token_id'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_token_id_col {
-                    connection.execute_batch("ALTER TABLE sessions ADD COLUMN token_id TEXT")?;
-                }
-
-                // Migration: add `sessions.additional_roots_json` so an ACP client's
-                // `additionalDirectories` survives a restart and `session/list` can report the
-                // workspace shape a session was last used with. NULL on legacy rows decodes to an
-                // empty list, i.e. single-root, which is what those sessions were.
-                //
-                // Runs after the cascade-FK rebuild for the same reason as the three migrations
-                // above: the rebuild's `sessions_new` schema lists only id/created_at/updated_at/
-                // parent_session_id/cwd, so it silently drops any column added before it. Adding
-                // this one next to the `cwd` migration looked natural and was wrong: on a pre-0.24
-                // database the column was created, then dropped by the rebuild, and every query
-                // naming it failed for the rest of that process's life.
-                let has_roots_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'additional_roots_json'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_roots_col {
-                    connection.execute_batch(
-                        "ALTER TABLE sessions ADD COLUMN additional_roots_json TEXT",
-                    )?;
-                }
-
-                // Migration: add `sessions.subagent_spec_json`, the terms a sub-agent was spawned
-                // under (see `crate::tools::subagent::SubagentSpec`). NULL on every non-sub-agent
-                // row and on sub-agent rows written before this column existed; `agent_followup`
-                // refuses those rather than guessing, because the alternative is rebuilding a
-                // worker from the parent's *current* permission and deny lists, which turns a
-                // follow-up into a privilege escalation.
-                //
-                // Placed after the cascade-FK rebuild, like the column migrations above: the
-                // rebuild's `sessions_new` lists only id/created_at/updated_at/parent_session_id/
-                // cwd and silently drops anything added before it.
-                let has_subagent_spec_col: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'subagent_spec_json'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_subagent_spec_col {
-                    connection.execute_batch(
-                        "ALTER TABLE sessions ADD COLUMN subagent_spec_json TEXT",
-                    )?;
-                }
-
-                // Migration: per-session cumulative stat columns (surfaced by `/status`) so the
-                // running totals survive resume instead of restarting at zero each process. Added as
-                // a set; the presence of `stat_turns` gates the whole batch.
-                // Checked and added per column rather than gating all eight on the presence of the
-                // first. `ALTER TABLE` statements are eight separate autocommits, so a failure or
-                // kill partway through (ENOSPC, `SQLITE_BUSY`, OOM) used to leave `stat_turns`
-                // present and the other seven missing -- and because the guard only tested
-                // `stat_turns`, no later run would ever add them. `session list` kept working while
-                // `session fork` and every stats write failed permanently with "no column named
-                // stat_input_tokens", with no recovery path short of hand-written SQL.
-                for column in STAT_COLUMNS {
-                    let present: bool = connection.query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
-                        [column],
-                        |row| row.get::<_, i64>(0),
-                    )? > 0;
-                    if !present {
-                        connection.execute_batch(&format!(
-                            "ALTER TABLE sessions ADD COLUMN {} INTEGER NOT NULL DEFAULT 0;",
-                            column
-                        ))?;
-                    }
-                }
-
-                // Scheduled wakeups (see `crate::schedule`). Created last, after the cascade-FK
-                // rebuild above, for the same reason the column migrations are: the rebuild does
-                // `DROP TABLE sessions` with enforcement off, and a table declared before it would
-                // have its FK target pulled out from under it mid-migration.
+                // Scheduled wakeups (see `crate::schedule`).
                 //
                 // `next_fire_at` is denormalised from `schedule` + `last_fired_at ?? created_at` so
                 // the due-job query is an index seek rather than a full scan plus a parse per row.
                 // `crate::schedule` owns keeping it consistent.
+                //
+                // `gate_permission` records the level a gate was authorised at. What withdraws a
+                // gate is the session's *live* level, which `crate::schedule` reads separately;
+                // this column earns its place by failing closed, since a
+                // hand-edited or unparseable value decodes as `Permission::None`
+                // and refuses the gate.
                 connection.execute_batch(
                     "CREATE TABLE IF NOT EXISTS scheduled_jobs (
                         id                TEXT PRIMARY KEY,
@@ -1092,25 +765,7 @@ impl SessionManager {
                         ON scheduled_jobs(session_id);",
                 )?;
 
-                // `gate_permission` records the level a gate was authorised at, so `prepare` can
-                // re-check it rather than trusting a decision the creating session has since walked
-                // back. Added by `ALTER` for databases whose `scheduled_jobs` predates it; a row
-                // written before this column reads back as `Permission::None` and its gate is
-                // refused, which is the safe direction.
-                let has_gate_permission: bool = connection.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('scheduled_jobs') \
-                     WHERE name = 'gate_permission'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )? > 0;
-                if !has_gate_permission {
-                    connection
-                        .execute_batch("ALTER TABLE scheduled_jobs ADD COLUMN gate_permission TEXT;")?;
-                }
-
-                // Background tool calls (see `crate::background`). Same placement rationale as
-                // `scheduled_jobs` above: declared after the cascade-FK rebuild so its FK target
-                // survives the migration.
+                // Background tool calls (see `crate::background`).
                 //
                 // `delivered_at` is what makes a finished task's outcome reach the conversation
                 // exactly once, including across a restart. `status = 'running'` rows are swept to
@@ -1136,16 +791,9 @@ impl SessionManager {
 
                 // The memory store (see `crate::memory::store`). Its DDL lives with the code that
                 // queries it, but runs here so the whole schema is created in one place, under one
-                // lock, with one completion stamp. No foreign key to `sessions`: a memory outlives
-                // every session and belongs to the meka instance, not to a conversation.
+                // lock. No foreign key to `sessions`: a memory outlives every session and belongs
+                // to the meka instance, not to a conversation.
                 crate::memory::store::create_tables(connection)?;
-
-                // Stamped last, so it means "everything above ran to completion". A kill partway
-                // through leaves the stamp unwritten and the next open re-runs the whole sequence,
-                // which is safe because every step is idempotent. What the stamp buys is the
-                // destructive cascade rebuild above: once set, that branch is never reached again
-                // on the strength of a `LIKE` over generated SQL.
-                connection.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
 
                 Ok(())
             })
@@ -1154,8 +802,7 @@ impl SessionManager {
     }
 
     /// Create a new session, optionally recording its working directory. `cwd` is persisted as an
-    /// absolute path string; pass `None` only for code paths that genuinely have no cwd context
-    /// (legacy/test fixtures, `meka tools list`).
+    /// absolute path string; pass `None` only for code paths that genuinely have no cwd context.
     ///
     /// Leaves the row unlocked, so a sweep can reach it before anyone claims it. Every host that
     /// creates a session a turn will run against wants [`Self::create_session_locked`] instead;
@@ -1334,8 +981,7 @@ impl SessionManager {
         Ok((session_id, lock))
     }
 
-    /// The recorded spawn terms for a sub-agent session, or `None` when the row has none (a
-    /// top-level session, or a sub-agent spawned before the column existed).
+    /// The recorded spawn terms for a sub-agent session, or `None` for a top-level session.
     pub async fn load_subagent_spec(&self, session_id: Uuid) -> Result<Option<String>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1617,9 +1263,11 @@ impl SessionManager {
             // `schema.lock` shares this directory and is not a session's. It survives the UUID
             // check below by accident -- "schema" does not parse as one -- and the accident is
             // worth not relying on: unlinking a file does not release a held `flock`, so a swept
-            // schema lock would let the next process create a different inode and both would enter
-            // the migration believing they held it. Named explicitly so a future lock called
-            // anything UUID-shaped does not quietly inherit the hazard.
+            // schema lock would let the next process create a different inode, and both would enter
+            // `memory::store`'s FTS-trigger reconciliation believing they held it, each deciding
+            // from a `sqlite_master` read the other is free to invalidate before the decision is
+            // acted on. Named explicitly so a future lock called anything UUID-shaped does not
+            // quietly inherit the hazard.
             if stem == SCHEMA_LOCK_STEM || stem.starts_with(PROVIDER_LOCK_PREFIX) {
                 continue;
             }
@@ -1662,10 +1310,6 @@ impl SessionManager {
     ///   `tool_results`).
     /// - `Event::CompactBoundary { … }` writes one row with the pseudo-role `compact_boundary` and
     ///   a JSON-serialized envelope in `content`.
-    ///
-    /// No schema migration: legacy databases (predating this commit) only contain `Event::Append`
-    /// rows; loading them via [`Self::load_events`] yields the same events the in-memory log
-    /// produced before.
     pub async fn save_event(
         &self,
         session_id: Uuid,
@@ -1851,10 +1495,11 @@ impl SessionManager {
             .map_err(|error| MekaError::Database(format!("failed to import sessions: {}", error)))
     }
 
-    /// Load every event for a session in chronological order. Legacy rows (role ∈ {`user`,
-    /// `assistant`, `tool_results`}) are reconstructed as `Event::Append`; rows with role
-    /// `compact_boundary` are deserialized from the JSON envelope. Unknown roles are skipped with a
-    /// warning.
+    /// Load every event for a session in chronological order. The `user`, `assistant`,
+    /// `tool_results` and `user_blocks` roles are what `encode_event_for_db` writes for an
+    /// `Event::Append`, so reading them back as `Event::Append` closes that round trip rather than
+    /// falling back to anything; `compact_boundary` and `repair` rows are deserialized from their
+    /// JSON envelope. Unknown roles are skipped with a warning.
     pub async fn load_events(&self, session_id: Uuid) -> Result<Vec<crate::conversation::Event>> {
         let stored = self.load_messages(session_id).await?;
         let mut events = Vec::with_capacity(stored.len());
@@ -2207,8 +1852,8 @@ impl SessionManager {
     /// e.g. via `meka session list --include-children`.
     ///
     /// `cwd_filter`, if `Some`, restricts the result set to sessions whose persisted `cwd` matches
-    /// the given path (rows with NULL `cwd` are excluded; legacy rows can't be filtered by cwd
-    /// they never recorded).
+    /// the given path. Rows with NULL `cwd` are excluded: a session created by
+    /// `create_session(None)` recorded no cwd to match against.
     ///
     /// `cursor`, if `Some`, is a previous `next_cursor` value from this method; rows are returned
     /// strictly *after* the cursor in `(updated_at, id) DESC` order. Returns `(rows, next_cursor)`;
@@ -3441,15 +3086,15 @@ pub fn strip_context_tags(text: &str) -> &str {
     }
 }
 
-/// Pseudo-role used in the `messages` table for `Event::CompactBoundary` rows. Coexists with the
-/// legacy `user`/`assistant`/`tool_results` roles without a schema migration.
+/// Pseudo-role written to the `messages` table's `role` column for `Event::CompactBoundary` rows,
+/// distinct from every role an `Event::Append` uses.
 const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
 
 /// Pseudo-role for a `Role::User` message that carries non-text blocks (input images). Its full
 /// `Vec<ContentBlock>` is stored as JSON, because flattening to `text_content()` (as the plain
 /// `user` role does) would silently drop the images. Text-only user turns stay plaintext under
-/// `user` so `list_sessions`'s raw-content preview subquery keeps working. Added without a schema
-/// migration, mirroring [`COMPACT_BOUNDARY_ROLE`].
+/// `user` so `list_sessions`'s raw-content preview subquery keeps working. A `role`-column
+/// pseudo-role, mirroring [`COMPACT_BOUNDARY_ROLE`].
 const USER_BLOCKS_ROLE: &str = "user_blocks";
 
 /// Pseudo-role for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_ROLE`]. The superseded
@@ -3522,7 +3167,10 @@ fn decode_event_from_row(
                 content,
             }))),
             Err(_) => {
-                // Legacy or malformed JSON: fall back to text.
+                // Deliberately softer than the `tool_results` and `user_blocks` arms below, which
+                // drop an unparseable row. Corruption here costs the turn's `tool_use` blocks, and
+                // dropping the row entirely would take the assistant's prose with them. Keeping the
+                // raw string as text leaves the transcript readable and the turn boundary intact.
                 Ok(Some(Event::Append(Message::assistant_text(&row.content))))
             }
         },
@@ -3586,8 +3234,8 @@ fn decode_list_cursor(token: &str) -> Result<(String, String)> {
 }
 
 /// Encode an additional-root list for the `additional_roots_json` column. `None` for the empty case
-/// keeps "no extra roots" as NULL, matching legacy rows, so the column has one representation for
-/// one meaning rather than NULL and `[]` both appearing.
+/// keeps "no extra roots" as NULL, so the column has one representation for one meaning rather than
+/// NULL and `[]` both appearing.
 fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String>> {
     if roots.is_empty() {
         return Ok(None);
@@ -3599,10 +3247,10 @@ fn encode_additional_roots(roots: &[PathBuf]) -> Result<Option<String>> {
 
 /// Decode the persisted `additional_roots_json` column into workspace roots.
 ///
-/// NULL (legacy rows, and every session that never carried extra roots) and unparseable JSON both
-/// yield an empty list. Failing soft is right here: a session whose root list can't be read is
-/// still perfectly usable as a single-root session, and refusing to load it would be a far worse
-/// outcome than silently narrowing its search scope.
+/// NULL (every session that never carried extra roots) and unparseable JSON both yield an empty
+/// list. Failing soft is right here: a session whose root list can't be read is still perfectly
+/// usable as a single-root session, and refusing to load it would be a far worse outcome than
+/// silently narrowing its search scope.
 fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
     json.and_then(|raw| serde_json::from_str::<Vec<PathBuf>>(raw).ok())
         .unwrap_or_default()
@@ -4141,8 +3789,8 @@ mod tests {
         );
     }
 
-    /// Legacy rows predate the column, and unparseable JSON shouldn't make a session unloadable:
-    /// both mean "single root", which is what those sessions always were.
+    /// Unparseable JSON must not make a session unloadable. Like NULL it means a single root, which
+    /// is what such a session is anyway.
     #[test]
     fn decode_additional_roots_fails_soft() {
         assert!(decode_additional_roots(None).is_empty());
@@ -4367,17 +4015,20 @@ mod tests {
         }
     }
 
-    /// Legacy databases (predating PR 2) only contain rows with the `user` / `assistant` /
-    /// `tool_results` roles, no `compact_boundary`. `load_events` must hydrate every legacy row as
-    /// an `Event::Append` so resume works without a schema migration.
+    /// The plain `user` and `assistant` roles are what `encode_event_for_db` writes for an
+    /// `Event::Append`, so `load_events` must hand every such row back as one: this is the primary
+    /// live path through the decoder, not a fallback.
     #[tokio::test]
-    async fn test_load_events_legacy_rows_as_append() {
+    async fn test_load_events_decodes_stored_append_rows() {
         use crate::conversation::Event;
 
         let manager = test_manager().await;
         let sid = manager.create_session(None).await.expect("create session");
 
-        // Simulate a pre-PR-2 session by writing rows the legacy way.
+        // Written by hand rather than through `save_event`, so what is under test is the decoder
+        // alone: nothing here would notice the encoder changing which role it writes.
+        // `test_user_input_image_round_trips_via_user_blocks_role` is the test that closes that
+        // loop.
         manager
             .save_message(sid, "user", "first")
             .await
@@ -5334,7 +4985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_preview_old_format_backward_compat() {
+    fn test_truncate_preview_untagged_multiline_takes_first_line() {
         let input = "[Environment context]\nWorking directory: /tmp\n\nfind all Rust files";
         assert_eq!(truncate_preview(input, 80), "[Environment context]");
     }
@@ -5633,14 +5284,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_sessions_preview_legacy_unwrapped_user_message() {
-        // Backward-compat: older sessions (or future non-wrapper message paths) whose user content
-        // has no `<context>` block at all; the stored string IS the prompt, and the preview equals
-        // it.
+    async fn test_list_sessions_preview_unwrapped_user_message() {
+        // The `<context>` block is added by `Agent::run_turn`, not by storage. A `user` row written
+        // by any other path carries none -- `import_sessions` replays whatever an archive held --
+        // and then the stored string IS the prompt, so the preview equals it.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
         manager
-            .save_message(session_id, "user", "legacy prompt without any wrapper")
+            .save_message(session_id, "user", "prompt without any wrapper")
             .await
             .expect("save_message");
 
@@ -5649,221 +5300,27 @@ mod tests {
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
-        assert_eq!(summary.preview, "legacy prompt without any wrapper");
-    }
-
-    // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id column, FKs without ON
-    // DELETE CASCADE, `metadata` still present) must succeed end-to-end with data preserved and the
-    // post-migration schema in place. Previously the initial `CREATE INDEX ... ON
-    // sessions(parent_session_id)` ran before the ADD COLUMN step and bombed with "no such column:
-    // parent_session_id".
-    #[tokio::test]
-    /// The stamp has to be written, and it has to make the destructive branch unreachable.
-    ///
-    /// The cascade rebuild recreates `sessions` from a five-column list, so running it against an
-    /// already-migrated database empties `permission`, `token_id` and all eight `stat_*` counters
-    /// for every session. Its only guard was a `LIKE` over generated SQL. This pins the second
-    /// guard: after one successful open the version says "done", and a database whose DDL text has
-    /// been altered out from under the probe is still left alone.
-    async fn an_initialised_database_is_never_rebuilt_a_second_time() {
-        use rusqlite::Connection as RusqliteConnection;
-
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_dir.path().join("meka.db");
-
-        let manager = SessionManager::open(Some(&db_path))
-            .await
-            .expect("first open");
-        let session = manager.create_session(None).await.expect("session");
-        manager
-            .update_session_permission(session, "write")
-            .await
-            .expect("set permission");
-        drop(manager);
-
-        {
-            let conn = RusqliteConnection::open(&db_path).expect("rusqlite open");
-            let stamped: i32 = conn
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .expect("read user_version");
-            assert_eq!(
-                stamped, SCHEMA_VERSION,
-                "a completed initialisation must stamp the version"
-            );
-
-            // Break the text probe the way a future schema edit would, leaving the stamp as the
-            // only thing standing between this database and the rebuild.
-            conn.execute_batch(
-                "PRAGMA writable_schema = ON;
-                 UPDATE sqlite_master
-                     SET sql = replace(sql, 'ON DELETE CASCADE', 'ON DELETE NO ACTION')
-                     WHERE type = 'table' AND name = 'messages';
-                 PRAGMA writable_schema = OFF;",
-            )
-            .expect("blunt the probe");
-        }
-
-        let manager = SessionManager::open(Some(&db_path))
-            .await
-            .expect("second open");
-        let summary = manager
-            .session_info(session)
-            .await
-            .expect("look up")
-            .expect("the session survived");
-        assert_eq!(
-            summary.permission.as_deref(),
-            Some("write"),
-            "the rebuild ran and dropped the columns it does not carry"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_migration_from_pre_0_24_schema() {
-        use rusqlite::Connection as RusqliteConnection;
-
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_dir.path().join("meka.db");
-        let session_id = Uuid::new_v4();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Stage a pre-0.24 schema with a session + message + tool_output.
-        {
-            let conn = RusqliteConnection::open(&db_path).expect("rusqlite open");
-            conn.execute_batch(
-                "CREATE TABLE sessions (
-                     id TEXT PRIMARY KEY,
-                     created_at TEXT NOT NULL,
-                     updated_at TEXT NOT NULL,
-                     metadata TEXT
-                 );
-                 CREATE TABLE messages (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     session_id TEXT NOT NULL,
-                     role TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     created_at TEXT NOT NULL,
-                     FOREIGN KEY (session_id) REFERENCES sessions(id)
-                 );
-                 CREATE INDEX idx_messages_session_id ON messages(session_id);
-                 CREATE TABLE tool_outputs (
-                     session_id TEXT NOT NULL,
-                     name TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     created_at TEXT NOT NULL,
-                     PRIMARY KEY (session_id, name),
-                     FOREIGN KEY (session_id) REFERENCES sessions(id)
-                 );",
-            )
-            .expect("stage pre-0.24 schema");
-            conn.execute(
-                "INSERT INTO sessions(id, created_at, updated_at, metadata) \
-                 VALUES (?1, ?2, ?2, NULL)",
-                rusqlite::params![session_id.to_string(), &now],
-            )
-            .expect("insert session");
-            conn.execute(
-                "INSERT INTO messages(session_id, role, content, created_at) \
-                 VALUES (?1, 'user', 'preserved', ?2)",
-                rusqlite::params![session_id.to_string(), &now],
-            )
-            .expect("insert message");
-            conn.execute(
-                "INSERT INTO tool_outputs(session_id, name, content, created_at) \
-                 VALUES (?1, 'scratch', 'body', ?2)",
-                rusqlite::params![session_id.to_string(), &now],
-            )
-            .expect("insert tool_output");
-        }
-
-        let manager = SessionManager::open(Some(&db_path))
-            .await
-            .expect("migration should succeed for pre-0.24 schema");
-
-        // Data preserved.
-        assert!(
-            manager.session_exists(session_id).await.expect("exists"),
-            "session row should survive migration"
-        );
-        let preserved = manager
-            .load_tool_output(session_id, "scratch")
-            .await
-            .expect("load tool_output");
-        assert_eq!(preserved.as_deref(), Some("body"));
-
-        // Schema reshaped to 0.24+ form.
-        let (has_metadata, has_parent, messages_cascade, tool_outputs_cascade): (
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = manager
-            .connection
-            .call(move |conn| -> rusqlite::Result<_> {
-                let has_metadata = conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='metadata'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                let has_parent = conn.query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info('sessions') \
-                     WHERE name='parent_session_id'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                let messages_cascade = conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master \
-                     WHERE type='table' AND name='messages' \
-                       AND sql LIKE '%ON DELETE CASCADE%'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                let tool_outputs_cascade = conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master \
-                     WHERE type='table' AND name='tool_outputs' \
-                       AND sql LIKE '%ON DELETE CASCADE%'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                Ok((
-                    has_metadata,
-                    has_parent,
-                    messages_cascade,
-                    tool_outputs_cascade,
-                ))
-            })
-            .await
-            .expect("schema introspection");
-
-        assert_eq!(has_metadata, 0, "metadata column should be dropped");
-        assert_eq!(has_parent, 1, "parent_session_id column should be added");
-        assert_eq!(
-            messages_cascade, 1,
-            "messages FK should carry ON DELETE CASCADE"
-        );
-        assert_eq!(
-            tool_outputs_cascade, 1,
-            "tool_outputs FK should carry ON DELETE CASCADE"
-        );
+        assert_eq!(summary.preview, "prompt without any wrapper");
     }
 
     #[tokio::test]
     async fn test_session_metadata_round_trips() {
         let manager = test_manager().await;
 
-        // Legacy path: `create_session` leaves permission + capabilities NULL so the re-attach
-        // helper falls back to the process default.
-        let legacy = manager
-            .create_session(Some(std::path::PathBuf::from("/tmp/legacy")))
+        // The NULL shape the REPL and ACP get from `create_session_locked(cwd, None, None, None)`:
+        // permission and capabilities unset, so the re-attach helper falls back to the process
+        // default.
+        let plain = manager
+            .create_session(Some(std::path::PathBuf::from("/tmp/plain")))
             .await
-            .expect("create legacy");
-        let legacy_info = manager
-            .session_info(legacy)
+            .expect("create plain");
+        let plain_info = manager
+            .session_info(plain)
             .await
             .expect("session_info")
-            .expect("legacy row");
-        assert_eq!(legacy_info.permission, None);
-        assert_eq!(legacy_info.capabilities_json, None);
+            .expect("plain row");
+        assert_eq!(plain_info.permission, None);
+        assert_eq!(plain_info.capabilities_json, None);
 
         // Metadata path: persisted permission + capabilities + token_id round-trip verbatim.
         let with_meta = manager
@@ -6015,16 +5472,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_sessions_cwd_filter_excludes_legacy_null_rows() {
-        // Sessions created via `create_session(None)` simulate legacy rows: they can't match any
-        // cwd filter (NULL is never equal to a TEXT value in SQL).
+    async fn test_list_sessions_cwd_filter_excludes_null_cwd_rows() {
+        // A session created by `create_session(None)` recorded no cwd, so it can never match a cwd
+        // filter: NULL is not equal to a TEXT value in SQL.
         let manager = test_manager().await;
         let cwd = PathBuf::from("/home/agent/proj");
         let with_cwd = manager
             .create_session(Some(cwd.clone()))
             .await
             .expect("create with cwd");
-        let _legacy = manager.create_session(None).await.expect("create legacy");
+        let _without_cwd = manager
+            .create_session(None)
+            .await
+            .expect("create without cwd");
 
         let (filtered, _) = manager
             .list_sessions(10, false, Some(&cwd), None)

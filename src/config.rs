@@ -282,9 +282,8 @@ pub struct ServeConfig {
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
     /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.
     ///
-    /// `"0s"` restores the older behaviour where a dropped stream cancels the turn immediately.
-    /// That spends fewer provider tokens on abandoned work, and makes re-attach useful only for
-    /// turns that already finished.
+    /// `"0s"` cancels the turn the moment the stream drops. That spends fewer provider tokens on
+    /// abandoned work, and makes re-attach useful only for turns that already finished.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub stream_reattach_grace: Option<std::time::Duration>,
     /// Bearer tokens configured for this deployment. An empty list means no caller can
@@ -905,8 +904,8 @@ pub struct DisplayConfig {
     /// `yellow`, …).
     pub input_style: Option<String>,
     /// When set to `Some(N)` with `N > 0`, resuming a session reprints the last `N` turns (user
-    /// prompts plus the agent's response, styled like the live REPL) instead of just the last
-    /// assistant message. Unset preserves the legacy behaviour.
+    /// prompts plus the agent's response, styled like the live REPL). Unset reprints only the last
+    /// assistant message.
     pub resume_show_recent: Option<usize>,
 }
 
@@ -1319,9 +1318,9 @@ pub struct ResolvedConfig {
     pub auto_compact: bool,
     pub compact_checkpoint: bool,
     pub context_window: Option<u64>,
-    /// Maximum sub-agent recursion depth. `1` matches the historical "root spawns, sub-agents
-    /// can't" behavior; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s
-    /// depth budget in `main.rs`.
+    /// Maximum sub-agent recursion depth. `1` lets the root agent spawn but denies its sub-agents
+    /// the same; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s depth
+    /// budget in `main.rs`.
     pub subagent_max_depth: usize,
     /// Whether the active profile's model accepts image input (the ACP `image` prompt capability).
     /// Resolved from `[providers.<name>].vision`, defaulting to `true`.
@@ -1391,7 +1390,6 @@ pub struct ResolvedConfig {
 /// Validated, defaults-filled view of [`ServeConfig`]. Constructed at config-load time by
 /// [`ResolvedServeConfig::resolve`].
 // Individual fields mirror [`ServeConfig`]; see its per-field documentation.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResolvedServeConfig {
     pub bind: String,
@@ -1406,7 +1404,7 @@ pub struct ResolvedServeConfig {
     /// How many SSE events per turn to retain for `Last-Event-ID` replay.
     pub stream_replay_events: usize,
     /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
-    /// reconnect. Zero means the previous behaviour: a dropped stream cancels the turn at once.
+    /// reconnect. Zero cancels the turn the moment the stream drops.
     pub stream_reattach_grace: std::time::Duration,
     pub tokens: Vec<ResolvedServeToken>,
     pub webhooks: Vec<ResolvedWebhook>,
@@ -1415,7 +1413,6 @@ pub struct ResolvedServeConfig {
 /// Validated token entry. The `token` field carries the final secret value with `${ENV}`
 /// substitution applied and `token_file` contents loaded; call sites compare against this
 /// directly via constant-time equality.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ResolvedServeToken {
     pub token: String,
@@ -1450,10 +1447,7 @@ pub enum TokenSource {
     /// `token = "${ENV_VAR}"` substituted at config-load time.
     EnvVar,
     /// `token_file = "/path/to/token"` read at config-load time.
-    File {
-        #[allow(dead_code)]
-        path: std::path::PathBuf,
-    },
+    File,
 }
 
 impl ResolvedServeConfig {
@@ -1573,7 +1567,7 @@ impl ResolvedServeToken {
                         format!("failed to read `token_file` {}: {}", path.display(), error)
                     })?;
                 warn_if_world_readable(&path);
-                (resolved, TokenSource::File { path })
+                (resolved, TokenSource::File)
             }
             (None, None) => {
                 return Err("[serve.tokens] entry must set either `token` or `token_file`".into());
@@ -3728,8 +3722,6 @@ type = "claude-subscription"
 
     #[test]
     fn test_persist_device_id_writes_into_profile_table() {
-        // Regression: device_id must land in `[providers.<name>].device_id`, not the dead singular
-        // `[provider]` table, under the named-profiles model.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -3750,11 +3742,6 @@ type = "claude-subscription"
             persisted,
             Some("abc123"),
             "device_id must be stored under the active profile"
-        );
-        // The legacy singular table must never be (re)created.
-        assert!(
-            !contents.contains("[provider]"),
-            "must not write the dead `[provider]` table: {contents}"
         );
         // Existing profile fields are preserved.
         assert_eq!(
@@ -3881,8 +3868,9 @@ redact_thinking = true
 
     #[test]
     fn test_unknown_config_keys_are_rejected() {
-        // `deny_unknown_fields`: a typo or a removed key errors at load instead of silently doing
-        // nothing. An unknown key inside a provider profile (here the removed `reasoning_effort`).
+        // `deny_unknown_fields`: an unrecognised key errors at load instead of silently doing
+        // nothing. An unknown key inside a provider profile (here `reasoning_effort`, which meka
+        // does not accept because the provider owns that default).
         let stale_profile = r#"
 [providers.work]
 type = "chatgpt-subscription"
@@ -4136,13 +4124,13 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
         assert!(subagents.disabled_tools.is_empty());
     }
 
-    /// `memory` was a config key during development and is deliberately not one: config withholds
-    /// capabilities, and the memory store is context a parent can copy into a prompt regardless.
-    /// A leftover key must be an error rather than silently ignored.
+    /// `[subagents]` deliberately has no `memory` key: config withholds capabilities, and the
+    /// memory store is context a parent can copy into a prompt regardless. Setting one must be an
+    /// error rather than silently ignored.
     #[test]
-    fn test_subagents_rejects_the_former_memory_key() {
+    fn test_subagents_has_no_memory_key() {
         let error = toml::from_str::<ConfigFile>("[subagents]\nmemory = \"none\"\n")
-            .expect_err("a removed key must not be silently ignored");
+            .expect_err("an unrecognised key must not be silently ignored");
         assert!(error.to_string().contains("memory"), "{error}");
     }
 
@@ -4511,12 +4499,13 @@ model = "m"
         assert!(resolved.provider_error.is_some(), "fixture has no profiles");
     }
 
-    /// Size-based cleanup is gone, not merely defaulted off. The key must be rejected outright so
-    /// a config that still sets it fails loudly rather than silently no-longer-pruning.
+    /// Session cleanup is driven by age alone, so `max_storage_bytes` is not a knob. It must be
+    /// rejected outright rather than parsed and ignored, which would leave a config that asks for
+    /// a size cap looking like it got one.
     #[test]
-    fn test_max_storage_bytes_is_rejected() {
+    fn test_size_based_cleanup_is_not_configurable() {
         let error = toml::from_str::<ConfigFile>("[session]\nmax_storage_bytes = 52428800\n")
-            .expect_err("the key must no longer parse");
+            .expect_err("the key must not parse");
         assert!(error.to_string().contains("max_storage_bytes"), "{error}");
     }
 
@@ -5566,7 +5555,7 @@ enabled = ["read", "write"]
     }
 
     /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,
-    /// including the prior internal alias `"bwrap"`, must be rejected; we don't want alias creep
+    /// including the obvious abbreviation `"bwrap"`, must be rejected; we don't want alias creep
     /// that would silently desync generated configs from hand-edited ones.
     #[test]
     fn test_sandbox_backend_deserializes_strict_values() {

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `openai-responses`, a backend for the OpenAI Responses API, authenticated with an API key.
 - `openai-responses` sends no encrypted-reasoning `include`; `chatgpt-subscription` still does.
 - `[providers.<name>].thinking` picks the wire encoding: `adaptive`, `budgeted`, or `off`.
+- `--provider` takes a `-p` shorthand, matching `-m` for `--model`.
+- `chatgpt-subscription` asks for a reasoning summary, so OpenAI thinking renders like Codex's.
 - Compaction runs a checkpoint turn first, so the agent saves what must outlast the summary.
 - `/compact <instructions>` says what to keep or drop, and reports the memories it wrote.
 - `context_check` and `context_compact` let the agent read its own headroom and ask to compact.
@@ -46,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** memories are rows in `MEKA_DATA_DIR`, not files under `MEKA_CONFIG_DIR`.
+- **Breaking:** memories are rows in the database under `MEKA_DATA_DIR`.
 - **Breaking:** a config-directory backup no longer captures memories; back up the data dir.
 - **Breaking:** `memory_search` takes `queries` (a list) instead of `pattern`, and drops regex.
 - **Breaking:** `GET /v1/memory` carries `recorded_at` and `tags`, drops `skipped`, 404s cleanly.
@@ -77,23 +79,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
 - An unknown or stale tool name now suggests the built-in it probably meant.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
-- Skills predating the Agent Skills format still load; a rewrite migrates them to it.
+- A skill's top-level `version` / `author` stay readable; a rewrite no longer moves them.
 - `--skill`, `meka skill get` and `skill show` read only the file they name, not the store.
 - Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
 - Log messages dropped redundant prefixes and Rust internals, and now name their provider backend.
 - Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
 - Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
 - Internal restructuring, no behaviour change: workspace, stores, CLI modules, turn recovery.
+- A thinking block records which provider its opaque half came from, so neither reaches the other.
+- `--thinking` names its modes in one short line; `--help` keeps the per-mode detail.
 
 ### Removed
 
+- **Breaking:** in-binary store migration; 0.41 -> 0.42 is a script shipped with the release.
+- **Breaking:** the read-time move of a skill's top-level `version` / `author` under `metadata`.
+- **Breaking:** a top-level `priority` is no longer a skill's rank; the release script moves it.
+- **Breaking:** reading a `tool_result` stored as a bare string; the release script converts it.
+- **Breaking:** reading a thinking block's bare `signature`; the release script converts it.
 - **Breaking:** `source_url` and `meka skill update`; clone the source into `[skills].extra_paths`.
-- **Breaking:** the file-backed memory store; memories are rows in the database under MEKA_DATA_DIR.
+- **Breaking:** the file-backed memory store under `MEKA_CONFIG_DIR`; the release script imports it.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
 - The MCP auth-probe cache: its only reader logged a verdict the connect path never acted on.
 
 ### Fixed
 
+- `chatgpt-subscription` discarded the encrypted reasoning it asked for; it is now replayed.
+- Resuming a `chatgpt-subscription` session under Claude replayed OpenAI's blob as a signature.
+- Reasoning was captured only when a summary came with it, losing it on every silent think.
+- A profile with no `effort` sent no `reasoning` block, so ChatGPT returned no encrypted reasoning.
+- Reasoning summary sections ran together; each part now starts a new paragraph.
 - A turn that could not read the memory store told the model every memory had been deleted.
 - A memory the per-turn diff could not restate was said to be in an index written before it existed.
 - The literal search tier's excerpt did not have to contain the term it said the text contained.
@@ -124,7 +138,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
 - **Breaking:** a stdio MCP server gets a curated environment; declare its secrets in `env`.
 - **Breaking:** ACP's sticky options read "Always allow any `<tool>`", matching their real scope.
-- Schema migration is serialised and gated on `user_version`, never rebuilt on a failed probe.
 - Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
 - Retention spares a session that owns a scheduled job, and its ancestors.
 - Every client, provider and MCP round trip is bounded in time and answers the turn's cancellation.

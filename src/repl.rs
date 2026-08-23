@@ -1992,10 +1992,7 @@ impl Frontend for ReplFrontend {
             // The indicator was committed by the hook above, which is the whole point of the
             // event; there is no block text to render.
             FrontendEvent::ThinkingEnded => {}
-            FrontendEvent::ThinkingBlock {
-                content,
-                signature: _,
-            } => {
+            FrontendEvent::ThinkingBlock { content } => {
                 Self::close_text_run(&mut state);
                 if state.spacing.before_thinking() {
                     eprintln!();
@@ -2825,7 +2822,6 @@ mod tests {
             (
                 E::ThinkingBlock {
                     content: "reasoning".to_string(),
-                    signature: None,
                 },
                 IndicatorAction::Erase,
             ),

@@ -3184,9 +3184,9 @@ async fn handle_list_sessions(
             ));
         }
     };
-    // Fallback cwd for legacy rows that predate the cwd column. The process cwd matches what the
-    // agent would use for relative-path resolution if the client picked one of these to load. That
-    // is better than refusing to surface them.
+    // Fallback for a row carrying no `cwd`, which `meka session import` produces when the archive
+    // omits it. The process cwd matches what the agent would use for relative-path resolution if
+    // the client picked one of these to load. That is better than refusing to surface them.
     let fallback_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let sessions = rows

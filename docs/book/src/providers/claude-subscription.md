@@ -57,6 +57,8 @@ Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, b
 
 Adds the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which sends it by default. With it on, the server withholds the readable chain of thought: `thinking` blocks come back with empty text plus a signature, and any `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn reasoning continuity is maintained. The practical effect is that live thinking output goes quiet for these models (there is no readable text to show), exactly as in Claude Code. Defaults to `true`; set `redact_thinking = false` to drop the beta and keep interleaved thinking visible.
 
+A stored block records that its signature is Claude's, so resuming the session under an OpenAI profile does not replay a Claude signature as encrypted reasoning. A session recorded by 0.41 holds its blocks under a shape that names no provider, and meka does not reshape them when it opens a session; the [one-shot upgrade script](../getting-started/upgrading.md) does. Until it runs, such a block keeps its readable text and loses its signature, so those turns are not replayed as verified reasoning.
+
 ### `device_id`
 
 Stable per-machine identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
@@ -129,7 +131,7 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `effort-2025-11-24` | Whenever `output_config.effort` is sent: effort-capable models by default (Claude 4.6+ and Opus 4.5), or any explicit `effort` override on any model |
 | `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
 
-meka does **not** send `context-1m-2025-08-07`: current Claude Code (2.1.219) does not send it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
+meka does **not** send `context-1m-2025-08-07`: Claude Code 2.1.219 does not send it because 1M is the default context window (no beta header) on the current large-context models (Opus 4.6+, Sonnet 4.6, Fable/Mythos 5). Earlier Claude Code (2.1.185) still sent it.
 
 ### System prompt
 

@@ -8,10 +8,10 @@
 //! casual mutation. The one exception is [`repair_invalid_images`], which runs on every
 //! materialization because a rebuild must not be able to reinstate content the provider refuses.
 //!
-//! On disk, events are stored row-per-event in the existing `messages` table (no schema migration);
-//! the encoding lives in `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers,
-//! behind the [`crate::session::SessionManager::save_event`] /
-//! [`crate::session::SessionManager::load_events`] API.
+//! On disk, events are stored row-per-event in the `messages` table; the encoding lives in
+//! `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
+//! [`crate::session::SessionManager::save_event`] / [`crate::session::SessionManager::load_events`]
+//! API.
 
 use std::collections::HashSet;
 
@@ -63,8 +63,7 @@ pub enum Event {
     },
 }
 
-/// Append-only conversation. Public API matches PR 1's `Vec<Message>`-backed implementation
-/// byte-for-byte; PR 2 swaps the internals to an event log.
+/// Append-only conversation: an event log, plus the materialized message view derived from it.
 #[derive(Debug, Default, Clone)]
 pub struct Conversation {
     events: Vec<Event>,
@@ -104,8 +103,11 @@ impl Conversation {
         log
     }
 
-    /// Hydrate from a flat `Vec<Message>`; every entry becomes an `Event::Append`. Used by the
-    /// resume path until the persistence layer is fully event-aware.
+    /// Hydrate from a flat `Vec<Message>`; every entry becomes an `Event::Append`. Test-only: every
+    /// hydration site in the tree goes through [`Self::from_events`], and a `Vec<Message>` cannot
+    /// express the boundary and repair events a real log carries, so a production caller would be
+    /// silently discarding them.
+    #[cfg(test)]
     pub fn from_vec(entries: Vec<Message>) -> Self {
         let events = entries.into_iter().map(Event::Append).collect();
         Self::from_events(events)

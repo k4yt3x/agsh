@@ -6,8 +6,9 @@
 //!
 //! The protocol itself lives in [`super::responses_wire`], shared with the API-key
 //! [`super::responses`] backend. What is particular to this one is the endpoint, the OAuth
-//! credential, the Codex client headers, and the `include` of encrypted reasoning content -- that
-//! last one stays here because this backend's endpoint is always ChatGPT.
+//! credential, the Codex client headers, and the two reasoning parameters Codex sends -- the
+//! `include` of encrypted reasoning content and the `reasoning.summary` that makes the reasoning
+//! visible. Those two stay here because this backend's endpoint is always ChatGPT.
 
 mod auth;
 
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use self::auth::{extract_account_id, extract_expiration_seconds};
 use super::responses_wire::{
     aggregate_stream, build_request_body, drive_responses_sse_stream, include_encrypted_reasoning,
+    request_reasoning_summary,
 };
 use crate::{
     error::{MekaError, Result},
@@ -140,7 +142,10 @@ impl ChatGptSubscriptionProvider {
             true,
         );
         // Safe here and only here: this backend's endpoint is always ChatGPT, and the first-party
-        // Codex client asks for the same thing so reasoning survives a stateless round trip.
+        // Codex client asks for the same two things -- a summary so the reasoning is visible, and
+        // the encrypted content so it survives a stateless round trip. Summary first: it settles
+        // the `reasoning` object the `include` keys off.
+        request_reasoning_summary(&mut body);
         include_encrypted_reasoning(&mut body);
         body
     }
@@ -810,6 +815,43 @@ mod tests {
             include
                 .iter()
                 .any(|value| value == "reasoning.encrypted_content"),
+            "{body}"
+        );
+    }
+
+    /// The summary is the only part of the reasoning a person ever sees. Without it the model
+    /// still thinks, the stream carries no summary deltas, and a long think renders as a hang.
+    #[test]
+    fn the_subscription_asks_chatgpt_to_summarise_its_reasoning() {
+        let body = test_provider().build_body("s", &[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
+    }
+
+    /// Both asks used to hinge on an effort being configured: with none, the shared body omits
+    /// `reasoning` entirely, so there was nothing for the `include` to attach to and the profile a
+    /// user gets by default asked ChatGPT for neither a summary nor encrypted reasoning. Codex
+    /// sends `reasoning` on every request and omits only the fields it has no value for.
+    #[test]
+    fn an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning() {
+        let unconfigured = ChatGptSubscriptionProvider::new(
+            test_credential(),
+            "gpt-5.6-sol".to_string(),
+            None,
+            None,
+            None,
+            None,
+            "test".to_string(),
+            None,
+            None,
+        )
+        .expect("provider");
+        let body = unconfigured.build_body("s", &[Message::user("hi")], &[]);
+
+        assert!(body["reasoning"].get("effort").is_none(), "{body}");
+        assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
             "{body}"
         );
     }

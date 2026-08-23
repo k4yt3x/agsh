@@ -10,7 +10,7 @@ These operational variables override config file values but are overridden by CL
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MEKA_PERMISSION` | Default permission mode | `none`, `read`, `write` |
+| `MEKA_PERMISSION` | Default permission mode | `none`, `read`, `ask`, `write` |
 | `MEKA_INSTRUCTIONS` | Standing instructions as a string, overriding the `instructions.md` file. Equivalent to `--instructions`. Used by the `mekabox` container wrapper, which mounts the config directory read-only and so cannot supply a file. | `Be terse.` |
 | `MEKA_INSTRUCTIONS_FILE` | Standing instructions read from this path (a file, or a directory of `*.md`). For a file you did not choose the location of, such as a Kubernetes ConfigMap. Conflicts with `MEKA_INSTRUCTIONS`. | `/run/secrets/meka-instructions` |
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. Must be absolute; an empty or relative value is ignored with a warning rather than loading `./config.toml` from wherever meka happened to start. | `/tmp/meka-test/meka` |

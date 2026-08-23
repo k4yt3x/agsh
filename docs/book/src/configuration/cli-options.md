@@ -103,12 +103,13 @@ meka --permission ask
 
 Default: `read`.
 
-### `--provider <NAME>`
+### `-p`, `--provider <NAME>`
 
 Select which configured provider profile to use for this run. Takes the name of a profile from
 `[providers.<name>]`, overriding `default_provider` in the config file.
 
 ```bash
+meka -p work
 meka --provider work
 ```
 
@@ -119,7 +120,7 @@ The value is a profile name (e.g. `work`, `personal`), not a backend type. List 
 Override the active profile's model for this run.
 
 ```bash
-meka -m gpt-4o-mini
+meka -m gpt-5.6-sol
 ```
 
 ### `--base-url <URL>`
