@@ -2740,9 +2740,7 @@ mod workspace_shell_boundary {
         if !matches!(detected, crate::sandbox::SandboxCapability::Unavailable) {
             backends.push(detected);
         }
-        if let Some(bwrap_path) = which_bwrap() {
-            backends.push(crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path });
-        }
+        backends.extend(a_backend_detect_does_not_name());
         // Skip rather than fail where no backend exists: this asserts what confinement does, and a
         // host without one has nothing to assert against. Loud, so it cannot silently never run.
         if backends.is_empty() {
@@ -2756,16 +2754,32 @@ mod workspace_shell_boundary {
         }
     }
 
-    /// `bwrap` on `PATH`, for deciding whether the Bubblewrap leg can run here.
+    /// A backend production would choose that [`crate::sandbox::detect`] does not name.
     ///
-    /// Deliberately not `sandbox::bwrap_on_path`, which now demands a root-owned binary: this only
-    /// answers "can this test spawn it", and a developer with a local build in `~/.local/bin`
-    /// should still get the leg run rather than silently skipped.
-    fn which_bwrap() -> Option<std::path::PathBuf> {
+    /// Linux only. `detect()` there consults `probe_landlock` alone, so it never returns
+    /// `Bubblewrap`, while production resolves through `resolve_sandbox_backend`, which
+    /// auto-prefers Bubblewrap whenever `bwrap` probes OK.
+    ///
+    /// Split behind a `cfg` rather than pushed inline because `SandboxCapability::Bubblewrap` is
+    /// itself `cfg(target_os = "linux")`: this module is `cfg(all(test, unix))`, so naming the
+    /// variant unconditionally compiled here and failed the macOS build with `E0599`, which no
+    /// amount of local Linux testing could have shown.
+    #[cfg(target_os = "linux")]
+    fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
+        // Deliberately not `sandbox::bwrap_on_path`, which demands a root-owned binary: this only
+        // answers "can this test spawn it", and a developer with a local build in `~/.local/bin`
+        // should still get the leg run rather than silently skipped.
         let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
+        let bwrap_path = std::env::split_paths(&path)
             .map(|dir| dir.join("bwrap"))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| candidate.is_file())?;
+        Some(crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path })
+    }
+
+    /// macOS has one read-mode backend and `detect()` names it, so there is nothing to add.
+    #[cfg(not(target_os = "linux"))]
+    fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
+        None
     }
 
     /// One backend's worth of the boundary check above.

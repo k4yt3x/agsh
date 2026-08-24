@@ -87,6 +87,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 await_holding_lock = "deny"
 expect_used = "warn"
 panic = "warn"
+result_large_err = "allow"
 unwrap_used = "warn"
 
 [profile.release]

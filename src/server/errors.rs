@@ -50,8 +50,8 @@ pub struct ProblemDetail {
     /// serialized into the body; call sites also pass the same value into the `retry_after`
     /// body extension via `.with(...)` for clients that only parse JSON.
     #[serde(skip)]
-    #[schema(value_type = Option<u64>)]
-    pub retry_after_seconds: Option<u64>,
+    #[schema(value_type = Option<u32>)]
+    pub retry_after_seconds: Option<u32>,
 }
 
 impl ProblemDetail {
@@ -88,7 +88,7 @@ impl ProblemDetail {
     /// added as the `retry_after` extension via `.with(...)` so clients reading just the JSON
     /// body can see it; most callers should use [`Self::with_retry_after`] which sets both.
     #[must_use]
-    pub fn retry_after(mut self, seconds: u64) -> Self {
+    pub fn retry_after(mut self, seconds: u32) -> Self {
         self.retry_after_seconds = Some(seconds);
         self
     }
@@ -97,7 +97,7 @@ impl ProblemDetail {
     /// extension. Always use this on 429 responses: calling only one of the two halves is
     /// a wire-shape bug clients can hit silently.
     #[must_use]
-    pub fn with_retry_after(self, seconds: u64) -> Self {
+    pub fn with_retry_after(self, seconds: u32) -> Self {
         self.with("retry_after", Value::from(seconds))
             .retry_after(seconds)
     }

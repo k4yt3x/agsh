@@ -13,10 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `workspace` permission: writes confined to the workspace roots, reads still unrestricted.
 - `--writable-root <PATH>` adds a directory to the workspace, repeatable; no config key.
-- Windows confines the shell at `workspace` with a restricted token plus a per-root write ACE.
-- `[shell].sandbox = false` refuses `execute_command` at any confining level, not unconfines it.
+- Windows confines the shell at `workspace` with a restricted token and ACEs released on exit.
 - A workspace root at or above a masked directory (`/tmp`, `/run`) is refused with a warning.
-- Windows workspace ACEs are shared process-wide and released on exit, Ctrl+C included.
 - Memory search is ranked and tiered: several phrasings at once, word endings, typos, CJK.
 - Memories take tags, a stamped `recorded` date, and render priority-0 bodies in full each turn.
 - `meka memory export`, `edit`, `verify` and `add --tag` manage the store by hand.
@@ -43,11 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** ACP `additionalDirectories` and `--writable-root` are writable at `workspace`.
 - **Breaking:** `ask` runs the shell unsandboxed and unscrubbed: writes anywhere, full environment.
 - **Breaking:** a gate needs `unrestricted`; `workspace` used to authorise one and no longer does.
+- **Breaking:** `[shell].sandbox = false` now refuses the shell rather than unconfining it.
+- **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
 - **Breaking:** `every = "..."` fires on its own grid; jobs that silently ran slow now run on time.
 - **Breaking:** memories are rows in the database under `MEKA_DATA_DIR`, not files in the config.
 - **Breaking:** a config-directory backup no longer captures memories; back up the data dir.
 - **Breaking:** `memory_search` takes `queries` (a list) instead of `pattern`, and drops regex.
 - **Breaking:** `GET /v1/memory` carries `recorded_at` and `tags`, drops `skipped`, 404s cleanly.
+- **Breaking:** a written `SKILL.md` conforms to the Agent Skills spec: `name`, then `metadata`.
+- **Breaking:** a skill name must follow the spec and match its directory, or it is skipped.
+- **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
+- **Breaking:** `meka skill add` swaps `--version` and `--author` for a repeatable `--metadata`.
+- **Breaking:** `meka skill add --from-file` needs the `name` the spec makes mandatory.
+- **Breaking:** `meka skill get` and `list` change columns; `get` prints every `metadata` key.
 - **Breaking:** `claude-api` → `anthropic-messages`, `claude-oauth` → `claude-subscription`.
 - **Breaking:** `openai-api` → `openai-chat-completions`, `openai-codex` → `chatgpt-subscription`.
 - **Breaking:** HTTP `GET /v1/providers` reports the new backend names in each profile's `type`.
@@ -57,13 +63,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** unset `effort` sends no tier, so the provider's own default applies.
 - **Breaking:** an unset context window is 1000000, not a guess from the model name.
 - **Breaking:** `claude-subscription` matches Claude Code 2.1.241; unset `effort` now sends `high`.
-- **Breaking:** a written `SKILL.md` conforms to the Agent Skills spec: `name`, then `metadata`.
-- **Breaking:** a skill name must follow the spec and match its directory, or it is skipped.
-- **Breaking:** the `skill` tool is now `skill_read`; config entries naming `skill` go stale.
-- **Breaking:** `meka skill add` swaps `--version` and `--author` for a repeatable `--metadata`.
-- **Breaking:** `meka skill add --from-file` needs the `name` the spec makes mandatory.
-- **Breaking:** `meka skill get` and `list` change columns; `get` prints every `metadata` key.
-- **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
 - **Breaking:** a stdio MCP server gets a curated environment; declare its secrets in `env`.
 - **Breaking:** deleting a session another meka process has open is refused, not silently done.
 - **Breaking:** ACP's sticky options read "Always allow any `<tool>`", matching their real scope.
@@ -71,26 +70,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
 - `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
 - `agent_followup` never widens a recorded grant, even when the parent has moved sideways since.
-- `[display].input_style` applies on submit; text keeps the terminal's own colours while typing.
-- Every built-in tool indicator is PascalCase; whole families used to render as raw snake_case.
 - `memory_write` and `skill_write` keep a stored description when the call omits it.
 - Memory has no discovery cap and no per-turn walk; the index is one indexed query over FTS5.
-- CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
-- Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
-- An unknown or stale tool name now suggests the built-in it probably meant.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
+- An unknown or stale tool name now suggests the built-in it probably meant.
+- `[display].input_style` applies on submit; text keeps the terminal's own colours while typing.
+- Every built-in tool indicator is PascalCase; whole families used to render as raw snake_case.
+- Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
+- CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
 - Building meka needs Rust 1.95, declared in `Cargo.toml` so an older toolchain is refused by name.
 - Upgrade `rmcp` to 3.1, reedline to 0.50, `base64` to 0.23, `infer` to 0.22, `termimad` to 0.35.
 
 ### Removed
 
 - **Breaking:** in-binary store migration; 0.41 -> 0.42 is a script shipped with the release.
-- **Breaking:** the file-backed memory store under `MEKA_CONFIG_DIR`; the script imports it.
 - **Breaking:** `source_url` and `meka skill update`; clone the source into `[skills].extra_paths`.
 - **Breaking:** the read-time move of a skill's top-level `version` / `author` under `metadata`.
 - **Breaking:** a top-level `priority` is no longer a skill's rank; the release script moves it.
 - **Breaking:** reading a bare-string `tool_result` or bare `signature`; the script converts both.
 - The model-metadata subsystem: the models-API probe, its cache table, and the window table.
+
+### Fixed
+
+- Under bubblewrap a `read` command whose cwd was masked silently ran in `$HOME` instead.
+- Landlock allows writing `/dev/null`, so `cmd 2>/dev/null` no longer fails on that backend.
+- The bubblewrap probe could strand a `bwrap` if meka died before the sandbox armed its own guard.
+- A failed Windows replace could delete the target and the replacement; the content is now rescued.
+- A Windows write replaced the target's ACL with the directory's; `ReplaceFileW` now keeps it.
+- Windows writes past `MAX_PATH` keep working: the Win32 call re-adds the prefix meka strips.
+- `~\path` is expanded on Windows; it was treated as a literal directory named `~`.
+- `/cd` on Windows stored a `\\?\` path, which then reached the prompt, the model and the DB.
+- Windows dropped an environment variable whose *value* was not valid UTF-8 from the sandbox.
+- Two files whose names differ outside UTF-8 shared one temp file, splicing a write into the other.
+- A non-UTF-8 path slipped past the hidden-file skip and read as missing to the search tools.
+- `find_files` left a trailing `\` on a Windows root, so the glob's separator handling decided.
+- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
+- Store files and roots are created private, and a rewrite no longer re-modes a file or its target.
+- `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
+- Store writes release their lock before `$EDITOR`; `$VISUAL` and editor arguments are honoured.
+- `scratchpad_save_file` refuses to replace a file without `force`, and records its write.
+- `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
+- Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
+- A listed skill can always be deleted. `con`, `two words` and `my:skill` had no way out but `rm`.
+- `meka skill add --force` deleted the skill before writing, losing it if the write never happened.
+- A skill rewrite alphabetised or re-nested frontmatter keys meka does not model.
+- A skill's description and `compatibility` are stored verbatim, not sanitised into the only copy.
+- A `SKILL.md` whose closing `---` ends the file was reported as having no frontmatter.
+- Priority-0 memories could reach no part of the context while the index claimed they were listed.
+- A memory directory left by the file store read as an empty store; it now says what to run.
+- A memory whose name meka would not write, including one over 64 characters, was unreachable.
+- A turn that could not read the memory store told the model every memory had been deleted.
+- `memory_search` was case-sensitive, stopped at 100 matches mid-walk, and mismeasured near misses.
+- `memory_read` had no size bound, and said nothing for a memory that has only a description.
+- Memory text reached the model unsanitised; only descriptions were filtered before.
+- A memory's age was its edit time, and a future date read as "today" while sorting first.
+- The per-turn memory index was read on every turn even with `[memory] enabled = false`.
+- The per-turn diff listed every changed memory by name, unbounded; a bulk change is now counted.
+- The `[Memory]` index told the model to call `memory_write` or `memory_search` when disabled.
+- `chatgpt-subscription` discarded the encrypted reasoning it asked for; it is now replayed.
+- Resuming a `chatgpt-subscription` session under Claude replayed OpenAI's blob as a signature.
+- Reasoning was captured only when a summary came with it, losing it on every silent think.
+- Reasoning summary sections ran together; each part now starts a new paragraph.
+- `/status` shows the context window from turn zero, so a configured window is verifiable up front.
+- `[session].context_messages` applies every round; a tool loop cannot carry the window past it.
+- Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
+- `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
+- `load_tool` promised a schema "on your next turn" even when every name failed to resolve.
+- Shift+Tab stacked a new prompt line once a turn had scrolled the prompt to the screen bottom.
+- An unreadable persisted permission was read as the process default, silently; it now warns.
+- `[permissions].enabled` naming no usable mode fell back to a *wider* default set than written.
+- ACP mode ids parse the way `--permission` does and echo back one of `availableModes`.
+- ACP `session/close` and `session/cancel` no longer deadlock or strand an `fs/*` round trip.
+- Two hosts on one database both fired every job; an occurrence is now claimed atomically.
+- A deferred job's restore overwrote another host's claim, so an occurrence came due twice.
+- A database hiccup during a sweep dropped an occurrence and skipped every other job due that tick.
+- A one-shot job was destroyed when its gate timed out or failed to spawn, having answered nothing.
+- A cancelled or retired job left its held-back state behind for the life of a `meka serve`.
+- A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
+- An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
+- `cron` parses the documented five fields, and a job whose next fire is years out is kept.
+- A session is locked before its row exists, so nothing can sweep or interleave one mid-creation.
+- `meka session fork` and `export` copied a conversation mid-turn, producing an unusable session.
+- The retention sweep and `session delete --all` skip sessions in use, and say how many.
+- Retention spares a session that owns a scheduled job, and its ancestors.
+- The lock-file sweep unlinked locks live processes held, letting two attach to one session.
+- A first launch racing another for a fresh database could die converting to WAL; it retries.
+- `meka serve` evicted a session with a background task running, then swept its own live task.
+- `agent_followup` is refused while another process is running a turn on the same sub-agent.
+- Webhook log lines redacted only the path, leaking a `?token=` query or `user:pass@` userinfo.
+- A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
+- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
+- HTTP store writes run off the runtime, so a held store lock cannot stall every other request.
+- `meka mcp add` held the config lock across the browser login, hanging every other meka launch.
+- MCP servers are closed on exit on every surface, and the close is bounded so it cannot hang exit.
+- Every provider, client and MCP round trip is bounded and cancellable; a stall cannot park a turn.
+- Shutdown drains in-flight turns, scheduled fires and background tasks instead of abandoning them.
+- Blocking work moved off the async runtime, where it stalled other sessions under `meka serve`.
+- Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
+- A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
+- OAuth callbacks decode `+` as a space, matching the form encoding the redirect actually uses.
+- A base URL's trailing slash or version segment no longer reaches the wire doubled.
 
 ### Security
 
@@ -108,96 +187,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A command-output capture is created at `0600` and swept after a day.
 - `utoipa-swagger-ui` is vendored, so a build no longer downloads an unpinned, unverified zip.
 - `event-listener` and `memmap2` move to patched releases, and the audit ignore list is gone.
+- RUSTSEC-2026-0258: `h2` moves to 0.4.19, past an unbounded empty-DATA-frame denial of service.
 - **Known limitation:** a Windows `workspace` command can read meka's memory, credentials included.
-
-### Fixed
-
-- Priority-0 memories could reach no part of the context while the index claimed they were listed.
-- A memory directory left by the file store read as an empty store; it now says what to run.
-- Under bubblewrap a `read` command whose cwd was masked silently ran in `$HOME` instead.
-- Shift+Tab stacked a new prompt line once a turn had scrolled the prompt to the screen bottom.
-- Landlock allows writing `/dev/null`, so `cmd 2>/dev/null` no longer fails on that backend.
-- The bubblewrap probe could strand a `bwrap` if meka died before the sandbox armed its own guard.
-- A failed Windows replace could delete the target and the replacement; the content is now rescued.
-- A Windows write replaced the target's ACL with the directory's; `ReplaceFileW` now keeps it.
-- Windows writes past `MAX_PATH` keep working: the Win32 call re-adds the prefix meka strips.
-- `~\path` is expanded on Windows; it was treated as a literal directory named `~`.
-- `/cd` on Windows stored a `\\?\` path, which then reached the prompt, the model and the DB.
-- Windows dropped an environment variable whose *value* was not valid UTF-8 from the sandbox.
-- Two files whose names differ outside UTF-8 shared one temp file, splicing a write into the other.
-- A directory whose name is not valid UTF-8 slipped past the hidden-file and `target` skip.
-- `search_contents` and `find_files` mishandled a non-UTF-8 root, reporting it as missing or empty.
-- `find_files` left a trailing `\` on a Windows root, so the glob's separator handling decided.
-- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
-- Store files and roots are created private, and a rewrite no longer re-modes a file or its target.
-- `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
-- Store writes release their lock before `$EDITOR`; `$VISUAL` and editor arguments are honoured.
-- `scratchpad_save_file` refuses to replace a file without `force`, and records its write.
-- `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
-- Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
-- A listed skill can always be deleted. `con`, `two words` and `my:skill` had no way out but `rm`.
-- `meka skill add --force` deleted the skill before writing, losing it if the write never happened.
-- A skill rewrite alphabetised or re-nested frontmatter keys meka does not model.
-- A skill's description and `compatibility` are stored verbatim, not sanitised into the only copy.
-- A `SKILL.md` whose closing `---` ends the file was reported as having no frontmatter.
-- A memory name over 64 characters could not be read, removed or exported by anything meka ships.
-- A memory whose name meka would not write could not be read or deleted through any door at all.
-- A turn that could not read the memory store told the model every memory had been deleted.
-- `memory_search` was case-sensitive, stopped at 100 matches mid-walk, and mismeasured near misses.
-- `memory_read` had no size bound, and said nothing for a memory that has only a description.
-- Memory text reached the model unsanitised; only descriptions were filtered before.
-- A memory's rendered age was its edit time, so a priority change made an old note "today".
-- A memory dated in the future rendered as "today", sorting first in its band while saying nothing.
-- The per-turn memory index was read on every turn even with `[memory] enabled = false`.
-- The per-turn diff listed every changed memory by name, unbounded; a bulk change is now counted.
-- The `[Memory]` index told the model to call `memory_write` or `memory_search` when disabled.
-- `chatgpt-subscription` discarded the encrypted reasoning it asked for; it is now replayed.
-- Resuming a `chatgpt-subscription` session under Claude replayed OpenAI's blob as a signature.
-- Reasoning was captured only when a summary came with it, losing it on every silent think.
-- Reasoning summary sections ran together; each part now starts a new paragraph.
-- `/status` shows the context window from turn zero, so a configured window is verifiable up front.
-- `[session].context_messages` applies every round; a tool loop cannot carry the window past it.
-- Unparseable tool arguments and truncated streams are rejected and retried, not committed as done.
-- `--no-stream` shows the model's reply; the blocking path rendered nothing but tool indicators.
-- `load_tool` promised a schema "on your next turn" even when every name failed to resolve.
-- An unreadable persisted permission was read as the process default, silently; it now warns.
-- `[permissions].enabled` naming no usable mode fell back to a *wider* default set than written.
-- ACP `session/set_mode` echoed the client's raw mode id, matching none of `availableModes`.
-- ACP mode ids parse the way `--permission` does, so `Read` and `w` name the modes they read as.
-- ACP `session/close` and `session/cancel` no longer deadlock or strand an `fs/*` round trip.
-- Two hosts on one database both fired every job; an occurrence is now claimed atomically.
-- A deferred job's restore overwrote another host's claim, so an occurrence came due twice.
-- A database hiccup during a sweep dropped an occurrence and skipped every other job due that tick.
-- A one-shot job was destroyed when its gate timed out or failed to spawn, having answered nothing.
-- A cancelled or retired job left its held-back state behind for the life of a `meka serve`.
-- A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
-- An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
-- `cron` parses the documented five fields, and a job whose next fire is years out is kept.
-- A new session was unlocked for its first turn, so a second meka attached and interleaved it.
-- A sub-agent's session was locked by nothing, so a concurrent sweep could delete it mid-run.
-- Forking committed the copy before locking it, so a sweep in the gap produced an empty session.
-- `meka session fork` and `export` copied a conversation mid-turn, producing an unusable session.
-- `session delete --all` destroyed a session another meka was creating; the lock now precedes it.
-- The retention sweep and `session delete --all` skip sessions in use, and say how many.
-- Retention spares a session that owns a scheduled job, and its ancestors.
-- The lock-file sweep unlinked locks live processes held, letting two attach to one session.
-- A first launch racing another for a fresh database could die converting to WAL; it retries.
-- `meka serve` evicted a session with a background task running, then swept its own live task.
-- `agent_followup` is refused while another process is running a turn on the same sub-agent.
-- Webhook log lines redacted only the path, leaking a `?token=` query or `user:pass@` userinfo.
-- A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
-- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
-- HTTP store writes run off the runtime, so a held store lock cannot stall every other request.
-- `meka mcp add` held the config lock across the browser login, hanging every other meka launch.
-- MCP servers are closed on exit on every surface, and the close is bounded so it cannot hang exit.
-- Every client, provider and MCP round trip is bounded in time and answers the turn's cancellation.
-- A stalled provider, token endpoint or MCP server no longer parks a turn for the process's life.
-- Shutdown drains in-flight turns, scheduled fires and background tasks instead of abandoning them.
-- Blocking work moved off the async runtime, where it stalled other sessions under `meka serve`.
-- Ctrl-C is one process-wide listener that escalates; the third press drains before it exits.
-- A panic in a GC, scheduler, outcome or prune loop is logged and the next tick runs.
-- OAuth callbacks decode `+` as a space, matching the form encoding the redirect actually uses.
-- A base URL's trailing slash or version segment no longer reaches the wire doubled.
 
 ## [0.41.0] - 2026-08-13
 

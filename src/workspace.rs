@@ -677,15 +677,22 @@ mod tests {
             "precondition: Windows canonicalize returns a verbatim path, got {}",
             canonical.display()
         );
+        // The as-spelled form is derived from `canonical`, never from `temp.path()`. The two differ
+        // by more than the prefix wherever `TEMP` resolves through an 8.3 short name, which is
+        // exactly what the GitHub Windows runner does: `canonicalize` expands `RUNNER~1` to
+        // `runneradmin`, so comparing against the raw handle failed on a difference this test is
+        // not about.
+        let as_spelled = strip_verbatim(canonical.clone());
+
         // The rebuild must preserve every component, not merely drop the prefix.
         assert_eq!(
             strip_verbatim(canonical.join("a").join("b")),
-            temp.path().join("a").join("b")
+            as_spelled.join("a").join("b")
         );
 
         let roots = writable_roots(&shared(temp.path()), &test_roots());
         assert!(
-            is_within_roots(&temp.path().join("f.txt"), &roots),
+            is_within_roots(&as_spelled.join("f.txt"), &roots),
             "an as-spelled path inside the root must be admitted: roots {roots:?}"
         );
         assert!(
