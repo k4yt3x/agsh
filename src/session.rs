@@ -2378,7 +2378,7 @@ impl SessionManager {
 
     /// Update the persisted capabilities JSON blob for a session. Symmetric counterpart to
     /// [`Self::update_session_permission`]. The blob's internal shape isn't validated here; the
-    /// HTTP handler is the only writer and serialises a `SessionCapabilities` value.
+    /// blob is expected to be a serialised `SessionCapabilities` value; nothing writes it yet.
     #[allow(
         dead_code,
         reason = "wired for future PATCH support; capability flips are rare"
@@ -5359,7 +5359,7 @@ mod tests {
 
         // `update_session_permission` flips the persisted value.
         let updated = manager
-            .update_session_permission(with_meta.id, "write")
+            .update_session_permission(with_meta.id, "workspace")
             .await
             .expect("update permission");
         assert_eq!(updated, 1);
@@ -5368,7 +5368,7 @@ mod tests {
             .await
             .expect("session_info")
             .expect("post-flip row");
-        assert_eq!(after_flip.permission.as_deref(), Some("write"));
+        assert_eq!(after_flip.permission.as_deref(), Some("workspace"));
     }
 
     // Child-session tests: parent→sub-agent linkage, cascade-on-delete, and `meka session list`

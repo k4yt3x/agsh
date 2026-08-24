@@ -15,7 +15,7 @@ Skills are normally authored by you. An agent can also be allowed to write its o
 - On every prompt, meka discovers all valid skills and lists them in the per-turn context with their `description`.
 - The agent invokes a skill by calling the `skill_read` tool with the skill name. The tool returns the full body, which the agent follows.
 - `skill_search` greps the full text of every installed skill, for when the one-line descriptions are not enough to tell which skill covers something.
-- Skills are available in **read**, **ask**, and **write** permission modes (not in **none**).
+- Skills are available in **read**, **workspace**, **ask** and **unrestricted** modes (not in **none**).
 - The whole subsystem can be switched off with `[skills] enabled = false`, which keeps the skill tools' schemas out of every request and stops the skills section from rendering.
 
 ## File Format

@@ -1795,9 +1795,8 @@ impl Tool for WriteFileTool {
             Err(error) => {
                 return Ok(ToolOutput::text(
                     format!(
-                        "Error: '{}' exists but its current contents could not be read ({}), so \
-                         meka cannot tell whether it changed since you last read it. Overwriting \
-                         it blind could discard someone else's edit. Pass force to write anyway.",
+                        "Error: '{}' exists but could not be read ({}), so meka cannot tell \
+                         whether it changed since you read it. Pass force to overwrite.",
                         path, error
                     ),
                     true,

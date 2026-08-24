@@ -309,14 +309,11 @@ impl Tool for AgentSpawnTool {
                     "permission": {
                         "type": "string",
                         "enum": ["none", "read", "workspace", "ask", "unrestricted"],
-                        "description": "Permission level for the sub-agent, bounded by your own: \
-                                        the worker never gets more reach than you have. Defaults \
-                                        to your current level. Use a lower level (e.g. \"read\") \
-                                        to sandbox untrusted or risky work. Note that \
-                                        \"workspace\" and \"ask\" do not contain each other, so \
-                                        asking for one while you are at the other gives the worker \
-                                        \"read\" -- the most both of you vouch for. The result is \
-                                        reported back to you."
+                        "description": "Permission level for the sub-agent, never above your \
+                                        own. Defaults to your current level; use a lower one \
+                                        (e.g. \"read\") to sandbox risky work. \"workspace\" and \
+                                        \"ask\" do not contain each other, so asking for one from \
+                                        the other yields \"read\"."
                     },
                     "memory": {
                         "type": "string",

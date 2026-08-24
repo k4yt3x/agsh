@@ -86,6 +86,8 @@ thinking = "budgeted"   # only if the endpoint rejects the adaptive form
 - `x-api-key: <api_key>`
 - `anthropic-version: 2023-06-01`
 - `content-type: application/json`
+- `accept: application/json`
+- `anthropic-beta: interleaved-thinking-2025-05-14`, whenever thinking is on (the default)
 
 **System prompt:** Sent as a top-level `system` string.
 

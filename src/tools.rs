@@ -434,12 +434,6 @@ fn is_destructive(name: &str) -> bool {
     name.ends_with("_delete") || name.ends_with("_cancel") || name.ends_with("_remove")
 }
 
-/// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
-/// over the registry is not worth optimising away.
-///
-/// Shared with `memory_search`, whose last-resort tier is the same idea applied to memory names
-/// and descriptions instead of tool names: when full-text matching finds nothing, the query was
-/// probably misspelled rather than absent.
 /// Counts entries into [`edit_distance`], so a test can assert the *matrix* was skipped rather than
 /// that the candidate was visited.
 ///
@@ -452,6 +446,12 @@ fn is_destructive(name: &str) -> bool {
 pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Levenshtein distance in chars, two-row. Only ever runs on an error path, so the quadratic cost
+/// over the registry is not worth optimising away.
+///
+/// Shared with `memory_search`, whose last-resort tier is the same idea applied to memory names
+/// and descriptions instead of tool names: when full-text matching finds nothing, the query was
+/// probably misspelled rather than absent.
 pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     #[cfg(test)]
     EDIT_DISTANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

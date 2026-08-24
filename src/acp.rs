@@ -13,11 +13,11 @@
 //!   reasons. `session/request_permission` handles `ask`-mode tool approvals; per-session sticky
 //!   always/never sets short-circuit subsequent requests. A running `execute_command` pushes its
 //!   output into the open tool call as it arrives, throttled by [`LIVE_OUTPUT_INTERVAL`].
-//! - **Commands + modes**: built-in local commands (`/status`, `/mcp`) and installed skills surface
-//!   as `available_commands_update` palette entries. Local commands render text and end the turn
-//!   with no model call; skills resolve `/<skill-name> [extra]` prompts to the rendered skill body
-//!   before the turn. `Permission` levels map 1:1 to ACP `SessionMode` ids, advertised on every
-//!   session-creation response and mutated live via `session/set_mode`.
+//! - **Commands + modes**: built-in local commands (`/status`, `/mcp`, `/usage`) and installed
+//!   skills surface as `available_commands_update` palette entries. Local commands render text and
+//!   end the turn with no model call; skills resolve `/<skill-name> [extra]` prompts to the
+//!   rendered skill body before the turn. `Permission` levels map 1:1 to ACP `SessionMode` ids,
+//!   advertised on every session-creation response and mutated live via `session/set_mode`.
 //! - **Delegation**: `read_file` / `write_file` / `edit_file` route through the client's
 //!   `fs/read_text_file` and `fs/write_text_file` when the matching capability is offered, falling
 //!   back to local syscalls otherwise. `execute_command` is deliberately never delegated: meka owns
@@ -1620,11 +1620,10 @@ fn mode_id_for(permission: Permission) -> SessionModeId {
 /// Parse a `SessionModeId` (treated as a `&str`) into the matching `Permission`. Returns `None` for
 /// any unrecognised mode id, which the caller turns into an error response.
 ///
-/// Delegates to [`Permission`]'s [`std::str::FromStr`] rather than keeping its own table. The two
-/// were previously hand-maintained copies that had to stay in lock-step, which is precisely the
-/// shape that lets a retired spelling survive in one of them: the mechanical half of this rename
-/// left `"write"` mapping to the *top* rung here, silently granting a client the whole filesystem
-/// when it asked for a mode that no longer exists. One table cannot drift from itself.
+/// Delegates to [`Permission`]'s [`std::str::FromStr`] rather than keeping its own table. A second
+/// hand-maintained copy is the shape that grants a client a mode it did not ask for: the two have
+/// to stay in lock-step, and when they drift it is an id silently mapping to the wrong rung. One
+/// table cannot drift from itself.
 fn parse_mode_id(id: &str) -> Option<Permission> {
     id.parse().ok()
 }
@@ -4566,24 +4565,20 @@ mod tests {
         );
     }
 
-    /// A client sending the retired id gets an error response, not the top rung.
-    ///
-    /// This is the exact bug the mechanical half of the rename left behind: `"write"` still mapped
-    /// to `Unrestricted` here after the enum variant was renamed, so an editor asking for a mode
-    /// that no longer exists would have been handed the whole filesystem.
-    #[test]
-    fn parse_mode_id_refuses_the_retired_write_id() {
-        assert!(parse_mode_id("write").is_none());
-    }
-
+    /// An id naming no mode is refused, rather than resolving to some rung the client did not ask
+    /// for.
     #[test]
     fn test_parse_mode_id_rejects_garbage() {
         // Case-insensitive since the parser became shared with `--permission`, where `Read` and
         // `read` have always meant the same thing. Nothing is granted by it: every id still has to
         // name a real mode, and `session/set_mode` separately refuses one outside the enabled set.
         assert_eq!(parse_mode_id("READ"), Some(Permission::Read));
-        assert!(parse_mode_id("admin").is_none());
-        assert!(parse_mode_id("").is_none());
+        for unknown in ["admin", "write", "elevated", ""] {
+            assert!(
+                parse_mode_id(unknown).is_none(),
+                "'{unknown}' names no mode and must not resolve"
+            );
+        }
     }
 
     #[test]

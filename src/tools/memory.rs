@@ -99,10 +99,9 @@ impl Tool for MemoryWriteTool {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Lowercase labels ([a-z0-9-], at most 10), e.g. ['infra', \
-                                        'deploy']. They are indexed as words, so memory_search \
-                                        finds them and the memory index summarises them; there is \
-                                        no separate tag filter. Omit to leave an existing memory's \
-                                        tags untouched; pass [] to clear them"
+                                        'deploy']. Indexed as words, so memory_search finds them. \
+                                        Omit to leave an existing memory's tags untouched; pass \
+                                        [] to clear them"
                     },
                     "body": {
                         "type": "string",
@@ -692,13 +691,10 @@ impl Tool for MemorySearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "memory_search".to_string(),
-            description: "Search every saved memory, including memories too old or low-priority \
-                to appear in your index. Results are ranked by how well they match, how important \
-                the memory is, and how often you have read it, and each carries enough detail to \
-                act on without a follow-up read. Pass several phrasings of the same question in \
-                `queries` -- they are searched together, so \"terse\", \"brevity\" and \
-                \"verbosity\" in one call will find a memory that used any of them. Matching is \
-                case-insensitive and handles word endings, so \"preference\" finds \"prefers\"."
+            description: "Search every saved memory, including ones too old or low-priority to \
+                appear in your index. Pass several phrasings in `queries`; they are searched \
+                together, so \"terse\", \"brevity\" and \"verbosity\" in one call all find the \
+                same memory. Matching is case-insensitive and handles word endings."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -780,7 +776,8 @@ impl Tool for MemorySearchTool {
         if terms.is_empty() {
             return Err(MekaError::ToolExecution {
                 tool_name: "memory_search".to_string(),
-                message: "'queries' contained no searchable words".to_string(),
+                message: "'queries' contained no searchable words; try different wording"
+                    .to_string(),
             });
         }
 

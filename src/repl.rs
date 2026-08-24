@@ -70,7 +70,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "permission",
         aliases: &[],
         help: "Show or set the permission level",
-        arg_hint: "[none|read|ask|write]",
+        arg_hint: "[none|read|workspace|ask|unrestricted]",
     },
     CommandSpec {
         name: "compact",
@@ -1371,7 +1371,7 @@ pub fn run_repl(
                 break;
             }
             // A host command we have no handler for. Both bindings that produce one are ours
-            // (`ExecuteHostCommand` for Shift+Tab, handled above), so reaching here means someone
+            // Nothing in meka binds `ExecuteHostCommand`, so reaching here means someone
             // added a third and forgot the arm. Ignore it rather than ending the session: dropping
             // a keystroke is a smaller surprise than the REPL quitting under the user.
             Ok(Signal::HostCommand(command)) => {

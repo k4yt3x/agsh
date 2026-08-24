@@ -94,8 +94,9 @@ pub enum SessionAction {
         /// Maximum number of sessions to show
         #[arg(short = 'n', long, default_value = "20")]
         limit: u32,
-        /// Include sub-agent sessions (children of a parent session) in the listing. Hidden by
-        /// default to keep the view focused on user-initiated conversations.
+        /// Include sub-agent sessions in the listing
+        ///
+        /// Hidden by default, so the view stays on conversations you started.
         #[arg(long)]
         include_children: bool,
     },
@@ -198,7 +199,7 @@ pub enum ProviderAction {
     Add {
         /// Profile name (e.g. `work`, `personal`).
         name: String,
-        /// Backend type: the wire protocol to speak.
+        /// Backend type: the wire protocol
         ///
         /// One of: anthropic-messages, chatgpt-subscription,
         /// claude-subscription, openai-chat-completions, openai-responses.
@@ -207,10 +208,12 @@ pub enum ProviderAction {
         /// Model name.
         #[arg(long)]
         model: Option<String>,
-        /// API base URL, for any endpoint serving the chosen protocol.
+        /// API base URL
+        ///
+        /// Any endpoint serving the chosen protocol.
         #[arg(long = "base-url")]
         base_url: Option<String>,
-        /// Extended thinking mode: adaptive, budgeted, or off
+        /// Thinking mode: adaptive, budgeted, off
         ///
         /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
         /// ignore it. Defaults to adaptive.
@@ -222,15 +225,15 @@ pub enum ProviderAction {
         /// window so compaction fires at the right point; meka never infers or probes for it.
         #[arg(long = "context-window")]
         context_window: Option<u64>,
-        /// Reasoning effort to send (e.g. low, medium, high, xhigh)
+        /// Reasoning effort (e.g. low, high)
         ///
         /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
         /// applies its own default.
         #[arg(long)]
         effort: Option<String>,
-        /// Read the API key from stdin (API backends only).
+        /// Read the API key from stdin
         ///
-        /// Non-interactive alternative to the key prompt.
+        /// Non-interactive alternative to the key prompt. API backends only.
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
     },
@@ -329,8 +332,6 @@ pub enum ScheduleAction {
     },
 }
 
-/// Inspect and curate the agent's durable notes. The agent maintains these itself through the
-/// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
 #[derive(clap::Subcommand, Debug)]
 pub enum InstructionsAction {
     /// Print the resolved instructions and where they came from
@@ -346,6 +347,8 @@ pub enum InstructionsAction {
     Path,
 }
 
+/// Inspect and curate the agent's durable notes. The agent maintains these itself through the
+/// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
 #[derive(clap::Subcommand, Debug)]
 pub enum MemoryAction {
     /// List saved memories and the priority distribution
@@ -910,25 +913,19 @@ mod tests {
         assert_eq!(cli.permission, Some(Permission::Unrestricted));
     }
 
-    /// The retired `write` must fail *loudly* at the CLI rather than resolve to either replacement.
+    /// A mode meka does not have must fail *loudly* at the CLI rather than resolve to anything.
     ///
-    /// This is the surface where a stale invocation is most likely to be automated, and a hard
-    /// exit is the good outcome there: a nonzero status stops a script, where a silently different
-    /// mode would let it run on with authority nobody chose. The message has to name both
-    /// replacements, because which one the user wants is not something meka can infer.
+    /// This is the surface where an invocation is most likely to be automated, and a hard exit is
+    /// the good outcome there: a nonzero status stops a script, where quietly picking a mode would
+    /// let it run on with authority nobody chose.
     #[test]
-    fn permission_flag_refuses_the_retired_write_mode() {
-        let error = Cli::try_parse_from(["meka", "--permission", "write"])
-            .expect_err("'write' must not parse to any mode");
+    fn permission_flag_refuses_a_mode_it_does_not_have() {
+        let error = Cli::try_parse_from(["meka", "--permission", "elevated"])
+            .expect_err("an unknown mode must not parse");
         let rendered = error.to_string();
-        // See the sibling in `src/permission.rs`: the two mode names also appear in the generic
-        // parse error, so only `was split` distinguishes the retired-mode arm from its deletion.
-        assert!(
-            rendered.contains("was split"),
-            "clap must surface the teaching message, not a bare invalid-value: {rendered}"
-        );
-        assert!(rendered.contains("workspace"), "{rendered}");
-        assert!(rendered.contains("unrestricted"), "{rendered}");
+        for mode in ["none", "read", "workspace", "ask", "unrestricted"] {
+            assert!(rendered.contains(mode), "clap must list {mode}: {rendered}");
+        }
     }
 
     #[test]

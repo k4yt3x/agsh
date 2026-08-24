@@ -190,11 +190,9 @@ impl Tool for SkillSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "skill_search".to_string(),
-            description: "Search the full text of every installed skill by regex. Use when the \
-                one-line descriptions in your skill index are not enough to tell which skill \
-                covers something, or when the index says skills are not shown. Searches bodies as \
-                well as frontmatter, so this finds skills whose description does not mention the \
-                term you are looking for."
+            description: "Search the full text of every installed skill by regex. Searches bodies \
+                as well as frontmatter, so it finds skills whose one-line description does not \
+                mention the term, and skills the index did not list."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -279,13 +277,10 @@ impl Tool for SkillWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "skill_write".to_string(),
-            description: "Create or update a skill: a reusable procedure written down so a later \
-                session, or a sub-agent, can follow it without being told again. Writing to a name \
-                that already exists updates it, so this is also how you refine one: omit body and \
-                whatever the skill already documented is kept. Prefer a skill over a memory when \
-                the content is a *method* rather than a fact, and especially when you would want \
-                to hand it to a sub-agent, since `agent_spawn` can run a skill by name without \
-                routing its text through your own context."
+            description: "Create or update a skill: a reusable procedure a later session or \
+                sub-agent can follow without being told again. Writing to an existing name \
+                updates it; omit `body` to keep what it already documents. Prefer a skill over a \
+                memory for a *method* rather than a fact, especially one to hand to `agent_spawn`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -550,10 +545,8 @@ impl Tool for SkillDeleteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "skill_delete".to_string(),
-            description: "Delete a skill permanently, including any files bundled alongside it. \
-                Use when a procedure you wrote down has turned out to be wrong or no longer \
-                applies. To revise a skill rather than drop it, call skill_write with the same \
-                name instead."
+            description: "Delete a skill permanently, including any files bundled with it. To \
+                revise one instead, call skill_write with the same name."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

@@ -467,7 +467,6 @@ async fn commit_idempotency(
 /// The `allow` matches the rest of this module's validation helpers: `ProblemDetail` is a large
 /// struct by design (RFC 9457 members plus an extensions map) and boxing it here alone would make
 /// the error type inconsistent with every other handler.
-#[allow(clippy::result_large_err)]
 fn decode_turn_images(
     images: &[ImageInput],
     vision: bool,
@@ -503,7 +502,6 @@ fn decode_turn_images(
 ///
 /// All validation failures map to 422 `invalid-body` so the status code is consistent with the
 /// body-parse error path and matches the spec's error-catalogue table for `invalid-body`.
-#[allow(clippy::result_large_err)]
 fn idempotency_header(headers: &HeaderMap) -> Result<Option<String>, ProblemDetail> {
     let Some(value) = headers.get("idempotency-key") else {
         return Ok(None);
@@ -1761,7 +1759,6 @@ pub async fn stream_turn(
     Ok(response)
 }
 
-#[allow(clippy::result_large_err)]
 fn no_stream_to_join(id: Uuid) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,

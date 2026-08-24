@@ -80,10 +80,10 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
 pub(crate) fn yaml_scalar(text: &str) -> String {
     // The leading set is every YAML indicator character, `[`, `{`, `]`, `}` and `,` included. They
     // were missing, and a description beginning `[` produced a file with an unterminated flow
-    // sequence: `meka memory export` reported success, and the importer then refused that one file
-    // and moved on, so a backup silently lost a memory. `null`, `true`, `~` and anything numeric
-    // are quoted for the adjacent reason -- unquoted they come back as a type rather than a
-    // string, so meka and every real YAML tool disagree about the same file.
+    // sequence: `meka memory export` reported success, and reading it back then refused that one
+    // file and moved on, so a backup silently lost a memory. `null`, `true`, `~` and anything
+    // numeric are quoted for the adjacent reason -- unquoted they come back as a type rather
+    // than a string, so meka and every real YAML tool disagree about the same file.
     let looks_typed = matches!(
         text.to_ascii_lowercase().as_str(),
         "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
@@ -106,6 +106,16 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
     }
 }
 
+/// Serialises tests that set `$EDITOR` / `$VISUAL`, which are process-global.
+///
+/// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
+/// never need to be held together. Exists because `meka memory edit` had no test at all until its
+/// scratch-file handling destroyed a user's edit twice.
+/// `unix` as well as `test`: every test that takes it drives a real `$EDITOR` through a shell
+/// script, so all three are `#[cfg(unix)]` and the lock has nobody to serialise elsewhere.
+#[cfg(all(test, unix))]
+pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Build the command that opens `path` in the user's editor, or `None` when neither `$VISUAL` nor
 /// `$EDITOR` is set to anything.
 ///
@@ -124,16 +134,6 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
 ///
 /// `$VISUAL` first, matching the convention: it names the full-screen editor, and `$EDITOR` is the
 /// line-mode fallback for a terminal that cannot run one.
-/// Serialises tests that set `$EDITOR` / `$VISUAL`, which are process-global.
-///
-/// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
-/// never need to be held together. Exists because `meka memory edit` had no test at all until its
-/// scratch-file handling destroyed a user's edit twice.
-/// `unix` as well as `test`: every test that takes it drives a real `$EDITOR` through a shell
-/// script, so all three are `#[cfg(unix)]` and the lock has nobody to serialise elsewhere.
-#[cfg(all(test, unix))]
-pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 pub(crate) fn editor_command(path: &std::path::Path) -> Option<std::process::Command> {
     let configured = ["VISUAL", "EDITOR"]
         .into_iter()

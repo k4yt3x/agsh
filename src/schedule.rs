@@ -160,14 +160,6 @@ impl Schedule {
         !matches!(self, Self::At(_))
     }
 
-    /// The first occurrence strictly after `anchor`, or `None` when there is no next occurrence
-    /// (a one-shot whose instant has passed, or a cron pattern matching no upcoming date).
-    ///
-    /// Callers must pass the job's own anchor -- `last_fired_at` if it has ever fired, otherwise
-    /// `created_at` -- and never `Utc::now()`. Anchoring on the current time makes a pinned pattern
-    /// such as `30 14 27 2 *` skip to next year whenever the process happens to restart after its
-    /// window; anchoring permanently on `created_at` makes a long-lived job replay every occurrence
-    /// since it was created.
     /// The occurrence to schedule after delivering the one at `delivered`, given the clock is now
     /// `now`.
     ///
@@ -221,6 +213,14 @@ impl Schedule {
         }
     }
 
+    /// The first occurrence strictly after `anchor`, or `None` when there is no next occurrence
+    /// (a one-shot whose instant has passed, or a cron pattern matching no upcoming date).
+    ///
+    /// Callers must pass the job's own anchor -- `last_fired_at` if it has ever fired, otherwise
+    /// `created_at` -- and never `Utc::now()`. Anchoring on the current time makes a pinned pattern
+    /// such as `30 14 27 2 *` skip to next year whenever the process happens to restart after its
+    /// window; anchoring permanently on `created_at` makes a long-lived job replay every occurrence
+    /// since it was created.
     pub fn next_after(&self, anchor: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Self::At(instant) => (*instant > anchor).then_some(*instant),
@@ -1058,7 +1058,8 @@ async fn prepare(
         //
         // Checking only the recorded value was a tautology: `schedule_create` and the HTTP handler
         // each demand `Unrestricted` before writing the row, and nothing ever updates the column,
-        // so `recorded == Write` for every job that exists. The comparison could not fail,
+        // so the recorded value is `unrestricted` for every job that exists. The comparison
+        // could not fail,
         // and the case it was written for -- the session cycles down to `read`, or a
         // `meka serve --permission read` restarts and inherits the row -- went unnoticed. The live
         // level is what makes the withdrawal real; the recorded one still matters because a
@@ -1739,11 +1740,9 @@ impl ScheduledJobRow {
                 // costs one re-creation; failing open costs the guarantee.
                 //
                 // Through `parse_recorded_permission` like the five session-row readers, so the
-                // *unreadable* case is heard rather than folded into the absent one. This was the
-                // last permission column decoding silently, and it is the one guaranteed to hit an
-                // upgrade: every pre-0.42 database records `gate_permission = 'write'`, which is
-                // retired. Without the warning the only clue is a later message saying the gate was
-                // authorised at `none` -- naming a level the job was never created at.
+                // *unreadable* case is heard rather than folded into the absent one. Without the
+                // warning the only clue is a later message saying the gate was authorised at
+                // `none` -- naming a level the job was never created at.
                 permission: crate::permission::parse_recorded_permission(
                     self.gate_permission.as_deref(),
                     &format_args!("the gate on job {}", self.id),
@@ -2701,11 +2700,11 @@ mod tests {
     /// The sibling below hand-sets `gate.permission` to `Read`, which no creation path can produce
     /// -- both `schedule_create` and the HTTP handler demand `Unrestricted` before writing the row,
     /// and nothing updates the column afterwards. So that test proved the mechanism worked on
-    /// an input reality never supplies, and the check it guarded was `Write == Write` for every
-    /// real job.
+    /// an input reality never supplies, and the check it guarded compared `unrestricted` with
+    /// itself for every real job.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_gate_is_not_executed_once_the_host_drops_below_write() {
+    async fn a_gate_is_not_executed_once_the_host_drops_below_unrestricted() {
         let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&marker);
 
@@ -3088,7 +3087,7 @@ mod tests {
 
     /// An unreadable `gate_permission` decodes to the level that authorises nothing.
     ///
-    /// This is the arm every pre-0.42 database hits, because those rows record the retired `write`.
+    /// This is the arm a row holding a value this build does not resolve hits.
     /// It fails *closed* -- `Permission::None` authorises no gate -- and nothing asserted it, so
     /// changing the fallback to `Unrestricted` left the suite green while every upgraded database
     /// silently regained unattended arbitrary shell. The fixtures all plant valid values, which is
@@ -3111,9 +3110,11 @@ mod tests {
             next_fire_at: Utc::now().to_rfc3339(),
         };
 
-        // The retired spelling every pre-0.42 row carries.
-        let retired = row(Some("write")).decode().expect("the row still decodes");
-        let gate = retired
+        // A value no build of meka resolves.
+        let unreadable = row(Some("elevated"))
+            .decode()
+            .expect("the row still decodes");
+        let gate = unreadable
             .gate
             .expect("the gate survives; only its level is unreadable");
         assert_eq!(gate.permission, crate::permission::Permission::None);

@@ -689,7 +689,7 @@ fn normalize_spacing(text: &str, starts_inside_fence: bool) -> String {
 
 /// Holds the expensive-to-load syntect assets, a `SyntaxSet` (~1 MB bincode blob) and a dark
 /// `Theme`, so subsequent highlighting calls can reuse them without paying the decode cost each
-/// time. Session-resume reprint and live streaming both call `highlight_markdown_line` per line;
+/// time. Session-resume reprint and live streaming both highlight per line;
 /// initializing assets once per process turns that cost from ~50 ms/call into <1 ms/call.
 struct Highlighter {
     syntax_set: SyntaxSet,
@@ -1272,7 +1272,7 @@ fn tail_columns(text: &str, max_columns: usize) -> String {
 /// own text rather than the model's: built-ins come from [`tool_display_name`] and an MCP name is
 /// normalised at registration. This bound exists for the remaining case, a hallucinated name, which
 /// is unvalidated at render time and otherwise unbounded. No genuine name approaches it: built-ins
-/// stop near 14 columns and `mcp__exa__web_search_exa` is 24.
+/// stop at 22 columns and `mcp__exa__web_search_exa` is 24.
 const TOOL_NAME_MAX_WIDTH: usize = 64;
 
 /// Below this many columns for the argument there is nothing worth showing, so the indicator drops

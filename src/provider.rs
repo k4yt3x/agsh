@@ -988,8 +988,8 @@ pub enum StreamEvent {
 }
 
 /// Severity hint for a provider-emitted [`Notice`]. Frontends can map these to per-level styling
-/// (a dim hint for `Info`, a warn-colored line for `Warn`). Today only `Info` is used by the
-/// image-redaction path; `Warn` is reserved for future provider-side recoverable conditions.
+/// (a dim hint for `Info`, a warn-colored line for `Warn`). `Info` carries the image-redaction
+/// notice; `Warn` carries recoverable conditions the user should see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,
@@ -1012,7 +1012,6 @@ impl Notice {
         }
     }
 
-    #[allow(dead_code)]
     pub fn warn(text: impl Into<String>) -> Self {
         Self {
             level: NoticeLevel::Warn,
@@ -1027,7 +1026,6 @@ impl Notice {
 pub(crate) const INVALID_TOOL_ARGS_MARKER: &str = "_meka_invalid_arguments";
 
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

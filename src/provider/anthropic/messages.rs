@@ -100,8 +100,8 @@ impl AnthropicMessagesProvider {
         // No `context-1m-2025-08-07`: on the direct Messages API, 1M context is the *default* for
         // the current large-context models (Opus 4.6+, Sonnet 4.6, Fable 5) with no beta header,
         // so the 1M window is already what the request gets. See
-        // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. (claude-subscription
-        // still sends it, mirroring Claude Code's captured wire.)
+        // <https://platform.claude.com/docs/en/build-with-claude/context-windows>. The
+        // claude-subscription path does not send it either; see `compute_betas` there.
         if parts.is_empty() {
             None
         } else {

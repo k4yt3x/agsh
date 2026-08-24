@@ -51,7 +51,7 @@ Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, m
 
 ### `thinking`
 
-`adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens), which pre-4.6 models require; `off` sends no thinking field. Betas and `temperature` follow whether thinking is on at all, not which encoding it uses.
+`adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens), which pre-4.6 models require; `off` sends no thinking field. `temperature` follows whether thinking is on at all, not which encoding it uses. The betas do not: they are gated on the model alone.
 
 ### `redact_thinking`
 
@@ -183,7 +183,7 @@ Only `claude-subscription` does this. `anthropic-messages` still omits `effort` 
 
 ### Cache control
 
-The most recent message's last content block, the last tool definition, and the user system prompt all carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire.
+The most recent message's last content block and the user system prompt carry `cache_control: {type: "ephemeral", ttl: "1h"}`. The 1h TTL is what an OAuth subscriber's Claude Code turn carries on the wire.
 
 Caching is prefix-based: the system prompt precedes the tools array, which precedes the messages, so a byte changing early invalidates everything after it. meka is built so that nothing which changes mid-session sits in that prefix.
 
@@ -197,4 +197,4 @@ You can see the effect directly: `/status` reports the cache hit ratio, and read
 
 ### Streaming
 
-Server-Sent Events with the same event taxonomy as [`anthropic-messages`](./anthropic-messages.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a single `[redacted]` block plus a signature.
+Server-Sent Events with the same event taxonomy as [`anthropic-messages`](./anthropic-messages.md): `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`. Reasoning streams as `thinking_delta` events; redacted thinking arrives as a `redacted_thinking` block carrying an opaque `data` payload and no signature, rendered as `[redacted thinking]`.

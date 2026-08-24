@@ -369,7 +369,7 @@ impl ServerEntry {
     /// go through backoff; a dead stdio child has to be respawned and retry-after-sleep doesn't
     /// help.
     ///
-    /// The connect future itself can be `!Send` for OAuth-authenticated servers (rmcp 1.5 holds a
+    /// The connect future itself can be `!Send` for OAuth-authenticated servers (rmcp holds a
     /// `form_urlencoded::Serializer` across an await in its auth module, whose `Option<&dyn
     /// Fn(&str) -> Cow<[u8]>>` closure slot is not `Sync`). To keep `Tool::execute`'s `Send` bound
     /// satisfied, we drive the reconnect on a `spawn_blocking` thread using the outer runtime's
@@ -675,13 +675,6 @@ impl McpClientManager {
         }
     }
 
-    /// Spawn the background connector. Consumes the `Pending` entry list stashed by
-    /// [`Self::prepare`] so subsequent calls are no-ops. Safe to call on managers with no pending
-    /// entries.
-    ///
-    /// The connector writes tool discoveries through [`Self::update_server_tools`], which fans out
-    /// to every registry attached via [`Self::attach_registry`]. The caller does not pass a
-    /// specific registry: attach yours first, then start the connector.
     /// The bound to put on an MCP request made outside the connector.
     fn request_timeout(&self) -> std::time::Duration {
         self.connect_timeout
@@ -690,6 +683,13 @@ impl McpClientManager {
             .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT)
     }
 
+    /// Spawn the background connector. Consumes the `Pending` entry list stashed by
+    /// [`Self::prepare`] so subsequent calls are no-ops. Safe to call on managers with no pending
+    /// entries.
+    ///
+    /// The connector writes tool discoveries through [`Self::update_server_tools`], which fans out
+    /// to every registry attached via [`Self::attach_registry`]. The caller does not pass a
+    /// specific registry: attach yours first, then start the connector.
     pub fn start_connector(self: &Arc<Self>, runtime: McpRuntimeConfig) {
         // Recorded before the early return, so a second `start_connector` call still leaves the
         // timeout set for the request paths that read it.
@@ -1701,7 +1701,7 @@ pub async fn list_prompts(
 //
 // Switching is not a local edit either: notifications routed to a `Subscription` are deliberately
 // not delivered through `ClientHandler`, so `on_resource_updated` would stop firing and the
-// updates `mcp_resource_poll` reads would need a per-server pump task feeding them instead. That
+// updates a poll would read would need a per-server pump task feeding them instead. That
 // belongs with the move to 2026-07-28, not ahead of it.
 #[allow(deprecated)]
 pub async fn subscribe_resource(
@@ -1810,7 +1810,7 @@ pub(crate) mod tests {
     #[test]
     fn resolve_tool_permission_prefers_per_tool_override() {
         let mut server = bare_server_config("s");
-        server.permission = Some("write".into());
+        server.permission = Some("unrestricted".into());
         let mut per_tool = std::collections::HashMap::new();
         per_tool.insert("search".to_string(), "read".to_string());
         server.tool_permissions = Some(per_tool);
@@ -1848,7 +1848,8 @@ pub(crate) mod tests {
     #[test]
     fn resolve_tool_permission_honours_read_only_hint() {
         let server = bare_server_config("s");
-        // readOnlyHint = true → Read, even though the global default would otherwise be Write.
+        // readOnlyHint = true → Read, even though the global default would otherwise be
+        // Unrestricted.
         let annotations = annotations_with_read_only_hint(Some(true));
         let resolved = resolve_tool_permission(
             "s",
@@ -1860,7 +1861,7 @@ pub(crate) mod tests {
         .expect("should resolve");
         assert_eq!(resolved, Permission::Read);
 
-        // readOnlyHint = false → Write, even though the global default is the lenient Read.
+        // readOnlyHint = false → Unrestricted, even though the global default is the lenient Read.
         let annotations = annotations_with_read_only_hint(Some(false));
         let resolved = resolve_tool_permission(
             "s",
@@ -1910,7 +1911,7 @@ pub(crate) mod tests {
         // straight back to `Read`, which is bit-for-bit what trusting it would have done, so the
         // knob changed nothing but a label. `"none"` was worse: a required level of `None` is
         // permitted at every tier, so the tool ran even at `--permission none`. This test asserted
-        // the invariant in its name while only ever passing `Some(Write)` and `None`.
+        // the invariant in its name while only ever passing `Some(Unrestricted)` and `None`.
         for default in [
             Some(Permission::Unrestricted),
             Some(Permission::Ask),
@@ -2090,9 +2091,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolve_tool_permission_hardcoded_write_fallback() {
+    fn resolve_tool_permission_hardcoded_unrestricted_fallback() {
         let server = bare_server_config("s");
-        // Nothing configured anywhere, no hint → hardcoded strict Write.
+        // Nothing configured anywhere, no hint → the hardcoded `Unrestricted` fallback.
         let resolved =
             resolve_tool_permission("s", "any", None, &server, None).expect("should resolve");
         assert_eq!(resolved, Permission::Unrestricted);
@@ -2227,7 +2228,7 @@ pub(crate) mod tests {
         server.eager_load_tools = Some(vec!["a".into(), "stale".into(), "b".into()]);
         let mut perms = std::collections::HashMap::new();
         perms.insert("a".to_string(), "read".to_string());
-        perms.insert("missing".to_string(), "write".to_string());
+        perms.insert("missing".to_string(), "unrestricted".to_string());
         server.tool_permissions = Some(perms);
 
         let advertised: std::collections::HashSet<&str> =

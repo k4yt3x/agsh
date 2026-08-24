@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tool descriptions, per-turn context and CLI output are shorter; `-h` fits 80 columns again.
+
+### Removed
+
+- **Breaking:** the retired `write` permission mode no longer has its own message.
+- The startup warning naming memory files left behind in the config directory.
+
+### Fixed
+
+- `/help` named a permission mode that does not exist and omitted two that do.
+- Docs permission modes, serve scopes, scratchpad tools, provider headers and defaults.
+- Docs understated the read-mode environment allow-list, which passes TLS-trust variables.
+
 ## [0.42.0] - 2026-08-24
 
 ### Added
@@ -157,10 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A first launch racing another for a fresh database could die converting to WAL; it retries.
 - `meka serve` evicted a session with a background task running, then swept its own live task.
 - `agent_followup` is refused while another process is running a turn on the same sub-agent.
-- Webhook log lines redacted only the path, leaking a `?token=` query or `user:pass@` userinfo.
 - A streaming turn survives its SSE consumer disconnecting for `[serve].stream_reattach_grace`.
-- SSE event ids run monotonically across a session, so `Last-Event-ID` survives a turn boundary.
-- HTTP store writes run off the runtime, so a held store lock cannot stall every other request.
 - `meka mcp add` held the config lock across the browser login, hanging every other meka launch.
 - MCP servers are closed on exit on every surface, and the close is bounded so it cannot hang exit.
 - Every provider, client and MCP round trip is bounded and cancellable; a stall cannot park a turn.
@@ -180,7 +192,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Secrets no longer reach a log, a `{:?}`, a 502 body, or the terminal echo at the API-key prompt.
 - Streamed model output, MCP text and prompts drop escapes, bidi overrides and carriage returns.
 - The `ask` prompt shows every argument, refuses on Ctrl+D, and ignores input typed before it drew.
-- Stored memory tags are filtered on read, the last field reaching a render without that guard.
 - Skill writes refuse a symlinked path instead of writing outside the store.
 - A token refresh cannot store a dead credential or overwrite a `provider login` mid-flight.
 - `MEKA_DATA_DIR` must be absolute, and an empty or relative `MEKA_CONFIG_DIR` is ignored.

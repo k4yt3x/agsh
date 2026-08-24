@@ -468,7 +468,6 @@ async fn session_permission_from_row(
 ///
 /// Ambiguity is refused rather than resolved by precedence, matching `schedule_create`: silently
 /// honouring one and dropping the other would produce a job firing on a schedule nobody asked for.
-#[allow(clippy::result_large_err)]
 fn parse_schedule(
     body: &CreateJobRequest,
     now: chrono::DateTime<Utc>,

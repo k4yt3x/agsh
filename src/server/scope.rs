@@ -47,7 +47,6 @@ pub const ANY_READ_SCOPES: &[&str] = &["sessions:r", "mcp:r", "skills:r", "memor
 
 // `ProblemDetail` is ~128 bytes and only constructed on the rejection path. Same trade-off as
 // `extract_bearer` in auth.rs; see the rationale there.
-#[allow(clippy::result_large_err)]
 /// Require one named scope. The rejection names the missing scope, so a client that gets a 403
 /// learns what to ask its operator for rather than having to diff against the docs.
 pub fn require(principal: &Principal, scope: &str) -> Result<(), ProblemDetail> {
@@ -61,7 +60,6 @@ pub fn require(principal: &Principal, scope: &str) -> Result<(), ProblemDetail> 
     ))
 }
 
-#[allow(clippy::result_large_err)]
 /// Require at least one of `scopes`. Used by the discovery endpoints; see [`ANY_READ_SCOPES`].
 pub fn require_any(principal: &Principal, scopes: &[&str]) -> Result<(), ProblemDetail> {
     if scopes.iter().any(|scope| principal.has_scope(scope)) {

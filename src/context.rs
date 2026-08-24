@@ -54,19 +54,6 @@ const MCP_RESOURCE_TOOLS: &[&str] = &[
     "mcp_resource_updates_list",
 ];
 
-/// The mutable half of what the model knows: which tools exist, which skills are installed, and
-/// what each connected MCP server said about itself.
-///
-/// Kept out of the system prompt because all three change mid-session. Skills are re-read from disk
-/// every turn, an MCP server can connect late, and `tools/list_changed` swaps a server's tools
-/// wholesale. Rendering any of that into the cached prefix means a re-cache of the whole
-/// conversation the first time it moves; rendering it into the per-turn `<context>` block costs an
-/// append instead.
-///
-/// Tools and MCP instructions are `BTreeMap`s, so a snapshot has one canonical form and equality is
-/// a real "did the model's picture change" test rather than an ordering accident. Skills and
-/// memories are `Vec`s because their order is meaningful (see [`WorldSnapshot::memories`]) and
-/// already canonical when it arrives.
 /// One memory's line in the `[Memory]` index. Carries the timestamp rather than a rendered age so
 /// the snapshot compares equal across a midnight boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +87,19 @@ struct ScheduledIndexEntry {
     summary: String,
 }
 
+/// The mutable half of what the model knows: which tools exist, which skills are installed, and
+/// what each connected MCP server said about itself.
+///
+/// Kept out of the system prompt because all three change mid-session. Skills are re-read from disk
+/// every turn, an MCP server can connect late, and `tools/list_changed` swaps a server's tools
+/// wholesale. Rendering any of that into the cached prefix means a re-cache of the whole
+/// conversation the first time it moves; rendering it into the per-turn `<context>` block costs an
+/// append instead.
+///
+/// Tools and MCP instructions are `BTreeMap`s, so a snapshot has one canonical form and equality is
+/// a real "did the model's picture change" test rather than an ordering accident. Skills and
+/// memories are `Vec`s because their order is meaningful (see [`WorldSnapshot::memories`]) and
+/// already canonical when it arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorldSnapshot {
     /// Tool name → `(required permission, deferred, one-line summary)`.
@@ -600,8 +600,7 @@ pub fn build_system_prompt(sandboxed_shell: bool, user_instructions: Option<&str
         prompt.push_str(
             "- `workspace`: full tool access with no approval required, but writes are \
              confined to the workspace roots named in `[Environment context]`. Reads are \
-             not confined. `execute_command` runs with the same boundary, so a command \
-             that writes outside them fails.\n",
+             not confined. `execute_command` runs under the same boundary.\n",
         );
     } else {
         prompt.push_str(
@@ -620,13 +619,11 @@ pub fn build_system_prompt(sandboxed_shell: bool, user_instructions: Option<&str
          where writes may land.\n\n",
     );
     prompt.push_str(
-        "The current level is delivered in the per-turn `[Permission context]` block of \
-         each user message, with a one-line statement of what it allows; the required \
-         level for each individual tool is in the `[Available tools]` catalogue. If the user \
-         asks for an operation their current level blocks, name the required tool and \
-         suggest they run `/permission <level>` (or Shift+Tab) to enable it. For \
-         potentially destructive operations at `unrestricted`, briefly explain what you \
-         will do before proceeding.\n\n",
+        "The current level is in the per-turn `[Permission context]` block; each tool's \
+         required level is in `[Available tools]`. If the user asks for something their \
+         level blocks, name the required tool and suggest `/permission <level>` (or \
+         Shift+Tab). At `unrestricted`, briefly explain destructive operations before \
+         proceeding.\n\n",
     );
 
     if let Some(instructions) = user_instructions
@@ -721,11 +718,10 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
 
     if !deferred.is_empty() {
         let mut out = String::from(
-            "[Tool discovery]\nThese are registered, but their schemas are withheld to keep the \
-             request small, so the summaries below are all you have and a trailing `…` means one \
-             was cut short. Call `load_tool` with a tool's exact `name` (or a list of names) to \
-             fetch the full schemas. Calling one of these directly does work, but you will be \
-             guessing at its optional parameters and silently taking their defaults.\n",
+            "[Tool discovery]\nRegistered, but their schemas are withheld; the summaries below are all \
+             you have and a trailing `…` means one was cut. Call `load_tool` with a tool's exact \
+             `name` (or a list) for the full schema. Calling one directly works but guesses at its \
+             optional parameters.\n",
         );
         for (heading, group) in group_deferred_entries(&deferred) {
             out.push_str(&format!("\n{}\n", heading));
@@ -795,9 +791,9 @@ const SCHEDULE_INDEX_MAX_ENTRIES: usize = 20;
 /// Deliberately carries no results. An outcome is permanent and belongs in the conversation.
 fn render_background_section(tasks: &[crate::background::BackgroundTask]) -> String {
     let mut out = String::from(
-        "[Background]\nTasks you started and did not wait for, still running. Each will report to \
-         you on its own when it finishes; do not poll for them and do not start a second copy of \
-         work already listed here. Call `task_list` for full detail, `task_cancel` to stop one.\n\n",
+        "[Background]\nTasks you started and did not wait for. Each reports when it finishes: do \
+         not poll, and do not restart work already listed. `task_list` for detail, `task_cancel` \
+         to stop one.\n\n",
     );
     for task in tasks.iter().take(BACKGROUND_INDEX_MAX_ENTRIES) {
         out.push_str(&format!(
@@ -829,9 +825,8 @@ const BACKGROUND_INDEX_MAX_ENTRIES: usize = 20;
 /// copy of one the user already asked for.
 fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
     let mut out = String::from(
-        "[Scheduled]\nJobs you have scheduled in this session. Check here before creating one so \
-         you do not duplicate an existing job. Call `schedule_list` for exact next-fire times, \
-         gates, and full prompts.\n\n",
+        "[Scheduled]\nJobs scheduled in this session. Check here before creating one, so you do \
+         not duplicate. `schedule_list` for exact fire times, gates and prompts.\n\n",
     );
     for entry in jobs.iter().take(SCHEDULE_INDEX_MAX_ENTRIES) {
         out.push_str(&format!(
@@ -873,8 +868,8 @@ fn render_skill_section(
     let mut out = String::from(if skills.is_empty() {
         "[Skills]\nNo skill is currently loadable.\n"
     } else {
-        "[Skills]\nCall the `skill_read` tool with a skill name to load its full content. Only \
-         invoke a skill when the user's request matches its stated purpose.\n\n"
+        "[Skills]\nCall `skill_read` with a skill name to load it. Only invoke one when the \
+         user's request matches its stated purpose.\n\n"
     });
 
     let mut shown = 0;
@@ -1735,9 +1730,8 @@ pub fn build_environment_context(
             // per-config question this function cannot answer, and when the answer is no the shell
             // is refused outright rather than run unconfined. Stating the outcome covers both.
             context.push_str(
-                "Reads are not confined. A write outside them is refused: file writes by the tool \
-                 itself, shell commands by the confinement they run under, and a shell command \
-                 that cannot be confined is refused rather than run.\n",
+                "Reads are not confined. Any write outside them is refused, including from \
+                 `execute_command`.\n",
             );
         }
     }

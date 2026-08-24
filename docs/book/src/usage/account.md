@@ -7,8 +7,9 @@ takes an optional profile (defaults to the active provider, same as `--provider`
 `meka account … 2>/dev/null | jq` stays clean.
 
 Availability is per backend: `claude-subscription` and `chatgpt-subscription` (subscription OAuth) support these;
-API-key backends, OpenAI-compatible endpoints, and Ollama print a short "not available" note and
-exit non-zero.
+for `usage` and `stats`, API-key backends, OpenAI-compatible endpoints and Ollama print a short
+"not available" note and exit non-zero. `whoami` works on any profile: it fills the fields it can
+and fails only when the credential itself is invalid.
 
 ## `meka account usage`
 
@@ -35,8 +36,8 @@ $ meka account usage --format json
 
 `resets_at` is a Unix timestamp in seconds (`date -d @1782958200`). The `extra_usage` block reports
 pay-as-you-go / overage state (whether it's enabled, percent of the extra-usage limit consumed,
-amount spent, and remaining credit balance); the plain view shows a line only when it's enabled or
-has a balance.
+amount spent, and remaining credit balance); the plain view shows a line when it is enabled, has a
+balance, or has recorded any spend.
 
 ## `meka account whoami`
 

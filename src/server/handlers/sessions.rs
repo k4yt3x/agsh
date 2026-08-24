@@ -217,7 +217,6 @@ pub struct ListSessionsResponse {
 /// This is *input validation*, not a security sandbox. A valid absolute directory still lets the
 /// agent operate anywhere the OS permissions allow. The check prevents obviously-wrong inputs
 /// (like `/dev/null` or `/proc/self`) from producing confusing downstream tool errors.
-#[allow(clippy::result_large_err)]
 fn validate_cwd(path: &std::path::Path) -> Result<(), ProblemDetail> {
     if !path.is_absolute() {
         return Err(ProblemDetail::new(

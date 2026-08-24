@@ -651,47 +651,40 @@ fn resolve_config(dir: &std::path::Path, config: &str, args: &[&str]) -> std::pr
         .unwrap_or_else(|err| panic!("failed to spawn meka {args:?}: {err}"))
 }
 
-/// The retired `write` mode fails at every door it can be spelled at, and never resolves quietly.
+/// A mode meka does not have fails at every door it can be spelled at, and never resolves quietly.
 ///
-/// `Permission` is read as a grant *and* as a requirement, so re-pointing `write` at one of the two
-/// new modes would have silently admitted tools a rung earlier than their author intended. Retiring
-/// it is what makes every stale config loud, and the value of that depends entirely on each surface
-/// actually refusing rather than one of them keeping a private table that still maps it.
+/// `Permission` is read as a grant *and* as a requirement, so a surface that quietly mapped an
+/// unknown string onto some mode would admit tools at authority nobody chose. The value of refusing
+/// depends entirely on every surface doing it, rather than one of them keeping a private table.
 #[test]
-fn the_retired_write_mode_is_refused_at_the_flag_and_in_the_config_file() {
+fn a_mode_meka_does_not_have_is_refused_at_the_flag_and_in_the_config_file() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let flag = meka()
-        .args(["--permission", "write", "session", "list"])
+        .args(["--permission", "elevated", "session", "list"])
         .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
         .env("MEKA_DATA_DIR", dir.path().join("data"))
         .output()
         .expect("spawn meka");
-    assert!(!flag.status.success(), "--permission write must not start");
+    assert!(!flag.status.success(), "an unknown mode must not start");
     let stderr = String::from_utf8_lossy(&flag.stderr);
     assert!(
-        stderr.contains("was split")
-            && stderr.contains("workspace")
-            && stderr.contains("unrestricted"),
-        "the refusal has to name both replacements, not just report 'invalid': {stderr}"
+        stderr.contains("workspace") && stderr.contains("unrestricted"),
+        "the refusal has to list the modes meka does have: {stderr}"
     );
 
     let file = resolve_config(
         dir.path(),
-        "[permissions]\ndefault = \"write\"\nenabled = [\"read\", \"write\"]\n",
+        "[permissions]\ndefault = \"elevated\"\nenabled = [\"read\", \"elevated\"]\n",
         &[],
     );
     let stderr = String::from_utf8_lossy(&file.stderr);
     for surface in ["[permissions].default", "[permissions].enabled"] {
         assert!(
             stderr.contains(surface),
-            "{surface} must warn about the retired mode by name: {stderr}"
+            "{surface} must warn about the unknown mode by name: {stderr}"
         );
     }
-    assert!(
-        stderr.contains("was split"),
-        "and must carry the same explanation the flag gives: {stderr}"
-    );
 }
 
 /// `workspace` is spellable everywhere the other modes are, and reaches config resolution.

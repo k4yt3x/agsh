@@ -312,8 +312,8 @@ pub struct ServeConfig {
     /// abandoned work, and makes re-attach useful only for turns that already finished.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub stream_reattach_grace: Option<std::time::Duration>,
-    /// Bearer tokens configured for this deployment. An empty list means no caller can
-    /// authenticate; the server runs but every request is rejected with 401.
+    /// Bearer tokens configured for this deployment. An empty list is refused at startup:
+    /// `meka serve` exits rather than binding a port nothing can authenticate against.
     pub tokens: Option<Vec<ServeTokenConfig>>,
     /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
     pub webhooks: Option<Vec<WebhookConfig>>,
@@ -1247,7 +1247,7 @@ pub struct ProviderProfile {
     /// `claude-subscription` only: when true, meka sends the `redact-thinking-2026-02-12` beta
     /// header so the server returns `redacted_thinking` blocks instead of full thinking
     /// summaries (saves bandwidth, but the redacted payloads can't be replayed back to the
-    /// server in multi-turn conversations). Defaults to false.
+    /// server in multi-turn conversations). Defaults to true.
     pub redact_thinking: Option<bool>,
 }
 
@@ -1357,7 +1357,7 @@ pub struct ResolvedConfig {
     /// the field off the request, so the provider applies its own default.
     pub effort: Option<String>,
     /// `claude-subscription`: when true, request `redacted_thinking` blocks via
-    /// `redact-thinking-2026-02-12` beta. Default false.
+    /// `redact-thinking-2026-02-12` beta. Default true.
     pub redact_thinking: bool,
     pub auto_compact: bool,
     pub compact_checkpoint: bool,
@@ -1375,7 +1375,7 @@ pub struct ResolvedConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     /// Parsed [`Permission`] from `[mcp].default_permission`, carried so per-turn tool-permission
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
-    /// `[mcp]` default configured"; resolution falls through to the hardcoded Write.
+    /// `[mcp]` default configured"; resolution falls through to the hardcoded `Unrestricted`.
     pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
     /// Where [`Self::user_instructions`] came from, rendered (`--instructions`,
@@ -2295,10 +2295,7 @@ fn resolve_permission(
                 .iter()
                 .filter_map(|raw| match raw.parse::<Permission>() {
                     Ok(mode) => Some(mode),
-                    // The parser's own message, not a list restated here. It is the only thing that
-                    // knows a retired spelling from an unknown one, and a user upgrading past the
-                    // `write` split needs to be told which of the two replaced it rather than a
-                    // bare "expected one of".
+                    // The parser's own message, not a list restated here, so the two cannot drift.
                     Err(error) => {
                         tracing::warn!(
                             "ignoring invalid [permissions].enabled entry '{}': {}",

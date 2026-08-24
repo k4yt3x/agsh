@@ -161,7 +161,6 @@ pub async fn bearer_auth(
 // `ProblemDetail` is ~128 bytes (it carries several `String`s and a `BTreeMap`). The lint flags
 // the `Err` variant as large; for an auth-failure path that fires at most once per request, the
 // extra stack space is fine and boxing would just shuffle the same allocation under the heap.
-#[allow(clippy::result_large_err)]
 fn extract_bearer(headers: &HeaderMap) -> Result<String, ProblemDetail> {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return Err(ProblemDetail::new(

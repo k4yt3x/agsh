@@ -142,7 +142,7 @@ Custom OAuth token refresh endpoint. Defaults:
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
 
-**When unset the field is omitted, and the provider applies its own default.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements - `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
+**When unset the field is omitted, and the provider applies its own default. `claude-subscription` is the exception: it sends `high`, matching Claude Code.** That is the point of leaving it unset: effort is a request parameter the provider owns, and omitting it is how you ask for whatever that provider considers right. meka picks no tier of its own, because it cannot know which tiers a given endpoint implements - `anthropic-messages` and `openai-chat-completions` reach any compatible server, including local ones serving weights that never had a reasoning knob, and a tier the backend doesn't implement is a rejected request rather than a graceful ignore.
 
 An explicit value is absolute: sent verbatim (trimmed and lowercased), with no validation or clamping, whatever model it is aimed at. You own correctness for your model and endpoint; an invalid value is rejected by the API. A blank value reads as unset.
 
@@ -246,7 +246,7 @@ config file.
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
 | `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
-| `meka provider remove <name>` | Logout + delete: best-effort revoke the OAuth token, delete the stored credential from the database, and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. |
+| `meka provider remove <name>` | Delete the stored credential from the database and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
 
@@ -1038,7 +1038,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `--signing-key <PATH>`, `--signing-algorithm <ALG>` | JWT signing material (`client-credentials-jwt` only). |
 | `--scope <SCOPE>` | OAuth scope (repeatable). |
 | `--redirect-port <PORT>` | Fixed OAuth redirect port (default: ephemeral). |
-| `--permission <none\|read\|ask\|write>` | Per-server permission cap (applies to all tools on the server). |
+| `--permission <none\|read\|workspace\|ask\|unrestricted>` | Per-server permission cap (applies to all tools on the server). |
 | `--allow-tool <NAME>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
@@ -1559,7 +1559,7 @@ An array of bearer tokens for API authentication. At least one token is required
 | `token` | Yes* | The bearer token value. Supports `${ENV_VAR}` substitution. Mutually exclusive with `token_file`. |
 | `token_file` | Yes* | Path to a file containing the token (one line, trimmed). Mutually exclusive with `token`. A startup warning is logged if the file is world-readable. |
 | `description` | No | Human-readable label for this token (appears in logs). |
-| `scopes` | Yes | Array of scope strings: `"sessions:r"`, `"sessions:w"`, `"skills:r"`, `"mcp:r"`. |
+| `scopes` | Yes | Array of scope strings. One `:r` and one `:w` per subsystem: `sessions`, `skills`, `memory`, `schedule`, `mcp`. |
 
 \* Exactly one of `token` or `token_file` must be set.
 

@@ -522,7 +522,7 @@ pub fn resolve_skill(name: &str, roots: &[PathBuf]) -> Result<SkillIndex, String
 /// The `SKILL.md` inside a skill directory.
 ///
 /// Prefers the spec's spelling and falls back to lowercase, matching the reference library's
-/// `find_skill_md`. Returns the uppercase path when neither exists, so a caller reporting the
+/// the discovery walk. Returns the uppercase path when neither exists, so a caller reporting the
 /// failure names the file the author was supposed to write.
 pub fn skill_file_in(dir: &Path) -> PathBuf {
     let upper = dir.join("SKILL.md");
@@ -1124,7 +1124,7 @@ pub const MAX_DESCRIPTION_LEN: usize = 1024;
 /// 1-64 characters, lowercase alphanumerics and hyphens, no leading or trailing hyphen, no
 /// consecutive hyphens. "Alphanumeric" is Unicode-wide, which is what the spec means by "unicode
 /// lowercase alphanumeric characters" and what the reference validator implements
-/// (`c.isalnum()` in `skills_ref/validator.py`); the `(a-z, 0-9)` in the spec's prose is an
+/// (`c.isalnum()` in the spec's reference validator); the `(a-z, 0-9)` in the spec's prose is an
 /// illustration, not the set.
 ///
 /// This is also the path-safety guard, and it is one by construction rather than by enumeration:
@@ -1132,8 +1132,9 @@ pub const MAX_DESCRIPTION_LEN: usize = 1024;
 /// character, so `root.join(name)` cannot escape the store.
 ///
 /// Applied only where meka *creates* a name. Reading, listing and deleting go through
-/// [`validate_addressable_name`], because a store written by an older meka is full of names
-/// this refuses, and refusing to delete one leaves the user with no way to remove it but `rm`.
+/// [`validate_addressable_name`], because a store can hold names this refuses -- another Agent
+/// Skills client writes them, and so does `mkdir` -- and refusing to delete one leaves the user
+/// with no way to remove it but `rm`.
 pub fn validate_skill_name(name: &str) -> Result<(), String> {
     if let Some(problem) = skill_name_problem(name) {
         return Err(problem);
@@ -1475,10 +1476,10 @@ pub fn write_skill(
     let written = parse_skill_definition(name, root, &dir, &skill_file, &rendered)
         .map_err(|error| format!("refusing to write a skill that would not parse back: {error}"))?;
 
-    // Atomic, like `write_memory`. `fs::write` truncates in place, so an interrupted write leaves a
-    // half-file that discovery rejects and the guard above then refuses to overwrite. That was
-    // survivable when only `meka skill add` wrote skills; an agent that may write on any turn makes
-    // it worth the rename.
+    // Atomic, like every other store write. `fs::write` truncates in place, so an interrupted write
+    // leaves a half-file that discovery rejects and the guard above then refuses to overwrite.
+    // That was survivable when only `meka skill add` wrote skills; an agent that may write on
+    // any turn makes it worth the rename.
     crate::config::write_file_atomic(&skill_file, &rendered)
         .map_err(|error| format!("failed to write {}: {}", skill_file.display(), error))?;
     Ok(written)
@@ -2951,7 +2952,7 @@ mod tests {
         // The property is "cannot leave the store", not "looks unusual". Requiring the latter is
         // what stranded `two words` and `my:skill`: both are ordinary directories a user or another
         // client can create, and refusing them bought no safety while costing the only way to
-        // remove them. See `every_name_discovery_accepts_can_also_be_deleted`.
+        // remove them.
         for escaping in ["../escape", "a/b", "a\\b", ".hidden", "..", ""] {
             assert!(
                 validate_addressable_name(escaping).is_err(),

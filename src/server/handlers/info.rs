@@ -17,7 +17,6 @@ use crate::server::{
 
 // `ProblemDetail` is ~128 bytes and only constructed on the rejection path of an auth check.
 // Same trade-off as `extract_bearer` in auth.rs. See the rationale there.
-#[allow(clippy::result_large_err)]
 fn require_any_read_scope(principal: &Principal) -> Result<(), ProblemDetail> {
     scope::require_any(principal, ANY_READ_SCOPES)
 }
@@ -247,7 +246,6 @@ pub async fn mcp_tools(
     }))
 }
 
-#[allow(clippy::result_large_err)]
 fn no_such_server(name: &str) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,

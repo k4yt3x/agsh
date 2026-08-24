@@ -24,7 +24,7 @@ The same agent core is exposed through four front-ends:
 - **Built-in tools**: file read/write/edit, glob search, regex content search (ripgrep), web fetch, web search, and shell command execution
 - **Pluggable providers**: `anthropic-messages`, `claude-subscription`, `openai-chat-completions`, `openai-responses`, `chatgpt-subscription`, and any endpoint serving one of those protocols
 - **MCP support**: extend the agent with tools, resources, and prompts from external MCP servers
-- **Permission model**: control what the agent can do (none/read/ask/write), switchable mid-session
+- **Permission model**: control what the agent can do (none/read/workspace/ask/unrestricted), switchable mid-session
 - **Sessions**: conversations persisted in SQLite; resume, export, or compact any session
 - **Working memory**: a session-scoped scratchpad for intermediate results that stays out of the context window
 - **Sub-agents**: delegate research or analysis to sub-agents that can orchestrate their own sub-agent teams and be run at a restricted permission level

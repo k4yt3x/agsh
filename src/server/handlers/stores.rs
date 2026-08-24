@@ -26,7 +26,6 @@ use crate::server::{
 
 /// Turn a store-layer `Err(String)` into a 422. Every one of them is a statement about the caller's
 /// input (bad name, empty description, a symlink in the way), not a server fault.
-#[allow(clippy::result_large_err)]
 fn store_error(message: String) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::InvalidBody,
@@ -35,7 +34,6 @@ fn store_error(message: String) -> ProblemDetail {
     )
 }
 
-#[allow(clippy::result_large_err)]
 fn not_found(noun: &str, name: &str) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,
@@ -49,7 +47,6 @@ fn not_found(noun: &str, name: &str) -> ProblemDetail {
 /// `not-found` rather than `invalid-body`: nothing is wrong with the request, there is simply
 /// nowhere to write. A client switching on `type` would read `invalid-body` as "fix your JSON" and
 /// retry forever against a store that does not exist.
-#[allow(clippy::result_large_err)]
 fn store_disabled(noun: &str) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::NotFound,

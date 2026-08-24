@@ -211,17 +211,6 @@ impl fmt::Display for Permission {
     }
 }
 
-/// What every surface says when it meets the retired `write`.
-///
-/// `Permission` is read as a *grant* (`--permission`, `[permissions]`) and as a *requirement*
-/// (`[tools].tool_permissions`, `[mcp].default_permission`, `[mcp.servers.*].tool_permissions`).
-/// Re-pointing `write` at the narrower of the two new modes would have been silent in the
-/// requirement direction and would have admitted tools a rung earlier than their author intended,
-/// so the string is retired outright and every door explains the split instead of reporting a bare
-/// "invalid".
-pub const RETIRED_WRITE_MODE: &str = "permission mode 'write' was split: use 'workspace' for writes confined to the workspace \
-     roots, or 'unrestricted' for no boundary at all";
-
 impl FromStr for Permission {
     type Err = String;
 
@@ -232,7 +221,6 @@ impl FromStr for Permission {
             "workspace" | "w" => Ok(Permission::Workspace),
             "ask" | "a" => Ok(Permission::Ask),
             "unrestricted" | "u" => Ok(Permission::Unrestricted),
-            "write" => Err(RETIRED_WRITE_MODE.to_string()),
             other => Err(format!(
                 "invalid permission mode '{other}': expected 'none', 'read', 'workspace', 'ask', \
                  or 'unrestricted'"
@@ -244,17 +232,15 @@ impl FromStr for Permission {
 /// Read a permission level back off a database row, given the subject to name if it cannot be read.
 ///
 /// Returns `None` for both an absent column and an unreadable one, because every caller has the
-/// same fallback for the two. What differs is that an unreadable value is now *noticed*. These
-/// sites used to spell this `.and_then(|value| value.parse().ok())`, which collapsed "this session
-/// never recorded a level" into "this session recorded a level meka can no longer read" and resumed
-/// the session at the process default either way, silently. Every database written before 0.42 has
-/// `permission = 'write'` rows, and that string is now retired, so this is not a hypothetical arm:
-/// it is what an un-migrated store hits on every row it has.
+/// same fallback for the two. What differs is that an unreadable value is *noticed*: spelling this
+/// `.and_then(|value| value.parse().ok())` collapses "this session never recorded a level" into
+/// "this session recorded a level meka cannot read" and resumes at the process default either way,
+/// silently.
 ///
-/// Repeats. The scheduler reads a job's session level every time that job comes due, so an
-/// un-migrated row behind an `every = "1m"` watcher warns once a minute until it is fixed. That is
-/// deliberate rather than overlooked: the condition silently downgrades what a session runs at, the
-/// message names the session, and the migration script clears it in one pass.
+/// Repeats. The scheduler reads a job's session level every time that job comes due, so a row it
+/// cannot read behind an `every = "1m"` watcher warns once a minute until the row is fixed. That is
+/// deliberate rather than overlooked: the condition silently changes what a session runs at, and
+/// the message names the session so it can be corrected.
 pub fn parse_recorded_permission(
     recorded: Option<&str>,
     subject: &dyn fmt::Display,
@@ -677,11 +663,10 @@ mod tests {
 
     /// Absent and unreadable are different answers, and the second one says so.
     ///
-    /// Six call sites, no tests. The warn arm is the one every pre-0.42 database reaches, because
-    /// those rows record the retired `write`: without the warning the level silently becomes the
-    /// configured default and the only later clue is a message naming a level the row was never
-    /// created at. Collapsing the two into a bare `None` is a one-character edit that nothing
-    /// caught.
+    /// Six call sites, no tests. The warn arm is reached by any row holding a value this build does
+    /// not resolve: without the warning the level silently becomes the configured default and the
+    /// only later clue is a message naming a level the row was never created at. Collapsing the two
+    /// into a bare `None` is a one-character edit that nothing caught.
     #[test]
     fn an_unreadable_recorded_permission_warns_where_an_absent_one_is_silent() {
         #[derive(Clone)]
@@ -738,11 +723,11 @@ mod tests {
         assert_eq!(answer, Some(Permission::Workspace));
         assert!(text.is_empty(), "a readable level is not a warning: {text}");
 
-        // The retired spelling every pre-0.42 row carries.
-        let (answer, text) = logged(Some("write"));
+        // A value no build of meka resolves.
+        let (answer, text) = logged(Some("elevated"));
         assert_eq!(answer, None, "an unreadable level must not resolve to one");
         assert!(
-            text.contains("job 7f3a1b2c") && text.contains("write"),
+            text.contains("job 7f3a1b2c") && text.contains("elevated"),
             "the warning must name the subject and the unreadable value: {text}"
         );
     }
@@ -861,31 +846,23 @@ mod tests {
         }
     }
 
-    /// `write` resolves to nothing and says which of the two replaced it.
+    /// A mode `Permission` does not have is refused, and the refusal lists the ones it does.
     ///
-    /// Reassigning the string to the narrower mode would have been silent in the *requirement*
-    /// direction (`tool_permissions`, `[mcp].default_permission`), admitting tools a rung earlier
-    /// than their author intended. Retiring it is what makes every stale config fail loudly.
+    /// The list is the whole answer: meka names its five modes and does not try to guess which one
+    /// an unrecognised string meant.
     #[test]
-    fn the_retired_write_mode_resolves_to_nothing_and_explains_itself() {
-        let error = Permission::from_str("write").expect_err("'write' must not resolve");
-        // The *teaching* phrase, not the two mode names.
-        //
-        // Both names appear in the generic "expected 'none', 'read', 'workspace', 'ask', or
-        // 'unrestricted'" arm as well, so asserting on them let the retired-mode arm be deleted
-        // outright without failing this test. `was split` appears only in `RETIRED_WRITE_MODE`,
-        // which is the whole point: a user upgrading past the split needs to be told which of the
-        // two replaced their setting, not handed a list.
-        assert!(
-            error.contains("was split"),
-            "the refusal must explain the split rather than list the modes: {error}"
-        );
-        assert!(error.contains("workspace"), "{error}");
-        assert!(error.contains("unrestricted"), "{error}");
+    fn an_unknown_mode_is_refused_and_the_refusal_names_the_five() {
+        let error = Permission::from_str("write").expect_err("an unknown mode must not resolve");
+        for mode in ["none", "read", "workspace", "ask", "unrestricted"] {
+            assert!(
+                error.contains(mode),
+                "the refusal must name {mode}: {error}"
+            );
+        }
         assert_eq!(
             Permission::from_str("WRITE").expect_err("case-insensitively too"),
             error,
-            "the retired spelling is matched after lowercasing, like every other alias"
+            "an unknown mode is matched after lowercasing, like every other alias"
         );
     }
 

@@ -189,75 +189,6 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
     validate_entry_name(name, "memory")
 }
 
-/// Where memories lived before they were rows, relative to the config directory.
-///
-/// Not a path meka reads. It exists so [`warn_about_a_stranded_file_store`] can recognise one and
-/// say so.
-const LEGACY_MEMORY_DIR: &str = "memory";
-
-/// Say so, once, when notes are sitting in the directory the store used to read.
-///
-/// Memories moved from `MEKA_CONFIG_DIR/memory/*.md` into the database, and the file-reading code
-/// went with them. What was left is silence: an installation that upgrades with notes in that
-/// directory gets "No memories saved." from `meka memory list`, an empty `[Memory]` index on every
-/// turn, and nothing anywhere naming the importer that would bring them across. Measured on a real
-/// upgraded config, which had one note stranded exactly this way.
-///
-/// A `warn!` rather than a print, because it is a recoverable diagnostic and not the data the
-/// command was run to get; a `Once`, because the condition is a standing state and repeating it per
-/// subcommand is how a real signal turns into noise. It stops on its own once the directory is
-/// emptied, which is what the importer does.
-///
-/// Deliberately not a migration. Reading those files back is the importer's job
-/// (`contrib/import-memory-store.py`), and re-teaching the binary the old layout to do it
-/// automatically is what putting migrations in a script exists to avoid.
-pub fn warn_about_a_stranded_file_store(config_dir: Option<&Path>) {
-    static SAID: std::sync::Once = std::sync::Once::new();
-    let Some(directory) = config_dir.map(|dir| dir.join(LEGACY_MEMORY_DIR)) else {
-        return;
-    };
-    let stranded = stranded_memory_files(&directory);
-    if stranded == 0 {
-        return;
-    }
-    SAID.call_once(|| {
-        // Phrased to be true on both sides of the import, because the importer deliberately never
-        // deletes the files: after a successful run the directory still holds them, and telling
-        // someone to import what they have already imported reads as the import having failed.
-        tracing::warn!(
-            "{} memory file{} in {} {} not loaded: memories are rows in the database now. If they \
-             have not been imported, contrib/import-memory-store.py does it; if they have, the \
-             directory is safe to delete",
-            stranded,
-            if stranded == 1 { "" } else { "s" },
-            directory.display(),
-            if stranded == 1 { "is" } else { "are" },
-        );
-    });
-}
-
-/// How many notes are sitting in the old file store.
-///
-/// Split from [`warn_about_a_stranded_file_store`] so the rule is testable: that function is a
-/// `Once` around a `warn!`, which fires at most once per process and leaves nothing to assert
-/// against. Counting `.md` only, because the directory also collects editor swap files and the
-/// `.bak` a hand-edit leaves behind, and reporting those as lost memories sends the user looking
-/// for notes that never existed. Files only for the same reason: an extension is a naming
-/// convention rather than a type, and a directory whose name happens to end in `.md` is not a lost
-/// note.
-fn stranded_memory_files(directory: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return 0;
-    };
-    entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        // `is_file` rather than the `DirEntry` file type, so a symlink pointing at a note counts as
-        // the note it resolves to.
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md") && path.is_file())
-        .count()
-}
-
 /// Bound a name being *looked up*, without demanding it be one this store would write.
 ///
 /// The lookup half of [`validate_memory_name`]; see [`crate::store::validate_lookup_name`] for why
@@ -337,7 +268,7 @@ pub fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
         // Each element through `yaml_scalar` rather than a bare flow sequence. Every tag reaching
         // here has passed `validate_tag`, so the bare form would be safe today; quoting costs
         // nothing and means a later loosening of that character class cannot quietly produce a file
-        // the importer reads as something else.
+        // a reader takes as something else.
         let quoted: Vec<String> = frontmatter
             .tags
             .iter()
@@ -347,7 +278,7 @@ pub fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
     }
     // The body verbatim between one separator newline and one terminator newline, both added
     // unconditionally. Trimming leading newlines and appending a terminator only when one was
-    // missing made the framing ambiguous, so the importer could not tell padding from content: a
+    // missing made the framing ambiguous, so a reader could not tell padding from content: a
     // body of `b` came back `\nb`, and one ending `\r` came back ending `\r\n`. Adding exactly one
     // of each, always, is what makes the round trip exact for every body including an empty one.
     out.push_str("---\n\n");
@@ -390,7 +321,7 @@ pub fn description_says_something(description: &str) -> bool {
 /// Whether a description would still say something once written to an export file.
 ///
 /// [`render_memory`] drops what YAML cannot carry, and a description made only of such characters
-/// becomes `description: ""` -- which the importer treats as no description at all and skips,
+/// becomes `description: ""` -- which reads back as no description at all,
 /// losing the memory through the one path that is supposed to preserve it. `meka memory export`
 /// asks this before it writes anything, and refuses the whole run rather than write a file that
 /// would come back empty.
@@ -468,44 +399,6 @@ pub fn render_age(recorded: SystemTime, now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Notes left in the directory the store used to read are counted, and nothing else is.
-    ///
-    /// The store moved into the database and the file-reading code went with it, so an upgraded
-    /// installation with notes still on disk got "No memories saved." and an empty `[Memory]` index
-    /// with nothing anywhere saying why. This is the count behind the warning that now says so.
-    #[test]
-    fn notes_left_in_the_old_file_store_are_counted_and_nothing_else_is() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let legacy = root.path().join(LEGACY_MEMORY_DIR);
-
-        assert_eq!(
-            stranded_memory_files(&legacy),
-            0,
-            "a directory that does not exist is the ordinary case and must stay silent"
-        );
-
-        std::fs::create_dir_all(&legacy).expect("create legacy dir");
-        assert_eq!(
-            stranded_memory_files(&legacy),
-            0,
-            "an empty directory is what a finished import leaves behind"
-        );
-
-        std::fs::write(legacy.join("one.md"), "body").expect("write");
-        std::fs::write(legacy.join("two.md"), "body").expect("write");
-        // Neither of these is a memory the user is missing, and counting them sends someone
-        // looking for notes that never existed.
-        std::fs::write(legacy.join("notes.txt"), "body").expect("write");
-        std::fs::write(legacy.join("one.md.bak"), "body").expect("write");
-        std::fs::create_dir(legacy.join("subdir.md")).expect("mkdir");
-
-        assert_eq!(
-            stranded_memory_files(&legacy),
-            2,
-            "only the `.md` files a memory was ever stored as"
-        );
-    }
 
     #[test]
     fn test_validate_memory_name_rejects_traversal_and_separators() {

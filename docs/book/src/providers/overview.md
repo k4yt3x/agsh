@@ -78,7 +78,7 @@ Note that several of these also expose a **legacy `/v1/completions`** endpoint. 
 
 Both talk to Claude's `/v1/messages` endpoint, but the auth and request shape differ:
 
-- **`anthropic-messages`** is the straightforward path: an `x-api-key` header, a plain system prompt, no extra headers. Choose this when you have a Claude API key.
+- **`anthropic-messages`** is the straightforward path: an `x-api-key` header and a plain system prompt, plus `anthropic-beta: interleaved-thinking-2025-05-14` whenever thinking is on (the default). Choose this when you have a Claude API key.
 - **`claude-subscription`** replicates the Claude Code CLI exactly: OAuth tokens, fingerprint-encoded version header, xxHash64 attestation over the request body, injected billing system block. Choose this when you want to use a Claude Code subscription. Any deviation from the expected shape causes requests to be rejected, so avoid proxies that rewrite headers or reformat the body.
 
 ## Choosing between the OpenAI backends

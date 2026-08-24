@@ -183,18 +183,15 @@ pub fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 fn is_usable_root(path: &Path) -> bool {
     if !path.is_dir() {
         tracing::warn!(
-            "workspace root {} is not a directory; ignoring it. A root has to be a directory: \
-             Landlock refuses a file-backed rule outright and would fail every shell command in \
-             the session",
+            "workspace root {} is not a directory; ignoring it",
             path.display()
         );
         return false;
     }
     if is_system_root(path) {
         tracing::warn!(
-            "refusing {} as a workspace root: it is a system directory whose contents the sandbox \
-             masks to keep IPC sockets out of reach, and binding it back would undo that. Name the \
-             project directory you actually want to write in",
+            "refusing {} as a workspace root: the sandbox masks system directories, so binding \
+             one back would undo that. Name a project directory instead",
             path.display()
         );
         return false;
@@ -397,9 +394,10 @@ impl WriteScope {
 
     /// The roots a write must land under right now, or `None` when this level imposes no boundary.
     ///
-    /// Only `workspace` confines. `ask` deliberately does not: its safety is the approval prompt,
-    /// and an approved call is meant to reach anywhere. `unrestricted` does not by definition, and
-    /// the levels below it never reach a write door at all.
+    /// Only `ask` and `unrestricted` disclaim a boundary. `ask` does so deliberately: its safety
+    /// is the approval prompt, and an approved call is meant to reach anywhere. `unrestricted` does
+    /// so by definition. Every other level, `none` and `read` included, is confined here: a level
+    /// that should never reach a write door must fail closed if one is ever wired to it.
     pub fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
         if self.denied {
             return Some(Vec::new());

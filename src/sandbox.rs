@@ -30,9 +30,9 @@
 /// the compiler asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confinement {
-    /// No sandbox. Either `unrestricted`, or sandboxing turned off in config.
+    /// No sandbox. `ask` or `unrestricted`, or sandboxing turned off in config.
     Unconfined,
-    /// Reads everywhere, writes nowhere. `none`, `read` and `ask`.
+    /// Reads everywhere, writes nowhere. `none` and `read`.
     ReadOnly,
     /// Reads everywhere, writes only beneath these canonical roots. `workspace`.
     ///
@@ -2797,7 +2797,7 @@ pub mod windows_impl {
     /// Create an anonymous pipe using the supplied SECURITY_ATTRIBUTES.
     ///
     /// A 1 MiB buffer hint is passed to `CreatePipe`. This is belt-and-
-    /// braces with the concurrent draining in `run_windows_low_integrity`:
+    /// braces with the concurrent draining in the Windows spawn path:
     /// even if the drain task is momentarily starved, the child has a MiB
     /// of slack before it blocks in `WriteFile`.
     unsafe fn create_pipe(sa: &SECURITY_ATTRIBUTES) -> std::io::Result<(OwnedHandle, OwnedHandle)> {

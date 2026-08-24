@@ -24,6 +24,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
+| [`scratchpad_merge`](./scratchpad.md#scratchpad_merge) | Read | Combine several scratchpad entries into one |
+| [`scratchpad_rename`](./scratchpad.md#scratchpad_rename) | Read | Rename a scratchpad entry |
 | [`scratchpad_load_file`](./scratchpad.md#scratchpad_load_file) | Read | Load a file into the scratchpad |
 | [`scratchpad_save_file`](./scratchpad.md#scratchpad_save_file) | Workspace | Write a scratchpad entry out to a path |
 | [`skill_read`](./overview.md#the-skill_-tools) | Read | Load a named skill's instructions |

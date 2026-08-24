@@ -781,15 +781,6 @@ impl Agent {
         Arc::clone(&self.session_lock)
     }
 
-    /// Shared handle to the agent's session-scoped working directory. Public so frontends can
-    /// observe live cwd changes via the same `Arc` the `/cd` handler mutates; currently unused
-    /// because main.rs / acp.rs build the `SharedCwd` themselves and pass it in. Kept
-    /// allow(dead_code) until a frontend reaches for it.
-    #[allow(dead_code)]
-    pub fn cwd(&self) -> &SharedCwd {
-        &self.cwd
-    }
-
     /// Build an `Agent` configured for sub-agent use: silent, with no MCP readiness gate.
     ///
     /// Inherits `sandboxed_shell`, `context_messages` and the auto-compaction settings from the
@@ -3807,8 +3798,6 @@ fn should_nudge_thinking_only(
         && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
 }
 
-/// Preprocess message content blocks for the compaction summarizer:
-/// replace images with "[image]" markers and truncate large text blocks.
 /// Cap a checkpoint tool result at the size a normal turn would allow inline.
 ///
 /// A normal turn spills anything larger to the scratchpad
@@ -3880,6 +3869,8 @@ fn strip_images(content: &mut [ContentBlock]) {
     }
 }
 
+/// Preprocess message content blocks for the compaction summarizer:
+/// replace images with "[image]" markers and truncate large text blocks.
 fn strip_images_and_truncate(content: &mut [ContentBlock]) {
     use crate::provider::ToolResultContent;
 

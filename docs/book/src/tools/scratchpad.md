@@ -10,7 +10,7 @@ The scratchpad is a session-scoped working memory that the agent can use to stor
 
 ## Tools
 
-All five tools below ship default-active; no `load_tool` round-trip is required to use any of them.
+The whole family ships default-active; no `load_tool` round-trip is required to use any of them.
 
 ### `scratchpad_write`
 
@@ -65,6 +65,32 @@ Delete a scratchpad entry by name.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `name` | string | yes | The entry name to delete |
+
+### `scratchpad_merge`
+
+Combine several entries into one without routing the bytes through the conversation. Useful for
+collecting parallel sub-agent reports. A sub-agent cannot merge into a name it inherited read-only
+from its parent, though it may read such a name as a source.
+
+**Permission:** Read
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `sources` | array of string | yes | Entry names to combine, in order |
+| `target` | string | yes | Name to store the result under; overwrites if it exists |
+| `format` | string | no | `concat_with_headers` (default, prepends `--- name ---`), `concat`, or `json_array` |
+
+### `scratchpad_rename`
+
+Rename an entry without round-tripping its content through the conversation. Errors if `old` does
+not exist, if `new` already exists, or, for a sub-agent, if either name is inherited read-only.
+
+**Permission:** Read
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `old` | string | yes | Current entry name |
+| `new` | string | yes | Replacement entry name |
 
 ### `scratchpad_load_file`
 

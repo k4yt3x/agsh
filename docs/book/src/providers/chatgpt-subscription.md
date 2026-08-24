@@ -82,7 +82,7 @@ If you have both a ChatGPT subscription and an OpenAI API key:
 
 ## Logging Out
 
-`meka provider remove <name>` revokes the OAuth token (best-effort), deletes the stored credential
+`meka provider remove <name>` deletes the stored credential
 from the database, and removes the profile from the config file:
 
 ```bash

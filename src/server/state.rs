@@ -292,7 +292,6 @@ impl TurnGuard {
     /// in-flight tracker decreases as soon as any other turn finishes).
     // `ProblemDetail` is ~144 bytes; for a path that fires at most once per request the
     // extra stack space is fine and boxing would just shuffle the allocation to the heap.
-    #[allow(clippy::result_large_err)]
     pub fn acquire(
         process_counter: Arc<AtomicUsize>,
         session_counter: Arc<AtomicUsize>,

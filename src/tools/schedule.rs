@@ -138,12 +138,11 @@ impl Tool for ScheduleCreateTool {
                     "isolated": {
                         "type": "boolean",
                         "description": "Run in a fresh session instead of this conversation. \
-                                        Cheaper for a recurring job, since this conversation's \
-                                        history is not replayed on every fire and the fires do \
-                                        not pile up in it. The trade is continuity: the turn \
-                                        recalls nothing said here and its result does not \
-                                        appear here. Leave it false when the job depends on \
-                                        that. Only `meka serve` honours it."
+                                        Cheaper for a recurring job: this conversation's history \
+                                        is not replayed on every fire and the fires do not pile \
+                                        up in it. The trade is continuity, since the turn recalls \
+                                        nothing said here and its result does not appear here. \
+                                        Only `meka serve` honours it."
                     }
                 },
                 "required": ["prompt"]

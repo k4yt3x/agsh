@@ -497,12 +497,12 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
             }
             // A description of nothing but control characters survives the write door -- they are
             // not whitespace, so `trim().is_empty()` says it is a description -- and leaves the
-            // file with `description: ""`, which the importer skips as having none. That is a
+            // file with `description: ""`, which reads back as having none. That is a
             // memory lost through a backup, so the export refuses instead.
             if !memory::description_survives_export(&memory.description) {
                 return Some(format!(
                     "{} (its description is made only of characters YAML cannot carry, so the \
-                     file would have none and the importer would skip it)",
+                     file would have none and it would not read back)",
                     memory.name
                 ));
             }
@@ -511,10 +511,9 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
         .collect();
     if !unusable.is_empty() {
         return Err(MekaError::Config(format!(
-            "{} memor{} cannot be written out, so nothing was exported: {}. A bad description is \
-             fixable with `meka memory add <name> --force --description ...`; a bad *name* is not \
-             -- that command validates the name too -- so remove {} with \
-             `meka memory remove <name>`, then re-run.",
+            "nothing exported: {} memor{} cannot be written out ({}). A bad description is fixable \
+             with `meka memory add <name> --force --description ...`; a bad name is not, so remove \
+             {} with `meka memory remove <name>`.",
             unusable.len(),
             if unusable.len() == 1 { "y" } else { "ies" },
             unusable.join(", "),
@@ -1210,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn an_unexportable_name_stops_the_export_before_it_writes_anything() {
         let store = MemoryStore::in_memory().await.expect("store");
-        // Past the CLI door, as a hand-edited database or an older importer would.
+        // Past the CLI door, as a hand-edited database would.
         for name in ["aaa", "nul", "zzz"] {
             store
                 .write(WriteRequest {
@@ -1234,7 +1233,7 @@ mod tests {
             "it must name the offender: {message}"
         );
         assert!(
-            message.contains("nothing was exported"),
+            message.contains("nothing exported"),
             "and say the export did not happen: {message}"
         );
         assert!(
@@ -1282,12 +1281,12 @@ mod tests {
     }
 
     /// A description the file cannot carry stops the export, rather than writing a file the
-    /// importer will skip.
+    /// cannot be read back.
     ///
     /// `require_str` only refuses a description that is blank after `trim`, and a control character
     /// is not whitespace -- so `\u{1}` is a description at every write door and nothing at all once
     /// `render_memory` has dropped what YAML cannot represent. The file then says
-    /// `description: ""`, and the importer treats that as having none and skips the memory: a note
+    /// `description: ""`, and that reads back as having none: a note
     /// lost through the one path that exists to preserve it.
     #[tokio::test]
     async fn a_description_the_file_cannot_carry_stops_the_export() {
@@ -1315,7 +1314,7 @@ mod tests {
             "it must name the offender: {message}"
         );
         assert!(
-            message.contains("importer would skip it"),
+            message.contains("would not read back"),
             "and say what would go wrong: {message}"
         );
         assert!(

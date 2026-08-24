@@ -24,7 +24,7 @@ meka uses Emacs-style keybindings (provided by reedline).
 |-----|--------|
 | Enter | Submit the current prompt |
 | Alt+Enter | Insert a newline (for multi-line input) |
-| Shift+Tab | Cycle the permission mode (none &rarr; read &rarr; ask &rarr; write &rarr; none) |
+| Shift+Tab | Cycle the permission mode, skipping any not in `[permissions].enabled` (by default none &rarr; read &rarr; workspace &rarr; unrestricted &rarr; none) |
 
 ### Navigation
 
@@ -108,7 +108,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/exit` | Exit the shell |
 | `/clear` | Clear the terminal screen |
 | `/session` | Show the current session ID |
-| `/permission [none\|read\|ask\|write]` | Show or set the permission level |
+| `/permission [none\|read\|workspace\|ask\|unrestricted]` | Show or set the permission level |
 | `/compact` | Summarize and compact the session history |
 | `/rewind [N]` | Drop the last `N` turns (default 1) from the conversation the model sees |
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
@@ -147,7 +147,7 @@ Session status
   Model:           claude-opus-4-8
   Provider:        claude-max (claude-subscription)
   Effort:          xhigh
-  Thinking:        on
+  Thinking:        adaptive
   Turns:           23
   Context:         128.4k / 1.0M (13% used, 871.6k left)
   Input tokens:    234.5k  (cache hit: 92%)
@@ -156,7 +156,7 @@ Session status
   Messages:        47
 ```
 
-The top block reports what the session actually resolved to: the model, the active profile and its backend, the reasoning `Effort` sent on the wire (the line is omitted when the profile sets none, in which case the provider applies its own default), and the `Thinking` mode. The rest are cumulative counters for the session.
+The top block reports what the session actually resolved to: the model, the active profile and its backend, the reasoning `Effort` sent on the wire (omitted when nothing is sent, so the provider applies its own default; `claude-subscription` sends `high` when the profile sets none), and the `Thinking` mode. The rest are cumulative counters for the session.
 
 `Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Set [`display.show_context_in_prompt`](../configuration/config-file.md#displayshow_context_in_prompt) to show the same gauge in the prompt itself.
 

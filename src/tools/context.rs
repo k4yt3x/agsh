@@ -78,15 +78,10 @@ impl Tool for ContextCheckTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "context_check".to_string(),
-            description: "Measure your context window right now. The `[Context budget]` line in \
-                          the per-turn context is rendered once, at the start of the turn, so it \
-                          does not move while you work; this does. Call it before reading a large \
-                          file, starting a long stretch of tool calls, or deciding whether a task \
-                          fits. Reports what you are using, how much headroom is left before \
-                          compaction, how much of the window is fixed overhead that compaction \
-                          cannot reclaim, how much of the recent conversation would survive a \
-                          compaction verbatim, and how many times this session has already been \
-                          compacted."
+            description: "Measure your context window now. Unlike the `[Context budget]` line, \
+                          which is fixed at the start of the turn, this is live. Call it before \
+                          reading a large file, starting a long stretch of tool calls, or \
+                          deciding whether a task fits."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -202,13 +197,11 @@ impl Tool for ContextCompactTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "context_compact".to_string(),
-            description: "Ask for your conversation to be compacted at the end of this turn. \
-                          Earlier turns are replaced by a summary you write yourself, after a \
-                          checkpoint in which you can save anything that must outlive them to \
-                          memory. Use this when you are done with a stretch of work and do not \
-                          need its detail any more, rather than waiting for auto-compaction to \
-                          fire mid-task. The full history stays on disk and remains reachable \
-                          with `conversation_search`."
+            description: "Compact this conversation when the turn ends. Earlier turns become a \
+                          summary you write, after a checkpoint for saving anything that must \
+                          outlive them. Use it when a stretch of work is done rather than \
+                          waiting for auto-compaction mid-task. `conversation_search` still \
+                          reaches the full history."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

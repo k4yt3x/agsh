@@ -655,7 +655,6 @@ pub struct ImportResponse {
 }
 
 /// Refuse an envelope large enough to hold the database against every other request.
-#[allow(clippy::result_large_err)]
 fn store_too_large(count: usize) -> ProblemDetail {
     ProblemDetail::new(
         ErrorKind::InvalidBody,
