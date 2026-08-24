@@ -113,7 +113,7 @@ When creating a session, specify the working directory and optionally a permissi
 ```json
 {
   "cwd": "/home/user/project",
-  "permission": "write",
+  "permission": "workspace",
   "capabilities": {
     "supports_reasoning_stream": false,
     "supports_permission_prompts": true
@@ -143,7 +143,7 @@ Set `supports_permission_prompts: false` if you stream but have no interface to 
 prompt on, which is the normal case for a service-to-service client streaming for liveness. Gated
 tools are then denied immediately with an explanatory `notice`, the same as blocking mode. Leaving it
 `true` means every gated call parks for 60 seconds and then denies anyway, which is hard to tell
-apart from a hang. Better still, create the session with `permission: "write"` so nothing is gated.
+apart from a hang. Better still, create the session with `permission: "workspace"` so nothing is gated.
 
 #### Forking a session
 
@@ -440,7 +440,7 @@ Delivery is fire-and-forget on a detached task, so a slow or dead receiver never
 
 ## Permission modes over HTTP
 
-The same four [permission levels](./permissions.md) apply: `none`, `read`, `ask`, `write`. Set the level at session creation or update it via `PATCH /v1/sessions/{id}`.
+The same five [permission levels](./permissions.md) apply: `none`, `read`, `workspace`, `ask`, `unrestricted`. Set the level at session creation or update it via `PATCH /v1/sessions/{id}`.
 
 ### Ask mode
 
@@ -466,11 +466,11 @@ If no response arrives within 60 seconds, the permission defaults to `deny`.
 
 ### Ask mode with blocking turns
 
-When `stream: false` and the session is in `ask` mode, there is no SSE channel for permission prompts. The agent runs the turn with tool permissions **auto-denied**; each denied tool appends a `notice` to the response explaining what happened and suggesting `permission: "write"` or `stream: true`.
+When `stream: false` and the session is in `ask` mode, there is no SSE channel for permission prompts. The agent runs the turn with tool permissions **auto-denied**; each denied tool appends a `notice` to the response explaining what happened and suggesting `permission: "workspace"` or `stream: true`.
 
 **MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
 
-**Recommendation:** non-interactive callers (bots, bridges, scripts) should create sessions with `permission: "read"` or `permission: "write"` so auto-deny never triggers. Use `stream: true` if you need approval flow.
+**Recommendation:** non-interactive callers (bots, bridges, scripts) should create sessions with `permission: "read"` or `permission: "workspace"` so auto-deny never triggers. Use `stream: true` if you need approval flow.
 
 ## Authentication
 
@@ -863,7 +863,7 @@ Descriptions and bodies are returned **exactly as stored**, not as they are rend
 
 These four endpoints are **not** gated by `[memory] enabled`. That switch decides whether an agent keeps memories; a token is the operator, so it reaches a store that already exists exactly as `meka memory list` does in a shell.
 
-A scheduled job's optional `gate` is the sharpest grant on this API. The command runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. It therefore requires `sessions:w` in addition to `schedule:w`, and the session must be at `write`. A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a shell. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
+A scheduled job's optional `gate` is the sharpest grant on this API. The command runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. It therefore requires `sessions:w` in addition to `schedule:w`, and the session must be at `unrestricted`. A gate is the one grant `workspace` does not carry: the command runs outside the turn, so nothing confines it to the workspace roots, and the API's own 403 says `unrestricted`. A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a shell. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
 
 `DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools — the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation.
 

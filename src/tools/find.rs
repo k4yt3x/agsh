@@ -104,19 +104,33 @@ impl Tool for FindFilesTool {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
             None => crate::workspace::glob_roots(&self.cwd, &self.roots),
         };
-        let full_patterns: Vec<String> = base_paths
-            .iter()
-            .map(|base| {
-                // The base is escaped, the caller's `pattern` is not: a root is a literal
-                // directory, and a client is free to have one named `2024*` or `notes[1]`. Without
-                // this those parse as wildcards, silently widening the search past the named roots.
-                format!(
-                    "{}/{}",
-                    glob::Pattern::escape(base.to_string_lossy().trim_end_matches('/')),
-                    pattern,
-                )
-            })
-            .collect();
+        let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
+        for base in &base_paths {
+            // Normalised through the type rather than by trimming a character. The old code did
+            // `trim_end_matches('/')`, which leaves a Windows `C:\work\` alone and yields
+            // `C:\work\/*.md`, whose meaning then depends on `glob`'s separator handling rather
+            // than on anything meka decided. Re-collecting the components drops a trailing
+            // separator on both platforms. A trailing separator is reachable: `resolve_against_cwd`
+            // preserves one, and an ACP client may send it in `additionalDirectories`.
+            let base: std::path::PathBuf = base.components().collect();
+            // `glob` takes a `&str` and there is no byte-oriented entry point, so a root that is
+            // not valid UTF-8 cannot be searched. Refused loudly. Left to `to_string_lossy` it
+            // became a path that does not exist, `glob` yielded nothing, and `find_files` reported
+            // "No files found" -- a definitive answer to a question it never actually asked.
+            let Some(base) = base.to_str() else {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "find_files".to_string(),
+                    message: format!(
+                        "workspace root '{}' is not valid UTF-8, and the glob matcher cannot accept it. Pass an explicit `path` inside a root that is, or rename the directory.",
+                        base.display()
+                    ),
+                });
+            };
+            // The base is escaped, the caller's `pattern` is not: a root is a literal directory,
+            // and a client is free to have one named `2024*` or `notes[1]`. Without this those
+            // parse as wildcards, silently widening the search past the named roots.
+            full_patterns.push(format!("{}/{}", glob::Pattern::escape(base), pattern));
+        }
 
         // Cap precedence:
         //   1. explicit `limit` parameter: honoured verbatim

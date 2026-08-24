@@ -101,7 +101,9 @@ impl SkillDetail {
     fn from_skill(skill: &crate::skills::Skill, body: Option<String>) -> Self {
         Self {
             name: skill.name.clone(),
-            description: skill.description.clone(),
+            // Sanitised for the same reason as the listing endpoint's: a description is a label a
+            // client renders, and the store returns what the file holds.
+            description: crate::memory::render_description_for_model(&skill.description),
             priority: skill.priority,
             version: skill.version(),
             author: skill.author(),
@@ -547,7 +549,7 @@ pub async fn put_memory(
         .memories
         .write(crate::memory::store::WriteRequest {
             name: name.clone(),
-            description: crate::store::normalize_description(&body.description),
+            description: Some(crate::store::normalize_description(&body.description)),
             tags,
             body: body.body.clone(),
             priority: body.priority,
@@ -604,7 +606,7 @@ pub async fn delete_memory(
 pub struct ToolView {
     pub name: String,
     pub description: String,
-    /// Permission level this tool needs: `none`, `read`, `ask`, or `write`.
+    /// Permission level this tool needs: `none`, `read`, `workspace`, `ask`, or `unrestricted`.
     pub required_permission: String,
     /// Whether the tool is deferred: present in the catalogue by name but with its schema withheld
     /// until the model calls `load_tool`.

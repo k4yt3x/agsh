@@ -1,10 +1,10 @@
 //! The `skill_*` tools: the agent's access to the installed skill store ([`crate::skills`]).
 //!
 //! All four gate at [`Permission::Read`], for the reason spelled out on [`crate::tools::memory`]:
-//! `Write` in meka means "may modify the user's tree", and these write to a store meka owns under
-//! its own config directory. `agent_spawn` is a read-tier tool too, so the dispatcher deployment
-//! these exist for runs at read permission permanently; gating them at `Write` would withhold them
-//! from the only configuration that wants them.
+//! `workspace` in meka means "may modify the user's tree", and these write to a store meka owns
+//! under its own config directory. `agent_spawn` is a read-tier tool too, so the dispatcher
+//! deployment these exist for runs at read permission permanently; gating them at `workspace` would
+//! withhold them from the only configuration that wants them.
 //!
 //! `skill_write` and `skill_delete` are registered only when `[skills] agent_managed` is on, and
 //! never for a sub-agent. The authorization lives in that flag rather than in the permission tier.
@@ -297,7 +297,9 @@ impl Tool for SkillWriteTool {
                     "description": {
                         "type": "string",
                         "description": "One line stating what the skill is for, shown in every \
-                                        future session's skill index"
+                                        future session's skill index. Required when creating a \
+                                        skill; omit it to leave an existing skill's description \
+                                        untouched"
                     },
                     "priority": {
                         "type": "integer",
@@ -314,7 +316,7 @@ impl Tool for SkillWriteTool {
                                         existing skill's body untouched"
                     }
                 },
-                "required": ["name", "description"]
+                "required": ["name"]
             }),
             ..Default::default()
         }
@@ -338,8 +340,45 @@ impl Tool for SkillWriteTool {
             tool_name: "skill_write".to_string(),
             message,
         })?;
-        let description = require_str(&input, "description", "skill_write")?;
-        let body = input.get("body").and_then(serde_json::Value::as_str);
+        // Omit-to-keep, like `body` and `priority` below. It was required, which forced an agent
+        // refining a stored skill to resend a description it cannot actually see: the only copy in
+        // its context is the `[Skills]` index's, elided to 500 characters. Refining the *body* of a
+        // skill whose description ran to 900 characters therefore rewrote that description as 503
+        // ending in `...`, silently, on a call that never mentioned it.
+        let requested_description = match input.get("description") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => {
+                if text.trim().is_empty() {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: "skill_write".to_string(),
+                        message: "'description' cannot be empty; omit it entirely to keep the \
+                                  description a skill already has"
+                            .to_string(),
+                    });
+                }
+                Some(text.clone())
+            }
+            Some(value) => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "skill_write".to_string(),
+                    message: format!("'description' must be a string, got {}", value),
+                });
+            }
+        };
+        // A present-but-not-a-string `body` is refused rather than read as absent. `as_str`
+        // returning `None` put `body: ["line one", "line two"]` down the omit-to-keep path, so the
+        // call reported success while storing nothing the caller sent -- and on a *new* skill it
+        // created one with an empty body. `memory_write` hard-errors on exactly this shape.
+        let body: Option<String> = match input.get("body") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(value) => {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "skill_write".to_string(),
+                    message: format!("'body' must be a string, got {}", value),
+                });
+            }
+        };
         let requested_priority = match input.get("priority") {
             Some(serde_json::Value::Null) | None => None,
             Some(value) => {
@@ -365,15 +404,76 @@ impl Tool for SkillWriteTool {
         // Unreadable first, because it is the more specific answer: a file that is both foreign and
         // unparseable needs its parse error named, and `reject_unreadable` carries the read-only
         // remedy for that case where the plain foreign refusal cannot carry the reason.
+        //
+        // These two run *before* the description is resolved. Resolving first put an "it does not
+        // exist" refusal in front of them, and `SkillIndex` keeps loaded and skipped skills
+        // disjoint -- so a skill whose `SKILL.md` is present but unparseable is absent from
+        // `installed.find`, and a body-only write to it answered "no skill named 'x' exists, so a
+        // description is required to create it". That is false, it contradicts the ordering this
+        // comment asserts, and the model's natural retry (resend with a description) is the call
+        // that finally surfaces the real parse error.
         if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
         }
         if let Some(refusal) = skills::refuse_foreign_write(&installed, &name, &root) {
             return Ok(ToolOutput::text(format!("Error: {}", refusal), true));
         }
+
+        let existing = installed.find(&name);
+        // Resolved against the same snapshot `priority` used, so both answer "what does the skill
+        // already say" from one read. A write that creates the skill has nothing to keep, so the
+        // description is required there and the refusal says which case this is.
+        let description = match requested_description {
+            Some(description) => description,
+            None => match existing {
+                // Truncated to what `write_skill` will accept, because it is being *carried*
+                // rather than authored. `parse_skill_definition` only warns about an over-long
+                // description, so a skill imported from a repository loads with one; handing it
+                // straight back made `write_skill` refuse the write with "description is 1100
+                // characters; the spec allows at most 1024" -- an error about a field the call
+                // never mentioned, on the most obviously correct call the model can make. Before
+                // omit-to-keep existed the agent supplied its own conforming description and the
+                // body landed, so this was a regression in the ordinary path.
+                //
+                // Truncated to the *spec's* 1024, not to the index's 500. Reaching for
+                // `elide_description_for_index` here would cap it at 500 and reintroduce exactly
+                // the silent rewrite omit-to-keep exists to prevent.
+                Some(skill) => skill
+                    .description
+                    .char_indices()
+                    .nth(skills::MAX_DESCRIPTION_LEN)
+                    .map_or_else(
+                        || skill.description.clone(),
+                        |(cut, _)| skill.description[..cut].to_string(),
+                    ),
+                None => {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: "skill_write".to_string(),
+                        message: format!(
+                            "no skill named '{}' exists, so a description is required to create it",
+                            name
+                        ),
+                    });
+                }
+            },
+        };
         // Read before the write, since the write is what makes the file exist: otherwise the
         // confirmation would claim to have kept the body of a skill that had none.
-        let kept_existing_body = body.is_none() && installed.find(&name).is_some();
+        //
+        // Whether there is a body to *keep*, not merely a file: testing existence alone made a
+        // metadata-only update to a body-less skill report ", keeping the existing body" -- a claim
+        // about content that does not exist, on the one line whose whole job is to distinguish a
+        // metadata update from a rewrite. `memory_write` already reads it this way and its comment
+        // describes the same defect.
+        let kept_existing_body = body.is_none()
+            && existing.is_some_and(|skill| {
+                std::fs::read_to_string(&skill.body_path)
+                    .ok()
+                    .and_then(|text| {
+                        crate::store::split_frontmatter(&text).map(|(_, body)| body.to_string())
+                    })
+                    .is_some_and(|body| !body.trim().is_empty())
+            });
 
         // On the blocking pool, for the same reason `memory_write` is: the write goes through
         // `write_file_atomic`, which `fsync`s, and a `fsync` parks the calling thread for as long
@@ -382,7 +482,7 @@ impl Tool for SkillWriteTool {
             let root = root.clone();
             let name = name.clone();
             let description = description.clone();
-            let body = body.map(str::to_string);
+            let body = body.clone();
             tokio::task::spawn_blocking(move || {
                 skills::write_skill(
                     &root,
@@ -596,7 +696,7 @@ mod tests {
             allowed_tools: None,
             priority: crate::store::DEFAULT_PRIORITY,
             metadata: None,
-            extra: std::collections::BTreeMap::new(),
+            extra: serde_norway::Mapping::new(),
             conformance: crate::skills::Conformance::default(),
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
             root: std::path::PathBuf::from("/tmp"),
@@ -638,7 +738,167 @@ mod tests {
 
     /// A skill from a read-only `extra_paths` root is not the agent's to change: the write would
     /// land in meka's own store and shadow it, so the tool would report an update that did not
-    /// happen to the file every other client reads.
+    /// A body-only write reaches a skill whose stored description exceeds the spec cap, and one
+    /// whose file is present but unparseable is told so rather than told it does not exist.
+    ///
+    /// Both were introduced by the omit-to-keep change. The description resolution sat above the
+    /// two refusal gates, and `SkillIndex` keeps loaded and skipped skills disjoint, so an
+    /// unparseable skill was reported absent -- costing the model a turn and telling it something
+    /// untrue. Separately, `parse_skill_definition` only warns about an over-long description, so a
+    /// skill imported from a repository loads with one; handing that back to `write_skill`
+    /// unchanged made it refuse the write over a field the call never mentioned.
+    #[tokio::test]
+    async fn a_body_only_write_survives_an_awkward_stored_description() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+
+        // Longer than the spec's cap, which discovery accepts with a warning.
+        let long = "d".repeat(skills::MAX_DESCRIPTION_LEN + 76);
+        let dir = root.join("imported");
+        std::fs::create_dir_all(&dir).expect("skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: imported\ndescription: {long}\n---\n\nORIGINAL\n"),
+        )
+        .expect("write");
+
+        let skills_cache = SkillCache::new(Some(root.clone()), Vec::new());
+        let write = SkillWriteTool {
+            skills: skills_cache.clone(),
+        };
+
+        let refined = run(
+            &write,
+            serde_json::json!({"name": "imported", "body": "REFINED"}),
+        )
+        .await;
+        assert!(
+            !refined.is_error,
+            "a body-only write must not be refused over the description it is carrying: {}",
+            text_of(&refined)
+        );
+        let stored = std::fs::read_to_string(dir.join("SKILL.md")).expect("read back");
+        assert!(
+            stored.contains("REFINED"),
+            "the body must have landed: {stored}"
+        );
+
+        // A present-but-unparseable skill is named for what it is.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).expect("broken dir");
+        std::fs::write(
+            broken.join("SKILL.md"),
+            "---\ndescription: [unclosed\n---\nBODY\n",
+        )
+        .expect("write");
+        skills_cache.invalidate().await;
+
+        let result = run(&write, serde_json::json!({"name": "broken", "body": "new"})).await;
+        let message = text_of(&result);
+        assert!(
+            !message.contains("does not exist") && !message.contains("is required to create it"),
+            "a skill whose file is on disk must not be reported as absent: {message}"
+        );
+    }
+
+    /// A non-string `body` is refused, not read as "leave it alone".
+    ///
+    /// `as_str` returning `None` put `body: ["a", "b"]` down the omit-to-keep path, so the call
+    /// reported success while storing nothing the caller sent -- and on a new skill it created one
+    /// with an empty body. `memory_write` hard-errors on the same shape.
+    #[tokio::test]
+    async fn a_non_string_body_is_refused_rather_than_treated_as_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+        let write = SkillWriteTool {
+            skills: SkillCache::new(Some(root), Vec::new()),
+        };
+
+        let result = write
+            .execute(
+                serde_json::json!({
+                    "name": "listy",
+                    "description": "d",
+                    "body": ["line one", "line two"],
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let message = match result {
+            Err(error) => error.to_string(),
+            Ok(output) => text_of(&output),
+        };
+        assert!(
+            message.contains("'body' must be a string"),
+            "a list body must be refused by name: {message}"
+        );
+    }
+
+    /// An omitted `description` keeps the stored one, and is refused when there is none to keep.
+    ///
+    /// Same defect and same shape as `memory_write`'s: the field was required, and the only copy
+    /// of a description an agent can see is the `[Skills]` index's, elided to 500 characters. So
+    /// refining a skill's body forced the model to resend a description it could only reconstruct
+    /// from that elision, and one longer than the cap came back as 503 characters ending in `...`
+    /// with the write reporting success.
+    #[tokio::test]
+    async fn omitting_a_skill_description_keeps_the_stored_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        std::fs::create_dir_all(&root).expect("root");
+        let skills = SkillCache::new(Some(root.clone()), Vec::new());
+        let write = SkillWriteTool {
+            skills: skills.clone(),
+        };
+
+        // Longer than the index elides to, which is the case that made the loss invisible.
+        let long = format!("how to triage a build failure {}", "in detail ".repeat(90));
+        let created = run(
+            &write,
+            serde_json::json!({"name": "triage", "description": long, "body": "FIRST"}),
+        )
+        .await;
+        assert!(!created.is_error, "{}", text_of(&created));
+
+        let refined = run(
+            &write,
+            serde_json::json!({"name": "triage", "body": "SECOND"}),
+        )
+        .await;
+        assert!(!refined.is_error, "{}", text_of(&refined));
+
+        let stored = skills.current().await;
+        let skill = stored.find("triage").expect("still installed");
+        assert_eq!(
+            skill.description,
+            crate::store::normalize_description(&long),
+            "refining the body must not rewrite the description"
+        );
+
+        // Nothing to keep: creating a skill still needs one, and the refusal says so.
+        let missing = write
+            .execute(
+                serde_json::json!({"name": "brand-new", "body": "text"}),
+                CancellationToken::new(),
+            )
+            .await;
+        let message = match missing {
+            Err(error) => error.to_string(),
+            Ok(output) => text_of(&output),
+        };
+        assert!(
+            message.contains("description is required to create it"),
+            "creating without a description must say which case this is: {message}"
+        );
+    }
+
+    /// Both write doors refuse a skill that lives in a read-only extra root, and neither writes
+    /// anything anywhere as a side effect.
+    ///
+    /// The refusal is only the visible half. The half worth a test is what must *not* happen to the
+    /// file every other client reads.
     #[tokio::test]
     async fn write_and_delete_refuse_a_skill_from_a_read_only_root() {
         let temp = tempfile::tempdir().expect("tempdir");

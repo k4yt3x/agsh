@@ -53,9 +53,9 @@ If the client omits a capability, the matching tool falls back to local syscalls
 
 ## Shell commands stay inside meka
 
-`execute_command` never runs in the client's terminal, whatever the client advertises and whatever the permission mode. meka spawns the process itself so everything it wraps a command in keeps applying: the read-mode sandbox (Landlock / bwrap / sandbox-exec / Low-Integrity), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
+`execute_command` never runs in the client's terminal, whatever the client advertises and whatever the permission mode. meka spawns the process itself so everything it wraps a command in keeps applying: the sandbox that `read` and `workspace` depend on (Landlock / bwrap / sandbox-exec / restricted token), the environment scrub that keeps API keys out of the child, the per-session cwd from `/cd`, the timeout, and the process-group kill that reaches backgrounded grandchildren. The client's `terminal/*` offers none of that.
 
-meka used to delegate in any mode other than `read`, which made `ask` mode a sandbox bypass: meka treats `ask` as sandboxed and refuses to run at all when no sandbox backend is available, yet handed the command to an unsandboxed editor terminal anyway. Delegation is gone rather than narrowed to `write`.
+meka used to delegate in any mode other than `read`, which made every sandboxed mode a bypass: meka would refuse to run at all when no sandbox backend was available, then hand the same command to an unsandboxed editor terminal. Delegation is gone rather than narrowed, so `workspace` keeps its boundary here exactly as it does in the REPL.
 
 ### Live output
 
@@ -139,7 +139,8 @@ meka's `Permission` levels map 1:1 to ACP `SessionMode` ids:
 | `None` | `none` | None | No tools available. |
 | `Read` | `read` | Read | File reads and searches only. No writes, no shell. |
 | `Ask` | `ask` | Ask | Every write or shell command requires approval. |
-| `Write` | `write` | Write | All tools allowed without per-call approval. |
+| `Workspace` | `workspace` | Workspace | Writes confined to the workspace roots. No approval prompts. |
+| `Unrestricted` | `unrestricted` | Unrestricted | Writes and shell commands reach anywhere on the machine. |
 
 The full mode picker is advertised on every session-creation response (`NewSessionResponse.modes`, `LoadSessionResponse.modes`, `ResumeSessionResponse.modes`) but only the modes in `[permissions].enabled` from your `config.toml` are listed; picking a disabled mode would just error.
 

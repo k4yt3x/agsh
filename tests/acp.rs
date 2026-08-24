@@ -751,13 +751,85 @@ enum PermissionAnswer {
     RejectOnce,
 }
 
+/// An ACP session at `workspace` writes inside its cwd and is refused outside it.
+///
+/// The ACP surface had no `workspace` session at all: its three mentions of the word are about ACP
+/// *workspace folders*, which are unrelated. So the fence could stop being applied to a session
+/// `session/new` created and nothing on this surface would notice.
+///
+/// Asserts disk state rather than the tool-call status, because a tool that never ran and one the
+/// fence refused report the same way.
+#[test]
+fn an_acp_session_at_workspace_is_fenced_to_its_cwd() {
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "workspace"
+enabled = ["read", "workspace", "unrestricted"]
+"#;
+    let outside_dir = tempfile::tempdir().expect("tempdir");
+    let outside = outside_dir.path().join("escaped.txt");
+    let outside_for_script = outside.clone();
+
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(move |config_dir| {
+            // The session's cwd is the config dir, so this one is inside the boundary.
+            let inside = config_dir.join("inside.txt");
+            serde_json::json!([
+                [
+                    { "kind": "tool_use_start", "id": "call_in", "name": "write_file" },
+                    {
+                        "kind": "tool_use_end",
+                        "input": { "path": inside.to_str().unwrap(), "content": "in" }
+                    },
+                    { "kind": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "kind": "tool_use_start", "id": "call_out", "name": "write_file" },
+                    {
+                        "kind": "tool_use_end",
+                        "input": {
+                            "path": outside_for_script.to_str().unwrap(),
+                            "content": "out"
+                        }
+                    },
+                    { "kind": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "kind": "text", "text": "done" },
+                    { "kind": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+
+    let inside = harness.config_dir().join("inside.txt");
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "write both");
+    let _ = harness.await_response(id);
+
+    assert!(
+        inside.exists(),
+        "a write inside the session cwd must land at workspace"
+    );
+    assert_eq!(std::fs::read_to_string(&inside).expect("read back"), "in");
+    assert!(
+        !outside.exists(),
+        "a write outside every root must be refused at workspace"
+    );
+}
+
 /// Drive a full `meka acp` permission round-trip with the mock provider. The scripted turn calls
-/// `write_file` (requires `write` permission, which under `ask` mode triggers a
+/// `write_file` (which under `ask` triggers a
 /// `session/request_permission`); the test auto-responds with the configured outcome and asserts
 /// the resulting tool-call status.
 fn run_permission_scenario(answer: PermissionAnswer) {
-    // [permissions].default = "ask" puts the agent in Ask mode, so write_file's Write requirement
-    // triggers the round-trip we want to exercise.
+    // [permissions].default = "ask" puts the agent in `ask`, where a write triggers the round-trip
+    // we want to exercise.
     let config_toml = r#"
 [providers.mock]
 type = "anthropic-messages"
@@ -765,7 +837,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "ask"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -1728,7 +1800,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -1797,7 +1869,7 @@ enabled = ["read", "ask", "write"]
         .iter()
         .map(|m| m["id"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert_eq!(ids, vec!["read", "ask", "write"]);
+    assert_eq!(ids, vec!["read", "ask", "unrestricted"]);
     assert_eq!(modes["currentModeId"], "read");
 }
 
@@ -1986,7 +2058,7 @@ enabled = ["read", "ask"]
     );
 
     // Invalid set_mode: write is not in the enabled set.
-    let bad_response = harness.set_mode(&sid, "write");
+    let bad_response = harness.set_mode(&sid, "unrestricted");
     assert!(
         bad_response["error"].is_object(),
         "set_mode for a disabled mode must error: {}",
@@ -2072,8 +2144,8 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -2103,7 +2175,17 @@ enabled = ["read", "write"]
     // `write_file` canonicalizes the parent directory before handing the path to the delegate, so
     // the expected path matches `/private/var/...` on macOS rather than the `/var/...` tempdir
     // returns from `config_dir()`.
-    let target_dir = std::fs::canonicalize(harness.config_dir()).expect("canonicalize tempdir");
+    // Stripped of the `\\?\` prefix the way meka strips it, because this is compared against a
+    // path meka reports rather than one the test constructs. `canonicalize` alone yields the
+    // verbatim spelling, which is the one meka never emits, so the mismatch is Windows-only.
+    let target_dir = {
+        let canonical = std::fs::canonicalize(harness.config_dir()).expect("canonicalize tempdir");
+        let text = canonical.to_string_lossy();
+        match text.strip_prefix(r"\\?\") {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => canonical,
+        }
+    };
     let target = target_dir.join("delegated-write.txt");
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "write it");
@@ -2164,8 +2246,8 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 "#;
     // No capabilities advertised; the harness default is `{}`.
     let mut harness = AcpTestHarness::builder()
@@ -2227,7 +2309,7 @@ fn zed_shaped_capabilities() -> serde_json::Value {
 /// that the output is the local shell's, not the client's.
 #[test]
 fn acp_execute_command_never_leaves_meka() {
-    for mode in ["write", "ask"] {
+    for mode in ["unrestricted", "ask"] {
         let config_toml = format!(
             r#"
 [providers.mock]
@@ -2236,7 +2318,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "{mode}"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#
         );
         let script = serde_json::json!([
@@ -2317,15 +2399,16 @@ enabled = ["read", "ask", "write"]
     }
 }
 
-/// Write mode, so `execute_command` isn't subject to the sandbox's availability on the test host.
+/// `unrestricted`, so `execute_command` is not subject to the sandbox's availability on the test
+/// host.
 const ACP_WRITE_MODE_CONFIG: &str = r#"
 [providers.mock]
 type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 "#;
 
 /// A command's output reaches the client while it is still running, not only when it exits. The
@@ -2939,8 +3022,8 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 "#;
     // edit_file canonicalizes the target before reaching the delegation seam, so the path must
     // exist on disk. Seed it with a *different* content from what the delegate will serve; this
@@ -3037,7 +3120,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "ask"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -3330,7 +3413,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "ask"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -3650,7 +3733,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "write"]
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
     let sid_a = harness.new_session();
@@ -3661,7 +3744,7 @@ enabled = ["read", "write"]
     // afterwards by inspecting the raw transcript to be sure none leaked.
     let set_id = harness.send_request(
         "session/set_mode",
-        serde_json::json!({ "sessionId": sid_a.clone(), "modeId": "write" }),
+        serde_json::json!({ "sessionId": sid_a.clone(), "modeId": "unrestricted" }),
     );
     // Track session-id of every current_mode_update we observe by inline-collecting alongside the
     // response.
@@ -4055,7 +4138,7 @@ enabled = ["read"]
         "session/set_mode",
         serde_json::json!({
             "sessionId": sid,
-            "modeId": "write"
+            "modeId": "unrestricted"
         }),
     );
     assert_invalid_params(&disabled, "set_mode with disabled mode");
@@ -4529,7 +4612,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "ask"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -4839,7 +4922,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "write"]
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, Some(script));
     let sid = harness.new_session();
@@ -4853,7 +4936,7 @@ enabled = ["read", "write"]
 
     // set_mode while the turn is mid-sleep must return promptly (well under the sleep's 2s).
     let start = Instant::now();
-    let set_response = harness.set_mode(&sid, "write");
+    let set_response = harness.set_mode(&sid, "unrestricted");
     let elapsed = start.elapsed();
     assert!(
         set_response["result"].is_object(),
@@ -4882,7 +4965,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "ask"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -5447,8 +5530,8 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 
 [schedule]
 poll_interval = "1s"
@@ -5530,6 +5613,60 @@ fn acp_scheduled_job_fires_without_a_prompt() {
     );
 }
 
+/// The same, through `session/resume` rather than `session/load`.
+///
+/// `handle_resume_session` carries its own copy of the permission restore, and nothing exercised
+/// it: `a_mode_set_through_acp_survives_a_reload` covers the twin in `handle_load_session`, and
+/// `acp_session_resume_adopts_without_replay` asserts nothing about the mode. Deleting the resume
+/// path's block left the suite green -- and the result is a session running at the config default
+/// while its row claims a higher level, which the scheduler's fire-time re-check then trusts. Fail
+/// open, reached from the side that re-check cannot see.
+#[test]
+fn a_mode_set_through_acp_survives_a_resume() {
+    const CONFIG: &str = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "read"
+enabled = ["read", "ask", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::spawn(CONFIG, None);
+    let cwd = harness.config_dir().to_path_buf();
+
+    let new_response = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_eq!(new_response["result"]["modes"]["currentModeId"], "read");
+    let sid = new_response["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    let set = harness.set_mode(&sid, "unrestricted");
+    assert!(set["result"].is_object(), "set_mode must succeed: {}", set);
+
+    let closed = harness.request("session/close", serde_json::json!({ "sessionId": sid }));
+    assert!(
+        closed["result"].is_object(),
+        "close must succeed: {}",
+        closed
+    );
+
+    let resumed = harness.request(
+        "session/resume",
+        serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
+    );
+    assert_eq!(
+        resumed["result"]["modes"]["currentModeId"], "unrestricted",
+        "the resumed session fell back to the process default instead of the mode its row \
+         records: {}",
+        resumed
+    );
+}
+
 /// A mode set through `session/set_mode` survives a reload.
 ///
 /// Two halves of one invariant. `set_mode` only moved the in-memory cell, so the session row kept
@@ -5550,7 +5687,7 @@ model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask", "write"]
+enabled = ["read", "ask", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
     let cwd = harness.config_dir().to_path_buf();
@@ -5568,7 +5705,7 @@ enabled = ["read", "ask", "write"]
         .expect("sessionId")
         .to_string();
 
-    let set = harness.set_mode(&sid, "write");
+    let set = harness.set_mode(&sid, "unrestricted");
     assert!(set["result"].is_object(), "set_mode must succeed: {}", set);
 
     // Drop it from the live map so the reload rebuilds from the row rather than reusing the entry.
@@ -5584,7 +5721,7 @@ enabled = ["read", "ask", "write"]
         serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
     );
     assert_eq!(
-        loaded["result"]["modes"]["currentModeId"], "write",
+        loaded["result"]["modes"]["currentModeId"], "unrestricted",
         "the reloaded session fell back to the process default instead of the mode it was set to: \
          {}",
         loaded

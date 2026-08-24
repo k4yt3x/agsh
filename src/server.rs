@@ -229,6 +229,7 @@ pub async fn run_serve(
             );
             // Non-zero exit so systemd / container orchestrators can distinguish forced
             // abort from a clean drain. Same semantics as `meka acp`.
+            crate::sandbox::release_process_grants();
             std::process::exit(1);
         }
     }

@@ -136,6 +136,18 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
 pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path)
         .await
+        // Stripped, because this path is compared and keyed against paths produced elsewhere and
+        // Windows' `canonicalize` returns the one spelling nothing else uses.
+        //
+        // Three things went wrong at once, all Windows-only. `WriteScope::admit` matched this
+        // `\\?\C:\ws\f.txt` against roots that `writable_roots` had already stripped to
+        // `C:\ws`, so `starts_with` said no and *every* `edit_file` inside the workspace was
+        // refused while writes outside stayed refused too -- the boundary looked right and allowed
+        // nothing. The read tracker and the per-path write lock key on this value while
+        // `resolve_write_target` strips, so `write_file` and `edit_file` took different locks for
+        // one file and recorded different freshness keys for it. Normalising once, here, is what
+        // makes every door agree; `strip_verbatim` is the identity everywhere else.
+        .map(crate::workspace::strip_verbatim)
         .map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!("failed to resolve path '{}': {}", path.display(), error),
@@ -247,9 +259,14 @@ mod tests {
         let canonical = canonicalize_for_tool("test_tool", &file_path)
             .await
             .expect("canonicalize");
-        assert_eq!(
-            canonical,
-            std::fs::canonicalize(&file_path).expect("canonical")
+        assert_eq!(canonical, crate::workspace::canonical_for_test(&file_path));
+        // And specifically *not* the raw spelling, which is the whole reason this function is not
+        // a bare `canonicalize`: every other door in the tree normalises, so one that did not
+        // handed back a key nothing else could match.
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "the verbatim prefix must not survive: {}",
+            canonical.display()
         );
     }
 

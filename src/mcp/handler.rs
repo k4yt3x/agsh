@@ -457,6 +457,11 @@ impl Tool for McpToolAdapter {
         self.permission
     }
 
+    /// An MCP call runs in the server's own process, which meka spawns but does not sandbox.
+    fn runs_outside_confinement(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,

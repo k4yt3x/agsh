@@ -592,7 +592,7 @@ pub enum McpAction {
         #[arg(long)]
         redirect_port: Option<u16>,
 
-        /// Permission: none, read, ask, write (default: read)
+        /// Permission: none, read, workspace, ask, unrestricted (default: read)
         #[arg(long)]
         permission: Option<String>,
 
@@ -684,9 +684,20 @@ pub struct Cli {
     #[arg(short = 'r', long = "resume", value_name = "SESSION")]
     pub resume: Option<String>,
 
-    /// Initial permission mode (none, read, ask, write)
+    /// Initial permission mode (none, read, workspace, ask, unrestricted)
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
+
+    /// Extra directory writable at `workspace` permission (repeatable)
+    ///
+    /// The working directory is always writable at that level, as are any folders an
+    /// ACP client supplies. This adds to them.
+    ///
+    /// Deliberately a flag rather than a config key: which folders this run may write
+    /// is a per-run scope, like the working directory itself, not a preference to
+    /// persist.
+    #[arg(long = "writable-root", value_name = "PATH")]
+    pub writable_root: Vec<std::path::PathBuf>,
 
     /// Provider profile to use this run (overrides default_provider)
     #[arg(short = 'p', long = "provider")]
@@ -889,8 +900,35 @@ mod tests {
 
     #[test]
     fn test_cli_permission_flag() {
-        let cli = Cli::parse_from(["meka", "--permission", "write"]);
-        assert_eq!(cli.permission, Some(Permission::Write));
+        let cli = Cli::parse_from(["meka", "--permission", "workspace"]);
+        assert_eq!(cli.permission, Some(Permission::Workspace));
+        let cli = Cli::parse_from(["meka", "--permission", "unrestricted"]);
+        assert_eq!(cli.permission, Some(Permission::Unrestricted));
+        // The single-letter aliases are the indicator characters, so what the prompt shows is
+        // always something the flag accepts.
+        let cli = Cli::parse_from(["meka", "--permission", "u"]);
+        assert_eq!(cli.permission, Some(Permission::Unrestricted));
+    }
+
+    /// The retired `write` must fail *loudly* at the CLI rather than resolve to either replacement.
+    ///
+    /// This is the surface where a stale invocation is most likely to be automated, and a hard
+    /// exit is the good outcome there: a nonzero status stops a script, where a silently different
+    /// mode would let it run on with authority nobody chose. The message has to name both
+    /// replacements, because which one the user wants is not something meka can infer.
+    #[test]
+    fn permission_flag_refuses_the_retired_write_mode() {
+        let error = Cli::try_parse_from(["meka", "--permission", "write"])
+            .expect_err("'write' must not parse to any mode");
+        let rendered = error.to_string();
+        // See the sibling in `src/permission.rs`: the two mode names also appear in the generic
+        // parse error, so only `was split` distinguishes the retired-mode arm from its deletion.
+        assert!(
+            rendered.contains("was split"),
+            "clap must surface the teaching message, not a bare invalid-value: {rendered}"
+        );
+        assert!(rendered.contains("workspace"), "{rendered}");
+        assert!(rendered.contains("unrestricted"), "{rendered}");
     }
 
     #[test]

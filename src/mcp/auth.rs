@@ -1007,21 +1007,20 @@ fn parse_callback_query(
     let mut state = None;
     let mut error_param: Option<String> = None;
 
-    for pair in query_string.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        // Strict UTF-8: see `parse_pasted_callback` for rationale.
-        let decoded = percent_encoding::percent_decode_str(value)
-            .decode_utf8()
-            .map_err(|error| {
-                CallbackParseError::Malformed(format!(
-                    "OAuth callback parameter '{}' is not valid UTF-8: {}",
-                    key, error
-                ))
-            })?
-            .into_owned();
-        match key {
+    // `form_urlencoded`, not a hand-rolled `split('&')` + `percent_decode_str`. A redirect query is
+    // `application/x-www-form-urlencoded`, where `+` means a space; `percent_decode_str` leaves it
+    // as a literal `+`, so a server that form-encodes a value containing a space hands back a code
+    // that is then re-encoded as `%2B` and rejected at the token exchange with nothing to point at.
+    for (key, value) in url::form_urlencoded::parse(query_string.as_bytes()) {
+        // Stricter than the `Cow<str>` this yields for invalid UTF-8: reject rather than accept
+        // a value with U+FFFD substituted into it. Same rationale as `parse_pasted_callback`.
+        if value.contains('\u{FFFD}') {
+            return Err(CallbackParseError::Malformed(format!(
+                "OAuth callback parameter '{key}' is not valid UTF-8"
+            )));
+        }
+        let decoded = value.into_owned();
+        match key.as_ref() {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
             "error" => error_param = Some(decoded),
@@ -1664,6 +1663,38 @@ mod tests {
         assert_eq!(
             extract_bearer_param("Bearer realm=\"x\"", "resource_metadata"),
             None
+        );
+    }
+
+    /// A form-encoded space arrives as a space, not a literal `+`.
+    ///
+    /// A redirect query is `application/x-www-form-urlencoded`, where `+` is a space.
+    /// `percent_decode_str` does not know that, so a hand-rolled split returned the `+` verbatim
+    /// and the token exchange re-encoded it as `%2B` -- a failure the server reports opaquely and
+    /// nothing local explains. `form_urlencoded::parse` is the decoder that matches the encoder.
+    #[test]
+    fn callback_query_decodes_form_encoding_not_just_percent_escapes() {
+        let (code, state) = parse_callback_query(
+            "GET /callback?code=a+b&state=c%20d HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("a well-formed callback");
+        assert_eq!(code, "a b", "`+` is a space in a form-encoded query");
+        assert_eq!(state, "c d", "and `%20` still is too");
+    }
+
+    /// Invalid UTF-8 in a callback parameter is refused rather than silently substituted.
+    ///
+    /// `form_urlencoded::parse` yields a lossy `Cow`, so without this check a `state` carrying
+    /// invalid bytes would come back with U+FFFD in place of them and be compared against the
+    /// stored value as though it were what the server sent.
+    #[test]
+    fn callback_query_refuses_invalid_utf8_rather_than_substituting() {
+        let result = parse_callback_query(
+            "GET /callback?code=ok&state=%FF%FE HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            matches!(result, Err(CallbackParseError::Malformed(_))),
+            "expected a malformed-parameter refusal, got {result:?}"
         );
     }
 

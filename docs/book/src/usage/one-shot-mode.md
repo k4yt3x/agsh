@@ -14,7 +14,7 @@ A prompt **without** `--oneshot` is not a one-shot run: it seeds the first turn 
 
 An empty or whitespace-only prompt is rejected rather than sent.
 
-`--permission ask` has nothing to ask from here: there is no prompt to answer, so every tool that needs approval is refused. meka says so once at startup and names each tool as it is refused, but the run is still less useful than it looks. Use `read` or `write` for a non-interactive run, or [`meka serve`](./http-api.md) if you need a human in the loop over an API.
+`--permission ask` has nothing to ask from here: there is no prompt to answer, so every tool that needs approval is refused. meka says so once at startup and names each tool as it is refused, but the run is still less useful than it looks. Use `read`, `workspace` or `unrestricted` for a non-interactive run, or [`meka serve`](./http-api.md) if you need a human in the loop over an API.
 
 ## Examples
 
@@ -22,8 +22,8 @@ An empty or whitespace-only prompt is rejected rather than sent.
 # Simple question
 meka --oneshot "what is my current working directory?"
 
-# File operations (requires write permission)
-meka --oneshot --permission write "create a file called notes.txt with today's date"
+# File operations (requires workspace permission)
+meka --oneshot --permission workspace "create a file called notes.txt with today's date"
 
 # Search
 meka --oneshot "find all TODO comments in this project"
@@ -40,8 +40,8 @@ All configuration flags work in one-shot mode:
 # Use a specific provider and model
 meka --oneshot --provider work -m claude-opus-5 "explain this codebase"
 
-# With write permission
-meka --oneshot --permission write "run 'cargo test' and summarize the results"
+# With workspace permission
+meka --oneshot --permission workspace "run 'cargo test' and summarize the results"
 
 # Disable streaming
 meka --oneshot --no-stream "read README.md and summarize it"

@@ -165,7 +165,7 @@ pub struct McpClientManager {
     /// `resolve_tool_permission` at tool-registration time when neither the server nor the user
     /// has configured a more specific permission and the server didn't advertise a
     /// `readOnlyHint`. `None` means "no user default": resolution falls through to the
-    /// hardcoded strict `Write`.
+    /// hardcoded strict `Unrestricted`.
     mcp_default_permission: Option<Permission>,
     /// Flipped to `true` by the background connector once every enabled entry has reached a
     /// terminal state (Connected or Failed). The turn gate watches this via
@@ -1355,10 +1355,10 @@ pub(crate) fn warn_on_stale_tool_config(
 ///
 /// 1. `server.tool_permissions[tool]`: per-tool user override.
 /// 2. `server.permission`: server-level user override.
-/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` → Write. The
-///    `true` half is skipped when the server sets `trust_read_only_hint = false`.
+/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` →
+///    Unrestricted. The `true` half is skipped when the server sets `trust_read_only_hint = false`.
 /// 4. `mcp.default_permission`: global fallback when no hint exists.
-/// 5. Hardcoded `Write`: ultimate strict fallback.
+/// 5. Hardcoded `Unrestricted`: ultimate strict fallback.
 ///
 /// User config at steps 1/2 always beats the server's hints. Hints beat the global fallback so a
 /// `readOnlyHint = false` destructive tool isn't silently promoted to Read just because the user
@@ -1447,12 +1447,11 @@ fn resolve_tool_permission_with_source(
     {
         let permission = raw
             .parse::<Permission>()
-            .map_err(|_| MekaError::McpConnection {
+            .map_err(|error| MekaError::McpConnection {
                 server_name: server_name.to_string(),
                 message: format!(
-                    "invalid tool_permissions['{}'] = '{}': expected \
-                     'none', 'read', 'ask', or 'write'",
-                    tool_raw_name, raw
+                    "invalid tool_permissions['{}'] = '{}': {}",
+                    tool_raw_name, raw, error
                 ),
             })?;
         return Ok((permission, PermissionSource::ToolOverride));
@@ -1461,20 +1460,16 @@ fn resolve_tool_permission_with_source(
     if let Some(raw) = server_config.permission.as_deref() {
         let permission = raw
             .parse::<Permission>()
-            .map_err(|_| MekaError::McpConnection {
+            .map_err(|error| MekaError::McpConnection {
                 server_name: server_name.to_string(),
-                message: format!(
-                    "invalid permission '{}': expected 'none', 'read', \
-                     'ask', or 'write'",
-                    raw
-                ),
+                message: format!("invalid permission '{}': {}", raw, error),
             })?;
         return Ok((permission, PermissionSource::ServerOverride));
     }
     // 3. Server-advertised readOnlyHint.
     //
     // The two directions are not symmetric, so they are gated differently. A hint of `false` only
-    // ever *raises* the requirement to Write, so believing it costs nothing and it is always
+    // ever *raises* the requirement to Unrestricted, so believing it costs nothing and it is always
     // honoured. A hint of `true` *lowers* the requirement to Read, and that is the direction in
     // which a wrong or dishonest hint matters: MCP tools run in the server's own process with no
     // sandbox, so a tool wrongly classified Read can write the user's tree while meka sits at
@@ -1486,7 +1481,7 @@ fn resolve_tool_permission_with_source(
         && let Some(hint) = annotations.read_only_hint
     {
         if !hint {
-            return Ok((Permission::Write, PermissionSource::ReadOnlyHint));
+            return Ok((Permission::Unrestricted, PermissionSource::ReadOnlyHint));
         }
         if server_config.trust_read_only_hint.unwrap_or(true) {
             return Ok((Permission::Read, PermissionSource::ReadOnlyHint));
@@ -1510,7 +1505,13 @@ fn resolve_tool_permission_with_source(
         return Ok((permission, PermissionSource::GlobalDefault));
     }
     // 5. Hardcoded strict fallback.
-    Ok((Permission::Write, PermissionSource::Fallback))
+    //
+    // `Unrestricted`, never `Workspace`, and this is load-bearing rather than incidental. An MCP
+    // tool runs inside the server's own process, which meka does not sandbox and cannot confine to
+    // a workspace root, so an unannotated tool reachable from `workspace` would make that mode's
+    // central promise false for every MCP user while looking exactly like it worked. The rung has
+    // to be the one that promises no boundary, because that is the only one this tool honours.
+    Ok((Permission::Unrestricted, PermissionSource::Fallback))
 }
 
 /// Whether a server offered `readOnlyHint: true` and resolution refused it.
@@ -1821,7 +1822,7 @@ pub(crate) mod tests {
             "search",
             Some(&annotations),
             &server,
-            Some(Permission::Write),
+            Some(Permission::Unrestricted),
         )
         .expect("should resolve");
         assert_eq!(resolved, Permission::Read);
@@ -1838,7 +1839,7 @@ pub(crate) mod tests {
             "any",
             Some(&annotations),
             &server,
-            Some(Permission::Write),
+            Some(Permission::Unrestricted),
         )
         .expect("should resolve");
         assert_eq!(resolved, Permission::Read);
@@ -1854,7 +1855,7 @@ pub(crate) mod tests {
             "search",
             Some(&annotations),
             &server,
-            Some(Permission::Write),
+            Some(Permission::Unrestricted),
         )
         .expect("should resolve");
         assert_eq!(resolved, Permission::Read);
@@ -1869,7 +1870,7 @@ pub(crate) mod tests {
             Some(Permission::Read),
         )
         .expect("should resolve");
-        assert_eq!(resolved, Permission::Write);
+        assert_eq!(resolved, Permission::Unrestricted);
     }
 
     /// `trust_read_only_hint = false` is the knob that keeps an unsandboxed MCP tool out of the
@@ -1911,7 +1912,7 @@ pub(crate) mod tests {
         // permitted at every tier, so the tool ran even at `--permission none`. This test asserted
         // the invariant in its name while only ever passing `Some(Write)` and `None`.
         for default in [
-            Some(Permission::Write),
+            Some(Permission::Unrestricted),
             Some(Permission::Ask),
             Some(Permission::Read),
             Some(Permission::None),
@@ -1922,7 +1923,7 @@ pub(crate) mod tests {
                     .expect("should resolve");
             assert_eq!(
                 resolved,
-                Permission::Write,
+                Permission::Unrestricted,
                 "a declined hint must reach the strict fallback whatever the global default is, \
                  but with {:?} it resolved to {}",
                 default,
@@ -1979,7 +1980,7 @@ pub(crate) mod tests {
             Some(Permission::Read),
         )
         .expect("should resolve");
-        assert_eq!(resolved, Permission::Write);
+        assert_eq!(resolved, Permission::Unrestricted);
         assert_eq!(source, PermissionSource::ReadOnlyHint);
     }
 
@@ -2094,7 +2095,7 @@ pub(crate) mod tests {
         // Nothing configured anywhere, no hint → hardcoded strict Write.
         let resolved =
             resolve_tool_permission("s", "any", None, &server, None).expect("should resolve");
-        assert_eq!(resolved, Permission::Write);
+        assert_eq!(resolved, Permission::Unrestricted);
     }
 
     #[test]
@@ -2148,7 +2149,7 @@ pub(crate) mod tests {
         let server = bare_server_config("s");
         let (perm, source) =
             resolve_tool_permission_with_source("s", "e", None, &server, None).unwrap();
-        assert_eq!(perm, Permission::Write);
+        assert_eq!(perm, Permission::Unrestricted);
         assert_eq!(source, PermissionSource::Fallback);
     }
 
@@ -2346,6 +2347,38 @@ pub(crate) mod tests {
         assert!(
             waited < DEFAULT_MCP_REQUEST_TIMEOUT,
             "waited {waited:?}, which is the module default rather than the configured {configured:?}",
+        );
+    }
+
+    /// Every MCP tool declares itself unconfinable, which is the input the `workspace` gate needs.
+    ///
+    /// The gate in `crate::agent` refuses a tool at `workspace` when it both exceeds the level and
+    /// `runs_outside_confinement()`. The trait default is the *permissive* answer (`false`), so the
+    /// three-line override on `McpToolAdapter` is the only thing making a real MCP call qualify --
+    /// delete it and the gate never fires, and `workspace` again forwards unannotated calls to a
+    /// server process meka spawns but does not sandbox.
+    ///
+    /// Nothing asserted it. The agent-side test builds its own fixture tool with its own override,
+    /// so it exercises the gate's logic and never touches the adapter that feeds it.
+    #[test]
+    fn an_mcp_tool_reports_itself_as_running_outside_confinement() {
+        use crate::tools::Tool;
+
+        let adapter = McpToolAdapter::new(
+            "mcp__demo__do_thing".to_string(),
+            "do_thing".to_string(),
+            "does a thing".to_string(),
+            serde_json::json!({"type": "object"}),
+            Permission::Read,
+            pending_entry("demo", McpTransport::Stdio),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            adapter.runs_outside_confinement(),
+            "an MCP call runs in the server's own process, which meka does not sandbox; the \
+             `workspace` gate depends on this being true"
         );
     }
 

@@ -1253,14 +1253,12 @@ fn code_state_from_query(query: &str) -> CodexCallback {
     let mut code = None;
     let mut state = None;
     let mut error_param: Option<String> = None;
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let decoded = percent_encoding::percent_decode_str(value)
-            .decode_utf8_lossy()
-            .into_owned();
-        match key {
+    // `form_urlencoded` rather than a hand-rolled split, for the reason given at the matching site
+    // in `mcp::auth`: a redirect query is form-encoded, so `+` is a space and decoding it as a
+    // literal `+` corrupts any value that contains one.
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let decoded = value.into_owned();
+        match key.as_ref() {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
             "error" => error_param = Some(decoded),

@@ -74,9 +74,11 @@ arrive and one is consumed) reads as unchanged, and the gate silently misses wha
 between. Pairing a count with a monotonic marker, as in `git rev-list --count HEAD` alongside the
 commit sha, avoids both.
 
-> **Gates need `write` permission.** A gate is a shell command that runs unattended, on a timer,
-> until someone cancels it: a longer-lived grant than `execute_command`, which at least ends with
-> the turn that called it. Ungated reminders work at `read`.
+> **Gates need `unrestricted` permission.** A gate is a shell command that runs unattended, on a
+> timer, until someone cancels it: a longer-lived grant than `execute_command`, which at least ends
+> with the turn that called it. It also runs with **no sandbox**, so `workspace` cannot authorise
+> one -- a level whose whole meaning is a write boundary must not hand out a command that has none.
+> Ungated reminders work at `read`.
 
 A gate that cannot run at all -- it times out, or the shell fails to start it -- is **not** treated
 as "nothing happened". It is logged as a warning, because a watcher whose command broke otherwise
@@ -208,21 +210,28 @@ job was created with: the level lives on the session and the session is mutable,
 the REPL or `PATCH /v1/sessions/{id}` under `serve`.
 
 A job's **gate** is the exception, because it is a shell command that runs unattended and
-unsandboxed. It needs `write` from two places every time it comes due: the level recorded on the job
-when it was authored, and the level in force *now* -- the session's, or the host process's for a
-session that carries none. Drop the session to `read`, or restart `meka serve --permission read` so
-it inherits the job, and the gate stops running -- and with it the job, because a gate is the
-condition on the job and an unevaluated condition has not been met. The occurrence is declined the
-same way a gate that ran and said "nothing happened" declines it, and a warning is logged naming the
-job. Raise the session back to `write` to restore it.
+unsandboxed. It needs `unrestricted` from two places every time it comes due: the level recorded on
+the job when it was authored, and the level the session holds *now*.
+
+That second one is the session's own, recorded on its row and kept current by whichever surface owns
+it -- Shift+Tab and `/permission` in the REPL, `session/set_mode` under ACP, `PATCH
+/v1/sessions/{id}` under `serve`. Every process that polls the schedule reads the same row, so
+withdrawing the level works across processes: a `meka serve` daemon sharing the data directory will
+refuse a gate you just dropped in a REPL. Only a session whose row somehow carries no level at all
+falls back to the polling process's own `--permission`, and no surface creates one that way.
+
+Drop the session to anything below `unrestricted` and the gate stops running -- and with it the job,
+because a gate is the condition on the job and an unevaluated condition has not been met. The
+occurrence is declined the same way a gate that ran and said "nothing happened" declines it, and a
+warning is logged naming the job. Raise the session back to `unrestricted` to restore it.
 
 Firing the reminder ungated instead would be the more forgiving-looking choice and the wrong one: it
 turns a conditional job into an unconditional one, so an `every = "1m"` watcher that normally speaks
-once a week would deliver a turn a minute for as long as the session stayed below `write`. An
+once a week would deliver a turn a minute for as long as the session stayed below that bar. An
 *ungated* job is unaffected by any of this and keeps firing.
 
 Both halves are load-bearing. The recorded level alone can never refuse anything, since creating a
-gate already demands `write`; the live level is what makes a withdrawal real. The recorded level
+gate already demands an unattended-write level; the live level is what makes a withdrawal real. The recorded level
 still matters for a job created before it was stored, which reads as "no authority" and stays
 refused.
 

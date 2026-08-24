@@ -5,8 +5,12 @@
 //! End-to-end integration tests for `meka serve`. Spawns the real `meka serve` binary against
 //! a tempdir and a scripted mock provider, then drives it over HTTP via `reqwest`.
 
+// Only the `#[cfg(unix)]` shutdown tests read an SSE body directly; importing it
+// unconditionally made the Windows build warn about an import nothing there uses.
+#[cfg(unix)]
+use std::io::Read;
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -85,8 +89,11 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write", "ask"]
+default = "unrestricted"
+# `workspace` included so it is reachable from a test at all. Leaving it out was a large part of
+# why this whole surface went unexercised: `POST /v1/sessions` refuses a level the server has not
+# enabled, so no test could create a `workspace` session even deliberately.
+enabled = ["read", "workspace", "unrestricted", "ask"]
 
 [serve]
 bind = "{bind}"
@@ -330,7 +337,7 @@ fn create_and_list_session_round_trip() {
     assert_eq!(create.status(), 201);
     let created: serde_json::Value = create.json().expect("parse");
     let id = created["id"].as_str().expect("id").to_string();
-    assert_eq!(created["permission"], "write");
+    assert_eq!(created["permission"], "unrestricted");
 
     let list = harness
         .request(reqwest::Method::GET, "/v1/sessions")
@@ -717,7 +724,7 @@ fn patch_session_updates_permission_and_cwd() {
     let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
-        .json(&serde_json::json!({"cwd": temp_dir, "permission": "write"}))
+        .json(&serde_json::json!({"cwd": temp_dir, "permission": "unrestricted"}))
         .send()
         .expect("send");
     let id = create.json::<serde_json::Value>().expect("parse")["id"]
@@ -2312,6 +2319,76 @@ fn get_session_reports_turn_in_flight_during_a_turn() {
     assert_eq!(after["turn_in_flight"], false);
 }
 
+/// A session created at `workspace` writes inside its cwd and is refused outside it.
+///
+/// The whole integration surface of this mode was uncovered: every session in `tests/serve.rs`,
+/// `tests/acp.rs` and `tests/multiprocess.rs` runs at `read`, `ask` or `unrestricted`, and the two
+/// `workspace` mentions in the tree assert a config string and a catalogue field. So the mode this
+/// change set exists to introduce had no end-to-end test on any surface -- the boundary could stop
+/// being applied to a session `POST /v1/sessions` created and nothing here would notice.
+///
+/// Asserts filesystem ground truth rather than the turn's narration: a tool that never ran reports
+/// failure just as convincingly as one the fence refused.
+#[test]
+fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
+    let inside_dir = tempfile::tempdir().expect("tempdir");
+    let outside_dir = tempfile::tempdir().expect("tempdir");
+    let inside = inside_dir.path().join("inside.txt");
+    let outside = outside_dir.path().join("escaped.txt");
+
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "kind": "tool_use_end", "input": {"path": inside, "content": "in"} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "tool_use_start", "id": "tu_2", "name": "write_file" },
+            { "kind": "tool_use_end", "input": {"path": outside, "content": "out"} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": inside_dir.path(),
+            "permission": "workspace",
+        }))
+        .send()
+        .expect("create");
+    let status = create.status();
+    let body: serde_json::Value = create.json().expect("parse");
+    assert_eq!(status, 201, "create failed: {body}");
+    assert_eq!(
+        body["permission"], "workspace",
+        "the session must actually be at workspace: {body}"
+    );
+    let id = body["id"].as_str().expect("id").to_string();
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "write both"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200, "{}", response.text().expect("text"));
+
+    assert!(
+        inside.exists(),
+        "a write inside the session cwd must land at workspace"
+    );
+    assert_eq!(std::fs::read_to_string(&inside).expect("read back"), "in");
+    assert!(
+        !outside.exists(),
+        "a write outside every root must be refused at workspace"
+    );
+}
+
 /// A streaming client that declared it has no approval interface must get an immediate deny, not
 /// a 60-second park. The turn completes well inside the timeout if the flag is honoured.
 #[test]
@@ -3113,11 +3190,11 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
     let id = body["id"].as_str().expect("id").to_string();
     assert_eq!(body["permission"], "read", "session created with read");
 
-    // Mixed-validity PATCH: permission flips to "write" (valid), cwd is relative (invalid).
+    // Mixed-validity PATCH: permission flips to "unrestricted" (valid), cwd is relative (invalid).
     let patch = harness
         .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
         .json(&serde_json::json!({
-            "permission": "write",
+            "permission": "unrestricted",
             "cwd": "relative/path",
         }))
         .send()
@@ -4838,6 +4915,88 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
     }
 }
 
+/// A `schedule:r` token sees that a job is gated, but not what the gate runs.
+///
+/// A gate command is an `execute_command` line that runs unattended as the server's user. The
+/// webhook path already withholds the same field, on the stated grounds that a command line is the
+/// highest-entropy field in the system and the one most likely to carry a credential someone pasted
+/// into a `curl`. `GET /v1/schedule` is server-wide, so leaving the command at `schedule:r` handed
+/// every gate on the box to a bridge scoped to the read half of a scope that was invented so
+/// schedule access would *not* imply session access.
+///
+/// The fire condition stays visible either way, so a client can still tell a gated job from an
+/// ungated one.
+#[test]
+fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
+    let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
+                  scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
+    let harness =
+        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+
+    let id = harness
+        .client
+        .post(format!("{}/v1/sessions", harness.base_url))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "unrestricted",
+        }))
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let secret = "curl -H 'Authorization: Bearer sk-live-DO-NOT-DISCLOSE' https://example.test";
+    let created = harness
+        .client
+        .post(format!("{}/v1/sessions/{}/schedule", harness.base_url, id))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({
+            "prompt": "check the thing",
+            "every": "1h",
+            "gate": {"command": secret, "fire": "on-success"},
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    // The full-scope token gets the command back.
+    let full: serde_json::Value = harness
+        .client
+        .get(format!("{}/v1/schedule", harness.base_url))
+        .header("Authorization", "Bearer sk_test_full")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        full["jobs"][0]["gate"]["command"].as_str(),
+        Some(secret),
+        "a token holding sessions:r may see the command: {full}"
+    );
+
+    // The schedule:r-only token does not.
+    let limited: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/schedule")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let body = limited.to_string();
+    assert!(
+        !body.contains("sk-live-DO-NOT-DISCLOSE"),
+        "the gate command must not reach a schedule:r-only token: {body}"
+    );
+    assert_eq!(
+        limited["jobs"][0]["gate"]["fire"].as_str(),
+        Some("on-success"),
+        "the gate itself must still be visible: {limited}"
+    );
+}
+
 /// A gate runs a shell command on a timer, before the turn, as the server's user, and needs no
 /// working provider to do it. `GET /v1/schedule` hands a `schedule:r` token every session id in
 /// the database, so if `schedule:w` alone could plant a gate, scoping a bridge to `schedule:*`
@@ -4858,7 +5017,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
         .header("Authorization", "Bearer sk_test_full")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "write",
+            "permission": "unrestricted",
         }))
         .send()
         .expect("send")
@@ -5716,7 +5875,7 @@ fn session_tools_endpoint_lists_the_catalogue_with_permissions() {
         .find(|t| t["name"] == "write_file")
         .expect("write_file must be registered");
     assert_eq!(
-        write_file["required_permission"], "write",
+        write_file["required_permission"], "workspace",
         "the catalogue must report the tier a client needs to render an approval prompt"
     );
 }

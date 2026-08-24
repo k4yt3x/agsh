@@ -14,17 +14,48 @@
 
 /// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
 /// valid frontmatter block is present.
-pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+///
+/// The closing fence may end the file. Requiring a newline after it meant a `SKILL.md` written by
+/// any editor that does not add a trailing newline -- and by any other client following the same
+/// spec -- was reported as "missing YAML frontmatter", naming the one thing the file plainly had.
+/// The body in that case is empty, which the callers already handle.
+///
+/// A fence is a whole line, so `----` and `--- x` are not closing fences and the search continues
+/// past them.
+pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a str)> {
     let rest = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))?;
 
-    for (marker, offset) in [("\n---\n", 5), ("\n---\r\n", 6)] {
-        if let Some(end) = rest.find(marker) {
-            let frontmatter = &rest[..end];
-            let body = &rest[end + offset..];
-            return Some((frontmatter, body));
+    // What follows the three dashes decides whether they closed the block: a line ending, or the
+    // end of the file.
+    let body_after_fence = |after: &'a str| -> Option<&'a str> {
+        if let Some(body) = after.strip_prefix("\r\n") {
+            Some(body)
+        } else if let Some(body) = after.strip_prefix('\n') {
+            Some(body)
+        } else if after.is_empty() {
+            Some("")
+        } else {
+            None
         }
+    };
+
+    // An empty block (`---\n---`) closes on the first line, with no newline in front of the fence
+    // to search for.
+    if let Some(after) = rest.strip_prefix("---")
+        && let Some(body) = body_after_fence(after)
+    {
+        return Some(("", body));
+    }
+
+    let mut searched = 0;
+    while let Some(found) = rest[searched..].find("\n---") {
+        let fence = searched + found;
+        if let Some(body) = body_after_fence(&rest[fence + 4..]) {
+            return Some((&rest[..fence], body));
+        }
+        searched = fence + 4;
     }
     None
 }
@@ -98,7 +129,9 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
 /// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
 /// never need to be held together. Exists because `meka memory edit` had no test at all until its
 /// scratch-file handling destroyed a user's edit twice.
-#[cfg(test)]
+/// `unix` as well as `test`: every test that takes it drives a real `$EDITOR` through a shell
+/// script, so all three are `#[cfg(unix)]` and the lock has nobody to serialise elsewhere.
+#[cfg(all(test, unix))]
 pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) fn editor_command(path: &std::path::Path) -> Option<std::process::Command> {
@@ -321,23 +354,24 @@ pub(crate) const MAX_ENTRY_NAME_LEN: usize = 64;
 /// account. Nothing meka ships could remove it; the only exit was raw `sqlite3`, which is what this
 /// store was built to stop needing.
 ///
-/// The length cap stays, because it is not a well-formedness rule. `memory_read`'s miss path runs
-/// an edit distance per stored name, measured at 48 s for a 200,000-character argument against
-/// 20,000 memories -- synchronously, on a runtime worker, ignoring the cancellation token.
+/// There is deliberately no length cap, so no stored name can be beyond reach.
+///
+/// One used to sit here, bounding the cost of `memory_read`'s miss path: it loads the index and
+/// runs an edit distance per stored name, measured at 48 s for a 200,000-character argument
+/// against 20,000 memories, synchronously on a runtime worker with the cancellation token ignored.
+/// Refusing the argument did bound that, and re-created the exact wedge this function exists to
+/// end one length short: a row whose name ran past 64 characters was listed to the model in the
+/// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
+/// `DELETE /v1/memory/{name}` alike, while `meka memory export` refused the whole store on its
+/// account and told the reader to run `meka memory remove`, which refused it too.
+///
+/// The cost is bounded where it is actually incurred instead. [`crate::tools::did_you_mean_hint`]
+/// skips any candidate whose length differs from the argument by more than the edit threshold,
+/// which no distance calculation can bridge, so a pathological argument now costs one pass over
+/// itself rather than one matrix per stored name.
 pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{} name cannot be empty", noun));
-    }
-    // Characters, not bytes. [`validate_entry_name`] may use `len()` because its character class
-    // is ASCII-only and the two are then the same number; this function deliberately has no
-    // character class, so they diverge. Counting bytes left a name of 30 CJK characters -- 90
-    // bytes, well inside the documented cap -- refused by every lookup door, which is precisely
-    // the wedge this function exists to end.
-    if name.chars().count() > MAX_ENTRY_NAME_LEN {
-        return Err(format!(
-            "{} name '{}' exceeds {} characters",
-            noun, name, MAX_ENTRY_NAME_LEN
-        ));
     }
     Ok(())
 }
@@ -353,8 +387,8 @@ pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String>
 ///
 /// This is the *write* rule, and the character class is the whole of why it is safe to put a name
 /// that passed it into a path. A caller that only needs to find a row wants
-/// [`validate_lookup_name`], which shares the length cap and nothing else -- and must never be
-/// mistaken for this one.
+/// [`validate_lookup_name`], which shares neither the character class nor a length bound -- and
+/// must never be mistaken for this one.
 pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{} name cannot be empty", noun));
@@ -437,6 +471,50 @@ pub(crate) fn check_case_collision<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A closing fence that ends the file still closes the block.
+    ///
+    /// Requiring a newline after it rejected a conforming `SKILL.md` -- one written by an editor
+    /// that adds no trailing newline, or by another client following the same spec -- with
+    /// "missing YAML frontmatter", naming the one thing the file demonstrably had. The body is
+    /// empty in that case, which every caller already handles.
+    #[test]
+    fn a_closing_fence_at_end_of_file_still_closes_the_frontmatter() {
+        let (frontmatter, body) =
+            split_frontmatter("---\nname: x\n---").expect("a file ending at the fence parses");
+        assert_eq!(frontmatter, "name: x");
+        assert_eq!(body, "");
+
+        // The same file with the newline it was previously required to have.
+        let (frontmatter, body) =
+            split_frontmatter("---\nname: x\n---\n").expect("the trailing-newline form parses");
+        assert_eq!(frontmatter, "name: x");
+        assert_eq!(body, "");
+
+        // CRLF, both ways.
+        let (frontmatter, body) =
+            split_frontmatter("---\r\nname: x\r\n---").expect("CRLF at EOF parses");
+        assert_eq!(frontmatter, "name: x\r");
+        assert_eq!(body, "");
+    }
+
+    /// Three dashes that are not a whole line do not close the block.
+    ///
+    /// The search has to continue past them, or a `----` rule inside the frontmatter would truncate
+    /// it and the remaining keys would silently become body text.
+    #[test]
+    fn a_fence_must_be_a_whole_line() {
+        let (frontmatter, body) = split_frontmatter("---\na: 1\n----\nb: 2\n---\nbody\n")
+            .expect("the real fence is found");
+        assert_eq!(frontmatter, "a: 1\n----\nb: 2");
+        assert_eq!(body, "body\n");
+
+        assert_eq!(
+            split_frontmatter("---\na: 1\n--- not a fence\n"),
+            None,
+            "a line beginning with the fence but continuing is not a fence"
+        );
+    }
     use super::*;
 
     /// The store root is created at 0700, and its lock file at 0600.

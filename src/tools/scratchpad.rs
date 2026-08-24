@@ -1165,6 +1165,9 @@ impl Tool for ScratchpadLoadFileTool {
 }
 
 pub(super) struct ScratchpadSaveFileTool {
+    /// The write boundary, shared with `write_file`. This tool reads as the scratchpad's
+    /// `write_file` and lands bytes at a path the user named, so it is fenced the same way.
+    pub scope: crate::workspace::WriteScope,
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
     /// See [`ScratchpadReadTool::parent_session_id`].
@@ -1174,6 +1177,14 @@ pub(super) struct ScratchpadSaveFileTool {
     /// Per-session cwd, so a relative `path` resolves the same way `write_file` does (against the
     /// agent's `/cd` directory, not the process cwd).
     pub cwd: crate::workspace::SharedCwd,
+    /// The same tracker `write_file` and `edit_file` stamp.
+    ///
+    /// This tool is described to the model as the scratchpad's `write_file`, and it lands bytes at
+    /// a path the user named -- so it has to leave the same record. Without it the tracker still
+    /// held the pre-save stamp, and the next `write_file` or `edit_file` on that path was refused
+    /// with "Something else wrote to it (a shell command, another agent, or the user)". The writer
+    /// was meka, one call earlier.
+    pub read_tracker: crate::tools::ReadTracker,
 }
 
 #[async_trait]
@@ -1211,7 +1222,7 @@ impl Tool for ScratchpadSaveFileTool {
     }
 
     fn required_permission(&self) -> Permission {
-        Permission::Write
+        Permission::Workspace
     }
 
     async fn execute(
@@ -1259,8 +1270,13 @@ impl Tool for ScratchpadSaveFileTool {
         // they name and on the lock they take, and a copy of the resolution here agreed on neither.
         // Both are dispatched concurrently from one assistant message and both write through a temp
         // file derived from the target, so two calls naming one path could interleave.
-        let (target, _write_guard) =
-            super::file::resolve_write_target("scratchpad_save_file", &self.cwd, &path).await?;
+        let (target, _write_guard) = super::file::resolve_write_target(
+            "scratchpad_save_file",
+            &self.cwd,
+            &self.scope,
+            &path,
+        )
+        .await?;
 
         // Asked *under* the write lock, so the answer is still true when the write happens.
         //
@@ -1298,6 +1314,17 @@ impl Tool for ScratchpadSaveFileTool {
                 tool_name: "scratchpad_save_file".to_string(),
                 message: format!("failed to write '{}': {}", path, error),
             })?;
+
+        // Stamped like any other write meka performs, so the next `write_file` or `edit_file` on
+        // this path does not mistake meka's own bytes for someone else's. `FileRoute::Local`
+        // because this wrote to disk directly rather than through an editor delegate.
+        super::file::record_write(
+            &self.read_tracker,
+            target.clone(),
+            super::file::FileRoute::Local,
+            &content,
+        )
+        .await;
 
         Ok(ToolOutput::text(
             format!(
@@ -1350,6 +1377,84 @@ mod tests {
     }
 
     // -- persist_oversized_results --
+
+    /// `scratchpad_save_file` is fenced by the scope it was built with, and stamps the tracker.
+    ///
+    /// Two gaps in one place. Every other test here builds the tool with
+    /// `WriteScope::unconfined()`, so replacing `&self.scope` with a fresh unconfined scope left
+    /// the suite green -- and this tool is described to the model as the scratchpad's `write_file`,
+    /// so that is a full write door outside the boundary at `workspace`. Separately it never
+    /// recorded its write, so the next `write_file`/`edit_file` on the same path was refused with
+    /// "Something else wrote to it", blaming a shell command or the user for meka's own bytes.
+    #[tokio::test]
+    async fn saving_a_file_is_fenced_by_its_scope_and_records_the_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = crate::workspace::canonical_for_test(temp.path()).join("work");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let outside = crate::workspace::canonical_for_test(temp.path()).join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+        manager
+            .save_tool_output(session_id, "report", "FINDINGS")
+            .await
+            .expect("seed");
+
+        let read_tracker: crate::tools::ReadTracker =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::clone(&read_tracker),
+            scope: crate::workspace::WriteScope::confined(vec![workspace.clone()]),
+            session_manager: manager,
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            cwd: std::sync::Arc::new(std::sync::RwLock::new(workspace.clone())),
+        };
+
+        // Outside the one root: refused, and nothing lands.
+        let escaped = outside.join("leaked.txt");
+        let refused = tool
+            .execute(
+                serde_json::json!({
+                    "name": "report",
+                    "path": escaped.to_str().expect("path"),
+                    "force": true,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let refused_text = match refused {
+            Err(error) => error.to_string(),
+            Ok(output) => crate::provider::ContentBlock::tool_result_text_content(&output.content),
+        };
+        assert!(
+            !escaped.exists(),
+            "a save outside the workspace must not land: {refused_text}"
+        );
+
+        // Inside it: lands, and the tracker records that meka was the writer.
+        let inside = workspace.join("report.txt");
+        tool.execute(
+            serde_json::json!({
+                "name": "report",
+                "path": inside.to_str().expect("path"),
+                "force": true,
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a save inside the workspace must succeed");
+        assert_eq!(
+            std::fs::read_to_string(&inside).expect("read back"),
+            "FINDINGS"
+        );
+        assert!(
+            read_tracker.read().await.contains_key(&inside),
+            "the write must be stamped, or the next write_file blames someone else for it"
+        );
+    }
 
     #[tokio::test]
     async fn test_persist_oversized_results_replaces_large_text() {
@@ -2634,6 +2739,10 @@ mod tests {
             std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf()));
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd,
             session_manager: manager,
             session_id: test_session_id(session_id),
@@ -2677,6 +2786,10 @@ mod tests {
             .expect("seed target");
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd: std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf())),
             session_manager: manager,
             session_id: test_session_id(session_id),
@@ -2688,6 +2801,7 @@ mod tests {
         let (_, held) = super::super::file::resolve_write_target(
             "write_file",
             &tool.cwd,
+            &crate::workspace::WriteScope::unconfined(),
             target.to_str().expect("path"),
         )
         .await
@@ -2747,6 +2861,10 @@ mod tests {
             .expect("seed target");
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd: std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf())),
             session_manager: manager,
             session_id: test_session_id(session_id),
@@ -2919,6 +3037,10 @@ mod tests {
         let path = dir.path().join("subdir").join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),
@@ -2956,6 +3078,10 @@ mod tests {
         let path = dir.path().join("log.txt");
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(child),
@@ -2983,6 +3109,10 @@ mod tests {
         let path = dir.path().join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
+            read_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            scope: crate::workspace::WriteScope::unconfined(),
             cwd: crate::workspace::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),

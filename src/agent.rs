@@ -334,9 +334,9 @@ pub struct Agent {
     /// updated by `/cd`; read by the file/shell/find/grep tools, the REPL prompt, and the per-turn
     /// environment-context block. Process `cwd` is no longer mutated.
     cwd: SharedCwd,
-    /// Workspace roots beyond [`Self::cwd`], from an ACP client's `additionalDirectories`. Read by
-    /// the per-turn environment-context block; the search tools hold the same handle. Empty for
-    /// every non-ACP session.
+    /// Workspace roots beyond [`Self::cwd`], from an ACP client's `additionalDirectories` or from
+    /// `--writable-root`. Read by the per-turn environment-context block; the search tools hold
+    /// the same handle. Empty unless one of those named a root.
     roots: SharedRoots,
     /// Total tokens of this agent's most recent provider round: the live, cache-write, and
     /// cache-read input tiers plus output. That equals everything in context as of the last
@@ -1154,7 +1154,20 @@ impl Agent {
             // whole of it.
             let (created, lock) = self
                 .session_manager
-                .create_session_locked(Some(cwd_snapshot(&self.cwd)), None, None, None)
+                .create_session_locked(
+                    Some(cwd_snapshot(&self.cwd)),
+                    // The level this session starts at, recorded rather than left NULL.
+                    //
+                    // A NULL here means "ask the polling process", and for a scheduled gate that
+                    // is the wrong authority: a `meka serve` sharing the data
+                    // directory answered it with its own `--permission` flag.
+                    // Writing the level the session actually has makes the row
+                    // the one answer every process reads. The REPL keeps it current
+                    // through `ReplEvent::PermissionChanged`; ACP through `session/set_mode`.
+                    Some(self.shared_permission.get().to_string()),
+                    None,
+                    None,
+                )
                 .await?;
             let id = created.id;
             self.hold_the_lock_on_a_created_session(lock.ok());
@@ -2424,6 +2437,41 @@ impl Agent {
                     "Permission denied: '{}' requires `{}` permission, current level is `{}`. \
                      Ask the user to run `/permission {}` (or press Shift+Tab) to enable it.",
                     name, required, permission, required
+                ),
+                true,
+            );
+        }
+        // The door `Permission::allows` cannot provide for a tool meka cannot confine.
+        //
+        // `allows` treats `Workspace | Ask | Unrestricted` as equal on purpose, so a tool requiring
+        // `Unrestricted` dispatches at `workspace` with no prompt. Every built-in that matters has
+        // its own door downstream -- the write fence, or `execute_command`'s refusal when it cannot
+        // be sandboxed. An MCP adapter has neither: the call is forwarded to an unsandboxed server
+        // process, so `workspace` was promising a boundary that nothing applied. Refused here, the
+        // way the shell refuses when its sandbox is unavailable, and for the same reason: half a
+        // boundary reported as a whole one is worse than an error saying so.
+        //
+        // Keyed on `is_within` rather than on the literal pair `(Workspace, Unrestricted)`. The
+        // pair form let a tool required at **`ask`** straight through: `Workspace.allows(Ask)` is
+        // `true` by design, `required != Unrestricted` so this gate did not fire, and the approval
+        // prompt below only runs when the *level* is `ask` -- so the call reached an unsandboxed
+        // server with neither a prompt nor a boundary. `ask` is above `workspace` on this ladder,
+        // which is exactly why a comparison that names one rung cannot stand in for the order.
+        //
+        // Still conditioned on the level being `workspace`, because that is the only level that
+        // promises a boundary it might fail to apply. At `ask` an unconfinable tool is the
+        // prompt's business, and at `unrestricted` there is nothing to promise.
+        if permission == crate::permission::Permission::Workspace
+            && !required.is_within(permission)
+            && tool.runs_outside_confinement()
+        {
+            return crate::tools::ToolOutput::text(
+                format!(
+                    "'{}' runs inside its MCP server's own process, which meka does not sandbox, \
+                     so `workspace` cannot confine what it writes. Switch to `unrestricted` \
+                     (Shift+Tab) to allow it, or grant it explicitly with \
+                     `[mcp.servers.*].tool_permissions` in your config.",
+                    name
                 ),
                 true,
             );
@@ -4098,7 +4146,7 @@ mod tests {
         memories
             .write(crate::memory::store::WriteRequest {
                 name: "deploy-policy".to_string(),
-                description: "Never deploy on Fridays".to_string(),
+                description: Some("Never deploy on Fridays".to_string()),
                 tags: None,
                 body: None,
                 priority: Some(3),
@@ -4179,6 +4227,128 @@ mod tests {
             !second.contains("deploy-policy"),
             "and it says nothing about memory at all rather than restating a guess: {second}"
         );
+    }
+
+    /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for
+    /// every requirement above it — not only for `Unrestricted`.
+    ///
+    /// The gate had no test at all: deleting it left the whole suite green, and it fails **open**,
+    /// because `resolve_tool_permission`'s fallback for an unannotated MCP tool is `Unrestricted`
+    /// and `Workspace.allows(Unrestricted)` is `true` by design. It was also keyed on the literal
+    /// pair `(Workspace, Unrestricted)`, which let a tool required at **`ask`** straight through:
+    /// `ask` is *above* `workspace` on this ladder, so a comparison naming one rung cannot stand in
+    /// for the order.
+    ///
+    /// The two controls matter as much as the refusals. A confinable tool with the same requirement
+    /// must still dispatch, or the gate is just a permission check; and a requirement the level
+    /// does cover must dispatch even when the tool is unconfinable.
+    #[tokio::test]
+    async fn an_unconfinable_tool_is_refused_at_workspace_for_every_requirement_above_it() {
+        use crate::provider::mock::MockProvider;
+
+        struct Fixture {
+            name: &'static str,
+            required: crate::permission::Permission,
+            unconfinable: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for Fixture {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.name.to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                self.required
+            }
+
+            fn runs_outside_confinement(&self) -> bool {
+                self.unconfinable
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _cancellation: CancellationToken,
+            ) -> crate::error::Result<crate::tools::ToolOutput> {
+                Ok(crate::tools::ToolOutput::text(
+                    "dispatched".to_string(),
+                    false,
+                ))
+            }
+        }
+
+        let registry = crate::tools::ToolRegistry::new();
+        for (name, required, unconfinable) in [
+            (
+                "mcp__x__unrestricted",
+                crate::permission::Permission::Unrestricted,
+                true,
+            ),
+            ("mcp__x__ask", crate::permission::Permission::Ask, true),
+            ("mcp__x__read", crate::permission::Permission::Read, true),
+            (
+                "builtin_unrestricted",
+                crate::permission::Permission::Unrestricted,
+                false,
+            ),
+        ] {
+            registry
+                .register(Arc::new(Fixture {
+                    name,
+                    required,
+                    unconfinable,
+                }))
+                .expect("registration");
+        }
+
+        let (agent, _session_manager) =
+            test_agent_with_registry(Arc::new(MockProvider::from_rounds(vec![])), registry).await;
+        agent
+            .shared_permission
+            .try_set(crate::permission::Permission::Workspace)
+            .expect("workspace is enabled in this fixture");
+
+        for (name, refused) in [
+            ("mcp__x__unrestricted", true),
+            // The case the literal-pair form missed.
+            ("mcp__x__ask", true),
+            // Within the level, so the gate has no business firing.
+            ("mcp__x__read", false),
+            // Above the level but confinable: it has its own door downstream.
+            ("builtin_unrestricted", false),
+        ] {
+            let output = agent
+                .resolve_and_execute_tool(
+                    "call-1",
+                    name,
+                    &serde_json::json!({}),
+                    &[],
+                    CancellationToken::new(),
+                )
+                .await;
+            let body = crate::tools::tests::text_content(&output);
+            if refused {
+                assert!(
+                    output.is_error,
+                    "{name} must be refused at workspace: {body}"
+                );
+                assert!(
+                    body.contains("does not sandbox"),
+                    "{name}'s refusal must say why: {body}"
+                );
+            } else {
+                assert!(
+                    !body.contains("does not sandbox"),
+                    "{name} must not be refused by the confinement gate: {body}"
+                );
+            }
+        }
     }
 
     /// Stands in for `memory_read` so the catalogue reports the index as live. Only the name

@@ -94,14 +94,49 @@ meka --oneshot -r 550e "summarise what we decided"
 
 ### `--permission <MODE>`
 
-Set the initial permission mode. Accepts `none` (or `n`), `read` (or `r`), `ask` (or `a`), `write` (or `w`).
+Set the initial permission mode. Accepts `none` (or `n`), `read` (or `r`), `workspace` (or `w`), `ask` (or `a`), `unrestricted` (or `u`).
 
 ```bash
-meka --permission write
+meka --permission workspace
 meka --permission ask
 ```
 
 Default: `read`.
+
+### `--writable-root <PATH>`
+
+Add a directory to the workspace, so writes may land there at `workspace` permission. Repeatable.
+The working directory is always a root; this adds to it.
+
+```bash
+meka --permission workspace --writable-root ../shared-assets --writable-root /srv/build
+```
+
+Deliberately a flag rather than a config key: which folders this run may write is a per-run scope,
+like the working directory itself, not a preference to persist.
+
+A path that does not resolve at startup is reported as a warning and kept, so a build directory that
+does not exist yet becomes a root the moment it does. A path that is not a directory, or a system
+directory the sandbox masks, is refused with a warning: neither can be expressed as a boundary by
+every backend.
+
+The masked set is the filesystem root itself plus `/proc`, `/dev`, `/sys`, `/run`, `/tmp` and
+`/var/tmp`, and `/run/user` and `$XDG_RUNTIME_DIR` as whole subtrees. A root is refused when it *is*
+one of these and when it is an **ancestor** of one, but not when it is merely underneath: a root
+under one of these is usually fine and refusing it would be a real loss, since
+`/run/media/$USER/drive` is an ordinary external disk. The ancestor half is why `--writable-root
+/var` is refused, and it is also why `--writable-root ~` is refused on WSL and on minimal window
+managers, where `$XDG_RUNTIME_DIR` lives under `$HOME` and so binding `$HOME` would hand the session
+bus back. `/tmp` and `/var/tmp` are in the set because
+Bubblewrap masks them with a tmpfs and then binds the requested root back over it, last mount
+winning: binding `/tmp/work` restores just that directory, but binding `/tmp` restores the entire
+host `/tmp` including every X11, D-Bus and tmux socket in it, which is a route straight back out of
+the sandbox. The cost is that a session started with `cd /tmp` has no write boundary, which is the
+safe direction to fail.
+
+The flag reaches the REPL, one-shot runs, ACP sessions, and isolated scheduled fires under
+`meka serve`. It does **not** reach sessions created through `POST /v1/sessions`, which are
+single-root by design.
 
 ### `-p`, `--provider <NAME>`
 

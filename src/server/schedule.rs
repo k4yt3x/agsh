@@ -552,12 +552,12 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
         .await?
         .ok_or_else(|| anyhow::anyhow!("session {} no longer exists", wakeup.job.session_id))?;
     let enabled = state.shared.config.enabled_permissions;
-    let permission = summary
-        .permission
-        .as_deref()
-        .and_then(|value| value.parse().ok())
-        .filter(|parsed| enabled.is_enabled(*parsed))
-        .unwrap_or(state.shared.config.permission);
+    let permission = crate::permission::parse_recorded_permission(
+        summary.permission.as_deref(),
+        &format_args!("session {}", wakeup.job.session_id),
+    )
+    .filter(|parsed| enabled.is_enabled(*parsed))
+    .unwrap_or(state.shared.config.permission);
     let permission = crate::permission::SharedPermission::new(permission, enabled);
 
     // The creating session's directory, for the same reason as its permission: an isolated run is
@@ -570,6 +570,18 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
     ));
+    // Empty, exactly like every other session this process builds.
+    //
+    // This used to seed from `state.shared.config.writable_roots` on the reasoning that an isolated
+    // fire "is that session's job, run with a cheaper context, not a different one". The reasoning
+    // was backwards: `POST /v1/sessions` and re-attach both pass `Vec::new()`, so the creating
+    // session never held those roots, and the fire was strictly *more* capable than the session it
+    // belongs to -- the one path by which a `workspace` session wrote outside its own fence. It was
+    // also reachable by a token holding only `schedule:w`, since `isolated` sits outside the
+    // `sessions:w` upgrade that guards `gate`.
+    //
+    // If `--writable-root` should reach HTTP sessions, it has to reach the interactive ones too;
+    // that is a request field, not a side door through the scheduler.
     let roots: crate::workspace::SharedRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
     // Counted as an in-flight turn for the whole of the fire.
     //

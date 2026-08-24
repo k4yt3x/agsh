@@ -120,11 +120,29 @@ pub struct ResolvedScheduleConfig {
     pub enabled: bool,
     /// The permission level of the process running the scheduler.
     ///
-    /// A gate is an unattended shell command, so it needs `Write` from the session *and* from the
-    /// host: a `meka serve --permission read` that inherits a job written by a write-mode session
-    /// must not run its gate. Sessions that carry no per-session level (the REPL and ACP paths
-    /// derive theirs from process config) fall back to this.
+    /// The **fallback** for a session row that carries no per-session level: the REPL and ACP
+    /// paths derive theirs from process config, so for those the host's level is the session's
+    /// level.
+    ///
+    /// Not a ceiling. `meka serve --permission read` does not stop a job whose own row carries a
+    /// higher level, because every session `serve` creates records its own; the host's level only
+    /// answers for a row that has none.
+    ///
+    /// Deliberately *not* a ceiling, which is what this comment used to claim. `--permission` on
+    /// `meka serve` is a starting default, and every session `serve` itself creates persists a
+    /// level of its own, so restarting at `read` does not disarm a gate an `unrestricted` session
+    /// authored. What does bound it is `enabled_permissions` below, which the operator can only
+    /// narrow in `config.toml` and which no session can exceed.
     pub host_permission: crate::permission::Permission,
+    /// The modes this installation permits at all.
+    ///
+    /// The fire-time gate check reads a session's recorded level straight out of the row, and a
+    /// row outlives the configuration that produced it. Without this, narrowing
+    /// `[permissions].enabled` and restarting left an `unrestricted` row firing its gate
+    /// forever while the live session re-attached at `read` -- verified end to end, and the
+    /// exact fail-open the live re-check was added to prevent, reached from the one of five
+    /// readers that did not apply the filter.
+    pub enabled_permissions: crate::permission::EnabledPermissions,
     pub poll_interval: std::time::Duration,
     pub missed_grace: std::time::Duration,
     pub gate_timeout: std::time::Duration,
@@ -152,10 +170,12 @@ impl ResolvedScheduleConfig {
     fn resolve(
         raw: Option<ScheduleConfig>,
         host_permission: crate::permission::Permission,
+        enabled_permissions: crate::permission::EnabledPermissions,
     ) -> Self {
         let raw = raw.unwrap_or_default();
         Self {
             host_permission,
+            enabled_permissions,
             enabled: raw.enabled.unwrap_or(true),
             poll_interval: raw.poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL),
             missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
@@ -172,7 +192,13 @@ impl Default for ResolvedScheduleConfig {
     /// `None` for the host level, which is the most restrictive: a default-constructed config is a
     /// test fixture or a caller that never said, and neither should be able to run a gate.
     fn default() -> Self {
-        Self::resolve(None, crate::permission::Permission::None)
+        // `DEFAULT` for the enabled set rather than something narrower: it can only ever *narrow*
+        // what a row already recorded, and `from_modes` guarantees a non-empty set anyway.
+        Self::resolve(
+            None,
+            crate::permission::Permission::None,
+            crate::permission::EnabledPermissions::DEFAULT,
+        )
     }
 }
 
@@ -335,13 +361,24 @@ impl std::fmt::Debug for WebhookConfig {
 ///
 /// The path is dropped because it frequently *is* the secret (Slack, Discord, and every other
 /// "unguessable URL" webhook). Enough to tell two endpoints apart; not enough to call one.
+///
+/// Parsed rather than split on `"://"` and `'/'`. Splitting only ever removed the *path*, and a
+/// URL has three other places to keep a secret: a query (`?token=…`, which survived intact because
+/// a URL with no path has no `/` to split on), a fragment, and userinfo (`user:pass@host`, which
+/// was returned verbatim as part of the host). Every one of those reached a `warn!` that runs at
+/// default verbosity, on the line whose own comment calls it the one that gets pasted into an issue
+/// tracker. Reconstructing from the parsed components keeps only what is named here, so a component
+/// nobody thought of cannot ride along.
 pub(crate) fn webhook_host(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let host = rest.split('/').next().unwrap_or(rest);
-            format!("{}://{}", scheme, host)
-        }
-        None => "<malformed>".to_string(),
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "<malformed>".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<malformed>".to_string();
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+        None => format!("{}://{}", parsed.scheme(), host),
     }
 }
 
@@ -655,7 +692,7 @@ pub struct ThinkingConfig {
 pub struct McpConfig {
     /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
     /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
-    /// unset the hardcoded fallback is `Write`, i.e. strict.
+    /// unset the hardcoded fallback is `Unrestricted`, i.e. strict.
     pub default_permission: Option<String>,
     pub servers: Option<Vec<McpServerConfig>>,
     /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
@@ -716,9 +753,9 @@ pub struct McpServerConfig {
     /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
     /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
     /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
-    /// the tool falls through to the strict `Write` fallback, and nothing from this server is
-    /// reachable at `read` without an explicit [`Self::tool_permissions`] or [`Self::permission`]
-    /// entry.
+    /// the tool falls through to the strict `Unrestricted` fallback, and nothing from this server
+    /// is reachable at `read` without an explicit [`Self::tool_permissions`] or
+    /// [`Self::permission`] entry.
     ///
     /// A refused hint deliberately skips `[mcp].default_permission` on the way. That is a global
     /// convenience and this is a per-server audit decision, so the per-server one wins, the same
@@ -1284,6 +1321,13 @@ pub struct ResolvedConfig {
     pub resume_show_recent: Option<usize>,
     pub web_client: WebClientConfig,
     pub sandbox: bool,
+    /// Extra workspace roots from `--writable-root`, joined with the cwd (and, under ACP, the
+    /// client's folders) to form the write boundary at `workspace` permission.
+    ///
+    /// CLI-only by design. Which folders a run may write is a per-run scope like the working
+    /// directory, not a preference worth persisting, so there is deliberately no `config.toml`
+    /// key and no env tier for it.
+    pub writable_roots: Vec<std::path::PathBuf>,
     /// Resolved Linux sandbox backend. Auto-picked at startup when `[shell].sandbox_backend` was
     /// not set: prefers bubblewrap, falls back to landlock. Silently `Landlock` on macOS / Windows
     /// (those platforms have their own backend and ignore the field).
@@ -1729,7 +1773,16 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
 pub fn expand_user_path(target: &str) -> Option<PathBuf> {
     if target.is_empty() || target == "~" {
         dirs::home_dir()
-    } else if let Some(rest) = target.strip_prefix("~/") {
+    } else if let Some(rest) = target
+        .strip_prefix('~')
+        .and_then(|rest| rest.strip_prefix(std::path::is_separator))
+    {
+        // `is_separator`, not a literal `"~/"`. On Windows both `/` and `\` separate, and `~\` is
+        // the spelling a user reaches for there because that is what PowerShell's own tilde
+        // expansion produces. Matching only `~/` left `~\projects` unexpanded, so it became a
+        // literal relative directory of that name and `/cd` reported the tilde back at the user as
+        // though it were a folder. `[skills] extra_paths` took the same spelling and resolved to a
+        // root that never existed.
         dirs::home_dir().map(|home| home.join(rest))
     } else {
         Some(PathBuf::from(target))
@@ -2037,6 +2090,9 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     // not: a dotfile manager's `~/dotfiles/config.toml` meant one `meka mcp disable` re-moded the
     // whole repository directory to 0700 and every unrelated file in it stayed put but newly
     // hidden -- a permission fact meka never established and cannot restore. Observed.
+    // Consulted only by the Unix mode-tightening branch below; there is no mode to tighten
+    // elsewhere, so computing it on those targets is dead work the compiler rightly flags.
+    #[cfg(unix)]
     let redirected = resolved.as_path() != path;
     let path = resolved.as_path();
 
@@ -2239,11 +2295,15 @@ fn resolve_permission(
                 .iter()
                 .filter_map(|raw| match raw.parse::<Permission>() {
                     Ok(mode) => Some(mode),
-                    Err(_) => {
+                    // The parser's own message, not a list restated here. It is the only thing that
+                    // knows a retired spelling from an unknown one, and a user upgrading past the
+                    // `write` split needs to be told which of the two replaced it rather than a
+                    // bare "expected one of".
+                    Err(error) => {
                         tracing::warn!(
-                            "ignoring invalid [permissions].enabled entry '{}' \
-                             (expected none, read, ask, or write)",
-                            raw
+                            "ignoring invalid [permissions].enabled entry '{}': {}",
+                            raw,
+                            error
                         );
                         None
                     }
@@ -2252,11 +2312,19 @@ fn resolve_permission(
             match EnabledPermissions::from_modes(parsed) {
                 Some(set) => set,
                 None => {
+                    // `{read}`, not `DEFAULT`. The user wrote a list; every entry being
+                    // unrecognised means their intent could not be honoured, and `DEFAULT` answers
+                    // that by handing back *four* modes including `unrestricted`. A pre-split
+                    // config pinning `enabled = ["write"]` -- exactly one mode, deliberately --
+                    // came back with the whole ladder reachable by Shift+Tab. Falling back to the
+                    // narrowest useful set keeps a failed parse from widening authority.
                     tracing::warn!(
-                        "[permissions].enabled was empty after filtering; falling back \
-                         to defaults (none, read, write)"
+                        "[permissions].enabled was empty after filtering, so none of the modes \
+                         you listed could be used; falling back to `read` alone rather than to \
+                         the default set, which would be wider than what you asked for"
                     );
-                    EnabledPermissions::DEFAULT
+                    EnabledPermissions::from_modes([Permission::Read])
+                        .unwrap_or(EnabledPermissions::DEFAULT)
                 }
             }
         }
@@ -2265,11 +2333,11 @@ fn resolve_permission(
 
     let configured_default = file_default.and_then(|raw| match raw.parse::<Permission>() {
         Ok(mode) => Some(mode),
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(
-                "ignoring invalid [permissions].default '{}' (expected none, read, \
-                 ask, or write)",
-                raw
+                "ignoring invalid [permissions].default '{}': {}",
+                raw,
+                error
             );
             None
         }
@@ -2300,12 +2368,8 @@ fn resolve_permission(
 
     let env_override = env_permission.and_then(|raw| match raw.parse::<Permission>() {
         Ok(mode) => Some(mode),
-        Err(_) => {
-            tracing::warn!(
-                "ignoring invalid MEKA_PERMISSION='{}' (expected none, read, ask, or \
-                 write)",
-                raw
-            );
+        Err(error) => {
+            tracing::warn!("ignoring invalid MEKA_PERMISSION='{}': {}", raw, error);
             None
         }
     });
@@ -2587,11 +2651,11 @@ impl ResolvedConfig {
         let mcp_default_permission = match mcp_default_permission_str.as_deref() {
             Some(raw) => match raw.parse::<Permission>() {
                 Ok(permission) => Some(permission),
-                Err(_) => {
+                Err(error) => {
                     tracing::warn!(
-                        "ignoring invalid [mcp].default_permission '{}' (expected \
-                         none, read, ask, or write)",
-                        raw
+                        "ignoring invalid [mcp].default_permission '{}': {}",
+                        raw,
+                        error
                     );
                     None
                 }
@@ -2637,12 +2701,12 @@ impl ResolvedConfig {
                 }
                 match level.parse::<Permission>() {
                     Ok(permission) => Some((name, permission)),
-                    Err(_) => {
+                    Err(error) => {
                         tracing::warn!(
-                            "ignoring invalid [tools.tool_permissions] entry '{}' = '{}' \
-                             (expected none, read, ask, or write)",
+                            "ignoring invalid [tools.tool_permissions] entry '{}' = '{}': {}",
                             name,
-                            level
+                            level,
+                            error
                         );
                         None
                     }
@@ -2675,7 +2739,8 @@ impl ResolvedConfig {
 
         // After `resolve_permission`, because a gate needs the level this process actually starts
         // at: a `meka serve --permission read` must not run a gate a write-mode session authored.
-        let schedule = ResolvedScheduleConfig::resolve(config_file.schedule, permission);
+        let schedule =
+            ResolvedScheduleConfig::resolve(config_file.schedule, permission, enabled_permissions);
 
         // Compute device_id before the struct literal so we can borrow `provider_name` and
         // `active_profile` here without conflicting with the field moves below.
@@ -2716,7 +2781,23 @@ impl ResolvedConfig {
                 )
             };
 
+        // A root that does not resolve contributes nothing to the write boundary, because
+        // `writable_roots` drops what it cannot canonicalise. Silently, until a write is refused
+        // with a boundary the user believed included this path. The path is kept regardless of the
+        // warning: a build directory that does not exist yet is a legitimate root, and the boundary
+        // is recomputed on every write rather than frozen here.
+        for root in &cli.writable_root {
+            if let Err(error) = std::fs::canonicalize(root) {
+                tracing::warn!(
+                    "--writable-root {} does not resolve ({}); it grants nothing until it exists",
+                    root.display(),
+                    error
+                );
+            }
+        }
+
         Self {
+            writable_roots: cli.writable_root.clone(),
             provider_name,
             active_profile,
             provider_error,
@@ -3098,6 +3179,75 @@ pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tilde is expanded whichever separator follows it.
+    ///
+    /// `~\projects` is what a Windows user types, because it is what PowerShell's own expansion
+    /// produces. Matching a literal `"~/"` left it alone, so `/cd` reported the tilde back as a
+    /// missing directory and `[skills] extra_paths` resolved to a root that never existed.
+    #[test]
+    fn expand_user_path_accepts_either_separator_after_the_tilde() {
+        let home = dirs::home_dir().expect("a home directory");
+
+        assert_eq!(expand_user_path("~"), Some(home.clone()));
+        assert_eq!(expand_user_path(""), Some(home.clone()));
+        assert_eq!(expand_user_path("~/projects"), Some(home.join("projects")));
+        #[cfg(windows)]
+        assert_eq!(expand_user_path(r"~\projects"), Some(home.join("projects")));
+
+        // Not a tilde-prefixed path: `~foo` is a user reference meka deliberately does not expand,
+        // and it must stay a literal rather than silently becoming `$HOME/foo`.
+        assert_eq!(
+            expand_user_path("~user/projects"),
+            Some(PathBuf::from("~user/projects"))
+        );
+    }
+
+    /// The webhook redactor keeps the scheme, host and port, and nothing else.
+    ///
+    /// Every case below is one a splitting implementation let through, and each reached a `warn!`
+    /// at default verbosity. The query one is the sharpest: a webhook URL with no path has no `/`
+    /// to split on, so `?token=…` was reproduced in full by the function whose entire job is to
+    /// remove the secret.
+    #[test]
+    fn webhook_host_keeps_only_the_origin() {
+        for (url, expected) in [
+            (
+                "https://hooks.example.com/services/T00/B00/XXXX",
+                "https://hooks.example.com",
+            ),
+            // No path, so nothing for a `'/'` split to cut.
+            (
+                "https://hooks.example.com?token=SECRET",
+                "https://hooks.example.com",
+            ),
+            (
+                "https://hooks.example.com/path?token=SECRET",
+                "https://hooks.example.com",
+            ),
+            (
+                "https://hooks.example.com#SECRET",
+                "https://hooks.example.com",
+            ),
+            // Userinfo rode along as part of what the old split called the host.
+            (
+                "https://user:pass@hooks.example.com/x",
+                "https://hooks.example.com",
+            ),
+            // A port distinguishes two endpoints and is not a secret, so it is kept.
+            ("http://127.0.0.1:8080/hook", "http://127.0.0.1:8080"),
+            ("not a url", "<malformed>"),
+        ] {
+            let rendered = webhook_host(url);
+            assert_eq!(rendered, expected, "redacting {url}");
+            for secret in ["SECRET", "pass", "T00", "XXXX"] {
+                assert!(
+                    !rendered.contains(secret),
+                    "{rendered} still carries `{secret}` from {url}"
+                );
+            }
+        }
+    }
 
     /// `extra_paths` resolution drops what discovery cannot use, and says so each time.
     ///
@@ -4057,8 +4207,11 @@ max_consecutive_fires = 3
 "#,
         )
         .expect("failed to parse toml");
-        let schedule =
-            ResolvedScheduleConfig::resolve(config.schedule, crate::permission::Permission::Write);
+        let schedule = ResolvedScheduleConfig::resolve(
+            config.schedule,
+            crate::permission::Permission::Unrestricted,
+            crate::permission::EnabledPermissions::DEFAULT,
+        );
         assert!(schedule.enabled);
         assert_eq!(schedule.poll_interval, std::time::Duration::from_secs(5));
         assert_eq!(schedule.missed_grace, std::time::Duration::from_secs(7200));
@@ -4071,8 +4224,11 @@ max_consecutive_fires = 3
     fn test_schedule_config_defaults_are_filled_when_absent() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.schedule.is_none());
-        let schedule =
-            ResolvedScheduleConfig::resolve(config.schedule, crate::permission::Permission::Write);
+        let schedule = ResolvedScheduleConfig::resolve(
+            config.schedule,
+            crate::permission::Permission::Unrestricted,
+            crate::permission::EnabledPermissions::DEFAULT,
+        );
         assert!(schedule.enabled, "scheduling is on unless turned off");
         assert!(!schedule.poll_interval.is_zero());
         assert!(!schedule.gate_timeout.is_zero());
@@ -4829,7 +4985,7 @@ read_file = "ask"
         // that a bad level string is filtered out without panicking and that valid entries still
         // land.
         let raw: HashMap<String, String> = [
-            ("read_file".to_string(), "write".to_string()),
+            ("read_file".to_string(), "unrestricted".to_string()),
             ("write_file".to_string(), "superuser".to_string()),
             ("find_files".to_string(), "read".to_string()),
         ]
@@ -4839,7 +4995,10 @@ read_file = "ask"
             .into_iter()
             .filter_map(|(name, level)| level.parse::<Permission>().ok().map(|p| (name, p)))
             .collect();
-        assert_eq!(parsed.get("read_file").copied(), Some(Permission::Write));
+        assert_eq!(
+            parsed.get("read_file").copied(),
+            Some(Permission::Unrestricted)
+        );
         assert_eq!(parsed.get("find_files").copied(), Some(Permission::Read));
         assert!(
             !parsed.contains_key("write_file"),
@@ -5453,26 +5612,40 @@ thinking = "budgeted"
 
     #[test]
     fn test_resolve_permission_explicit_enabled_all() {
-        let list = enabled_strings(&["none", "read", "ask", "write"]);
+        let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
         let (_perm, enabled) = resolve_permission(None, None, None, Some(&list));
         assert!(enabled.is_enabled(Permission::Ask));
-        assert_eq!(enabled.iter().count(), 4);
+        assert_eq!(enabled.iter().count(), 5);
     }
 
     #[test]
     fn test_resolve_permission_invalid_entry_warns_and_drops() {
-        let list = enabled_strings(&["read", "lol", "write"]);
+        let list = enabled_strings(&["read", "lol", "unrestricted"]);
         let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
-        assert_eq!(enabled, enabled_set(&[Permission::Read, Permission::Write]));
+        assert_eq!(
+            enabled,
+            enabled_set(&[Permission::Read, Permission::Unrestricted])
+        );
         assert_eq!(perm, Permission::Read);
     }
 
+    /// A list that yields nothing must not resolve to a set *wider* than the one written.
+    ///
+    /// `EnabledPermissions::DEFAULT` was the old answer for both of these, and it holds four modes
+    /// including `unrestricted`. So `enabled = []`, which asks for nothing, and `enabled =
+    /// ["write"]`, which asks for exactly one now-retired mode, each came back with the full ladder
+    /// reachable by Shift+Tab. The fallback has to move down the ladder, never up.
     #[test]
-    fn test_resolve_permission_empty_enabled_falls_back_to_default() {
-        let list: Vec<String> = vec![];
-        let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
-        assert_eq!(enabled, EnabledPermissions::DEFAULT);
-        assert_eq!(perm, Permission::Read);
+    fn an_enabled_list_that_yields_nothing_falls_back_to_read_alone() {
+        for list in [enabled_strings(&[]), enabled_strings(&["write"])] {
+            let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
+            assert_eq!(enabled, enabled_set(&[Permission::Read]), "for {list:?}");
+            assert!(
+                !enabled.is_enabled(Permission::Unrestricted),
+                "a failed parse must not enable a mode the user did not write: {list:?}"
+            );
+            assert_eq!(perm, Permission::Read);
+        }
     }
 
     #[test]
@@ -5499,8 +5672,8 @@ thinking = "budgeted"
 
     #[test]
     fn test_resolve_permission_explicit_default_used() {
-        let (perm, _enabled) = resolve_permission(None, None, Some("write"), None);
-        assert_eq!(perm, Permission::Write);
+        let (perm, _enabled) = resolve_permission(None, None, Some("unrestricted"), None);
+        assert_eq!(perm, Permission::Unrestricted);
     }
 
     #[test]
@@ -5513,15 +5686,15 @@ thinking = "budgeted"
 
     #[test]
     fn test_resolve_permission_cli_override_enabled_wins() {
-        let list = enabled_strings(&["none", "read", "ask", "write"]);
+        let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
         let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, Some(&list));
         assert_eq!(perm, Permission::Ask);
     }
 
     #[test]
     fn test_resolve_permission_env_override_used() {
-        let (perm, _enabled) = resolve_permission(None, Some("write"), None, None);
-        assert_eq!(perm, Permission::Write);
+        let (perm, _enabled) = resolve_permission(None, Some("unrestricted"), None, None);
+        assert_eq!(perm, Permission::Unrestricted);
     }
 
     #[test]

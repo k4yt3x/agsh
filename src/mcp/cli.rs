@@ -960,17 +960,13 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         McpTransport::Stdio
     });
 
-    // Permission allow-list matches `parse_server_permission` upstream.
+    // Validated through `Permission`'s own parser rather than a list restated here. The value is
+    // stored as the string the user typed, so only the check is borrowed; keeping a second copy of
+    // the vocabulary is how a retired spelling survives in one door after being removed from the
+    // other.
     if let Some(perm) = permission.as_deref() {
-        match perm {
-            "none" | "read" | "ask" | "write" => {}
-            other => {
-                return Err(config_err(format!(
-                    "unknown permission '{}' (expected none, read, ask, or write)",
-                    other
-                )));
-            }
-        }
+        perm.parse::<crate::permission::Permission>()
+            .map_err(|error| config_err(format!("unknown permission '{}': {}", perm, error)))?;
     }
 
     // Per-tool permission overrides arrive as `NAME=LEVEL` strings. Parse
@@ -994,16 +990,14 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                     entry
                 )));
             }
-            match level {
-                "none" | "read" | "ask" | "write" => {}
-                other => {
-                    return Err(config_err(format!(
-                        "--tool-permission '{}' has unknown level '{}' \
-                         (expected none, read, ask, or write)",
-                        entry, other
-                    )));
-                }
-            }
+            level
+                .parse::<crate::permission::Permission>()
+                .map_err(|error| {
+                    config_err(format!(
+                        "--tool-permission '{}' has unknown level '{}': {}",
+                        entry, level, error
+                    ))
+                })?;
             map.insert(tool.to_string(), level.to_string());
         }
         Some(map)

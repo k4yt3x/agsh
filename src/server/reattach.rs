@@ -144,10 +144,11 @@ pub async fn ensure_session_loaded(
     // permission could in principle become disabled by an operator editing config; defensively
     // re-check.
     let enabled = state.shared.config.enabled_permissions;
-    let permission: Permission = match summary.permission.as_deref() {
-        Some(value) => value.parse().unwrap_or(state.shared.config.permission),
-        None => state.shared.config.permission,
-    };
+    let permission: Permission = crate::permission::parse_recorded_permission(
+        summary.permission.as_deref(),
+        &format_args!("session {id}"),
+    )
+    .unwrap_or(state.shared.config.permission);
     let permission = if enabled.is_enabled(permission) {
         permission
     } else {

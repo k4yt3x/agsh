@@ -79,9 +79,10 @@ The indicator shows the current permission mode:
 | None | `[n]` | Green |
 | Read | `[r]` | Yellow |
 | Ask | `[a]` | Magenta |
-| Write | `[w]` | Red |
+| Workspace | `[w]` | Orange |
+| Unrestricted | `[u]` | Red |
 
-The color provides a visual cue about the agent's current capabilities. Red means the agent can modify your system.
+The color provides a visual cue about the agent's current capabilities. Orange means the agent can modify your system inside the workspace roots; red means it can modify anything you can.
 
 ## Multi-Line Input
 

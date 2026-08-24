@@ -57,20 +57,37 @@ pub struct ScheduledJobView {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GateView {
-    pub command: String,
+    /// The gate's shell command, or `None` when the caller may not see it.
+    ///
+    /// Withheld from a token that does not also hold `sessions:r`. A gate command is an
+    /// `execute_command` line that runs unattended, and the webhook path already omits the same
+    /// field on the stated grounds that a command line is "the highest-entropy field in the system
+    /// and the one most likely to carry a credential someone pasted into a `curl`". `GET
+    /// /v1/schedule` is server-wide, so leaving it at `schedule:r` handed every gate on the box to
+    /// a calendar bridge scoped to the read half of a scope invented so that schedule access would
+    /// *not* imply session access.
+    ///
+    /// The gate's presence and its fire condition stay visible either way, so a client can still
+    /// tell a gated job from an ungated one without being told what it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// `on-change` or `on-success`.
     pub fire: String,
 }
 
-impl From<ScheduledJob> for ScheduledJobView {
-    fn from(job: ScheduledJob) -> Self {
+impl ScheduledJobView {
+    /// Render a job for a caller, disclosing the gate command only when `reveal_command` is set.
+    ///
+    /// Not a `From` impl any more: the rendering depends on the caller's scopes, and a conversion
+    /// that cannot see them is exactly how the command came to be disclosed at `schedule:r`.
+    fn render(job: ScheduledJob, reveal_command: bool) -> Self {
         Self {
             id: job.id,
             session_id: job.session_id,
             schedule: job.schedule.describe(),
             prompt: job.prompt,
             gate: job.gate.map(|gate| GateView {
-                command: gate.command,
+                command: reveal_command.then_some(gate.command),
                 fire: gate.fire.as_str().to_string(),
             }),
             isolated: job.isolated,
@@ -103,6 +120,7 @@ pub async fn list_all(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<ScheduledJobsResponse>, ProblemDetail> {
     scope::require(&principal, "schedule:r")?;
+    let reveal_command = principal.has_scope("sessions:r");
     let jobs = state
         .shared
         .session_manager
@@ -113,7 +131,10 @@ pub async fn list_all(
             ProblemDetail::internal_sanitized("failed to list scheduled jobs", error)
         })?;
     Ok(Json(ScheduledJobsResponse {
-        jobs: jobs.into_iter().map(ScheduledJobView::from).collect(),
+        jobs: jobs
+            .into_iter()
+            .map(|job| ScheduledJobView::render(job, reveal_command))
+            .collect(),
     }))
 }
 
@@ -137,6 +158,7 @@ pub async fn list_for_session(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ScheduledJobsResponse>, ProblemDetail> {
     scope::require(&principal, "schedule:r")?;
+    let reveal_command = principal.has_scope("sessions:r");
     require_session_exists(&state, id).await?;
     let jobs = state
         .shared
@@ -149,7 +171,10 @@ pub async fn list_for_session(
                 .with("session_id", id.to_string())
         })?;
     Ok(Json(ScheduledJobsResponse {
-        jobs: jobs.into_iter().map(ScheduledJobView::from).collect(),
+        jobs: jobs
+            .into_iter()
+            .map(|job| ScheduledJobView::render(job, reveal_command))
+            .collect(),
     }))
 }
 
@@ -167,8 +192,9 @@ pub struct CreateJobRequest {
     /// 5-field cron pattern, evaluated in the host's local time.
     #[serde(default)]
     pub cron: Option<String>,
-    /// Guard the job on a shell command. Requires the session to be at `write` permission, for the
-    /// same reason `schedule_create` does: the command runs unattended and unsandboxed.
+    /// Guard the job on a shell command. Requires the session to be at `unrestricted`, for the
+    /// same reason `schedule_create` does: the command runs unattended and with no sandbox, so no
+    /// level that promises a boundary can honestly authorise it.
     #[serde(default)]
     pub gate: Option<CreateGate>,
     /// Run in a fresh sub-agent session rather than replaying the parent's history every fire.
@@ -196,7 +222,7 @@ pub struct CreateGate {
     responses(
         (status = 201, description = "Job created", body = ScheduledJobView),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope, or a gate below write permission", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope, or a gate on a session that cannot do unattended work", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid schedule, or the session's job limit is reached", body = ProblemDetail),
@@ -275,14 +301,14 @@ pub async fn create(
                 )
                 .with("session_id", id.to_string())
             })?;
-            // Matched explicitly rather than compared, exactly as `schedule_create` does:
-            // `Permission`'s `Ord` is for clamping a sub-agent to its parent, and `Ask` is
-            // precisely the level a gate must not run at, because there is nobody to approve it.
+            // The shared predicate rather than a comparison, exactly as `schedule_create` does:
+            // `Permission`'s `Ord` is for display order, and `Ask` is precisely the level a gate
+            // must not run at, because there is nobody to approve it.
             let permission = match &resident {
                 Some(entry) => entry.permission.get(),
                 None => session_permission_from_row(&state, id).await?,
             };
-            if !matches!(permission, Permission::Write) {
+            if !permission.allows_unattended_shell() {
                 // `SessionPermission`, not `AuthScope`: the token is fine and a better one will
                 // never help. The docs tell clients to route on `type`, so reporting this as a
                 // scope failure sends them to re-provision a token when the fix is to raise the
@@ -292,8 +318,9 @@ pub async fn create(
                     StatusCode::FORBIDDEN,
                     format!(
                         "a gate runs a shell command unattended, so it needs the session to be at \
-                         write permission (currently {}). Create the job without `gate` and check \
-                         the condition inside the prompt instead.",
+                         `unrestricted` permission (currently {}), because a gate runs with no \
+                         sandbox at all. Create the job \
+                         without `gate` and check the condition inside the prompt instead.",
                         permission
                     ),
                 )
@@ -325,9 +352,9 @@ pub async fn create(
                 fire,
                 last_output: None,
                 // See `schedule_create`: the level is recorded so `prepare` can re-check it at fire
-                // time. `permission` is `Write` by the guard above, and the session's level is
-                // mutable through `PATCH /v1/sessions/{id}`, so the check above cannot stand in for
-                // one made when the command actually runs.
+                // time. `permission` is `Unrestricted` by the guard above, and the session's level
+                // is mutable through `PATCH /v1/sessions/{id}`, so the check above
+                // cannot stand in for one made when the command actually runs.
                 permission,
             })
         }
@@ -393,7 +420,11 @@ pub async fn create(
         id,
         job.next_fire_at.to_rfc3339()
     );
-    Ok((StatusCode::CREATED, Json(ScheduledJobView::from(job))))
+    // The caller just supplied this command, so echoing it back discloses nothing new.
+    Ok((
+        StatusCode::CREATED,
+        Json(ScheduledJobView::render(job, true)),
+    ))
 }
 
 /// The permission an evicted session would come back at, read from its row.
@@ -414,10 +445,11 @@ async fn session_permission_from_row(
             ProblemDetail::internal_sanitized("failed to read session permission", error)
                 .with("session_id", id.to_string())
         })?;
-    let persisted = summary
-        .and_then(|summary| summary.permission)
-        .and_then(|value| value.parse::<Permission>().ok())
-        .unwrap_or(state.shared.config.permission);
+    let persisted = crate::permission::parse_recorded_permission(
+        summary.and_then(|summary| summary.permission).as_deref(),
+        &format_args!("session {id}"),
+    )
+    .unwrap_or(state.shared.config.permission);
     Ok(
         if state
             .shared

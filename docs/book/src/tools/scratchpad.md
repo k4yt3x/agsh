@@ -66,6 +66,41 @@ Delete a scratchpad entry by name.
 |------|------|----------|-------------|
 | `name` | string | yes | The entry name to delete |
 
+### `scratchpad_load_file`
+
+Read a file's contents into a scratchpad entry without the bytes passing through the conversation.
+The model never sees the payload, which is what makes this the way to stage a large log or document
+for `inherit_scratchpad`. UTF-8 text only; a binary file is refused with its detected MIME type.
+Overwrites an existing entry of the same name, and a sub-agent cannot load into a name it inherited
+read-only from its parent.
+
+**Permission:** Read
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | yes | The file path to read |
+| `name` | string | yes | Name to store the contents under |
+
+### `scratchpad_save_file`
+
+Write a scratchpad entry out to a file, again without routing the bytes through the conversation.
+A sub-agent can save an entry it inherited, so a worker's report reaches disk without being copied
+through the model.
+
+**Permission:** Workspace
+
+This is the one scratchpad tool that leaves meka's own storage, so it is the one that carries a
+write permission. It reads as the scratchpad's `write_file` and is fenced identically: at
+`workspace` the path must resolve inside a workspace root, and the refusal is the same one
+`write_file` gives. Every other scratchpad tool stays at `read` because the scratchpad lives in
+meka's database, not your tree.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | The scratchpad entry to read from |
+| `path` | string | yes | The file path to write to |
+| `force` | boolean | no | Replace the file if it already exists; without it, saving over an existing file is refused |
+
 ## Handing entries to a sub-agent
 
 `agent_spawn`'s `inherit_scratchpad` takes a list of the parent's entry names and grants the

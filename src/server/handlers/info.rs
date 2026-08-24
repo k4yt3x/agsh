@@ -115,7 +115,10 @@ pub async fn skills(
         .iter()
         .map(|skill| SkillView {
             name: skill.name.clone(),
-            description: skill.description.clone(),
+            // Sanitised: this is an index for a client to render, not a backup door. The body is
+            // returned verbatim by `GET /v1/skills/{name}` for that purpose; a one-line label the
+            // caller will draw in a list is a render, and the store now hands back file bytes.
+            description: crate::memory::render_description_for_model(&skill.description),
             priority: skill.priority,
             version: skill.version(),
             author: skill.author(),

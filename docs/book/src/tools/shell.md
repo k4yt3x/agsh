@@ -4,7 +4,7 @@
 
 Execute a shell command and return its output.
 
-**Permission:** Read (sandboxed) / Write (unsandboxed)
+**Permission:** `read` (sandboxed read-only) / `workspace` (sandboxed, writable inside the workspace roots) / `ask` and `unrestricted` (unsandboxed)
 
 ### Parameters
 
@@ -48,6 +48,23 @@ In **read mode**, commands run inside a sandbox that blocks writes to the user's
 
 The sandbox is not an adversarial containment boundary; it's defense-in-depth against an agent accidentally modifying user data. Set permission to `none` if you don't trust a turn at all.
 
+#### Scratch space: one place the backends genuinely differ
+
+A confined command may or may not get a writable temporary directory, and this is the one difference between backends big enough to change which commands work:
+
+| Backend | Scratch space | Effect |
+|---|---|---|
+| Bubblewrap (`read`) | Private `/tmp` tmpfs | `mktemp`, `git`, `python`, `gpg`, `pip` all work |
+| Landlock (`read`) | None | Anything that writes a temp file is denied |
+| Windows `workspace` | None outside the roots | `New-TemporaryFile` is denied (measured) |
+| macOS Seatbelt (`read`) | Per-backend; see below | |
+
+Under Bubblewrap the child gets a private writable `/tmp`, so `mktemp` succeeds and the write goes nowhere real. Under Landlock there is no such directory and the write is simply denied, which takes `git`'s index lock, Python's `tempfile`, `gpg` and `pip` with it. The same is true of `workspace` on Windows outside the granted roots.
+
+This divergence is deliberate. Granting a scratch directory under Landlock would weaken what `read` promises on the backend that currently keeps that promise strictly, so the narrower behaviour stays.
+
+The practical cost is diagnostic: the model sees a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%`), with nothing in the message connecting it to the sandbox, and cannot act on it. If a command fails that way and you expected it to work, install `bwrap` for Landlock hosts, or add the directory it wants as a writable root at `workspace`.
+
 #### Environment variable scrubbing
 
 Read-mode sandboxes still permit outbound network (the threat model intentionally keeps `curl http://x | pdftotext`-style pipelines working), so any secret in the parent process's environment (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, OAuth tokens, etc.) would be a live exfiltration vector under prompt injection. meka scrubs the child environment at spawn time across every backend (Bubblewrap, Landlock, Seatbelt, Windows Low-integrity).
@@ -60,7 +77,9 @@ Read-mode sandboxes still permit outbound network (the threat model intentionall
 
   The deny-list is intentionally aggressive on false positives (a legitimate `GITHUB_ACTOR` is dropped alongside `GITHUB_TOKEN`) because the cost of a missing env var is a confusing tool error, while the cost of a leaked credential is a live exfiltration channel.
 
-**Write mode keeps the full parent environment.** Write mode is the trusted-operation path where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a read-mode shell command, switch to write mode for that turn.
+**`ask` and `unrestricted` keep the full parent environment.** These are the trusted-operation paths where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a sandboxed shell command, switch to one of them for that turn.
+
+For `ask` specifically this is worth stating outright, because the approval prompt shows you a *command* and not its environment: an approved `npm test` whose postinstall script reads `process.env` sees `ANTHROPIC_API_KEY` and every other secret in meka's environment, on a sandbox that deliberately leaves the network open. That is the same reach an approved `write_file` has, which is the point of the level — the prompt is what you are trusting, not a scrub behind it. If you want the scrub, `workspace` keeps it and confines writes to the workspace roots.
 
 #### Linux: pick a backend
 
@@ -84,13 +103,30 @@ sandbox_backend = "bubblewrap"       # or "landlock"; unset = auto-detect
 
 Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself.
 
+#### Windows at `workspace`
+
+`workspace` uses a second mechanism, not the Low-integrity token above. meka derives a capability
+SID from each workspace root, places an inheritable `GENERIC_WRITE | DELETE` ACE for it on that
+root, and runs the shell under a `WRITE_RESTRICTED` token carrying that capability, so a write
+succeeds exactly where one of those ACEs exists. Three consequences worth knowing before you use it:
+
+- meka has to **own** the root, which is what lets it grant without elevation. A network share or
+  another user's folder cannot be a workspace root.
+- PowerShell runs in **ConstrainedLanguage** mode under a restricted token, so scripts that
+  construct .NET types fail there while working at `unrestricted`. meka's UTF-8 output preamble is
+  skipped for the same reason, so non-ASCII output may be mangled at `workspace`.
+- The ACE is real, standing state on your directory, visible in `icacls`. It is released when the
+  process exits, Ctrl+C included, but not after a crash or a kill.
+
+See [Permissions](../usage/permissions.md#per-platform-enforcement) for the full account.
+
 #### When the configured backend is unavailable
 
-If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` in read mode returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to write mode (Shift+Tab).
+If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` in read mode returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
 
 #### Disabling the sandbox entirely
 
-To disable sandboxed shell execution in read mode altogether, set `sandbox = false` under `[shell]`. When disabled, shell commands require write mode.
+To disable sandboxed shell execution altogether, set `sandbox = false` under `[shell]`. When disabled, shell commands require `ask` or `unrestricted`: `read` loses the tool entirely, and `workspace` refuses it with an error naming the key, because there is no longer anything to hold the boundary that mode promises. Reach for `unrestricted` on those turns rather than expecting `workspace` to quietly run unconfined.
 
 ```toml
 [shell]

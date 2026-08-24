@@ -645,7 +645,15 @@ impl Ranking {
 #[derive(Debug, Clone)]
 pub struct WriteRequest {
     pub name: String,
-    pub description: String,
+    /// `None` means "keep what is stored", exactly as it does for the three fields below.
+    ///
+    /// Required only when the write creates the memory, which [`MemoryStore::write`] checks inside
+    /// its own transaction. Before this the field was a plain `String`, so a caller refining a
+    /// stored note had to resend the description -- and the only copy an agent can see is the
+    /// index's, elided to 500 characters. Refining the body of a memory whose description ran to
+    /// 900 characters therefore rewrote it as 503 ending in `...`, silently, on a call that did
+    /// not mean to touch it.
+    pub description: Option<String>,
     pub tags: Option<Vec<String>>,
     pub body: Option<String>,
     pub priority: Option<u8>,
@@ -709,20 +717,26 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 /// `split_whitespace` already stops a newline, but an ANSI escape, a bidi override or a zero-width
 /// character is not whitespace and went through untouched.
 ///
-/// Dropping rather than refusing: a tag is a label, and a label with something odd in it is still
-/// worth showing with the odd part gone. Refusing would hide the memory instead.
+/// All-or-nothing, against the write door's own rule. Filtering character by character was worse
+/// than refusing, because for the most likely input it did not remove an odd character -- it
+/// silently produced a *different, entirely plausible* tag. A stored `Infra` came back as `nfra`:
+/// still a valid tag, still rendered without complaint, and wrong. `Q3-2026` became `3-2026`.
+/// Nothing in the histogram or the diff marks a tag as altered, so the corruption is invisible at
+/// every surface that displays it.
 ///
-/// A tag left with nothing at all -- `UPPER`, a run of CJK, a lone escape -- is dropped by the
-/// caller rather than kept as an empty string. Keeping it put a nameless entry in the tag
-/// histogram (`most common tags  (3)`) and a stray separator in the diff's `[deploy, ]`, which is
-/// the render this guard exists to protect.
+/// The predicate is [`crate::memory::validate_tag`] itself rather than a second character list, so
+/// what a read keeps is exactly what a write would have accepted -- one rule in one place. That
+/// also settles the uppercase case the same way the write door does: `validate_tag` *refuses*
+/// `Infra` rather than lowercasing it, so a read that folded case would be inventing a third
+/// policy. The tag drops, and the caller filters the empty string out, which keeps a nameless entry
+/// out of the tag histogram (`most common tags  (3)`) and a stray separator out of the diff's
+/// `[deploy, ]`.
 fn keepable_tag(stored: &str) -> String {
-    stored
-        .chars()
-        .filter(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || *character == '-'
-        })
-        .collect()
+    if crate::memory::validate_tag(stored).is_ok() {
+        stored.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Clamp a stored priority into the band. Stored values come from meka's own validated write door,
@@ -979,6 +993,7 @@ impl MemoryStore {
     /// Three of this subsystem's defects were omit-to-keep bugs. None of them is expressible here.
     pub async fn write(&self, request: WriteRequest) -> Result<Memory> {
         let now = crate::memory::render_recorded(SystemTime::now());
+        let name = request.name.clone();
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 // IMMEDIATE, not the `transaction()` default of DEFERRED. A deferred
@@ -991,12 +1006,41 @@ impl MemoryStore {
                 // write lock up front is what lets the handler wait.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                // Asked inside the transaction, so "does this row exist" cannot go stale before
+                // the upsert that depends on the answer. A creating write must carry a
+                // description; an updating one may omit it and keep what is stored.
+                if request.description.is_none() {
+                    let exists: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM memories WHERE name = ?1",
+                        rusqlite::params![request.name],
+                        |row| row.get(0),
+                    )?;
+                    if exists == 0 {
+                        // A sentinel the caller maps back to a plain refusal, not a `rusqlite`
+                        // variant that renders as one.
+                        //
+                        // This used to be `InvalidParameterName`, whose `Display` is "Invalid
+                        // parameter name: {name}". Wrapped by `tokio_rusqlite` and then by
+                        // `MekaError::Database`, the model received `database error: failed to
+                        // write memory: Error("Invalid parameter name: no memory named 'x'
+                        // exists...")` -- a user-input mistake dressed as a database fault, with a
+                        // prefix inviting a retry under a different `name`.
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    }
+                }
                 transaction.execute(
+                    // `COALESCE(?2, '')` in the VALUES clause, not a bare `?2`: SQLite checks
+                    // `NOT NULL` while attempting the insert, before it notices the uniqueness
+                    // conflict that would route to DO UPDATE, so an omitted description failed the
+                    // constraint instead of reaching the `COALESCE` below. The `''` is never
+                    // stored, because the only path that inserts rather than updates is one the
+                    // existence check above already required a description for.
                     "INSERT INTO memories
                          (name, description, tags, body, priority, recorded_at, updated_at)
-                     VALUES (?1, ?2, COALESCE(?3, ''), COALESCE(?4, ''), COALESCE(?5, ?7), ?6, ?6)
+                     VALUES (?1, COALESCE(?2, ''), COALESCE(?3, ''), COALESCE(?4, ''),
+                             COALESCE(?5, ?7), ?6, ?6)
                      ON CONFLICT(name) DO UPDATE SET
-                         description = excluded.description,
+                         description = COALESCE(?2, memories.description),
                          tags        = COALESCE(?3, memories.tags),
                          body        = COALESCE(?4, memories.body),
                          priority    = COALESCE(?5, memories.priority),
@@ -1022,7 +1066,17 @@ impl MemoryStore {
                 Ok(written)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to write memory: {error}")))
+            .map_err(|error| match error {
+                // The sentinel the transaction raises when an omitted description would have to
+                // create the row. Mapped back here, at the boundary that owns the vocabulary, so
+                // the caller sees a refusal it can act on rather than a database fault.
+                tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
+                    MekaError::InvalidRequest(format!(
+                        "no memory named '{name}' exists, so a description is required to create it"
+                    ))
+                }
+                error => MekaError::Database(format!("failed to write memory: {error}")),
+            })
     }
 
     /// Replace one memory's body and nothing else, provided it still holds `expected`.
@@ -1426,13 +1480,52 @@ impl MemoryStore {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stored tag is either kept as written or dropped, never quietly rewritten into a different
+    /// tag.
+    ///
+    /// Filtering character by character looked conservative and was the opposite: `Infra` came out
+    /// as `nfra` and `Q3-2026` as `3-2026`, both of them valid tags that nobody stored, rendered
+    /// into the tag histogram and the world-state diff with nothing marking them as altered.
+    ///
+    /// The kept set is exactly what `validate_tag` accepts, so a read agrees with a write instead
+    /// of applying a second rule. That includes refusing uppercase rather than folding it, which is
+    /// what the write door does.
+    #[test]
+    fn a_stored_tag_is_kept_or_dropped_but_never_rewritten() {
+        assert_eq!(keepable_tag("infra"), "infra");
+        assert_eq!(keepable_tag("q3-2026"), "q3-2026");
+        assert_eq!(
+            keepable_tag("Infra"),
+            "",
+            "was silently rewritten to `nfra`"
+        );
+        assert_eq!(
+            keepable_tag("Q3-2026"),
+            "",
+            "was silently rewritten to `3-2026`"
+        );
+
+        for hostile in [
+            "de\u{1b}[31mploy",
+            "de\u{202e}ploy",
+            "de\u{200b}ploy",
+            "\u{6f22}\u{5b57}",
+        ] {
+            assert_eq!(
+                keepable_tag(hostile),
+                "",
+                "a tag holding {hostile:?} must drop whole, not become a shorter valid tag"
+            );
+        }
+    }
     use super::*;
 
     /// A write that states every field, for fixtures that only care about the text.
     fn full(name: &str, priority: u8, description: &str, body: &str) -> WriteRequest {
         WriteRequest {
             name: name.to_string(),
-            description: description.to_string(),
+            description: Some(description.to_string()),
             tags: Some(Vec::new()),
             body: Some(body.to_string()),
             priority: Some(priority),
@@ -1468,7 +1561,7 @@ mod tests {
         let created = store
             .write(WriteRequest {
                 name: "policy".to_string(),
-                description: "How to reply".to_string(),
+                description: Some("How to reply".to_string()),
                 tags: Some(vec!["style".to_string()]),
                 body: Some("Always answer in kind. xylophone".to_string()),
                 priority: Some(0),
@@ -1482,7 +1575,7 @@ mod tests {
         let updated = store
             .write(WriteRequest {
                 name: "POLICY".to_string(),
-                description: "How to reply, reworded".to_string(),
+                description: Some("How to reply, reworded".to_string()),
                 tags: None,
                 body: None,
                 priority: None,
@@ -1786,7 +1879,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "runbook".to_string(),
-                description: "how to restart the thing".to_string(),
+                description: Some("how to restart the thing".to_string()),
                 tags: Some(vec!["infra".to_string()]),
                 body: None,
                 priority: Some(5),
@@ -1809,7 +1902,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "runbook".to_string(),
-                description: "how to restart the thing".to_string(),
+                description: Some("how to restart the thing".to_string()),
                 tags: Some(vec!["deploy".to_string()]),
                 body: None,
                 priority: None,
@@ -1856,7 +1949,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "policy".to_string(),
-                description: "the retention window".to_string(),
+                description: Some("the retention window".to_string()),
                 tags: None,
                 body: None,
                 priority: Some(5),
@@ -2127,7 +2220,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "note".to_string(),
-                description: "reworded by the agent".to_string(),
+                description: Some("reworded by the agent".to_string()),
                 tags: None,
                 body: None,
                 priority: Some(0),
@@ -2186,7 +2279,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "race".to_string(),
-                description: "d".to_string(),
+                description: Some("d".to_string()),
                 tags: None,
                 body: Some("WHAT THE AGENT LEARNED".to_string()),
                 priority: None,
@@ -2255,7 +2348,7 @@ mod tests {
         let cleared = store
             .write(WriteRequest {
                 name: "note".to_string(),
-                description: "a note".to_string(),
+                description: Some("a note".to_string()),
                 tags: Some(Vec::new()),
                 body: Some(String::new()),
                 priority: None,
@@ -2317,7 +2410,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "planted".to_string(),
-                description: description.to_string(),
+                description: Some(description.to_string()),
                 tags: None,
                 body: Some(body.to_string()),
                 priority: Some(0),
@@ -2596,13 +2689,15 @@ mod tests {
             .expect("plant the tags");
 
         let tags = &store.index().await.expect("index")[0].tags;
-        // Filtered, not repaired: the printable remains of an escape sequence stay, and the point
-        // is that nothing outside the alphabet a tag is validated against survives. `UPPER` is
-        // gone entirely rather than reduced to an empty tag -- a tag is lowercase, which is the
-        // same rule `validate_tag` applies, and a label with nothing left in it is not a label. An
-        // empty one rendered as a nameless bucket in the tag histogram and a stray separator in
-        // the world-state diff, which are the two renders this guard exists for.
-        assert_eq!(tags, &["in31mfra".to_string(), "deploy".to_string()]);
+        // Dropped, not repaired. The filter used to hand back `in31mfra` -- the printable remains
+        // of the escape sequence, spliced into a tag that reads as real and that nobody wrote --
+        // and `dep\u{202e}loy` reduced to `deploy`. Neither is a tag a write door would have
+        // accepted, and nothing downstream marks a tag as altered, so both rendered as fact.
+        // `UPPER` is gone for the same reason it always was: `validate_tag` refuses uppercase.
+        assert!(
+            tags.is_empty(),
+            "a tag outside the alphabet must drop whole rather than be rewritten: {tags:?}"
+        );
         for tag in tags {
             assert!(
                 crate::memory::validate_tag(tag).is_ok(),

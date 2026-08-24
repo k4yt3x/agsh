@@ -65,3 +65,16 @@ Deleting a `[providers.<name>]` block by hand removes the settings but not the s
 the database under that name. `meka provider list` names any credential left that way, and `meka
 provider remove <name>` deletes it; see [Leftover
 credentials](./config-file.md#leftover-credentials).
+
+## Why some settings have no config key
+
+A few things are deliberately CLI-only, with no `config.toml` key and no environment variable.
+`--writable-root` is the current example: which folders a run may write at `workspace` permission is
+a per-run scope, like the working directory itself, not a preference worth persisting. Writing it
+into a file would make the boundary depend on where the file lives rather than on what you asked for
+this time.
+
+This is the same reasoning that keeps the working directory out of config, and it is the exception
+to "config.toml is the complete source of truth": that rule covers persistent *settings*, and a
+per-run scope is not one.
+

@@ -87,8 +87,8 @@ pub struct ToolBuilderParams {
     /// so a parent `/cd` mid-sub-agent-turn can't change the sub-agent's path resolution
     /// mid-flight.
     pub parent_cwd: crate::workspace::SharedCwd,
-    /// Parent's extra workspace roots, so a delegated search sees the same folders the parent
-    /// does.
+    /// Parent's extra workspace roots, so a delegated search sees the same folders the parent does
+    /// and, at `workspace` permission, may write to the same ones.
     ///
     /// Shared rather than snapshotted, unlike `parent_cwd`: that one is copied into a fresh `Arc`
     /// at spawn time so a mid-flight `/cd` in the parent can't move a running sub-agent. Roots
@@ -163,9 +163,10 @@ impl SubagentSpec {
     /// Two ceilings, because there are two ways a worker could end up with authority it should not
     /// have. The spec stops a follow-up *escalating* a worker its spawn call deliberately
     /// restricted. `ceiling` -- the parent's level right now -- stops a worker *outliving* a
-    /// restriction: spawn at Write, switch the session to Read, and without this the worker would
-    /// still run at Write on the next follow-up, so the user's downgrade would silently not reach
-    /// the work being done on their behalf. The effective level is the lower of the two.
+    /// restriction: spawn at `unrestricted`, switch the session to `read`, and without this the
+    /// worker would still run at `unrestricted` on the next follow-up, so the user's downgrade
+    /// would silently not reach the work being done on their behalf. The effective level is the
+    /// lower of the two.
     ///
     /// Falls back to a singleton set when the persisted list is empty or invalid, rather than to
     /// `EnabledPermissions::ALL`: an unreadable spec must not widen what the worker can do.
@@ -211,8 +212,15 @@ impl SubagentSpec {
     }
 
     /// The level this worker actually runs at, given the parent's current ceiling.
+    /// What a **replayed** grant resolves to under the parent's current level.
+    ///
+    /// `greatest_within_both`, not `clamp_to`: a follow-up must never run the worker at more than
+    /// the spawn call asked for. `clamp_to` would resolve a recorded `workspace` under an `ask`
+    /// parent to `ask`, handing the worker whole-filesystem reach that the original
+    /// `agent_spawn({permission: "workspace"})` explicitly declined. See the helper for why spawn
+    /// and replay are different questions.
     fn effective_permission(&self, ceiling: Permission) -> Permission {
-        self.permission.min(ceiling)
+        self.permission.greatest_within_both(ceiling)
     }
 }
 
@@ -300,11 +308,15 @@ impl Tool for AgentSpawnTool {
                     },
                     "permission": {
                         "type": "string",
-                        "enum": ["none", "read", "ask", "write"],
-                        "description": "Permission level for the sub-agent, clamped to your own \
-                                        level as a ceiling: you can restrict but never escalate. \
-                                        Defaults to your current level. Use a lower level (e.g. \
-                                        \"read\") to sandbox untrusted or risky work."
+                        "enum": ["none", "read", "workspace", "ask", "unrestricted"],
+                        "description": "Permission level for the sub-agent, bounded by your own: \
+                                        the worker never gets more reach than you have. Defaults \
+                                        to your current level. Use a lower level (e.g. \"read\") \
+                                        to sandbox untrusted or risky work. Note that \
+                                        \"workspace\" and \"ask\" do not contain each other, so \
+                                        asking for one while you are at the other gives the worker \
+                                        \"read\" -- the most both of you vouch for. The result is \
+                                        reported back to you."
                     },
                     "memory": {
                         "type": "string",
@@ -950,7 +962,8 @@ impl Tool for AgentListTool {
 pub struct AgentFollowupTool {
     pub provider: Arc<dyn Provider>,
     /// The level of the agent holding this tool, read live at each call. A worker never runs above
-    /// it, so switching the session down to Read reaches workers spawned while it was at Write.
+    /// it, so switching the session down to `read` reaches workers spawned while it was at
+    /// `unrestricted`.
     pub parent_permission: SharedPermission,
     pub tool_builder_params: ToolBuilderParams,
     /// Sub-agents currently running a follow-up, keyed by session id. Shared with every other
@@ -995,6 +1008,31 @@ impl Drop for FollowupGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.agent_id);
+    }
+}
+
+/// The spec a follow-up actually runs under: the recorded grant, narrowed by whatever the operator
+/// has denied since.
+///
+/// Named rather than inlined at the call site because the narrowing is the security property and it
+/// was not observable there. The stored spec is deliberately left alone, so the only assertion a
+/// test could make against the call site was that the *recording* had not changed -- which is true
+/// whether or not the narrowing happened. A mutation dropping `denied_servers` from the expression
+/// therefore survived the whole suite, and would have let a worker keep reaching an MCP server the
+/// operator had since denied.
+///
+/// The spec is a floor on restriction, never a licence: config can only narrow it, and `..spec`
+/// carries everything config has no opinion about.
+fn combined_for_followup(
+    spec: SubagentSpec,
+    config_denials: &ToolDenials,
+    memory_access: MemoryAccess,
+) -> SubagentSpec {
+    SubagentSpec {
+        denied_servers: spec.denials().union(config_denials).server_list(),
+        denied_tools: spec.denials().union(config_denials).tool_list(),
+        memory: spec.memory.min(memory_access),
+        ..spec
     }
 }
 
@@ -1091,18 +1129,11 @@ impl Tool for AgentFollowupTool {
         // an old worker had to survive to be here -- and the memory grant is re-clamped against
         // what *this* agent currently holds, so a worker cannot outlive its granter's own limits.
         // Both combines take the more restrictive side, so neither can widen the worker.
-        let spec = SubagentSpec {
-            denied_servers: spec
-                .denials()
-                .union(&self.tool_builder_params.config_denials)
-                .server_list(),
-            denied_tools: spec
-                .denials()
-                .union(&self.tool_builder_params.config_denials)
-                .tool_list(),
-            memory: spec.memory.min(self.tool_builder_params.memory_access),
-            ..spec
-        };
+        let spec = combined_for_followup(
+            spec,
+            &self.tool_builder_params.config_denials,
+            self.tool_builder_params.memory_access,
+        );
 
         // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
         // `/cd` between the spawn and the follow-up must not move a worker mid-task.
@@ -1118,7 +1149,11 @@ impl Tool for AgentFollowupTool {
 
         let ceiling = self.parent_permission.get();
         let effective_permission = spec.effective_permission(ceiling);
-        if effective_permission < spec.permission {
+        // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
+        // decide authority, and it cannot see a sideways move at all: a `workspace` spec resolving
+        // to `ask` compares as *greater* and reported nothing, even though the worker changed
+        // level. Any difference from what was recorded is worth saying out loud.
+        if effective_permission != spec.permission {
             tracing::info!(
                 "sub-agent {} runs at {} rather than its recorded {}: this session has since been \
                  restricted",
@@ -1528,24 +1563,43 @@ fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> R
                         tool_name: "agent_spawn".to_string(),
                         message,
                     })?;
-            Ok(requested.min(parent))
+            // `clamp_to`, not `min`. The ladder is a partial order: `Workspace` and `Ask` are
+            // incomparable, and `min` over the discriminants hands a child at `workspace` to a
+            // parent at `ask` because 2 < 3. That is not merely a mislabel. `SharedPermission::
+            // with_ceiling` flattens a grandchild's ceiling to the *root* cell, on the stated
+            // precondition that this clamp already folded the intermediate level in; with `min`
+            // that precondition is false, so an `ask` child spawning a `workspace` grandchild under
+            // an `unrestricted` root produced a worker that wrote unattended beneath a parent whose
+            // whole safety was the approval prompt.
+            Ok(requested.clamp_to(parent))
         }
         None => Ok(parent),
     }
 }
 
-/// Restrict an `EnabledPermissions` set to modes at or below `ceiling`. Defense-in-depth for the
-/// permission clamp: sub-agents have no runtime permission-switch path today, so their initial
-/// level is what governs, but bounding the enabled set means any future switch path can't climb a
-/// sub-agent back above the ceiling its parent set. Falls back to a singleton `{ceiling}` set when
-/// the intersection is empty (e.g. the parent enabled only higher modes).
+/// Restrict an `EnabledPermissions` set to the modes *contained by* `ceiling`.
+///
+/// Not "at or below", which is what this used to say and is a different question. The ladder is a
+/// partial order and the predicate is [`Permission::is_within`], so `workspace` and `ask` exclude
+/// each other in both directions: neither is within the other, and an `ask` ceiling therefore
+/// drops `workspace` from the set rather than keeping it as something lower down. Reading the doc
+/// as a `<=` over the discriminants would predict the opposite for exactly the pair this release
+/// introduced.
+///
+/// Defense-in-depth for the permission clamp: sub-agents have no runtime permission-switch path
+/// today, so their initial level is what governs, but bounding the enabled set means any future
+/// switch path cannot climb a sub-agent back past the ceiling its parent set. Falls back to a
+/// singleton `{ceiling}` set when the intersection is empty, which the incomparable pair makes
+/// reachable rather than theoretical: a parent that enabled only `workspace` and hands down an
+/// `ask` ceiling leaves nothing behind.
 fn clamp_enabled_permissions(
     enabled: EnabledPermissions,
     ceiling: Permission,
 ) -> EnabledPermissions {
-    EnabledPermissions::from_modes(enabled.iter().filter(|mode| *mode <= ceiling)).unwrap_or_else(
-        || EnabledPermissions::from_modes([ceiling]).unwrap_or(EnabledPermissions::DEFAULT),
-    )
+    EnabledPermissions::from_modes(enabled.iter().filter(|mode| mode.is_within(ceiling)))
+        .unwrap_or_else(|| {
+            EnabledPermissions::from_modes([ceiling]).unwrap_or(EnabledPermissions::DEFAULT)
+        })
 }
 
 /// Compute the recursion budget for a sub-agent one level below a `AgentSpawnTool` with the given
@@ -1733,9 +1787,12 @@ mod tests {
 
     #[test]
     fn test_subagent_system_prompt_reflects_inherited_permission() {
-        let prompt = build_subagent_system_prompt(Permission::Write, &[], &[], None, "");
+        let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
         assert!(
-            prompt.contains(&format!("## Permission Level: {}", Permission::Write)),
+            prompt.contains(&format!(
+                "## Permission Level: {}",
+                Permission::Unrestricted
+            )),
             "expected Write level in prompt, got: {}",
             prompt
         );
@@ -1749,7 +1806,7 @@ mod tests {
     /// voice, under rules written for a conversation it is not part of.
     #[test]
     fn test_subagent_system_prompt_carries_no_user_instructions() {
-        let prompt = build_subagent_system_prompt(Permission::Write, &[], &[], None, "");
+        let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
         assert!(!prompt.contains("User Instructions"));
         assert!(!prompt.contains("installation-specific"));
     }
@@ -1821,12 +1878,129 @@ mod tests {
     #[test]
     fn test_resolve_subagent_permission_inherits_when_absent() {
         assert_eq!(
-            resolve_subagent_permission(None, Permission::Write).unwrap(),
-            Permission::Write
+            resolve_subagent_permission(None, Permission::Unrestricted).unwrap(),
+            Permission::Unrestricted
         );
         assert_eq!(
             resolve_subagent_permission(None, Permission::Read).unwrap(),
             Permission::Read
+        );
+    }
+
+    /// `agent_followup` resolves a stored grant with the meet, not the spawn clamp.
+    ///
+    /// Reverting `effective_permission` to `clamp_to` passed every sub-agent test, so which of the
+    /// two operations the replay path uses was unguarded. The difference is not academic: it is
+    /// whether a worker that was deliberately confined to the workspace comes back able to write
+    /// anywhere once the parent moves to `ask`.
+    #[test]
+    fn a_followup_resolves_a_stored_grant_without_widening_it() {
+        let spec = SubagentSpec {
+            permission: Permission::Workspace,
+            enabled_permissions: Vec::new(),
+            denied_servers: Vec::new(),
+            denied_tools: Vec::new(),
+            memory: MemoryAccess::None,
+            instructions: InstructionAccess::None,
+            inherited_scratchpad: Vec::new(),
+            remaining_depth: 2,
+            absolute_depth: 1,
+        };
+
+        assert_eq!(
+            spec.effective_permission(Permission::Ask),
+            Permission::Read,
+            "a `workspace` worker replayed under an `ask` parent must not gain whole-filesystem \
+             reach; `clamp_to` would have said `ask` here"
+        );
+        assert_eq!(
+            spec.effective_permission(Permission::Unrestricted),
+            Permission::Workspace,
+            "a parent that still holds the recorded level replays it unchanged"
+        );
+        assert_eq!(
+            spec.effective_permission(Permission::Read),
+            Permission::Read,
+            "and a parent that has dropped below it narrows the worker with it"
+        );
+    }
+
+    /// The incomparable pair, at the depth where nothing downstream re-clamps it.
+    ///
+    /// `Workspace` and `Ask` are incomparable, and `min` picks `Workspace` because 2 < 3. At depth
+    /// 1 that is invisible: `SharedPermission::get` re-clamps against the parent and returns `Ask`.
+    /// At depth 2 it is not, because `with_ceiling` flattens a grandchild's ceiling to the *root*
+    /// cell on the stated precondition that the spawn-time clamp already folded the intermediate
+    /// level in. With `min` that precondition is false, so an `ask` child under an `unrestricted`
+    /// root could spawn a `workspace` grandchild that wrote unattended -- beneath a parent whose
+    /// entire safety was the approval prompt.
+    ///
+    /// The pre-existing ceiling test only exercised pairs the total order already gets right
+    /// (`unrestricted`/`read`, `ask`/`read`), which is why this shipped.
+    ///
+    /// **What this does not cover**, and the honest limit of the guarantee: the root cell here
+    /// never moves. `with_ceiling`'s precondition is taken once, at spawn, so cycling the root
+    /// `unrestricted -> workspace -> unrestricted` between two spawns leaves a grandchild bound to
+    /// a root that has changed shape underneath it, and it can sit at `workspace` under an `ask`
+    /// parent. Nothing exceeds the *root*, which is the human's own level, so the headline
+    /// invariant holds and the next `agent_followup` re-clamps it -- but the direct-parent bound
+    /// does not hold across that sequence, and no test asserts it does.
+    #[test]
+    fn a_grandchild_cannot_escape_an_intermediate_ask_parent() {
+        assert_eq!(
+            resolve_subagent_permission(Some("workspace"), Permission::Ask).unwrap(),
+            Permission::Ask,
+            "a `workspace` request under an `ask` parent must resolve to the parent's own level"
+        );
+        assert_eq!(
+            resolve_subagent_permission(Some("ask"), Permission::Workspace).unwrap(),
+            Permission::Workspace,
+            "and the same in the other direction"
+        );
+
+        // The full chain, through the handles production actually builds.
+        fn spec_at(permission: Permission, parent_enabled: EnabledPermissions) -> SubagentSpec {
+            SubagentSpec {
+                permission,
+                enabled_permissions: clamp_enabled_permissions(parent_enabled, permission)
+                    .iter()
+                    .collect(),
+                denied_servers: Vec::new(),
+                denied_tools: Vec::new(),
+                memory: MemoryAccess::None,
+                instructions: InstructionAccess::None,
+                inherited_scratchpad: Vec::new(),
+                remaining_depth: 2,
+                absolute_depth: 1,
+            }
+        }
+
+        let root = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
+        let child_spec = spec_at(
+            resolve_subagent_permission(Some("ask"), root.get()).unwrap(),
+            root.enabled(),
+        );
+        let child = child_spec.shared_permission_bounded(&root);
+        assert_eq!(
+            child.get(),
+            Permission::Ask,
+            "child holds what it asked for"
+        );
+
+        let grandchild_spec = spec_at(
+            resolve_subagent_permission(Some("workspace"), child.get()).unwrap(),
+            child.enabled(),
+        );
+        let grandchild = grandchild_spec.shared_permission_bounded(&child);
+        assert_eq!(
+            grandchild.get(),
+            Permission::Ask,
+            "a grandchild must not reach `workspace` past an `ask` parent, however the ceiling \
+             cell is flattened"
+        );
+        assert!(
+            !grandchild.enabled().is_enabled(Permission::Workspace),
+            "nor may `workspace` remain switchable in its enabled set"
         );
     }
 
@@ -1835,7 +2009,7 @@ mod tests {
         // Requesting a higher level than the parent is clamped down: a sub-agent can never be
         // escalated above its parent.
         assert_eq!(
-            resolve_subagent_permission(Some("write"), Permission::Read).unwrap(),
+            resolve_subagent_permission(Some("unrestricted"), Permission::Read).unwrap(),
             Permission::Read
         );
         assert_eq!(
@@ -1844,18 +2018,18 @@ mod tests {
         );
         // Requesting a lower level restricts the sub-agent below the parent.
         assert_eq!(
-            resolve_subagent_permission(Some("read"), Permission::Write).unwrap(),
+            resolve_subagent_permission(Some("read"), Permission::Unrestricted).unwrap(),
             Permission::Read
         );
         assert_eq!(
-            resolve_subagent_permission(Some("none"), Permission::Write).unwrap(),
+            resolve_subagent_permission(Some("none"), Permission::Unrestricted).unwrap(),
             Permission::None
         );
     }
 
     #[test]
     fn test_resolve_subagent_permission_rejects_invalid() {
-        assert!(resolve_subagent_permission(Some("admin"), Permission::Write).is_err());
+        assert!(resolve_subagent_permission(Some("admin"), Permission::Unrestricted).is_err());
     }
 
     /// A restriction passed with the wrong type is refused, not read as absent. Reading it as
@@ -1908,17 +2082,17 @@ mod tests {
         assert!(clamped.is_enabled(Permission::None));
         assert!(clamped.is_enabled(Permission::Read));
         assert!(!clamped.is_enabled(Permission::Ask));
-        assert!(!clamped.is_enabled(Permission::Write));
+        assert!(!clamped.is_enabled(Permission::Unrestricted));
     }
 
     #[test]
     fn test_clamp_enabled_permissions_falls_back_to_singleton() {
         // Parent enabled only Write; clamping to Read leaves an empty intersection, so we fall back
         // to a singleton set of the ceiling itself rather than an invalid empty set.
-        let only_write = EnabledPermissions::from_modes([Permission::Write]).unwrap();
+        let only_write = EnabledPermissions::from_modes([Permission::Unrestricted]).unwrap();
         let clamped = clamp_enabled_permissions(only_write, Permission::Read);
         assert!(clamped.is_enabled(Permission::Read));
-        assert!(!clamped.is_enabled(Permission::Write));
+        assert!(!clamped.is_enabled(Permission::Unrestricted));
     }
 
     #[test]
@@ -2065,8 +2239,8 @@ mod tests {
     #[test]
     fn test_subagent_spec_decodes_a_minimal_document_and_fails_closed() {
         let decoded: SubagentSpec =
-            serde_json::from_str(r#"{"permission":"write"}"#).expect("decode");
-        assert_eq!(decoded.permission, Permission::Write);
+            serde_json::from_str(r#"{"permission":"unrestricted"}"#).expect("decode");
+        assert_eq!(decoded.permission, Permission::Unrestricted);
         assert_eq!(
             decoded.memory,
             MemoryAccess::None,
@@ -2087,30 +2261,29 @@ mod tests {
     }
 
     /// The core follow-up invariant: the worker is rebuilt at the level its spawn call chose. A
-    /// parent that has since moved to Write does not drag the worker up with it.
+    /// parent that has since moved to `unrestricted` does not drag the worker up with it.
     #[test]
     fn test_spec_permission_survives_a_parent_that_has_since_escalated() {
         let spec = test_spec(Permission::Read);
-        let rebuilt = spec.shared_permission(Permission::Write);
+        let rebuilt = spec.shared_permission(Permission::Unrestricted);
         assert_eq!(rebuilt.get(), Permission::Read);
-        assert!(!rebuilt.enabled().is_enabled(Permission::Write));
+        assert!(!rebuilt.enabled().is_enabled(Permission::Unrestricted));
         assert!(!rebuilt.enabled().is_enabled(Permission::Ask));
     }
 
-    /// And the other direction, which matters more: a worker spawned at Write while the session was
-    /// in write mode must drop to Read when the user switches the session down. Otherwise pressing
-    /// Shift+Tab would stop the agent writing while leaving every worker it already has free to
-    /// write on its behalf.
+    /// And the other direction, which matters more: a worker spawned at `unrestricted` must drop to
+    /// `read` when the user switches the session down. Otherwise pressing Shift+Tab would stop
+    /// the agent writing while leaving every worker it already has free to write on its behalf.
     #[test]
     fn test_spec_permission_follows_a_parent_that_has_since_been_restricted() {
         let spec = SubagentSpec {
-            enabled_permissions: vec![Permission::Read, Permission::Write],
-            ..test_spec(Permission::Write)
+            enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
+            ..test_spec(Permission::Unrestricted)
         };
         let rebuilt = spec.shared_permission(Permission::Read);
         assert_eq!(rebuilt.get(), Permission::Read);
         assert!(
-            !rebuilt.enabled().is_enabled(Permission::Write),
+            !rebuilt.enabled().is_enabled(Permission::Unrestricted),
             "the downgrade has to reach the enabled set too, or a switch path could climb back"
         );
         // None is a floor like any other.
@@ -2120,8 +2293,8 @@ mod tests {
         );
         // Unrestricted parent: the spec's own level still governs.
         assert_eq!(
-            spec.shared_permission(Permission::Write).get(),
-            Permission::Write
+            spec.shared_permission(Permission::Unrestricted).get(),
+            Permission::Unrestricted
         );
     }
 
@@ -2132,16 +2305,16 @@ mod tests {
     /// while `permissions.md` presents cycling the parent as the way to restrict sub-agents.
     #[test]
     fn a_running_sub_agent_sees_a_parent_downgrade() {
-        let parent = SharedPermission::new(Permission::Write, EnabledPermissions::ALL);
+        let parent = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
         let spec = SubagentSpec {
-            enabled_permissions: vec![Permission::Read, Permission::Write],
-            ..test_spec(Permission::Write)
+            enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
+            ..test_spec(Permission::Unrestricted)
         };
 
         let worker = spec.shared_permission_bounded(&parent);
         assert_eq!(
             worker.get(),
-            Permission::Write,
+            Permission::Unrestricted,
             "spawned under a write parent"
         );
 
@@ -2155,8 +2328,8 @@ mod tests {
 
         // And back up: the rule is min(own grant, what the human currently permits), read in both
         // directions. The worker never exceeds its own grant either way.
-        parent.set_unchecked(Permission::Write);
-        assert_eq!(worker.get(), Permission::Write);
+        parent.set_unchecked(Permission::Unrestricted);
+        assert_eq!(worker.get(), Permission::Unrestricted);
     }
 
     /// A worker granted less than its parent keeps its own lower level when the parent is raised:
@@ -2167,7 +2340,7 @@ mod tests {
         let spec = test_spec(Permission::Read);
 
         let worker = spec.shared_permission_bounded(&parent);
-        parent.set_unchecked(Permission::Write);
+        parent.set_unchecked(Permission::Unrestricted);
 
         assert_eq!(
             worker.get(),
@@ -2184,10 +2357,10 @@ mod tests {
             enabled_permissions: Vec::new(),
             ..test_spec(Permission::Read)
         };
-        let rebuilt = spec.shared_permission(Permission::Write);
+        let rebuilt = spec.shared_permission(Permission::Unrestricted);
         assert_eq!(rebuilt.get(), Permission::Read);
         assert!(rebuilt.enabled().is_enabled(Permission::Read));
-        assert!(!rebuilt.enabled().is_enabled(Permission::Write));
+        assert!(!rebuilt.enabled().is_enabled(Permission::Unrestricted));
     }
 
     #[test]
@@ -2272,7 +2445,10 @@ mod tests {
 
         let spawn = AgentSpawnTool {
             provider: Arc::clone(&provider),
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params.clone(),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
@@ -2319,7 +2495,10 @@ mod tests {
 
         let followup = AgentFollowupTool {
             provider: Arc::clone(&provider),
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params.clone(),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
@@ -2373,9 +2552,9 @@ mod tests {
         );
     }
 
-    /// End to end: a worker spawned while the session was at Write must not still be at Write after
-    /// the user restricts the session to Read. Asserted through the worker's registry rather than
-    /// A follow-up holds the worker's session for the length of its turn.
+    /// End to end: a worker spawned while the session was at `unrestricted` must not still be there
+    /// after the user restricts the session to Read. Asserted through the worker's registry
+    /// rather than A follow-up holds the worker's session for the length of its turn.
     ///
     /// `agent_spawn` gained this and `agent_followup` did not, which left the exposure open on the
     /// door that reaches an *existing* worker: a follow-up runs a full turn against a row nothing
@@ -2425,7 +2604,10 @@ mod tests {
 
         let followup = AgentFollowupTool {
             provider: Arc::clone(&provider),
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params.clone(),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
@@ -2442,7 +2624,11 @@ mod tests {
         );
     }
 
-    /// its spec, since the registry is what actually decides what it can do.
+    /// A follow-up turn runs the worker at the parent's *current* level, not at the one it was
+    /// spawned with.
+    ///
+    /// Asserted against the worker's persisted conversation rather than against its spec, since the
+    /// registry is what actually decides what it can do.
     #[tokio::test]
     async fn test_followup_drops_a_worker_when_the_session_is_restricted() {
         let session_manager = test_session_manager().await;
@@ -2474,10 +2660,10 @@ mod tests {
             ]));
         let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
 
-        // Spawned at Write.
+        // Spawned at `unrestricted`.
         let spec = SubagentSpec {
-            permission: Permission::Write,
-            enabled_permissions: vec![Permission::Read, Permission::Write],
+            permission: Permission::Unrestricted,
+            enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
             denied_servers: Vec::new(),
             denied_tools: Vec::new(),
             memory: MemoryAccess::Write,
@@ -2528,8 +2714,8 @@ mod tests {
         );
         assert!(!target.exists(), "and nothing should have been written");
 
-        // The recorded spec is untouched, so the worker returns to Write if the session does: the
-        // clamp is a live ceiling, not a rewrite of the spawn terms.
+        // The recorded spec is untouched, so the worker returns to `unrestricted` if the session
+        // does: the clamp is a live ceiling, not a rewrite of the spawn terms.
         let reloaded: SubagentSpec = serde_json::from_str(
             &session_manager
                 .load_subagent_spec(child)
@@ -2538,7 +2724,7 @@ mod tests {
                 .expect("spec"),
         )
         .expect("decode");
-        assert_eq!(reloaded.permission, Permission::Write);
+        assert_eq!(reloaded.permission, Permission::Unrestricted);
     }
 
     /// A restriction added to config after a worker was spawned still reaches it on follow-up. The
@@ -2608,6 +2794,57 @@ mod tests {
         assert_eq!(reloaded.memory, MemoryAccess::Write);
     }
 
+    /// Config denials narrow a recorded grant on every axis, not just the ones a test happened to
+    /// look at.
+    ///
+    /// Asserted against the combined spec directly. The call site deliberately leaves the *stored*
+    /// spec alone so a later loosening restores the original terms, which means the only thing
+    /// observable there is that the recording did not change -- true whether or not the narrowing
+    /// ran. Dropping `denied_servers` from the expression survived the whole suite on exactly that
+    /// gap, while `denied_tools` beside it was caught.
+    #[test]
+    fn a_followup_narrows_a_recorded_grant_by_config_on_every_axis() {
+        let spec = SubagentSpec {
+            permission: Permission::Read,
+            enabled_permissions: vec![Permission::Read],
+            denied_servers: Vec::new(),
+            denied_tools: Vec::new(),
+            memory: MemoryAccess::Write,
+            instructions: InstructionAccess::None,
+            inherited_scratchpad: Vec::new(),
+            remaining_depth: 0,
+            absolute_depth: 1,
+        };
+        let config = ToolDenials::new(vec!["mekabridge".to_string()], vec![
+            "web_search".to_string(),
+        ]);
+
+        let combined = combined_for_followup(spec.clone(), &config, MemoryAccess::None);
+
+        assert!(
+            combined.denied_servers.contains(&"mekabridge".to_string()),
+            "a server denied since the spawn must reach the worker: {:?}",
+            combined.denied_servers
+        );
+        assert!(
+            combined.denied_tools.contains(&"web_search".to_string()),
+            "and so must a tool: {:?}",
+            combined.denied_tools
+        );
+        assert_eq!(
+            combined.memory,
+            MemoryAccess::None,
+            "memory narrows to the lesser of the grant and config"
+        );
+        // Never the other direction: config cannot hand back what the spawn call withheld.
+        assert_eq!(combined.permission, Permission::Read);
+        assert_eq!(
+            combined_for_followup(spec, &ToolDenials::default(), MemoryAccess::Write).memory,
+            MemoryAccess::Write,
+            "an empty config leaves the recorded grant exactly as it was"
+        );
+    }
+
     /// Drive a spawn and hand back the spec that was recorded for the worker.
     async fn spawn_and_read_spec(
         params: ToolBuilderParams,
@@ -2652,7 +2889,7 @@ mod tests {
 
         let spec = spawn_and_read_spec(
             params,
-            Permission::Write,
+            Permission::Unrestricted,
             parent_sid,
             serde_json::json!({ "prompt": "go" }),
         )
@@ -2671,7 +2908,7 @@ mod tests {
 
         let spec = spawn_and_read_spec(
             params,
-            Permission::Write,
+            Permission::Unrestricted,
             parent_sid,
             serde_json::json!({ "prompt": "go", "memory": "read", "instructions": "inherit" }),
         )
@@ -2694,7 +2931,7 @@ mod tests {
 
         let error = spawn_and_read_spec(
             params,
-            Permission::Write,
+            Permission::Unrestricted,
             parent_sid,
             serde_json::json!({ "prompt": "go", "memory": "write" }),
         )
@@ -2727,7 +2964,7 @@ mod tests {
 
         let spec = spawn_and_read_spec(
             params,
-            Permission::Write,
+            Permission::Unrestricted,
             parent_sid,
             serde_json::json!({ "prompt": "go", "memory": "read", "instructions": "inherit" }),
         )
@@ -2787,7 +3024,10 @@ mod tests {
 
         let spawn = AgentSpawnTool {
             provider,
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params,
             inherited_denials: ToolDenials::default(),
             // Deep enough that the worker gets its own `agent_spawn`.
@@ -2855,7 +3095,10 @@ mod tests {
                 text_round("the findings"),
                 text_round("the findings"),
             ])),
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params,
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
@@ -2899,7 +3142,7 @@ mod tests {
     fn test_a_spec_claiming_write_is_capped_at_read() {
         let forged = SubagentSpec {
             memory: MemoryAccess::Write,
-            ..test_spec(Permission::Write)
+            ..test_spec(Permission::Unrestricted)
         };
         assert_eq!(forged.granted_memory(), MemoryAccess::Read);
         // And the honest values pass through untouched.
@@ -3054,7 +3297,10 @@ mod tests {
         );
         let spawn = |params: ToolBuilderParams| AgentSpawnTool {
             provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new())),
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params,
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
@@ -3399,7 +3645,10 @@ mod tests {
 
         let followup = AgentFollowupTool {
             provider,
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: params.clone(),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
@@ -3455,7 +3704,10 @@ mod tests {
             ]));
         let followup = AgentFollowupTool {
             provider,
-            parent_permission: SharedPermission::new(Permission::Write, EnabledPermissions::ALL),
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
             tool_builder_params: test_params(
                 session_manager,
                 Arc::new(RwLock::new(Some(parent_sid))),
@@ -3497,5 +3749,41 @@ mod tests {
         // Released on drop, so a turn that errors or is cancelled doesn't strand the worker.
         drop(first);
         assert!(FollowupGuard::claim(&in_flight, agent).is_some());
+    }
+}
+
+#[cfg(test)]
+mod clamp_enabled_permissions_doc {
+    use super::*;
+
+    /// The set a ceiling leaves behind is what `is_within` contains, not what a `<=` would keep.
+    ///
+    /// Written because the doc on `clamp_enabled_permissions` claimed "at or below", which is a
+    /// different question on a partial order and predicts the opposite answer for the one pair this
+    /// release introduced: `workspace` and `ask` exclude each other in both directions, so an `ask`
+    /// ceiling drops `workspace` entirely rather than keeping it as something lower down.
+    #[test]
+    fn an_ask_ceiling_drops_workspace_rather_than_keeping_it_as_lower() {
+        let all = EnabledPermissions::ALL;
+        let under_ask = clamp_enabled_permissions(all, Permission::Ask);
+        assert!(
+            !under_ask.is_enabled(Permission::Workspace),
+            "`workspace` is not within `ask`, so an `ask` ceiling must not leave it enabled"
+        );
+        assert!(under_ask.is_enabled(Permission::Ask));
+        assert!(under_ask.is_enabled(Permission::Read));
+
+        // And the reverse, which is the half a `<=` reading would get right by accident.
+        let under_workspace = clamp_enabled_permissions(all, Permission::Workspace);
+        assert!(!under_workspace.is_enabled(Permission::Ask));
+        assert!(under_workspace.is_enabled(Permission::Workspace));
+
+        // The empty-intersection fallback is reachable, not theoretical: a set holding only
+        // `workspace` under an `ask` ceiling has nothing left, so the ceiling itself stands in.
+        let only_workspace = EnabledPermissions::from_modes([Permission::Workspace])
+            .expect("a one-mode set is valid");
+        let collapsed = clamp_enabled_permissions(only_workspace, Permission::Ask);
+        assert!(collapsed.is_enabled(Permission::Ask));
+        assert!(!collapsed.is_enabled(Permission::Workspace));
     }
 }

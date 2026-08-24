@@ -177,7 +177,7 @@ pub async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()> {
             // As `memory_write` and `PUT /v1/memory` do. A description is a one-line label at every
             // door, and `meka memory export` writes it normalised, so storing it raw here made the
             // CLI the one door whose descriptions changed on the way through a backup.
-            description: memory::normalize_description(args.description),
+            description: Some(memory::normalize_description(args.description)),
             tags,
             body,
             priority: args.priority,
@@ -589,6 +589,8 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
 /// races. Parents are still created recursively -- the race that matters is over the leaf, which is
 /// the directory this function's caller will later delete.
 fn create_private_export_dir(directory: &Path) -> Result<()> {
+    // `mut` earns its keep only where the mode is set; elsewhere the binding is never written.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -727,7 +729,7 @@ mod tests {
             store
                 .write(WriteRequest {
                     name: name.to_string(),
-                    description: description.to_string(),
+                    description: Some(description.to_string()),
                     tags: Some(vec!["infra".to_string()]),
                     body: Some(body.to_string()),
                     priority: Some(*priority),
@@ -833,7 +835,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "note".to_string(),
-                description: "a note".to_string(),
+                description: Some("a note".to_string()),
                 tags: None,
                 body: Some(body.to_string()),
                 priority: None,
@@ -866,7 +868,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "note".to_string(),
-                description: "a note".to_string(),
+                description: Some("a note".to_string()),
                 tags: None,
                 body: Some(handed.replace("keep", "kept")),
                 priority: None,
@@ -896,11 +898,16 @@ mod tests {
     /// than at the end of the test body, because `tokio::sync::Mutex` does not poison -- an
     /// assertion failure left `$EDITOR` pointing into a deleted temp directory for every test that
     /// ran afterwards.
+    /// Gated with the tests that use it: every consumer is `#[cfg(unix)]`, because they drive a
+    /// real `$EDITOR` through a shell script. Leaving the helper ungated made the Windows build
+    /// warn about three items nothing there can reach.
+    #[cfg(unix)]
     struct EditorEnv {
         editor: Option<std::ffi::OsString>,
         visual: Option<std::ffi::OsString>,
     }
 
+    #[cfg(unix)]
     impl EditorEnv {
         fn pointing_at(path: &Path) -> Self {
             let saved = Self {
@@ -917,6 +924,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EditorEnv {
         fn drop(&mut self) {
             // SAFETY: as above.
@@ -972,7 +980,7 @@ mod tests {
         store
             .write(WriteRequest {
                 name: "race".to_string(),
-                description: "d".to_string(),
+                description: Some("d".to_string()),
                 tags: None,
                 body: Some("WHAT THE AGENT LEARNED".to_string()),
                 priority: None,
@@ -1054,6 +1062,7 @@ mod tests {
     }
 
     /// How many `meka memory edit` scratch directories are sitting in the temp directory.
+    #[cfg(unix)]
     fn scratch_directory_count() -> usize {
         let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
             return 0;
@@ -1206,7 +1215,7 @@ mod tests {
             store
                 .write(WriteRequest {
                     name: name.to_string(),
-                    description: "a note".to_string(),
+                    description: Some("a note".to_string()),
                     tags: None,
                     body: Some("body".to_string()),
                     priority: None,
@@ -1287,7 +1296,7 @@ mod tests {
             store
                 .write(WriteRequest {
                     name: name.to_string(),
-                    description: description.to_string(),
+                    description: Some(description.to_string()),
                     tags: None,
                     body: Some("body".to_string()),
                     priority: None,

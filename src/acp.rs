@@ -1610,24 +1610,23 @@ fn maybe_emit_session_title(
     );
 }
 
-/// Map a meka [`Permission`] to its ACP [`SessionModeId`] string. The mapping is the lowercase
-/// debug name (`none` / `read` / `ask` / `write`), the same string `Permission::Display` produces.
-/// It is kept as a dedicated function so the inverse parser ([`parse_mode_id`]) reads as the
-/// obvious complement.
+/// Map a meka [`Permission`] to its ACP [`SessionModeId`] string: the same lowercase word
+/// `Permission::Display` produces, so the id a client reads back is the one it sees in
+/// `config.toml` and on the `--permission` flag.
 fn mode_id_for(permission: Permission) -> SessionModeId {
     SessionModeId::from(permission.to_string())
 }
 
 /// Parse a `SessionModeId` (treated as a `&str`) into the matching `Permission`. Returns `None` for
-/// any unrecognised mode id. The match arms must stay in lock-step with [`mode_id_for`].
+/// any unrecognised mode id, which the caller turns into an error response.
+///
+/// Delegates to [`Permission`]'s [`std::str::FromStr`] rather than keeping its own table. The two
+/// were previously hand-maintained copies that had to stay in lock-step, which is precisely the
+/// shape that lets a retired spelling survive in one of them: the mechanical half of this rename
+/// left `"write"` mapping to the *top* rung here, silently granting a client the whole filesystem
+/// when it asked for a mode that no longer exists. One table cannot drift from itself.
 fn parse_mode_id(id: &str) -> Option<Permission> {
-    match id {
-        "none" => Some(Permission::None),
-        "read" => Some(Permission::Read),
-        "ask" => Some(Permission::Ask),
-        "write" => Some(Permission::Write),
-        _ => None,
-    }
+    id.parse().ok()
 }
 
 /// Human-readable label for a permission mode, shown in editor mode pickers next to each option.
@@ -1637,19 +1636,24 @@ fn mode_display_name(permission: Permission) -> &'static str {
     match permission {
         Permission::None => "None",
         Permission::Read => "Read",
+        Permission::Workspace => "Workspace",
         Permission::Ask => "Ask",
-        Permission::Write => "Write",
+        Permission::Unrestricted => "Unrestricted",
     }
 }
 
 /// One-line description of what a permission mode lets the agent do. Shown beneath the mode label
 /// in editor pickers.
+///
+/// `Unrestricted` is described by its *reach*, not by the absence of approval prompts: "all tools
+/// without per-call approval" is equally true of `Workspace`, so it never distinguished the two.
 fn mode_description(permission: Permission) -> &'static str {
     match permission {
         Permission::None => "No tools available.",
         Permission::Read => "File reads and searches only. No writes, no shell.",
+        Permission::Workspace => "Writes confined to the workspace roots. No approval prompts.",
         Permission::Ask => "Every write or shell command requires approval.",
-        Permission::Write => "All tools allowed without per-call approval.",
+        Permission::Unrestricted => "Writes and shell commands reach anywhere on the machine.",
     }
 }
 
@@ -1810,11 +1814,17 @@ async fn emit_available_commands(
             .iter()
             .filter(|skill| !LOCAL_COMMANDS.iter().any(|(name, _)| *name == skill.name))
             .map(|skill| {
-                AvailableCommand::new(skill.name.clone(), skill.description.clone()).input(
-                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
-                        "additional context (optional)",
-                    )),
+                // Sanitised, like every other place a skill description is shown. The store hands
+                // back the file's bytes now, so this is a render boundary: a description carrying a
+                // bidi override or a control character would otherwise reach the editor's command
+                // palette over JSON-RPC and be drawn by whatever renders it.
+                AvailableCommand::new(
+                    skill.name.clone(),
+                    crate::memory::render_description_for_model(&skill.description),
                 )
+                .input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new("additional context (optional)"),
+                ))
             }),
     );
     send_session_update(
@@ -3117,17 +3127,16 @@ async fn handle_load_session(
     // `build_session_runtime` seeds from `shared.config.permission`, which is right for
     // `session/new` and wrong here: the row carries what the user last chose via
     // `session/set_mode`. Leaving it out is not merely a lost preference. The scheduler's live gate
-    // re-check reads the row, so a session whose row said `write` while its live cell sat at the
+    // re-check reads the row, so a session whose row said `unrestricted` while its live cell sat at
     // config default would have its gates evaluated against authority the session is not running
     // at -- the same fail-open the re-check exists to prevent, reached from the other side.
     //
     // `try_set` validates against the enabled set, so a row naming a mode this configuration no
     // longer enables cannot escalate the session: it is refused and the default stands.
-    if let Some(persisted) = summary
-        .permission
-        .as_deref()
-        .and_then(|level| level.parse::<crate::permission::Permission>().ok())
-        && let Err(disabled) = permission.try_set(persisted)
+    if let Some(persisted) = crate::permission::parse_recorded_permission(
+        summary.permission.as_deref(),
+        &format_args!("session {}", summary.id),
+    ) && let Err(disabled) = permission.try_set(persisted)
     {
         tracing::debug!(
             "session was last set to '{}', which this configuration no longer enables; keeping the \
@@ -3357,17 +3366,16 @@ async fn handle_resume_session(
     // `build_session_runtime` seeds from `shared.config.permission`, which is right for
     // `session/new` and wrong here: the row carries what the user last chose via
     // `session/set_mode`. Leaving it out is not merely a lost preference. The scheduler's live gate
-    // re-check reads the row, so a session whose row said `write` while its live cell sat at the
+    // re-check reads the row, so a session whose row said `unrestricted` while its live cell sat at
     // config default would have its gates evaluated against authority the session is not running
     // at -- the same fail-open the re-check exists to prevent, reached from the other side.
     //
     // `try_set` validates against the enabled set, so a row naming a mode this configuration no
     // longer enables cannot escalate the session: it is refused and the default stands.
-    if let Some(persisted) = summary
-        .permission
-        .as_deref()
-        .and_then(|level| level.parse::<crate::permission::Permission>().ok())
-        && let Err(disabled) = permission.try_set(persisted)
+    if let Some(persisted) = crate::permission::parse_recorded_permission(
+        summary.permission.as_deref(),
+        &format_args!("session {}", summary.id),
+    ) && let Err(disabled) = permission.try_set(persisted)
     {
         tracing::debug!(
             "session was last set to '{}', which this configuration no longer enables; keeping the \
@@ -3670,9 +3678,9 @@ async fn handle_set_session_mode(
     // The scheduler's live gate re-check reads the session *row*, falling back to the process's
     // startup level when the column is null (see `ResolvedScheduleConfig::host_permission`). An ACP
     // session that only ever moved its in-memory cell left that column null forever, so cycling to
-    // `write` in the editor and authoring a gate left the gate refused, and cycling back down to
-    // `read` did not withdraw one already written. The row is also what `session/list` reports, so
-    // it was misreporting the mode for the same reason.
+    // `unrestricted` in the editor and authoring a gate left the gate refused, and cycling back
+    // down to `read` did not withdraw one already written. The row is also what `session/list`
+    // reports, so it was misreporting the mode for the same reason.
     //
     // In-memory first and best-effort here: the mode change the user asked for has already taken
     // effect on the next tool call, and failing the whole request over a database write would be a
@@ -3703,10 +3711,16 @@ async fn handle_set_session_mode(
             );
         }
     }
+    // The canonical id for the mode that was actually set, not the string the client sent.
+    //
+    // `parse_mode_id` accepts what `--permission` accepts, so `W`, `Workspace` and `workspace` all
+    // reach the same rung. Echoing the request verbatim reported a `currentMode` matching none of
+    // the ids advertised in `availableModes`, which is what an editor compares against to tick the
+    // right entry in its mode picker.
     send_session_update(
         &entry.frontend.connection,
         &entry.frontend.session_id,
-        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(req.mode_id.clone())),
+        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id_for(permission))),
     );
     responder.respond(SetSessionModeResponse::new())
 }
@@ -3733,7 +3747,17 @@ async fn build_session_runtime(
     messages: Conversation,
 ) -> anyhow::Result<SessionRuntime> {
     let cwd: SharedCwd = Arc::new(std::sync::RwLock::new(cwd_path));
-    let roots: SharedRoots = Arc::new(std::sync::RwLock::new(additional_roots));
+    // `--writable-root` is a flag on the process the editor launched, so it belongs to every
+    // session that process serves, not only the REPL's. Merged into the live handle and
+    // deliberately not into the persisted row: the row is what `session/load` hands back to the
+    // client as its `additionalDirectories`, and reporting a folder the client never asked for
+    // would misdescribe its own request to it.
+    let roots: SharedRoots = Arc::new(std::sync::RwLock::new(
+        additional_roots
+            .into_iter()
+            .chain(shared.config.writable_roots.iter().cloned())
+            .collect(),
+    ));
     let permission =
         SharedPermission::new(shared.config.permission, shared.config.enabled_permissions);
 
@@ -3896,21 +3920,30 @@ mod tests {
 
     /// A session running a turn is never idle, whatever its timestamp says.
     ///
-    /// `last_activity` is stamped when a request arrives, so a turn that runs for an hour leaves it
-    /// an hour old while the agent is still working. Testing the timestamp alone would evict the
-    /// entry out from under the turn -- dropping its `Agent`, its registry and its file lock
-    /// mid-tool-call -- which is why the busy check comes first rather than second.
+    /// `last_activity` is stamped when a request arrives, so a long turn leaves it older than the
+    /// eviction timeout while the agent is still working. Testing the timestamp alone would evict
+    /// the entry out from under the turn -- dropping its `Agent`, its registry and its file
+    /// lock mid-tool-call -- which is why the busy check comes first rather than second.
     #[test]
     fn a_session_running_a_turn_is_not_idle_however_old_its_timestamp() {
         let runtime = Mutex::new(());
-        let ancient = std::sync::RwLock::new(
-            std::time::Instant::now() - std::time::Duration::from_secs(60 * 60),
-        );
         let timeout = std::time::Duration::from_secs(1);
+        // Derived from the timeout rather than an evocative hour. `Instant` is measured from boot
+        // on both Linux and Windows, and subtracting more than the host's uptime panics
+        // with "overflow when subtracting duration from instant" -- which is how this
+        // failed on a Windows box 55 minutes after a reboot, having passed on the same box
+        // earlier the same day. Any age past the timeout proves the same thing, so the test
+        // asks for the smallest one that does.
+        let age = timeout * 10;
+        let ancient = std::sync::RwLock::new(
+            std::time::Instant::now()
+                .checked_sub(age)
+                .expect("the host must have been up longer than a few seconds"),
+        );
 
         assert!(
             session_is_idle(&runtime, &ancient, timeout),
-            "untouched for an hour and nothing running: evictable",
+            "untouched for longer than the timeout and nothing running: evictable",
         );
 
         let _turn = runtime.try_lock().expect("nothing holds it yet");
@@ -4525,13 +4558,30 @@ mod tests {
     fn test_parse_mode_id_covers_all_levels() {
         assert_eq!(parse_mode_id("none"), Some(Permission::None));
         assert_eq!(parse_mode_id("read"), Some(Permission::Read));
+        assert_eq!(parse_mode_id("workspace"), Some(Permission::Workspace));
         assert_eq!(parse_mode_id("ask"), Some(Permission::Ask));
-        assert_eq!(parse_mode_id("write"), Some(Permission::Write));
+        assert_eq!(
+            parse_mode_id("unrestricted"),
+            Some(Permission::Unrestricted)
+        );
+    }
+
+    /// A client sending the retired id gets an error response, not the top rung.
+    ///
+    /// This is the exact bug the mechanical half of the rename left behind: `"write"` still mapped
+    /// to `Unrestricted` here after the enum variant was renamed, so an editor asking for a mode
+    /// that no longer exists would have been handed the whole filesystem.
+    #[test]
+    fn parse_mode_id_refuses_the_retired_write_id() {
+        assert!(parse_mode_id("write").is_none());
     }
 
     #[test]
     fn test_parse_mode_id_rejects_garbage() {
-        assert!(parse_mode_id("READ").is_none(), "case-sensitive");
+        // Case-insensitive since the parser became shared with `--permission`, where `Read` and
+        // `read` have always meant the same thing. Nothing is granted by it: every id still has to
+        // name a real mode, and `session/set_mode` separately refuses one outside the enabled set.
+        assert_eq!(parse_mode_id("READ"), Some(Permission::Read));
         assert!(parse_mode_id("admin").is_none());
         assert!(parse_mode_id("").is_none());
     }
@@ -4566,11 +4616,11 @@ mod tests {
         use crate::permission::{EnabledPermissions, SharedPermission};
         let permission = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
         permission
-            .try_set(Permission::Write)
-            .expect("write enabled");
+            .try_set(Permission::Unrestricted)
+            .expect("unrestricted enabled");
         assert_eq!(
             build_mode_state(&permission).current_mode_id.0.as_ref(),
-            "write"
+            "unrestricted"
         );
     }
 

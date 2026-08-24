@@ -68,30 +68,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_JobObjects",
-    "Win32_System_Pipes",
-    "Win32_System_Threading",
-] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
 [dev-dependencies]
-# Also a runtime dependency; here so `tests/cli.rs` can hold a store's `flock` from outside the
-# binary and prove the CLI actually waits on it.
 fd-lock = "4"
 filetime = "0.2.29"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"
-# `test-util` for the paused clock, so a test can assert a 30-second timeout without waiting one.
-# Edition 2024 resolves dev-dependency features separately, so the shipped binary does not get it.
 tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] }
 
 [lints.clippy]
 await_holding_lock = "deny"

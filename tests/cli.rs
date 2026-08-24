@@ -509,9 +509,9 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
         "--disable-tool",
         "notion-delete-pages",
         "--tool-permission",
-        "notion-create-pages=write",
+        "notion-create-pages=unrestricted",
         "--tool-permission",
-        "notion-update-page=write",
+        "notion-update-page=unrestricted",
     ]);
     assert!(
         output.status.success(),
@@ -544,7 +544,7 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
     assert!(
         contents.contains("notion-create-pages")
             && contents.contains("notion-update-page")
-            && contents.contains("write"),
+            && contents.contains("unrestricted"),
         "tool_permissions entries missing:\n{}",
         contents
     );
@@ -625,4 +625,136 @@ fn skill_remove_waits_for_a_store_lock_another_process_holds() {
     drop(guard);
     assert!(blocked.wait().expect("wait").success(), "then it completes");
     assert!(!skills.join("victim").exists(), "and the skill is gone");
+}
+
+/// Run `meka` isolated, with a config file, and a prompt that will fail on the missing provider.
+///
+/// The prompt is what forces full config resolution: `session list` and friends short-circuit
+/// before `ResolvedConfig::from_cli` runs, so a flag that only affects the resolved config is
+/// unobservable through them. Failing on "no provider profiles configured" is the expected end of
+/// every call here; what the tests read is what was warned on the way there.
+fn resolve_config(dir: &std::path::Path, config: &str, args: &[&str]) -> std::process::Output {
+    let config_dir = dir.join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    if !config.is_empty() {
+        std::fs::write(config_dir.join("config.toml"), config).expect("write config");
+    }
+    let mut command = meka();
+    command
+        .args(args)
+        .args(["-p", "hi"])
+        .env("MEKA_CONFIG_DIR", &config_dir)
+        .env("MEKA_DATA_DIR", dir.join("data"))
+        .env("HOME", dir);
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to spawn meka {args:?}: {err}"))
+}
+
+/// The retired `write` mode fails at every door it can be spelled at, and never resolves quietly.
+///
+/// `Permission` is read as a grant *and* as a requirement, so re-pointing `write` at one of the two
+/// new modes would have silently admitted tools a rung earlier than their author intended. Retiring
+/// it is what makes every stale config loud, and the value of that depends entirely on each surface
+/// actually refusing rather than one of them keeping a private table that still maps it.
+#[test]
+fn the_retired_write_mode_is_refused_at_the_flag_and_in_the_config_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let flag = meka()
+        .args(["--permission", "write", "session", "list"])
+        .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
+        .env("MEKA_DATA_DIR", dir.path().join("data"))
+        .output()
+        .expect("spawn meka");
+    assert!(!flag.status.success(), "--permission write must not start");
+    let stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(
+        stderr.contains("was split")
+            && stderr.contains("workspace")
+            && stderr.contains("unrestricted"),
+        "the refusal has to name both replacements, not just report 'invalid': {stderr}"
+    );
+
+    let file = resolve_config(
+        dir.path(),
+        "[permissions]\ndefault = \"write\"\nenabled = [\"read\", \"write\"]\n",
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&file.stderr);
+    for surface in ["[permissions].default", "[permissions].enabled"] {
+        assert!(
+            stderr.contains(surface),
+            "{surface} must warn about the retired mode by name: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("was split"),
+        "and must carry the same explanation the flag gives: {stderr}"
+    );
+}
+
+/// `workspace` is spellable everywhere the other modes are, and reaches config resolution.
+#[test]
+fn the_workspace_mode_is_accepted_at_the_flag_and_in_the_config_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let flag = resolve_config(dir.path(), "", &["--permission", "workspace"]);
+    let stderr = String::from_utf8_lossy(&flag.stderr);
+    assert!(
+        stderr.contains("no provider profiles configured"),
+        "resolution must get past the permission flag to the provider: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid value"),
+        "`workspace` must not be rejected by the parser: {stderr}"
+    );
+
+    let file = resolve_config(
+        dir.path(),
+        "[permissions]\ndefault = \"workspace\"\nenabled = [\"read\", \"workspace\"]\n",
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&file.stderr);
+    assert!(
+        !stderr.contains("ignoring invalid"),
+        "neither [permissions] key may treat `workspace` as unknown: {stderr}"
+    );
+}
+
+/// `--writable-root` naming a path that does not exist warns, and does not fail the run.
+///
+/// Both halves matter. A root that cannot be canonicalised is dropped from the boundary by
+/// `writable_roots`, so without the warning the user learns about it from a refused write naming a
+/// boundary they believed included the path. And a build directory that does not exist *yet* is a
+/// legitimate root, so this cannot be an error: the boundary is recomputed on every write.
+#[test]
+fn an_unresolvable_writable_root_warns_without_failing_the_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("not-created-yet");
+    let output = resolve_config(dir.path(), "", &[
+        "--writable-root",
+        missing.to_str().expect("path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--writable-root") && stderr.contains("does not resolve"),
+        "an unresolvable root must say so: {stderr}"
+    );
+    assert!(
+        stderr.contains("no provider profiles configured"),
+        "and must not be what stops the run: {stderr}"
+    );
+
+    // The existing case stays quiet, so the warning means something when it appears.
+    std::fs::create_dir_all(&missing).expect("create the root");
+    let output = resolve_config(dir.path(), "", &[
+        "--writable-root",
+        missing.to_str().expect("path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("does not resolve"),
+        "a root that exists must not warn: {stderr}"
+    );
 }

@@ -42,9 +42,9 @@ meka [r] > what files are in the current directory?
 
 The agent will use the `find_files` tool to list files and describe them.
 
-## 4. Enable Write Mode
+## 4. Enable Workspace Mode
 
-Press **Shift+Tab** to cycle the permission to write mode:
+Press **Shift+Tab** to cycle the permission to `workspace`, where the agent may write inside your working directory:
 
 ```text
 meka [w] >

@@ -57,7 +57,7 @@ meka [r] > show me lines 10 through 20 of src/main.rs
 
 Modify a file. Supports two modes: **replace** (swap `old_string` for `new_string`) and **insert** (place content before or after `old_string` while preserving the anchor). The file must have been read with `read_file` first (unless `force` is set).
 
-**Permission:** Write
+**Permission:** Workspace
 
 ### Parameters
 
@@ -107,7 +107,7 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 
 Create or overwrite a file with the given content.
 
-**Permission:** Write
+**Permission:** Workspace
 
 ### Parameters
 

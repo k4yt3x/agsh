@@ -3,8 +3,8 @@
 //!
 //! Both gate at [`Permission::Read`]. Neither runs anything: listing reads meka's own store, and
 //! cancelling only signals a token belonging to work whose permission was already checked when it
-//! was dispatched. Requiring `write` to stop something the agent itself started would leave it
-//! unable to clean up after a call it had every right to make.
+//! was dispatched. Requiring `unrestricted` to stop something the agent itself started would leave
+//! it unable to clean up after a call it had every right to make.
 //!
 //! Sub-agents deliberately get neither, for the same reason they get no `schedule_*`: a sub-agent's
 //! session ends with the single turn that spawned it, so it can neither start a task that outlives

@@ -961,8 +961,8 @@ pub async fn patch_session(
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PatchSessionRequest {
-    /// New permission level (`read` / `write` / `ask`). Must be in the server's enabled set.
-    /// Absent → keep current.
+    /// New permission level (`none` / `read` / `workspace` / `ask` / `unrestricted`). Must be in
+    /// the server's enabled set. Absent → keep current.
     #[serde(default)]
     pub permission: Option<String>,
     /// New working directory. Must be absolute. Absent → keep current.

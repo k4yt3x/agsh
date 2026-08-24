@@ -85,6 +85,11 @@ fn main() -> anyhow::Result<()> {
     // joins that thread and hangs the process after a clean rollback.
     runtime.shutdown_background();
 
+    // Ahead of the interrupt arm below, which exits without unwinding. Placed here rather than
+    // duplicated into that arm because this is the funnel: every ordinary end of the process, clean
+    // or interrupted, passes this line.
+    crate::sandbox::release_process_grants();
+
     // User-initiated interrupts are already acknowledged by the rollback warn log ("interrupted;
     // rolling back …") and the shell typically echoes `^C` itself; anyhow's default "Error:
     // agent interrupted by user" on top of that is just noise. Exit with the conventional
@@ -900,9 +905,10 @@ async fn create_agent_from_config(
         shared_permission,
         frontend,
         Arc::clone(&cwd),
-        // The REPL and one-shot paths have no multi-root concept; only ACP supplies extra
-        // workspace roots.
-        Arc::new(std::sync::RwLock::new(Vec::new())),
+        // ACP is the other source of extra workspace roots; here they come from
+        // `--writable-root`. Both land in the same handle because they mean the same thing, so
+        // a named folder is searched and, at `workspace` permission, writable.
+        Arc::new(std::sync::RwLock::new(config.writable_roots.clone())),
     )
     .await?;
 
@@ -998,7 +1004,7 @@ async fn collect_background_outcomes(
 /// compare against the level the process was launched with. Shift+Tab and `/permission` move only
 /// the [`SharedPermission`] cell, so that snapshot is wrong from the first cycle onward, and wrong
 /// in both directions: cycling up from the default `read` to author a gate left it refused forever,
-/// and cycling down from `write` left an already-written gate firing, which is exactly the
+/// and cycling down from `unrestricted` left an already-written gate firing, which is exactly the
 /// withdrawal the re-check exists to perform.
 ///
 /// A function rather than two lines at the call site so the substitution is assertable; the wiring
@@ -1147,6 +1153,9 @@ fn install_interrupt_handler(agent: &Agent) {
                             INTERRUPT_DRAIN_GRACE
                         );
                     }
+                    // This arm exits from inside a spawned task, so it never reaches the funnel in
+                    // `main` and has to release the grants itself.
+                    crate::sandbox::release_process_grants();
                     std::process::exit(130);
                 }
             }
@@ -1220,7 +1229,8 @@ async fn run_oneshot(
     if config.permission == crate::permission::Permission::Ask {
         tracing::warn!(
             "permission is 'ask' but one-shot mode has no interactive prompt: every tool that \
-             needs approval will be denied. Use --permission read or write, or drop --oneshot."
+             needs approval will be denied. Use --permission workspace or unrestricted, or drop \
+             --oneshot."
         );
     }
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
@@ -1622,6 +1632,38 @@ async fn run_interactive(
 
     while let Some(event) = input_receiver.recv().await {
         match event {
+            // Recorded on the row, then straight back to the prompt: this is not a turn and must
+            // not look like one, so no `AgentToReplEvent::Done` and no spacing.
+            //
+            // The row is what a *scheduled gate* is re-checked against at fire time, and a row that
+            // carries no level falls back to the polling process's own startup flag. Before this,
+            // a REPL session's row was always NULL, so a `meka serve` sharing the data directory
+            // answered that question with its own `--permission` -- and kept running a gate the
+            // user had just withdrawn with Shift+Tab. `docs/book/src/usage/scheduling.md` documents
+            // that withdrawal, so it was a promise the code did not keep whenever serve was up.
+            ReplEvent::PermissionChanged(level) => {
+                let Some(id) = session_id else {
+                    // No row yet: the level the first turn creates the session with is this one, so
+                    // there is nothing to correct.
+                    continue;
+                };
+                if let Err(error) = session_manager
+                    .update_session_permission(id, &level.to_string())
+                    .await
+                {
+                    // `warn!` rather than `?`: the user's own level has already moved in this
+                    // process, and failing the REPL over a bookkeeping write would be worse than
+                    // the stale row. Loud because the consequence is precisely that another process
+                    // may still act on the old level.
+                    tracing::warn!(
+                        "could not record permission `{}` on session {}: {}. Another meka process \
+                         may still act on this session's previous level",
+                        level,
+                        id,
+                        error
+                    );
+                }
+            }
             ReplEvent::Wake => {
                 let scope = match session_id {
                     Some(id) => crate::schedule::SchedulerScope::OneSession(id),
@@ -1651,10 +1693,11 @@ async fn run_interactive(
                 // row (`ResolvedScheduleConfig::host_permission` documents that fallback). The
                 // gate's live re-check therefore read a snapshot that Shift+Tab and `/permission`
                 // never touch, and it failed in both directions: starting at the default `read` and
-                // cycling up to `write` to author a gate left it refused forever, while starting at
-                // `write` and cycling down to `read` kept firing it -- which is the withdrawal the
-                // re-check exists for. Overriding it here is the whole fix; `run_due` reads this
-                // clone, not the process-wide one.
+                // cycling up to `unrestricted` to author a gate left it refused forever, while
+                // starting at `unrestricted` and cycling down to `read` kept firing
+                // it -- which is the withdrawal the re-check exists for. Overriding
+                // it here is the whole fix; `run_due` reads this clone, not the
+                // process-wide one.
                 let schedule_config =
                     schedule_config_at_live_permission(&config.schedule, &scheduler_permission);
                 if config.schedule.enabled
@@ -3064,12 +3107,14 @@ mod tests {
     /// with.
     ///
     /// This is the wiring half of the scheduled-gate fix, and it is the half that was wrong: the
-    /// refusal logic in `schedule.rs` is well covered at both `read` and `write`, but every one of
-    /// those tests *supplies* the host permission. Nothing checked that the REPL supplies a live
-    /// one, so the gate compared against a startup snapshot that `Shift+Tab` never touches.
+    /// refusal logic in `schedule.rs` is well covered at both `read` and `unrestricted`, but every
+    /// one of those tests *supplies* the host permission. Nothing checked that the REPL
+    /// supplies a live one, so the gate compared against a startup snapshot that `Shift+Tab`
+    /// never touches.
     #[test]
     fn a_repl_sweep_reads_the_permission_the_session_is_at_now() {
         let configured = crate::config::ResolvedScheduleConfig {
+            enabled_permissions: crate::permission::EnabledPermissions::DEFAULT,
             enabled: true,
             host_permission: crate::permission::Permission::Read,
             poll_interval: std::time::Duration::from_secs(10),
@@ -3082,17 +3127,17 @@ mod tests {
             crate::permission::Permission::Read,
             crate::permission::EnabledPermissions::from_modes([
                 crate::permission::Permission::Read,
-                crate::permission::Permission::Write,
+                crate::permission::Permission::Unrestricted,
             ])
             .expect("a non-empty mode set"),
         );
 
         // Cycling up is what lets a gate authored now ever fire.
-        live.try_set(crate::permission::Permission::Write)
+        live.try_set(crate::permission::Permission::Unrestricted)
             .expect("write is enabled");
         assert_eq!(
             schedule_config_at_live_permission(&configured, &live).host_permission,
-            crate::permission::Permission::Write,
+            crate::permission::Permission::Unrestricted,
             "a gate authored after cycling up to write would be refused forever"
         );
 

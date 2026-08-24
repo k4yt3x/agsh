@@ -2569,7 +2569,7 @@ mod tests {
 
         let u2_text = {
             let block = build_turn_context(
-                Permission::Write,
+                Permission::Unrestricted,
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
                 &[],
@@ -2609,7 +2609,7 @@ mod tests {
         // 4. Sanity: the two user messages do differ in their permission context (fresh content on
         //    each turn, not cached yet).
         assert!(u1_text.contains("Current permission level: read"));
-        assert!(u2_text.contains("Current permission level: write"));
+        assert!(u2_text.contains("Current permission level: unrestricted"));
         assert_ne!(u1_text, u2_text);
     }
 
@@ -2635,7 +2635,7 @@ mod tests {
             .await
             .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
-            Permission::Write,
+            Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
@@ -2679,7 +2679,7 @@ mod tests {
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
             let block = build_turn_context(
-                Permission::Write,
+                Permission::Unrestricted,
                 &crate::tools::todo::TodoState::default(),
                 std::path::Path::new("."),
                 &[],
@@ -2780,7 +2780,7 @@ mod tests {
             .await
             .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
-            Permission::Write,
+            Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
         let registry = ToolRegistry::build_default(
@@ -2901,7 +2901,7 @@ mod tests {
             .await
             .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
-            Permission::Write,
+            Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
@@ -3048,11 +3048,16 @@ mod tests {
         .expect("default web client config should build cleanly");
 
         let provider = test_provider();
+        // All five. `Workspace` was missing, which is the level this release adds and the one the
+        // property is most load-bearing for: it sits between `read` and `ask` in the Shift+Tab
+        // cycle, so a user reaching `unrestricted` passes through it and would invalidate the
+        // cached prefix on the way if the array moved.
         let levels = [
             Permission::None,
             Permission::Read,
+            Permission::Workspace,
             Permission::Ask,
-            Permission::Write,
+            Permission::Unrestricted,
         ];
 
         let mut bodies = Vec::with_capacity(levels.len());
@@ -3061,6 +3066,10 @@ mod tests {
             let system = build_system_prompt(true, None);
             let tools = registry.definitions_active(&[]);
             let messages = vec![Message::user("hello")];
+            assert!(
+                !tools.is_empty(),
+                "{level} produced no tools, so the pairwise equality below would be vacuous"
+            );
             bodies.push(provider.build_request_body(&system, &messages, &tools, true));
         }
 

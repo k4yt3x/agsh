@@ -56,8 +56,8 @@ type = "anthropic-messages"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "unrestricted"
+enabled = ["read", "unrestricted"]
 {extra_config}
 "#
             ),
@@ -348,7 +348,7 @@ enabled = ["read", "write"]
                         job.prompt,
                         job.gate_command,
                         job.gate_command.map(|_| "on-success"),
-                        job.gate_command.map(|_| "write"),
+                        job.gate_command.map(|_| "unrestricted"),
                         i64::from(job.isolated),
                         due,
                         due,

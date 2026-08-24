@@ -7,13 +7,13 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | Tool | Permission | Description |
 |------|-----------|-------------|
 | [`read_file`](./file-operations.md#read_file) | Read | Read file contents |
-| [`edit_file`](./file-operations.md#edit_file) | Write | Make string replacements in a file |
-| [`write_file`](./file-operations.md#write_file) | Write | Create or overwrite a file |
+| [`edit_file`](./file-operations.md#edit_file) | Workspace | Make string replacements in a file |
+| [`write_file`](./file-operations.md#write_file) | Workspace | Create or overwrite a file |
 | [`find_files`](./search.md#find_files) | Read | Find files by glob pattern |
 | [`search_contents`](./search.md#search_contents) | Read | Search file contents with regex |
 | [`fetch_url`](./web.md#fetch_url) | Read | Fetch a web page as markdown |
 | [`search_web`](./web.md#search_web) | Read | Search the web |
-| [`execute_command`](./shell.md#execute_command) | Read/Write | Run a shell command |
+| [`execute_command`](./shell.md#execute_command) | Read | Run a shell command (see the note below) |
 | [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
 | [`agent_list`](./overview.md#agent_list--agent_followup--agent_delete) | Read | List the sub-agents this session spawned |
@@ -24,6 +24,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
+| [`scratchpad_load_file`](./scratchpad.md#scratchpad_load_file) | Read | Load a file into the scratchpad |
+| [`scratchpad_save_file`](./scratchpad.md#scratchpad_save_file) | Workspace | Write a scratchpad entry out to a path |
 | [`skill_read`](./overview.md#the-skill_-tools) | Read | Load a named skill's instructions |
 | [`skill_search`](./overview.md#the-skill_-tools) | Read | Regex over the full text of every skill |
 | [`skill_write`](./overview.md#the-skill_-tools) | Read | Create or update a skill |
@@ -49,21 +51,23 @@ The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-fi
 
 Tools are grouped by the minimum permission level required:
 
-**Read permission** (available in read, ask, and write modes):
+**Read permission** (available at `read` and above):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`
 - `execute_command` (sandboxed, filesystem write-protected)
 - `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `render_image`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory, the
   store is meka's own under its config directory, not your working tree
 - `conversation_search`, `conversation_read`, `context_check`, `context_compact`
-- All scratchpad tools
+- Every scratchpad tool except `scratchpad_save_file`, which writes to a path you name and so sits at `workspace` with `write_file`
 - All memory tools. Writing a memory needs only read permission: the store is meka's own, in
   meka's database, not your working tree.
 
-**Write permission** (only available in write mode):
-- `edit_file`, `write_file`, `execute_command` (unsandboxed)
+**Workspace permission** (available at `workspace` and above; writes are confined to the workspace roots at `workspace`):
+- `edit_file`, `write_file`, `scratchpad_save_file`
 
-In **ask** mode, all tools are available but each call requires user confirmation. `execute_command` still runs in the read-only sandbox there: approving a call says the command may run, not that it may write. Switch to write mode for a command that has to modify the tree.
+`execute_command` is not in that list: it asks for `read` when a sandbox backend is available and `unrestricted` when none is, so it is reachable at `read` and confined by the *level*, not by its own requirement.
+
+In **ask** mode, all tools are available but each call requires user confirmation. Once approved, nothing is confined: `execute_command` runs unsandboxed and a write reaches anywhere, the same as an approved `write_file`. The prompt is the whole gate. Use `workspace` when you want a boundary instead of a prompt.
 
 In **none** mode, no tools are available. The agent can only respond with text.
 
@@ -161,7 +165,7 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 **Recursion.** Sub-agents may themselves spawn further sub-agents, so an agent can orchestrate a team. Nesting is bounded by [`session.subagent_max_depth`](../configuration/config-file.md#sessionsubagent_max_depth) (default 3; `1` reproduces the old "sub-agents can't spawn" behavior, `0` disables `agent_spawn` entirely). Pass the optional `max_depth` parameter to tune how deep a given subtree may recurse; a built-in absolute cap always bounds real nesting so recursion can't run away.
 
-**Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `ask` / `write`) to run it at a *more restricted* level: the value is clamped to the parent's level as a ceiling, so a sub-agent can never be escalated above its parent. This lets a write-mode orchestrator hand untrusted or risky work to a read-only sub-agent.
+**Permission.** By default a sub-agent inherits the parent's permission level. Pass the optional `permission` parameter (`none` / `read` / `workspace` / `ask` / `unrestricted`) to run it at a *more restricted* level: the value is clamped to the parent's level as a ceiling, so a sub-agent can never be escalated above its parent. This lets an orchestrator hand untrusted or risky work to a read-only sub-agent. `workspace` and `ask` are incomparable, so asking for one under a parent holding the other yields the parent's own level rather than either.
 
 **Tools.** Pass `deny_servers` to withhold whole MCP servers from the sub-agent (its tools, its resources, and its prompts) or `deny_tools` to withhold individual tools by name. Both union with whatever [`[subagents]`](../configuration/config-file.md#subagents) already denies; there is no way to grant something back, so a nested `agent_spawn` can only ever narrow further. Config is the place to put a restriction you always want, since the failure mode this guards against is an orchestrator forgetting to ask for it.
 
@@ -184,7 +188,7 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's workers.
 
-**A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a worker at `read` and have since switched to write mode, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a worker you deliberately restricted.
+**A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a worker at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a worker you deliberately restricted.
 
 Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn.
 

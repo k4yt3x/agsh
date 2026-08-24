@@ -641,7 +641,7 @@ Settings for shell command execution.
 
 ### `shell.sandbox`
 
-Whether to enable read-only filesystem sandboxing for shell commands in read mode. When enabled (default), shell commands can be executed in read mode but with the filesystem physically write-protected. When disabled, shell commands require write mode.
+Whether to enable read-only filesystem sandboxing for shell commands in read mode. When enabled (default), shell commands can be executed at `read` and `workspace` but with the filesystem write-protected outside the workspace roots. When disabled, shell commands require `unrestricted`.
 
 Default: `true`
 
@@ -650,7 +650,7 @@ Default: `true`
 sandbox = false  # disable sandboxed shell in read mode
 ```
 
-The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require write mode regardless of this setting.
+The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
 
 ### `shell.sandbox_backend`
 
@@ -680,15 +680,15 @@ Controls which permission modes are reachable at runtime and which mode the sess
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `default` | No | Mode the session starts in. One of `"none"`, `"read"`, `"ask"`, `"write"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
-| `enabled` | No | List of modes that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "write"]`; `"ask"` is opt-in. Disabled modes are skipped during Shift+Tab cycling and rejected by `/permission` with an error. |
+| `default` | No | Mode the session starts in. One of `"none"`, `"read"`, `"workspace"`, `"ask"`, `"unrestricted"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
+| `enabled` | No | List of modes that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`; `"ask"` is opt-in. Disabled modes are skipped during Shift+Tab cycling and rejected by `/permission` with an error. |
 
-If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest-discriminant enabled mode (in `none → read → ask → write` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled mode: meka warns and starts in the configured default rather than refusing to launch.
+If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest-discriminant enabled mode (in `none → read → workspace → ask → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled mode: meka warns and starts in the configured default rather than refusing to launch.
 
 ```toml
 [permissions]
 default = "read"
-enabled = ["none", "read", "ask", "write"]  # opt back into ask
+enabled = ["none", "read", "workspace", "ask", "unrestricted"]  # opt back into ask
 ```
 
 ## `[session]`
@@ -836,7 +836,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools`; tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
 | `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
-| `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `write` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honoured either way, since it only raises the requirement. See *Permission resolution* below. |
+| `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honoured either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Defaults to `false`. |
 | `required` | No | When `true`, a turn is rejected while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). When `false`, the session runs without it and its tools are simply absent. Defaults to `[mcp].strict` (itself `false`), so servers are optional unless they opt in. |
 
@@ -844,7 +844,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 
 | Field | Purpose |
 |-------|---------|
-| `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"ask"`, or `"write"`. If unset the hardcoded fallback is `"write"` (strict). |
+| `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"workspace"`, `"ask"`, or `"unrestricted"`. If unset the hardcoded fallback is `"unrestricted"` (strict). It stays there deliberately: an MCP server runs unsandboxed, so `workspace` cannot confine it. |
 | `strict` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` in the REPL or probed with `meka mcp reconnect <name>`. |
 | `grace_seconds` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. Default `3`. Set to `0` to skip waiting (useful for scripts that want to fail fast). |
 | `connect_timeout_seconds` | Per-server timeout for connect + `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. Default `30`. |
@@ -864,9 +864,9 @@ Every MCP tool's required permission is resolved through a five-step chain; the 
 
 1. **`server.tool_permissions[<raw-tool>]`**: explicit per-tool override.
 2. **`server.permission`**: explicit server-level override. Applies to every tool on that server regardless of what the server advertises.
-3. **`tool.annotations.readOnlyHint`** from the server: `true` → `Read`, `false` → `Write`. The `true` half is skipped when the server sets `trust_read_only_hint = false`, and a hint skipped that way also bypasses step 4, landing on step 5.
+3. **`tool.annotations.readOnlyHint`** from the server: `true` → `Read`, `false` → `Unrestricted`. The `true` half is skipped when the server sets `trust_read_only_hint = false`, and a hint skipped that way also bypasses step 4, landing on step 5.
 4. **`[mcp].default_permission`**: global fallback. Not consulted for a hint that step 3 refused.
-5. **Hardcoded `Write`**: strict ultimate fallback.
+5. **Hardcoded `Unrestricted`**: strict ultimate fallback.
 
 User-supplied config (1, 2, 4) always beats the server's self-classification; if a server lies about a tool, you can override. But when no user config says anything, the server's hint is trusted for that specific tool so `readOnlyHint = false` destructive tools don't silently become Read-accessible just because the user opted into a lenient global default.
 
@@ -875,14 +875,14 @@ User-supplied config (1, 2, 4) always beats the server's self-classification; if
 Three defences, in increasing order of bluntness:
 
 - `tool_permissions` on the specific tools you want pinned (step 1 wins).
-- `trust_read_only_hint = false` on the server, which makes its hints advisory for display only. A refused hint drops straight to the strict `write` fallback, deliberately skipping `[mcp].default_permission`: that key is a global default, and letting it answer would mean `default_permission = "read"` silently re-granting exactly what the per-server flag refused. None of that server's hinted tools is reachable at `read` without an explicit override.
-- `server.permission = "write"` on the whole server (step 2 wins), or `disabled_tools` to remove the tool entirely.
+- `trust_read_only_hint = false` on the server, which makes its hints advisory for display only. A refused hint drops straight to the strict `unrestricted` fallback, deliberately skipping `[mcp].default_permission`: that key is a global default, and letting it answer would mean `default_permission = "read"` silently re-granting exactly what the per-server flag refused. None of that server's hinted tools is reachable at `read` without an explicit override.
+- `server.permission = "unrestricted"` on the whole server (step 2 wins), or `disabled_tools` to remove the tool entirely.
 
 The hint is trusted by default because most servers annotate honestly and requiring per-tool config for every server would make read mode impractical. `trust_read_only_hint` is the switch for a server you have not audited.
 
 **Stale config**: entries in `allowed_tools` / `disabled_tools` / `eager_load_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool. A name that appears in both `eager_load_tools` and `disabled_tools` also warns: the disabled filter wins, so eager-loading the disabled tool is a no-op.
 
-**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
+**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the per-turn context with its required level noted inline, and a `[Permission context]` section names the current level and states in one line what it allows (it does not enumerate tools; the per-tool levels are in the catalogue above it). The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
 
 #### The stdio server's environment
 
@@ -950,7 +950,7 @@ url        = "https://mcp.internal/…"
 permission = "read"
 ```
 
-Overriding a mis-annotated or distrusted tool (one specific tool requires Write):
+Overriding a mis-annotated or distrusted tool (one specific tool requires `unrestricted`):
 ```toml
 [[mcp.servers]]
 name      = "notion"
@@ -958,7 +958,7 @@ transport = "http"
 url       = "https://mcp.notion.com/mcp"
 
 [mcp.servers.tool_permissions]
-"notion-do-something-scary" = "write"
+"notion-do-something-scary" = "unrestricted"
 ```
 
 Subset of a server's tools (only `query` registers, all others are ignored):
@@ -1040,7 +1040,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `--allow-tool <NAME>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
 | `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
-| `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`ask`/`write`. |
+| `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`workspace`/`ask`/`unrestricted`. |
 | `--required` | Persist `required = true`, so a turn is rejected while this server isn't connected. Omitted, the server inherits `[mcp].strict` and is optional by default. |
 | `--disabled` | Persist `disabled = true`, so the server is skipped entirely at startup. Re-enable with `meka mcp enable <name>`. |
 
@@ -1165,7 +1165,7 @@ name = "postgres"
 transport = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
-permission = "write"
+permission = "unrestricted"
 ```
 
 #### HTTP server
@@ -1186,7 +1186,7 @@ name = "api"
 transport = "http"
 url = "https://api.example.com/mcp"
 auth_token = "your-bearer-token"
-permission = "write"
+permission = "unrestricted"
 
 [mcp.servers.headers]
 X-Custom-Header = "value"
@@ -1221,7 +1221,7 @@ name = "github"
 transport = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
-permission = "write"
+permission = "unrestricted"
 ```
 
 #### HTTP server with OAuth client credentials
@@ -1231,7 +1231,7 @@ permission = "write"
 name = "api"
 transport = "http"
 url = "https://api.example.com/mcp"
-permission = "write"
+permission = "unrestricted"
 
 [mcp.servers.auth]
 type = "client_credentials"
@@ -1283,7 +1283,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 |---|---|
 | `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tools list` to see the canonical names. |
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
-| `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `ask`, `write`. |
+| `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `ask`, `unrestricted`. |
 
 Stale entries (a name that doesn't match any built-in) emit a `warn!` at startup. meka still starts; the warning just flags a likely typo or a tool the binary renamed.
 
@@ -1293,10 +1293,10 @@ Restrict a session to read-only inspection:
 allowed_tools = ["read_file", "find_files", "search_contents", "fetch_url"]
 ```
 
-Force `execute_command` to need `write` so `ask` mode prompts for every shell call:
+Force `execute_command` to need `unrestricted` so `ask` mode prompts for every shell call:
 ```toml
 [tools.tool_permissions]
-execute_command = "write"
+execute_command = "unrestricted"
 ```
 
 Disable web access entirely in a locked-down environment:

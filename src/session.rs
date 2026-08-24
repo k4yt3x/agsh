@@ -4754,10 +4754,11 @@ mod tests {
         assert!(messages.is_empty());
     }
 
+    /// The FK cascade must not take a job-owning child with its stale parent.
+    ///
     /// A session holding a scheduled job is not idle, whatever its `updated_at` says: only turns
     /// bump that column, so a gated watcher that evaluates every tick and rarely fires looks
-    /// untouched precisely while it is doing its job. The FK cascade then destroyed the schedule
-    /// The FK cascade must not take a job-owning child with its stale parent.
+    /// untouched precisely while it is doing its job.
     ///
     /// Sparing only the row named by `scheduled_jobs.session_id` left the guard half-built:
     /// `parent_session_id` carries `ON DELETE CASCADE`, so a top-level session that has gone quiet
@@ -4810,7 +4811,10 @@ mod tests {
         );
     }
 
-    /// along with the session, and the sweep reported only "deleted N session(s)".
+    /// Retention must leave a session alone while it still owns a scheduled job.
+    ///
+    /// It did not: the cascade took the job along with the session, and the sweep reported only
+    /// "deleted N session(s)".
     #[tokio::test]
     async fn retention_spares_a_session_that_still_has_a_scheduled_job() {
         let manager = test_manager().await;
@@ -5087,15 +5091,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_covers_all_permission_levels() {
-        // The context block's shape differs per permission level (Write omits the [Environment
-        // context], None differs again). Every level should still surface the user's prompt
-        // cleanly.
+        // The context block's shape differs per permission level (`none` omits the [Environment
+        // context] entirely, `workspace` adds a write-boundary paragraph to it). Every level should
+        // still surface the user's prompt cleanly. "all permission levels" in the name is a claim,
+        // so the list has to actually hold all of them: `workspace` was missing here, and it is the
+        // level whose block grew a new section.
         let manager = test_manager().await;
         for (label, permission) in &[
             ("none", crate::permission::Permission::None),
             ("read", crate::permission::Permission::Read),
+            ("workspace", crate::permission::Permission::Workspace),
             ("ask", crate::permission::Permission::Ask),
-            ("write", crate::permission::Permission::Write),
+            ("unrestricted", crate::permission::Permission::Unrestricted),
         ] {
             let session_id = manager.create_session(None).await.expect("create_session");
             let prompt = format!("ask at {} level", label);
@@ -6180,7 +6187,7 @@ mod tests {
                 command: "gh pr checks 123".to_string(),
                 fire: crate::schedule::GateFire::OnChange,
                 last_output: None,
-                permission: crate::permission::Permission::Write,
+                permission: crate::permission::Permission::Unrestricted,
             }),
         )
         .await;
@@ -6650,7 +6657,7 @@ mod tests {
                 command: "true".to_string(),
                 fire: crate::schedule::GateFire::OnSuccess,
                 last_output: None,
-                permission: crate::permission::Permission::Write,
+                permission: crate::permission::Permission::Unrestricted,
             }),
         )
         .await;

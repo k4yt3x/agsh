@@ -47,11 +47,11 @@ meka provider add openrouter --type openai-chat-completions --model anthropic/cl
     --base-url https://openrouter.ai/api/v1
 ```
 
-Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, ask, write):
+Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted):
 
 ```console
 meka [r] > find all TODO comments in this project
-meka [w] > install and start nginx
+meka [u] > install and start nginx
 ```
 
 See the [documentation](https://docs.meka.so) for the full usage guide.
@@ -96,8 +96,14 @@ The prompt indicator shows the current permission mode. Press **Shift+Tab** to c
 
 - `[n]` **none**: no tools available, text-only responses
 - `[r]` **read**: read-only tools (file reading, searching, web, sandboxed shell)
-- `[a]` **ask**: all tools available, but each call requires user approval
-- `[w]` **write**: all tools enabled, including shell execution and file writes
+- `[w]` **workspace**: all tools enabled; writes are confined to the working directory and any
+  `--writable-root`, reads are not confined
+- `[a]` **ask**: all tools enabled, but each call requires user approval. Not in the default cycle;
+  enable it under `[permissions]`
+- `[u]` **unrestricted**: all tools enabled with no boundary on where writes land
+
+`workspace` and `ask` are deliberately not ordered against each other: one confines writes without
+prompting, the other prompts without confining.
 
 ## Sessions
 

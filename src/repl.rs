@@ -201,11 +201,12 @@ const MCP_SUBCOMMANDS: [&str; 4] = ["list", "reconnect", "login", "logout"];
 
 /// Permission levels in canonical order, sourced through the `Display` impl so the completions
 /// cannot drift from what the parser accepts.
-const PERMISSION_LEVELS: [crate::permission::Permission; 4] = [
+const PERMISSION_LEVELS: [crate::permission::Permission; 5] = [
     crate::permission::Permission::None,
     crate::permission::Permission::Read,
+    crate::permission::Permission::Workspace,
     crate::permission::Permission::Ask,
-    crate::permission::Permission::Write,
+    crate::permission::Permission::Unrestricted,
 ];
 
 impl Completer for SlashCompleter {
@@ -371,7 +372,6 @@ fn complete_cd_path(
     suggestions
 }
 
-const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
 const COMPLETION_MENU: &str = "completion_menu";
 
 struct MekaPrompt {
@@ -465,20 +465,92 @@ impl Prompt for MekaPrompt {
     }
 }
 
-fn build_reedline_editor(
-    input_style: nu_ansi_term::Style,
-    printer: ExternalPrinter<String>,
-    history: Option<Box<dyn History>>,
-    completer: SlashCompleter,
-    wake: Arc<AtomicBool>,
-) -> Reedline {
-    let mut keybindings = default_emacs_keybindings();
+/// Emacs bindings plus one key that reedline has no vocabulary for: cycling meka's permission.
+///
+/// Wraps rather than replaces, so every other binding is stock reedline and stays that way when
+/// reedline changes.
+///
+/// The point of intercepting here rather than binding Shift+Tab to `ExecuteHostCommand` is that
+/// cycling is not a host command. That signal means "the editor is exiting, the host is about to
+/// run something and may scroll the terminal", and reedline reasonably refuses to re-use a prompt
+/// row after it -- `select_prompt_row` gives up whenever the suspended prompt sat flush against the
+/// bottom of the screen (nushell/reedline#1130). Cycling runs nothing and paints nothing, so
+/// `read_line` never needs to return: `parse_event` takes `&mut self`, which is the supported way
+/// for a host to react to a key, and `Repaint` re-renders the prompt in place from the permission
+/// cell it just moved. Every earlier attempt at this fought that mismatch from the outside, first
+/// stacking a prompt line per press and then flashing when the line was cleared to stop the
+/// stacking.
+struct CyclePermissionMode {
+    inner: Emacs,
+    shared_permission: SharedPermission,
+    /// Best-effort: a closed channel means the agent loop is gone, which is the one case where
+    /// nothing is left to act on the recorded level.
+    input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
+    sandbox_state: crate::sandbox::SandboxState,
+}
 
-    keybindings.add_binding(
-        KeyModifiers::SHIFT,
-        KeyCode::BackTab,
-        ReedlineEvent::ExecuteHostCommand(CYCLE_PERMISSION_SENTINEL.to_string()),
-    );
+impl reedline::EditMode for CyclePermissionMode {
+    fn parse_event(&mut self, event: reedline::ReedlineRawEvent) -> ReedlineEvent {
+        let raw: crossterm::event::Event = event.into();
+        if matches!(
+            raw,
+            crossterm::event::Event::Key(crossterm::event::KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            })
+        ) {
+            let new_permission = self.shared_permission.cycle();
+            tracing::debug!("permission cycled to {}", new_permission);
+            // Recorded on the session row, not just in this process's cell. A scheduled gate is
+            // re-checked at fire time against the row, and a row that carries no level falls back
+            // to the *polling process's* startup flag -- so a `meka serve` sharing the data
+            // directory kept firing a gate the user had just withdrawn here.
+            if self
+                .input_sender
+                .send(ReplEvent::PermissionChanged(new_permission))
+                .is_err()
+            {
+                tracing::debug!("agent loop is gone; permission change not persisted");
+            }
+            // Re-emit the "backend unavailable" warn at the moment the user enters read mode, so a
+            // misconfigured sandbox surfaces immediately instead of waiting for the first
+            // `execute_command` failure. The "stronger sandbox available" nudge (Warn 2)
+            // intentionally does not fire here: startup-only, to avoid nagging.
+            //
+            // Reached while `read_line` is still running, so the relay routes this through the
+            // `ExternalPrinter` and it lands cleanly above the live prompt rather than in the gap
+            // between two of them.
+            if new_permission == crate::permission::Permission::Read {
+                crate::sandbox::warn_if_sandbox_issues(
+                    &self.sandbox_state,
+                    crate::sandbox::WarnContext::ReadModeEntry,
+                );
+            }
+            return ReedlineEvent::Repaint;
+        }
+        // Rebuilt rather than cloned: `ReedlineRawEvent` is consumed by the conversion above, and
+        // its `TryFrom` is the only constructor. It rejects a key *release*, which cannot appear
+        // here because this event already passed that same filter on the way in.
+        match reedline::ReedlineRawEvent::try_from(raw) {
+            Ok(event) => self.inner.parse_event(event),
+            Err(()) => ReedlineEvent::None,
+        }
+    }
+
+    fn edit_mode(&self) -> reedline::PromptEditMode {
+        self.inner.edit_mode()
+    }
+
+    // `handle_mode_specific_event` is deliberately not forwarded: it exists for vi's mode changes,
+    // `Emacs` leaves it at the trait's `Inapplicable` default, and `EventStatus` is not exported
+    // from reedline's root so it cannot be named here anyway.
+}
+
+/// Emacs defaults plus meka's own. Shift+Tab is deliberately absent: [`CyclePermissionMode`]
+/// answers that key before the bindings are consulted, and a binding here would only be dead
+/// weight that a reader has to reconcile with the interception.
+fn meka_keybindings() -> reedline::Keybindings {
+    let mut keybindings = default_emacs_keybindings();
 
     keybindings.add_binding(
         KeyModifiers::ALT,
@@ -501,9 +573,23 @@ fn build_reedline_editor(
         ]),
     );
 
-    let emacs_mode = Emacs::new(keybindings);
+    keybindings
+}
+
+/// The editor, given the edit mode it should drive.
+///
+/// The mode arrives assembled rather than as the three values needed to build one, so this stays a
+/// function about reedline wiring and knows nothing about permissions.
+fn build_reedline_editor(
+    input_style: nu_ansi_term::Style,
+    printer: ExternalPrinter<String>,
+    history: Option<Box<dyn History>>,
+    completer: SlashCompleter,
+    wake: Arc<AtomicBool>,
+    edit_mode: CyclePermissionMode,
+) -> Reedline {
     let mut editor = Reedline::create()
-        .with_edit_mode(Box::new(emacs_mode))
+        .with_edit_mode(Box::new(edit_mode))
         .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
         .with_completer(Box::new(completer))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(
@@ -609,6 +695,13 @@ pub enum ReplEvent {
     /// watcher noticing and this arriving the job could have been cancelled, and firing a prompt
     /// the user just cancelled is worse than missing it.
     Wake,
+    /// The user moved this session's permission level.
+    ///
+    /// Sent so the agent side can record it on the session row. The REPL thread is not async and
+    /// holds no `SessionManager`, so it cannot write it itself; and the level has to reach the
+    /// database *without* waiting for a turn, because the whole point of the withdrawal is that
+    /// Shift+Tab-ing down and walking away stops a gate.
+    PermissionChanged(crate::permission::Permission),
     Exit,
 }
 
@@ -948,7 +1041,19 @@ pub fn run_repl(
         cwd: cwd.clone(),
     };
 
-    let mut editor = build_reedline_editor(input_style, printer, history, completer, wake);
+    let mut editor = build_reedline_editor(
+        input_style,
+        printer,
+        history,
+        completer,
+        wake,
+        CyclePermissionMode {
+            inner: Emacs::new(meka_keybindings()),
+            shared_permission: shared_permission.clone(),
+            input_sender: input_sender.clone(),
+            sandbox_state: sandbox_state.clone(),
+        },
+    );
     let prompt = MekaPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
@@ -972,23 +1077,6 @@ pub fn run_repl(
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
         match signal {
-            // Shift+Tab is bound to `ReedlineEvent::ExecuteHostCommand`, which reedline returns
-            // here rather than as `Success`. It is not user input and never reaches the agent.
-            Ok(Signal::HostCommand(command)) if command == CYCLE_PERMISSION_SENTINEL => {
-                let new_permission = shared_permission.cycle();
-                tracing::debug!("permission cycled to {}", new_permission);
-                // Re-emit the "backend unavailable" warn at the moment the user enters read
-                // mode, so a misconfigured sandbox surfaces immediately instead of waiting for
-                // the first `execute_command` failure. The "stronger sandbox available" nudge
-                // (Warn 2) intentionally doesn't fire here: startup-only, to avoid nagging.
-                if new_permission == crate::permission::Permission::Read {
-                    crate::sandbox::warn_if_sandbox_issues(
-                        &sandbox_state,
-                        crate::sandbox::WarnContext::ReadModeEntry,
-                    );
-                }
-                continue;
-            }
             // A scheduled job came due while the prompt sat idle. `read_line` has returned, so the
             // terminal is back in cooked mode and the turn that follows is indistinguishable from
             // one the user typed: it streams, Ctrl+C reaches it, and the absent prompt is what
@@ -1059,6 +1147,19 @@ pub fn run_repl(
                                                         "Permission level set to: {}",
                                                         permission
                                                     );
+                                                    // Persisted for the same reason as the
+                                                    // Shift+Tab path above.
+                                                    if input_sender
+                                                        .send(ReplEvent::PermissionChanged(
+                                                            permission,
+                                                        ))
+                                                        .is_err()
+                                                    {
+                                                        tracing::debug!(
+                                                            "agent loop is gone; permission change \
+                                                             not persisted"
+                                                        );
+                                                    }
                                                 }
                                                 Err(_) => {
                                                     render::render_error(&format!(
@@ -1739,8 +1840,13 @@ fn handle_cd(cwd: &crate::workspace::SharedCwd, target: &str) -> Option<String> 
     // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
     // agent's current view, then canonicalize so the prompt and the tools see a clean path.
     let resolved = crate::workspace::resolve_against_cwd(cwd, &raw);
+    // Normalised to the same shape every other producer of a path uses. On Windows `canonicalize`
+    // returns `\\?\C:\proj`, and storing that spelling propagates it to everything derived from
+    // the cwd: `~` no longer strips from the prompt, the model reads it in `Working directory:`
+    // every turn, every relative tool path renders with the prefix, and the sessions table's `cwd`
+    // column stops matching an ACP `session/list` filter spelling the same directory normally.
     let canonical = match std::fs::canonicalize(&resolved) {
-        Ok(canonical) => canonical,
+        Ok(canonical) => crate::workspace::strip_verbatim(canonical),
         Err(error) => return Some(format!("cd: {}: {}", raw.display(), error)),
     };
     if !canonical.is_dir() {
@@ -2933,7 +3039,7 @@ mod tests {
         // leaves `std::env::current_dir()` untouched. Use a tempdir + canonicalize so the assertion
         // is robust to platform-specific symlinks (e.g. `/tmp` → `/private/tmp` on macOS).
         let temp = tempfile::tempdir().expect("tempdir");
-        let target = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let target = crate::workspace::canonical_for_test(temp.path());
         let process_cwd_before = std::env::current_dir().expect("read process cwd before /cd");
 
         let cwd: crate::workspace::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
@@ -2960,7 +3066,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("not-a-directory");
         std::fs::write(&file, b"x").expect("write file");
-        let start = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let start = crate::workspace::canonical_for_test(temp.path());
 
         let cwd: crate::workspace::SharedCwd =
             std::sync::Arc::new(std::sync::RwLock::new(start.clone()));
@@ -3131,16 +3237,16 @@ mod tests {
     #[test]
     fn test_slash_completer_permission_arg_prefix() {
         let completer = empty_completer();
-        let one = completer.suggestions("/permission w", 13);
+        let one = completer.suggestions("/permission wo", 14);
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].value, "write");
+        assert_eq!(one[0].value, "workspace");
         assert!(one[0].append_whitespace);
         let all: Vec<String> = completer
             .suggestions("/permission ", 12)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
-        assert_eq!(all, ["none", "read", "ask", "write"]);
+        assert_eq!(all, ["none", "read", "workspace", "ask", "unrestricted"]);
     }
 
     #[test]
@@ -3148,7 +3254,7 @@ mod tests {
         let completer = empty_completer();
         assert!(
             completer
-                .suggestions("/permission write extra", 23)
+                .suggestions("/permission workspace extra", 27)
                 .is_empty()
         );
     }
@@ -3201,7 +3307,7 @@ mod tests {
     #[test]
     fn test_slash_completer_cd_lists_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = std::fs::canonicalize(temp.path()).expect("canonicalize");
+        let root = crate::workspace::canonical_for_test(temp.path());
         std::fs::create_dir(root.join("src")).expect("mkdir src");
         std::fs::create_dir(root.join("target")).expect("mkdir target");
         std::fs::create_dir(root.join(".git")).expect("mkdir .git");

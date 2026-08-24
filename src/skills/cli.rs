@@ -93,7 +93,10 @@ fn render_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool
                 // fabricated record rather than a cosmetic smudge.
                 row.push(display_path(&skill.source_dir));
             }
-            row.push(truncate(&skill.description, DESCRIPTION_TRUNCATE));
+            row.push(truncate(
+                &crate::memory::render_description_for_model(&skill.description),
+                DESCRIPTION_TRUNCATE,
+            ));
             row
         })
         .collect();
@@ -117,7 +120,10 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     // and can carry a newline or an escape, and this line goes straight to a terminal.
     println!("source_dir: {}", display_path(&skill.source_dir));
     println!("body_path: {}", display_path(&skill.body_path));
-    println!("description: {}", skill.description);
+    println!(
+        "description: {}",
+        crate::memory::render_description_for_model(&skill.description)
+    );
     println!("priority: {}", skill.priority);
     println!("license: {}", optional(skill.license.as_deref()));
     println!(
@@ -159,7 +165,7 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     for (key, value) in &skill.extra {
         println!(
             "extra.{}: {}",
-            crate::store::sanitize_stored_description(key),
+            crate::store::sanitize_stored_description(&skills::yaml_value_to_string(key)),
             crate::store::sanitize_stored_description(&skills::yaml_value_to_string(value))
         );
     }
@@ -944,18 +950,32 @@ mod tests {
 
         // A directory differing only by case: `check_case_collision` refuses, and used to do so
         // after the delete had already run.
-        let collides = dir.with_file_name("Deploy");
-        std::fs::create_dir_all(&collides).expect("mkdir");
-        std::fs::write(
-            collides.join("SKILL.md"),
-            "---\nname: Deploy\ndescription: other\n---\nother\n",
-        )
-        .expect("seed");
+        //
+        // Only representable on a case-sensitive filesystem. Windows and a default macOS volume
+        // fold the two names onto one directory, so `create_dir_all` would silently reopen the
+        // skill's own directory and the `SKILL.md` written below would overwrite the very file this
+        // test asserts survives -- a fixture that destroys its own subject and then fails on the
+        // missing refusal. Probed rather than `cfg!`-gated, because the answer is a property of the
+        // volume rather than of the operating system.
+        let case_sensitive = {
+            let probe = temp.path().join("Case-Sensitivity-Probe");
+            std::fs::create_dir_all(&probe).expect("probe dir");
+            !temp.path().join("case-sensitivity-probe").exists()
+        };
+        if case_sensitive {
+            let collides = dir.with_file_name("Deploy");
+            std::fs::create_dir_all(&collides).expect("mkdir");
+            std::fs::write(
+                collides.join("SKILL.md"),
+                "---\nname: Deploy\ndescription: other\n---\nother\n",
+            )
+            .expect("seed");
 
-        let mut args = add_args("deploy", "an updated procedure");
-        args.force = true;
-        let error = run_add(args, &roots).await.expect_err("must refuse");
-        assert!(format!("{error}").contains("only by case"), "{error}");
+            let mut args = add_args("deploy", "an updated procedure");
+            args.force = true;
+            let error = run_add(args, &roots).await.expect_err("must refuse");
+            assert!(format!("{error}").contains("only by case"), "{error}");
+        }
 
         let skill = require_skill("deploy", &roots).expect("the skill must survive its refusal");
         assert_eq!(skill.description, "a precious deployment procedure");
@@ -1251,8 +1271,11 @@ mod tests {
             vec!["Name", "Author", "Pri", "External", "Path", "Description"],
             "--paths adds exactly one column, and Description stays last"
         );
+        // Joined rather than spelled, because the rendered path uses the host separator and the
+        // literal only matched on Unix.
+        let expected = std::path::Path::new("/elsewhere/skills").join("theirs");
         assert!(
-            with_paths.contains("/elsewhere/skills/theirs"),
+            with_paths.contains(&expected.display().to_string()),
             "{with_paths}"
         );
     }
@@ -1298,7 +1321,7 @@ mod tests {
             priority: crate::store::DEFAULT_PRIORITY,
             metadata,
 
-            extra: BTreeMap::new(),
+            extra: serde_norway::Mapping::new(),
             conformance: skills::Conformance {
                 declares_name: true,
                 ..Default::default()

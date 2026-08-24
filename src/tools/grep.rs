@@ -88,13 +88,15 @@ impl Tool for SearchContentsTool {
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd. With
         // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
         // `cwd` silently misses whole folders the user can see in their editor.
-        let search_paths: Vec<String> = match input["path"].as_str() {
+        // Carried as `PathBuf` end to end. Rendering each root through `to_string_lossy` and
+        // rebuilding it with `Path::new` replaced every non-UTF-8 byte with U+FFFD, so a working
+        // directory whose name is not valid UTF-8 -- `mkdir $'proj\xff'` -- named a directory that
+        // does not exist, and the tool reported the user's own cwd as missing under a spelling
+        // they never typed.
+        let search_paths: Vec<std::path::PathBuf> = match input["path"].as_str() {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
             None => crate::workspace::search_roots(&self.cwd, &self.roots),
-        }
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
+        };
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
         // Cap match count for inline use; lift it when redirecting output to the scratchpad so the
         // agent can collect an unbounded result set.
@@ -138,7 +140,7 @@ impl Tool for SearchContentsTool {
 /// leg.
 fn search_with_grep(
     pattern: &str,
-    search_paths: &[String],
+    search_paths: &[std::path::PathBuf],
     file_glob: Option<&str>,
     max_results: usize,
     budget: &WalkBudget,
@@ -189,7 +191,7 @@ fn search_with_grep(
             None => {}
         }
 
-        let path = std::path::Path::new(search_path.as_str());
+        let path = search_path.as_path();
 
         // Stop before the walk, not after, so the remaining roots are counted rather than silently
         // dropped. Checked after `exists`, not before: counting a stale root here would advertise
@@ -241,7 +243,14 @@ fn search_with_grep(
     if !searched_any && !timed_out {
         return Err(MekaError::ToolExecution {
             tool_name: "search_contents".to_string(),
-            message: format!("path '{}' does not exist", search_paths.join("', '")),
+            message: format!(
+                "path '{}' does not exist",
+                search_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("', '")
+            ),
         });
     }
 
@@ -375,7 +384,12 @@ fn walk_directory(
             let Ok(entry) = entry else { continue };
             let path = entry.path();
 
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // `to_string_lossy`, not `to_str().unwrap_or("")`. A directory whose name is not
+            // valid UTF-8 made `to_str` yield `None` and the fallback yield `""`, which does not
+            // start with `.` -- so `.cache\xff` was the one shape that walked straight past the
+            // skip this exists for. Lossy conversion never alters ASCII bytes, so the leading dot
+            // and both literals below survive it intact.
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
             if file_name.starts_with('.') || file_name == "target" || file_name == "node_modules" {
                 continue;
             }
@@ -391,7 +405,7 @@ fn walk_directory(
                 pending.push(path);
             } else if path.is_file() {
                 if let Some(pattern) = glob_pattern
-                    && !pattern.matches(file_name)
+                    && !pattern.matches(&file_name)
                 {
                     continue;
                 }
@@ -689,10 +703,7 @@ mod tests {
         let budget = WalkBudget::new(CancellationToken::new());
         let output = search_with_grep(
             "needle",
-            &[
-                busy.path().to_string_lossy().into_owned(),
-                other.path().to_string_lossy().into_owned(),
-            ],
+            &[busy.path().to_path_buf(), other.path().to_path_buf()],
             None,
             MAX_INLINE_MATCHES,
             &budget,
@@ -730,8 +741,8 @@ mod tests {
         let output = search_with_grep(
             "needle",
             &[
-                busy.path().to_string_lossy().into_owned(),
-                "/nonexistent-workspace-root".to_string(),
+                busy.path().to_path_buf(),
+                std::path::PathBuf::from("/nonexistent-workspace-root"),
             ],
             None,
             MAX_INLINE_MATCHES,
@@ -758,7 +769,7 @@ mod tests {
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
         let output = search_with_grep(
             "needle",
-            &[temp.path().to_string_lossy().into_owned()],
+            &[temp.path().to_path_buf()],
             None,
             MAX_INLINE_MATCHES,
             &budget,
@@ -778,7 +789,7 @@ mod tests {
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
         let output = search_with_grep(
             "needle",
-            &[temp_dir.path().to_string_lossy().into_owned()],
+            &[temp_dir.path().to_path_buf()],
             None,
             MAX_INLINE_MATCHES,
             &budget,

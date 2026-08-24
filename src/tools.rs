@@ -368,6 +368,7 @@ pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a 
 
     let mut by_segment: Vec<&str> = Vec::new();
     let mut by_distance: Vec<(usize, &str)> = Vec::new();
+    let needle_chars = needle.chars().count();
     for candidate in candidates {
         let lowered = candidate.to_ascii_lowercase();
         if lowered == needle
@@ -376,6 +377,24 @@ pub fn did_you_mean_hint<'a>(target: &str, candidates: impl Iterator<Item = &'a 
             || lowered.starts_with(&family_prefix)
         {
             by_segment.push(candidate);
+            continue;
+        }
+        // Two strings whose lengths differ by more than the threshold cannot be within it, so
+        // this rejects them without building the matrix. The same guard the memory search tier
+        // carries, and for the same measurement: an unbounded argument ran an edit distance per
+        // stored name at 11 s for 200,000 characters against 200 memories and 48 s against 20,000,
+        // synchronously on a runtime worker with the cancellation token ignored.
+        //
+        // Counted in *characters*, because `threshold` and `edit_distance` both are; comparing
+        // `len()` would measure bytes and silently discard non-ASCII candidates that are inside
+        // the threshold.
+        //
+        // This is what lets `validate_lookup_name` stop capping length. That cap bounded the cost
+        // by refusing the argument, which also refused every stored name past 64 characters -- so
+        // a row written straight to the column was listed to the model and then unremovable by
+        // anything meka ships, with `meka memory export` refusing the whole store on its account
+        // and naming `meka memory remove` as the remedy, which refused it too.
+        if needle_chars.abs_diff(lowered.chars().count()) > threshold {
             continue;
         }
         let distance = edit_distance(&needle, &lowered);
@@ -421,7 +440,21 @@ fn is_destructive(name: &str) -> bool {
 /// Shared with `memory_search`, whose last-resort tier is the same idea applied to memory names
 /// and descriptions instead of tool names: when full-text matching finds nothing, the query was
 /// probably misspelled rather than absent.
+/// Counts entries into [`edit_distance`], so a test can assert the *matrix* was skipped rather than
+/// that the candidate was visited.
+///
+/// The distinction is the whole point of the length band in [`did_you_mean_hint`] and it is not
+/// observable any other way: skipping costs work, not output, and a counter placed in the caller's
+/// iterator increments before the band is consulted. That is what the previous version of
+/// `a_pathological_name_does_not_run_a_distance_matrix_per_candidate` did, which made its assertion
+/// true whether or not the band existed.
+#[cfg(test)]
+pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
+    #[cfg(test)]
+    EDIT_DISTANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
     if left.is_empty() {
@@ -998,6 +1031,18 @@ pub trait Tool: Send + Sync {
     /// Lowest permission level that may invoke this tool. The dispatch loop short-circuits with a
     /// "permission denied" tool error when the current level is below this.
     fn required_permission(&self) -> Permission;
+    /// Whether this tool's work happens in a process meka does not confine.
+    ///
+    /// True only for MCP adapters today: the call is forwarded to a server meka spawned but does
+    /// not sandbox, so no boundary meka can express reaches it. The dispatch gate needs this
+    /// because `Permission::allows` deliberately treats `Workspace`, `Ask` and `Unrestricted` as
+    /// equal -- scope is meant to be enforced at the write door, and the tools array must stay
+    /// byte-identical across mode toggles for the prompt cache. That works for built-ins, which
+    /// have a door; an MCP adapter has none, so `Workspace.allows(Unrestricted)` being `true` let
+    /// an unannotated tool write anywhere from inside the confined mode, unprompted.
+    fn runs_outside_confinement(&self) -> bool {
+        false
+    }
     /// Run the tool. Long-running implementations must observe `cancellation` (e.g. via
     /// `tokio::select!`) so a user interrupt or turn-level abort unblocks promptly.
     async fn execute(
@@ -1020,6 +1065,9 @@ pub struct ToolRegistry {
     /// Per-tool overrides from `[tools.tool_permissions]`. Immutable after construction so the
     /// cached system-prompt prefix stays byte-stable across `/permission` toggles.
     permission_overrides: Arc<HashMap<String, Permission>>,
+    /// The scope built during `register_core_tools`, so the session-scoped pass can hand the same
+    /// one to `scratchpad_save_file` without re-deriving it from a different set of inputs.
+    write_scope: Arc<std::sync::RwLock<Option<crate::workspace::WriteScope>>>,
     /// Built-in allow/block-list. MCP tools have their own per-server filtering in `src/mcp.rs`
     /// and bypass this.
     builtin_filter: Arc<BuiltinToolFilter>,
@@ -1069,7 +1117,26 @@ impl ToolRegistry {
             mcp_manager: Arc::new(std::sync::OnceLock::new()),
             background_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             read_tracker: Arc::new(RwLock::new(HashMap::new())),
+            write_scope: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// The scope `register_core_tools` built, or a deny-all one.
+    ///
+    /// `None` only on a registry whose core tools were never registered. Both production builders
+    /// register them first and only then run the session-scoped pass, so the fallback is
+    /// unreachable there; it fails closed so that a registry which cannot tell whether a boundary
+    /// applies refuses rather than assumes.
+    ///
+    /// Named for what it returns. The previous name promised an *unconfined* scope, the opposite of
+    /// what the body does, sitting in the one place a reader auditing for fail-open behaviour would
+    /// look first.
+    fn write_scope_or_deny_all(&self) -> crate::workspace::WriteScope {
+        self.write_scope
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(crate::workspace::WriteScope::deny_all)
     }
 
     /// What this registry refuses to register. Read by the MCP installation paths so they can skip
@@ -1447,17 +1514,27 @@ impl ToolRegistry {
         frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<()> {
         let read_tracker = self.read_tracker.clone();
+        // One scope for every tool that writes a path the user named, so `write_file`, `edit_file`
+        // and `scratchpad_save_file` cannot end up judging the boundary differently.
+        let write_scope =
+            crate::workspace::WriteScope::new(shared_permission.clone(), roots.clone());
+        *self
+            .write_scope
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(write_scope.clone());
         self.register_builtin(Arc::new(file::ReadFileTool {
             read_tracker: read_tracker.clone(),
             cwd: cwd.clone(),
             frontend: Arc::clone(&frontend),
         }));
         self.register_builtin(Arc::new(file::EditFileTool {
+            scope: write_scope.clone(),
             read_tracker: read_tracker.clone(),
             cwd: cwd.clone(),
             frontend: Arc::clone(&frontend),
         }));
         self.register_builtin(Arc::new(file::WriteFileTool {
+            scope: write_scope.clone(),
             read_tracker,
             cwd: cwd.clone(),
             frontend: Arc::clone(&frontend),
@@ -1478,6 +1555,9 @@ impl ToolRegistry {
         }));
         self.register_builtin(Arc::new(web::WebSearchTool { client: web_client }));
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
+            scope: write_scope.clone(),
+            #[cfg(windows)]
+            windows_grants: Arc::clone(crate::sandbox::windows_impl::process_grants()),
             sandbox_capability,
             sandbox_backend,
             backend_probe,
@@ -1667,11 +1747,13 @@ impl ToolRegistry {
             cwd: cwd.clone(),
         }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadSaveFileTool {
+            scope: self.write_scope_or_deny_all(),
             session_manager,
             session_id: shared_session_id,
             parent_session_id,
             inherited_names: inherited_scratchpad_names,
             cwd,
+            read_tracker: Arc::clone(&self.read_tracker),
         }));
     }
 
@@ -1872,6 +1954,59 @@ impl ToolRegistry {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// A pathological argument costs one pass over itself, not one distance matrix per candidate.
+    ///
+    /// This is what replaced the length cap on `validate_lookup_name`. That cap bounded the cost by
+    /// refusing the argument outright, and in doing so refused every *stored* name past 64
+    /// characters too -- leaving a row meka listed to the model every turn that nothing it shipped
+    /// could open or remove. Bounding the work here instead lets the lookup doors accept any name
+    /// the column holds.
+    ///
+    /// Counted, not timed. A wall-clock bound measures the machine as much as the code: it would
+    /// eventually flake on a loaded CI runner, and a flake and a real regression look identical.
+    /// The candidate iterator reports how many names were actually inspected, which is the property
+    /// the skip exists to hold and is the same on every host.
+    #[test]
+    fn a_pathological_name_does_not_run_a_distance_matrix_per_candidate() {
+        use std::sync::atomic::Ordering;
+
+        let candidates: Vec<String> = (0..500).map(|index| format!("memory-{index}")).collect();
+        let needle = "x".repeat(200_000);
+
+        // Counted at the callee, not in the caller's iterator. Every candidate is still *visited*
+        // -- the band is inside the loop -- so counting visits answers a question nothing was
+        // asking, and it answers it identically whether or not the band is there.
+        EDIT_DISTANCE_CALLS.store(0, Ordering::Relaxed);
+        let hint = did_you_mean_hint(&needle, candidates.iter().map(String::as_str));
+        let built = EDIT_DISTANCE_CALLS.load(Ordering::Relaxed);
+
+        assert!(
+            hint.is_empty(),
+            "nothing is within an edit of a 200,000-character name: {hint}"
+        );
+        assert_eq!(
+            built,
+            0,
+            "no 11-character candidate is within an edit-distance threshold of a \
+             200,000-character name, so none should have reached the matrix; {built} of {} did, \
+             at ~200,000 x 11 cells each",
+            candidates.len()
+        );
+
+        // The control, so "no matrices" is not passing because the function stopped working: a name
+        // one edit away is still suggested, and that path *does* build the matrix.
+        EDIT_DISTANCE_CALLS.store(0, Ordering::Relaxed);
+        let near = did_you_mean_hint("memory-1", candidates.iter().map(String::as_str));
+        assert!(
+            near.contains("memory-1"),
+            "a near miss must still be suggested: {near}"
+        );
+        assert!(
+            EDIT_DISTANCE_CALLS.load(Ordering::Relaxed) > 0,
+            "a needle inside the band must reach the matrix, or the band is refusing everything"
+        );
+    }
     use std::path::Path;
 
     use super::*;
@@ -1884,7 +2019,7 @@ pub(crate) mod tests {
 
     fn test_shared_permission() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(
-            Permission::Write,
+            Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         )
     }
@@ -1992,6 +2127,185 @@ pub(crate) mod tests {
             ),
         )
         .expect("default web client config should build cleanly")
+    }
+
+    /// The shell tool the production builder hands out writes into the **process-wide** grant
+    /// ledger, not one of its own.
+    ///
+    /// `WindowsGrants` is a singleton because a sub-agent finishing its task must not revoke ACEs
+    /// the parent is still writing through. `register_core_tools` clones `process_grants()` to get
+    /// that, but every Windows test built its tool by hand with a fresh `WindowsGrants::default()`,
+    /// so the clone was untested: replace it with a default and the suite stays green while each
+    /// tool gets a private ledger again, restoring the bug the singleton was introduced to fix.
+    ///
+    /// Asserted behaviourally rather than by identity because `ToolRegistry` hands back
+    /// `Arc<dyn Tool>` with no downcast: run a real confined command through the registry's own
+    /// `execute_command`, then ask the process ledger whether it heard about the root.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_shell_the_registry_builds_grants_through_the_process_ledger() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = crate::workspace::canonical_for_test(temp.path());
+
+        let permission = crate::permission::SharedPermission::new(
+            crate::permission::Permission::Workspace,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory database");
+        let sandbox_capability = crate::sandbox::detect();
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            permission,
+            true,
+            sandbox_capability.clone(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Ok(sandbox_capability),
+            test_todo_list(),
+            session_manager,
+            Arc::new(RwLock::new(None)),
+            crate::skills::SkillCache::for_root(None),
+            false,
+            crate::memory::MemoryStore::detached(),
+            BuiltinToolFilter::default(),
+            Arc::new(std::sync::RwLock::new(workspace.clone())),
+            Arc::new(std::sync::RwLock::new(vec![workspace.clone()])),
+            Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
+        )
+        .expect("registry builds");
+
+        let execute_command = registry
+            .get("execute_command")
+            .expect("execute_command is registered");
+        let result = execute_command
+            .execute(
+                serde_json::json!({"command": "cmd /c echo ok"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_ok(), "the confined command must run: {result:?}");
+
+        let granted = crate::sandbox::windows_impl::process_grants().granted_roots();
+        assert!(
+            granted.contains(&workspace),
+            "the registry's shell must grant through the process-wide ledger, but it holds \
+             {granted:?} and not {}",
+            workspace.display()
+        );
+    }
+
+    /// The registry's write boundary is bound to the **session's own** permission cell, so moving
+    /// that cell moves the boundary.
+    ///
+    /// Nothing tested this wire, and cutting it -- building the shared `WriteScope` from a
+    /// permanently-`Unrestricted` handle instead of `shared_permission` -- left the whole suite
+    /// green. That single edit severs the session's level from `write_file`, `edit_file`,
+    /// `scratchpad_save_file` *and* `execute_command` at once, which makes `workspace` completely
+    /// inert in production while reporting success on every write. It fails **open**, silently, and
+    /// it is one line.
+    ///
+    /// Driven through the production builder and the real tool rather than through the helpers,
+    /// because the helpers are what the cut edit leaves working.
+    #[tokio::test]
+    async fn the_write_boundary_follows_the_session_permission_cell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = crate::workspace::canonical_for_test(temp.path());
+        let outside = crate::workspace::canonical_for_test(std::env::temp_dir())
+            .join(format!("meka-outside-{}.txt", uuid::Uuid::new_v4()));
+
+        let permission = crate::permission::SharedPermission::new(
+            crate::permission::Permission::Workspace,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory database");
+        let sandbox_capability = crate::sandbox::detect();
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            permission.clone(),
+            true,
+            sandbox_capability.clone(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Ok(sandbox_capability),
+            test_todo_list(),
+            session_manager,
+            Arc::new(RwLock::new(None)),
+            crate::skills::SkillCache::for_root(None),
+            false,
+            crate::memory::MemoryStore::detached(),
+            BuiltinToolFilter::default(),
+            Arc::new(std::sync::RwLock::new(workspace.clone())),
+            crate::workspace::test_roots(),
+            Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
+        )
+        .expect("registry builds");
+
+        let write_file = registry
+            .get("write_file")
+            .expect("write_file is registered");
+        let write_outside = || {
+            write_file.execute(
+                serde_json::json!({
+                    "path": outside.to_str().expect("path"),
+                    "content": "payload",
+                }),
+                CancellationToken::new(),
+            )
+        };
+
+        // At `workspace` the cell confines it.
+        //
+        // Either refusal shape counts. `write_file` returns `Err(MekaError::ToolExecution)` from
+        // `resolve_write_target` while `edit_file` returns `Ok(ToolOutput { is_error: true })`;
+        // both reach the model as a failed tool call, and pinning one here would make this test
+        // fail for a reason that has nothing to do with the boundary.
+        let refused = write_outside().await;
+        let refused_message = match &refused {
+            Err(error) => error.to_string(),
+            Ok(output) => {
+                assert!(
+                    output.is_error,
+                    "at `workspace` a write outside every root must be refused: {output:?}"
+                );
+                crate::tools::tests::text_content(output)
+            }
+        };
+        assert!(
+            refused_message.contains("outside the workspace"),
+            "the refusal must name the boundary: {refused_message}"
+        );
+        assert!(
+            !outside.exists(),
+            "and must not have been written: {}",
+            outside.display()
+        );
+
+        // The same registry, the same tool object, one cell mutation later.
+        permission
+            .try_set(crate::permission::Permission::Unrestricted)
+            .expect("unrestricted is enabled in this fixture");
+        let allowed = write_outside().await.expect("write");
+        assert!(
+            !allowed.is_error,
+            "at `unrestricted` the same write must land: {allowed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read back"),
+            "payload"
+        );
+        let _ = std::fs::remove_file(&outside);
     }
 
     use crate::provider::Role;
@@ -2878,7 +3192,7 @@ pub(crate) mod tests {
         assert!(read_tools.iter().any(|t| t.name == "execute_command"));
         assert!(!read_tools.iter().any(|t| t.name == "write_file"));
 
-        let write_tools = registry.definitions_for_permission(Permission::Write);
+        let write_tools = registry.definitions_for_permission(Permission::Unrestricted);
         assert!(write_tools.iter().any(|t| t.name == "read_file"));
         assert!(write_tools.iter().any(|t| t.name == "write_file"));
         assert!(write_tools.iter().any(|t| t.name == "execute_command"));
@@ -2943,15 +3257,83 @@ pub(crate) mod tests {
         ]);
     }
 
+    /// The active tool set is **byte-identical at every permission level**, which is what lets the
+    /// Claude prompt-cache prefix survive a mid-session Shift+Tab.
+    ///
+    /// This is the property `Permission::allows` is shaped around: `Workspace`, `Ask` and
+    /// `Unrestricted` are deliberately equal there, and scope is enforced at the write door instead
+    /// of by hiding tools. The test that carried this name did not mention permission at all -- it
+    /// called `definitions_active(&[])` twice and compared the two results, which is `a == a` and
+    /// holds even if the function returns an empty vector. Making the registry's tools array
+    /// depend on the level again would not have failed it.
+    ///
+    /// Compares the serialised definitions rather than the names, because "byte-identical" is the
+    /// actual claim: a description or a schema that varied by level would break the cache just as
+    /// thoroughly as a missing tool, and a name list cannot see either.
     #[tokio::test]
-    async fn test_definitions_active_stable_across_permissions() {
-        let registry = test_registry().await;
-        let a = registry.definitions_active(&[]);
-        let b = registry.definitions_active(&[]);
-        assert_eq!(a.len(), b.len());
-        let a_names: Vec<_> = a.iter().map(|t| t.name.clone()).collect();
-        let b_names: Vec<_> = b.iter().map(|t| t.name.clone()).collect();
-        assert_eq!(a_names, b_names);
+    async fn the_tools_array_is_byte_identical_at_every_permission_level() {
+        let permission = crate::permission::SharedPermission::new(
+            crate::permission::Permission::None,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory database");
+        let sandbox_capability = crate::sandbox::detect();
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            permission.clone(),
+            true,
+            sandbox_capability.clone(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Ok(sandbox_capability),
+            test_todo_list(),
+            session_manager,
+            Arc::new(RwLock::new(None)),
+            crate::skills::SkillCache::for_root(None),
+            false,
+            crate::memory::MemoryStore::detached(),
+            BuiltinToolFilter::default(),
+            crate::workspace::test_cwd(),
+            crate::workspace::test_roots(),
+            Arc::new(crate::frontend::SilentFrontend),
+            crate::config::ResolvedScheduleConfig::default(),
+            (
+                crate::config::ResolvedBackgroundConfig::default(),
+                crate::background::BackgroundTasks::default(),
+            ),
+        )
+        .expect("registry builds");
+
+        let render = |registry: &ToolRegistry| {
+            serde_json::to_string(&registry.definitions_active(&[])).expect("definitions serialise")
+        };
+
+        let mut baseline: Option<(crate::permission::Permission, String)> = None;
+        for level in [
+            crate::permission::Permission::None,
+            crate::permission::Permission::Read,
+            crate::permission::Permission::Workspace,
+            crate::permission::Permission::Ask,
+            crate::permission::Permission::Unrestricted,
+        ] {
+            permission
+                .try_set(level)
+                .expect("every level is enabled here");
+            let rendered = render(&registry);
+            assert!(
+                !rendered.is_empty() && rendered != "[]",
+                "{level} produced no tools at all, so equality below would be vacuous"
+            );
+            match &baseline {
+                None => baseline = Some((level, rendered)),
+                Some((first_level, first)) => assert_eq!(
+                    first, &rendered,
+                    "the tools array differs between {first_level} and {level}, which invalidates \
+                     the cached prompt prefix on every mode toggle"
+                ),
+            }
+        }
     }
 
     #[tokio::test]
@@ -3042,7 +3424,7 @@ pub(crate) mod tests {
         let required: std::collections::HashMap<_, _> =
             entries.iter().map(|(n, _, p, _)| (n.clone(), *p)).collect();
         assert_eq!(required["read_file"], Permission::Read);
-        assert_eq!(required["write_file"], Permission::Write);
+        assert_eq!(required["write_file"], Permission::Workspace);
     }
 
     #[tokio::test]
@@ -3129,7 +3511,7 @@ pub(crate) mod tests {
         let registry = test_registry().await;
         let slot = Arc::new(std::sync::Mutex::new(None));
         let names: HashSet<String> = registry
-            .checkpoint_tools(Permission::Write, slot)
+            .checkpoint_tools(Permission::Unrestricted, slot)
             .iter()
             .map(|tool| tool.definition().name)
             .collect();
@@ -3154,7 +3536,7 @@ pub(crate) mod tests {
         .await;
         let slot = Arc::new(std::sync::Mutex::new(None));
         let names: HashSet<String> = registry
-            .checkpoint_tools(Permission::Write, slot)
+            .checkpoint_tools(Permission::Unrestricted, slot)
             .iter()
             .map(|tool| tool.definition().name)
             .collect();
@@ -3302,19 +3684,19 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_registry_permission_override_applied() {
         let mut overrides = HashMap::new();
-        overrides.insert("read_file".to_string(), Permission::Write);
+        overrides.insert("read_file".to_string(), Permission::Unrestricted);
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = build_test_registry(filter).await;
 
         // Override wins over the Tool impl's hardcoded `Read`.
         assert_eq!(
             registry.required_permission_for("read_file"),
-            Some(Permission::Write)
+            Some(Permission::Unrestricted)
         );
         // Non-overridden tool returns its hardcoded level.
         assert_eq!(
             registry.required_permission_for("write_file"),
-            Some(Permission::Write)
+            Some(Permission::Workspace)
         );
         // Catalogue must reflect the override too (the world-state block reads from it).
         let catalogue = registry.tool_catalogue();
@@ -3322,22 +3704,22 @@ pub(crate) mod tests {
             .iter()
             .find(|(name, ..)| name == "read_file")
             .map(|(_, _, perm, _)| *perm);
-        assert_eq!(read_file_required, Some(Permission::Write));
+        assert_eq!(read_file_required, Some(Permission::Unrestricted));
     }
 
     #[tokio::test]
     async fn test_registry_permission_override_excludes_tool_from_lower_level() {
         let mut overrides = HashMap::new();
-        overrides.insert("read_file".to_string(), Permission::Write);
+        overrides.insert("read_file".to_string(), Permission::Unrestricted);
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = build_test_registry(filter).await;
 
         // At Read permission, read_file should now be excluded from the permission-filtered
-        // definitions because the override raised it to Write.
+        // definitions because the override raised it to `unrestricted`.
         let read_defs = registry.definitions_for_permission(Permission::Read);
         assert!(!read_defs.iter().any(|t| t.name == "read_file"));
 
-        let write_defs = registry.definitions_for_permission(Permission::Write);
+        let write_defs = registry.definitions_for_permission(Permission::Unrestricted);
         assert!(write_defs.iter().any(|t| t.name == "read_file"));
     }
 
@@ -3420,7 +3802,7 @@ pub(crate) mod tests {
         ToolRegistry::build_for_subagent(
             crate::config::WebClientConfig::default(),
             crate::permission::SharedPermission::new(
-                Permission::Write,
+                Permission::Unrestricted,
                 crate::permission::EnabledPermissions::ALL,
             ),
             true,

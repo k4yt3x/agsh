@@ -4,7 +4,7 @@
 //! scheduled prompt writes to a store meka owns, and the turn it eventually produces is permission
 //! -checked when it runs, so scheduling one grants nothing the session did not already have.
 //!
-//! The `gate` field is the exception, and is rejected below [`Permission::Write`] inside
+//! The `gate` field is the exception, and is rejected below [`Permission::Unrestricted`] inside
 //! [`ScheduleCreateTool::execute`]. A gate is a shell command that runs unattended, on a timer,
 //! until someone cancels it -- persistent in a way `execute_command` is not, since that at least
 //! ends with the turn that called it. [`Tool::required_permission`] is per-tool and cannot vary by
@@ -111,7 +111,7 @@ impl Tool for ScheduleCreateTool {
                         "description": "Optional. Run a shell command first and only take a turn \
                                         if it says something happened. Turns an expensive poll \
                                         into a cheap one, so a short `every` becomes affordable. \
-                                        Requires write permission.",
+                                        Requires `unrestricted` permission: it runs with no sandbox.",
                         "properties": {
                             "command": {
                                 "type": "string",
@@ -247,13 +247,12 @@ impl ScheduleCreateTool {
         // A gate outlives the turn that created it and runs with no supervision, which is a
         // stronger grant than `execute_command`'s one-shot use. Checked here rather than through
         // `required_permission` so an ungated reminder still works at read.
-        // Matched explicitly rather than compared. `Permission`'s `Ord` exists to clamp a
-        // sub-agent's level to its parent's and its own docs warn against reusing it for
-        // authorization; the capability predicate `allows` is the usual tool, but it treats `Ask`
-        // and `Write` as equal, and `Ask` is precisely the level a gate must not run at -- there is
-        // nobody to approve an unattended command.
+        //
+        // `allows_unattended_shell` rather than `allows` or an `Ord` comparison: the capability
+        // predicate treats `Ask` as equal to the levels above it, and `Ask` is precisely the level
+        // a gate must not run at, because there is nobody to approve an unattended command.
         let permission = self.shared_permission.get();
-        if !matches!(permission, Permission::Write) {
+        if !permission.allows_unattended_shell() {
             let reason = match permission {
                 Permission::Ask => {
                     "a gate runs unattended, with nobody present to approve it, so \
@@ -264,8 +263,9 @@ impl ScheduleCreateTool {
             return Err(MekaError::ToolExecution {
                 tool_name: tool_name.to_string(),
                 message: format!(
-                    "{}; it needs write permission (currently {}). Create the job without `gate` \
-                     and check the condition inside the prompt instead.",
+                    "{}; it needs `unrestricted` permission (currently {}), because a gate runs with \
+                     no sandbox at all. Create \
+                     the job without `gate` and check the condition inside the prompt instead.",
                     reason, permission
                 ),
             });
@@ -285,7 +285,8 @@ impl ScheduleCreateTool {
             last_output: None,
             // Recorded, not re-derived. The check above proves the level *now*; the row will be
             // executed by some other process on some later day, and `prepare` re-reads this to
-            // confirm the authority still stands. `permission` is `Write` here by the guard above.
+            // confirm the authority still stands. `permission` is `Unrestricted` here by the guard
+            // above.
             permission,
         }))
     }
@@ -534,7 +535,7 @@ mod tests {
             session_id: session_id.clone(),
             config: ResolvedScheduleConfig::default(),
             shared_permission: crate::permission::SharedPermission::new(
-                Permission::Write,
+                Permission::Unrestricted,
                 crate::permission::EnabledPermissions::ALL,
             ),
         };
@@ -580,9 +581,27 @@ mod tests {
     /// The permission rule that cannot live in `required_permission`, since that is per-tool.
     #[tokio::test]
     async fn test_a_gate_is_refused_below_write_but_the_reminder_is_not() {
+        // Every level below `unrestricted`, not just `read`.
+        //
+        // `workspace` is the one that matters: it used to *pass* this door, and that was a
+        // one-call escape -- `schedule_create` with a gate ran arbitrary unconfined commands from
+        // inside the confined mode within one poll interval. `ask` matters for the other reason:
+        // nobody is present at fire time to answer the prompt its safety rests on. Exercising only
+        // `read` left both of those unguarded at the tool door.
+        for level in [
+            Permission::None,
+            Permission::Read,
+            Permission::Workspace,
+            Permission::Ask,
+        ] {
+            refuses_a_gate_at(level).await;
+        }
+    }
+
+    async fn refuses_a_gate_at(level: Permission) {
         let (mut tool, _session_id, _manager) = harness().await;
         tool.shared_permission = crate::permission::SharedPermission::new(
-            Permission::Read,
+            level,
             crate::permission::EnabledPermissions::ALL,
         );
 
@@ -596,10 +615,10 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect_err("a gate needs write");
+            .expect_err("a gate needs an unattended-write level");
         assert!(
-            refused.to_string().contains("write permission"),
-            "{refused}"
+            refused.to_string().contains("`unrestricted`"),
+            "the refusal at {level} must name the level a gate needs: {refused}"
         );
 
         // The same job without a gate is fine at read: scheduling a prompt grants nothing, since
@@ -609,7 +628,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("an ungated reminder is allowed at read");
+        .unwrap_or_else(|error| panic!("an ungated reminder is allowed at {level}: {error}"));
     }
 
     #[tokio::test]
