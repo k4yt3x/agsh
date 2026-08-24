@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-08-24
+
 ### Added
 
 - `workspace` permission: writes confined to the workspace roots, reads still unrestricted.
@@ -1576,7 +1578,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.41.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.0...HEAD
+[0.42.0]: https://github.com/k4yt3x/meka/compare/0.41.0...0.42.0
 [0.41.0]: https://github.com/k4yt3x/meka/compare/0.40.0...0.41.0
 [0.40.0]: https://github.com/k4yt3x/meka/compare/0.39.0...0.40.0
 [0.39.0]: https://github.com/k4yt3x/meka/compare/0.38.0...0.39.0

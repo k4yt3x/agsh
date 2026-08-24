@@ -221,9 +221,13 @@ pub fn warn_about_a_stranded_file_store(config_dir: Option<&Path>) {
         return;
     }
     SAID.call_once(|| {
+        // Phrased to be true on both sides of the import, because the importer deliberately never
+        // deletes the files: after a successful run the directory still holds them, and telling
+        // someone to import what they have already imported reads as the import having failed.
         tracing::warn!(
-            "{} memory file{} in {} {} not loaded: memories are rows in the database now. Bring \
-             them across with contrib/import-memory-store.py, then delete the directory",
+            "{} memory file{} in {} {} not loaded: memories are rows in the database now. If they \
+             have not been imported, contrib/import-memory-store.py does it; if they have, the \
+             directory is safe to delete",
             stranded,
             if stranded == 1 { "" } else { "s" },
             directory.display(),

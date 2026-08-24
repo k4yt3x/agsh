@@ -5,22 +5,21 @@ A general-purpose AI agent harness.
 > [!CAUTION]
 > Agents can perform potentially destructive actions. Exercise caution when granting write permissions. It is not recommended to run meka on important systems with write permissions enabled.
 
-> [!WARNING]
-> Agents can consume a large number of tokens on complex tasks. If you're on a subscription, be prepared for quota exhaustion; if you are billed per token, it is recommended that you set a spending limit on the API key.
+> [!IMPORTANT]
+> meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats change between releases. Read the changelog before upgrading.
 
 ![meka Screenshot](https://github.com/user-attachments/assets/e94c40ee-76ae-4b00-bcfe-1c1d9d075a2b)
 
 ## Overview
 
-meka is a general-purpose AI agent harness: it wraps a large language model with a tool set, working memory, persistent sessions, a permission model, and several front-ends (an interactive REPL, one-shot commands, an editor agent via ACP, and an HTTP service). Bring a provider (Claude or OpenAI, API key or subscription) and meka turns it into an agent that reads and edits files, runs commands, searches the web, calls MCP servers, and delegates to sub-agents to accomplish real tasks.
+meka wraps a large language model with a tool set, durable memory, persistent sessions, and a permission model. Bring a provider and it becomes an agent that reads and edits files, runs commands, searches the web, calls MCP servers, and delegates to sub-agents.
 
 Supported providers:
 
-- **Anthropic Messages**: bring your own API key; also reaches LiteLLM, Ollama and other servers implementing it.
-- **Claude subscription**: authenticate with a Claude subscription.
-- **OpenAI Chat Completions**: bring your own API key; works with any endpoint serving that format.
+- **Anthropic Messages**: your own API key; also reaches LiteLLM, Ollama and anything else speaking it.
+- **OpenAI Chat Completions**: your own API key, against any endpoint serving that format.
 - **OpenAI Responses**: OpenAI's newer protocol, likewise against any server that offers it.
-- **ChatGPT subscription**: authenticate with a ChatGPT subscription.
+- **Claude subscription** / **ChatGPT subscription**: sign in with a subscription instead of a key.
 
 ## Installation
 
@@ -40,7 +39,7 @@ Add a provider profile with `meka provider add`. It runs the OAuth login (or pro
 meka provider add work --type claude-subscription --model claude-opus-5
 ```
 
-The profile pins a backend `type` plus a model. A backend names the wire protocol it speaks - `anthropic-messages`, `openai-chat-completions`, `openai-responses` - or, for the two subscription backends, the account it bills: `claude-subscription`, `chatgpt-subscription`. Add several profiles and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
+A profile pins a backend and a model. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription account (`claude-subscription`, `chatgpt-subscription`). Add several and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
 
 ```bash
 meka provider add openrouter --type openai-chat-completions --model anthropic/claude-opus-5 \
@@ -56,13 +55,26 @@ meka [u] > install and start nginx
 
 See the [documentation](https://docs.meka.so) for the full usage guide.
 
+## Features
+
+- **Skills**: [Agent Skills](https://agentskills.io/specification) compliant, so skills work across clients.
+- **Memory**: notes the agent keeps for itself, carried into every later session.
+- **MCP**: add tools, resources, and prompts from any MCP server.
+- **Sub-agents**: delegate work to children that never exceed your permission level.
+- **Sandboxed shell**: read mode confines commands using the OS's own sandbox.
+- **Scheduling**: have the agent prompt itself later, once or on a cron.
+- **Background tasks**: long jobs run detached and report back when done.
+- **Sessions**: resume, fork, rewind, or export any past conversation.
+- **Context management**: compacts itself before the window fills.
+- **Standing instructions**: your own rules, applied to every session.
+
 ## Interfaces
 
 The same agent core is available through several interfaces:
 
-- **CLI REPL**: an interactive prompt in your terminal.
-- **ACP**: makes meka work inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
-- **HTTP API**: embed meka as an agent backend in your own apps, bots, and services.
+- **CLI**: an interactive REPL, or one-shot commands for scripts.
+- **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
+- **HTTP API**: embed meka in your own apps and bots.
 
 ## Tools
 
@@ -80,51 +92,33 @@ The agent has access to the following built-in tools:
 - `conversation_read` / `conversation_search`: re-read this session's history
 - `context_check` / `context_compact`: read the remaining window, or compact on purpose
 - `agent_*`: delegate to a sub-agent, which never exceeds your permission level
-- `skill_*`: load, search, and optionally author reusable prompt templates
+- `skill_*`: load, search, and optionally author skills
 - `schedule_*`: run a prompt later, once or on a cron
 - `task_list` / `task_cancel`: manage work the agent detached to the background
 - `render_image`: render an image into the conversation for vision models
 - `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
+- `load_tool`: fetch the full schema for a tool held back to keep the prompt small
 
-Run `meka tools list` for the current set with descriptions.
-
-Long-output tools take an optional `scratchpad` parameter to save their output there instead.
+Run `meka tools list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it.
 
 ## Permissions
 
 The prompt indicator shows the current permission mode. Press **Shift+Tab** to cycle between modes:
 
-- `[n]` **none**: no tools available, text-only responses
-- `[r]` **read**: read-only tools (file reading, searching, web, sandboxed shell)
-- `[w]` **workspace**: all tools enabled; writes are confined to the working directory and any
-  `--writable-root`, reads are not confined
-- `[a]` **ask**: all tools enabled, but each call requires user approval. Not in the default cycle;
-  enable it under `[permissions]`
-- `[u]` **unrestricted**: all tools enabled with no boundary on where writes land
-
-`workspace` and `ask` are deliberately not ordered against each other: one confines writes without
-prompting, the other prompts without confining.
+- `[n]` **none**: no tools; the model can only reply with text
+- `[r]` **read**: read-only tools, and a shell sandboxed against writes
+- `[w]` **workspace**: every tool; writes confined to the cwd and any `--writable-root`
+- `[a]` **ask**: every tool, each call approved by you; enable it under `[permissions]`
+- `[u]` **unrestricted**: every tool, with no boundary on where writes land
 
 ## Sessions
 
 Conversations are persisted in a local SQLite database and can be resumed:
 
 - `meka -c` continues the last session
-- `meka -r <UUID>` resumes a specific session by UUID, or by a leading prefix of one
-- `meka session list` lists past sessions
-- `meka session delete <UUID>` deletes sessions
-- `meka session export <UUID>` exports a session as Markdown
-- `meka history list` / `meka history clear` view or clear REPL input history
-- `/export` exports the current session from within the shell
-- `/compact` summarizes and compacts the session history
-
-## Features
-
-- **Extended thinking**: on by default for Claude; `thinking` picks adaptive, budgeted, or off
-- **Syntax-highlighted output**: markdown rendering with syntect-highlighted code blocks, using bat's Monokai Extended theme
-- **Auto-compact**: automatically compacts the conversation when approaching the context limit
-- **MCP support**: extend the agent with tools from external MCP servers
-- **Skills**: load reusable prompt templates from `~/.config/meka/skills/`
+- `meka -r <UUID>` resumes a session by UUID, or by a leading prefix of one
+- `meka session list` / `delete` / `export` manage and export past sessions
+- `/compact`, `/fork`, `/rewind`, `/export` act on the current session from the shell
 
 ## Shell Escape
 
