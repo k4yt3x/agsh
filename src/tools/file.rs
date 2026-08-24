@@ -4371,7 +4371,11 @@ mod tests {
     /// This guards the outcome, not one line: the faithful `OsString` name and the per-attempt
     /// counter each prevent the collision on their own, so reverting either alone still passes.
     /// Reverting to the original single-shot lossy name does fail it.
-    #[cfg(unix)]
+    /// Linux, not `unix`: macOS validates filenames as UTF-8 in the kernel and answers `EILSEQ`
+    /// ("Illegal byte sequence") to a `create` for either of these names, so the collision this
+    /// guards cannot be built there. The fix it guards is still compiled on macOS; only the
+    /// corpus is Linux-shaped.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn concurrent_writes_to_names_differing_outside_utf8_do_not_share_a_temp_file() {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};

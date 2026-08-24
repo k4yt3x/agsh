@@ -243,7 +243,21 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
         // Refusing `/tmp` costs a session started with `cd /tmp` its write boundary, which is the
         // safe direction: the alternative is a boundary that reports itself as holding while the
         // shell can reach the session bus.
-        const MASKED: &[&str] = &["/proc", "/dev", "/sys", "/run", "/tmp", "/var/tmp"];
+        const MASKED: &[&str] = &[
+            "/proc",
+            "/dev",
+            "/sys",
+            "/run",
+            "/tmp",
+            "/var/tmp",
+            // The same two directories as macOS canonicalises them. `/tmp` and `/var` are symlinks
+            // into `/private` there, and a root is canonicalised before it reaches here, so the
+            // literals above are matched against a path that never has that spelling: `/tmp` was
+            // accepted as a writable root on macOS while being refused on Linux. Harmless on
+            // Linux, where nothing resolves to either.
+            "/private/tmp",
+            "/private/var/tmp",
+        ];
         // Equal to a masked path, or an ancestor of one. The equality test alone left the ancestor
         // case open: `--writable-root /var` was accepted and then un-masked `/var/tmp` inside the
         // sandbox, measured by writing a file there from a confined shell and finding it on the

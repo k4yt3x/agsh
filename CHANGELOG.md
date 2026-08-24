@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory search is ranked and tiered: several phrasings at once, word endings, typos, CJK.
 - Memories take tags, a stamped `recorded` date, and render priority-0 bodies in full each turn.
 - `meka memory export`, `edit`, `verify` and `add --tag` manage the store by hand.
+- Memory files left in the config directory are reported at startup, naming the importer.
 - `skill_search` greps every installed skill; `skill_write` / `skill_delete` let the agent author.
 - `[skills].extra_paths` scans further directories for skills, read-only and never created.
 - Skills read the spec's `license`, `compatibility` and `allowed-tools`, and keep every other key.
@@ -92,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every macOS `read` command failed: the Seatbelt profile no longer parses, so nothing ran at all.
 - Under bubblewrap a `read` command whose cwd was masked silently ran in `$HOME` instead.
 - Landlock allows writing `/dev/null`, so `cmd 2>/dev/null` no longer fails on that backend.
 - The bubblewrap probe could strand a `bwrap` if meka died before the sandbox armed its own guard.
@@ -116,8 +118,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A skill rewrite alphabetised or re-nested frontmatter keys meka does not model.
 - A skill's description and `compatibility` are stored verbatim, not sanitised into the only copy.
 - A `SKILL.md` whose closing `---` ends the file was reported as having no frontmatter.
-- Priority-0 memories could reach no part of the context while the index claimed they were listed.
-- A memory directory left by the file store read as an empty store; it now says what to run.
 - A memory whose name meka would not write, including one over 64 characters, was unreachable.
 - A turn that could not read the memory store told the model every memory had been deleted.
 - `memory_search` was case-sensitive, stopped at 100 matches mid-walk, and mismeasured near misses.

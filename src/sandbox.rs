@@ -1345,9 +1345,15 @@ pub const SANDBOX_PROFILE_READONLY: &str = r#"
     (socket-protocol 2)))
 
 ; Outbound BSD sockets (curl, http clients, etc.)
+;
+; Outbound only. This carried `(allow network-bind (local ip "*:0"))` and the matching
+; `network-inbound`, vendored from Codex, and a current macOS rejects `"*:0"` outright:
+; `sandbox-exec: invalid port in network address`. That is a *parse* failure, so the whole profile
+; is refused and every read-mode command exits 65 rather than running confined -- the mode was
+; entirely broken on macOS, not merely narrowed. Dropped rather than respelled because the right
+; spelling cannot be confirmed without a macOS host, and because read mode's stated network need is
+; outbound (`curl http://x | pdftotext`); nothing in it binds a listening socket.
 (allow network-outbound)
-(allow network-bind (local ip "*:0"))
-(allow network-inbound (local ip "*:0"))
 
 ; Services needed for hostname lookup, TLS trust evaluation, proxy config.
 (allow mach-lookup

@@ -443,6 +443,24 @@ fn wait_until(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     panic!("timed out after {:?} waiting for {}", timeout, what);
 }
 
+/// A gate command that records one run and then declines, spelled for the host's own shell.
+///
+/// `execute_command` runs `powershell.exe -Command` on Windows and a POSIX shell elsewhere, and a
+/// gate is an ordinary command. The POSIX spelling alone (`printf 'ran\n' >> …`) has no `printf` in
+/// PowerShell, so on Windows the log stayed empty, [`gate_runs`] read zero forever, and the test
+/// timed out waiting rather than failing on the claim semantics it exists to measure. `sleep` needs
+/// no such treatment: PowerShell aliases it to `Start-Sleep`.
+fn record_a_run_then_decline(log: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "Add-Content -LiteralPath '{}' -Value 'ran'; exit 1",
+            log.display()
+        )
+    } else {
+        format!("printf 'ran\\n' >> '{}'; exit 1", log.display())
+    }
+}
+
 /// How many lines a gate command has appended to its log, which is how many times it ran.
 fn gate_runs(log: &Path) -> usize {
     std::fs::read_to_string(log)
@@ -710,7 +728,7 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
     let mut second = cluster.serve("two");
 
     let log = cluster.path("gate.log");
-    let gate = format!("printf 'ran\\n' >> '{}'; exit 1", log.display());
+    let gate = record_a_run_then_decline(&log);
     plant_a_decoy_and_the_job(&cluster, &session, PlantedJob {
         name: "shared",
         session_id: &session,
