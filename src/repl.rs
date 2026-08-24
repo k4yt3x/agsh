@@ -4,7 +4,10 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -154,16 +157,29 @@ const KNOWN_COLOR: nu_ansi_term::Color = nu_ansi_term::Color::Green;
 /// Foreground applied to the leading token when it starts with `/` but is not a known command.
 const UNKNOWN_COLOR: nu_ansi_term::Color = nu_ansi_term::Color::Red;
 
-/// Reedline highlighter for the input buffer. The leading `/command` token is recolored to signal
-/// whether it is recognized; everything else keeps the base style. The final paint reedline emits
-/// on submit is what lands in scrollback, so this is also what visually separates user prompts from
-/// assistant output.
+/// Reedline highlighter for the input buffer, painting two things on two different schedules.
+///
+/// The leading `/command` token is recolored on every keystroke to signal whether it is recognized,
+/// because that answers "is this command real" while there is still time to fix the spelling.
+///
+/// The base style waits for submission. What it marks is the seam between a finished prompt and the
+/// reply printed underneath, which is a question about scrollback rather than about the line in
+/// hand, so a line still being edited keeps the terminal's own colors. Reedline repaints once more
+/// on its way out of `read_line`, and that paint is the one that stays on screen.
 struct UserInputHighlighter {
     style: nu_ansi_term::Style,
+    /// Raised by [`SubmitWatcher`] the instant reedline commits to submitting, and lowered by the
+    /// prompt loop once `read_line` has returned.
+    submitted: Arc<AtomicBool>,
 }
 
 impl Highlighter for UserInputHighlighter {
     fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let base = if self.submitted.load(Ordering::Relaxed) {
+            self.style
+        } else {
+            nu_ansi_term::Style::new()
+        };
         let mut text = StyledText::new();
         if let Some(after_slash) = line.strip_prefix('/') {
             let word_len = after_slash
@@ -175,15 +191,55 @@ impl Highlighter for UserInputHighlighter {
                 .iter()
                 .any(|command| command.name == word || command.aliases.contains(&word));
             let token_color = if known { KNOWN_COLOR } else { UNKNOWN_COLOR };
-            text.push((self.style.fg(token_color), token.to_string()));
+            text.push((base.fg(token_color), token.to_string()));
             if !remainder.is_empty() {
-                text.push((self.style, remainder.to_string()));
+                text.push((base, remainder.to_string()));
             }
         } else {
-            text.push((self.style, line.to_string()));
+            text.push((base, line.to_string()));
         }
         text
     }
+}
+
+/// Tells [`UserInputHighlighter`] that the paint about to happen is the one that stays on screen.
+///
+/// Reedline consults a validator once per submit attempt, from the `Enter` arm, after it has ruled
+/// out an open completion menu and immediately before `submit_buffer` repaints. That makes it the
+/// only place in reedline's API that reports the *decision* to submit rather than a keystroke that
+/// might have caused one, and the difference is most of the cases: Enter with a menu open accepts
+/// the completion, Enter during a Ctrl+R search recalls the match into the buffer, and Alt+Enter
+/// and Shift+Enter open a second line. Watching the key raises the flag on every one of those and
+/// then leaves it raised for the rest of a line that is still being edited.
+///
+/// Always `Complete`, which is the arm reedline takes when no validator is installed at all. This
+/// one is here for the notification, not to hold a line back.
+struct SubmitWatcher {
+    submitted: Arc<AtomicBool>,
+}
+
+impl reedline::Validator for SubmitWatcher {
+    fn validate(&self, _line: &str) -> reedline::ValidationResult {
+        self.submitted.store(true, Ordering::Relaxed);
+        reedline::ValidationResult::Complete
+    }
+}
+
+/// The highlighter and the validator that releases it, over one shared cell.
+///
+/// Built as a pair because the pair is the whole mechanism: two independently constructed flags
+/// type-check, wire up, and silently never paint anything.
+fn submit_aware_input_painter(
+    style: nu_ansi_term::Style,
+    submitted: Arc<AtomicBool>,
+) -> (UserInputHighlighter, SubmitWatcher) {
+    (
+        UserInputHighlighter {
+            style,
+            submitted: Arc::clone(&submitted),
+        },
+        SubmitWatcher { submitted },
+    )
 }
 
 /// Tab completer for slash commands. The data needed to complete arguments (MCP server names,
@@ -587,10 +643,13 @@ fn build_reedline_editor(
     completer: SlashCompleter,
     wake: Arc<AtomicBool>,
     edit_mode: CyclePermissionMode,
+    submitted: Arc<AtomicBool>,
 ) -> Reedline {
+    let (highlighter, submit_watcher) = submit_aware_input_painter(input_style, submitted);
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(edit_mode))
-        .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
+        .with_highlighter(Box::new(highlighter))
+        .with_validator(Box::new(submit_watcher))
         .with_completer(Box::new(completer))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(
             ColumnarMenu::default().with_name(COMPLETION_MENU),
@@ -1041,6 +1100,10 @@ pub fn run_repl(
         cwd: cwd.clone(),
     };
 
+    // Raised the instant reedline commits to submitting and lowered as soon as `read_line` has
+    // returned, so `input_style` paints the line that stays on screen and nothing else.
+    let submitted = Arc::new(AtomicBool::new(false));
+
     let mut editor = build_reedline_editor(
         input_style,
         printer,
@@ -1053,6 +1116,7 @@ pub fn run_repl(
             input_sender: input_sender.clone(),
             sandbox_state: sandbox_state.clone(),
         },
+        Arc::clone(&submitted),
     );
     let prompt = MekaPrompt {
         shared_permission: shared_permission.clone(),
@@ -1076,6 +1140,9 @@ pub fn run_repl(
         RELAY.set_at_prompt(true);
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
+        // Every exit lowers it, not just a submitted line: a Ctrl+C or a scheduler wake leaves the
+        // buffer to be edited further, and it must go back to being edited plainly.
+        submitted.store(false, Ordering::Relaxed);
         match signal {
             // A scheduled job came due while the prompt sat idle. `read_line` has returned, so the
             // terminal is back in cooked mode and the turn that follows is indistinguishable from
@@ -3090,11 +3157,18 @@ mod tests {
         );
     }
 
+    /// A highlighter already past the moment of submission, which is the state the styling tests
+    /// below are about.
+    fn submitted_highlighter(style: nu_ansi_term::Style) -> UserInputHighlighter {
+        UserInputHighlighter {
+            style,
+            submitted: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     #[test]
     fn test_user_input_highlighter_default_preset_preserves_literal() {
-        let highlighter = UserInputHighlighter {
-            style: crate::config::default_input_style(),
-        };
+        let highlighter = submitted_highlighter(crate::config::default_input_style());
         let rendered = highlighter.highlight("hello world", 5).render_simple();
         assert!(
             rendered.contains("hello world"),
@@ -3108,18 +3182,14 @@ mod tests {
 
     #[test]
     fn test_user_input_highlighter_none_emits_no_escape() {
-        let highlighter = UserInputHighlighter {
-            style: nu_ansi_term::Style::default(),
-        };
+        let highlighter = submitted_highlighter(nu_ansi_term::Style::default());
         let rendered = highlighter.highlight("hello", 0).render_simple();
         assert_eq!(rendered, "hello");
     }
 
     #[test]
     fn test_user_input_highlighter_known_command_distinct_from_unknown() {
-        let highlighter = UserInputHighlighter {
-            style: crate::config::default_input_style(),
-        };
+        let highlighter = submitted_highlighter(crate::config::default_input_style());
         let known = highlighter.highlight("/compact", 8).render_simple();
         let unknown = highlighter.highlight("/bogus", 6).render_simple();
         assert!(
@@ -3138,15 +3208,76 @@ mod tests {
 
     #[test]
     fn test_user_input_highlighter_non_slash_single_style() {
-        let highlighter = UserInputHighlighter {
-            style: crate::config::default_input_style(),
-        };
+        let highlighter = submitted_highlighter(crate::config::default_input_style());
         let line = "hello world";
         let mut expected = StyledText::new();
         expected.push((highlighter.style, line.to_string()));
         assert_eq!(
             highlighter.highlight(line, 0).render_simple(),
             expected.render_simple()
+        );
+    }
+
+    #[test]
+    fn only_the_base_style_waits_for_submit() {
+        let submitted = Arc::new(AtomicBool::new(false));
+        let highlighter = UserInputHighlighter {
+            style: crate::config::default_input_style(),
+            submitted: Arc::clone(&submitted),
+        };
+
+        // Three cases, because two would not pin this. Asserting only that a line being typed is
+        // plain also passes against a highlighter that stopped styling altogether, and asserting
+        // only that a submitted line is styled also passes against the old always-on behavior.
+        let typing = highlighter.highlight("hello world", 5).render_simple();
+        assert_eq!(
+            typing, "hello world",
+            "a line still being typed keeps the terminal's own colors: {typing:?}"
+        );
+
+        let typing_command = highlighter.highlight("/help", 5).render_simple();
+        assert!(
+            typing_command.contains("\x1b["),
+            "the slash token is recolored while there is still time to fix the spelling: \
+             {typing_command:?}"
+        );
+
+        submitted.store(true, Ordering::Relaxed);
+        let sent = highlighter.highlight("hello world", 5).render_simple();
+        assert!(
+            sent.contains("\x1b["),
+            "a submitted line carries the input style, which is what separates it from the reply \
+             printed under it: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_validator_releases_the_highlighter_it_was_built_with() {
+        use reedline::Validator;
+
+        let (highlighter, watcher) = submit_aware_input_painter(
+            crate::config::default_input_style(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            highlighter.highlight("hello", 0).render_simple(),
+            "hello",
+            "nothing has been submitted yet"
+        );
+
+        assert!(
+            matches!(
+                watcher.validate("hello"),
+                reedline::ValidationResult::Complete
+            ),
+            "the watcher must never hold a line back; it only reports the decision"
+        );
+        assert!(
+            highlighter
+                .highlight("hello", 0)
+                .render_simple()
+                .contains("\x1b["),
+            "the pair shares one cell, so reedline's submit decision reaches the paint that follows"
         );
     }
 

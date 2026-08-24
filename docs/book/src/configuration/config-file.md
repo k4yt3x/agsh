@@ -567,7 +567,9 @@ resume_show_recent = 3
 
 ### `display.input_style`
 
-Visual style applied to text typed into the REPL prompt. Makes submitted prompts easy to spot when scrolling back through a long session. Reedline paints the buffer with this style on every repaint, including the final paint before the newline, so the styling lands in the terminal's scrollback alongside the literal text.
+Visual style applied to a REPL prompt once it is submitted. Makes past prompts easy to spot when scrolling back through a long session. A line still being edited keeps the terminal's own colours; the style arrives on reedline's final paint, which is the one that lands in scrollback.
+
+The leading `/command` token is a separate signal and is coloured as you type, green when meka recognises the command and red when it does not. This setting does not affect it.
 
 Accepted values:
 - `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.

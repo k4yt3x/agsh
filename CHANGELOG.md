@@ -69,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** an empty list prints its "none found" line on stderr, so stdout stays pipeable.
 - `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
 - `agent_followup` never widens a recorded grant, even when the parent has moved sideways since.
+- `[display].input_style` applies on submit; text keeps the terminal's own colours while typing.
 - `memory_write` and `skill_write` keep a stored description when the call omits it.
 - Memory has no discovery cap and no per-turn walk; the index is one indexed query over FTS5.
 - CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
