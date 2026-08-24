@@ -193,12 +193,14 @@ scopes = [{scopes_str}]
             .header("Authorization", format!("Bearer {}", self.token))
     }
 
-    /// The `HOME` this server runs under, so a test can seed files a config `~/...` path names.
+    /// The temp root this server's config and data live under, so a test can seed files inside it.
     ///
-    /// `extra_config` is written before the server starts and the temp directory is chosen inside
-    /// `spawn_with`, so a config entry pointing outside meka's own store can only be seeded through
-    /// a path both sides can name. `~` is what `[skills] extra_paths` expands, and the store is
-    /// re-scanned per request, so seeding after startup is enough.
+    /// Reach meka's own store through this (`home().join("meka")` is `MEKA_CONFIG_DIR`), not a
+    /// directory outside it. This used to be described as "the `HOME` this server runs under",
+    /// which held only on Unix: `dirs::home_dir` on Windows is
+    /// `SHGetKnownFolderPath(FOLDERID_Profile)` and never reads the environment, so a config `~/…`
+    /// path resolved to the runner's real profile while the test seeded a temp directory. A test
+    /// that needs a root outside meka's store should make its own and name it absolutely.
     fn home(&self) -> &std::path::Path {
         self._temp.path()
     }
@@ -5587,13 +5589,23 @@ fn skill_write_read_and_delete_round_trip() {
 /// write went through silently.
 #[test]
 fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
+    // A directory of its own, named absolutely, rather than `~` under the harness's home.
+    //
+    // The config has to name this root before the server starts, and `~` cannot be pointed at a
+    // temp directory on Windows: `dirs::home_dir` there is `SHGetKnownFolderPath(FOLDERID_Profile)`
+    // and ignores environment entirely, so the `HOME` the harness sets did nothing,
+    // `~/shared-skills` resolved to the runner's real profile, and the root came up empty. An empty
+    // read-only root refuses nothing, so the PUT this test exists to see refused went through.
+    //
+    // A TOML *literal* string, because a Windows path's backslashes are escapes in a basic one.
+    let shared_root = tempfile::tempdir().expect("tempdir");
+    let shared = shared_root.path().to_path_buf();
     let harness = ServeTestHarness::spawn_with(
-        "\n[skills]\nextra_paths = [\"~/shared-skills\"]\n",
+        &format!("\n[skills]\nextra_paths = ['{}']\n", shared.display()),
         mock_simple_turn(),
         "sk_test_token",
         STORE_SCOPES,
     );
-    let shared = harness.home().join("shared-skills");
     for (name, body) in [
         (
             "borrowed",
