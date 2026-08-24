@@ -234,7 +234,7 @@ fn checkpoint_instruction(request: &CompactRequest) -> String {
     let mut instruction = String::from("[Checkpoint: your context is about to be summarized]\n\n");
     instruction.push_str(match request.origin {
         CompactOrigin::Requested => "You asked for this compaction.\n\n",
-        CompactOrigin::Manual => "The user ran `/compact`.\n\n",
+        CompactOrigin::Manual => "The user asked for this compaction.\n\n",
         // Reactive and Proactive alike: the agent did not choose the moment, so say so rather than
         // letting it read an involuntary interruption as its own decision.
         _ => {
@@ -2426,7 +2426,7 @@ impl Agent {
             return crate::tools::ToolOutput::text(
                 format!(
                     "Permission denied: '{}' requires `{}` permission, current level is `{}`. \
-                     Ask the user to run `/permission {}` (or press Shift+Tab) to enable it.",
+                     Ask the user to raise it to `{}`.",
                     name, required, permission, required
                 ),
                 true,
@@ -2459,9 +2459,9 @@ impl Agent {
             return crate::tools::ToolOutput::text(
                 format!(
                     "'{}' runs inside its MCP server's own process, which meka does not sandbox, \
-                     so `workspace` cannot confine what it writes. Switch to `unrestricted` \
-                     (Shift+Tab) to allow it, or grant it explicitly with \
-                     `[mcp.servers.*].tool_permissions` in your config.",
+                     so `workspace` cannot confine what it writes. Ask the user for \
+                     `unrestricted`, or grant it explicitly with \
+                     `[mcp.servers.*].tool_permissions` in the config.",
                     name
                 ),
                 true,

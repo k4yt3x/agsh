@@ -2929,8 +2929,8 @@ pub mod windows_impl {
                 err.kind(),
                 format!(
                     "{err}. `workspace` spawns through CreateProcessAsUserW, which needs \
-                     SE_INCREASE_QUOTA_NAME; this account does not hold it. Switch to \
-                     `unrestricted` (Shift+Tab), or run meka from an account that does."
+                     SE_INCREASE_QUOTA_NAME; this account does not hold it. `unrestricted` \
+                     avoids that path, or run meka from an account that holds it."
                 ),
             ));
         }

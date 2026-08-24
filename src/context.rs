@@ -580,9 +580,8 @@ pub fn build_system_prompt(sandboxed_shell: bool, user_instructions: Option<&str
 
     prompt.push_str("## Permission Model\n\n");
     prompt.push_str(
-        "meka runs at a graduated permission level that the user can change mid-session \
-         by pressing Shift+Tab or typing `/permission <level>`. Levels, from least to \
-         most powerful:\n\n",
+        "meka runs at a graduated permission level, which the user can change \
+         mid-session. Levels, from least to most powerful:\n\n",
     );
     prompt.push_str("- `none`: text-only, no tools may execute.\n");
     if sandboxed_shell {
@@ -621,9 +620,9 @@ pub fn build_system_prompt(sandboxed_shell: bool, user_instructions: Option<&str
     prompt.push_str(
         "The current level is in the per-turn `[Permission context]` block; each tool's \
          required level is in `[Available tools]`. If the user asks for something their \
-         level blocks, name the required tool and suggest `/permission <level>` (or \
-         Shift+Tab). At `unrestricted`, briefly explain destructive operations before \
-         proceeding.\n\n",
+         level blocks, name the tool and the level it needs and ask them to raise it; \
+         how they do that depends on the interface, so do not name a key or command. At \
+         `unrestricted`, briefly explain destructive operations before proceeding.\n\n",
     );
 
     if let Some(instructions) = user_instructions
@@ -2997,7 +2996,16 @@ mod tests {
         assert!(prompt.contains("`ask`"));
         assert!(prompt.contains("`unrestricted`"));
         assert!(prompt.contains("`[Permission context]`"));
-        assert!(prompt.contains("Shift+Tab"));
+        // No key, command or endpoint: the level is raised differently in the REPL, over ACP and
+        // over HTTP, and a prompt that names one sends the model to tell a chat user to press a
+        // key they do not have.
+        for surface in ["Shift+Tab", "/permission", "POST ", "endpoint"] {
+            assert!(
+                !prompt.contains(surface),
+                "the prompt must not name {surface}: how the level changes is the frontend's, \
+                 not the model's, to know"
+            );
+        }
     }
 
     #[test]

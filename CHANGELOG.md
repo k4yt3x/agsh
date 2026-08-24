@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The agent no longer tells a chat or API user to press Shift+Tab; refusals name the level only.
 - `/help` named a permission mode that does not exist and omitted two that do.
 - Docs permission modes, serve scopes, scratchpad tools, provider headers and defaults.
 - Docs understated the read-mode environment allow-list, which passes TLS-trust variables.

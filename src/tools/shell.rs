@@ -250,10 +250,9 @@ impl Tool for ExecuteCommandTool {
         if !matches!(permission, Permission::Ask | Permission::Unrestricted) && !sandboxed {
             return Err(MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
-                message: "`workspace` confines writes to the workspace roots, and \
-                          [shell].sandbox = false leaves nothing to confine this command with. \
-                          Switch to `unrestricted` (Shift+Tab) to run shell commands without a \
-                          boundary, or re-enable [shell].sandbox in your config."
+                message: "[shell].sandbox = false leaves nothing to confine this command, \
+                          which `workspace` requires. `unrestricted` runs it without a boundary; \
+                          otherwise re-enable [shell].sandbox in the config."
                     .to_string(),
             });
         }
@@ -269,15 +268,14 @@ impl Tool for ExecuteCommandTool {
                 #[cfg(target_os = "linux")]
                 let message = format!(
                     "configured sandbox backend ({}) is unavailable: {}. \
-                     Switch to `unrestricted` (Shift+Tab) to run shell commands \
-                     without a sandbox, or update [shell].sandbox_backend in \
-                     your config.",
+                     `unrestricted` runs shell commands without a sandbox; otherwise \
+                     update [shell].sandbox_backend in the config.",
                     self.sandbox_backend, reason
                 );
                 #[cfg(not(target_os = "linux"))]
                 let message = format!(
-                    "sandbox is unavailable: {}. Switch to `unrestricted` \
-                     (Shift+Tab) to run shell commands without a sandbox.",
+                    "sandbox is unavailable: {}. `unrestricted` runs shell commands \
+                     without a sandbox.",
                     reason
                 );
                 return Err(MekaError::ToolExecution {
