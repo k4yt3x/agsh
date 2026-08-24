@@ -7,20 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-08-24
+
 ### Changed
 
 - Tool descriptions, per-turn context and CLI output are shorter; `-h` fits 80 columns again.
 
 ### Removed
 
-- **Breaking:** the retired `write` permission mode no longer has its own message.
+- The dedicated message for the retired `write` permission mode; it reads as any unknown mode.
 - The startup warning naming memory files left behind in the config directory.
 
 ### Fixed
 
 - The agent no longer tells a chat or API user to press Shift+Tab; refusals name the level only.
 - `/help` named a permission mode that does not exist and omitted two that do.
-- Docs permission modes, serve scopes, scratchpad tools, provider headers and defaults.
+- Docs misstated permission modes, serve scopes, scratchpad tools, provider headers and defaults.
 - Docs understated the read-mode environment allow-list, which passes TLS-trust variables.
 
 ## [0.42.0] - 2026-08-24
@@ -1581,7 +1583,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.1...HEAD
+[0.42.1]: https://github.com/k4yt3x/meka/compare/0.42.0...0.42.1
 [0.42.0]: https://github.com/k4yt3x/meka/compare/0.41.0...0.42.0
 [0.41.0]: https://github.com/k4yt3x/meka/compare/0.40.0...0.41.0
 [0.40.0]: https://github.com/k4yt3x/meka/compare/0.39.0...0.40.0
