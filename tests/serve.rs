@@ -4272,6 +4272,106 @@ fn scheduled_job_fires_without_a_client_request() {
     );
 }
 
+/// A scheduled job fires at the level its session was created with, not the level this server
+/// process defaults to.
+///
+/// The scenario is the ordinary one: a session is given a level, it schedules something, and
+/// whoever set it goes away. By the time the job fires the session may have been evicted or the
+/// process restarted, so the row is the only thing left that remembers.
+///
+/// `isolated` deliberately. An in-session fire resolves the level through re-attach, which
+/// `re_attach_to_evicted_session_continues_conversation` already covers; `run_isolated` reads the
+/// row itself, because going through re-attach would rebuild and pin the parent runtime for a job
+/// that exists to avoid exactly that. It is a second copy of the rule and it was the one no test
+/// reached: it could be cut down to `state.shared.config.permission` and everything stayed green.
+///
+/// The session is at `workspace` while the harness defaults to `unrestricted`, so a fire reading
+/// the process default would *widen* the job. Choosing the level below the default is what makes
+/// the failure visible and points it at the direction that matters.
+#[test]
+fn an_isolated_fire_runs_at_its_session_level_not_the_server_default() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    // One turn is all this needs: the fire's own. The job is created over HTTP rather than through
+    // `schedule_create`, so no client turn runs first.
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ISOLATED_REPLY_MARKER" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let harness = ServeTestHarness::spawn_with(
+        "\n[schedule]\npoll_interval = \"1s\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": workspace.path(),
+            "permission": "workspace",
+        }))
+        .send()
+        .expect("create");
+    let status = create.status();
+    let body: serde_json::Value = create.json().expect("parse");
+    assert_eq!(status, 201, "create failed: {body}");
+    assert_eq!(
+        body["permission"], "workspace",
+        "the creating session must actually be at workspace: {body}"
+    );
+    let parent = body["id"].as_str().expect("id").to_string();
+
+    let scheduled = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/schedule", parent),
+        )
+        .json(&serde_json::json!({
+            "prompt": "run the isolated job",
+            "at": "2s",
+            "isolated": true,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        scheduled.status(),
+        201,
+        "{}",
+        scheduled.text().expect("text")
+    );
+
+    // Polled rather than slept: the job is due in 2s and the scheduler ticks every 1s, so the fire
+    // lands in a window. The isolated run is a session of its own, which is what makes the level it
+    // ran at observable at all -- `run_turn` records it on the row it creates.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut fired: Option<serde_json::Value> = None;
+    let mut last_seen = String::new();
+    while Instant::now() < deadline && fired.is_none() {
+        std::thread::sleep(Duration::from_millis(250));
+        let listed = harness
+            .request(reqwest::Method::GET, "/v1/sessions")
+            .send()
+            .expect("list");
+        last_seen = listed.text().expect("body");
+        let parsed: serde_json::Value = serde_json::from_str(&last_seen).expect("parse list");
+        fired = parsed["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|session| session["id"].as_str() != Some(parent.as_str()))
+            .cloned();
+    }
+
+    let fired = fired.unwrap_or_else(|| {
+        panic!("the isolated job never produced a session of its own; sessions were:\n{last_seen}")
+    });
+    assert_eq!(
+        fired["permission"], "workspace",
+        "an isolated fire must run at the level its creating session holds, not the server's own \
+         default; the fired session was:\n{fired}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Session capability endpoints: compact, context, rewind, export, import, and
 // the schedule / background-task surfaces.

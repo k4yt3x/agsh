@@ -1030,10 +1030,12 @@ async fn prepare(
 
     // What the session's permission is *now*, as opposed to what it was when the gate was authored.
     //
-    // `None` means the row carries no per-session level, which is the REPL and ACP case: those
-    // derive permission from process config rather than the row, so the host's own level is the
-    // live answer. A session row that exists but cannot be read leaves this `None` and the
-    // host level decides, which is why the lookup failure above warns rather than passing silently.
+    // `None` means the row carries no per-session level, so the host's own level is the live
+    // answer. That is now only an ACP session that has never been through `session/set_mode`
+    // (`session/new` writes no level) or an imported archive that carried none: `POST /v1/sessions`
+    // records it at insert, and `run_turn` records it for the REPL, one-shot and sub-agent rows it
+    // creates. A session row that exists but cannot be read also leaves this `None` and the host
+    // level decides, which is why the lookup failure above warns rather than passing silently.
     //
     // Filtered by the enabled set, like the other four readers of this column. A row records what a
     // session was set to, not what this installation still permits, and the two diverge the moment

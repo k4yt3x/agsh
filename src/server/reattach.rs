@@ -137,12 +137,15 @@ pub async fn ensure_session_loaded(
             .with("session_id", id.to_string())
         })?;
 
-    // Resolve persisted permission. NULL for REPL, ACP and sub-agent rows, which carry no
-    // per-session level and derive permission from process config instead, and for an imported
-    // session whose archive omitted one: fall back to the process default. The HTTP
-    // `create_session` handler validates against the enabled set at insert time, but a stored
-    // permission could in principle become disabled by an operator editing config; defensively
-    // re-check.
+    // Resolve persisted permission. The row is the authority and this process's default is the
+    // answer only when the row has none, which is an ACP session that has never been through
+    // `session/set_mode` (`session/new` writes no level) or an imported session whose archive
+    // omitted one. Every other door records it: `POST /v1/sessions` at insert, and `run_turn` for
+    // the REPL, one-shot and sub-agent rows it creates.
+    //
+    // The HTTP `create_session` handler validates against the enabled set at insert time, but a
+    // stored permission could in principle become disabled by an operator editing config;
+    // defensively re-check.
     let enabled = state.shared.config.enabled_permissions;
     let permission: Permission = crate::permission::parse_recorded_permission(
         summary.permission.as_deref(),

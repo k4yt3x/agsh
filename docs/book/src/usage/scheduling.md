@@ -217,8 +217,10 @@ That second one is the session's own, recorded on its row and kept current by wh
 it -- Shift+Tab and `/permission` in the REPL, `session/set_mode` under ACP, `PATCH
 /v1/sessions/{id}` under `serve`. Every process that polls the schedule reads the same row, so
 withdrawing the level works across processes: a `meka serve` daemon sharing the data directory will
-refuse a gate you just dropped in a REPL. Only a session whose row somehow carries no level at all
-falls back to the polling process's own `--permission`, and no surface creates one that way.
+refuse a gate you just dropped in a REPL. A session whose row carries no level at all falls back to
+the polling process's own `--permission`. That is an ACP session that has never had
+`session/set_mode` called on it, since `session/new` records no level; every other surface records
+one when the session is created.
 
 Drop the session to anything below `unrestricted` and the gate stops running -- and with it the job,
 because a gate is the condition on the job and an unevaluated condition has not been met. The
