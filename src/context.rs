@@ -1019,7 +1019,6 @@ fn render_memory_section(memories: &[MemoryIndexEntry], tools: MemoryTools) -> S
     }
     out.push_str("\n\n");
     let (standing, inlined) = render_standing_memories(memories, now);
-    out.push_str(&standing);
 
     // Whatever the standing band rendered in full is *not* repeated as a description line below.
     // Listing it twice wastes the budget and reads as a duplicate: a live model, shown a
@@ -1030,12 +1029,19 @@ fn render_memory_section(memories: &[MemoryIndexEntry], tools: MemoryTools) -> S
         .filter(|entry| !inlined.contains(entry.name.as_str()))
         .collect();
 
+    // Built into its own buffer so the standing band's overflow notice can be written *between* the
+    // band and the index, after both budgets have been spent. The notice cannot be computed any
+    // earlier: it is a claim about what the index below contains, and the index does not know until
+    // it has laid itself out.
+    //
     // Measured against the index's own bytes, not `out.len()`. Charging the standing band to this
     // budget is what [`MEMORY_INLINE_MAX_BYTES`] says it does not do -- four ordinary directives
     // were costing the index 40% of its entries -- and the separation is only real if the two are
     // counted separately.
+    let mut index = String::new();
     let mut index_bytes = 0;
     let mut shown = 0;
+    let mut standing_listed = 0;
     for entry in listable.iter().take(MEMORY_INDEX_MAX_ENTRIES) {
         let line = format!(
             "- **{}** (p{}, {}): {}\n",
@@ -1050,9 +1056,23 @@ fn render_memory_section(memories: &[MemoryIndexEntry], tools: MemoryTools) -> S
             break;
         }
         index_bytes += line.len();
-        out.push_str(&line);
+        index.push_str(&line);
         shown += 1;
+        if entry.inline_body.is_some() {
+            standing_listed += 1;
+        }
     }
+
+    if !standing.is_empty() {
+        let overflow = listable
+            .iter()
+            .filter(|entry| entry.inline_body.is_some())
+            .count();
+        out.push_str(&standing);
+        out.push_str(&render_standing_overflow(overflow, standing_listed, tools));
+        out.push('\n');
+    }
+    out.push_str(&index);
 
     let hidden = listable.len().saturating_sub(shown);
     if hidden > 0 {
@@ -1140,25 +1160,54 @@ fn render_standing_memories(
         inlined.insert(entry.name.as_str());
     }
 
-    // A standing memory the budget could not fit is not lost: it falls through to the index below
-    // and is listed by description like everything else. Saying so is what keeps this block from
-    // reading as the complete set of things the model is obliged to do.
-    let hidden = standing.len().saturating_sub(inlined.len());
-    if hidden > 0 {
-        let _ = writeln!(
-            out,
-            "\n{hidden} further priority-0 {} listed by description below rather than in full; \
-             read {} with `memory_read`.",
-            if hidden == 1 {
+    // What became of the overflow is stated by [`render_standing_overflow`], which the caller
+    // appends once the index below has laid itself out. This block deliberately does not say,
+    // because from here the answer is a guess.
+    (out, inlined)
+}
+
+/// What became of the priority-0 memories the inline band could not fit.
+///
+/// Separate from [`render_standing_memories`] because only the caller knows the answer. The band
+/// used to state its own overflow as "N further priority-0 memories are listed by description
+/// below", on the reasoning that a standing memory the inline budget dropped still falls through to
+/// the index like everything else. That holds for a small store and fails for a large one: the
+/// index rations [`MEMORY_INDEX_MAX_BYTES`] across the *whole* store, so the overflow competes with
+/// it, and past a few dozen standing memories some of them lose. Measured at 140 priority-0
+/// memories: the band promised 118 below, the index had room for 72, and 46 standing directives
+/// reached the model nowhere at all while the block asserted they were listed.
+///
+/// The count being wrong is the smaller half. Priority 0 is the tier whose contract is "these
+/// always apply", so one that appears in no part of the context is a rule the model is being held
+/// to and cannot read, and a confident sentence saying otherwise removes the one clue that it
+/// should go looking.
+fn render_standing_overflow(overflow: usize, listed: usize, tools: MemoryTools) -> String {
+    if overflow == 0 {
+        return String::new();
+    }
+    if listed >= overflow {
+        return format!(
+            "\n{overflow} further priority-0 {} listed by description below rather than in full; \
+             read {} with `memory_read`.\n",
+            if overflow == 1 {
                 "memory is"
             } else {
                 "memories are"
             },
-            if hidden == 1 { "it" } else { "them" }
+            if overflow == 1 { "it" } else { "them" }
         );
     }
-    out.push('\n');
-    (out, inlined)
+    format!(
+        "\n{overflow} further priority-0 memories are not shown in full: {listed} listed by \
+         description below, {} left out entirely because this index is full. All of them still \
+         apply{}\n",
+        overflow - listed,
+        if tools.search {
+            "; reach the ones left out with `memory_search`."
+        } else {
+            ", and nothing in this context names the ones left out."
+        }
+    )
 }
 
 /// `, most common tags infra (820), people (611)` for the entries the budget could not list, or an
@@ -1954,6 +2003,79 @@ mod tests {
         let mut memory = sample_memory(name, 0, description, 1);
         memory.body = Some(body.to_string());
         memory
+    }
+
+    /// The standing band may not promise what the index below cannot deliver.
+    ///
+    /// The band used to state its own overflow as "N further priority-0 memories are listed by
+    /// description below", reasoning that whatever the inline budget dropped still falls through to
+    /// the index. The index rations [`MEMORY_INDEX_MAX_BYTES`] across the whole store, so past a
+    /// few dozen standing memories the overflow loses that competition. Measured against a real
+    /// store of 140: the band promised 118 below, 72 were listed, and 46 standing directives
+    /// reached the model nowhere while the block asserted they were there.
+    ///
+    /// Both halves are asserted, because either alone passes against a wrong implementation: a
+    /// renderer that dropped the sentence entirely satisfies "does not overstate", and one that
+    /// kept the old sentence satisfies "names a number".
+    #[test]
+    fn the_standing_band_never_promises_more_than_the_index_lists() {
+        let long = "d".repeat(300);
+        let standing: Vec<Memory> = (0..140)
+            .map(|index| {
+                standing_memory(
+                    &format!("standing-{index:03}"),
+                    &long,
+                    "Body of a standing rule.",
+                )
+            })
+            .collect();
+        let rendered = world_state_for_memories(&standing);
+
+        let listed = rendered.matches("(p0, ").count();
+        let claimed: usize = rendered
+            .split(" listed by description below")
+            .next()
+            .and_then(|before| {
+                before
+                    .rsplit(&[' ', '\n'][..])
+                    .find(|word| !word.is_empty())
+            })
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("no overflow notice in:\n{rendered}"));
+        assert_eq!(
+            claimed, listed,
+            "the band claimed {claimed} priority-0 memories are listed below but {listed} are:\n\
+             {rendered}"
+        );
+
+        // And when some cannot fit, the block has to say so rather than let them pass as ordinary
+        // overflow. A standing rule the model never sees is one it is held to and cannot read.
+        assert!(
+            rendered.contains("left out entirely because this index is full"),
+            "a standing memory that reached no part of the context must be named as missing:\n\
+             {rendered}"
+        );
+
+        // A store small enough for every overflow entry to fit keeps the original wording, so the
+        // shortfall clause is reserved for a real shortfall.
+        let small: Vec<Memory> = (0..6)
+            .map(|index| {
+                standing_memory(
+                    &format!("rule-{index}"),
+                    "short",
+                    &"body line\n".repeat(200),
+                )
+            })
+            .collect();
+        let small = world_state_for_memories(&small);
+        assert!(
+            small.contains("listed by description below rather than in full"),
+            "an overflow the index can absorb reads as before:\n{small}"
+        );
+        assert!(
+            !small.contains("left out entirely"),
+            "nothing was left out, so nothing may say it was:\n{small}"
+        );
     }
 
     /// For a standing directive the body *is* the directive. Leaving it behind a `memory_read` the

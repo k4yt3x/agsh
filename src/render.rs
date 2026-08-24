@@ -2899,33 +2899,66 @@ pub fn resolve_primary_param(
     schema.and_then(|s| schema_primary_param(s, input))
 }
 
+/// The label a tool indicator shows for a built-in.
+///
+/// One entry per name in [`crate::tools::BUILTIN_TOOL_NAMES`], in PascalCase, enforced by
+/// `every_builtin_tool_has_a_display_name`. Both halves of that are the point. The table had
+/// drifted into three styles at once, and whole families were absent: `skill_search` rendered as
+/// "Search skills" in the same transcript where its sibling `memory_search` rendered raw, because
+/// the memory family was never added. AGENTS.md already requires updating this table when a tool is
+/// *renamed*; nothing said anything about adding one, so every tool added after the table was
+/// written fell through to `other` and nothing noticed.
 fn tool_display_name(name: &str) -> &str {
     match name {
-        "execute_command" => "Shell",
-        "read_file" => "ReadFile",
-        "write_file" => "WriteFile",
-        "edit_file" => "EditFile",
-        "find_files" => "FindFiles",
-        "search_contents" => "SearchContents",
-        "fetch_url" => "FetchUrl",
-        "search_web" => "SearchWeb",
-        "todo" => "Todo",
-        "agent_spawn" => "AgentSpawn",
-        "agent_list" => "AgentList",
-        "agent_followup" => "AgentFollowup",
         "agent_delete" => "AgentDelete",
-        "scratchpad_write" => "ScratchpadWrite",
-        "scratchpad_read" => "ScratchpadRead",
-        "scratchpad_edit" => "ScratchpadEdit",
-        "scratchpad_list" => "ScratchpadList",
-        "scratchpad_delete" => "ScratchpadDelete",
-        "skill_read" => "Skill",
-        "skill_search" => "Search skills",
-        "skill_write" => "Save skill",
-        "skill_delete" => "Delete skill",
-        "render_image" => "RenderImage",
+        "agent_followup" => "AgentFollowup",
+        "agent_list" => "AgentList",
+        "agent_spawn" => "AgentSpawn",
         "context_check" => "ContextCheck",
         "context_compact" => "ContextCompact",
+        "conversation_read" => "ConversationRead",
+        "conversation_search" => "ConversationSearch",
+        "edit_file" => "EditFile",
+        "execute_command" => "Shell",
+        "fetch_url" => "FetchUrl",
+        "find_files" => "FindFiles",
+        "load_tool" => "LoadTool",
+        "mcp_prompt_get" => "McpPromptGet",
+        "mcp_prompt_list" => "McpPromptList",
+        "mcp_resource_list" => "McpResourceList",
+        "mcp_resource_read" => "McpResourceRead",
+        "mcp_resource_subscribe" => "McpResourceSubscribe",
+        "mcp_resource_unsubscribe" => "McpResourceUnsubscribe",
+        "mcp_resource_updates_list" => "McpResourceUpdatesList",
+        "memory_delete" => "MemoryDelete",
+        "memory_read" => "MemoryRead",
+        "memory_search" => "MemorySearch",
+        "memory_write" => "MemoryWrite",
+        "read_file" => "ReadFile",
+        "render_image" => "RenderImage",
+        "schedule_cancel" => "ScheduleCancel",
+        "schedule_create" => "ScheduleCreate",
+        "schedule_list" => "ScheduleList",
+        "scratchpad_delete" => "ScratchpadDelete",
+        "scratchpad_edit" => "ScratchpadEdit",
+        "scratchpad_list" => "ScratchpadList",
+        "scratchpad_load_file" => "ScratchpadLoadFile",
+        "scratchpad_merge" => "ScratchpadMerge",
+        "scratchpad_read" => "ScratchpadRead",
+        "scratchpad_rename" => "ScratchpadRename",
+        "scratchpad_save_file" => "ScratchpadSaveFile",
+        "scratchpad_write" => "ScratchpadWrite",
+        "search_contents" => "SearchContents",
+        "search_web" => "SearchWeb",
+        "skill_delete" => "SkillDelete",
+        "skill_read" => "Skill",
+        "skill_search" => "SkillSearch",
+        "skill_write" => "SkillWrite",
+        "task_cancel" => "TaskCancel",
+        "task_list" => "TaskList",
+        "todo" => "Todo",
+        "write_file" => "WriteFile",
+        // An MCP tool's name is the server's, not meka's, so it is shown as the server spells it.
         other => other,
     }
 }
@@ -3104,6 +3137,49 @@ fn coerce_display_value(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every built-in has a label, and every label is spelled the same way.
+    ///
+    /// The table this guards is hand-maintained and had gone stale in both directions at once: the
+    /// whole `memory_*` family, all four later `scratchpad_*` tools, `schedule_*`, `task_*`,
+    /// `load_tool`, `conversation_*` and the MCP meta-tools fell through to the raw name, while
+    /// three `skill_*` entries used sentence case. A live transcript showed
+    /// `[tool Search skills(...)]` one line above `[tool memory_search(...)]`.
+    ///
+    /// Asserting the style as well as the presence is what makes the test worth having: a mapping
+    /// added as `"memory_search" => "Search memories"` satisfies "has an entry" and reintroduces
+    /// exactly the inconsistency this exists to stop.
+    #[test]
+    fn every_builtin_tool_has_a_display_name() {
+        let missing: Vec<&str> = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| super::tool_display_name(name) == *name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "built-ins with no display name, so they render as raw snake_case next to labelled \
+             siblings: {missing:?}"
+        );
+
+        let misspelled: Vec<(&str, &str)> = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .map(|name| (name, super::tool_display_name(name)))
+            .filter(|(_, label)| {
+                !label
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_uppercase())
+                    || !label.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .collect();
+        assert!(
+            misspelled.is_empty(),
+            "display names are PascalCase with no spaces, so one transcript reads in one voice: \
+             {misspelled:?}"
+        );
+    }
 
     /// The window is reported from turn zero, before there is any occupancy to divide into it.
     ///

@@ -70,6 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `effort` and the thinking encoding are no longer inferred from a model's name, on any backend.
 - `agent_followup` never widens a recorded grant, even when the parent has moved sideways since.
 - `[display].input_style` applies on submit; text keeps the terminal's own colours while typing.
+- Every built-in tool indicator is PascalCase; whole families used to render as raw snake_case.
 - `memory_write` and `skill_write` keep a stored description when the call omits it.
 - Memory has no discovery cap and no per-turn walk; the index is one indexed query over FTS5.
 - CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
@@ -109,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Priority-0 memories could reach no part of the context while the index claimed they were listed.
+- A memory directory left by the file store read as an empty store; it now says what to run.
 - Under bubblewrap a `read` command whose cwd was masked silently ran in `$HOME` instead.
 - Shift+Tab stacked a new prompt line once a turn had scrolled the prompt to the screen bottom.
 - Landlock allows writing `/dev/null`, so `cmd 2>/dev/null` no longer fails on that backend.

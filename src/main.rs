@@ -76,6 +76,11 @@ fn main() -> anyhow::Result<()> {
         .with_writer(relay::RELAY.clone())
         .init();
 
+    // Before any subcommand runs, because every one of them is a surface where a stranded file
+    // store looks like an empty one: `memory list` prints "No memories saved.", a turn renders an
+    // empty index, and the HTTP store answers 200 with nothing in it.
+    crate::memory::warn_about_a_stranded_file_store(crate::config::meka_config_dir().as_deref());
+
     let runtime = tokio::runtime::Runtime::new()?;
     let result = run_on_runtime(&runtime, cli);
     // Detach any lingering blocking threads instead of joining them on drop. `tokio::io::stdin()`

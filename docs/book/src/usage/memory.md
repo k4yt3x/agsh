@@ -58,6 +58,8 @@ Because the agent picks a priority at write time and everything feels important 
 
 **Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
 
+Priority 0 is not a promise of unlimited space. A memory the 4 KiB band cannot fit falls through to the index below, and on a large store the index has its own ceiling to ration, so past a few dozen standing memories some of them fit nowhere. The section says so explicitly when it happens, naming how many are listed by description and how many were left out entirely, because a standing rule the agent never sees is one it is being held to and cannot read. If you see that line, either raise those notes' importance relative to the rest of the store or trim the tier: a hundred always-apply rules is not an always-apply tier.
+
 ## The index budget
 
 The index is capped at 8 KiB and 200 entries. When more memories exist than fit, the section ends with a line stating how many were left out, and, when they carry tags, what they are about:
