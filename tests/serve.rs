@@ -459,9 +459,9 @@ fn per_turn_context_states_the_catalogue_once_not_every_turn() {
 #[test]
 fn fork_copies_the_conversation_into_a_new_session() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
-    // Deliberately not the server's configured default (`write`): a fork that dropped the
-    // `permission` column entirely would still report `write`, because the re-attach path falls
-    // back to the config default when the column is NULL.
+    // Deliberately not the server's configured default (`unrestricted`): a fork that dropped the
+    // `permission` column entirely would still report `unrestricted`, because the re-attach path
+    // falls back to the config default when the column is NULL.
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({

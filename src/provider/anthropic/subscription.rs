@@ -2560,9 +2560,9 @@ mod tests {
         let messages_t1 = vec![Message::user(&u1_text)];
         let body_t1 = provider.build_request_body(&system, &messages_t1, &tools, true);
 
-        // Simulate a `/permission write` toggle: in real code this happens on a different thread
-        // via `SharedPermission::set`; here we just re-read the catalogue and rebuild everything to
-        // prove the outputs don't depend on the live permission state.
+        // Simulate a `/permission unrestricted` toggle: in real code this happens on a different
+        // thread via `SharedPermission::set`; here we just re-read the catalogue and rebuild
+        // everything to prove the outputs don't depend on the live permission state.
 
         let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&[]);

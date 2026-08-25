@@ -3,7 +3,7 @@
 A general-purpose AI agent harness.
 
 > [!CAUTION]
-> Agents can perform potentially destructive actions. Exercise caution when granting write permissions. It is not recommended to run meka on important systems with write permissions enabled.
+> Agents can perform potentially destructive actions. Exercise caution when granting a permission mode that can modify files or run commands.
 
 > [!IMPORTANT]
 > meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats change between releases. Read the changelog before upgrading.

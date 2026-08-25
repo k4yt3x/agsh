@@ -3528,8 +3528,8 @@ mod tests {
             parse_slash_command("/permission"),
             Some(SlashCommand::Permission(None))
         ));
-        match parse_slash_command("/permission write") {
-            Some(SlashCommand::Permission(Some(arg))) => assert_eq!(arg, "write"),
+        match parse_slash_command("/permission workspace") {
+            Some(SlashCommand::Permission(Some(arg))) => assert_eq!(arg, "workspace"),
             _ => panic!("expected Permission with argument"),
         }
     }

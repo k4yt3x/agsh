@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.2] - 2026-08-25
+
+### Fixed
+
+- Docs and HTTP auto-deny notices still named `write`, the permission mode retired in 0.42.0.
+
 ## [0.42.1] - 2026-08-24
 
 ### Changed
@@ -1583,7 +1589,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.2...HEAD
+[0.42.2]: https://github.com/k4yt3x/meka/compare/0.42.1...0.42.2
 [0.42.1]: https://github.com/k4yt3x/meka/compare/0.42.0...0.42.1
 [0.42.0]: https://github.com/k4yt3x/meka/compare/0.41.0...0.42.0
 [0.41.0]: https://github.com/k4yt3x/meka/compare/0.40.0...0.41.0

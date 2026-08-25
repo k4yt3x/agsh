@@ -2057,7 +2057,7 @@ enabled = ["read", "ask"]
         set_response,
     );
 
-    // Invalid set_mode: write is not in the enabled set.
+    // Invalid set_mode: unrestricted is not in the enabled set.
     let bad_response = harness.set_mode(&sid, "unrestricted");
     assert!(
         bad_response["error"].is_object(),
@@ -2136,8 +2136,8 @@ model = "claude-sonnet-4-5"
 #[test]
 fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     let content_to_write = "hello from delegated write";
-    // `write` mode so the agent's permission gate doesn't refuse `write_file` before we even reach
-    // the delegation seam.
+    // `unrestricted` so the agent's permission gate doesn't refuse `write_file` before we even
+    // reach the delegation seam.
     let config_toml = r#"
 [providers.mock]
 type = "anthropic-messages"
@@ -2302,11 +2302,11 @@ fn zed_shaped_capabilities() -> serde_json::Value {
 }
 
 /// `execute_command` always runs in meka's own (sandboxed) child process, never in the client's
-/// terminal, whatever the permission mode and whatever the client advertises. `write` is the mode
-/// that used to delegate, and `ask` is the mode where delegating was a sandbox bypass: meka treats
-/// `ask` as sandboxed (it hard-errors when no sandbox backend is available) yet handed the command
-/// to an unsandboxed editor terminal anyway. Guards both by asserting no `terminal/*` traffic and
-/// that the output is the local shell's, not the client's.
+/// terminal, whatever the permission mode and whatever the client advertises. `unrestricted` is the
+/// mode that used to delegate, and `ask` is the mode where delegating was a sandbox bypass: meka
+/// treats `ask` as sandboxed (it hard-errors when no sandbox backend is available) yet handed the
+/// command to an unsandboxed editor terminal anyway. Guards both by asserting no `terminal/*`
+/// traffic and that the output is the local shell's, not the client's.
 #[test]
 fn acp_execute_command_never_leaves_meka() {
     for mode in ["unrestricted", "ask"] {
@@ -2401,7 +2401,7 @@ enabled = ["read", "ask", "unrestricted"]
 
 /// `unrestricted`, so `execute_command` is not subject to the sandbox's availability on the test
 /// host.
-const ACP_WRITE_MODE_CONFIG: &str = r#"
+const ACP_UNRESTRICTED_CONFIG: &str = r#"
 [providers.mock]
 type = "anthropic-messages"
 model = "claude-sonnet-4-5"
@@ -2433,7 +2433,7 @@ fn acp_execute_command_streams_output_while_running() {
             { "kind": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let mut harness = AcpTestHarness::spawn(ACP_WRITE_MODE_CONFIG, Some(script));
+    let mut harness = AcpTestHarness::spawn(ACP_UNRESTRICTED_CONFIG, Some(script));
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "run it");
     let (updates, response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
@@ -2494,7 +2494,7 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_WRITE_MODE_CONFIG,
+        ACP_UNRESTRICTED_CONFIG,
         Some(script),
         zed_shaped_capabilities(),
     );
@@ -2578,7 +2578,7 @@ fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_WRITE_MODE_CONFIG,
+        ACP_UNRESTRICTED_CONFIG,
         Some(script),
         // `terminal/*` implemented, agent-owned terminal frames not understood.
         serde_json::json!({ "terminal": true }),
@@ -2624,7 +2624,7 @@ fn acp_client_without_terminal_capability_gets_console_text() {
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
-        ACP_WRITE_MODE_CONFIG,
+        ACP_UNRESTRICTED_CONFIG,
         Some(script),
         serde_json::json!({ "terminal": false }),
     );
@@ -4132,8 +4132,8 @@ enabled = ["read"]
     );
     assert_invalid_params(&unknown, "set_mode with unknown mode id");
 
-    // `write` is a valid mode id (parse_mode_id succeeds) but it's not in the configured `enabled`
-    // list, so try_set rejects it.
+    // `unrestricted` is a valid mode id (parse_mode_id succeeds) but it's not in the configured
+    // `enabled` list, so try_set rejects it.
     let disabled = harness.request(
         "session/set_mode",
         serde_json::json!({
@@ -5671,10 +5671,11 @@ enabled = ["read", "ask", "unrestricted"]
 ///
 /// Two halves of one invariant. `set_mode` only moved the in-memory cell, so the session row kept
 /// whatever it was created with; the scheduler's live gate re-check reads that row, which meant a
-/// gate authored after cycling to `write` was refused forever and one authored before cycling down
-/// to `read` kept firing. Persisting alone is not enough either: `build_session_runtime` seeds the
-/// permission from process config, so a reloaded session would run at the default while its row
-/// claimed the level the gate check would then trust -- the same fail-open from the other side.
+/// gate authored after cycling to `unrestricted` was refused forever and one authored before
+/// cycling down to `read` kept firing. Persisting alone is not enough either:
+/// `build_session_runtime` seeds the permission from process config, so a reloaded session would
+/// run at the default while its row claimed the level the gate check would then trust -- the same
+/// fail-open from the other side.
 ///
 /// Asserted through `currentModeId`, which is the client-visible form of the live cell, so this
 /// fails if either the write or the restore is dropped.

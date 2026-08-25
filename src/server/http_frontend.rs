@@ -574,7 +574,8 @@ impl Frontend for HttpFrontend {
             self.record_warn_notice(format!(
                 "Permission for '{}' auto-denied: session is in Ask mode but the caller \
                  requested stream=false, which has no human-in-loop channel. Configure the \
-                 session with permission=write to allow these tools, or use stream=true.",
+                 session with permission=workspace or permission=unrestricted to allow these \
+                 tools, or use stream=true.",
                 request.tool_name
             ))
             .await;
@@ -587,7 +588,8 @@ impl Frontend for HttpFrontend {
             self.record_warn_notice(format!(
                 "Permission for '{}' auto-denied: the session declared \
                  supports_permission_prompts=false, so there is no channel to approve on. \
-                 Configure the session with permission=write to allow these tools.",
+                 Configure the session with permission=workspace or permission=unrestricted to \
+                 allow these tools.",
                 request.tool_name
             ))
             .await;

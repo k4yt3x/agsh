@@ -115,8 +115,8 @@ through the model.
 
 **Permission:** Workspace
 
-This is the one scratchpad tool that leaves meka's own storage, so it is the one that carries a
-write permission. It reads as the scratchpad's `write_file` and is fenced identically: at
+This is the one scratchpad tool that leaves meka's own storage, so it is the one that requires a
+level that can write. It reads as the scratchpad's `write_file` and is fenced identically: at
 `workspace` the path must resolve inside a workspace root, and the refusal is the same one
 `write_file` gives. Every other scratchpad tool stays at `read` because the scratchpad lives in
 meka's database, not your tree.

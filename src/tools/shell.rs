@@ -1860,8 +1860,8 @@ mod tests {
     /// `workspace` and `read` are the opposite case and are refused outright, which is what makes
     /// this arm worth pinning separately.
     #[tokio::test]
-    async fn test_execute_command_runs_without_sandbox_when_write_mode() {
-        let write_perm = crate::permission::SharedPermission::new(
+    async fn test_execute_command_runs_without_sandbox_when_unrestricted() {
+        let unrestricted_perm = crate::permission::SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
@@ -1876,7 +1876,7 @@ mod tests {
             backend_probe: crate::sandbox::BackendProbe::Missing {
                 reason: "bwrap not found on PATH".to_string(),
             },
-            shared_permission: write_perm,
+            shared_permission: unrestricted_perm,
             sandbox_enabled: true,
             cwd: crate::workspace::test_cwd(),
             frontend: Arc::new(crate::frontend::SilentFrontend),

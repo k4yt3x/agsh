@@ -3197,7 +3197,7 @@ mod tests {
     /// about the recorded authority and not about gates having quietly stopped working.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_gate_that_still_holds_write_is_executed() {
+    async fn a_gate_that_still_holds_unrestricted_is_executed() {
         let marker = std::env::temp_dir().join(format!("meka-gate-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&marker);
 
@@ -3216,7 +3216,10 @@ mod tests {
 
         harness.tick().await;
 
-        assert!(marker.exists(), "a gate at write permission must run");
+        assert!(
+            marker.exists(),
+            "a gate at unrestricted permission must run"
+        );
         let _ = std::fs::remove_file(&marker);
     }
 

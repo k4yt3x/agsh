@@ -4700,7 +4700,7 @@ permission = "read"
 name = "web-api"
 transport = "http"
 url = "http://localhost:8080/mcp"
-permission = "write"
+permission = "workspace"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let mcp = config.mcp.expect("mcp should be present");
@@ -4721,7 +4721,7 @@ permission = "write"
         assert_eq!(servers[1].name, "web-api");
         assert_eq!(servers[1].transport, McpTransport::Http);
         assert_eq!(servers[1].url.as_deref(), Some("http://localhost:8080/mcp"));
-        assert_eq!(servers[1].permission.as_deref(), Some("write"));
+        assert_eq!(servers[1].permission.as_deref(), Some("workspace"));
     }
 
     #[test]
@@ -5701,10 +5701,13 @@ thinking = "budgeted"
         assert_eq!(perm, Permission::Read);
     }
 
+    /// The env value has to be one meka still accepts, or this proves nothing: an unparseable
+    /// `MEKA_PERMISSION` is dropped before the precedence rule is ever consulted, so the CLI wins
+    /// by default rather than by rule, and reversing the precedence leaves the test green.
     #[test]
     fn test_resolve_permission_cli_beats_env() {
         let (perm, _enabled) =
-            resolve_permission(Some(Permission::None), Some("write"), None, None);
+            resolve_permission(Some(Permission::None), Some("unrestricted"), None, None);
         assert_eq!(perm, Permission::None);
     }
 
@@ -5712,15 +5715,15 @@ thinking = "budgeted"
     fn test_permissions_config_deserialization() {
         let toml_str = r#"
 [permissions]
-default = "write"
-enabled = ["read", "write"]
+default = "workspace"
+enabled = ["read", "workspace"]
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let perms = config.permissions.expect("permissions present");
-        assert_eq!(perms.default.as_deref(), Some("write"));
+        assert_eq!(perms.default.as_deref(), Some("workspace"));
         assert_eq!(
             perms.enabled.as_deref(),
-            Some(&[String::from("read"), String::from("write")][..])
+            Some(&[String::from("read"), String::from("workspace")][..])
         );
     }
 
