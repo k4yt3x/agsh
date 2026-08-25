@@ -29,7 +29,7 @@
 //!   to send a non-default `protocolVersion`, which the harness bakes in during `build()`.
 //! - **Bespoke timing tests** (`acp_session_cancel_interrupts_running_prompt`,
 //!   `acp_multi_session_parallel_prompts_dont_serialize`) rely on precise `Instant::now()`
-//!   measurements outside the harness's deadline window.
+//!   measurements outside the harness's per-request window.
 //!
 //! Everything else (the tool-call lifecycle, permission flows, delegation paths, sub-agent
 //! forwarding, and per-session isolation) sits on the harness.
@@ -45,8 +45,8 @@ fn meka_acp() -> Command {
     Command::new(env!("CARGO_BIN_EXE_meka"))
 }
 
-/// Test harness that owns the child process, stdio pipes, and a running deadline. Wraps the spawn /
-/// `initialize` / `session/new` boilerplate so each test stays focused on the behavior it
+/// Test harness that owns the child process, stdio pipes, and a per-request window. Wraps the spawn
+/// / `initialize` / `session/new` boilerplate so each test stays focused on the behavior it
 /// exercises. See the module header for the inline-pattern exceptions.
 struct AcpTestHarness {
     _temp: tempfile::TempDir,
@@ -60,7 +60,7 @@ struct AcpTestHarness {
     stderr_handle: std::thread::JoinHandle<String>,
     config_dir: std::path::PathBuf,
     next_id: u64,
-    deadline: Instant,
+    window: Duration,
 }
 
 /// Boxed pre-spawn hook. Type-aliased to keep the builder field declaration readable
@@ -112,8 +112,8 @@ impl AcpTestHarnessBuilder {
         self
     }
 
-    /// Override the default 15s deadline.
-    fn deadline(mut self, duration: Duration) -> Self {
+    /// Override the default 15s per-request window.
+    fn window(mut self, duration: Duration) -> Self {
         self.config_window = Some(duration);
         self
     }
@@ -156,7 +156,7 @@ impl AcpTestHarnessBuilder {
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + self.config_window.unwrap_or(Duration::from_secs(15));
+        let window = self.config_window.unwrap_or(Duration::from_secs(15));
         let mut harness = AcpTestHarness {
             _temp: temp,
             child,
@@ -165,7 +165,7 @@ impl AcpTestHarnessBuilder {
             stderr_handle,
             config_dir,
             next_id: 0,
-            deadline,
+            window,
         };
         let _ = harness.request(
             "initialize",
@@ -263,7 +263,7 @@ impl AcpTestHarness {
         let lines = read_until_with_dispatch(
             &mut self.reader,
             &mut self.stdin,
-            self.deadline,
+            Instant::now() + self.window,
             |value| handler(value),
             |line| response_matches(line, &needle),
         );
@@ -294,7 +294,7 @@ impl AcpTestHarness {
         let lines = read_until_with_dispatch(
             &mut self.reader,
             &mut self.stdin,
-            self.deadline,
+            Instant::now() + self.window,
             |_| None,
             |line| response_matches(line, &needle),
         );
@@ -338,7 +338,8 @@ impl AcpTestHarness {
         let mut updates: Vec<serde_json::Value> = Vec::new();
         let mut response: Option<serde_json::Value> = None;
         let mut transcript = String::new();
-        while Instant::now() < self.deadline {
+        let deadline = Instant::now() + self.window;
+        while Instant::now() < deadline {
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
                 Ok(0) => break,
@@ -442,6 +443,18 @@ impl Drop for AcpTestHarness {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A deadline `seconds` from now, for one wait.
+///
+/// Each wait gets its own budget rather than a share of one. A single `Instant` computed at the top
+/// of a test is a stopwatch, not a timeout: it is checked *before* each `read_line`, so once it
+/// passes, every later read returns nothing instantly and the test fails with an empty transcript
+/// naming a request the child was never given time to answer. On a loaded runner a slow child start
+/// spent the whole budget during `initialize` and `session/new`, and the first real assertion of
+/// nine different tests failed on Windows CI for a timeout none of them had actually reached.
+fn window(seconds: u64) -> Instant {
+    Instant::now() + Duration::from_secs(seconds)
 }
 
 /// Read lines until either `f` returns `true`, EOF, or the deadline elapses. Collects every line
@@ -994,14 +1007,13 @@ model = "claude-sonnet-4-5"
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
 
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("initialize");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1010,7 +1022,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": config_dir.clone(), "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let new_line = new_lines
             .iter()
             .find(|line| line.contains("\"id\":2"))
@@ -1032,7 +1044,7 @@ model = "claude-sonnet-4-5"
             }
         });
         writeln!(stdin, "{}", prompt_req).expect("write session/prompt");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
@@ -1066,14 +1078,12 @@ model = "claude-sonnet-4-5"
         buf
     });
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("initialize");
-    let init_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let init_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
     // Confirm session-management capabilities were advertised.
     let init_response: serde_json::Value = serde_json::from_str(
         init_lines
@@ -1103,7 +1113,7 @@ model = "claude-sonnet-4-5"
         }
     });
     writeln!(stdin, "{}", load_req).expect("session/load");
-    let load_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":4"));
+    let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     let mut saw_user_chunk = false;
     let mut saw_agent_chunk = false;
@@ -1240,14 +1250,13 @@ model = "claude-sonnet-4-5"
             buf
         });
         let mut reader = BufReader::new(stdout);
-        let deadline = Instant::now() + Duration::from_secs(15);
 
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("initialize");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1256,7 +1265,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": config_dir.clone(), "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let sid = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
@@ -1276,7 +1285,7 @@ model = "claude-sonnet-4-5"
             "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "hello" }] }
         });
         writeln!(stdin, "{}", prompt_req).expect("session/prompt");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         // Drain remaining stdout on a thread so a shutdown-time write can't block the child, then
         // disconnect by closing stdin. Crucially: NO `child.kill()` -- the process must exit
@@ -1322,14 +1331,13 @@ model = "claude-sonnet-4-5"
         buf
     });
     let mut reader = BufReader::new(stdout);
-    let deadline = Instant::now() + Duration::from_secs(15);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("initialize");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
     let load_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1338,7 +1346,7 @@ model = "claude-sonnet-4-5"
         "params": { "sessionId": session_id, "cwd": config_dir.clone(), "mcpServers": [] }
     });
     writeln!(stdin, "{}", load_req).expect("session/load");
-    let load_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":4"));
+    let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     drop(stdin);
     let _ = child.kill();
@@ -1418,13 +1426,12 @@ model = "claude-sonnet-4-5"
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("init");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1433,7 +1440,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": session_cwd, "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let new_line = new_lines
             .iter()
             .find(|line| line.contains("\"id\":2"))
@@ -1457,7 +1464,7 @@ model = "claude-sonnet-4-5"
             }
         });
         writeln!(stdin, "{}", prompt_req).expect("prompt");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
@@ -1491,14 +1498,13 @@ model = "claude-sonnet-4-5"
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("init");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
     let list_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1507,7 +1513,7 @@ model = "claude-sonnet-4-5"
         "params": { "cwd": cwd_a.clone() }
     });
     writeln!(stdin, "{}", list_req).expect("session/list");
-    let list_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":5"));
+    let list_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":5"));
 
     drop(stdin);
     let _ = child.kill();
@@ -1586,13 +1592,12 @@ model = "claude-sonnet-4-5"
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("init");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1601,7 +1606,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": config_dir.clone(), "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let sid = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
@@ -1623,7 +1628,7 @@ model = "claude-sonnet-4-5"
             }
         });
         writeln!(stdin, "{}", prompt_req).expect("first prompt");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
@@ -1654,14 +1659,13 @@ model = "claude-sonnet-4-5"
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("init");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
     let resume_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1674,7 +1678,7 @@ model = "claude-sonnet-4-5"
         }
     });
     writeln!(stdin, "{}", resume_req).expect("session/resume");
-    let resume_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":6"));
+    let resume_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":6"));
 
     // The `available_commands_update` push is allowed (and expected) on resume. What must NOT
     // appear is a replay update: `user_message_chunk`, `agent_message_chunk`, `tool_call`, or
@@ -1733,7 +1737,7 @@ model = "claude-sonnet-4-5"
         }
     });
     writeln!(stdin, "{}", prompt_req).expect("follow-up prompt");
-    let prompt_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":7"));
+    let prompt_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":7"));
 
     drop(stdin);
     let _ = child.kill();
@@ -1829,7 +1833,8 @@ enabled = ["read", "ask", "unrestricted"]
     let mut saw_skill = false;
     let mut new_response: Option<serde_json::Value> = None;
     let mut transcript = String::new();
-    while Instant::now() < harness.deadline {
+    let deadline = Instant::now() + harness.window;
+    while Instant::now() < deadline {
         let mut line = String::new();
         match harness.reader.read_line(&mut line) {
             Ok(0) => break,
@@ -2726,14 +2731,13 @@ model = "claude-sonnet-4-5"
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("init");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
     let new_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -2742,7 +2746,7 @@ model = "claude-sonnet-4-5"
         "params": { "cwd": config_dir.clone(), "mcpServers": [] }
     });
     writeln!(stdin, "{}", new_req).expect("session/new");
-    let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+    let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
     let sid = serde_json::from_str::<serde_json::Value>(
         new_lines
             .iter()
@@ -2868,14 +2872,13 @@ model = "claude-sonnet-4-5"
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
 
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("initialize");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2884,7 +2887,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": config_dir.clone(), "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let sid = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
@@ -2971,14 +2974,13 @@ model = "claude-sonnet-4-5"
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("initialize");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
     let load_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -2991,7 +2993,7 @@ model = "claude-sonnet-4-5"
         }
     });
     writeln!(stdin, "{}", load_req).expect("session/load");
-    let load_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":4"));
+    let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     drop(stdin);
     let _ = child.kill();
@@ -3162,7 +3164,7 @@ enabled = ["read", "ask", "unrestricted"]
                 ]
             ])
         })
-        .deadline(Duration::from_secs(30))
+        .window(Duration::from_secs(30))
         .build();
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "delegate the write");
@@ -3247,14 +3249,13 @@ model = "claude-sonnet-4-5"
             while r.read_line(&mut buf).unwrap_or(0) > 0 {}
             buf
         });
-        let deadline = Instant::now() + Duration::from_secs(15);
 
         writeln!(
             stdin,
             r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
         )
         .expect("init");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
         let new_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -3263,7 +3264,7 @@ model = "claude-sonnet-4-5"
             "params": { "cwd": cwd.clone(), "mcpServers": [] }
         });
         writeln!(stdin, "{}", new_req).expect("session/new");
-        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let sid = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
@@ -3286,7 +3287,7 @@ model = "claude-sonnet-4-5"
             }
         });
         writeln!(stdin, "{}", prompt_req).expect("prompt");
-        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+        let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
@@ -3324,14 +3325,13 @@ model = "claude-sonnet-4-5"
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
     )
     .expect("init");
-    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let _ = read_until(&mut reader, window(30), |line| line.contains("\"id\":1"));
 
     let list_req_a = serde_json::json!({
         "jsonrpc": "2.0",
@@ -3340,7 +3340,7 @@ model = "claude-sonnet-4-5"
         "params": { "cwd": cwd.clone() }
     });
     writeln!(stdin, "{}", list_req_a).expect("list page 1");
-    let lines_a = read_until(&mut reader, deadline, |line| line.contains("\"id\":5"));
+    let lines_a = read_until(&mut reader, window(30), |line| line.contains("\"id\":5"));
     let line_a = lines_a
         .iter()
         .find(|line| line.contains("\"id\":5"))
@@ -3367,7 +3367,7 @@ model = "claude-sonnet-4-5"
         "params": { "cwd": cwd.clone(), "cursor": cursor }
     });
     writeln!(stdin, "{}", list_req_b).expect("list page 2");
-    let lines_b = read_until(&mut reader, deadline, |line| line.contains("\"id\":6"));
+    let lines_b = read_until(&mut reader, window(30), |line| line.contains("\"id\":6"));
     let line_b = lines_b
         .iter()
         .find(|line| line.contains("\"id\":6"))
@@ -3455,7 +3455,7 @@ enabled = ["read", "ask", "unrestricted"]
                 ]
             ])
         })
-        .deadline(Duration::from_secs(30))
+        .window(Duration::from_secs(30))
         .build();
     let sid = harness.new_session();
 
@@ -3753,7 +3753,8 @@ enabled = ["read", "unrestricted"]
     let mut saw_a_update_on_a = false;
     let mut saw_a_update_on_b = false;
     let needle = format!("\"id\":{}", set_id);
-    while Instant::now() < harness.deadline {
+    let deadline = Instant::now() + harness.window;
+    while Instant::now() < deadline {
         let mut line = String::new();
         match harness.reader.read_line(&mut line) {
             Ok(0) => break,
@@ -3805,7 +3806,7 @@ fn acp_multi_session_cancel_fires_only_target_session() {
     let mut harness = AcpTestHarnessBuilder::default()
         .config(ACP_INVALID_PARAMS_CONFIG)
         .script(script)
-        .deadline(Duration::from_secs(20))
+        .window(Duration::from_secs(20))
         .build();
     let sid_a = harness.new_session();
     let sid_b = harness.new_session();
@@ -3822,8 +3823,9 @@ fn acp_multi_session_cancel_fires_only_target_session() {
     // Poll for both responses arriving in any order.
     let mut a_stop: Option<String> = None;
     let mut b_stop: Option<String> = None;
+    let deadline = Instant::now() + harness.window;
     while a_stop.is_none() || b_stop.is_none() {
-        if Instant::now() > harness.deadline {
+        if Instant::now() > deadline {
             break;
         }
         let mut line = String::new();
@@ -4177,7 +4179,6 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
 
     // Far-future version, well past anything the schema crate would ever produce. Must come back
     // clamped to LATEST (V1).
@@ -4188,7 +4189,7 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
         "params": { "protocolVersion": 9999 }
     });
     writeln!(stdin, "{}", init_req).expect("init");
-    let lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let lines = read_until(&mut reader, window(10), |line| line.contains("\"id\":1"));
 
     drop(stdin);
     let _ = child.kill();
@@ -4503,7 +4504,7 @@ fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
     let mut harness = AcpTestHarness::builder()
         .config(ACP_INVALID_PARAMS_CONFIG)
         .script(script)
-        .deadline(std::time::Duration::from_secs(25))
+        .window(std::time::Duration::from_secs(25))
         .build();
     let sid = harness.new_session();
     let id = harness.prompt(&sid, "go");
@@ -4992,7 +4993,8 @@ enabled = ["read", "ask", "unrestricted"]
     let mut cancel_fired = false;
     let needle = format!("\"id\":{}", id);
     let mut response: Option<serde_json::Value> = None;
-    while Instant::now() < harness.deadline {
+    let deadline = Instant::now() + harness.window;
+    while Instant::now() < deadline {
         let mut line = String::new();
         if harness.reader.read_line(&mut line).unwrap_or(0) == 0 {
             break;
@@ -5058,14 +5060,13 @@ fn acp_initialize_rejects_protocol_version_zero() {
         while r.read_line(&mut buf).unwrap_or(0) > 0 {}
         buf
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
 
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":0}}}}"#,
     )
     .expect("init");
-    let lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+    let lines = read_until(&mut reader, window(10), |line| line.contains("\"id\":1"));
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
@@ -5568,7 +5569,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
     let mut harness = AcpTestHarness::builder()
         .config(ACP_SCHEDULE_CONFIG)
         .script(script)
-        .deadline(Duration::from_secs(45))
+        .window(Duration::from_secs(45))
         .build();
 
     let sid = harness.new_session();
