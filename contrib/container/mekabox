@@ -40,28 +40,21 @@ if ! "$runtime" info >/dev/null 2>&1; then
 fi
 
 # Override instructions for the containerized environment
-mekabox_instructions='You are running inside an isolated mekabox container with full root privileges.
-You may freely install system packages (pacman -S, apt install, etc.), language runtimes, and
-developer tooling as needed for the task. Container changes do not persist between invocations
-except in mounted volumes.
+mekabox_instructions='You are running inside an isolated mekabox container with full root
+privileges. You may freely install system packages (pacman -S, apt install, etc.), language
+runtimes, and developer tooling as needed for the task. Container changes do not persist between
+invocations except in mounted volumes.
 
 Limit all changes to within this container; do not attempt to modify the host system or rely on
-changes persisting outside mounted volumes.
+changes persisting outside mounted volumes.'
 
-Prefer Exa Search (`mcp__exa__web_search_exa` and `mcp__exa__web_fetch_exa`) over the built-in
-`search_web` tool for searches, when available.'
-
-# `MEKA_SANDBOX_BACKEND=landlock` pins the read-mode sandbox to Landlock inside the container.
-# Bubblewrap rarely works in a nested container, and the image has no host config to pin it in
-# (the host config is mounted read-only), so this also silences the auto-resolve warning.
-#
-# `--entrypoint` must precede the image; archlinux:latest has none.
+# Launch the container
 exec "${sudo_prefix[@]}" "$runtime" run --rm -it \
     --entrypoint /usr/local/bin/meka \
     -v "$meka_bin:/usr/local/bin/meka:ro" \
     -v "$HOME/.config/meka:/root/.config/meka:ro" \
     -v "$HOME/.local/share/meka:/root/.local/share/meka:rw" \
-    -e MEKA_PERMISSION=write \
+    -e MEKA_PERMISSION=unrestricted \
     -e MEKA_INSTRUCTIONS="$mekabox_instructions" \
     -e MEKA_SANDBOX_BACKEND=landlock \
     archlinux:latest \
