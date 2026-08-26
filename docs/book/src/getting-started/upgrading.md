@@ -4,42 +4,29 @@ Most upgrades are a binary swap: replace the old executable with the new one and
 
 ## 0.42 to 0.43
 
-0.43 changes two things about the `scheduled_jobs` table, and one script does both.
+Nothing to do. Start 0.43 and it brings the store forward itself, on the first open, before anything reads it.
 
-It stores a scheduled job's gate differently. A gate used to be two columns, `gate_command` and `gate_fire`; it is now `gate_kind` plus a JSON `gate_spec`, which is what lets a gate call a read-only tool instead of a shell command. `migrate-0.42-to-0.43.py`, attached to the 0.43 release, converts them.
+This is the first release that migrates its own store, and from here on that is the rule: upgrades from 0.43 onward are a binary swap, whatever the schema does.
 
-It also claims a due job by *leasing* it rather than by consuming its row, which adds `claimed_by`,
-`claimed_until` and `attempts`. Those start empty, so for the lease half the migration is the columns
-themselves: stop meka first and nothing is in flight to preserve. The gain is that a host which
-crashes mid-delivery no longer loses the occurrence, and for a one-shot no longer loses the job.
+What it changes, if you want to know what happened. A scheduled job's gate used to be two columns, `gate_command` and `gate_fire`; it is now `gate_kind` plus a JSON `gate_spec`, which is what lets a gate call a read-only tool instead of a shell command. And a due job is now claimed by *leasing* it rather than by consuming its row, which adds `claimed_by`, `claimed_until` and `attempts`, so a host that crashes mid-delivery no longer loses the occurrence, or for a one-shot the whole job. Each gate's stored baseline is preserved, so a `changed` gate does not fire spuriously on its first evaluation afterwards.
 
-**If you have no scheduled jobs, there is nothing to do here.** The script still adds the columns,
-which every read in 0.43 names.
+Before it writes anything, meka copies the store to `meka.db.v1.bak` beside it. That doubles the space the store takes until you delete it, which is worth knowing if yours is large. Start with `-v` once if you want the exact path in the log; the copy is otherwise silent, and nothing prunes it. It records the version it was taken at, so if you ever restore it, the next start migrates it again correctly rather than mistaking it for a store that is already current.
 
-You cannot skip it and find out later. Every *read* of `scheduled_jobs` names `gate_kind`, so 0.43 against an unmigrated store fails with `no such column: gate_kind` and scheduling stops entirely, listings included. That is loud and harmless; the quiet failure is the one below.
+The whole thing is one transaction, so an interruption leaves the store exactly as it was rather than half-converted. Running two hosts at once is fine: the first takes the schema lock and the second waits, then finds nothing to do.
 
-Take a backup first (`sqlite3 meka.db '.backup meka.db.bak'`) and stop any running meka. The row conversion is one transaction, but Python's `sqlite3` commits `ALTER TABLE` statements outside it, so a run interrupted at exactly the wrong moment can leave the two new columns added and the rows unconverted -- which 0.43 reads as a set of *ungated* jobs. Re-running the script fixes that; the backup is for the interruption that does not get a re-run.
+**Coming from 0.41 or older**, run `migrate-0.41-to-0.42.py` once first, as described below. 0.43 recognises a 0.41-shaped store and refuses it by name rather than converting it into something still unreadable, and it changes nothing when it does.
 
-Coming from 0.41, run `migrate-0.41-to-0.42.py` first. This script checks and refuses a 0.41 store rather than converting it into a shape 0.43 still cannot read.
+### A gate that cannot be read
 
-```bash
-python3 migrate-0.42-to-0.43.py            # reports what it would change; writes nothing
-python3 migrate-0.42-to-0.43.py --apply    # does it
-```
+Rare, and worth knowing the shape of. If a job's gate was already unreadable under 0.42 (a hand-edited row, or a `gate_fire` value meka never wrote), it cannot be converted, because there is nothing to convert it *from*. Such a job never fired under 0.42, and it does not fire under 0.43 either: the migration leaves it in the same refused state rather than guessing at what it meant or deleting it. It is logged once, by id, at `warn`.
 
-Order is looser than the 0.41 upgrade: this script adds the two columns itself, so it can run before or after you install 0.43. What it must not do is run *after* 0.43's scheduler has been let loose on the store.
-
-### Read the `!` lines
-
-A row 0.42 refused to load -- a half-written gate, or a `gate_fire` value it did not recognise -- cannot be converted, so the script reports it and leaves it alone. That row is the quiet failure: 0.43 reads a NULL `gate_kind` as "no gate at all", so an `every = "30s"` watcher that used to fire on a condition becomes one that fires **every thirty seconds**. Cancel those jobs with `meka schedule cancel <id>`, or recreate them with a gate, before starting 0.43's scheduler. The script prints the count and the ids.
-
-Everything else is preserved, including each gate's stored baseline, so a `changed` gate does not fire spuriously on its first evaluation after the upgrade. Re-running the script is a no-op.
+The consequence is that the row stays inert and invisible, as it already was: it will not appear in `meka schedule list` and `meka schedule cancel` cannot reach it. Recreate the job if you still want it. The original row is in the backup.
 
 ## 0.41 to 0.42
 
 A store written by 0.41 needs five conversions before 0.42 reads all of it. They are performed by `migrate-0.41-to-0.42.py`, a one-shot script attached as an asset to the 0.42 release. Download it, run it once, and you are done with it.
 
-meka does not convert anything at startup, and that is deliberate: a migration that runs on every start is one nobody can see fail. A script runs under your eye, tells you what it would change before it changes anything, and finishes.
+This one stays a script, and 0.43's own store migration does not replace it: 0.42 carried no migration code to reach back with, and conversion B below has to *guess*. 0.41 recorded nothing about which provider a thinking block came from, so the script tells them apart by the shape of the blob, and it reports what it read before it writes. A guess wants a human reading the counts, which is the one thing a migration that runs on every start cannot offer.
 
 ### Order
 

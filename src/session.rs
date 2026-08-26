@@ -2,8 +2,14 @@
 //! conversation, `tool_outputs` for results too large to keep inline (referenced from the
 //! conversation by handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and
 //! `scheduled_jobs` and `background_tasks` for work the agent starts and does not wait for. They
-//! are not the whole database: `initialize_schema` also calls
-//! `crate::memory::store::create_tables`, whose DDL lives with the code that queries it.
+//! are not the whole database, and this module does not define them: they and the memory store's
+//! tables are created by [`migrations`], the single ledger that also brings an older store forward.
+//! `initialize_schema` runs it, then hands the memory search index to
+//! `crate::memory::store::reconcile_index`.
+//!
+//! One table is outside that: `prompt_history`, created by `crate::history` on the separate
+//! connection the REPL opens for input history. It carries no schema the agent reads and is not
+//! versioned with the rest.
 //!
 //! Per-session mutual exclusion is provided by an OS-level file lock ([`FileLock`]) so the
 //! kernel reclaims it whenever the holder dies: no PID-aliveness check, no risk of stale locks.
@@ -13,6 +19,7 @@
 //! conversation content aren't readable by other local users regardless of the user's umask.
 
 pub mod cli;
+pub mod migrations;
 
 use std::{
     fs::{File, OpenOptions},
@@ -485,6 +492,182 @@ fn restrict_permissions(_path: &Path, _mode: u32) {
     // Windows ACLs inherit from the parent directory; leave alone.
 }
 
+/// Copy the store aside before [`migrations::apply`] touches it, returning where it went.
+///
+/// `VACUUM INTO` rather than a file copy: it is atomic against concurrent writers, produces a
+/// defragmented image rather than one that may span a live WAL, and carries `user_version` across,
+/// so restoring the copy yields a store that identifies itself as the version it was and migrates
+/// once when next opened. Lives here rather than in [`migrations`] because it is a question about
+/// the store *file* -- a path, a mode -- and because that module is deliberately kept clear of
+/// meka's own code.
+///
+/// Kept rather than cleaned up on success. It is the user's undo, and deleting it the moment the
+/// migration works removes the safety net exactly when they might still want it.
+///
+/// Written to a staging name and renamed into place, so the name the docs tell people to restore
+/// either does not exist or is a complete copy. `VACUUM INTO` does not unlink its output when a
+/// write fails partway: measured under a write limit, it left a file with a zeroed page-1 header,
+/// which SQLite then opens cleanly as an *empty database* that passes `integrity_check`. The retry
+/// stepped past it to `.bak.1`, so the file wearing the documented name was the empty one. Staging
+/// plus rename removes that whole class rather than special-casing it.
+fn back_up_before_migrating(
+    connection: &rusqlite::Connection,
+    database_path: &Path,
+    from: u32,
+) -> Result<Option<PathBuf>> {
+    // Nothing to preserve: an in-memory store is created empty by this very process.
+    if database_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let target = free_backup_path(database_path, from)?;
+    let staging = staging_path(&target);
+    // `create_new` rather than `create`: it fails rather than following a symlink or truncating
+    // something already there, and it is what makes the mode below a guarantee instead of a hope.
+    // The mode matters because this file holds every credential and every conversation the store
+    // does, and SQLite would otherwise create it at `0644 & ~umask` and leave it that way for as
+    // long as the copy takes. `SessionManager::open` pre-touches the main database at `0600` for
+    // exactly this reason; the backup gets the same treatment.
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&staging).map_err(|error| {
+        MekaError::Database(format!(
+            "failed to create the pre-migration backup at '{}': {}. Nothing has been changed",
+            staging.display(),
+            error
+        ))
+    })?;
+
+    // Bound rather than interpolated, so a data directory containing a quote is not a broken
+    // statement. `VACUUM INTO` accepts a parameter here, and writes into the empty file just made.
+    let Some(staging_text) = staging.to_str() else {
+        remove_partial_backup(&staging);
+        return Err(MekaError::Database(format!(
+            "cannot write the pre-migration backup to '{}' because the path is not valid UTF-8. \
+             Nothing has been changed. Move the store somewhere it is, or set MEKA_DATA_DIR",
+            staging.display()
+        )));
+    };
+    if let Err(error) = connection.execute("VACUUM INTO ?1", rusqlite::params![staging_text]) {
+        remove_partial_backup(&staging);
+        return Err(MekaError::Database(format!(
+            "failed to back the store up to '{}' before migrating: {}. Nothing has been changed",
+            target.display(),
+            error
+        )));
+    }
+    // Belt-and-braces on platforms where the mode above is a no-op, and against a umask that
+    // somehow widened it.
+    restrict_permissions(&staging, 0o600);
+    std::fs::rename(&staging, &target).map_err(|error| {
+        remove_partial_backup(&staging);
+        MekaError::Database(format!(
+            "failed to move the pre-migration backup into place at '{}': {}. Nothing has been \
+             changed",
+            target.display(),
+            error
+        ))
+    })?;
+    Ok(Some(target))
+}
+
+/// Clear away a backup that never finished. Best-effort by design: the caller is already returning
+/// an error that stops the migration, and failing to tidy up must not replace that error with a
+/// less useful one. Leaving it behind is safe either way, because only a completed copy is ever
+/// renamed onto the name the docs name.
+fn remove_partial_backup(staging: &Path) {
+    if let Err(error) = std::fs::remove_file(staging) {
+        tracing::debug!(
+            "failed to remove the incomplete backup '{}': {}",
+            staging.display(),
+            error
+        );
+    }
+}
+
+/// `<store>.v<from>.bak`, or the first numbered variant whose name *and staging sibling* are both
+/// unused.
+///
+/// Built through `OsString` rather than `format!` on a `String`, so a data directory whose name is
+/// not valid UTF-8 still produces a path that names the file the user actually has.
+///
+/// Never reuses a name that exists. An earlier backup is the record of an earlier attempt, and a
+/// migration that replaced it would destroy the copy taken before whatever failure made a second
+/// attempt necessary.
+///
+/// **Both halves of the pair have to be free, and that is the whole of a bug worth remembering.**
+/// The copy is staged at `<name>.partial` and renamed into place, so an abnormal exit between the
+/// two leaves a `.partial` behind. Checking only the target then chose that same name again, and
+/// `create_new` failed `EEXIST` on every subsequent start: measured, one `kill -9` during the
+/// upgrade of a 90 MB store, then three consecutive runs all refusing with
+/// `failed to create the pre-migration backup … File exists` and the store still at its old
+/// version. A single interrupted upgrade wedged meka permanently, which is the opposite of what
+/// staging was introduced to achieve.
+///
+/// Exhaustion is an error rather than a fallback to the unsuffixed name. It used to be safe to
+/// return the occupied base, because `VACUUM INTO` refuses a non-empty target; staging moved the
+/// write to `.partial` and the final step to `std::fs::rename`, which does not refuse anything. So
+/// the old fallback silently overwrote the *oldest* backup, the one most likely to matter.
+fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBuf> {
+    let base = {
+        let mut name = database_path.as_os_str().to_os_string();
+        name.push(format!(".v{}.bak", from));
+        PathBuf::from(name)
+    };
+    if is_free_pair(&base) {
+        return Ok(base);
+    }
+    for suffix in 1..1000 {
+        let mut name = base.as_os_str().to_os_string();
+        name.push(format!(".{}", suffix));
+        let candidate = PathBuf::from(name);
+        if is_free_pair(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(MekaError::Database(format!(
+        "cannot name a pre-migration backup: '{}' and its 999 numbered variants are all taken. \
+         Nothing has been changed. Move or delete the old copies beside the store",
+        base.display()
+    )))
+}
+
+/// Whether both the backup name and the staging name it implies are unused.
+fn is_free_pair(target: &Path) -> bool {
+    let staging = staging_path(target);
+    is_free(target) && is_free(&staging)
+}
+
+/// Where a copy is written before it is renamed onto `target`.
+///
+/// One function so the caller and [`is_free_pair`] cannot disagree about the name, which is exactly
+/// how the wedge above happened: the check looked at one path and the create at another.
+fn staging_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+/// Whether nothing at all sits at this path, symlinks included.
+///
+/// `Path::exists` is the wrong question here: it follows symlinks, so it answers `false` for a
+/// *dangling* one and this would hand back a name that is really a redirection.
+/// `symlink_metadata` asks about the link rather than through it.
+///
+/// The hazard that prompted this is no longer reachable, and saying so is the honest version:
+/// measured on the pre-staging code, `VACUUM INTO` followed such a link and wrote the whole
+/// credential store outside the data directory at `0644`. Staging closed that by construction,
+/// because `VACUUM INTO` now only ever touches `.partial` and `rename` replaces a symlink rather
+/// than following it. This stays because a name occupied by a link is still occupied, and
+/// handing it back would mean the log naming a file that is not the one written.
+fn is_free(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err()
+}
+
 impl SessionManager {
     pub async fn open(path: Option<&Path>) -> Result<Self> {
         let database_path = match path {
@@ -613,14 +796,14 @@ impl SessionManager {
     async fn initialize_schema(&self) -> Result<()> {
         // Serialise schema work across processes.
         //
-        // Everything below is `CREATE TABLE IF NOT EXISTS`, which SQLite makes safe on its own --
-        // but not everything below is only that. `memory::store::create_tables` reconciles the FTS
-        // triggers, and the `sqlite_master` read that decides whether they have drifted sits
-        // *outside* the transaction that replaces them. The replacement itself is a single
-        // immediate transaction, so no process ever sees a half-applied trigger set; what a second
-        // process can see is a snapshot the winner is about to invalidate, and it then acts on that
-        // answer after it has stopped being true. A systemd unit and a shell REPL starting together
-        // is exactly when that happens.
+        // Two things below need it, and neither is safe on its own. The migration run decides what
+        // to do by reading the store and then acts on that answer, so two processes that both read
+        // "needs migrating" would both try. And `memory::store::reconcile_index` makes the
+        // `sqlite_master` read that decides whether the FTS triggers have drifted *outside* the
+        // transaction that replaces them; the replacement itself is one immediate transaction, so
+        // no process ever sees a half-applied trigger set, but a second process can see a snapshot
+        // the winner is about to invalidate and then act on it after it has stopped being true. A
+        // systemd unit and a shell REPL starting together is exactly when that happens.
         //
         // An OS file lock rather than a SQLite transaction, the same primitive `FileLock` uses,
         // held for the whole of the schema work so the check and the write it authorises cannot be
@@ -648,160 +831,66 @@ impl SessionManager {
             ))
         })?;
 
-        // Declaration only: this creates what is missing and changes nothing that exists. meka
-        // carries no migration code at all -- a store from an older release is brought forward by
-        // the one-shot script shipped with the release that needs it, so nothing here has to guess
-        // what shape it is arriving in, and no user pays a scan on every start for a rewrite that
-        // happens once.
+        // Migrations, not declaration. [`migrations::plan`] decides what this store needs and
+        // [`migrations::apply`] performs it, both under the lock taken above, so two processes
+        // starting together cannot each decide to migrate and then both try. Everything downstream
+        // of this point may assume the current schema unconditionally, which is the whole benefit;
+        // [`migrations`] states the rule that keeps it true.
         //
-        // What that costs, and it is real: opening the store takes a write lock to change nothing,
-        // so a long-running writer elsewhere fails commands that only read. An external
-        // `BEGIN IMMEDIATE` held for eight seconds kills `meka --oneshot` at 5.1 seconds with
-        // `failed to initialize schema: database is locked`, and `meka session list` -- a pure
+        // What the lock costs, and it is real: opening the store takes a write lock even when there
+        // is nothing to do, so a long-running writer elsewhere fails commands that only read. An
+        // external `BEGIN IMMEDIATE` held for eight seconds kills `meka --oneshot` at 5.1 seconds
+        // with `failed to initialize schema: database is locked`, and `meka session list` -- a pure
         // read -- dies the same way. A rare, loud, retryable startup error is the accepted half of
         // that trade.
-        self.connection
-            .call(|connection| -> rusqlite::Result<_> {
-                connection.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS sessions (
-                        id TEXT PRIMARY KEY,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
-                        cwd TEXT,
-                        permission TEXT,
-                        capabilities_json TEXT,
-                        token_id TEXT,
-                        additional_roots_json TEXT,
-                        subagent_spec_json TEXT,
-                        stat_turns INTEGER NOT NULL DEFAULT 0,
-                        stat_input_tokens INTEGER NOT NULL DEFAULT 0,
-                        stat_output_tokens INTEGER NOT NULL DEFAULT 0,
-                        stat_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-                        stat_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-                        stat_redactions INTEGER NOT NULL DEFAULT 0,
-                        stat_redacted_images INTEGER NOT NULL DEFAULT 0,
-                        stat_redacted_bytes INTEGER NOT NULL DEFAULT 0
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
-                        ON sessions(updated_at);
-
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                        role TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_messages_session_id
-                        ON messages(session_id);
-
-                    -- Provider credentials (API keys and OAuth bundles) are keyed by the
-                    -- user-chosen profile name and stored as a serialized AuthCredential.
-                    CREATE TABLE IF NOT EXISTS provider_credentials (
-                        profile TEXT PRIMARY KEY,
-                        credentials_json TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS mcp_oauth_credentials (
-                        server_name TEXT PRIMARY KEY,
-                        credentials_json TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-
-                    ",
-                )?;
-
-                connection.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS tool_outputs (
-                        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                        name TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        PRIMARY KEY (session_id, name)
-                    );",
-                )?;
-
-                connection.execute_batch(
-                    "CREATE INDEX IF NOT EXISTS idx_sessions_parent
-                         ON sessions(parent_session_id)",
-                )?;
-
-                // Scheduled wakeups (see `crate::schedule`).
-                //
-                // `next_fire_at` is denormalised from `schedule` + `last_fired_at ?? created_at` so
-                // the due-job query is an index seek rather than a full scan plus a parse per row.
-                // `crate::schedule` owns keeping it consistent.
-                //
-                // `gate_permission` records the level a gate was authorised at. What withdraws a
-                // gate is the session's *live* level, which `crate::schedule` reads separately;
-                // this column earns its place by failing closed, since a
-                // hand-edited or unparseable value decodes as `Permission::None`
-                // and refuses the gate.
-                connection.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                        id                TEXT PRIMARY KEY,
-                        session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                        kind              TEXT NOT NULL,
-                        spec              TEXT NOT NULL,
-                        prompt            TEXT NOT NULL,
-                        gate_kind         TEXT,
-                        gate_spec         TEXT,
-                        gate_last_output  TEXT,
-                        gate_permission   TEXT,
-                        isolated          INTEGER NOT NULL DEFAULT 0,
-                        created_at        TEXT NOT NULL,
-                        last_fired_at     TEXT,
-                        next_fire_at      TEXT NOT NULL,
-                        claimed_by        TEXT,
-                        claimed_until     TEXT,
-                        attempts          INTEGER NOT NULL DEFAULT 0
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_fire
-                        ON scheduled_jobs(next_fire_at);
-
-                    CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_session
-                        ON scheduled_jobs(session_id);",
-                )?;
-
-                // Background tool calls (see `crate::background`).
-                //
-                // `delivered_at` is what makes a finished task's outcome reach the conversation
-                // exactly once, including across a restart. `status = 'running'` rows are swept to
-                // `interrupted` when a process takes the session lock, because holding that lock
-                // means nothing else can still be running them.
-                connection.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS background_tasks (
-                        id                TEXT PRIMARY KEY,
-                        session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                        tool_name         TEXT NOT NULL,
-                        label             TEXT NOT NULL,
-                        status            TEXT NOT NULL,
-                        outcome           TEXT,
-                        scratchpad_name   TEXT,
-                        started_at        TEXT NOT NULL,
-                        finished_at       TEXT,
-                        delivered_at      TEXT
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
-                        ON background_tasks(session_id, status);",
-                )?;
-
-                // The memory store (see `crate::memory::store`). Its DDL lives with the code that
-                // queries it, but runs here so the whole schema is created in one place, under one
-                // lock. No foreign key to `sessions`: a memory outlives every session and belongs
-                // to the meka instance, not to a conversation.
-                crate::memory::store::create_tables(connection)?;
-
-                Ok(())
+        let database_path = self.database_path.clone();
+        let (plan, backup) = self
+            .connection
+            .call(move |connection| -> std::result::Result<_, MekaError> {
+                let plan = migrations::plan(connection)?;
+                // Before anything is written, and only when there is something to lose. `from > 0`
+                // is what distinguishes carrying an existing store forward from building a new one:
+                // a fresh store has no data to preserve, and copying the empty file it does not yet
+                // have would leave a `.v0.bak` beside every first run. The copy carries its own
+                // `user_version`, so restoring it yields a store that migrates once when next
+                // opened rather than one mistaken for already-current.
+                let backup = if plan.from > 0 && plan.has_work() {
+                    back_up_before_migrating(connection, &database_path, plan.from)?
+                } else {
+                    None
+                };
+                migrations::apply(connection, plan)?;
+                // Reconciliation rather than creation, and outside the ledger for that reason: it
+                // asks whether this database's FTS triggers are the ones this build requires and
+                // makes them so, which is as true of a store created a minute ago as of one carried
+                // forward. `crate::memory::store` owns the reasoning.
+                crate::memory::store::reconcile_index(connection).map_err(|error| {
+                    MekaError::Database(format!("failed to reconcile the memory index: {}", error))
+                })?;
+                Ok((plan, backup))
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to initialize schema: {}", error)))
+            .map_err(|error| match error {
+                tokio_rusqlite::Error::Error(inner) => inner,
+                other => MekaError::Database(format!("failed to initialize schema: {}", other)),
+            })?;
+
+        if plan.has_work() {
+            match backup {
+                Some(path) => tracing::info!(
+                    "brought the store forward from schema version {} to {}; the pre-migration copy is at {}",
+                    plan.from,
+                    plan.head,
+                    path.display()
+                ),
+                None => tracing::info!(
+                    "brought the store forward from schema version {} to {}",
+                    plan.from,
+                    plan.head
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Create a new session, optionally recording its working directory. `cwd` is persisted as an
@@ -6715,5 +6804,309 @@ mod tests {
                 .is_empty(),
             "the corrupt row is skipped rather than read as ungated"
         );
+    }
+
+    /// A name already taken is stepped over rather than reused, so an earlier backup survives a
+    /// second attempt.
+    #[test]
+    fn a_backup_name_already_in_use_is_not_reused() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        assert_eq!(
+            free_backup_path(&database_path, 1).expect("a free name"),
+            temp_dir.path().join("meka.db.v1.bak"),
+            "the unsuffixed name when nothing is there"
+        );
+
+        std::fs::write(
+            temp_dir.path().join("meka.db.v1.bak"),
+            b"an earlier attempt",
+        )
+        .expect("plant");
+        assert_eq!(
+            free_backup_path(&database_path, 1).expect("a free name"),
+            temp_dir.path().join("meka.db.v1.bak.1")
+        );
+        std::fs::write(temp_dir.path().join("meka.db.v1.bak.1"), b"and another").expect("plant");
+        assert_eq!(
+            free_backup_path(&database_path, 1).expect("a free name"),
+            temp_dir.path().join("meka.db.v1.bak.2")
+        );
+    }
+
+    /// `Path::exists` follows symlinks and so reports `false` for a dangling one, which would hand
+    /// back a name that is really a redirection out of the data directory. The whole credential
+    /// store went with it when this was measured.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_does_not_count_as_a_free_backup_name() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        let taken = temp_dir.path().join("meka.db.v1.bak");
+        std::os::unix::fs::symlink(temp_dir.path().join("nowhere"), &taken).expect("symlink");
+        assert!(
+            !taken.exists(),
+            "the premise: the link dangles, so `exists` says no"
+        );
+
+        assert_eq!(
+            free_backup_path(&database_path, 1).expect("a free name"),
+            temp_dir.path().join("meka.db.v1.bak.1"),
+            "a dangling symlink occupies the name as surely as a file does"
+        );
+    }
+
+    /// Debris from an interrupted upgrade must not wedge the next one.
+    ///
+    /// The copy is staged at `<name>.partial`, so a crash between creating it and renaming it into
+    /// place leaves that file behind. Checking only the target name then reused it, `create_new`
+    /// failed `EEXIST`, and *every* later start refused with the store still unmigrated: one Ctrl-C
+    /// during the upgrade this release is built around bricked meka permanently. Reproduced against
+    /// the real binary before this guard existed.
+    #[test]
+    fn a_staging_file_left_by_a_crash_does_not_block_the_next_attempt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        std::fs::write(
+            temp_dir.path().join("meka.db.v1.bak.partial"),
+            b"an interrupted copy",
+        )
+        .expect("plant the debris");
+
+        assert_eq!(
+            free_backup_path(&database_path, 1).expect("a usable name is still found"),
+            temp_dir.path().join("meka.db.v1.bak.1"),
+            "the pair is taken, so the next pair is used rather than failing forever"
+        );
+    }
+
+    /// Running out of names is an error, not a fallback to the occupied one.
+    ///
+    /// It used to be safe to return the base name, because `VACUUM INTO` refuses a non-empty
+    /// target. Staging moved the write to `.partial` and the final step to `std::fs::rename`, which
+    /// refuses nothing, so the old fallthrough silently overwrote the *oldest* backup: the one most
+    /// likely to be the one that mattered.
+    #[test]
+    fn running_out_of_backup_names_refuses_rather_than_overwriting_the_oldest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        std::fs::write(
+            temp_dir.path().join("meka.db.v1.bak"),
+            b"the irreplaceable one",
+        )
+        .expect("plant");
+        for suffix in 1..1000 {
+            std::fs::write(
+                temp_dir.path().join(format!("meka.db.v1.bak.{suffix}")),
+                b"x",
+            )
+            .expect("plant");
+        }
+
+        let error = free_backup_path(&database_path, 1).expect_err("no name is available");
+        assert!(
+            error.to_string().contains("Nothing has been changed"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("meka.db.v1.bak")).expect("still there"),
+            b"the irreplaceable one",
+            "the oldest copy must survive"
+        );
+    }
+
+    /// Best-effort, and both halves matter: it clears a copy that never finished, and it stays
+    /// quiet when there is nothing to clear, because the caller is already returning the error
+    /// that stopped the migration.
+    #[test]
+    fn an_incomplete_backup_is_cleared_and_a_missing_one_is_not_an_error() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let staging = temp_dir.path().join("meka.db.v1.bak.partial");
+        std::fs::write(&staging, b"half a copy").expect("plant");
+        remove_partial_backup(&staging);
+        assert!(!staging.exists(), "the incomplete copy is gone");
+        remove_partial_backup(&staging);
+    }
+
+    /// When no backup can be taken, the migration refuses and the store is left where it was.
+    ///
+    /// Reached here by exhausting every name, which is the one way to make the copy impossible that
+    /// a test can force deterministically. Two earlier attempts are worth recording because both
+    /// stopped working, and for good reasons: a read-only data directory does not work because
+    /// `SessionManager::open` calls `restrict_permissions(parent, 0o700)` on the way in and widens
+    /// it back; occupying the staging name with a directory no longer works because
+    /// `free_backup_path` now treats a taken `.partial` as a taken pair and steps past it, which is
+    /// the fix for the wedge described on that function.
+    #[tokio::test]
+    async fn a_migration_that_cannot_be_backed_up_refuses_and_changes_nothing() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("a store with work pending");
+        }
+        std::fs::write(temp_dir.path().join("meka.db.v1.bak"), b"the oldest copy").expect("plant");
+        for suffix in 1..1000 {
+            std::fs::write(
+                temp_dir.path().join(format!("meka.db.v1.bak.{suffix}")),
+                b"x",
+            )
+            .expect("plant");
+        }
+
+        let error = SessionManager::open(Some(&database_path))
+            .await
+            .err()
+            .expect("the migration refuses rather than proceeding without a backup");
+        assert!(
+            error.to_string().contains("Nothing has been changed"),
+            "{error}"
+        );
+
+        let connection = rusqlite::Connection::open(&database_path).expect("reopen");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 0, "no migration ran");
+        let old_column: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('scheduled_jobs') WHERE name = 'gate_command'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(old_column, 1, "the conversion did not start");
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("meka.db.v1.bak")).expect("still there"),
+            b"the oldest copy",
+            "and the existing copies are untouched"
+        );
+    }
+
+    /// A store carried forward keeps a copy of what it was, without the user having asked.
+    ///
+    /// The instruction the retired script's documentation had to give ("take a backup first") is
+    /// the one a user skips, and it is only needed on the one run that might go wrong. Doing it
+    /// here means it happened.
+    #[tokio::test]
+    async fn an_upgraded_store_leaves_a_copy_of_what_it_was() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            // A store as an older meka left one: the baseline shape, and nothing in `user_version`.
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("the baseline builds");
+        }
+
+        let manager = SessionManager::open(Some(&database_path))
+            .await
+            .expect("the store migrates on open");
+        drop(manager);
+
+        let backup = temp_dir.path().join("meka.db.v1.bak");
+        assert!(
+            backup.exists(),
+            "the pre-migration copy should be beside the store"
+        );
+        let copy = rusqlite::Connection::open(&backup).expect("the copy opens");
+        let version: i64 = copy
+            .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            .expect("the copy has a version");
+        assert_eq!(
+            version, 0,
+            "the copy must identify itself as what it was, so restoring it migrates once rather \
+             than being mistaken for a current store"
+        );
+    }
+
+    /// A backup protects data that already exists, so neither a first run nor a subsequent one
+    /// leaves a copy: the first has nothing to lose, and the second has nothing to do. Copying on
+    /// every start would double the store on disk and make opening meka cost more as the
+    /// conversation grows.
+    #[tokio::test]
+    async fn a_store_with_nothing_to_preserve_is_not_backed_up() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        drop(
+            SessionManager::open(Some(&database_path))
+                .await
+                .expect("first open"),
+        );
+        drop(
+            SessionManager::open(Some(&database_path))
+                .await
+                .expect("second open"),
+        );
+
+        let copies: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("readable")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak"))
+            .collect();
+        assert!(copies.is_empty(), "expected no backups, found {copies:?}");
+    }
+
+    /// Two hosts starting together against one unmigrated store. The schema lock is what makes the
+    /// loser re-read the winner's answer instead of acting on its own stale one, and a migration
+    /// applied twice is how a store gets a duplicated column or a half-converted table.
+    ///
+    /// Spawned rather than `join!`ed, and that is not a style choice. `initialize_schema` holds a
+    /// *blocking* file lock across an `await`, so two opens driven by one task deadlock: the second
+    /// blocks the thread that the first needs in order to be polled again and release. Separate
+    /// tasks put them on separate workers, which is also what two real hosts are.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_hosts_opening_one_unmigrated_store_migrate_it_once() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("the baseline builds");
+        }
+
+        let one = tokio::spawn({
+            let database_path = database_path.clone();
+            async move { SessionManager::open(Some(&database_path)).await }
+        });
+        let other = tokio::spawn({
+            let database_path = database_path.clone();
+            async move { SessionManager::open(Some(&database_path)).await }
+        });
+        let first = one
+            .await
+            .expect("the task finishes")
+            .expect("one host opens");
+        let second = other
+            .await
+            .expect("the task finishes")
+            .expect("the other host opens too");
+
+        let version: i64 = first
+            .connection
+            .call(|connection| {
+                connection.query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            })
+            .await
+            .expect("a version");
+        assert!(version > 0, "the store was migrated");
+        // One migration, not two: a second pass would have tried to add columns that now exist.
+        let claim_columns: i64 = second
+            .connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT count(*) FROM pragma_table_info('scheduled_jobs') WHERE name = 'claimed_by'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("column count");
+        assert_eq!(claim_columns, 1);
     }
 }

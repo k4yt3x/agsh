@@ -181,7 +181,7 @@ An export reads back with any tool that understands YAML frontmatter; meka itsel
 
 ## Coming from a file-backed store
 
-Memories used to be Markdown files in `<config>/memory/`. If you are upgrading from 0.41, the one-shot migration script attached to the 0.42 release imports them into the database; run it once, check `meka memory list`, then remove the directory yourself. meka never reads those files again and does not migrate them on startup, deliberately: a migration that runs on every start is one nobody can see fail.
+Memories used to be Markdown files in `<config>/memory/`. If you are upgrading from 0.41, the one-shot migration script attached to the 0.42 release imports them into the database; run it once, check `meka memory list`, then remove the directory yourself. meka never reads those files again. What it brings forward on its own is the database; a directory of files you still have is yours to import when you get to it, and importing it twice is not something a startup pass could ask you about.
 
 ## Configuration
 

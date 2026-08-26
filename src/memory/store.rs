@@ -184,71 +184,58 @@ fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
     })
 }
 
-/// Create the memory tables. Idempotent, and invoked from
-/// [`crate::session::SessionManager::initialize_schema`] so schema ownership stays in one place.
+/// Bring the memory search index into line with this build, on every open.
 ///
-/// Not creation alone. The `CREATE`s are followed by [`sync_triggers`], which replaces the FTS
-/// triggers and rebuilds the index when the stored definitions differ from this build's, and then
-/// by [`repair_a_desynced_index`] -- unless that rebuild just ran, in which case the probe would
-/// only re-ask a question one pass of the table has already answered. Both reconcile a derived
-/// index against the table it is derived from, which is why they sit on the open path instead of in
-/// a command the user has to remember to run. Nothing beyond the objects named here is touched.
-pub(crate) fn create_tables(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        // `id` rather than an implicit rowid because the FTS index anchors to it by name, and an
-        // anchor you cannot see is one a later `ALTER` can move.
-        "CREATE TABLE IF NOT EXISTS memories (
-             id           INTEGER PRIMARY KEY,
-             name         TEXT NOT NULL UNIQUE COLLATE NOCASE,
-             description  TEXT NOT NULL,
-             tags         TEXT NOT NULL DEFAULT '',
-             body         TEXT NOT NULL DEFAULT '',
-             priority     INTEGER NOT NULL DEFAULT 5,
-             recorded_at  TEXT NOT NULL,
-             updated_at   TEXT NOT NULL,
-             read_count   INTEGER NOT NULL DEFAULT 0,
-             last_read_at TEXT
-         );
-
-         -- Serves the one ordering the `[Memory]` index renders in, so the per-turn read is a
-         -- scan of an index rather than a sort of the table.
-         CREATE INDEX IF NOT EXISTS memories_rank
-             ON memories(priority, recorded_at DESC);
-
-         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-             name,
-             description,
-             tags,
-             body,
-             content = 'memories',
-             content_rowid = 'id',
-             tokenize = 'porter unicode61'
-         );",
-    )?;
-    // The triggers are created by [`sync_triggers`] and nowhere else.
-    //
-    // A `CREATE TRIGGER IF NOT EXISTS` pass here first looked harmless and was the opposite: a
-    // trigger that had gone *missing*, however it went missing, was silently put back before
-    // `sync_triggers` read `sqlite_master`, so the comparison matched, no rebuild ran, and every
-    // write that landed while it was absent stayed out of the index for good.
-    // `repair_a_desynced_index` cannot see that either, because a missed *update* leaves the
-    // document counts equal. Reproduced end to end: an edit made with `memories_au` dropped was
-    // still unfindable after a normal restart, with `meka memory verify` reporting the store sound.
-    //
-    // Letting `sync_triggers` own creation costs nothing on a fresh database -- it finds none of
-    // the three, takes the replacement path, and creates all three plus a rebuild of an empty table
-    // inside one transaction, which is better than three autocommit statements anyway.
-    //
-    // Skipped when that swap rebuilt: the index is then one pass old, and probing it would only ask
-    // a question just answered.
+/// The `memories` table, its `memories_rank` index and the `memories_fts` virtual table are *not*
+/// created here. They are created by [`crate::session::migrations`], which owns the `CREATE` for
+/// every table the agent reads, so that one ledger describes that schema and an older store is
+/// carried forward by the same code path a new one is built by. This function is what is left, and
+/// it is a different kind of operation: reconciliation of a derived index against the table it is
+/// derived from, which is why it sits on the open path rather than in the ledger or in a command
+/// the user has to remember to run.
+///
+/// Two steps, both of which name no release and hold no knowledge of a past shape.
+/// [`sync_triggers`] asks whether this database's FTS triggers are the ones this build requires and
+/// replaces them if not, rebuilding the index because whatever the old ones did or failed to do is
+/// already in it. [`repair_a_desynced_index`] then probes for a drift the trigger comparison cannot
+/// see, and is skipped when that rebuild just ran, since it would only re-ask a question one pass
+/// of the table has already answered.
+///
+/// The triggers are created by [`sync_triggers`] and nowhere else, deliberately. A
+/// `CREATE TRIGGER IF NOT EXISTS` pass ahead of it first looked harmless and was the opposite: a
+/// trigger that had gone *missing*, however it went missing, was silently put back before
+/// `sync_triggers` read `sqlite_master`, so the comparison matched, no rebuild ran, and every write
+/// that landed while it was absent stayed out of the index for good.
+/// [`repair_a_desynced_index`] cannot see that either, because a missed *update* leaves the
+/// document counts equal. Reproduced end to end: an edit made with `memories_au` dropped was still
+/// unfindable after a normal restart, with `meka memory verify` reporting the store sound. That is
+/// also why the ledger's baseline creates the tables but not the triggers.
+///
+/// Letting [`sync_triggers`] own creation costs nothing on a fresh database: it finds none of the
+/// three, takes the replacement path, and creates all three plus a rebuild of an empty table inside
+/// one transaction, which is better than three autocommit statements anyway.
+pub(crate) fn reconcile_index(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
     if sync_triggers(connection)? {
         return Ok(());
     }
     repair_a_desynced_index(connection)
 }
 
+/// A store at head with its index reconciled, exactly as `initialize_schema` leaves one.
+///
+/// Test-only, and routed through [`crate::session::migrations`] rather than a local copy of the
+/// DDL: a memory test that built its own tables could pass against a schema production does not
+/// produce, which is the whole failure mode the single ledger exists to remove.
+#[cfg(test)]
+fn create_tables(connection: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    crate::session::migrations::create_for_test(connection)
+        .expect("the schema ledger builds a fresh store");
+    reconcile_index(connection)
+}
+
 /// The three triggers that uphold the external-content contract, and the single place their text
-/// lives so [`sync_triggers`] compares against exactly what [`create_tables`] writes.
+/// lives, so [`sync_triggers`] compares against exactly what it will write. Nothing else creates
+/// them, including the schema ledger that creates the tables they hang off.
 ///
 /// Every mutation of `memories` must be mirrored, and a delete must be told the *old* values so
 /// FTS can find the posting list to remove. A column added to the table and not added to all three
@@ -844,15 +831,29 @@ impl MemoryStore {
 
     /// A standalone in-memory store, for tests and for callers that want one without a session
     /// database. Schema is created eagerly, so the handle is usable on return.
+    ///
+    /// Built by [`crate::session::migrations`], the same ledger `initialize_schema` runs, so this
+    /// store is the shape a real one is rather than a second opinion about it. A fresh
+    /// `:memory:` database is unversioned and empty, so the ledger classifies it as new and runs
+    /// every step.
     pub async fn in_memory() -> Result<Arc<Self>> {
         let connection = Connection::open_in_memory().await.map_err(|error| {
             MekaError::Database(format!("failed to open the memory store: {error}"))
         })?;
         connection
-            .call(|connection| -> rusqlite::Result<_> { create_tables(connection) })
+            .call(|connection| -> std::result::Result<_, MekaError> {
+                let plan = crate::session::migrations::plan(connection)?;
+                crate::session::migrations::apply(connection, plan)?;
+                reconcile_index(connection).map_err(|error| {
+                    MekaError::Database(format!("failed to reconcile the memory index: {error}"))
+                })
+            })
             .await
-            .map_err(|error| {
-                MekaError::Database(format!("failed to create the memory tables: {error}"))
+            .map_err(|error| match error {
+                tokio_rusqlite::Error::Error(inner) => inner,
+                other => {
+                    MekaError::Database(format!("failed to create the memory tables: {other}"))
+                }
             })?;
         Ok(Arc::new(Self {
             connection: Some(Arc::new(connection)),

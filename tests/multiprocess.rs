@@ -812,3 +812,84 @@ fn two_servers_do_not_both_run_one_isolated_job() {
         logs
     );
 }
+
+/// Two processes opening one unmigrated store at the same time.
+///
+/// The in-process version of this lives in `src/session.rs` and drives two tasks on one runtime,
+/// which cannot see what two real processes do to each other's schema lock. Applying the migration
+/// twice is the failure: the second pass would try to add columns the first one just added, and
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent.
+///
+/// The store is rewound to the shape a 0.42 release left, stamp included, so both processes find
+/// work waiting rather than racing over nothing.
+#[test]
+fn two_processes_migrating_one_store_apply_it_once() {
+    let cluster = Cluster::new("");
+    {
+        let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
+        connection
+            .execute_batch(
+                "ALTER TABLE scheduled_jobs DROP COLUMN gate_kind;
+                 ALTER TABLE scheduled_jobs DROP COLUMN gate_spec;
+                 ALTER TABLE scheduled_jobs DROP COLUMN claimed_by;
+                 ALTER TABLE scheduled_jobs DROP COLUMN claimed_until;
+                 ALTER TABLE scheduled_jobs DROP COLUMN attempts;
+                 ALTER TABLE scheduled_jobs ADD COLUMN gate_command TEXT;
+                 ALTER TABLE scheduled_jobs ADD COLUMN gate_fire TEXT;
+                 PRAGMA user_version = 1;",
+            )
+            .expect("rewind the store to the 0.42 shape");
+    }
+
+    let mut first = cluster
+        .meka(&["session", "list"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the first host");
+    let mut second = cluster
+        .meka(&["session", "list"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the second host");
+    assert!(
+        first.wait().expect("wait").success(),
+        "the first host exits cleanly"
+    );
+    assert!(
+        second.wait().expect("wait").success(),
+        "the second host exits cleanly"
+    );
+
+    let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read the version");
+    assert_eq!(version, 2, "the store reached head");
+
+    for column in ["claimed_by", "gate_kind"] {
+        let occurrences: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('scheduled_jobs') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )
+            .expect("count the column");
+        assert_eq!(occurrences, 1, "`{column}` should exist exactly once");
+    }
+
+    let backups = std::fs::read_dir(cluster.data_dir())
+        .expect("read the data dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Not `contains(".bak")`: a staging file is `<name>.bak.partial` and is not a backup.
+            name.contains(".bak") && !name.ends_with(".partial")
+        })
+        .count();
+    assert_eq!(
+        backups, 1,
+        "one migration means one backup, not one per process"
+    );
+}

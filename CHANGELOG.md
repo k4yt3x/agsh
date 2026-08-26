@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-08-26
+
 ### Added
 
 - A scheduled job's gate can call a read-only tool, MCP or built-in, instead of a shell command.
@@ -14,12 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A job that cannot fire is marked and explained on every listing, `GET /v1/schedule` included.
 - The agent is told when a job stops being able to fire, or becomes able to again.
 - `[schedule] claim_lease` sets how long a host's claim on a due occurrence is good for.
+- meka migrates its own store on open, in one transaction; no upgrade from 0.42 on needs a script.
+- An existing store is copied beside itself before a migration touches it, and the copy is kept.
 
 ### Changed
 
 - **Breaking:** a gate is now `check` plus `when`; `command` and `fire` are gone (see Upgrading).
 - **Breaking:** `GET /v1/schedule` renders a gate as `check`/`kind`/`when`, not `command`/`fire`.
 - **Breaking:** a due job is leased rather than consumed, which adds three `scheduled_jobs` columns.
+- A store from an older release than 0.42, or from a newer meka, is refused by name and left alone.
 - A tool gate is authorised at the tool's own level, so gating no longer demands `unrestricted`.
 - A gate's authority is re-resolved at fire time, tool level included, not trusted from creation.
 - A gate refused for an unknown or non-read-only tool is a 422, not a 403; no token or level helps.
@@ -1618,7 +1623,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.42.2...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.43.0...HEAD
+[0.43.0]: https://github.com/k4yt3x/meka/compare/0.42.2...0.43.0
 [0.42.2]: https://github.com/k4yt3x/meka/compare/0.42.1...0.42.2
 [0.42.1]: https://github.com/k4yt3x/meka/compare/0.42.0...0.42.1
 [0.42.0]: https://github.com/k4yt3x/meka/compare/0.41.0...0.42.0
