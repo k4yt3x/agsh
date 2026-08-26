@@ -4,11 +4,13 @@
 //! scheduled prompt writes to a store meka owns, and the turn it eventually produces is permission
 //! -checked when it runs, so scheduling one grants nothing the session did not already have.
 //!
-//! The `gate` field is the exception, and is rejected below [`Permission::Unrestricted`] inside
-//! [`ScheduleCreateTool::execute`]. A gate is a shell command that runs unattended, on a timer,
-//! until someone cancels it -- persistent in a way `execute_command` is not, since that at least
-//! ends with the turn that called it. [`Tool::required_permission`] is per-tool and cannot vary by
-//! argument, so the check has to live in the body.
+//! The `gate` field is the exception, and is checked inside [`ScheduleCreateTool::execute`]
+//! against [`crate::schedule::gate_probe_is_authorised`]. A gate runs unattended, on a timer, until
+//! someone cancels it -- persistent in a way a tool call inside a turn is not, since that at least
+//! ends with the turn that made it. The bar depends on what the gate runs: a shell command needs
+//! `unrestricted` because it is unsandboxed, while a read-only tool call needs only what that tool
+//! needs. [`Tool::required_permission`] is per-tool and cannot vary by argument, so the check has
+//! to live in the body either way.
 //!
 //! Sub-agents deliberately get none of these tools. A sub-agent's session is ephemeral, so a job
 //! keyed to it would outlive the only conversation that could run it.
@@ -30,7 +32,7 @@ use crate::{
     error::{MekaError, Result},
     permission::Permission,
     provider::ToolDefinition,
-    schedule::{Gate, GateFire, Schedule, ScheduledJob},
+    schedule::{Gate, GatePredicate, GateProbe, Schedule, ScheduledJob},
     session::SessionManager,
 };
 
@@ -108,32 +110,42 @@ impl Tool for ScheduleCreateTool {
                     },
                     "gate": {
                         "type": "object",
-                        "description": "Optional. Run a shell command first and only take a turn \
-                                        if it says something happened. Turns an expensive poll \
-                                        into a cheap one, so a short `every` becomes affordable. \
-                                        Requires `unrestricted` permission: it runs with no sandbox.",
+                        "description": "Optional. Check something first and only take a turn if it \
+                                        says something happened. Turns an expensive poll into a \
+                                        cheap one, so a short `every` becomes affordable.",
                         "properties": {
-                            "command": {
-                                "type": "string",
-                                "description": "Shell command. A fast, read-only \
-                                                check whose output changes when, and \
-                                                only when, the watched thing does. \
-                                                Output that moves on its own (a \
-                                                timestamp) fires every tick; output \
-                                                that can return to an earlier value \
-                                                between polls (a bare count) hides \
-                                                the change in between."
+                            "check": {
+                                "type": "object",
+                                "description": "What to run. Either {\"command\": \"...\"} for a \
+                                                shell command, which needs `unrestricted` because \
+                                                it runs unsandboxed, or {\"tool\": \"name\", \
+                                                \"arguments\": {...}} to call a read-only tool, \
+                                                which needs only what that tool needs. Prefer the \
+                                                tool form when one exists: it is available at lower \
+                                                permission and returns structured data you can \
+                                                point `when.at` into.",
+                                "properties": {
+                                    "command": {"type": "string"},
+                                    "tool": {"type": "string"},
+                                    "arguments": {"type": "object"}
+                                }
                             },
-                            "fire": {
-                                "type": "string",
-                                "enum": ["on-change", "on-success"],
-                                "description": "'on-change' (default) fires when stdout differs \
-                                                from last time, for 'tell me when X changes'. \
-                                                'on-success' fires while the command exits 0, for \
-                                                'is X true yet'."
+                            "when": {
+                                "description": "What counts as 'something happened'. \"changed\" \
+                                                (default) fires when the whole result differs from \
+                                                last time. \"succeeded\" fires while the command \
+                                                exits 0 or the tool call does not error. \
+                                                {\"matches\": \"regex\"} fires when the result \
+                                                matches. {\"at\": \"/json/pointer\", \"is\": \
+                                                \"not-empty\"|\"empty\"|\"changed\"} judges one \
+                                                field. Use `at` for anything returning JSON: a \
+                                                result carrying a timestamp or an id differs on \
+                                                every call, so \"changed\" over the whole of it \
+                                                fires every tick and costs the turns the gate is \
+                                                meant to save."
                             }
                         },
-                        "required": ["command"]
+                        "required": ["check"]
                     },
                     "isolated": {
                         "type": "boolean",
@@ -205,6 +217,7 @@ impl Tool for ScheduleCreateTool {
             created_at: now,
             last_fired_at: None,
             next_fire_at,
+            attempts: 0,
         };
         self.session_manager
             .schedule_store()
@@ -225,7 +238,7 @@ impl Tool for ScheduleCreateTool {
             describe_fire_time(next_fire_at)
         );
         if job.gate.is_some() {
-            summary.push_str(" Gated: a turn happens only when the gate command says so.");
+            summary.push_str(" Gated: a turn happens only when the gate says so.");
         }
         if job.isolated {
             summary.push_str(" Runs in a fresh session, so its result will not appear here.");
@@ -243,49 +256,38 @@ impl ScheduleCreateTool {
         let Some(raw) = input.get("gate").filter(|value| !value.is_null()) else {
             return Ok(None);
         };
+        let refuse = |message: String| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message,
+        };
+        let probe = GateProbe::parse_request(raw.get("check")).map_err(refuse)?;
+        let predicate = GatePredicate::parse_request(raw.get("when")).map_err(refuse)?;
+
         // A gate outlives the turn that created it and runs with no supervision, which is a
-        // stronger grant than `execute_command`'s one-shot use. Checked here rather than through
-        // `required_permission` so an ungated reminder still works at read.
-        //
-        // `allows_unattended_shell` rather than `allows` or an `Ord` comparison: the capability
-        // predicate treats `Ask` as equal to the levels above it, and `Ask` is precisely the level
-        // a gate must not run at, because there is nobody to approve an unattended command.
+        // stronger grant than a tool call inside a turn. Checked here rather than through
+        // `required_permission` so an ungated reminder still works at read, and because the bar
+        // depends on the probe: a shell command needs `unrestricted`, a read-only tool call needs
+        // only what that tool needs.
         let permission = self.shared_permission.get();
-        if !permission.allows_unattended_shell() {
-            let reason = match permission {
-                Permission::Ask => {
-                    "a gate runs unattended, with nobody present to approve it, so \
-                                    `ask` is not enough"
-                }
-                _ => "a gate runs a shell command unattended on a schedule",
-            };
-            return Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message: format!(
-                    "{}; it needs `unrestricted` permission (currently {}), because a gate runs with \
-                     no sandbox at all. Create \
-                     the job without `gate` and check the condition inside the prompt instead.",
-                    reason, permission
-                ),
-            });
+        if let Err(refusal) = crate::schedule::gate_probe_is_authorised(
+            &probe,
+            permission,
+            self.config.gate_tools.as_deref(),
+        ) {
+            return Err(refuse(format!(
+                "{}. Create the job without `gate` and check the condition inside the prompt \
+                 instead.",
+                refusal.explain(&probe, permission)
+            )));
         }
 
-        let command = require_str(raw, "command", tool_name)?;
-        let fire = match raw.get("fire").and_then(serde_json::Value::as_str) {
-            None => GateFire::OnChange,
-            Some(text) => GateFire::parse(text).map_err(|message| MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
-                message,
-            })?,
-        };
         Ok(Some(Gate {
-            command: command.to_string(),
-            fire,
+            probe,
+            predicate,
             last_output: None,
             // Recorded, not re-derived. The check above proves the level *now*; the row will be
-            // executed by some other process on some later day, and `prepare` re-reads this to
-            // confirm the authority still stands. `permission` is `Unrestricted` here by the guard
-            // above.
+            // executed by some other process on some later day, and `prepare` re-checks both this
+            // and the live level before running anything.
             permission,
         }))
     }
@@ -348,6 +350,10 @@ fn parse_schedule(
 
 pub(super) struct ScheduleListTool {
     pub context: ScheduleContext,
+    /// Carried only to resolve a gate's tool when reporting whether the gate can still fire. The
+    /// listing itself creates nothing, so none of the creation limits in here apply to it.
+    pub config: ResolvedScheduleConfig,
+    pub shared_permission: crate::permission::SharedPermission,
 }
 
 #[async_trait]
@@ -357,7 +363,7 @@ impl Tool for ScheduleListTool {
             name: "schedule_list".to_string(),
             description: "List the scheduled jobs for this session, with their next fire times, \
                 gates, and full prompts. Your per-turn context already carries a short index, so \
-                reach for this when you need a job's exact prompt or gate command."
+                reach for this when you need a job's exact prompt or gate check."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -405,11 +411,26 @@ impl Tool for ScheduleListTool {
                 ));
             }
             if let Some(gate) = &job.gate {
+                // `detail`, not `summary`: this is the surface the model authored the job on, and
+                // it cannot otherwise read back the arguments it wrote.
                 rendered.push_str(&format!(
                     "  gate ({}): {}\n",
-                    gate.fire.as_str(),
-                    gate.command
+                    gate.predicate.summary(),
+                    gate.probe.detail()
                 ));
+            }
+            // A job that cannot fire is the difference between one quietly waiting and one that is
+            // dead, and the two look identical without this line: both simply never fire, and
+            // `last fired` is absent for a brand-new job too. Outside the `gate` branch because an
+            // ungated job on a session at `none` is held as well. Reported to the model because it
+            // can act on it -- `schedule_cancel` needs only `read` -- where until now the only
+            // trace was a `warn!` in the operator's log.
+            if let Some(reason) = crate::schedule::job_withheld_reason(
+                job,
+                self.shared_permission.get(),
+                self.config.gate_tools.as_deref(),
+            ) {
+                rendered.push_str(&format!("  NOT FIRING: {}\n", reason));
             }
             if job.isolated {
                 rendered.push_str("  runs in a fresh session\n");
@@ -496,14 +517,16 @@ pub(super) fn build(
         Arc::new(ScheduleCreateTool {
             session_manager: session_manager.clone(),
             session_id: session_id.clone(),
-            config,
-            shared_permission,
+            config: config.clone(),
+            shared_permission: shared_permission.clone(),
         }),
         Arc::new(ScheduleListTool {
             context: ScheduleContext {
                 session_manager: session_manager.clone(),
                 session_id: session_id.clone(),
             },
+            config,
+            shared_permission,
         }),
         Arc::new(ScheduleCancelTool {
             context: ScheduleContext {
@@ -609,7 +632,7 @@ mod tests {
                 serde_json::json!({
                     "prompt": "x",
                     "every": "1h",
-                    "gate": {"command": "true"}
+                    "gate": {"check": {"command": "true"}}
                 }),
                 CancellationToken::new(),
             )
@@ -666,6 +689,114 @@ mod tests {
         assert!(error.to_string().contains("future"), "{error}");
     }
 
+    /// The model can read back the arguments it wrote into a tool gate.
+    ///
+    /// `schedule_list` is the only surface that shows them: the HTTP view and `meka schedule list`
+    /// are read by parties who did not author the job, and arguments are where a pasted credential
+    /// would sit. Without this the model could not tell a gate it built with the wrong `folder`
+    /// from a correct one.
+    #[tokio::test]
+    async fn list_shows_a_tool_gate_s_arguments_to_the_model_that_wrote_them() {
+        let (_tool, session_id, manager) = harness().await;
+        // Planted through the store rather than `schedule_create`: the creation door needs a live
+        // tool dispatcher to authorise a tool gate, and what is under test here is the rendering.
+        let id = session_id.read().await.expect("harness made a session");
+        let schedule = Schedule::parse_every("1h").expect("parses");
+        let now = Utc::now();
+        manager
+            .schedule_store()
+            .create_scheduled_job(&ScheduledJob {
+                attempts: 0,
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: id,
+                schedule: schedule.clone(),
+                prompt: "watch it".to_string(),
+                gate: Some(Gate {
+                    probe: GateProbe::Tool {
+                        name: "mcp__bridge__unseen".to_string(),
+                        arguments: serde_json::json!({"folder": "sentinel-9c3f"}),
+                    },
+                    predicate: GatePredicate::Succeeded,
+                    last_output: None,
+                    permission: Permission::Read,
+                }),
+                isolated: false,
+                created_at: now,
+                last_fired_at: None,
+                next_fire_at: schedule.next_after(now).expect("has a next fire"),
+            })
+            .await
+            .expect("plants the job");
+
+        let list = ScheduleListTool {
+            context: ScheduleContext {
+                session_manager: manager.clone(),
+                session_id: session_id.clone(),
+            },
+            config: ResolvedScheduleConfig::default(),
+            shared_permission: crate::permission::SharedPermission::new(
+                Permission::Unrestricted,
+                crate::permission::EnabledPermissions::DEFAULT,
+            ),
+        };
+        let listed = text_content(
+            &list
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+                .expect("lists"),
+        );
+        assert!(listed.contains("mcp__bridge__unseen"), "{listed}");
+        assert!(
+            listed.contains("sentinel-9c3f"),
+            "the arguments the model wrote must come back to it: {listed}"
+        );
+    }
+
+    /// `schedule_list` is where the model looks when it wants detail, so it is where the reason a
+    /// job is dead belongs. The listing used to show the gate's *definition* and stop there, which
+    /// reads as healthy however long the gate has been refused.
+    #[tokio::test]
+    async fn list_reports_a_gate_that_cannot_currently_fire() {
+        let (tool, session_id, manager) = harness().await;
+        tool.execute(
+            serde_json::json!({
+                "prompt": "watch the build",
+                "every": "1h",
+                "gate": {"check": {"command": "gh pr checks"}, "when": "changed"}
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("creates at unrestricted");
+
+        // What the operator did afterwards: dropped the session to `read`.
+        let list = ScheduleListTool {
+            context: ScheduleContext {
+                session_manager: manager.clone(),
+                session_id: session_id.clone(),
+            },
+            config: ResolvedScheduleConfig::default(),
+            shared_permission: crate::permission::SharedPermission::new(
+                Permission::Read,
+                crate::permission::EnabledPermissions::DEFAULT,
+            ),
+        };
+        let listed = text_content(
+            &list
+                .execute(serde_json::json!({}), CancellationToken::new())
+                .await
+                .expect("lists"),
+        );
+        assert!(
+            listed.contains("NOT FIRING"),
+            "a withheld gate must say so: {listed}"
+        );
+        assert!(
+            listed.contains("unrestricted"),
+            "and name what it needs: {listed}"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_and_cancel_round_trip() {
         let (tool, session_id, manager) = harness().await;
@@ -681,6 +812,11 @@ mod tests {
                 session_manager: manager.clone(),
                 session_id: session_id.clone(),
             },
+            config: ResolvedScheduleConfig::default(),
+            shared_permission: crate::permission::SharedPermission::new(
+                Permission::Unrestricted,
+                crate::permission::EnabledPermissions::DEFAULT,
+            ),
         };
         let listed = text_content(
             &list

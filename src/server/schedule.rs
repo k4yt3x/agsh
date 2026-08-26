@@ -57,7 +57,7 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 /// warning. The exemption keeps serve eligible so the flag can be honoured at all; it does not make
 /// serve the winner. Which host takes a given occurrence is a race between their tickers, but only
 /// a race for *which*: `prepare` claims the occurrence with a compare-and-swap
-/// (`ScheduleStore::claim_by_advancing`), so the hosts that lose it return before running the gate.
+/// (`ScheduleStore::claim_occurrence`), so the hosts that lose it return before running the gate.
 ///
 /// Otherwise there are two ways to be runnable, and the order matters. A resident session is
 /// runnable by definition, and has to be checked first because *this* process is the one holding
@@ -247,7 +247,7 @@ async fn deliver_ready_outcomes(state: &ServerState) -> std::ops::ControlFlow<()
             }
         };
         let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-        // Stamped before the turn, like `stamp_scheduled_job_fired`: an outcome that wedges
+        // Stamped before the turn, unlike the scheduler's own completion: an outcome that wedges
         // the process must not be redelivered on every restart.
         if let Err(error) = state
             .shared
@@ -652,6 +652,7 @@ mod tests {
 
     fn job(isolated: bool) -> crate::schedule::ScheduledJob {
         crate::schedule::ScheduledJob {
+            attempts: 0,
             id: "7f3a1b2c".to_string(),
             session_id: uuid::Uuid::nil(),
             schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),

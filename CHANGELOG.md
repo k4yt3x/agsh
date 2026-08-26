@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A scheduled job's gate can call a read-only tool, MCP or built-in, instead of a shell command.
+- Gate conditions `matches` (regex) and `at` (a JSON pointer, tested empty / not-empty / changed).
+- A job that cannot fire is marked and explained on every listing, `GET /v1/schedule` included.
+- The agent is told when a job stops being able to fire, or becomes able to again.
+- `[schedule] claim_lease` sets how long a host's claim on a due occurrence is good for.
+
+### Changed
+
+- **Breaking:** a gate is now `check` plus `when`; `command` and `fire` are gone (see Upgrading).
+- **Breaking:** `GET /v1/schedule` renders a gate as `check`/`kind`/`when`, not `command`/`fire`.
+- **Breaking:** a due job is leased rather than consumed, which adds three `scheduled_jobs` columns.
+- A tool gate is authorised at the tool's own level, so gating no longer demands `unrestricted`.
+- A gate's authority is re-resolved at fire time, tool level included, not trusted from creation.
+- A gate refused for an unknown or non-read-only tool is a 422, not a 403; no token or level helps.
+- `schedule_list` shows a tool gate's arguments and its kind; other listings show the kind only.
+- A session at `none` accepts no new scheduled job over HTTP, since none of them could ever fire.
+- A job whose delivery fails three times is parked and reported, instead of retried forever.
+
+### Fixed
+
+- A session at `none` no longer fires scheduled jobs; the woken turn could not act or cancel.
+- A one-shot job held back for permission is kept, not deleted; its gate was never evaluated.
+- Cancelling a job a sweep removed first reports a miss; both doors used to report success.
+- A host that crashes mid-delivery no longer loses the occurrence, or for a one-shot the whole job.
+- A cancellation issued while a job is being delivered is no longer undone when the host hands back.
+- `meka schedule list` no longer lets a job's prompt carry a terminal escape into the table.
+
 ## [0.42.2] - 2026-08-25
 
 ### Fixed

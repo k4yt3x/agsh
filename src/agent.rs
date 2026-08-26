@@ -137,6 +137,12 @@ pub struct AgentOptions {
     /// updates or permission changes, which is fine for one-shot sub-agents whose tool list and
     /// permission level are fixed at spawn time.
     pub system_prompt_override: Option<String>,
+    /// How to resolve a scheduled gate's tool when telling the model which of its jobs are held.
+    ///
+    /// `None` leaves every tool gate reported as unresolvable, which is honest for a process that
+    /// genuinely has no dispatcher, and is what a sub-agent gets: it does not own the parent's
+    /// jobs and has no `[Scheduled]` section to fill.
+    pub gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
 }
 
 /// What set a compaction going. Selects the summarisation strategy, so it is not merely
@@ -822,6 +828,9 @@ impl Agent {
     ) -> Self {
         let options = AgentOptions {
             sandboxed_shell: parent_options.sandboxed_shell,
+            // A sub-agent has no `[Scheduled]` section: the jobs belong to the parent's
+            // session, and `new_subagent` gives it a session of its own.
+            gate_tools: None,
             context_messages: parent_options.context_messages,
             // Deliberately not inherited. Instructions are installation-wide and describe the
             // top-level agent; a worker handed a task by another agent is not that agent. The
@@ -1300,6 +1309,13 @@ impl Agent {
                 &memories,
                 &mcp_instructions,
                 &scheduled,
+            )
+            // The live level, not the one recorded on the row: this answers "can it fire *now*",
+            // which is the same question `prepare` asks a moment later on the scheduler's thread.
+            .with_gate_authority(
+                &scheduled,
+                self.shared_permission.get(),
+                self.options.gate_tools.as_deref(),
             );
             let mut last = self.last_rendered_world.write().await;
             // An unreadable store carries the previous snapshot's memories forward, so the diff
@@ -4087,6 +4103,7 @@ mod tests {
         let options = AgentOptions {
             streaming: true,
             sandboxed_shell: false,
+            gate_tools: None,
             context_messages: None,
             auto_compact: false,
             compact_checkpoint: false,

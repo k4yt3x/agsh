@@ -1,6 +1,39 @@
 # Upgrading
 
-Most upgrades are a binary swap: replace the old executable with the new one and carry on. This page covers the one that is not.
+Most upgrades are a binary swap: replace the old executable with the new one and carry on. This page covers the ones that are not.
+
+## 0.42 to 0.43
+
+0.43 changes two things about the `scheduled_jobs` table, and one script does both.
+
+It stores a scheduled job's gate differently. A gate used to be two columns, `gate_command` and `gate_fire`; it is now `gate_kind` plus a JSON `gate_spec`, which is what lets a gate call a read-only tool instead of a shell command. `migrate-0.42-to-0.43.py`, attached to the 0.43 release, converts them.
+
+It also claims a due job by *leasing* it rather than by consuming its row, which adds `claimed_by`,
+`claimed_until` and `attempts`. Those start empty, so for the lease half the migration is the columns
+themselves: stop meka first and nothing is in flight to preserve. The gain is that a host which
+crashes mid-delivery no longer loses the occurrence, and for a one-shot no longer loses the job.
+
+**If you have no scheduled jobs, there is nothing to do here.** The script still adds the columns,
+which every read in 0.43 names.
+
+You cannot skip it and find out later. Every *read* of `scheduled_jobs` names `gate_kind`, so 0.43 against an unmigrated store fails with `no such column: gate_kind` and scheduling stops entirely, listings included. That is loud and harmless; the quiet failure is the one below.
+
+Take a backup first (`sqlite3 meka.db '.backup meka.db.bak'`) and stop any running meka. The row conversion is one transaction, but Python's `sqlite3` commits `ALTER TABLE` statements outside it, so a run interrupted at exactly the wrong moment can leave the two new columns added and the rows unconverted -- which 0.43 reads as a set of *ungated* jobs. Re-running the script fixes that; the backup is for the interruption that does not get a re-run.
+
+Coming from 0.41, run `migrate-0.41-to-0.42.py` first. This script checks and refuses a 0.41 store rather than converting it into a shape 0.43 still cannot read.
+
+```bash
+python3 migrate-0.42-to-0.43.py            # reports what it would change; writes nothing
+python3 migrate-0.42-to-0.43.py --apply    # does it
+```
+
+Order is looser than the 0.41 upgrade: this script adds the two columns itself, so it can run before or after you install 0.43. What it must not do is run *after* 0.43's scheduler has been let loose on the store.
+
+### Read the `!` lines
+
+A row 0.42 refused to load -- a half-written gate, or a `gate_fire` value it did not recognise -- cannot be converted, so the script reports it and leaves it alone. That row is the quiet failure: 0.43 reads a NULL `gate_kind` as "no gate at all", so an `every = "30s"` watcher that used to fire on a condition becomes one that fires **every thirty seconds**. Cancel those jobs with `meka schedule cancel <id>`, or recreate them with a gate, before starting 0.43's scheduler. The script prints the count and the ids.
+
+Everything else is preserved, including each gate's stored baseline, so a `changed` gate does not fire spuriously on its first evaluation after the upgrade. Re-running the script is a no-op.
 
 ## 0.41 to 0.42
 

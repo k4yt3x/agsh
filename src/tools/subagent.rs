@@ -2408,6 +2408,7 @@ mod tests {
             parent_options: AgentOptions {
                 streaming: false,
                 sandboxed_shell: false,
+                gate_tools: None,
                 context_messages: None,
                 auto_compact: false,
                 compact_checkpoint: false,

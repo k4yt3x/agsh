@@ -786,6 +786,48 @@ impl McpClientManager {
         self.servers.get(server_name).cloned()
     }
 
+    /// Whether the server owning a namespaced tool name has yet to finish its first connection.
+    ///
+    /// For callers that report a *standing* condition rather than act on one. A tool missing from
+    /// the snapshot because its server is still handshaking is not the same as one whose server
+    /// failed or was never configured, and saying so out loud before the handshake finishes tells
+    /// the reader something untrue that fixes itself a moment later. Anything that has to *run* the
+    /// tool should keep treating both as unavailable, which is what it is.
+    ///
+    /// Split on the first `__`, like [`Self::unavailable_tool_reason`]: a server name cannot
+    /// contain one (`sanitize::normalize_server_name`), so the first occurrence separates server
+    /// from tool. A name with no `__` after the prefix is not one meka minted and answers `false`.
+    pub async fn server_is_still_connecting(&self, namespaced_tool: &str) -> bool {
+        let Some((server, _tool)) = namespaced_tool
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+        else {
+            return false;
+        };
+        match self.servers.get(server) {
+            Some(entry) => matches!(entry.state().await, ServerState::Pending),
+            None => false,
+        }
+    }
+
+    /// Find a registered MCP tool by the name the model uses (`mcp__server__tool`).
+    ///
+    /// Reads [`Self::tools_snapshot`], which `update_server_tools` keeps current, so this is a map
+    /// lookup rather than a round trip. That matters because the caller is a scheduled job's gate,
+    /// asked once per poll interval per job: resolving through
+    /// [`Self::list_advertised_tools`] would put a `tools/list` on the wire every tick.
+    ///
+    /// `None` covers both "no such tool" and "its server is not connected", which are the same
+    /// answer to the only question a gate asks: can this be evaluated right now.
+    pub async fn tool_by_name(&self, name: &str) -> Option<Arc<dyn crate::tools::Tool>> {
+        let snapshot = self.tools_snapshot.read().await;
+        snapshot
+            .values()
+            .flatten()
+            .find(|tool| tool.definition().name == name)
+            .map(Arc::clone)
+    }
+
     pub fn server_names(&self) -> Vec<String> {
         self.servers.keys().cloned().collect()
     }

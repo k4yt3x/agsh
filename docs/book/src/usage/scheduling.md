@@ -41,55 +41,131 @@ A plain recurring job spends a full model turn on every fire, whether or not any
 Checking something every 15 minutes is roughly a hundred turns a day to say "nothing new" ninety-odd
 times.
 
-A **gate** is a shell command run before the turn. Only if it says something happened does the turn
-occur. The interval then costs a process spawn instead of a model call, which is what makes a short
-cadence reasonable:
+A **gate** is a cheap check run before the turn. Only if it says something happened does the turn
+occur. The interval then costs a tool call or a process spawn instead of a model call, which is what
+makes a short cadence reasonable.
+
+A gate has two halves. `check` is what to run, and `when` is what counts as "something happened":
 
 ```
 schedule_create(
   every: "30s",
-  gate: { command: "gh pr checks 123 --json state -q '.[].state' | sort -u", fire: "on-change" },
+  gate: {
+    check: { command: "gh pr checks 123 --json state -q '.[].state' | sort -u" },
+    when: "changed"
+  },
   prompt: "CI state for PR 123 changed. Investigate and report."
 )
 ```
 
-| `fire` | Fires when | Use for |
-|--------|-----------|---------|
-| `on-change` (default) | stdout differs from the previous run | "tell me when the build **finishes**" |
-| `on-success` | the command exits 0 | "is this true yet" |
+### What a gate can check
 
-The gate's stdout is passed into the turn it triggers, so the model does not re-run the check the
-gate just ran.
+| `check` | Runs | Needs |
+|---------|------|-------|
+| `{ command: "..." }` | a shell command, unsandboxed | `unrestricted` |
+| `{ tool: "name", arguments: {...} }` | a tool call, by the name the model uses | `read`, and the tool must resolve to `read` |
 
-A gate's first evaluation always fires: with no previous output to compare against, "changed" is the
-honest answer, and it means a typo in the command surfaces immediately instead of lying quiet.
+A tool gate is the one to reach for when a tool exists for the job. It is available at a far lower
+permission, because a structured call to a server you configured is not a shell, and it returns
+structured data that `when.at` can point into:
 
-**An `on-change` gate is only as good as the stability of its output.** The command should print
-something that changes when, and only when, the watched thing does, which is a stronger requirement
-than "read-only" and is where most gates go wrong. It fails in both directions. Output carrying
-something that moves on its own (a timestamp, an elapsed time, an unsorted list whose order varies)
-differs on every evaluation, so the gate fires every tick and costs more than the ungated job it
-replaced. Output that can return to an earlier value between polls (a bare count, where two events
-arrive and one is consumed) reads as unchanged, and the gate silently misses what happened in
-between. Pairing a count with a monotonic marker, as in `git rev-list --count HEAD` alongside the
-commit sha, avoids both.
+```
+schedule_create(
+  every: "1m",
+  gate: {
+    check: { tool: "mcp__mekabridge__unseen", arguments: {} },
+    when: { at: "/chats", is: "not-empty" }
+  },
+  prompt: "There are unseen chats. Read them and reply if anything needs an answer."
+)
+```
 
-> **Gates need `unrestricted` permission.** A gate is a shell command that runs unattended, on a
-> timer, until someone cancels it: a longer-lived grant than `execute_command`, which at least ends
-> with the turn that called it. It also runs with **no sandbox**, so `workspace` cannot authorise
-> one -- a level whose whole meaning is a write boundary must not hand out a command that has none.
-> Ungated reminders work at `read`.
+**A gate may only call a tool that resolves to `read`.** A gate asks a question; a tool that can act
+is not one. This is checked when the job is created *and* again every time it fires, so a tool that
+resolves higher after an operator retunes it stops being a gate rather than
+carrying on with authority nobody granted it.
 
-A gate that cannot run at all -- it times out, or the shell fails to start it -- is **not** treated
-as "nothing happened". It is logged as a warning, because a watcher whose command broke otherwise
-looks exactly like a healthy watcher with nothing to report.
+### When a gate fires
 
-A non-zero **exit code** is different, and `on-change` deliberately does not treat it as a failure:
-for a large class of good gates it is the signal. `diff -q a b` and `git diff --exit-code` exit 1
-exactly when there *is* a difference; `grep ERROR log` exits 1 through the entire quiet period it is
-watching; `curl -f` exits non-zero until the endpoint returns. `on-change` compares stdout as usual
-and logs the exit code, so a genuinely broken command is visible in the log without a working one
-being silenced. `on-success` reads the exit code by definition.
+| `when` | Fires when |
+|--------|-----------|
+| `"changed"` (default) | the whole result differs from the previous evaluation |
+| `"succeeded"` | the command exits 0, or the tool call did not return an error |
+| `{ matches: "<regex>" }` | the result matches the pattern |
+| `{ at: "<json pointer>", is: "not-empty" \| "empty" \| "changed" }` | the pointed-at value satisfies the test |
+
+One trap in the `"succeeded"` row: most MCP tools never set an error, so it is true on every
+evaluation and the job fires every interval. It earns its place on a *shell* gate, where the exit
+code is a real signal. For a tool, reach for `at` instead.
+
+The gate's output is passed into the turn it triggers, so the model does not re-run the check the
+gate just ran. A pointer narrows what is *judged*, not what the model is told: the turn still sees
+the whole result, because the surrounding fields are usually what makes the fire worth reading. The
+turn sees at most 8 KiB of it, and `at` will read a document up to a megabyte; past that there is
+nothing for a pointer to point into and the gate reports that the probe did not return JSON. A gate
+should be reading a status, not a payload.
+
+The two shapes that compare against the previous evaluation -- `"changed"`, and `at` with
+`is: "changed"` -- always fire the first time: with nothing to compare against, "changed" is the
+honest answer, and it means a typo surfaces immediately instead of lying quiet. The others judge the
+result on its own, so a first evaluation is no different from any other: `"succeeded"` on a command
+that exits non-zero does not fire, and neither does a `matches` whose pattern is absent.
+
+**`changed` is only as good as the stability of the result.** The check should produce something
+that changes when, and only when, the watched thing does, which is a stronger requirement than
+"read-only" and is where most gates go wrong. It fails in both directions. A result carrying
+something that moves on its own (a timestamp, an elapsed time, a request id, an unsorted list whose
+order varies) differs on every evaluation, so the gate fires every tick and costs more than the
+ungated job it replaced. A result that can return to an earlier value between polls (a bare count,
+where two events arrive and one is consumed) reads as unchanged, and the gate silently misses what
+happened in between.
+
+This is the reason `at` exists. Almost any JSON result carries a field that moves on its own, so
+`"changed"` over the whole of it is usually wrong; `{ at: "/chats", is: "changed" }` watches the one
+field you mean and ignores the `checked_at` beside it. For a shell gate, pairing a count with a
+monotonic marker (`git rev-list --count HEAD` alongside the commit sha) does the same job.
+
+> **A shell gate needs `unrestricted` permission.** It runs unattended, on a timer, until someone
+> cancels it: a longer-lived grant than `execute_command`, which at least ends with the turn that
+> called it. It also runs with **no sandbox**, so `workspace` cannot authorise one -- a level whose
+> whole meaning is a write boundary must not hand out a command that has none. A *tool* gate is not
+> held to this: `read` carries it, provided the tool resolves to `read` as well. Ungated reminders
+> work at `read`.
+
+> **`execute_command` is a tool, and that is a door.** Where a sandbox backend is usable it resolves
+> to `read`, so `check: { tool: "execute_command", arguments: { command: "..." } }` is a legitimate
+> tool gate at `read` -- an arbitrary command, on a timer, from a session that could not have
+> authorised the shell form. What makes that acceptable is that the two are not the same thing: a
+> gate dispatches at `read`, which is the level `Confinement::resolve` sandboxes, so the command
+> runs read-only-confined rather than as the bare `sh -c` a `command` gate would be. Where no
+> sandbox is available the same tool resolves above `read` and the gate is refused instead, so
+> "admitted" and "confined" cannot come apart. The confinement blocks writes, not the network: treat
+> such a gate as something that can read this machine and talk to the internet, unattended, for as
+> long as the job exists.
+
+A gate that cannot run at all -- it times out, the shell fails to start it, or its MCP server is not
+connected -- is **not** treated as "nothing happened". It is logged as a warning and the occurrence
+is declined, because a watcher whose check broke otherwise looks exactly like a healthy watcher with
+nothing to report. The marker that tells the *agent* about it needs two consecutive failures, and
+those are now an occurrence or a lease apart rather than a poll interval, so a standing breakage
+takes two periods to be reported rather than twenty seconds. That is the price of not re-running a
+broken check at tick cadence.
+
+Declined means *spent*, exactly as it does for a gate that ran and said no. A recurring job moves to
+its next occurrence, so a six-hour job whose server is down is probed once every six hours rather
+than on every poll tick. A one-shot has no next occurrence to move to, so it keeps its claim instead
+and the retry waits out `[schedule] claim_lease` (an hour by default) -- long enough that a server
+restarting near the job's due time does not cost the reminder, and bounded, because each of those
+retries counts against the ceiling below. Either way the gate's stored baseline is left alone, so
+when the check starts working again it compares against the last value actually observed and reports
+the change that happened while it was broken.
+
+A non-zero **exit code** is different, and only `succeeded` reads it as failure: for a large class
+of good gates it is the signal. `diff -q a b` and `git diff --exit-code` exit 1 exactly when there
+*is* a difference; `grep ERROR log` exits 1 through the entire quiet period it is watching; `curl -f`
+exits non-zero until the endpoint returns. Every other predicate judges the output and logs the exit
+code at debug level, so `-vv` will show you a command that is failing when you suspect one, without
+a warning on every tick of the many gates for which a non-zero exit is the normal state.
 
 ## Where jobs run
 
@@ -112,10 +188,41 @@ Jobs all live in the same database, so a host that does not fire a job has not l
 session nobody has open simply waits, and fires as soon as something that can run it picks it up:
 another host, or a `meka serve` daemon pointed at the same data directory.
 
+### Claiming an occurrence
+
+A due job is *leased* before it runs: the host records itself and an expiry on the row, delivers the
+turn, and then advances the schedule (or retires a one-shot). Three consequences worth knowing:
+
+- **A crash costs a retry, not the job.** The row is untouched until the turn is delivered, so a
+  host that dies mid-delivery leaves a lease that expires and the next host takes the occurrence.
+  Before this a claim consumed the row, and a crash lost the occurrence outright -- for a one-shot,
+  the whole reminder, with nothing anywhere to recover it from.
+- **A cancellation always wins.** Cancelling deletes the row unconditionally; a host handing an
+  occurrence back only releases its own lease, so a cancel issued while a gate is running cannot be
+  undone by the handback.
+- **A job that keeps failing to be delivered is parked.** Claims that end in neither a delivery nor
+  a handback are counted, and after three the job stops being retried. Two things reach that count:
+  a host that dies or panics mid-delivery, and a one-shot whose gate probe cannot be evaluated.
+  Both leave their claim to expire rather than giving it back, so those three attempts are a lease
+  apart rather than a tick apart: three panics in half a minute would otherwise park a job whose
+  only problem was a blip, and nothing retires a parked recurring job afterwards. The
+  job is not deleted: it stays listed, cancellable, and marked as held with the reason, because a
+  prompt that crashes meka is something to look at rather than something to throw away. Recreate it,
+  or cancel it. A host that simply declines a job it cannot take -- `meka serve` finding the session
+  locked by a REPL -- does not count, since that says nothing about the job.
+
+`[schedule] claim_lease` (default `"1h"`) is how long a lease is good for, and therefore how long a
+crashed host's occurrence waits before another host takes it. It must exceed a gate probe plus a
+turn: a lease that expires under a host still working lets a second host take the same occurrence,
+which for a session-bound job is caught by the session lock but for an `isolated` job would run the
+turn twice. A host refuses to start on a `claim_lease` at or under `gate_timeout`, since that half is
+checkable; the turn after the probe is unbounded, so leave real headroom on top rather than treating
+that check as the whole answer.
+
 Two hosts sharing a session do not fight over its jobs. A session is held by one process at a time,
 and `meka serve` leaves that session's jobs to whoever holds it rather than reaching for them and
-handing the occurrence back afterwards — which matters most for a gated job, since deciding late
-would mean running its shell command on every tick.
+handing the occurrence back afterwards -- which matters most for a gated job, since deciding late
+would mean running its probe on every tick.
 
 The exception is an `isolated` job, which runs in a session of its own and so needs nothing from the
 one that created it. `meka serve` stays eligible for those whatever else holds the session, because
@@ -125,11 +232,12 @@ with a warning. Run isolated jobs under `meka serve` alone if you want the flag 
 
 ### More than one host on the same database
 
-Several meka processes pointed at one data directory — two `meka serve` instances, or a daemon and
-a terminal — all poll the same table, so the same occurrence appears in several due lists at once.
-Each occurrence is nevertheless run once. A host takes it by moving the job's next fire time off
-the value it read, in a single conditional write, and the hosts that lose that write stop before
-evaluating the gate: no duplicate shell command, no duplicate turn, no duplicate isolated session.
+Several meka processes pointed at one data directory -- two `meka serve` instances, or a daemon and
+a terminal -- all poll the same table, so the same occurrence appears in several due lists at once.
+Each occurrence is nevertheless run once. A host takes it by leasing it in a single conditional
+write -- recording itself and an expiry on a row that no other host currently holds -- and the hosts
+that lose that write stop before evaluating the gate: no duplicate probe, no duplicate turn, no
+duplicate isolated session.
 Which host wins is a race between their tickers and is not something you can pin down; that only
 one wins is.
 
@@ -157,10 +265,10 @@ That collapsing is per job. A session with several jobs all due at once still wa
 and a sweep runs at most `[schedule] max_consecutive_fires` (5 by default) of any **one session's**
 jobs before moving on. The rest keep their occurrence and their gate baseline and are taken by the
 next sweep, most-overdue first, so nothing is lost and nothing starves. A job held over runs no gate,
-so holding one over is nearly free — the sweep still evaluates whether the job is one it can run.
+so holding one over is nearly free -- the sweep still evaluates whether the job is one it can run.
 
 **What this does and does not do.** It bounds a *batch*, not a total: forty due jobs still produce
-forty turns, and they are not spaced out — a sweep that ran long leaves the next one already due.
+forty turns, and they are not spaced out -- a sweep that ran long leaves the next one already due.
 What changes is that they arrive in groups of five, so under `meka serve` another session's single
 due job is reached after five of the first session's rather than after all forty.
 
@@ -168,12 +276,12 @@ If you want a large backlog not to land at all, that is not what this setting is
 jobs (`meka schedule list`, then `meka schedule cancel <id>`) before starting a host that will fire
 them, or leave `[schedule] enabled = false` while you clear it.
 
-A **recurring** job that fires and then fails — most often because the provider is unreachable —
+A **recurring** job that fires and then fails -- most often because the provider is unreachable --
 leaves nothing behind in the conversation: its prompt is withdrawn, because the job produces it again
 on the next occurrence. Without that, an outage would deposit one unanswered message per fire for as
-long as it lasted. A **one-shot** keeps its prompt, because nothing will produce it again — its row
-is already gone by the time the turn runs, so that message is the last trace the reminder ever fired.
-A turn that got as far as running a tool keeps everything either way, since there is real work behind
+long as it lasted. A **one-shot** keeps its prompt, because nothing will produce it again: its row
+is retired as soon as the turn is delivered, so that message is the last trace the reminder ever
+fired. A turn that got as far as running a tool keeps everything either way, since there is real work behind
 it. Failures are recorded regardless: `meka serve` logs them and sends a `schedule.fired` webhook
 with `status: "failed"`.
 
@@ -209,12 +317,30 @@ A job's **turn** runs at whatever permission the session holds when it fires, no
 job was created with: the level lives on the session and the session is mutable, through Shift+Tab in
 the REPL or `PATCH /v1/sessions/{id}` under `serve`.
 
-A job's **gate** is the exception, because it is a shell command that runs unattended and
-unsandboxed. It needs `unrestricted` from two places every time it comes due: the level recorded on
-the job when it was authored, and the level the session holds *now*.
+With one floor: a session at `none` fires nothing, gated or not. Nothing is executable there, so the
+turn would read nothing, change nothing, and could not even reach `schedule_cancel` to stop itself
+being woken again. The agent can *see* the job -- a tool's registration does not depend on the
+permission level, so `[Scheduled]` still lists it and `schedule_cancel` is still offered -- but every
+call is refused at dispatch, which leaves it able to describe the problem and unable to fix it. An
+`every = "5s"` reminder on such a session was a turn's worth of tokens every five seconds with no
+in-session way to stop it. Raise the session to restore the job; it is declined, not cancelled, and a
+one-shot that came due while the session was down there is kept rather than spent.
 
-That second one is the session's own, recorded on its row and kept current by whichever surface owns
-it -- Shift+Tab and `/permission` in the REPL, `session/set_mode` under ACP, `PATCH
+A job's **gate** is the exception, because it runs unattended. Its bar is re-checked from two places
+every time the job comes due: the level recorded on the job when it was authored, and the level the
+session holds *now*. What that bar is depends on what the gate runs -- `unrestricted` for a shell
+command, `read` for a tool call -- and for a tool gate the tool's own resolved level is looked up
+again too, so retuning a tool's level takes effect on the next fire rather than whenever the job
+is next rewritten. That level comes from `[tools.tool_permissions]` for a built-in, and for an MCP tool from the
+five-step chain in [Permission resolution](../configuration/config-file.md#permission-resolution): the
+server's `tool_permissions`, its `permission`, the tool's `readOnlyHint`, `[mcp] default_permission`,
+then `unrestricted`. Step four is worth knowing about here: one global line turns every unannotated
+tool on every server into a `read` probe a gate may call. And `readOnlyHint` is asserted by the
+server and not verified by meka, which is a weaker footing under a gate than under a call in
+conversation, because nobody reads the result of a gate.
+
+That second level is the session's own, recorded on its row and kept current by whichever surface
+owns it -- Shift+Tab and `/permission` in the REPL, `session/set_mode` under ACP, `PATCH
 /v1/sessions/{id}` under `serve`. Every process that polls the schedule reads the same row, so
 withdrawing the level works across processes: a `meka serve` daemon sharing the data directory will
 refuse a gate you just dropped in a REPL. A session whose row carries no level at all falls back to
@@ -222,20 +348,56 @@ the polling process's own `--permission`. That is an ACP session that has never 
 `session/set_mode` called on it, since `session/new` records no level; every other surface records
 one when the session is created.
 
-Drop the session to anything below `unrestricted` and the gate stops running -- and with it the job,
-because a gate is the condition on the job and an unevaluated condition has not been met. The
-occurrence is declined the same way a gate that ran and said "nothing happened" declines it, and a
-warning is logged naming the job. Raise the session back to `unrestricted` to restore it.
+Drop the session below what the gate needs and the gate stops running -- and with it the job, because
+a gate is the condition on the job and an unevaluated condition has not been met. The occurrence is
+declined, and a warning is logged naming the job. Raise the session back to restore it. Unlike a gate
+that ran and said "nothing happened", a held gate was never evaluated at all, so a one-shot that came
+due while it was held is kept rather than spent.
+
+The agent is told too, not just the log. A job that cannot currently fire is marked in the
+`[Scheduled]` block it sees every turn and in `schedule_list`, as `NOT FIRING: <reason>`, with the
+same sentence the warning carries; the moment a gate is withdrawn or restored is announced as a
+world change. This matters because the two states are otherwise identical from the agent's side: a
+held job and a healthy watcher with nothing to report both simply never fire. It can act on the
+difference, since `schedule_cancel` needs only `read`.
+
+A gate whose *probe* keeps breaking is marked the same way, after two consecutive failures. A server
+that changed its schema, a command that was uninstalled, a pointer into a result that stopped being
+JSON: each errors on every evaluation, and each is a dead watcher that looks exactly like a quiet
+one. The first failure is deliberately not reported, because one failure is as often a blip as a
+break. This one is tracked in memory rather than on the row, so it is known to the process running
+the job: a restart re-establishes it within two poll intervals, and `meka schedule list`, which is a
+separate process, does not see it.
+
+Three surfaces report it, and each says only what it can establish:
+
+- **`[Scheduled]` and `schedule_list`** carry the full sentence, since the agent is the one that can
+  recreate or cancel the job.
+- **`meka schedule list` and `/schedule`** have a `Held` column: `yes` when the job cannot fire,
+  blank when it can, and `?` when this process cannot establish the answer. Blank means "it will
+  fire", not "I did not check". `meka schedule list` is a separate process from any host, so it
+  cannot resolve a tool gate and shows `?` for every one; `/schedule` runs inside a host and uses
+  its MCP manager, so it answers them. Either shows `?` for a job whose session level it could not
+  read, since that is also unestablished rather than fine. Both apply `[permissions].enabled` when
+  reading a session's recorded level, so the column cannot report a job as firing that the host
+  refuses.
+- **`GET /v1/schedule` and `GET /v1/sessions/{id}/schedule`** carry a `withheld` field with the same
+  sentence, absent when the job can fire.
 
 Firing the reminder ungated instead would be the more forgiving-looking choice and the wrong one: it
 turns a conditional job into an unconditional one, so an `every = "1m"` watcher that normally speaks
 once a week would deliver a turn a minute for as long as the session stayed below that bar. An
-*ungated* job is unaffected by any of this and keeps firing.
+*ungated* job is unaffected by a gate's authority, and keeps firing at any level above `none`.
 
-Both halves are load-bearing. The recorded level alone can never refuse anything, since creating a
-gate already demands an unattended-write level; the live level is what makes a withdrawal real. The recorded level
-still matters for a job created before it was stored, which reads as "no authority" and stays
-refused.
+At `none` nothing fires at all, gated or not. Every tool is refused at dispatch there, so the turn
+would read nothing, change nothing, and be unable to reach `schedule_cancel` to stop itself being
+woken again -- tokens spent to produce an agent that can describe its predicament and do nothing
+about it. `POST /v1/sessions/{id}/schedule` refuses to create a job on such a session for the same
+reason; `schedule_create` needs `read` to dispatch at all, so the agent cannot reach it.
+
+Both halves are load-bearing. The recorded level rarely refuses on its own, since a creation door
+already demanded it; the live level is what makes a withdrawal real. The recorded level still matters
+for a job created before it was stored, which reads as "no authority" and stays refused.
 
 ## Inspecting jobs
 
@@ -259,13 +421,14 @@ In the REPL, `/schedule` lists the current session's jobs and `/schedule cancel 
 enabled = true          # default true; false hides the tools and stops the scheduler
 poll_interval = "10s"   # how often due jobs are checked
 missed_grace = "24h"    # how late a one-shot may be and still fire
-gate_timeout = "30s"    # wall-clock budget for a gate command
+gate_timeout = "30s"    # wall-clock budget for a gate probe
 max_jobs = 50           # per-session ceiling, refused at schedule_create
 max_consecutive_fires = 5 # per-session ceiling on turns spent in one sweep
+claim_lease = "1h"      # how long a host's claim on an occurrence is good for
 ```
 
 `max_consecutive_fires` bounds a batch, not a total. A sweep contains its turns, so lowering it does
-not stop a backlog landing, nor slow it down — it splits it into smaller groups with other sessions
+not stop a backlog landing, nor slow it down -- it splits it into smaller groups with other sessions
 interleaved between them. Raising it above the number of jobs one session can have due at once has
 no effect at all.
 
@@ -287,9 +450,9 @@ keep working, so jobs left over from before the flag was flipped can still be li
 - Reach for `isolated: true` when a recurring job is self-contained; the token difference is large.
   Leave it off when the job needs to remember what happened in the conversation that created it.
 - Reach for a gate whenever the answer is usually "nothing happened".
-- Keep gate commands fast and read-only. They run on every tick, and a gate that changes something
+- Keep gate probes fast and read-only. They run on every tick, and a gate that changes something
   is a side effect on a timer.
-- Check what a gate's command prints across two runs where nothing happened. Identical output is the
+- Check what a gate's probe returns across two runs where nothing happened. Identical output is the
   whole mechanism, and anything varying inside it turns the gate into a timer.
 - If a schedule matters, check what `schedule_create` reports back: it states the resolved next fire
   in absolute local time, which is how you catch a cron expression that parsed fine and means

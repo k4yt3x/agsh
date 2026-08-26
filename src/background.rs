@@ -585,10 +585,14 @@ impl BackgroundStore {
 
     /// Stamp outcomes as delivered.
     ///
-    /// Called *before* the turn runs, matching
-    /// [`crate::schedule::ScheduleStore::stamp_scheduled_job_fired`] and for the same reason: an
-    /// outcome that reliably wedges the process would otherwise be redelivered on every restart,
-    /// turning one bad result into a boot loop. Losing one report is the cheaper failure.
+    /// Called *before* the turn runs: an outcome that reliably wedges the process would otherwise
+    /// be redelivered on every restart, turning one bad result into a boot loop. Losing one report
+    /// is the cheaper failure.
+    ///
+    /// The scheduler used to do the same and no longer does.
+    /// [`crate::schedule::ScheduleStore::complete_claim`] writes *after* the turn, because a lease
+    /// plus an attempt ceiling gives it the same boot-loop protection without paying an occurrence
+    /// for every crash. A background outcome has no lease to hold, so it keeps the cruder rule.
     pub async fn mark_background_tasks_delivered(
         &self,
         ids: &[String],

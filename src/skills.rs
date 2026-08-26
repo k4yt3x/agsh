@@ -2334,62 +2334,14 @@ mod tests {
 
     /// Run `body` and return the warnings it logged.
     ///
-    /// The subscriber is installed **globally, once**, rather than per call with `with_default`.
-    /// `tracing` caches a callsite's interest process-wide the first time it is evaluated, so a
-    /// thread-local subscriber loses a race it cannot see: another test thread reaching the same
-    /// `warn!` while no subscriber is installed registers the callsite as never-enabled, and every
-    /// later capture of it comes back empty. That is a 2-in-30 flake, which is worse than a loud
-    /// failure because it reads as an unrelated CI hiccup.
-    ///
-    /// The buffer is thread-local, so concurrent tests do not see each other's output even though
-    /// they share one subscriber.
+    /// See [`crate::render::log_capture`] for why the subscriber behind this is global and why
+    /// there is exactly one of it.
     fn capture_warnings(body: impl FnOnce()) -> String {
-        use std::{cell::RefCell, io, sync::OnceLock};
-
-        thread_local! {
-            static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-        }
-
-        struct ThreadLocalWriter;
-
-        impl io::Write for ThreadLocalWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                BUFFER.with(|buffer| buffer.borrow_mut().extend_from_slice(buf));
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalWriter {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                ThreadLocalWriter
-            }
-        }
-
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(ThreadLocalWriter)
-                .with_max_level(tracing::Level::WARN)
-                .without_time()
-                .finish();
-            // An already-installed global is fine and not an error worth failing a test over: what
-            // this needs is for the callsites it asserts on to be *enabled*, which either
-            // subscriber achieves. Reported rather than discarded so a future change that breaks
-            // capture does not do it silently.
-            if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
-                eprintln!("skill tests: a global subscriber was already installed: {error}");
-            }
-        });
-
-        BUFFER.with(|buffer| buffer.borrow_mut().clear());
+        crate::render::log_capture::start();
         body();
-        BUFFER.with(|buffer| String::from_utf8_lossy(&buffer.borrow()).into_owned())
+        // Filtered to warnings: the shared subscriber captures `info!` too, and several of the
+        // assertions below are that a conforming skill is *silent*.
+        crate::render::log_capture::warnings()
     }
 
     /// Rendering is a fixed point: parse, render, parse, render again, and the two renders match

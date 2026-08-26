@@ -92,8 +92,10 @@ model = "claude-sonnet-4-5"
 default = "unrestricted"
 # `workspace` included so it is reachable from a test at all. Leaving it out was a large part of
 # why this whole surface went unexercised: `POST /v1/sessions` refuses a level the server has not
-# enabled, so no test could create a `workspace` session even deliberately.
-enabled = ["read", "workspace", "unrestricted", "ask"]
+# enabled, so no test could create a `workspace` session even deliberately. `none` is here for the
+# same reason and it was found the same way: the scheduler refuses every job on a session at
+# `none`, and no test could reach that state to check what the endpoints then say.
+enabled = ["none", "read", "workspace", "unrestricted", "ask"]
 
 [serve]
 bind = "{bind}"
@@ -5017,6 +5019,230 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
     }
 }
 
+/// A job that cannot fire is refused at the door, and one already there says so when listed.
+///
+/// This is the only door that could plant such a job: `schedule_create` needs `read` to dispatch at
+/// all, so the agent cannot reach it from a session at `none`, and a token's scopes say nothing
+/// about the session's level. It was also the only reader with no way to find out -- the agent gets
+/// a `NOT FIRING` line and `meka schedule list` a `Held` column, while `GET` returned a row that
+/// looked exactly like a working one.
+#[test]
+fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
+    let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
+                  scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
+    let harness =
+        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+
+    let session = harness
+        .client
+        .post(format!("{}/v1/sessions", harness.base_url))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "read",
+        }))
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let plant = || {
+        harness
+            .client
+            .post(format!(
+                "{}/v1/sessions/{}/schedule",
+                harness.base_url, session
+            ))
+            .header("Authorization", "Bearer sk_test_full")
+            .json(&serde_json::json!({"prompt": "remind me", "every": "1h"}))
+            .send()
+            .expect("send")
+    };
+
+    // Planted while the session can still run it, so the listing below is about the level changing
+    // underneath an existing job rather than about the refusal.
+    assert_eq!(plant().status().as_u16(), 201, "ungated at `read` is fine");
+
+    let lowered = harness
+        .client
+        .patch(format!("{}/v1/sessions/{}", harness.base_url, session))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({"permission": "none"}))
+        .send()
+        .expect("send");
+    assert_eq!(lowered.status().as_u16(), 200, "the session drops to none");
+
+    let refused = plant();
+    assert_eq!(
+        refused.status().as_u16(),
+        403,
+        "a second job would never fire either, and the fire door already knows it"
+    );
+    let body = refused.json::<serde_json::Value>().expect("parse");
+    assert!(
+        body["type"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("session-permission"),
+        "raising the session is the remedy, and the type has to say so: {body}"
+    );
+
+    let listed = harness
+        .client
+        .get(format!(
+            "{}/v1/sessions/{}/schedule",
+            harness.base_url, session
+        ))
+        .header("Authorization", "Bearer sk_test_full")
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse");
+    let withheld = listed["jobs"][0]["withheld"].as_str().unwrap_or_default();
+    assert!(
+        withheld.contains("nothing is executable"),
+        "the job planted before the drop is inert now, and a client has no other way to tell: \
+         {listed}"
+    );
+}
+
+/// A gate refusal is routed by what would actually fix it.
+///
+/// A shell gate below `unrestricted` is a 403 `session-permission`, whose documented remedy --
+/// `PATCH /v1/sessions/{id}` -- is the real one. A misspelled or write-capable tool is not: no
+/// level and no token changes the answer, so sending a client to raise a session is a wild goose
+/// chase. Both used to be 403 `session-permission`, which meant `{"tool": 5}` was a 422 and
+/// `{"tool": "typo"}` a 403 saying the session sat too low.
+#[test]
+fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
+    let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
+                  scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
+    let harness =
+        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+
+    let session = |permission: &str| -> String {
+        harness
+            .client
+            .post(format!("{}/v1/sessions", harness.base_url))
+            .header("Authorization", "Bearer sk_test_full")
+            .json(&serde_json::json!({
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "permission": permission,
+            }))
+            .send()
+            .expect("send")
+            .json::<serde_json::Value>()
+            .expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string()
+    };
+    let refuse = |id: &str, check: serde_json::Value| -> (u16, String) {
+        let response = harness
+            .client
+            .post(format!("{}/v1/sessions/{}/schedule", harness.base_url, id))
+            .header("Authorization", "Bearer sk_test_full")
+            .json(&serde_json::json!({
+                "prompt": "check the thing",
+                "every": "1h",
+                "gate": {"check": check, "when": "succeeded"},
+            }))
+            .send()
+            .expect("send");
+        let status = response.status().as_u16();
+        let body = response.json::<serde_json::Value>().expect("parse");
+        let kind = body["type"].as_str().unwrap_or_default().to_string();
+        (status, kind)
+    };
+
+    let (status, kind) = refuse(&session("read"), serde_json::json!({"command": "true"}));
+    assert_eq!(
+        status, 403,
+        "raising the session is the remedy for a shell gate"
+    );
+    assert!(kind.ends_with("session-permission"), "{kind}");
+
+    // At `unrestricted`, so the level cannot be what is wrong.
+    let high = session("unrestricted");
+    let (status, kind) = refuse(&high, serde_json::json!({"tool": "no_such_tool_at_all"}));
+    assert_eq!(status, 422, "no level fixes a name that does not exist");
+    assert!(kind.ends_with("invalid-body"), "{kind}");
+
+    let (status, kind) = refuse(&high, serde_json::json!({"tool": "write_file"}));
+    assert_eq!(status, 422, "no level fixes a tool that is not read-only");
+    assert!(kind.ends_with("invalid-body"), "{kind}");
+}
+
+/// The whole point of tool gates, asserted through a real door: a read-only built-in is accepted at
+/// `read`, where a shell gate is refused.
+///
+/// This is the only test that requires the gate dispatcher to be *wired*. Every refusal above
+/// passes whether or not one exists, because a process that cannot resolve any name refuses for
+/// `ToolUnavailable` with the same 422 and the same body type as a tool that is genuinely not
+/// read-only. Deleting the assignment in `main` therefore left the entire suite green while no tool
+/// gate could ever be created.
+#[test]
+fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
+    let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
+                  scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
+    let harness =
+        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+
+    let session = harness
+        .client
+        .post(format!("{}/v1/sessions", harness.base_url))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "permission": "read",
+        }))
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/schedule",
+            harness.base_url, session
+        ))
+        .header("Authorization", "Bearer sk_test_full")
+        .json(&serde_json::json!({
+            "prompt": "tell me when it changes",
+            "every": "1h",
+            "gate": {
+                "check": {"tool": "read_file", "arguments": {"path": "/etc/hostname"}},
+                "when": "changed",
+            },
+        }))
+        .send()
+        .expect("send");
+
+    let status = response.status().as_u16();
+    let body = response.json::<serde_json::Value>().expect("parse");
+    assert_eq!(
+        status, 201,
+        "a `read` session may gate on a tool that resolves to `read`: {body}"
+    );
+    assert_eq!(
+        body["gate"]["kind"].as_str(),
+        Some("tool"),
+        "and it round-trips as a tool gate: {body}"
+    );
+    assert_eq!(
+        body["withheld"].as_str(),
+        None,
+        "with nothing holding it back: {body}"
+    );
+}
+
 /// A `schedule:r` token sees that a job is gated, but not what the gate runs.
 ///
 /// A gate command is an `execute_command` line that runs unattended as the server's user. The
@@ -5059,7 +5285,7 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
         .json(&serde_json::json!({
             "prompt": "check the thing",
             "every": "1h",
-            "gate": {"command": secret, "fire": "on-success"},
+            "gate": {"check": {"command": secret}, "when": "succeeded"},
         }))
         .send()
         .expect("send");
@@ -5075,7 +5301,7 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
         .json()
         .expect("parse");
     assert_eq!(
-        full["jobs"][0]["gate"]["command"].as_str(),
+        full["jobs"][0]["gate"]["check"].as_str(),
         Some(secret),
         "a token holding sessions:r may see the command: {full}"
     );
@@ -5093,9 +5319,14 @@ fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
         "the gate command must not reach a schedule:r-only token: {body}"
     );
     assert_eq!(
-        limited["jobs"][0]["gate"]["fire"].as_str(),
-        Some("on-success"),
+        limited["jobs"][0]["gate"]["when"].as_str(),
+        Some("succeeded"),
         "the gate itself must still be visible: {limited}"
+    );
+    assert_eq!(
+        limited["jobs"][0]["gate"]["kind"].as_str(),
+        Some("shell"),
+        "and so must its kind, so a shell gate reads differently from a tool one: {limited}"
     );
 }
 
@@ -5137,7 +5368,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
         .json(&serde_json::json!({
             "prompt": "report",
             "every": "30m",
-            "gate": {"command": "id"},
+            "gate": {"check": {"command": "id"}},
         }))
         .send()
         .expect("send");
@@ -5196,7 +5427,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
         .json(&serde_json::json!({
             "prompt": "report",
             "every": "30m",
-            "gate": {"command": "git status --porcelain"},
+            "gate": {"check": {"command": "git status --porcelain"}},
         }))
         .send()
         .expect("send");

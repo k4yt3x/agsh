@@ -103,10 +103,21 @@ pub struct ScheduleConfig {
     /// recent missed one is always less than a period old, and the scheduler coalesces the rest.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub missed_grace: Option<std::time::Duration>,
-    /// Wall-clock budget for a gate command. Accepts humantime strings like `"30s"`. Default
+    /// Wall-clock budget for a gate probe. Accepts humantime strings like `"30s"`. Default
     /// `"30s"`. A gate that overruns is a failure, not a silent skip.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub gate_timeout: Option<std::time::Duration>,
+    /// How long a host's claim on an occurrence is good for. Default `"1h"`.
+    ///
+    /// The window in which a crashed host's job is nobody's, so it is the delay before another
+    /// host picks it up. It has to comfortably exceed a gate probe plus a model turn, because
+    /// a lease that expires while the holder is still working lets a second host take the same
+    /// occurrence: for a job bound to a session that is caught by the session lock and
+    /// deferred, but an `isolated` job has no such backstop and would run twice. An hour is
+    /// far longer than any realistic turn and still short enough that a machine which rebooted
+    /// overnight has caught up by morning.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub claim_lease: Option<std::time::Duration>,
     /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
     pub max_jobs: Option<usize>,
     /// How many of one session's jobs may spend a turn in a single sweep. Default 5. Jobs past it
@@ -117,6 +128,13 @@ pub struct ScheduleConfig {
 /// [`ScheduleConfig`] with every default filled in.
 #[derive(Debug, Clone)]
 pub struct ResolvedScheduleConfig {
+    /// Where a gate's tool probe is dispatched, or `None` in a process that cannot dispatch one.
+    ///
+    /// Carried here rather than threaded separately because this struct already reaches every
+    /// scheduler site and both gate doors, and already holds two other things that are not
+    /// configuration (`host_permission`, `enabled_permissions`) for the same reason. `None` makes
+    /// a tool gate decline, which is the same answer a disconnected server gets.
+    pub gate_tools: Option<std::sync::Arc<dyn crate::schedule::GateTools>>,
     pub enabled: bool,
     /// The permission level of the process running the scheduler.
     ///
@@ -146,11 +164,17 @@ pub struct ResolvedScheduleConfig {
     pub poll_interval: std::time::Duration,
     pub missed_grace: std::time::Duration,
     pub gate_timeout: std::time::Duration,
+    /// See [`ScheduleConfig::claim_lease`].
+    pub claim_lease: std::time::Duration,
     pub max_jobs: usize,
     pub max_consecutive_fires: usize,
 }
 
 impl ResolvedScheduleConfig {
+    /// An hour: far longer than any realistic gate plus turn, so a lease cannot expire under a
+    /// host that is still working, and short enough that a machine which rebooted overnight has
+    /// caught up by morning.
+    const DEFAULT_CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     const DEFAULT_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     /// Five is well above what a healthy session has due at once, since coalescing means one job
     /// contributes one fire however long the outage was, so the budget only engages on a real
@@ -174,12 +198,17 @@ impl ResolvedScheduleConfig {
     ) -> Self {
         let raw = raw.unwrap_or_default();
         Self {
+            // Attached by whichever host built the process's tool stack; `resolve` runs before that
+            // exists. A config that never receives one declines tool gates, which is correct for a
+            // process that genuinely cannot dispatch them.
+            gate_tools: None,
             host_permission,
             enabled_permissions,
             enabled: raw.enabled.unwrap_or(true),
             poll_interval: raw.poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL),
             missed_grace: raw.missed_grace.unwrap_or(Self::DEFAULT_MISSED_GRACE),
             gate_timeout: raw.gate_timeout.unwrap_or(Self::DEFAULT_GATE_TIMEOUT),
+            claim_lease: raw.claim_lease.unwrap_or(Self::DEFAULT_CLAIM_LEASE),
             max_jobs: raw.max_jobs.unwrap_or(Self::DEFAULT_MAX_JOBS),
             max_consecutive_fires: raw
                 .max_consecutive_fires
@@ -2992,6 +3021,21 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
+        // A lease has to outlast the work it covers, and the probe is the part meka can check. One
+        // that expires while a host is still working lets a second host take the same occurrence:
+        // for a session-bound job the session lock catches it, but an `isolated` job runs its turn
+        // twice. Checked against `gate_timeout` rather than against a fixed floor because that is
+        // the only bound on the work meka knows -- the turn after it is unbounded, which is why the
+        // documentation asks for headroom on top rather than this settling the question.
+        if self.schedule.claim_lease <= self.schedule.gate_timeout {
+            return Err(crate::error::MekaError::Config(format!(
+                "[schedule].claim_lease ({}) must outlast [schedule].gate_timeout ({}), or a \
+                 host's claim can expire while its own gate is still running. Remove the key for \
+                 the default of \"1h\".",
+                humantime_serde::re::humantime::format_duration(self.schedule.claim_lease),
+                humantime_serde::re::humantime::format_duration(self.schedule.gate_timeout),
+            )));
+        }
         match self.provider_name.as_deref() {
             None => {
                 return Err(crate::error::MekaError::Config(
@@ -4607,6 +4651,46 @@ model = "m"
                 .validate()
                 .expect_err("a zero value must not be accepted");
             assert!(error.to_string().contains(needle), "{key}: {error}");
+        }
+    }
+
+    /// The lease was the one schedule duration nothing checked.
+    ///
+    /// Zero is the obvious mistake and is not the only one: any lease shorter than the gate budget
+    /// can expire while the host that took it is still running its own probe, which hands the same
+    /// occurrence to a second host. A session-bound job survives that on the session lock; an
+    /// `isolated` one runs its turn twice.
+    #[test]
+    fn test_schedule_claim_lease_must_outlast_the_gate_budget() {
+        for (lease, accepted) in [("\"0s\"", false), ("\"10s\"", false), ("\"90s\"", true)] {
+            let resolved = resolve_with_config(&format!(
+                r#"
+default_provider = "p"
+
+[providers.p]
+type = "openai-chat-completions"
+model = "m"
+
+[schedule]
+gate_timeout = "30s"
+claim_lease = {lease}
+"#
+            ));
+            match accepted {
+                true => assert!(
+                    resolved.validate().is_ok(),
+                    "{lease}: a lease with room for the probe and a turn is fine"
+                ),
+                false => {
+                    let error = resolved.validate().expect_err(
+                        "a lease that cannot outlast its own gate must not be accepted",
+                    );
+                    assert!(
+                        error.to_string().contains("claim_lease"),
+                        "{lease}: {error}"
+                    );
+                }
+            }
         }
     }
 

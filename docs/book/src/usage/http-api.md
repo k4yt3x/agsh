@@ -488,8 +488,8 @@ Each token carries a set of scopes that control what it can access:
 | `skills:w` | Create, update, delete skills |
 | `memory:r` | Read the memory store |
 | `memory:w` | Create, update, delete memories |
-| `schedule:r` | List scheduled jobs. `GET /v1/schedule` is server-wide and returns each job's full `prompt` and, where set, its `gate.command` — so this reads instruction text and shell commands, not just schedules |
-| `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a raw shell command and additionally requires `sessions:w` (see below) |
+| `schedule:r` | List scheduled jobs. `GET /v1/schedule` is server-wide and returns each job's full `prompt`, so this reads instruction text and not just schedules. A gate's `check` is withheld unless the token also holds `sessions:r` |
+| `schedule:w` | Create and cancel scheduled jobs. **A job's `prompt` runs a full turn with tools**, so this is deferred turn execution, not just bookkeeping. A job's optional `gate` runs a shell command or a read-only tool call and additionally requires `sessions:w` (see below) |
 | `mcp:r` | Read MCP server status and advertised tools |
 | `mcp:w` | Reconnect an MCP server |
 
@@ -863,9 +863,19 @@ Descriptions and bodies are returned **exactly as stored**, not as they are rend
 
 These four endpoints are **not** gated by `[memory] enabled`. That switch decides whether an agent keeps memories; a token is the operator, so it reaches a store that already exists exactly as `meka memory list` does in a shell.
 
-A scheduled job's optional `gate` is the sharpest grant on this API. The command runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. It therefore requires `sessions:w` in addition to `schedule:w`, and the session must be at `unrestricted`. A gate is the one grant `workspace` does not carry: the command runs outside the turn, so nothing confines it to the workspace roots, and the API's own 403 says `unrestricted`. A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a shell. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
+A scheduled job's optional `gate` is the sharpest grant on this API, and how sharp depends on what it checks. It requires `sessions:w` in addition to `schedule:w` either way.
 
-`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools — the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation.
+A **shell** gate (`"check": {"command": "…"}`) runs through `sh -c` as the user running `meka serve`, on a timer, *before* the turn and independently of it, so it needs no working provider and no model to execute. The session must be at `unrestricted`. This is the one grant `workspace` does not carry: the command runs outside the turn, so nothing confines it to the workspace roots, and the API's own 403 says `unrestricted`.
+
+A **tool** gate (`"check": {"tool": "…", "arguments": {…}}`) is not held to that bar. It may only name a tool meka resolves to `read`, and the session need only be at `read`. Both facts are re-checked on every fire, so a tool that resolves higher after a config change stops being a gate.
+
+`execute_command` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
+
+No job of any kind can be created on a session at `none`, gated or not: nothing is dispatchable there, so the turn could neither act on the job nor cancel it, and `POST /v1/sessions/{id}/schedule` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back, with the same sentence the agent is given. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten.
+
+A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
+
+`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools — the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation. A job that a scheduler sweep retired between the lookup and the delete is a 404 as well, for the same reason: 204 means this request cancelled the job, not merely that it is gone.
 
 Cancelling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `cancelled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 

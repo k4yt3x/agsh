@@ -76,6 +76,11 @@ fn main() -> anyhow::Result<()> {
         .with_writer(relay::RELAY.clone())
         .init();
 
+    // Multi-threaded, and one caller depends on that rather than merely preferring it:
+    // `GateToolset::resolve` answers a scheduled gate's authority question synchronously and blocks
+    // its worker on an MCP snapshot read. On a current-thread runtime that would park the only
+    // thread the release has to run on. Anything that narrows this needs to make that resolver
+    // async first.
     let runtime = tokio::runtime::Runtime::new()?;
     let result = run_on_runtime(&runtime, cli);
     // Detach any lingering blocking threads instead of joining them on drop. `tokio::io::stdin()`
@@ -139,7 +144,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Instructions { action } => run_instructions_subcommand(action),
                 cli::Command::Schedule { action } => {
-                    crate::schedule::cli::run(&session_manager, action).await
+                    crate::schedule::cli::run(&session_manager, action, cli_ref).await
                 }
                 cli::Command::Account { action } => {
                     provider::cli::run_account_subcommand(&session_manager, action).await
@@ -265,7 +270,7 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
 }
 
 async fn async_main(
-    config: ResolvedConfig,
+    mut config: ResolvedConfig,
     acp_mode: bool,
     serve_mode: bool,
 ) -> anyhow::Result<()> {
@@ -327,6 +332,19 @@ async fn async_main(
     } else {
         None
     };
+
+    // Attached before the host branch so all three hosts share one dispatcher, for the same reason
+    // the MCP manager above is process-wide: a gate's tool probe is answered by the process that
+    // picks the job up, not by the session that wrote it.
+    config.schedule.gate_tools = Some(Arc::new(crate::tools::GateToolset::new(
+        mcp_manager.clone(),
+        &config,
+        crate::tools::BuiltinToolFilter::from_config(
+            config.builtin_allowed_tools.clone(),
+            config.builtin_disabled_tools.clone(),
+            config.builtin_tool_permissions.clone(),
+        ),
+    )));
 
     // `meka acp` and `meka serve` reuse every step above (credential resolution, MCP setup,
     // session-manager housekeeping) and then enter their respective transport loops instead of
@@ -484,6 +502,7 @@ pub async fn build_shared_deps(
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
+        gate_tools: config.schedule.gate_tools.clone(),
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
         compact_checkpoint: config.compact_checkpoint,
@@ -865,6 +884,7 @@ async fn create_agent_from_config(
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
+        gate_tools: config.schedule.gate_tools.clone(),
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
         compact_checkpoint: config.compact_checkpoint,
@@ -944,7 +964,7 @@ async fn report_background_survivors(agent: &Agent) {
 
 /// Claim this session's undelivered task outcomes, ready to be rendered into one turn.
 ///
-/// Stamped delivered *before* the turn runs, matching `stamp_scheduled_job_fired` and for the same
+/// Stamped delivered *before* the turn runs, matching the scheduler's own claim and for the same
 /// reason: an outcome that reliably wedges the process would otherwise be redelivered on every
 /// restart, turning one bad result into a boot loop. Losing one report is the cheaper failure.
 ///
@@ -2162,9 +2182,12 @@ async fn run_interactive(
                     // conversation to be "this one" and so shows every session's jobs.
                     repl::SlashCommand::ScheduleList => match session_id {
                         Some(id) => {
-                            if let Err(error) =
-                                crate::schedule::cli::run_list_for_session(&session_manager, id)
-                                    .await
+                            if let Err(error) = crate::schedule::cli::run_list_for_session(
+                                &session_manager,
+                                id,
+                                &config.schedule,
+                            )
+                            .await
                             {
                                 render::render_error(&error);
                             }
@@ -3114,6 +3137,8 @@ mod tests {
     #[test]
     fn a_repl_sweep_reads_the_permission_the_session_is_at_now() {
         let configured = crate::config::ResolvedScheduleConfig {
+            gate_tools: None,
+            claim_lease: std::time::Duration::from_secs(3600),
             enabled_permissions: crate::permission::EnabledPermissions::DEFAULT,
             enabled: true,
             host_permission: crate::permission::Permission::Read,

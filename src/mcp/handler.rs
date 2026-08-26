@@ -536,38 +536,51 @@ impl Tool for McpToolAdapter {
             }
         };
 
-        let is_error = result.is_error.unwrap_or(false);
-        let mut content = convert_tool_result_content(&result.content);
+        Ok(tool_output_from_result(
+            &result,
+            format!("mcp_{}_{}", self.entry.server_name(), self.remote_tool_name),
+        ))
+    }
+}
 
-        // If the server included structured_content, append it as a fenced JSON block so providers
-        // can reason over it without needing a dedicated ToolResultContent variant. Matches Claude
-        // Code's pragmatic passthrough.
-        if let Some(structured) = &result.structured_content {
-            let pretty = serde_json::to_string_pretty(structured).unwrap_or_default();
-            if !pretty.is_empty() {
-                let appended =
-                    format!("\n\n---\n**Structured content:**\n```json\n{}\n```", pretty);
-                content.push(crate::provider::ToolResultContent::Text { text: appended });
-            }
+/// Convert a server's `CallToolResult` into meka's [`ToolOutput`].
+///
+/// Split out of `execute` so it can be tested without a live server: everything above it in
+/// `execute` is transport and retry, and none of that bears on how a result is shaped.
+fn tool_output_from_result(
+    result: &rmcp::model::CallToolResult,
+    scratchpad_hint: String,
+) -> ToolOutput {
+    let mut content = convert_tool_result_content(&result.content);
+
+    // If the server included structured_content, append it as a fenced JSON block so providers
+    // can reason over it without needing a dedicated ToolResultContent variant. Matches Claude
+    // Code's pragmatic passthrough.
+    //
+    // This block is for the model to *read*. Callers that compute on the result take the
+    // `structured` field below instead, so the wording and fencing here stay free to change
+    // without altering what a scheduled job's gate predicate decides.
+    if let Some(structured) = &result.structured_content {
+        let pretty = serde_json::to_string_pretty(structured).unwrap_or_default();
+        if !pretty.is_empty() {
+            let appended = format!("\n\n---\n**Structured content:**\n```json\n{}\n```", pretty);
+            content.push(crate::provider::ToolResultContent::Text { text: appended });
         }
+    }
 
-        // Unicode sanitisation on every text block that came from the server.
-        for block in content.iter_mut() {
-            if let crate::provider::ToolResultContent::Text { text } = block {
-                *text = crate::mcp::sanitize::sanitize_text(text);
-            }
+    // Unicode sanitisation on every text block that came from the server.
+    for block in content.iter_mut() {
+        if let crate::provider::ToolResultContent::Text { text } = block {
+            *text = crate::mcp::sanitize::sanitize_text(text);
         }
+    }
 
-        Ok(ToolOutput {
-            content,
-            is_error,
-            scratchpad_hint: Some(format!(
-                "mcp_{}_{}",
-                self.entry.server_name(),
-                self.remote_tool_name
-            )),
-            frontend_metadata: None,
-        })
+    ToolOutput {
+        content,
+        is_error: result.is_error.unwrap_or(false),
+        scratchpad_hint: Some(scratchpad_hint),
+        frontend_metadata: None,
+        structured: result.structured_content.clone(),
     }
 }
 
@@ -817,6 +830,57 @@ mod tests {
     use base64::Engine as _;
 
     use super::*;
+
+    /// A server's structured output reaches callers as data, not only as rendered prose.
+    ///
+    /// The fenced block is what the model reads and is deliberately presentational, so anything
+    /// deciding *on* a result -- a scheduled job's gate predicate is the caller this exists for --
+    /// has to take the field. Recovering the JSON by parsing the block back out would make that
+    /// format string a wire format between two parts of meka while it reads as formatting, and a
+    /// readability edit would then silently change what a gate decides. Both halves are asserted
+    /// here so neither can quietly stop happening.
+    #[test]
+    fn structured_content_is_carried_as_data_and_still_rendered_for_the_model() {
+        let structured = serde_json::json!({ "chats": [{ "id": "a" }], "checked_at": "now" });
+        let mut result =
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "1 unseen chat",
+            )]);
+        result.structured_content = Some(structured.clone());
+
+        let output = tool_output_from_result(&result, "mcp_bridge_unseen".to_string());
+
+        assert_eq!(
+            output.structured.as_ref(),
+            Some(&structured),
+            "a predicate must reach the value without parsing the rendering"
+        );
+        let rendered = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::provider::ToolResultContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            rendered.contains("**Structured content:**") && rendered.contains("\"chats\""),
+            "the model still sees the fenced block: {rendered}"
+        );
+    }
+
+    /// The common case: a server that sends only text leaves `structured` empty rather than
+    /// inventing a value, so a pointer predicate knows to fall back to parsing the text itself.
+    #[test]
+    fn a_text_only_result_carries_no_structured_value() {
+        let result = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            "{\"chats\": []}",
+        )]);
+
+        let output = tool_output_from_result(&result, "mcp_bridge_unseen".to_string());
+
+        assert!(output.structured.is_none());
+    }
 
     /// A remote server sees the model's arguments and nothing of meka's.
     ///

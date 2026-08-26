@@ -85,6 +85,12 @@ struct ScheduledIndexEntry {
     short_id: String,
     schedule: String,
     summary: String,
+    /// Why this job's gate cannot fire right now, if it cannot.
+    ///
+    /// Part of the snapshot rather than resolved at render time, like every other field here, so
+    /// the diff announces a job going held and coming back. That is the point: the model is told
+    /// once, when it changes, instead of having to notice an absence.
+    withheld: Option<String>,
 }
 
 /// The mutable half of what the model knows: which tools exist, which skills are installed, and
@@ -338,9 +344,42 @@ impl WorldSnapshot {
                     short_id: job.short_id().to_string(),
                     schedule: job.schedule.describe(),
                     summary: elide(&job.prompt, SCHEDULE_SUMMARY_MAX_CHARS),
+                    withheld: None,
                 })
                 .collect(),
         }
+    }
+
+    /// Say which of the scheduled jobs cannot currently fire, and why.
+    ///
+    /// Separate from [`Self::new`] rather than another parameter on it because answering needs the
+    /// live permission and a tool resolver, which most callers of `new` (every test, and the
+    /// compaction paths) have no business holding. A snapshot built without this reports no job as
+    /// held, which is the same thing it said before the field existed.
+    pub fn with_gate_authority(
+        mut self,
+        scheduled: &[crate::schedule::ScheduledJob],
+        live: crate::permission::Permission,
+        tools: Option<&dyn crate::schedule::GateTools>,
+    ) -> Self {
+        for entry in &mut self.scheduled {
+            // Matched by id rather than zipped: `new` drops the whole list when `schedule_list` is
+            // not registered, so the two are not the same length in that case and position means
+            // nothing.
+            let Some(job) = scheduled
+                .iter()
+                .find(|job| job.short_id() == entry.short_id)
+            else {
+                continue;
+            };
+            // Sanitised at the boundary, like every other field on this snapshot. The reason quotes
+            // the probe -- a shell command the model wrote, or a tool name an MCP server chose --
+            // straight into a bulleted block the model reads every turn, so a newline in one would
+            // forge an entry beneath the job it belongs to.
+            entry.withheld = crate::schedule::job_withheld_reason(job, live, tools)
+                .map(|reason| crate::memory::render_description_for_model(&reason));
+        }
+        self
     }
 }
 
@@ -777,6 +816,13 @@ fn render_world_state_full(current: &WorldSnapshot) -> String {
 /// double-booking a reminder. `schedule_list` is there for the rest.
 const SCHEDULE_INDEX_MAX_ENTRIES: usize = 20;
 
+/// Ceiling on how many jobs the world-state *diff* names when their status changes at once.
+///
+/// Lower than the index above, because this is one line rather than a section and the whole set
+/// flips together: dropping a session to `none` withholds every job it has, each contributing the
+/// same sentence. Past this the count carries the fact.
+const SCHEDULE_STATUS_MAX_ENTRIES: usize = 5;
+
 /// The `[Background]` section: what is still running, and nothing else.
 ///
 /// Rendered fresh every turn from live state, like `[Todo list]`, rather than living in
@@ -832,6 +878,12 @@ fn render_schedule_section(jobs: &[ScheduledIndexEntry]) -> String {
             "- **{}** ({}): {}\n",
             entry.short_id, entry.schedule, entry.summary
         ));
+        // A held job is otherwise indistinguishable from a healthy one that has nothing to report,
+        // which is the normal resting state of a watcher. Without this the model could cancel a
+        // job it had no way of knowing was dead.
+        if let Some(reason) = &entry.withheld {
+            out.push_str(&format!("  NOT FIRING: {}\n", reason));
+        }
     }
     let hidden = jobs.len().saturating_sub(SCHEDULE_INDEX_MAX_ENTRIES);
     if hidden > 0 {
@@ -1524,10 +1576,19 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
     // Jobs the model did not create itself still have to be announced: `meka schedule cancel` and
     // a second attached client both change this behind its back, and a job it believes still exists
     // is one it will not recreate.
+    // By id, not by whole entry. A job is immutable once created except for whether its gate can
+    // currently fire, so comparing the whole struct reported a job that had merely gone held as
+    // newly *scheduled* -- announcing an appearance that never happened, and burying the thing that
+    // did change.
     let added_jobs: Vec<String> = current
         .scheduled
         .iter()
-        .filter(|entry| !previous.scheduled.contains(entry))
+        .filter(|entry| {
+            !previous
+                .scheduled
+                .iter()
+                .any(|candidate| candidate.short_id == entry.short_id)
+        })
         .map(|entry| format!("{} ({}): {}", entry.short_id, entry.schedule, entry.summary))
         .collect();
     let removed_jobs: Vec<&String> = previous
@@ -1541,6 +1602,39 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         })
         .map(|entry| &entry.short_id)
         .collect();
+    // A job that is still there but has changed whether it can fire. Neither an appearance nor a
+    // disappearance, and reporting it as either would be a lie; it gets its own line because it is
+    // the moment the model can act on, and the only one it would otherwise have to infer.
+    let gate_changes: Vec<String> = current
+        .scheduled
+        .iter()
+        .filter_map(|entry| {
+            let before = previous
+                .scheduled
+                .iter()
+                .find(|candidate| candidate.short_id == entry.short_id)?;
+            if before.withheld == entry.withheld {
+                return None;
+            }
+            // Three transitions, not two. A job whose reason merely *changed* -- a session
+            // dropping from `read` to `none` under a shell gate swaps one refusal for another --
+            // was reported as "can no longer fire", asserting a transition from firing that never
+            // happened and inviting the model to act on a change of state rather than a change of
+            // explanation.
+            Some(match (&before.withheld, &entry.withheld) {
+                (None, Some(reason)) => {
+                    format!("{} can no longer fire: {}", entry.short_id, reason)
+                }
+                (Some(_), Some(reason)) => {
+                    format!(
+                        "{} still cannot fire, now because {}",
+                        entry.short_id, reason
+                    )
+                }
+                (_, None) => format!("{} can fire again", entry.short_id),
+            })
+        })
+        .collect();
     if !added_jobs.is_empty() {
         lines.push(format!("- Jobs scheduled: {}", added_jobs.join("; ")));
     }
@@ -1549,6 +1643,23 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
             "- Jobs no longer scheduled: {}",
             join_names(removed_jobs.into_iter())
         ));
+    }
+    if !gate_changes.is_empty() {
+        // Budgeted like every other line in this function. Lowering a session to `none` flips every
+        // job at once, and the snapshot holds all of them (the 20-entry cap applies only to the
+        // rendered section), so at the default `max_jobs = 50` this was one ~7 KB line of the same
+        // sentence fifty times. Past the cap the count carries the fact, which is the part the
+        // model acts on.
+        let shown = gate_changes.len().min(SCHEDULE_STATUS_MAX_ENTRIES);
+        let hidden = gate_changes.len() - shown;
+        let mut line = format!(
+            "- Scheduled job status: {}",
+            gate_changes[..shown].join("; ")
+        );
+        if hidden > 0 {
+            line.push_str(&format!("; and {} more", hidden));
+        }
+        lines.push(line);
     }
 
     let mut server_blocks: Vec<String> = Vec::new();
@@ -2881,6 +2992,7 @@ mod tests {
         let schedule = crate::schedule::Schedule::parse_every("1h").expect("parses");
         let next_fire_at = schedule.next_after(now).expect("has a next fire");
         crate::schedule::ScheduledJob {
+            attempts: 0,
             id: "7f3a1b2c-0000-0000-0000-000000000000".to_string(),
             session_id: uuid::Uuid::nil(),
             schedule,
@@ -2891,6 +3003,268 @@ mod tests {
             last_fired_at: None,
             next_fire_at,
         }
+    }
+
+    /// A shell-gated job, which needs `unrestricted` and so can be withheld by lowering the level
+    /// alone, with no tool resolver in play.
+    fn shell_gated_job(prompt: &str) -> crate::schedule::ScheduledJob {
+        let mut job = sample_job(prompt);
+        job.gate = Some(crate::schedule::Gate {
+            probe: crate::schedule::GateProbe::Shell {
+                command: "gh pr checks".to_string(),
+            },
+            predicate: crate::schedule::GatePredicate::Changed,
+            last_output: None,
+            permission: crate::permission::Permission::Unrestricted,
+        });
+        job
+    }
+
+    /// The model can cancel a job it cannot fire, so it has to be able to tell the two apart. A
+    /// held job and a healthy one that has nothing to report both simply never fire, and `last
+    /// fired` is absent for a brand-new job too, so without this line there is no signal at all.
+    #[test]
+    fn scheduled_section_marks_a_job_whose_gate_cannot_fire() {
+        let jobs = vec![shell_gated_job("check the deploy")];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(
+                &catalogue_with(SCHEDULE_INDEX_TOOL),
+                &no_skills(),
+                &[],
+                &[],
+                &jobs,
+            )
+            .with_gate_authority(&jobs, crate::permission::Permission::Read, None),
+            None,
+        );
+        assert!(rendered.contains("NOT FIRING"), "{rendered}");
+        assert!(rendered.contains("unrestricted"), "{rendered}");
+    }
+
+    /// An ungated job on a session at `none` is marked too.
+    ///
+    /// The marker started as a gate-shaped question, which is exactly the shape that misses this:
+    /// an ungated reminder there reads as perfectly healthy on every surface and never fires,
+    /// because the fire door refuses the whole job regardless of any gate. The creation door still
+    /// accepts it, so without this the two disagree in silence.
+    #[test]
+    fn scheduled_section_marks_an_ungated_job_on_a_session_at_none() {
+        let jobs = vec![sample_job("ungated reminder")];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(
+                &catalogue_with(SCHEDULE_INDEX_TOOL),
+                &no_skills(),
+                &[],
+                &[],
+                &jobs,
+            )
+            .with_gate_authority(&jobs, crate::permission::Permission::None, None),
+            None,
+        );
+        assert!(rendered.contains("NOT FIRING"), "{rendered}");
+        assert!(rendered.contains("nothing is executable"), "{rendered}");
+    }
+
+    /// The other half, so the marker means something: a gate that can still fire is not annotated,
+    /// and the section reads exactly as it did before the field existed.
+    #[test]
+    fn scheduled_section_leaves_a_healthy_gate_unmarked() {
+        let jobs = vec![shell_gated_job("check the deploy")];
+        let rendered = render_world_state(
+            &WorldSnapshot::new(
+                &catalogue_with(SCHEDULE_INDEX_TOOL),
+                &no_skills(),
+                &[],
+                &[],
+                &jobs,
+            )
+            .with_gate_authority(
+                &jobs,
+                crate::permission::Permission::Unrestricted,
+                None,
+            ),
+            None,
+        );
+        assert!(!rendered.contains("NOT FIRING"), "{rendered}");
+    }
+
+    /// The index says how many jobs it is not showing, and the number is right.
+    ///
+    /// The cap is the only thing standing between a long job list and the context window, and the
+    /// count beside it is the only signal the model gets that it is looking at a truncated view --
+    /// it can act on jobs it cannot see, so "and 7 more" is the difference between an informed
+    /// `schedule_list` and a wrong conclusion. A mutation sweep neutered both the threshold and
+    /// the subtraction here with every test still green.
+    #[test]
+    fn the_scheduled_index_reports_how_many_jobs_it_truncated() {
+        let render = |count: usize| {
+            let jobs: Vec<_> = (0..count).map(|_| shell_gated_job("watch it")).collect();
+            render_world_state(
+                &WorldSnapshot::new(
+                    &catalogue_with(SCHEDULE_INDEX_TOOL),
+                    &no_skills(),
+                    &[],
+                    &[],
+                    &jobs,
+                ),
+                None,
+            )
+        };
+
+        let exact = render(SCHEDULE_INDEX_MAX_ENTRIES);
+        assert!(
+            !exact.contains("more not shown"),
+            "a list that fits is not truncated: {exact}"
+        );
+
+        let over = render(SCHEDULE_INDEX_MAX_ENTRIES + 7);
+        assert!(
+            over.contains("7 more not shown here"),
+            "and one that does not says by how much: {over}"
+        );
+        let section = over
+            .split_once("[Scheduled]")
+            .map(|(_, rest)| rest.split("\n[").next().unwrap_or(rest).to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            section.matches("- **").count(),
+            SCHEDULE_INDEX_MAX_ENTRIES,
+            "showing exactly the cap, not one more or fewer: {section}"
+        );
+    }
+
+    /// The status line says how many jobs it left out, and the number is right.
+    ///
+    /// Lowering a session to `none` flips every job at once, so this line is capped -- and past the
+    /// cap the count is the only thing carrying the fact that more changed. A mutation sweep
+    /// neutered both the subtraction and the `> 0` here with every test green.
+    #[test]
+    fn the_scheduled_status_line_reports_how_many_changes_it_truncated() {
+        let diff = |count: usize| {
+            let jobs: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut job = shell_gated_job("watch it");
+                    job.id = format!("{:08x}-0000-0000-0000-000000000000", index);
+                    job
+                })
+                .collect();
+            let snapshot = |held: bool| {
+                let mut snapshot = WorldSnapshot::new(
+                    &catalogue_with(SCHEDULE_INDEX_TOOL),
+                    &no_skills(),
+                    &[],
+                    &[],
+                    &jobs,
+                );
+                if held {
+                    for entry in snapshot.scheduled.iter_mut() {
+                        entry.withheld = Some("the session is at none".to_string());
+                    }
+                }
+                snapshot
+            };
+            render_world_state_diff(&snapshot(true), &snapshot(false))
+        };
+
+        let exact = diff(SCHEDULE_STATUS_MAX_ENTRIES);
+        assert!(
+            exact.contains("Scheduled job status:") && !exact.contains("and 0 more"),
+            "a list that fits says nothing about a remainder: {exact}"
+        );
+
+        let over = diff(SCHEDULE_STATUS_MAX_ENTRIES + 3);
+        assert!(
+            over.contains("and 3 more"),
+            "and one that does not says by how much: {over}"
+        );
+        assert_eq!(
+            over.matches("can no longer fire").count(),
+            SCHEDULE_STATUS_MAX_ENTRIES,
+            "listing exactly the cap: {over}"
+        );
+    }
+
+    /// A reason that merely changes is not a job that has just stopped firing.
+    ///
+    /// The diff reported every transition as "can no longer fire", which asserts a change of state
+    /// where there was only a change of explanation -- and invites the model to act on the former.
+    #[test]
+    fn a_changed_withheld_reason_is_not_reported_as_newly_broken() {
+        let job = shell_gated_job("watch it");
+        let snapshot = |reason: Option<&str>| {
+            let mut snapshot = WorldSnapshot::new(
+                &catalogue_with(SCHEDULE_INDEX_TOOL),
+                &no_skills(),
+                &[],
+                &[],
+                std::slice::from_ref(&job),
+            );
+            if let Some(entry) = snapshot.scheduled.first_mut() {
+                entry.withheld = reason.map(str::to_string);
+            }
+            snapshot
+        };
+
+        let newly = render_world_state_diff(&snapshot(Some("the gate needs X")), &snapshot(None));
+        assert!(
+            newly.contains("can no longer fire"),
+            "firing to held is the transition that sentence is for: {newly}"
+        );
+
+        let moved = render_world_state_diff(
+            &snapshot(Some("the session is at none")),
+            &snapshot(Some("the gate needs X")),
+        );
+        assert!(
+            moved.contains("still cannot fire"),
+            "held to held-for-another-reason is not: {moved}"
+        );
+        assert!(
+            !moved.contains("can no longer fire"),
+            "and must not claim it is: {moved}"
+        );
+
+        let recovered =
+            render_world_state_diff(&snapshot(None), &snapshot(Some("the gate needs X")));
+        assert!(recovered.contains("can fire again"), "{recovered}");
+    }
+
+    /// Held-ness lives in the snapshot rather than being resolved at render time, so a job going
+    /// held is a world change the model is told about once, at the moment it happens, instead of
+    /// something it has to notice.
+    #[test]
+    fn a_job_going_held_is_announced_as_a_gate_change_not_a_new_job() {
+        let jobs = vec![shell_gated_job("check the deploy")];
+        let build = |level| {
+            WorldSnapshot::new(
+                &catalogue_with(SCHEDULE_INDEX_TOOL),
+                &no_skills(),
+                &[],
+                &[],
+                &jobs,
+            )
+            .with_gate_authority(&jobs, level, None)
+        };
+        let healthy = build(crate::permission::Permission::Unrestricted);
+        let held = build(crate::permission::Permission::Read);
+        assert_ne!(
+            healthy, held,
+            "lowering the level withdraws the gate, and the model is entitled to hear about it"
+        );
+
+        let announced = render_world_state(&held, Some(&healthy));
+        assert!(announced.contains("can no longer fire"), "{announced}");
+        assert!(
+            !announced.contains("Jobs scheduled:"),
+            "the job did not appear, it stopped working: {announced}"
+        );
+
+        let restored = render_world_state(&healthy, Some(&held));
+        assert!(restored.contains("can fire again"), "{restored}");
+        assert!(
+            !restored.contains("no longer scheduled"),
+            "it was never cancelled: {restored}"
+        );
     }
 
     #[test]

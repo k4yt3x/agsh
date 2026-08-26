@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     background::TaskStatus,
     permission::Permission,
-    schedule::{Gate, GateFire, Schedule, ScheduledJob},
+    schedule::{Gate, GatePredicate, GateProbe, Schedule, ScheduledJob},
     server::{
         auth::Principal,
         errors::{ErrorKind, ProblemDetail},
@@ -43,7 +43,7 @@ pub struct ScheduledJobView {
     /// RFC 3339 instant for a one-shot.
     pub schedule: String,
     pub prompt: String,
-    /// Present when the job is gated on a shell command.
+    /// Present when the job is gated, on a shell command or a tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateView>,
     /// Whether the job runs in a fresh sub-agent session rather than the conversation that created
@@ -53,11 +53,23 @@ pub struct ScheduledJobView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fired_at: Option<String>,
     pub next_fire_at: String,
+    /// Why this job will not fire on its next occurrence, when something is holding it back.
+    ///
+    /// Absent means it will, as far as this server can establish. A held job and a healthy watcher
+    /// with nothing to report are otherwise identical from outside: neither fires, and
+    /// `last_fired_at` is absent for a brand-new job too. The agent gets the same sentence in its
+    /// `[Scheduled]` block and `meka schedule list` gets a `Held` column; this is the third
+    /// reader, and it is the one that can create a job on a session that cannot run it.
+    ///
+    /// Computed per request from the session's *current* level, not stored, so it tracks a `PATCH
+    /// /v1/sessions/{id}` without the job being rewritten.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GateView {
-    /// The gate's shell command, or `None` when the caller may not see it.
+    /// What the gate runs: a shell command, or a tool name. `None` when the caller may not see it.
     ///
     /// Withheld from a token that does not also hold `sessions:r`. A gate command is an
     /// `execute_command` line that runs unattended, and the webhook path already omits the same
@@ -65,14 +77,20 @@ pub struct GateView {
     /// and the one most likely to carry a credential someone pasted into a `curl`". `GET
     /// /v1/schedule` is server-wide, so leaving it at `schedule:r` handed every gate on the box to
     /// a calendar bridge scoped to the read half of a scope invented so that schedule access would
-    /// *not* imply session access.
+    /// *not* imply session access. A tool gate is withheld on the same terms, though it discloses
+    /// less either way: this field carries [`crate::schedule::GateProbe::summary`], which is the
+    /// bare tool name. Its arguments, which are where a pasted credential would sit, reach only
+    /// `schedule_list` and therefore only the agent that wrote them.
     ///
-    /// The gate's presence and its fire condition stay visible either way, so a client can still
-    /// tell a gated job from an ungated one without being told what it runs.
+    /// The gate's kind and its condition stay visible either way, so a client can still tell a
+    /// gated job from an ungated one, and a shell gate from a tool gate, without being told what
+    /// it runs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// `on-change` or `on-success`.
-    pub fire: String,
+    pub check: Option<String>,
+    /// `shell` or `tool`.
+    pub kind: String,
+    /// The fire condition, as `changed`, `succeeded`, `matches /…/` or `/pointer not-empty`.
+    pub when: String,
 }
 
 impl ScheduledJobView {
@@ -80,15 +98,17 @@ impl ScheduledJobView {
     ///
     /// Not a `From` impl any more: the rendering depends on the caller's scopes, and a conversion
     /// that cannot see them is exactly how the command came to be disclosed at `schedule:r`.
-    fn render(job: ScheduledJob, reveal_command: bool) -> Self {
+    fn render(job: ScheduledJob, reveal_command: bool, withheld: Option<String>) -> Self {
         Self {
+            withheld,
             id: job.id,
             session_id: job.session_id,
             schedule: job.schedule.describe(),
             prompt: job.prompt,
             gate: job.gate.map(|gate| GateView {
-                command: reveal_command.then_some(gate.command),
-                fire: gate.fire.as_str().to_string(),
+                check: reveal_command.then(|| gate.probe.summary()),
+                kind: gate.probe.kind_str().to_string(),
+                when: gate.predicate.summary(),
             }),
             isolated: job.isolated,
             created_at: job.created_at.to_rfc3339(),
@@ -131,10 +151,7 @@ pub async fn list_all(
             ProblemDetail::internal_sanitized("failed to list scheduled jobs", error)
         })?;
     Ok(Json(ScheduledJobsResponse {
-        jobs: jobs
-            .into_iter()
-            .map(|job| ScheduledJobView::render(job, reveal_command))
-            .collect(),
+        jobs: render_batch(&state, jobs, reveal_command).await,
     }))
 }
 
@@ -171,10 +188,7 @@ pub async fn list_for_session(
                 .with("session_id", id.to_string())
         })?;
     Ok(Json(ScheduledJobsResponse {
-        jobs: jobs
-            .into_iter()
-            .map(|job| ScheduledJobView::render(job, reveal_command))
-            .collect(),
+        jobs: render_batch(&state, jobs, reveal_command).await,
     }))
 }
 
@@ -192,9 +206,12 @@ pub struct CreateJobRequest {
     /// 5-field cron pattern, evaluated in the host's local time.
     #[serde(default)]
     pub cron: Option<String>,
-    /// Guard the job on a shell command. Requires the session to be at `unrestricted`, for the
-    /// same reason `schedule_create` does: the command runs unattended and with no sandbox, so no
-    /// level that promises a boundary can honestly authorise it.
+    /// Guard the job on a probe: a shell command, or a call to a read-only tool.
+    ///
+    /// The level required depends on which. A shell command runs unattended and with no sandbox,
+    /// so it needs `unrestricted` and no level that promises a boundary can honestly authorise it.
+    /// A tool probe needs only what the tool itself resolves to, which a gate requires to be
+    /// `read`.
     #[serde(default)]
     pub gate: Option<CreateGate>,
     /// Run in a fresh sub-agent session rather than replaying the parent's history every fire.
@@ -205,11 +222,17 @@ pub struct CreateJobRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateGate {
-    pub command: String,
-    /// `on-change` (fire when stdout differs from last run) or `on-success` (fire while the
-    /// command exits 0). Defaults to `on-change`.
+    /// What to run: `{"command": "…"}` for a shell command, or `{"tool": "mcp__server__tool",
+    /// "arguments": {…}}` for a tool call.
+    pub check: serde_json::Value,
+    /// When to fire: `"changed"` (the default), `"succeeded"`, `{"matches": "<regex>"}`, or
+    /// `{"at": "<json pointer>", "is": "not-empty" | "empty" | "changed"}`.
+    ///
+    /// Untyped here because one parser answers for this field on every door
+    /// ([`crate::schedule::GatePredicate::parse_request`]); a second, derived shape would drift
+    /// from the tool schema and give different errors for the same mistake.
     #[serde(default)]
-    pub fire: Option<String>,
+    pub when: Option<serde_json::Value>,
 }
 
 /// `POST /v1/sessions/{id}/schedule`: plant a job on a session.
@@ -222,7 +245,7 @@ pub struct CreateGate {
     responses(
         (status = 201, description = "Job created", body = ScheduledJobView),
         (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
-        (status = 403, description = "Insufficient scope, or a gate on a session that cannot do unattended work", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope, or a session that cannot do unattended work", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid schedule, or the session's job limit is reached", body = ProblemDetail),
@@ -278,6 +301,39 @@ pub async fn create(
 
     let now = Utc::now();
     let schedule = parse_schedule(&body, now)?;
+
+    // The session's level, for both checks below rather than only the gate's.
+    //
+    // The shared predicate rather than a comparison, exactly as `schedule_create` does:
+    // `Permission`'s `Ord` is for display order, and `Ask` is precisely the level a gate must not
+    // run at, because there is nobody to approve it.
+    let permission = match &resident {
+        Some(entry) => entry.permission.get(),
+        None => session_permission_from_row(&state, id).await?,
+    };
+
+    // Refused for an *ungated* job too, which is the case a gate-shaped check misses.
+    //
+    // The fire door declines every job on a session at `none`, so accepting one here creates a row
+    // that can never run. This endpoint is the only door that could: `schedule_create` requires
+    // `read` to dispatch at all, so the agent cannot reach it, and a token's scopes say nothing
+    // about the session's level. A client that means to raise the session later can do so and then
+    // create the job; one that does not now finds out at the point it can act on it, rather than by
+    // noticing months later that nothing ever fired.
+    if !permission.allows_unattended_work() {
+        return Err(ProblemDetail::new(
+            ErrorKind::SessionPermission,
+            StatusCode::FORBIDDEN,
+            format!(
+                "this session is at {}, where no tool is executable, so a scheduled turn could \
+                 neither act on the job nor cancel it. Raise the session with `PATCH \
+                 /v1/sessions/{{id}}` first.",
+                permission
+            ),
+        )
+        .with("session_id", id.to_string()));
+    }
+
     let gate = match &body.gate {
         None => None,
         Some(requested) => {
@@ -295,66 +351,85 @@ pub async fn create(
                 ProblemDetail::new(
                     ErrorKind::AuthScope,
                     StatusCode::FORBIDDEN,
-                    "a `gate` runs a shell command unattended, so it needs `sessions:w` as well as \
+                    "a `gate` runs a probe unattended, so it needs `sessions:w` as well as \
                      `schedule:w`. Create the job without `gate` and check the condition inside \
                      the prompt instead.",
                 )
                 .with("session_id", id.to_string())
             })?;
-            // The shared predicate rather than a comparison, exactly as `schedule_create` does:
-            // `Permission`'s `Ord` is for display order, and `Ask` is precisely the level a gate
-            // must not run at, because there is nobody to approve it.
-            let permission = match &resident {
-                Some(entry) => entry.permission.get(),
-                None => session_permission_from_row(&state, id).await?,
+            let invalid = |message: String| {
+                ProblemDetail::new(
+                    ErrorKind::InvalidBody,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    message,
+                )
             };
-            if !permission.allows_unattended_shell() {
-                // `SessionPermission`, not `AuthScope`: the token is fine and a better one will
-                // never help. The docs tell clients to route on `type`, so reporting this as a
-                // scope failure sends them to re-provision a token when the fix is to raise the
-                // session's permission.
+            let probe = GateProbe::parse_request(Some(&requested.check)).map_err(invalid)?;
+            let predicate =
+                GatePredicate::parse_request(requested.when.as_ref()).map_err(invalid)?;
+
+            // Authority is re-checked at fire time as well; this is the early, specific refusal so
+            // a client learns at `POST` rather than from a job that silently never fires.
+            if let Err(refusal) = crate::schedule::gate_probe_is_authorised(
+                &probe,
+                permission,
+                state.shared.config.schedule.gate_tools.as_deref(),
+            ) {
+                // Routed by what would actually fix it, because that is what clients switch on.
+                //
+                // Never `AuthScope`: the token is fine and a better one will never help. Reporting
+                // a scope failure sends a client off to re-provision a token it already holds.
+                //
+                // `SessionPermission` only where raising the session is the remedy the docs promise
+                // for that type. A misspelled tool, or one that resolves above `read`, is a bad
+                // request: no level and no token changes the answer, and `PATCH /v1/sessions/{id}`
+                // is a wild goose chase. Those are `InvalidBody`, alongside the malformed-`check`
+                // refusals the parser above already returns that way.
+                let (kind, status) = match refusal {
+                    crate::schedule::GateRefusal::ShellNeedsUnrestricted
+                    | crate::schedule::GateRefusal::SessionBelowTool => {
+                        (ErrorKind::SessionPermission, StatusCode::FORBIDDEN)
+                    }
+                    crate::schedule::GateRefusal::ToolUnavailable
+                    | crate::schedule::GateRefusal::ToolNotReadOnly(_) => {
+                        (ErrorKind::InvalidBody, StatusCode::UNPROCESSABLE_ENTITY)
+                    }
+                };
+                // A server mid-handshake resolves nothing, and every tool it provides is
+                // `ToolUnavailable` for the second that takes. The status stays 422 rather than
+                // gaining a taxonomy entry for a sub-second window, but the message says so: a
+                // client that retries once is right, and one that concludes the tool does not
+                // exist is wrong.
+                let transient = matches!(refusal, crate::schedule::GateRefusal::ToolUnavailable)
+                    && state
+                        .shared
+                        .config
+                        .schedule
+                        .gate_tools
+                        .as_ref()
+                        .is_some_and(|tools| tools.is_still_connecting(&probe.summary()));
+                let advice = if transient {
+                    "Its MCP server has not finished connecting; retry shortly."
+                } else {
+                    "Create the job without `gate` and check the condition inside the prompt \
+                     instead."
+                };
                 return Err(ProblemDetail::new(
-                    ErrorKind::SessionPermission,
-                    StatusCode::FORBIDDEN,
-                    format!(
-                        "a gate runs a shell command unattended, so it needs the session to be at \
-                         `unrestricted` permission (currently {}), because a gate runs with no \
-                         sandbox at all. Create the job \
-                         without `gate` and check the condition inside the prompt instead.",
-                        permission
-                    ),
+                    kind,
+                    status,
+                    format!("{}. {}", refusal.explain(&probe, permission), advice),
                 )
                 .with("session_id", id.to_string()));
             }
-            if requested.command.trim().is_empty() {
-                return Err(ProblemDetail::new(
-                    ErrorKind::InvalidBody,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "`gate.command` cannot be empty",
-                ));
-            }
-            let fire = match requested.fire.as_deref().unwrap_or("on-change") {
-                "on-change" => GateFire::OnChange,
-                "on-success" => GateFire::OnSuccess,
-                other => {
-                    return Err(ProblemDetail::new(
-                        ErrorKind::InvalidBody,
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "unknown gate.fire '{}'; expected 'on-change' or 'on-success'",
-                            other
-                        ),
-                    ));
-                }
-            };
             Some(Gate {
-                command: requested.command.clone(),
-                fire,
+                probe,
+                predicate,
                 last_output: None,
                 // See `schedule_create`: the level is recorded so `prepare` can re-check it at fire
-                // time. `permission` is `Unrestricted` by the guard above, and the session's level
-                // is mutable through `PATCH /v1/sessions/{id}`, so the check above
-                // cannot stand in for one made when the command actually runs.
+                // time. The guard above has admitted this level for this probe, but the session's
+                // is mutable through `PATCH /v1/sessions/{id}` and a tool's resolved level moves
+                // with config, so the check above cannot stand in for one made when the probe
+                // actually runs.
                 permission,
             })
         }
@@ -402,6 +477,7 @@ pub async fn create(
         created_at: now,
         last_fired_at: None,
         next_fire_at,
+        attempts: 0,
     };
     state
         .shared
@@ -420,18 +496,95 @@ pub async fn create(
         id,
         job.next_fire_at.to_rfc3339()
     );
-    // The caller just supplied this command, so echoing it back discloses nothing new.
+    // The caller just supplied this command, so echoing it back discloses nothing new. `withheld`
+    // is `None` by construction: both refusals above have already run against this same level, so a
+    // job that reached here can fire.
     Ok((
         StatusCode::CREATED,
-        Json(ScheduledJobView::render(job, true)),
+        Json(ScheduledJobView::render(job, true, None)),
     ))
 }
 
-/// The permission an evicted session would come back at, read from its row.
+/// Render a batch of jobs, each paired with why it cannot fire.
 ///
-/// Mirrors `reattach::ensure_session_loaded`'s resolution so a gate authorised here is authorised
-/// against the level the job will actually fire at: a persisted level that is no longer in the
-/// enabled set falls back to the process default, exactly as re-attach would.
+/// One permission lookup per distinct *session* rather than per job: a listing of fifty jobs on one
+/// session is the ordinary case, and the level is a property of the session. The resident copy wins
+/// where there is one, matching the creation door two functions up.
+///
+/// A session whose level cannot be read does not silence the answer. `job_withheld` asks the
+/// questions that need no level -- parking, above all -- before it asks for one, so a job that is
+/// provably dead is still reported as such. Passing the level as an `Option` is what lets that
+/// happen; resolving it to a default first, or skipping the call, reports a parked job as healthy
+/// on the one surface a client would ask.
+///
+/// (The two paragraphs that used to open this comment described
+/// `session_permission_from_row` below, and were left attached here when this function was
+/// inserted above it. Rustdoc showed them as this function's summary and left that one
+/// undocumented.)
+async fn render_batch(
+    state: &ServerState,
+    jobs: Vec<ScheduledJob>,
+    reveal_command: bool,
+) -> Vec<ScheduledJobView> {
+    // Snapshotted rather than held: the loop below awaits a database read, and keeping the sessions
+    // lock across that would put a listing in the way of every attach and detach.
+    let resident: std::collections::HashMap<Uuid, Permission> = {
+        let sessions = state.sessions.read().await;
+        sessions
+            .iter()
+            .map(|(id, entry)| (*id, entry.permission.get()))
+            .collect()
+    };
+    let tools = state.shared.config.schedule.gate_tools.as_deref();
+    let mut levels: std::collections::HashMap<Uuid, Option<Permission>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let level = match levels.get(&job.session_id) {
+            Some(level) => *level,
+            None => {
+                let level = match resident.get(&job.session_id) {
+                    Some(level) => Some(*level),
+                    None => session_permission_from_row(state, job.session_id)
+                        .await
+                        .ok(),
+                };
+                levels.insert(job.session_id, level);
+                level
+            }
+        };
+        let withheld = match crate::schedule::job_withheld(&job, level, tools) {
+            crate::schedule::Withheld::Yes(reason) => Some(reason),
+            crate::schedule::Withheld::No | crate::schedule::Withheld::Undetermined => None,
+        };
+        out.push(ScheduledJobView::render(
+            job,
+            reveal_command,
+            withheld_for_scope(withheld, reveal_command),
+        ));
+    }
+    out
+}
+
+/// The withheld reason as far as this reader's scope allows.
+///
+/// The reason is not a neutral sentence. `GateRefusal::explain` embeds `probe.summary()`, which for
+/// a tool gate *is* the tool name that `check` beside it is nulled to hide; the level refusals name
+/// the session's permission, which is otherwise behind `sessions:r`; and a standing probe failure
+/// carries the first line of the check's own output. Attaching it unconditionally therefore handed
+/// a `schedule:r` token everything the field next to it withholds, and one MCP server failing to
+/// connect turned a server-wide endpoint into a listing of every internal tool name on the box.
+///
+/// The bare fact survives at that scope, because it is why a client polls this at all, and it
+/// discloses nothing `kind` does not already.
+fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<String> {
+    match reveal_command {
+        true => reason,
+        false => reason
+            .map(|_| "this job cannot currently fire; the reason needs `sessions:r`".to_string()),
+    }
+}
+
 async fn session_permission_from_row(
     state: &ServerState,
     id: Uuid,
@@ -581,7 +734,7 @@ pub async fn cancel(
         }
     };
 
-    state
+    let removed = state
         .shared
         .session_manager
         .schedule_store()
@@ -591,6 +744,18 @@ pub async fn cancel(
             ProblemDetail::internal_sanitized("failed to cancel scheduled job", error)
                 .with("job_id", resolved.clone())
         })?;
+    // The listing above and the delete are two statements, and a scheduler sweep can retire the row
+    // in between. `204` then reported a cancellation this request did not perform, which is exactly
+    // what a client polls this endpoint to establish. `404` is the same answer it would have got a
+    // moment earlier, and is true.
+    if !removed {
+        return Err(ProblemDetail::new(
+            ErrorKind::NotFound,
+            StatusCode::NOT_FOUND,
+            format!("scheduled job '{}' was already gone", resolved),
+        )
+        .with("job_id", resolved));
+    }
     tracing::info!("cancelled scheduled job {} via HTTP", resolved);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -776,4 +941,51 @@ pub async fn cancel_task(
     }
     tracing::info!("cancelled background task {} via HTTP", task.id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing about *why* a job is held escapes to a token that may not see what the gate runs.
+    ///
+    /// Every refusal sentence carries something the scope withholds elsewhere: a tool name, a
+    /// session's permission level, or a line of the check's own output. Asserting on the exact
+    /// wording would be brittle, so this asserts the property -- none of the reason survives --
+    /// against the three shapes the reasons actually take.
+    #[test]
+    fn a_low_scope_reader_learns_that_a_job_is_held_and_nothing_else() {
+        let reasons = [
+            "no gate tool named `mcp__internal_bridge__unseen`. A gate can call a read-only tool",
+            "a gate command runs unattended with no sandbox, so it needs `unrestricted` \
+             (currently workspace)",
+            "its gate keeps failing and cannot say whether to fire: gate points at `/x` but the \
+             probe did not return JSON: sk-live-DO-NOT-DISCLOSE",
+        ];
+        for reason in reasons {
+            let redacted = withheld_for_scope(Some(reason.to_string()), false)
+                .expect("the fact that it is held still reaches the client");
+            for leaked in [
+                "mcp__internal_bridge__unseen",
+                "workspace",
+                "sk-live-DO-NOT-DISCLOSE",
+                "unrestricted",
+            ] {
+                assert!(
+                    !redacted.contains(leaked),
+                    "{leaked:?} reached a reader that cannot see `check`: {redacted:?}"
+                );
+            }
+            assert_eq!(
+                withheld_for_scope(Some(reason.to_string()), true).as_deref(),
+                Some(reason),
+                "and a reader that can see `check` still gets the whole answer"
+            );
+        }
+        assert_eq!(
+            withheld_for_scope(None, false),
+            None,
+            "a job that can fire is not reported as held to anyone"
+        );
+    }
 }

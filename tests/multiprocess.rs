@@ -338,7 +338,7 @@ enabled = ["read", "unrestricted"]
             transaction
                 .execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
-                     gate_command, gate_fire, gate_permission, isolated, created_at, \
+                     gate_kind, gate_spec, gate_permission, isolated, created_at, \
                      next_fire_at) \
                      VALUES (?1, ?2, 'every', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
@@ -346,8 +346,14 @@ enabled = ["read", "unrestricted"]
                         job.session_id,
                         job.every,
                         job.prompt,
-                        job.gate_command,
-                        job.gate_command.map(|_| "on-success"),
+                        job.gate_command.map(|_| "shell"),
+                        job.gate_command.map(|command| {
+                            serde_json::json!({
+                                "shell": { "command": command },
+                                "when": "succeeded",
+                            })
+                            .to_string()
+                        }),
                         job.gate_command.map(|_| "unrestricted"),
                         i64::from(job.isolated),
                         due,
@@ -368,7 +374,7 @@ struct PlantedJob<'a> {
     every: &'a str,
     prompt: &'a str,
     /// `None` for an ungated job, which fires a turn every occurrence. A gate that exits non-zero
-    /// under `on-success` declines instead, which claims the occurrence without spending a turn --
+    /// under `succeeded` declines instead, which claims the occurrence without spending a turn --
     /// the cheapest observable a scheduler test can have.
     gate_command: Option<&'a str>,
     isolated: bool,

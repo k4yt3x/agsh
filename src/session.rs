@@ -361,8 +361,8 @@ const PROVIDER_LOCK_PREFIX: &str = "provider-";
 /// Sessions a scheduled job still depends on, as a `WHERE` fragment over `sessions`.
 ///
 /// A session with a job ahead of it is *not* expired, whatever `updated_at` says. Only turns bump
-/// that column -- [`ScheduleStore::claim_by_advancing`] and
-/// [`ScheduleStore::stamp_scheduled_job_fired`] touch `scheduled_jobs` alone -- so a gated watcher
+/// that column -- [`ScheduleStore::claim_occurrence`] and
+/// [`ScheduleStore::complete_claim`] touch `scheduled_jobs` alone -- so a gated watcher
 /// that evaluates every tick and rarely fires looks untouched for exactly as long as it is
 /// working. The cascade then took the job with the session, and the sweep reported
 /// `deleted 1 session(s)` without ever mentioning that a schedule went with it.
@@ -376,8 +376,8 @@ const PROVIDER_LOCK_PREFIX: &str = "provider-";
 /// A constant because it is applied twice, in two statements, and the pair is only sound while
 /// they agree: see [`SessionManager::delete_the_unattached_among`].
 ///
-/// [`ScheduleStore::claim_by_advancing`]: crate::schedule::ScheduleStore::claim_by_advancing
-/// [`ScheduleStore::stamp_scheduled_job_fired`]: crate::schedule::ScheduleStore::stamp_scheduled_job_fired
+/// [`ScheduleStore::claim_occurrence`]: crate::schedule::ScheduleStore::claim_occurrence
+/// [`ScheduleStore::complete_claim`]: crate::schedule::ScheduleStore::complete_claim
 const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session_id FROM scheduled_jobs) \
      AND id NOT IN ( \
          WITH RECURSIVE ancestors(id) AS ( \
@@ -748,14 +748,17 @@ impl SessionManager {
                         kind              TEXT NOT NULL,
                         spec              TEXT NOT NULL,
                         prompt            TEXT NOT NULL,
-                        gate_command      TEXT,
-                        gate_fire         TEXT,
+                        gate_kind         TEXT,
+                        gate_spec         TEXT,
                         gate_last_output  TEXT,
                         gate_permission   TEXT,
                         isolated          INTEGER NOT NULL DEFAULT 0,
                         created_at        TEXT NOT NULL,
                         last_fired_at     TEXT,
-                        next_fire_at      TEXT NOT NULL
+                        next_fire_at      TEXT NOT NULL,
+                        claimed_by        TEXT,
+                        claimed_until     TEXT,
+                        attempts          INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_fire
@@ -2162,8 +2165,8 @@ impl SessionManager {
                 // expired parents.
                 //
                 // A session with a scheduled job still ahead of it is *not* expired, whatever
-                // `updated_at` says. Only turns bump that column -- `stamp_scheduled_job_fired` and
-                // `claim_by_advancing` touch `scheduled_jobs` alone -- so a gated watcher
+                // `updated_at` says. Only turns bump that column -- `complete_claim` and
+                // `claim_occurrence` touch `scheduled_jobs` alone -- so a gated watcher
                 // that evaluates every tick but rarely fires looks untouched for as
                 // long as it stays quiet, which is exactly when it is working. The
                 // cascade then took the job with the session, and the sweep
@@ -4622,6 +4625,7 @@ mod tests {
         manager
             .schedule_store()
             .create_scheduled_job(&crate::schedule::ScheduledJob {
+                attempts: 0,
                 id: "job-1".to_string(),
                 session_id: scheduled,
                 schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
@@ -4776,6 +4780,7 @@ mod tests {
             .0;
 
         let job = crate::schedule::ScheduledJob {
+            attempts: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: child,
             schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
@@ -4822,6 +4827,7 @@ mod tests {
         let plain = manager.create_session(None).await.expect("create");
 
         let job = crate::schedule::ScheduledJob {
+            attempts: 0,
             id: uuid::Uuid::new_v4().to_string(),
             session_id: watcher,
             schedule: crate::schedule::Schedule::parse_every("30m").expect("parses"),
@@ -6157,6 +6163,7 @@ mod tests {
         let created_at = chrono::Utc::now();
         let next_fire_at = schedule.next_after(created_at).expect("has a next fire");
         let job = crate::schedule::ScheduledJob {
+            attempts: 0,
             id: Uuid::new_v4().to_string(),
             session_id,
             schedule,
@@ -6184,8 +6191,10 @@ mod tests {
             session_id,
             crate::schedule::Schedule::parse_every("30m").expect("parses"),
             Some(crate::schedule::Gate {
-                command: "gh pr checks 123".to_string(),
-                fire: crate::schedule::GateFire::OnChange,
+                probe: crate::schedule::GateProbe::Shell {
+                    command: "gh pr checks 123".to_string(),
+                },
+                predicate: crate::schedule::GatePredicate::Changed,
                 last_output: None,
                 permission: crate::permission::Permission::Unrestricted,
             }),
@@ -6203,8 +6212,10 @@ mod tests {
         assert_eq!(read.prompt, "check the deploy");
         assert_eq!(read.schedule.spec(), written.schedule.spec());
         let gate = read.gate.as_ref().expect("gate survived the round trip");
-        assert_eq!(gate.command, "gh pr checks 123");
-        assert_eq!(gate.fire, crate::schedule::GateFire::OnChange);
+        assert_eq!(gate.probe, crate::schedule::GateProbe::Shell {
+            command: "gh pr checks 123".to_string(),
+        });
+        assert_eq!(gate.predicate, crate::schedule::GatePredicate::Changed);
     }
 
     async fn task_fixture(
@@ -6576,16 +6587,22 @@ mod tests {
         assert!(
             manager
                 .schedule_store()
-                .claim_by_advancing(&job.id, job.next_fire_at, next)
+                .claim_occurrence(
+                    &job.id,
+                    job.next_fire_at,
+                    "this-process",
+                    fired_at,
+                    fired_at + chrono::Duration::hours(1),
+                )
                 .await
                 .expect("claim the occurrence"),
             "the occurrence is unclaimed, so this process takes it"
         );
         manager
             .schedule_store()
-            .stamp_scheduled_job_fired(&job.id, fired_at, next)
+            .complete_claim(&job.id, "this-process", Some(next), Some(fired_at), None)
             .await
-            .expect("stamp fired");
+            .expect("record the delivery");
 
         let reloaded = manager
             .schedule_store()
@@ -6654,8 +6671,10 @@ mod tests {
             session_id,
             crate::schedule::Schedule::parse_every("30m").expect("parses"),
             Some(crate::schedule::Gate {
-                command: "true".to_string(),
-                fire: crate::schedule::GateFire::OnSuccess,
+                probe: crate::schedule::GateProbe::Shell {
+                    command: "true".to_string(),
+                },
+                predicate: crate::schedule::GatePredicate::Succeeded,
                 last_output: None,
                 permission: crate::permission::Permission::Unrestricted,
             }),
@@ -6679,7 +6698,7 @@ mod tests {
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE scheduled_jobs SET gate_fire = NULL WHERE id = ?1",
+                    "UPDATE scheduled_jobs SET gate_spec = NULL WHERE id = ?1",
                     rusqlite::params![id],
                 )?;
                 Ok(())

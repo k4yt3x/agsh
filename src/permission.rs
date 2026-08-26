@@ -128,7 +128,7 @@ impl Permission {
     ///
     /// `Unrestricted` alone. Two conditions have to hold at once and only the top rung satisfies
     /// both. Nobody is present at fire time, so `Ask` is out: its entire safety is a human
-    /// answering a prompt. And a scheduled gate is spawned by `evaluate_gate` as a bare `sh -c`
+    /// answering a prompt. And a scheduled gate is spawned by `run_shell_probe` as a bare `sh -c`
     /// with no `Confinement`, no sandbox and meka's full environment, so the level that authorises
     /// it must be the one that promises no boundary.
     ///
@@ -144,6 +144,21 @@ impl Permission {
     /// already drifted into phrasing the same rule three different ways.
     pub fn allows_unattended_shell(self) -> bool {
         matches!(self, Permission::Unrestricted)
+    }
+
+    /// Whether waking the agent unattended at this level could accomplish anything.
+    ///
+    /// Only `none` fails, and it fails completely: nothing is executable there, so a scheduled turn
+    /// reads nothing, acts on nothing, and cannot even cancel the job that woke it. Registration is
+    /// permission-independent, so the model does see the job in `[Scheduled]` and is offered
+    /// `schedule_cancel`; the refusal happens at dispatch, which leaves it able to describe its
+    /// predicament and unable to do anything about it. An `every = "5s"` job on such a session was
+    /// a turn's worth of tokens every five seconds, forever, stoppable only by an operator.
+    ///
+    /// Distinct from [`Self::allows_unattended_shell`], which asks what a *gate* may run. This asks
+    /// whether the job is worth running at all, so it applies to ungated jobs too.
+    pub fn allows_unattended_work(self) -> bool {
+        !matches!(self, Permission::None)
     }
 
     /// The highest level contained by **both** `self` and `other`.
@@ -785,13 +800,18 @@ mod tests {
         );
     }
 
-    /// Only `unrestricted` may authorise a gate, and each exclusion is for its own reason.
+    /// Only `unrestricted` may authorise a *shell* gate, and each exclusion is for its own reason.
+    ///
+    /// A gate whose probe is a tool call is authorised by
+    /// [`crate::schedule::gate_probe_is_authorised`] instead, at the tool's own resolved level;
+    /// this predicate answers only for the bare `sh -c` case, which is why it is the strict one.
     ///
     /// `ask` is out because a gate fires on a timer with nobody watching, so the prompt that is its
-    /// entire safety will never be answered. `workspace` is out because a gate is spawned with no
-    /// sandbox at all, so a level whose whole meaning is a write boundary cannot honestly authorise
-    /// one. `workspace` used to pass here, and that was a one-call escape: `schedule_create` with a
-    /// `gate` ran arbitrary unconfined commands from inside the confined mode.
+    /// entire safety will never be answered. `workspace` is out because a shell gate is spawned
+    /// with no sandbox at all, so a level whose whole meaning is a write boundary cannot honestly
+    /// authorise one. `workspace` used to pass here, and that was a one-call escape:
+    /// `schedule_create` with a `gate` ran arbitrary unconfined commands from inside the confined
+    /// mode.
     ///
     /// Spelled out per level rather than looped, because the two exclusions are different arguments
     /// and a future reader needs to see both before widening this.
