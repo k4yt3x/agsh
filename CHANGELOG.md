@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `schedule_list` shows a tool gate's arguments and its kind; other listings show the kind only.
 - A session at `none` accepts no new scheduled job over HTTP, since none of them could ever fire.
 - A job whose delivery fails three times is parked and reported, instead of retried forever.
+- A new meka icon replaces the old one for agsh.
 
 ### Fixed
 
