@@ -8,7 +8,7 @@ A general-purpose AI agent harness.
 > [!IMPORTANT]
 > meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats change between releases. Read the changelog before upgrading.
 
-![meka Screenshot](https://github.com/user-attachments/assets/e94c40ee-76ae-4b00-bcfe-1c1d9d075a2b)
+![meka Screenshot](https://github.com/user-attachments/assets/2efa1688-1461-4d26-9743-a3e88203e522)
 
 ## Overview
 
