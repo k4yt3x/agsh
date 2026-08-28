@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** a pre-migration backup supersedes the previous one; the copy 0.43 left is deleted.
 - **Breaking:** `schedule_create` drops `isolated`; every job fires in the session that created it.
 - **Breaking:** `POST /v1/sessions/{id}/schedule` rejects `isolated`; job views and webhooks drop it.
 - **Breaking:** a scheduled job is refused on a sub-agent session, naming the one to use instead.

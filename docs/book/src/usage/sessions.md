@@ -106,6 +106,29 @@ Sessions are stored in a SQLite database at a platform-specific location:
 | macOS | `~/Library/Application Support/meka/meka.db` |
 | Windows | `%APPDATA%\meka\meka.db` |
 
+### What else is in that directory
+
+`meka.db-wal` and `meka.db-shm` are SQLite's own companions to the open store, not backups. The
+`locks/` subdirectory holds the lock files meka uses to keep two processes off one session and off
+one schema change; it is empty of anything worth reading.
+
+You may also find one `meka.db.v<version>.bak`. meka copies the store aside before it changes the
+schema, and keeps exactly one such copy: the next schema-changing upgrade takes a fresh one and
+removes the one before it, so the copies do not accumulate. Expect the data directory to settle at
+roughly twice the size of the store, and to peak higher than that during an upgrade, since the new
+copy is written before the old one goes.
+
+To restore one, stop every meka process and copy it over `meka.db`. It records the schema version it
+was taken at, so the next start brings it forward again rather than mistaking it for a current store.
+Because only the newest is kept, restoring undoes the most recent schema-changing upgrade and
+nothing before it; move a copy of your own aside if you want to go back further.
+
+An interrupted upgrade can leave a `meka.db.v<version>.bak.partial` behind. That is a copy that never
+finished, so it is not restorable and nothing removes it; delete it whenever you like.
+
+Anything else you put in this directory is yours and meka leaves it alone, including a file whose
+name merely resembles the above.
+
 ## Database Schema
 
 The three tables below are the conversation itself. The database holds seven more, which the

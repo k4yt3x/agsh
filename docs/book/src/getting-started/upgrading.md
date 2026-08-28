@@ -84,6 +84,27 @@ if the session was spawned by another. Sub-agents never had the `schedule_*` too
 created can be affected; what this closes is a client planting one directly, which would have woken
 the worker without the tool restrictions or memory grants it was spawned under.
 
+**This upgrade deletes the pre-migration copy 0.43 left, and keeps one from now on.** Before it
+migrates, meka copies the store aside; until now nothing removed those, so a full duplicate of your
+whole history accumulated per schema-changing release. From 0.44 a fresh copy supersedes the one
+before it. In practice that means `meka.db.v1.bak` in your data directory, the copy of your
+pre-0.43 store, is removed on this upgrade and replaced by a copy of your pre-0.44 one. **If you
+want the older file, move it somewhere else before upgrading.**
+
+Two things worth knowing about what is kept. Peak disk during an upgrade is higher than the steady
+state, because the new copy is written before the old ones go: budget for the store plus every copy
+already beside it plus one more, and expect to settle back at twice the store. And the copy is taken
+per schema-*changing* upgrade, not per release, so one file can span several versions if you skip
+some.
+
+**What keeping only the newest copy costs, stated plainly.** The copy you hold is of the store
+*after* the migration before this one. So it undoes the most recent conversion and nothing earlier:
+if a migration converts something wrongly, you do not notice, and you then take another
+schema-changing upgrade, the only copy predating the fault is gone. That is a real limitation rather
+than a technicality, and it is the reason to move a copy of your own aside if a particular upgrade
+worries you. It is accepted because the alternative was an unbounded pile of full-size duplicates,
+whose cost is certain where this one is conditional on a bug outliving a release.
+
 **A resume now starts at the level the session recorded.** Both CLI hosts do this: the REPL and
 `meka --oneshot -c` / `-r`. The scripted one is where a silent change matters most, since a
 `--oneshot` run that passes no `--permission` used to start at the config default and now starts at
@@ -130,7 +151,7 @@ This is the first release that migrates its own store, and from here on that is 
 
 What it changes, if you want to know what happened. A scheduled job's gate used to be two columns, `gate_command` and `gate_fire`; it is now `gate_kind` plus a JSON `gate_spec`, which is what lets a gate call a read-only tool instead of a shell command. And a due job is now claimed by *leasing* it rather than by consuming its row, which adds `claimed_by`, `claimed_until` and `attempts`, so a host that crashes mid-delivery no longer loses the occurrence, or for a one-shot the whole job. Each gate's stored baseline is preserved, so a `changed` gate does not fire spuriously on its first evaluation afterwards.
 
-Before it writes anything, meka copies the store to `meka.db.v1.bak` beside it. That doubles the space the store takes until you delete it, which is worth knowing if yours is large. Start with `-v` once if you want the exact path in the log; the copy is otherwise silent, and nothing prunes it. It records the version it was taken at, so if you ever restore it, the next start migrates it again correctly rather than mistaking it for a store that is already current.
+Before it writes anything, meka copies the store to `meka.db.v1.bak` beside it. That doubles the space the store takes until you delete it, which is worth knowing if yours is large. Start with `-v` once if you want the exact path in the log; the copy is otherwise silent. It records the version it was taken at, so if you ever restore it, the next start migrates it again correctly rather than mistaking it for a store that is already current.
 
 The whole thing is one transaction, so an interruption leaves the store exactly as it was rather than half-converted. Running two hosts at once is fine: the first takes the schema lock and the second waits, then finds nothing to do.
 
@@ -140,7 +161,7 @@ The whole thing is one transaction, so an interruption leaves the store exactly 
 
 Rare, and worth knowing the shape of. If a job's gate was already unreadable under 0.42 (a hand-edited row, or a `gate_fire` value meka never wrote), it cannot be converted, because there is nothing to convert it *from*. Such a job never fired under 0.42, and it does not fire under 0.43 either: the migration leaves it in the same refused state rather than guessing at what it meant or deleting it. It is logged once, by id, at `warn`.
 
-The consequence is that the row stays inert and invisible, as it already was: it will not appear in `meka schedule list` and `meka schedule cancel` cannot reach it. Recreate the job if you still want it. The original row is in the backup.
+The consequence is that the row stays inert and invisible, as it already was: it will not appear in `meka schedule list` and `meka schedule cancel` cannot reach it. Recreate the job if you still want it. The original row is in the backup 0.43 took, `meka.db.v1.bak`. Note that from 0.44 a later schema-changing upgrade deletes that file, so put a copy somewhere of your own if you want to keep it.
 
 ## 0.41 to 0.42
 

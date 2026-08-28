@@ -623,6 +623,169 @@ fn back_up_before_migrating(
     Ok(Some(target))
 }
 
+/// Remove the copies an earlier migration left, now that a fresher one is in place.
+///
+/// **Production reaches this only with a path [`back_up_before_migrating`] returned**, which is
+/// what makes the ordering safe rather than merely intended. That function answers `Ok(Some(_))` on
+/// one line, after the rename has put a complete copy at that name, so the caller's `?` is what
+/// stops this running on a failure. Pruning before the copy landed would mean a failure between
+/// choosing the name and renaming -- a path that is not valid UTF-8 is one, refused at
+/// `staging.to_str()` -- leaves no backup at all.
+///
+/// One backup rather than one per release. The store holds every conversation and every memory, so
+/// a copy per schema-changing upgrade is a full duplicate accumulating forever in a directory
+/// nobody opens (`~/.local/share/meka`, `%APPDATA%\meka`), and conversations carry images as inline
+/// base64, so "full" is not small.
+///
+/// **What that costs, stated rather than argued away.** The copy kept is of the store *after* the
+/// migration before this one, so it cannot undo a conversion whose bug is found late: a step that
+/// silently mis-converts, goes unnoticed, and is followed by another schema-changing upgrade takes
+/// the only pre-conversion copy with it. That is a real loss and not the same thing as the copy
+/// being stale, which is what an earlier draft of this comment claimed. It is accepted because the
+/// alternative was an unbounded pile whose cost is certain, while this one is conditional on a bug
+/// that outlives a release; `upgrading.md` says the same to users rather than implying the older
+/// copy was never worth anything.
+///
+/// Only names this module could have produced are touched; see [`is_backup_name`], which matches
+/// against what [`free_backup_path`] actually emits rather than against "some digits". A
+/// `meka.db.mine.bak` someone parked beside the store is not meka's to delete.
+///
+/// Compared through [`std::ffi::OsStr::as_encoded_bytes`] rather than `to_string_lossy`, because
+/// lossy conversion maps distinct names onto one string, which here would mean deleting a file that
+/// merely resembles a backup. Every byte tested is ASCII, and ASCII cannot occur inside a
+/// multi-byte sequence, so splitting on it is sound on both platforms.
+///
+/// Every failure is a `warn!` and nothing more, so that a filesystem that will not let a file go
+/// cannot turn a migration that worked into a refusal to start. Reaching one takes something
+/// narrower than a read-only directory -- that already stopped the copy itself, upstream of here --
+/// such as an immutable file, a sticky-bit directory owned by someone else, or a Windows sharing
+/// violation.
+fn prune_older_backups(database_path: &Path, keep: &Path) {
+    let (Some(directory), Some(store_name), Some(keep_name)) = (
+        database_path.parent(),
+        database_path.file_name(),
+        keep.file_name(),
+    ) else {
+        return;
+    };
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                "could not list '{}' to remove older pre-migration backups: {}",
+                directory.display(),
+                error
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        // Not `.flatten()`. An entry that cannot be read is a question this cannot answer, and
+        // skipping it is right -- but silently is not, because the answer it stands in for is
+        // "there may be a superseded copy still on disk".
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    "could not read an entry of '{}' while removing older pre-migration backups: \
+                     {}",
+                    directory.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if name == keep_name || !is_backup_name(store_name, &name) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                "removed the superseded pre-migration backup '{}'",
+                path.display()
+            ),
+            Err(error) => tracing::warn!(
+                "could not remove the superseded pre-migration backup '{}': {}",
+                path.display(),
+                error
+            ),
+        }
+    }
+}
+
+/// Whether `candidate` is a name [`free_backup_path`] could have produced for `store_name`.
+///
+/// `<store>.v<version>.bak`, optionally then `.<suffix>`. Both numbers are matched against what
+/// that function can actually emit rather than against "some digits", because the two differ and
+/// the difference is deletions: a `version` it renders through `Display` from a `u32` it is only
+/// ever called with above zero, and a `suffix` from `1..1000`. So `.v0.`, `.v01.`, `.bak.0` and
+/// `.bak.1000` are all shapes meka cannot write, and a `meka.db.v1.bak.0` is somebody's own
+/// zero-indexed archive rather than a copy this module left.
+///
+/// **One shape, tracking the writer.** If [`free_backup_path`] ever names copies differently, this
+/// follows it and matches only the new name. Keeping the old one alongside would be a reader
+/// tolerating what an older meka wrote, which is the arrangement `migrations` exists to make
+/// unnecessary, and there is no ledger for files sitting beside the store to convert them with. The
+/// honest price of such a rename is that copies already on disk stop being recognised and are left
+/// where they are, which errs toward keeping a file rather than deleting one.
+///
+/// A `.partial` is deliberately not a match. It is litter as well, but [`free_backup_path`] reads
+/// its presence to step past a name it would otherwise reuse, and removing completed copies is the
+/// whole of what this is for.
+fn is_backup_name(store_name: &std::ffi::OsStr, candidate: &std::ffi::OsStr) -> bool {
+    let store = store_name.as_encoded_bytes();
+    let candidate = candidate.as_encoded_bytes();
+    let Some(rest) = candidate.strip_prefix(store) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(b".v") else {
+        return false;
+    };
+    let (version, rest) = split_digits(rest);
+    // `from > 0` is guarded at the one call site, and `Display` never pads, so a leading zero and a
+    // bare `0` are both names this module cannot have written.
+    if !matches!(parse_number(version), Some(1..=u32::MAX)) {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix(b".bak") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(rest) = rest.strip_prefix(b".") else {
+        return false;
+    };
+    let (suffix, tail) = split_digits(rest);
+    tail.is_empty() && matches!(parse_number(suffix), Some(1..MAX_BACKUP_SUFFIX))
+}
+
+/// The exclusive end of [`free_backup_path`]'s suffix range, named so the loop there and the match
+/// in [`is_backup_name`] cannot drift apart.
+const MAX_BACKUP_SUFFIX: u32 = 1000;
+
+/// Parse a run of ASCII digits exactly as `free_backup_path` rendered one, or `None`.
+///
+/// Rejects what `Display` cannot produce (nothing at all, a leading zero) and what a `u32` cannot
+/// hold, so an absurdly long run of digits is a non-match rather than a wrap or a panic.
+fn parse_number(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Split a leading run of ASCII digits from the rest, for [`is_backup_name`]. Either half may be
+/// empty; the caller decides which of those are acceptable.
+fn split_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    bytes.split_at(end)
+}
+
 /// Clear away a backup that never finished. Best-effort by design: the caller is already returning
 /// an error that stops the migration, and failing to tidy up must not replace that error with a
 /// less useful one. Leaving it behind is safe either way, because only a completed copy is ever
@@ -669,7 +832,7 @@ fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBuf> {
     if is_free_pair(&base) {
         return Ok(base);
     }
-    for suffix in 1..1000 {
+    for suffix in 1..MAX_BACKUP_SUFFIX {
         let mut name = base.as_os_str().to_os_string();
         name.push(format!(".{}", suffix));
         let candidate = PathBuf::from(name);
@@ -678,9 +841,10 @@ fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBuf> {
         }
     }
     Err(MekaError::Database(format!(
-        "cannot name a pre-migration backup: '{}' and its 999 numbered variants are all taken. \
+        "cannot name a pre-migration backup: '{}' and its {} numbered variants are all taken. \
          Nothing has been changed. Move or delete the old copies beside the store",
-        base.display()
+        base.display(),
+        MAX_BACKUP_SUFFIX - 1
     )))
 }
 
@@ -916,6 +1080,11 @@ impl SessionManager {
                 } else {
                     None
                 };
+                // Here rather than inside the helper, so the `?` above is what guarantees a copy is
+                // in place before an older one is removed. See `prune_older_backups`.
+                if let Some(target) = &backup {
+                    prune_older_backups(&database_path, target);
+                }
                 migrations::apply(connection, plan, &context)?;
                 // Reconciliation rather than creation, and outside the ledger for that reason: it
                 // asks whether this database's FTS triggers are the ones this build requires and
@@ -8104,6 +8273,261 @@ mod tests {
             version, 0,
             "the copy must identify itself as what it was, so restoring it migrates once rather \
              than being mistaken for a current store"
+        );
+    }
+
+    /// [`parse_number`]'s own contract, which its callers only partly exercise.
+    ///
+    /// Both call sites reject zero themselves, so nothing downstream can tell `Some(0)` from `None`
+    /// here, and a mutation sweep found exactly that: widening the leading-zero guard's
+    /// `digits.len() > 1` to `>= 1`, which makes a bare `0` a non-match, survived the entire suite.
+    /// It is worth pinning anyway, because this function's job is to read back what `Display` wrote
+    /// and `Display` writes zero as `0`. A guard that is only correct because of who happens to
+    /// call it is the kind that drifts.
+    #[test]
+    fn a_number_is_parsed_exactly_as_display_would_have_written_it() {
+        assert_eq!(parse_number(b"0"), Some(0), "`Display` writes zero as `0`");
+        assert_eq!(parse_number(b"1"), Some(1));
+        assert_eq!(parse_number(b"999"), Some(999));
+        assert_eq!(
+            parse_number(u32::MAX.to_string().as_bytes()),
+            Some(u32::MAX)
+        );
+        assert_eq!(parse_number(b""), None, "no digits at all is not a number");
+        assert_eq!(parse_number(b"01"), None, "`Display` never pads");
+        assert_eq!(parse_number(b"007"), None);
+        assert_eq!(
+            parse_number(b"4294967296"),
+            None,
+            "one past `u32::MAX` is a non-match rather than a wrap"
+        );
+        assert_eq!(parse_number(b"99999999999999999999"), None);
+    }
+
+    /// Exactly which names this module will delete, stated as a table.
+    ///
+    /// The cheapest guard on the whole change, and the one that matters most: everything else
+    /// decides *when* to prune, and this decides *what*. A match that is too generous deletes a
+    /// file meka did not write, which is the one outcome the feature must never have.
+    ///
+    /// `meka.db.vault.bak` earns its row. It is the near-miss the digit requirement exists for:
+    /// drop that requirement and `.v` followed by anything at all becomes a backup.
+    #[test]
+    fn only_names_this_module_writes_are_recognised_as_backups() {
+        let store = std::ffi::OsStr::new("meka.db");
+        let matches = |name: &str| is_backup_name(store, std::ffi::OsStr::new(name));
+
+        for name in ["meka.db.v1.bak", "meka.db.v42.bak", "meka.db.v1.bak.7"] {
+            assert!(matches(name), "{name} is a name free_backup_path builds");
+        }
+        for name in [
+            "meka.db",
+            "meka.db-wal",
+            "meka.db-shm",
+            "meka.db.mine.bak",
+            // `.v` then a word, not a version.
+            "meka.db.vault.bak",
+            // Staging is deliberately spared: `free_backup_path` reads it to step past a name.
+            "meka.db.v1.bak.partial",
+            // A version or suffix has to be digits, and the suffix has to end the name.
+            "meka.db.v.bak",
+            "meka.db.v1.bak.",
+            "meka.db.v1.bak.x",
+            "meka.db.v1.bak.1.2",
+            // Digits are not enough: these are shapes `free_backup_path` cannot emit, so a file
+            // wearing one belongs to whoever made it. `.bak.0` is the near-miss that matters,
+            // being how a person numbering their own archive from zero would name it.
+            "meka.db.v1.bak.0",
+            "meka.db.v0.bak",
+            "meka.db.v01.bak",
+            "meka.db.v1.bak.01",
+            "meka.db.v1.bak.1000",
+            "meka.db.v99999999999999999999.bak",
+            // Another store's backup in a shared directory.
+            "other.db.v1.bak",
+            "notes.txt",
+        ] {
+            assert!(!matches(name), "{name} is not meka's to delete");
+        }
+    }
+
+    /// One copy survives an upgrade, not one per release.
+    ///
+    /// The planted names are what a store carried through two earlier releases looks like, and they
+    /// also force the interesting interaction: `free_backup_path` steps past both to `.bak.2`, so
+    /// the copy being kept is *not* the name the older ones wear. A prune keyed to the name rather
+    /// than to the path would take the wrong file.
+    #[tokio::test]
+    async fn only_the_newest_pre_migration_copy_survives() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("a store with work pending");
+        }
+        std::fs::write(temp_dir.path().join("meka.db.v1.bak"), b"older").expect("plant");
+        std::fs::write(temp_dir.path().join("meka.db.v1.bak.1"), b"less old").expect("plant");
+
+        drop(
+            SessionManager::open(Some(&database_path), &Default::default())
+                .await
+                .expect("the store migrates on open"),
+        );
+
+        let kept = temp_dir.path().join("meka.db.v1.bak.2");
+        assert!(kept.exists(), "the copy just taken is the one that stays");
+        assert!(
+            !temp_dir.path().join("meka.db.v1.bak").exists()
+                && !temp_dir.path().join("meka.db.v1.bak.1").exists(),
+            "and the copies it supersedes are gone"
+        );
+        let copy = rusqlite::Connection::open(&kept).expect("the survivor opens");
+        let version: i64 = copy
+            .query_row("SELECT * FROM pragma_user_version", [], |row| row.get(0))
+            .expect("the copy has a version");
+        assert_eq!(version, 0, "and it is the real copy, not a planted file");
+    }
+
+    /// Everything else beside the store is left exactly as it was.
+    ///
+    /// A data directory is the user's, and a migration that tidies it is a migration that deletes
+    /// something one day. The `.partial` is here because sparing it is load-bearing rather than
+    /// incidental: `free_backup_path` treats a taken staging name as a taken pair, which is what
+    /// makes it step to `.bak.1` below.
+    #[tokio::test]
+    async fn a_file_meka_did_not_write_is_left_alone() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("a store with work pending");
+        }
+        let bystanders = [
+            "meka.db.mine.bak",
+            // `.v` with no version at all: the near-miss that a match without the digit
+            // requirement swallows, which is why it is here and not only in the table test.
+            "meka.db.v.bak",
+            "meka.db.vault.bak",
+            "other.db.v1.bak",
+            "notes.txt",
+            "meka.db.v1.bak.partial",
+        ];
+        for name in bystanders {
+            std::fs::write(temp_dir.path().join(name), name.as_bytes()).expect("plant");
+        }
+
+        drop(
+            SessionManager::open(Some(&database_path), &Default::default())
+                .await
+                .expect("the store migrates on open"),
+        );
+
+        for name in bystanders {
+            let path = temp_dir.path().join(name);
+            assert_eq!(
+                std::fs::read(&path).expect("still there").as_slice(),
+                name.as_bytes(),
+                "{name} is not meka's to delete"
+            );
+        }
+        assert!(
+            temp_dir.path().join("meka.db.v1.bak.1").exists(),
+            "and the copy stepped past the occupied staging name, as it always did"
+        );
+    }
+
+    /// A prune that cannot delete is a warning, not a failed upgrade.
+    ///
+    /// Driven directly rather than through `SessionManager::open`, because open widens the data
+    /// directory back to `0700` on its way in (`restrict_permissions`), so a read-only parent
+    /// cannot be staged through it. The property under test belongs to the helper anyway: it must
+    /// return, having done what it could, whatever the filesystem says.
+    #[cfg(unix)]
+    #[test]
+    fn a_prune_that_cannot_delete_still_returns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let directory = temp_dir.path().join("data");
+        std::fs::create_dir(&directory).expect("create");
+        let database_path = directory.join("meka.db");
+        std::fs::write(&database_path, b"store").expect("plant");
+        let keep = directory.join("meka.db.v2.bak");
+        std::fs::write(&keep, b"newest").expect("plant");
+        let doomed = directory.join("meka.db.v1.bak");
+        std::fs::write(&doomed, b"older").expect("plant");
+
+        let original = std::fs::metadata(&directory).expect("stat").permissions();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .expect("make it read-only");
+        prune_older_backups(&database_path, &keep);
+        std::fs::set_permissions(&directory, original).expect("restore so the tempdir can go");
+
+        assert!(
+            doomed.exists(),
+            "it could not delete, which is the point: it must not have panicked or unwound either"
+        );
+    }
+
+    /// Nothing is pruned unless a fresh copy actually landed.
+    ///
+    /// The failure this needs is a narrow one: it has to happen *after* `free_backup_path` has
+    /// chosen a name and *before* the rename, since anything earlier or later cannot tell a
+    /// prune-then-copy ordering from the copy-then-prune one. A store path that is not valid UTF-8
+    /// is exactly that: `back_up_before_migrating` gets as far as `staging.to_str()` and refuses
+    /// there, with a name already picked and no copy written.
+    ///
+    /// An earlier version of this module's comments claimed no such test existed and rested the
+    /// guarantee on control flow alone. Control flow is still what enforces it; this is the test
+    /// that would notice if someone rearranged that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nothing_is_pruned_when_no_fresh_copy_landed() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        // A directory whose name is not valid UTF-8, so every path under it is not either.
+        let mut name = OsString::from_vec(b"not-utf8-\xff".to_vec());
+        name.push("");
+        let directory = temp_dir.path().join(name);
+        std::fs::create_dir(&directory).expect("create");
+        let database_path = directory.join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("a store with work pending");
+        }
+        let planted = directory.join("meka.db.v1.bak");
+        std::fs::write(&planted, b"the only copy").expect("plant");
+
+        let error = SessionManager::open(Some(&database_path), &Default::default())
+            .await
+            .err()
+            .expect("a backup that cannot be written refuses the migration");
+        assert!(
+            error.to_string().contains("not valid UTF-8"),
+            "the refusal should be the one this test aims at, not some other: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&planted).expect("still there"),
+            b"the only copy",
+            "a prune that ran before the copy landed would have left the user with none"
+        );
+    }
+
+    /// A directory that is not there at all is not an error, for the same reason.
+    #[test]
+    fn a_prune_with_nowhere_to_look_is_not_an_error() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let missing = temp_dir.path().join("gone").join("meka.db");
+        prune_older_backups(
+            &missing,
+            &temp_dir.path().join("gone").join("meka.db.v1.bak"),
         );
     }
 
