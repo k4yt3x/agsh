@@ -32,8 +32,6 @@ pub(super) fn spawn(state: Arc<super::ServerState>) -> tokio::task::JoinHandle<(
     // string form (every insertion site derives the key from `session_uuid.to_string()`), so this
     // needs no lock on any session's runtime.
     let sessions = Arc::clone(&state.sessions);
-    // Every job, `isolated` included: ACP does not honour that flag (it warns and runs the job in
-    // the open conversation), so an isolated job still needs the editor to have that session open.
     let scope = SchedulerScope::Jobs(Arc::new(move |job: &crate::schedule::ScheduledJob| {
         // `try_read` rather than `read`: the map is briefly write-locked on every `session/new` and
         // `session/close`, and blocking the sweep behind session setup would be worse than skipping
@@ -217,17 +215,6 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
         );
         return FireOutcome::Deferred;
     };
-
-    if wakeup.job.isolated {
-        // Same limit as the REPL: this agent belongs to a session the editor created, with its own
-        // cwd and capabilities, and an isolated run would need a session the client never asked for
-        // and has no window for. Said out loud rather than silently downgraded.
-        tracing::warn!(
-            "job {} asked for an isolated session; ACP runs it in the open conversation instead. \
-             Run `meka serve` for isolated jobs.",
-            job_id
-        );
-    }
 
     // A fire is activity on this session; see `deliver_outcomes`. A schedule whose session is only
     // ever driven by the scheduler would otherwise be evicted as idle and never fire again.

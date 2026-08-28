@@ -597,9 +597,6 @@ pub struct ScheduledJob {
     pub schedule: Schedule,
     pub prompt: String,
     pub gate: Option<Gate>,
-    /// Run in a fresh sub-agent session rather than the conversation that created the job. Cheaper
-    /// for anything recurring, since the parent's history is not replayed every fire.
-    pub isolated: bool,
     pub created_at: DateTime<Utc>,
     pub last_fired_at: Option<DateTime<Utc>>,
     pub next_fire_at: DateTime<Utc>,
@@ -1076,11 +1073,10 @@ fn standing_probe_failure(job: &ScheduledJob) -> Option<String> {
         held.get(&job.id).cloned()?
     };
     // The verdict is this process's, but the job is not. Only the host that wins `claim_occurrence`
-    // evaluates, and `isolated` jobs are exempt from the session-residency filter, so a second
-    // `meka serve` on the same store can take over every occurrence and heal the gate without this
-    // process ever hearing. Nothing here re-enters the counting path in that case, so without this
-    // check the marker stood forever: the model was told, every turn, that a job firing hourly was
-    // dead.
+    // evaluates, so a second `meka serve` on the same store can take over every occurrence and heal
+    // the gate without this process ever hearing. Nothing here re-enters the counting path in that
+    // case, so without this check the marker stood forever: the model was told, every turn, that a
+    // job firing hourly was dead.
     //
     // Neither half of the witness is written by the failing path -- it persists no `fired_at` and
     // no baseline, deliberately -- so either of them having moved is proof of a successful
@@ -1584,9 +1580,9 @@ pub enum SchedulerScope {
     /// Jobs the predicate accepts, re-asked every sweep, so a host whose set of runnable jobs moves
     /// under it (ACP's open editors, serve's session locks) is never working from a snapshot.
     ///
-    /// Takes the whole job rather than its session id because "can this host run it" is not always
-    /// a question about the session: an `isolated` job runs in a fresh conversation and needs
-    /// nothing from the one that created it, including its lock.
+    /// Takes the whole job rather than its session id because the answer is not the only thing a
+    /// host produces: `meka serve` names the job it is declining when the lock cannot be probed at
+    /// all, and a predicate handed a bare uuid could not say which one.
     Jobs(std::sync::Arc<dyn Fn(&ScheduledJob) -> bool + Send + Sync>),
 }
 
@@ -2546,7 +2542,6 @@ impl ScheduleStore {
         let gate_spec = job.gate.as_ref().map(|gate| gate.spec());
         let gate_last_output = job.gate.as_ref().and_then(|gate| gate.last_output.clone());
         let gate_permission = job.gate.as_ref().map(|gate| gate.permission.to_string());
-        let isolated = i64::from(job.isolated);
         let created_at = job.created_at.to_rfc3339();
         let last_fired_at = job.last_fired_at.map(|at| at.to_rfc3339());
         let next_fire_at = job.next_fire_at.to_rfc3339();
@@ -2555,9 +2550,9 @@ impl ScheduleStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, gate_kind, \
-                     gate_spec, gate_last_output, gate_permission, isolated, created_at, \
+                     gate_spec, gate_last_output, gate_permission, created_at, \
                      last_fired_at, next_fire_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         id,
                         session_id,
@@ -2568,7 +2563,6 @@ impl ScheduleStore {
                         gate_spec,
                         gate_last_output,
                         gate_permission,
-                        isolated,
                         created_at,
                         last_fired_at,
                         next_fire_at
@@ -2589,7 +2583,7 @@ impl ScheduleStore {
     ) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
             "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec, \
-             gate_last_output, gate_permission, isolated, created_at, last_fired_at, next_fire_at, \
+             gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at, \
              attempts FROM scheduled_jobs WHERE session_id = ?1 ORDER BY next_fire_at ASC"
                 .to_string(),
             vec![session_id.to_string()],
@@ -2602,7 +2596,7 @@ impl ScheduleStore {
     pub async fn list_all_scheduled_jobs(&self) -> crate::error::Result<Vec<ScheduledJob>> {
         self.query_scheduled_jobs(
             "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec, \
-             gate_last_output, gate_permission, isolated, created_at, last_fired_at, next_fire_at, \
+             gate_last_output, gate_permission, created_at, last_fired_at, next_fire_at, \
              attempts FROM scheduled_jobs ORDER BY next_fire_at ASC"
                 .to_string(),
             Vec::new(),
@@ -2619,7 +2613,7 @@ impl ScheduleStore {
         self.query_scheduled_jobs(
             format!(
                 "SELECT id, session_id, kind, spec, prompt, gate_kind, gate_spec, \
-                 gate_last_output, gate_permission, isolated, created_at, last_fired_at, \
+                 gate_last_output, gate_permission, created_at, last_fired_at, \
                  next_fire_at, attempts FROM scheduled_jobs \
                  WHERE next_fire_at <= ?1 AND {} \
                  ORDER BY next_fire_at ASC",
@@ -2654,11 +2648,10 @@ impl ScheduleStore {
                             gate_spec: row.get(6)?,
                             gate_last_output: row.get(7)?,
                             gate_permission: row.get(8)?,
-                            isolated: row.get::<_, i64>(9)? != 0,
-                            created_at: row.get(10)?,
-                            last_fired_at: row.get(11)?,
-                            next_fire_at: row.get(12)?,
-                            attempts: row.get::<_, i64>(13)?.max(0) as u32,
+                            created_at: row.get(9)?,
+                            last_fired_at: row.get(10)?,
+                            next_fire_at: row.get(11)?,
+                            attempts: row.get::<_, i64>(12)?.max(0) as u32,
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3096,7 +3089,6 @@ struct ScheduledJobRow {
     gate_spec: Option<String>,
     gate_last_output: Option<String>,
     gate_permission: Option<String>,
-    isolated: bool,
     created_at: String,
     last_fired_at: Option<String>,
     next_fire_at: String,
@@ -3150,7 +3142,6 @@ impl ScheduledJobRow {
             schedule: Schedule::from_stored(&self.kind, &self.spec)?,
             prompt: self.prompt,
             gate,
-            isolated: self.isolated,
             created_at: parse_time(&self.created_at)?,
             last_fired_at: self.last_fired_at.as_deref().map(parse_time).transpose()?,
             next_fire_at: parse_time(&self.next_fire_at)?,
@@ -3772,7 +3763,6 @@ mod tests {
             schedule: Schedule::parse_every("1h").expect("parses"),
             prompt: "watch the thing".to_string(),
             gate,
-            isolated: false,
             created_at: Utc::now(),
             last_fired_at: None,
             next_fire_at: Utc::now(),
@@ -4262,7 +4252,6 @@ mod tests {
                 schedule,
                 prompt: "do the thing".to_string(),
                 gate,
-                isolated: false,
                 created_at: now - overdue - chrono::Duration::seconds(1),
                 last_fired_at: None,
                 next_fire_at: now - overdue,
@@ -4358,6 +4347,106 @@ mod tests {
                 .list_scheduled_jobs(self.session_id)
                 .await
                 .expect("list jobs")
+        }
+    }
+
+    /// Every field a job carries survives the write and the read back.
+    ///
+    /// `ScheduledJobRow` addresses columns by position, so the `INSERT`, the three `SELECT` lists
+    /// and the decoder have to agree on an ordering that is written out four times and checked
+    /// nowhere. A field asserted here is one an index shift cannot move silently: the timestamps
+    /// stop parsing, and the gate and the schedule come back as something else.
+    ///
+    /// Both an ungated and a gated job, because the gate occupies four consecutive columns in the
+    /// middle of the row and a shift that starts after them is invisible to a job that has none.
+    #[tokio::test]
+    async fn every_field_of_a_job_survives_the_round_trip() {
+        let harness = SchedulerHarness::new().await;
+        // Fixed rather than `Utc::now()`: the store round-trips through RFC 3339, so a wall-clock
+        // instant would make this assert the precision of that format rather than the ordering of
+        // the columns.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("parses")
+            .with_timezone(&Utc);
+        let gate = Gate {
+            probe: GateProbe::Tool {
+                name: "mcp__bridge__unseen".to_string(),
+                arguments: serde_json::json!({"folder": "inbox"}),
+            },
+            predicate: GatePredicate::At {
+                pointer: "/chats".to_string(),
+                is: PointerTest::NotEmpty,
+            },
+            last_output: Some("{\"chats\":[]}".to_string()),
+            permission: crate::permission::Permission::Read,
+        };
+
+        for (label, gate) in [("ungated", None), ("gated", Some(gate))] {
+            let written = ScheduledJob {
+                attempts: 2,
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: harness.session_id,
+                schedule: Schedule::parse_every("90m").expect("parses"),
+                prompt: "check the feed".to_string(),
+                gate,
+                created_at: now,
+                last_fired_at: Some(now + chrono::Duration::minutes(5)),
+                next_fire_at: now + chrono::Duration::minutes(90),
+            };
+            harness
+                .manager
+                .schedule_store()
+                .create_scheduled_job(&written)
+                .await
+                .expect("write");
+
+            let read = harness
+                .manager
+                .schedule_store()
+                .list_scheduled_jobs(harness.session_id)
+                .await
+                .expect("read back")
+                .into_iter()
+                .find(|job| job.id == written.id)
+                .unwrap_or_else(|| panic!("{label}: the job is not there"));
+
+            assert_eq!(read.session_id, written.session_id, "{label}: session");
+            assert_eq!(
+                read.schedule.spec(),
+                written.schedule.spec(),
+                "{label}: schedule"
+            );
+            assert_eq!(read.prompt, written.prompt, "{label}: prompt");
+            assert_eq!(
+                read.gate.as_ref().map(|gate| gate.spec()),
+                written.gate.as_ref().map(|gate| gate.spec()),
+                "{label}: gate"
+            );
+            assert_eq!(
+                read.gate.as_ref().and_then(|gate| gate.last_output.clone()),
+                written
+                    .gate
+                    .as_ref()
+                    .and_then(|gate| gate.last_output.clone()),
+                "{label}: gate baseline"
+            );
+            assert_eq!(
+                read.gate.as_ref().map(|gate| gate.permission),
+                written.gate.as_ref().map(|gate| gate.permission),
+                "{label}: gate permission"
+            );
+            assert_eq!(read.created_at, written.created_at, "{label}: created_at");
+            assert_eq!(
+                read.last_fired_at, written.last_fired_at,
+                "{label}: last_fired_at"
+            );
+            assert_eq!(
+                read.next_fire_at, written.next_fire_at,
+                "{label}: next_fire_at"
+            );
+            // Not written by `create_scheduled_job`, which is itself the point: the column has a
+            // default and sits at the end of the row, so a shift lands here first.
+            assert_eq!(read.attempts, 0, "{label}: attempts starts unclaimed");
         }
     }
 
@@ -4614,7 +4703,6 @@ mod tests {
             schedule,
             prompt: "check the news".to_string(),
             gate: None,
-            isolated: false,
             created_at: at("2026-08-11T12:00:00Z"),
             last_fired_at: None,
             next_fire_at: at("2026-08-11T12:00:00Z"),
@@ -5213,7 +5301,6 @@ mod tests {
             gate_spec: Some(r#"{"shell":{"command":"true"},"when":"succeeded"}"#.to_string()),
             gate_last_output: None,
             gate_permission: permission.map(str::to_string),
-            isolated: false,
             created_at: Utc::now().to_rfc3339(),
             last_fired_at: None,
             next_fire_at: Utc::now().to_rfc3339(),
@@ -6612,10 +6699,10 @@ mod tests {
     /// A standing "this gate is broken" verdict retires itself once the row shows otherwise.
     ///
     /// The counter is per process and only the host that wins `claim_occurrence` ever touches it.
-    /// `isolated` jobs are exempt from the session-residency filter and which host wins is a race
-    /// between their tickers, so a second `meka serve` on the same store can take over every
-    /// occurrence and heal the gate while this process's count stays where it stopped. The marker
-    /// then stood forever: the model was told, every turn, that a job firing hourly was dead.
+    /// Which host wins is a race between their tickers, so a second `meka serve` on the same store
+    /// can take over every occurrence and heal the gate while this process's count stays where it
+    /// stopped. The marker then stood forever: the model was told, every turn, that a job firing
+    /// hourly was dead.
     ///
     /// Driven in one process rather than two. Advancing `last_fired_at` here is exactly what the
     /// other host's `complete_claim` writes, and the counter it has to convince lives in this

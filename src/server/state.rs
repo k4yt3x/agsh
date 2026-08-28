@@ -345,22 +345,6 @@ impl TurnGuard {
             epoch_at_admission,
         })
     }
-
-    /// Count a turn against the *process* only, for work that owns no session entry.
-    ///
-    /// An isolated scheduled fire creates its session inside `run_turn` and never registers it in
-    /// `state.sessions`, so there is no per-session counter to bump -- but the shutdown drain also
-    /// watches the process-wide one, and without this the fire is invisible to it and gets aborted
-    /// part-way through.
-    pub fn mark_process_busy(process_counter: Arc<AtomicUsize>) -> Self {
-        process_counter.fetch_add(1, Ordering::AcqRel);
-        let session = Arc::new(AtomicUsize::new(1));
-        Self {
-            process: process_counter,
-            session,
-            epoch_at_admission: 0,
-        }
-    }
 }
 
 impl Drop for TurnGuard {

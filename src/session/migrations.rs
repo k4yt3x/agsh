@@ -152,6 +152,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "mcp_credentials_hold_every_kind",
         step: Step::Rust(mcp_credentials_hold_every_kind),
     },
+    Migration {
+        name: "scheduled_jobs_forget_isolation",
+        step: Step::Rust(scheduled_jobs_forget_isolation),
+    },
 ];
 
 /// What [`plan`] decided, and what [`apply`] will do about it.
@@ -980,6 +984,38 @@ fn mcp_credentials_hold_every_kind(
     Ok(())
 }
 
+/// 0.44: a scheduled job always fires in the session that created it.
+///
+/// `isolated` let a job run its turn in a fresh top-level session instead of the conversation that
+/// created it. The flag was honoured only by `meka serve`; the REPL and ACP each drive one
+/// conversation per session and ran such a job in the open one, with a warning. It is gone, so
+/// every host now does what two of the three already did.
+///
+/// Nothing is converted, because there is nothing to convert: a job's identity is its session, its
+/// schedule and its prompt, and only where the turn landed changes. A row that carried `1` keeps
+/// firing on exactly its old schedule, into the conversation it belongs to.
+///
+/// Dropping the column rather than leaving it inert is what earns every reader the right to stop
+/// asking. The row decoder addresses columns by position, so a dead column is not free: it stays in
+/// every `SELECT` list and every index below it counts around it, which is a standing invitation to
+/// an off-by-one in a place where the symptom is a timestamp that will not parse.
+fn scheduled_jobs_forget_isolation(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns: Vec<String> = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["scheduled_jobs"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
+    // every step after the baseline, and a bare `DROP COLUMN` on the second pass fails with
+    // `no such column` and refuses that store on every start afterwards.
+    if columns.iter().any(|column| column == "isolated") {
+        transaction.execute_batch("ALTER TABLE scheduled_jobs DROP COLUMN isolated")?;
+    }
+    Ok(())
+}
+
 /// The profile named by the only stored credential, when there is exactly one.
 ///
 /// Ambiguity is not resolved by picking: with two credentials there is no evidence here about which
@@ -1468,6 +1504,99 @@ mod tests {
             vec!["client_secret".to_string(), "oauth".to_string()],
             "a replay leaves both secrets where they were"
         );
+    }
+
+    /// Every job survives losing the column, keeps its schedule, and is still readable afterwards.
+    ///
+    /// The column sat at index 9 of a positionally-decoded row, so dropping it moves four fields
+    /// under the reader. Reading the schedule and the fire time back out is what would catch a
+    /// half-applied shift: a timestamp read from the wrong column does not parse.
+    #[test]
+    fn a_job_survives_losing_the_isolated_column() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) \
+                 VALUES ('s1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO scheduled_jobs \
+                   (id, session_id, kind, spec, prompt, isolated, created_at, next_fire_at) \
+                 VALUES ('j-solo', 's1', 'every', '1h', 'check the feed', 1, \
+                         '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z'), \
+                        ('j-joined', 's1', 'every', '2h', 'check the other feed', 0, \
+                         '2026-01-01T00:00:00Z', '2026-01-01T02:00:00Z')",
+            )
+            .expect("one job of each kind");
+
+        let planned = plan(&connection).expect("classified");
+        apply(&mut connection, planned, &Context::adopting(Some("p"))).expect("migrated");
+
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('scheduled_jobs')")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert!(
+            !columns.iter().any(|column| column == "isolated"),
+            "the column is gone: {columns:?}"
+        );
+
+        let rows: Vec<(String, String, String)> = connection
+            .prepare("SELECT id, spec, next_fire_at FROM scheduled_jobs ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "j-joined".to_string(),
+                    "2h".to_string(),
+                    "2026-01-01T02:00:00Z".to_string()
+                ),
+                (
+                    "j-solo".to_string(),
+                    "1h".to_string(),
+                    "2026-01-01T01:00:00Z".to_string()
+                ),
+            ],
+            "both jobs keep their schedule and their next fire; the one that was isolated is now \
+             an ordinary job on the same session"
+        );
+    }
+
+    /// Rule 3 for the column drop. A bare `ALTER TABLE … DROP COLUMN` would fail with
+    /// `no such column: isolated` on the second pass and refuse the store on every start.
+    #[test]
+    fn dropping_the_isolated_column_replays_cleanly() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) \
+                 VALUES ('s1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO scheduled_jobs \
+                   (id, session_id, kind, spec, prompt, isolated, created_at, next_fire_at) \
+                 VALUES ('j1', 's1', 'every', '1h', 'watch it', 1, \
+                         '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
+            )
+            .expect("a job");
+        let first = plan(&connection).expect("classified");
+        apply(&mut connection, first, &Context::adopting(Some("p"))).expect("migrated");
+
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(&mut connection, replayed, &Context::adopting(Some("p")))
+            .expect("the replay must not fail");
+
+        let surviving: i64 = connection
+            .query_row("SELECT COUNT(*) FROM scheduled_jobs", [], |row| row.get(0))
+            .expect("query");
+        assert_eq!(surviving, 1, "and the job is still there");
     }
 
     /// The override columns replay for the same reason the provider column does, and the failure

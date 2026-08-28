@@ -338,9 +338,8 @@ enabled = ["read", "unrestricted"]
             transaction
                 .execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
-                     gate_kind, gate_spec, gate_permission, isolated, created_at, \
-                     next_fire_at) \
-                     VALUES (?1, ?2, 'every', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     gate_kind, gate_spec, gate_permission, created_at, next_fire_at) \
+                     VALUES (?1, ?2, 'every', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         format!("job-{}", job.name),
                         job.session_id,
@@ -355,7 +354,6 @@ enabled = ["read", "unrestricted"]
                             .to_string()
                         }),
                         job.gate_command.map(|_| "unrestricted"),
-                        i64::from(job.isolated),
                         due,
                         due,
                     ],
@@ -366,8 +364,8 @@ enabled = ["read", "unrestricted"]
     }
 }
 
-/// The arguments [`Cluster::plant_job`] takes, named rather than positional because five of the
-/// seven are strings or bools and a call site of bare literals says nothing.
+/// The arguments [`Cluster::plant_job`] takes, named rather than positional because four of the
+/// six are strings and a call site of bare literals says nothing.
 struct PlantedJob<'a> {
     name: &'a str,
     session_id: &'a str,
@@ -377,7 +375,6 @@ struct PlantedJob<'a> {
     /// under `succeeded` declines instead, which claims the occurrence without spending a turn --
     /// the cheapest observable a scheduler test can have.
     gate_command: Option<&'a str>,
-    isolated: bool,
     overdue_by: Duration,
 }
 
@@ -724,7 +721,6 @@ fn plant_a_decoy_and_the_job(cluster: &Cluster, session: &str, job: PlantedJob<'
             every: "1h",
             prompt: "never delivered: the gate declines",
             gate_command: Some(&decoy),
-            isolated: false,
             // More overdue than the job under test, so it sorts first in every host's due list.
             overdue_by: Duration::from_secs(600),
         },
@@ -762,7 +758,6 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
         every: "1h",
         prompt: "check the thing",
         gate_command: Some(&gate),
-        isolated: false,
         overdue_by: Duration::from_secs(60),
     });
 
@@ -784,52 +779,6 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
         gate_runs(&log),
         1,
         "one occurrence must produce one gate execution, not one per host\n{}",
-        logs
-    );
-}
-
-/// The same arbitration for an `isolated` job, which reaches it by a different route: `runnable`
-/// exempts isolated jobs from the session-lock probe entirely, so nothing before the claim declines
-/// either host. Each fire creates a *new top-level session*, so a duplicate is not a repeated turn
-/// that vanishes but a permanent extra row in `meka session list`.
-#[test]
-fn two_servers_do_not_both_run_one_isolated_job() {
-    let cluster = Cluster::new("[schedule]\npoll_interval = \"200ms\"\n");
-    cluster.script(one_reply("isolated run"));
-    let started = cluster.run(&["--oneshot", "make a session"]);
-    assert!(started.status.success(), "the first turn failed");
-    let session = cluster.only_session();
-    assert_eq!(cluster.session_count(), 1);
-
-    let mut first = cluster.serve("one");
-    let mut second = cluster.serve("two");
-
-    plant_a_decoy_and_the_job(&cluster, &session, PlantedJob {
-        name: "isolated",
-        session_id: &session,
-        every: "1h",
-        prompt: "run somewhere else",
-        gate_command: None,
-        isolated: true,
-        overdue_by: Duration::from_secs(60),
-    });
-
-    wait_until(
-        "the isolated run to finish",
-        Duration::from_secs(30),
-        || cluster.session_count() >= 2,
-    );
-    std::thread::sleep(DECOY_GATE + Duration::from_secs(2));
-    let logs = format!(
-        "--- server one ---\n{}\n--- server two ---\n{}",
-        first.stop(),
-        second.stop()
-    );
-
-    assert_eq!(
-        cluster.session_count(),
-        2,
-        "one occurrence must produce one isolated session, not one per host\n{}",
         logs
     );
 }

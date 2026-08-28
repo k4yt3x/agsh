@@ -2998,7 +2998,6 @@ mod tests {
             schedule,
             prompt: prompt.to_string(),
             gate: None,
-            isolated: false,
             created_at: now,
             last_fired_at: None,
             next_fire_at,

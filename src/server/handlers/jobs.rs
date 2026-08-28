@@ -46,9 +46,6 @@ pub struct ScheduledJobView {
     /// Present when the job is gated, on a shell command or a tool call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateView>,
-    /// Whether the job runs in a fresh sub-agent session rather than the conversation that created
-    /// it.
-    pub isolated: bool,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fired_at: Option<String>,
@@ -110,7 +107,6 @@ impl ScheduledJobView {
                 kind: gate.probe.kind_str().to_string(),
                 when: gate.predicate.summary(),
             }),
-            isolated: job.isolated,
             created_at: job.created_at.to_rfc3339(),
             last_fired_at: job.last_fired_at.map(|at| at.to_rfc3339()),
             next_fire_at: job.next_fire_at.to_rfc3339(),
@@ -214,9 +210,6 @@ pub struct CreateJobRequest {
     /// `read`.
     #[serde(default)]
     pub gate: Option<CreateGate>,
-    /// Run in a fresh sub-agent session rather than replaying the parent's history every fire.
-    #[serde(default)]
-    pub isolated: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -291,12 +284,33 @@ pub async fn create(
         ));
     }
 
-    // Existence-checked, not revived. Reviving would take the session's cross-process file lock
-    // for up to `idle_timeout` and hand a `schedule:w` token the same lock-pinning reach a read
-    // token was just denied on `GET /context`. A gate is authorised against the session's
-    // permission, which is on the row as well as the entry, so the resident copy is used when
-    // there is one and the row answers otherwise.
-    require_session_exists(&state, id).await?;
+    // Read, not revived. Reviving would take the session's cross-process file lock for up to
+    // `idle_timeout` and hand a `schedule:w` token the same lock-pinning reach a read token was
+    // just denied on `GET /context`. One read answers all three questions below -- that the session
+    // exists, that it is one a job may belong to, and what level a gate would be authorised
+    // against -- so the row is fetched once here rather than per check.
+    let summary = state
+        .shared
+        .session_manager
+        .session_info(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to look up session", error)
+                .with("session_id", id.to_string())
+        })?
+        .ok_or_else(|| {
+            ProblemDetail::new(
+                ErrorKind::SessionNotFound,
+                StatusCode::NOT_FOUND,
+                format!("session '{}' does not exist", id),
+            )
+            .with("session_id", id.to_string())
+        })?;
+
+    if let Some(refusal) = refuse_subagent_session(id, summary.parent_id) {
+        return Err(refusal);
+    }
+
     let resident = state.sessions.read().await.get(&id).cloned();
 
     let now = Utc::now();
@@ -309,7 +323,7 @@ pub async fn create(
     // run at, because there is nobody to approve it.
     let permission = match &resident {
         Some(entry) => entry.permission.get(),
-        None => session_permission_from_row(&state, id).await?,
+        None => permission_from_summary(&state, id, Some(&summary)),
     };
 
     // Refused for an *ungated* job too, which is the case a gate-shaped check misses.
@@ -473,7 +487,6 @@ pub async fn create(
         schedule,
         prompt: body.prompt,
         gate,
-        isolated: body.isolated,
         created_at: now,
         last_fired_at: None,
         next_fire_at,
@@ -585,6 +598,75 @@ fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<St
     }
 }
 
+/// Refuse a job on a session that is somebody's sub-agent, returning the problem when it is one.
+///
+/// A job belongs to a top-level session, and this endpoint is the only door that could plant one
+/// elsewhere. A sub-agent has no `schedule_*` tools by construction
+/// ([`crate::tools::ToolRegistry::build_for_subagent`] passes no schedule config), so until this
+/// the rule was held by omission at the tool door and by nothing at all here.
+///
+/// What it prevents is an authority escalation rather than an oddity. A worker's restrictions live
+/// in `sessions.subagent_spec_json` and are applied by `build_for_subagent`, but the fire path
+/// rebuilds a session through [`crate::build_session_agent`], which never reads that column. A job
+/// keyed to a worker would therefore wake it with the full built-in set, none of its `[subagents]`
+/// denials, and none of its memory or instruction grants. Its row also records no `permission`, so
+/// the turn would run at the *host's* level rather than the lower one it was spawned under.
+///
+/// **This closes the scheduling route to that, not the weakness itself.** Every caller of
+/// `reattach::ensure_session_loaded` rebuilds a worker the same unrestricted way, and `POST
+/// /v1/sessions/{id}/turn` does it on demand for anyone holding `sessions:w`. Closing that needs a
+/// re-attach path that reads the spec and routes to `build_for_subagent`, which is a larger change
+/// than a refusal. What this door earns meanwhile is that the cheaper `schedule:w` grant cannot
+/// reach it at all, and that nobody can leave a *standing* job that reaches it on a timer.
+///
+/// `InvalidBody` rather than `AuthScope` or `SessionPermission`: no token and no permission level
+/// changes the answer, so routing it at either would send a client off to re-provision a token or
+/// to `PATCH /v1/sessions/{id}` for a refusal neither can lift. [`create`] routes its gate refusals
+/// by the same rule.
+fn refuse_subagent_session(id: Uuid, parent: Option<Uuid>) -> Option<ProblemDetail> {
+    let parent = parent?;
+    Some(
+        ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "session '{}' is a sub-agent of '{}', and a sub-agent runs only while the agent \
+                 that spawned it is waiting on it. Schedule the job on '{}' instead and let its \
+                 turn dispatch the worker.",
+                id, parent, parent
+            ),
+        )
+        .with("session_id", id.to_string()),
+    )
+}
+
+/// The level a non-resident session's row asks for, narrowed to what this installation permits.
+///
+/// Split from the fetch so a caller that already holds the row does not read it again. A row that
+/// records nothing (REPL, ACP and sub-agent rows all leave `permission` NULL) falls back to the
+/// host's configured level, which is also what an unparseable value resolves to.
+fn permission_from_summary(
+    state: &ServerState,
+    id: Uuid,
+    summary: Option<&crate::session::SessionSummary>,
+) -> Permission {
+    let persisted = crate::permission::parse_recorded_permission(
+        summary.and_then(|summary| summary.permission.as_deref()),
+        &format_args!("session {id}"),
+    )
+    .unwrap_or(state.shared.config.permission);
+    if state
+        .shared
+        .config
+        .enabled_permissions
+        .is_enabled(persisted)
+    {
+        persisted
+    } else {
+        state.shared.config.permission
+    }
+}
+
 async fn session_permission_from_row(
     state: &ServerState,
     id: Uuid,
@@ -598,23 +680,7 @@ async fn session_permission_from_row(
             ProblemDetail::internal_sanitized("failed to read session permission", error)
                 .with("session_id", id.to_string())
         })?;
-    let persisted = crate::permission::parse_recorded_permission(
-        summary.and_then(|summary| summary.permission).as_deref(),
-        &format_args!("session {id}"),
-    )
-    .unwrap_or(state.shared.config.permission);
-    Ok(
-        if state
-            .shared
-            .config
-            .enabled_permissions
-            .is_enabled(persisted)
-        {
-            persisted
-        } else {
-            state.shared.config.permission
-        },
-    )
+    Ok(permission_from_summary(state, id, summary.as_ref()))
 }
 
 /// Resolve exactly one of `at` / `every` / `cron`.
@@ -946,6 +1012,39 @@ pub async fn cancel_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job may be planted on a top-level session and on nothing else.
+    ///
+    /// The refusal is what stands between a `schedule:w` token and an authority escalation:
+    /// `GET /v1/sessions?include_children=true` hands out sub-agent ids to any `sessions:r`
+    /// holder, and the fire path rebuilds a session through `build_session_agent`, which knows
+    /// nothing of `subagent_spec_json`. Without this the worker wakes unrestricted, at the host's
+    /// permission rather than its own.
+    ///
+    /// Both arms are asserted. A guard that refused everything would pass a
+    /// refusal-only test while breaking every ordinary job.
+    #[test]
+    fn a_job_is_refused_on_a_sub_agent_session_and_admitted_on_a_top_level_one() {
+        let worker = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+
+        assert!(
+            refuse_subagent_session(worker, None).is_none(),
+            "a session with no parent is the ordinary case and must be admitted"
+        );
+
+        let refusal = refuse_subagent_session(worker, Some(parent))
+            .expect("a session with a parent cannot own a job");
+        assert_eq!(refusal.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal.type_uri, ErrorKind::InvalidBody.type_uri());
+        // Both ids, because the remedy is to re-issue the request against the parent and a client
+        // that was handed the worker's id may not know what spawned it.
+        let detail = refusal.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains(&worker.to_string()) && detail.contains(&parent.to_string()),
+            "the refusal must name the worker and the session to use instead: {detail}"
+        );
+    }
 
     /// Nothing about *why* a job is held escapes to a token that may not see what the gate runs.
     ///

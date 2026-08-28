@@ -47,11 +47,7 @@ directory, so it cannot relocate its own boundary. You can, with `/cd`; and unde
 client holding `sessions:w` can, with `PATCH /v1/sessions/{id}`.
 
 `--writable-root` belongs to the process and reaches the REPL, a one-shot run, and an ACP session.
-It deliberately does **not** reach an isolated scheduled fire under `meka serve`, which has no
-session of its own to inherit from: seeding one from the daemon's flags would make the fire strictly
-more capable than the job's own session, and would be reachable by a token holding only
-`schedule:w`. An isolated fire writes nowhere unless the session the job belongs to carries roots.
-It likewise does **not** reach a session created through `POST /v1/sessions`: the HTTP API is single-root, so a session there is confined to its own
+It does **not** reach a session created through `POST /v1/sessions`: the HTTP API is single-root, so a session there is confined to its own
 `cwd` and nothing else. Extra roots supplied by an ACP client apply to that client's session only,
 and meka does not report your `--writable-root` back to the client as though the client had asked
 for it.

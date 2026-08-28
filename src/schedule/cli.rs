@@ -324,7 +324,6 @@ mod tests {
             schedule: Schedule::parse_every("1h").expect("parses"),
             prompt: "watch the thing".to_string(),
             gate,
-            isolated: false,
             created_at: chrono::Utc::now(),
             last_fired_at: None,
             next_fire_at: chrono::Utc::now(),

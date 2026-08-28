@@ -110,12 +110,12 @@ pub struct ScheduleConfig {
     /// How long a host's claim on an occurrence is good for. Default `"1h"`.
     ///
     /// The window in which a crashed host's job is nobody's, so it is the delay before another
-    /// host picks it up. It has to comfortably exceed a gate probe plus a model turn, because
-    /// a lease that expires while the holder is still working lets a second host take the same
-    /// occurrence: for a job bound to a session that is caught by the session lock and
-    /// deferred, but an `isolated` job has no such backstop and would run twice. An hour is
-    /// far longer than any realistic turn and still short enough that a machine which rebooted
-    /// overnight has caught up by morning.
+    /// host picks it up. It should comfortably exceed a gate probe plus a model turn: a lease
+    /// that expires while the holder is still working lets a second host take the same
+    /// occurrence, and although the session lock then catches it and defers, that costs the
+    /// occurrence a round trip and re-runs the gate probe. An hour is far longer than any
+    /// realistic turn and still short enough that a machine which rebooted overnight has caught
+    /// up by morning.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub claim_lease: Option<std::time::Duration>,
     /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
@@ -3179,9 +3179,9 @@ impl ResolvedConfig {
             ));
         }
         // A lease has to outlast the work it covers, and the probe is the part meka can check. One
-        // that expires while a host is still working lets a second host take the same occurrence:
-        // for a session-bound job the session lock catches it, but an `isolated` job runs its turn
-        // twice. Checked against `gate_timeout` rather than against a fixed floor because that is
+        // that expires while a host is still working lets a second host take the same occurrence,
+        // which the session lock catches at the cost of a deferral and a re-run gate probe.
+        // Checked against `gate_timeout` rather than against a fixed floor because that is
         // the only bound on the work meka knows -- the turn after it is unbounded, which is why the
         // documentation asks for headroom on top rather than this settling the question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
@@ -4943,8 +4943,8 @@ model = "m"
     ///
     /// Zero is the obvious mistake and is not the only one: any lease shorter than the gate budget
     /// can expire while the host that took it is still running its own probe, which hands the same
-    /// occurrence to a second host. A session-bound job survives that on the session lock; an
-    /// `isolated` one runs its turn twice.
+    /// occurrence to a second host. The session lock stops that becoming a second turn, but only
+    /// after the occurrence has been round-tripped and the probe re-run.
     #[test]
     fn test_schedule_claim_lease_must_outlast_the_gate_budget() {
         for (lease, accepted) in [("\"0s\"", false), ("\"10s\"", false), ("\"90s\"", true)] {

@@ -460,7 +460,6 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
   "timestamp": "2026-02-01T03:00:00Z",
   "job_id": "9f2c...",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "isolated": true,
   "status": "completed"
 }
 ```

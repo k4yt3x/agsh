@@ -188,6 +188,15 @@ Jobs all live in the same database, so a host that does not fire a job has not l
 session nobody has open simply waits, and fires as soon as something that can run it picks it up:
 another host, or a `meka serve` daemon pointed at the same data directory.
 
+A job's turn always joins the session that owns it, on every host. If what you want instead is a
+recurring turn that carries no conversation at all, that is an external timer's job rather than a
+scheduled one: systemd, cron or Task Scheduler invoking `meka --oneshot`, with the level and the
+profile stated outright rather than inherited from a session.
+
+```bash
+meka --oneshot --permission read --provider work "summarise today's alerts"
+```
+
 ### Claiming an occurrence
 
 A due job is *leased* before it runs: the host records itself and an expiry on the row, delivers the
@@ -212,23 +221,17 @@ turn, and then advances the schedule (or retires a one-shot). Three consequences
   locked by a REPL -- does not count, since that says nothing about the job.
 
 `[schedule] claim_lease` (default `"1h"`) is how long a lease is good for, and therefore how long a
-crashed host's occurrence waits before another host takes it. It must exceed a gate probe plus a
+crashed host's occurrence waits before another host takes it. It should exceed a gate probe plus a
 turn: a lease that expires under a host still working lets a second host take the same occurrence,
-which for a session-bound job is caught by the session lock but for an `isolated` job would run the
-turn twice. A host refuses to start on a `claim_lease` at or under `gate_timeout`, since that half is
-checkable; the turn after the probe is unbounded, so leave real headroom on top rather than treating
-that check as the whole answer.
+and although the session lock stops that becoming a second turn, the occurrence still makes a round
+trip and the gate probe runs again. A host refuses to start on a `claim_lease` at or under
+`gate_timeout`, since that half is checkable; the turn after the probe is unbounded, so leave real
+headroom on top rather than treating that check as the whole answer.
 
 Two hosts sharing a session do not fight over its jobs. A session is held by one process at a time,
 and `meka serve` leaves that session's jobs to whoever holds it rather than reaching for them and
 handing the occurrence back afterwards -- which matters most for a gated job, since deciding late
 would mean running its probe on every tick.
-
-The exception is an `isolated` job, which runs in a session of its own and so needs nothing from the
-one that created it. `meka serve` stays eligible for those whatever else holds the session, because
-it is the only host that honours the flag. If you have a REPL open on the same session at the same
-time, though, either host may take a given occurrence, and the REPL will run it in your conversation
-with a warning. Run isolated jobs under `meka serve` alone if you want the flag respected every time.
 
 ### More than one host on the same database
 
@@ -236,8 +239,7 @@ Several meka processes pointed at one data directory -- two `meka serve` instanc
 a terminal -- all poll the same table, so the same occurrence appears in several due lists at once.
 Each occurrence is nevertheless run once. A host takes it by leasing it in a single conditional
 write -- recording itself and an expiry on a row that no other host currently holds -- and the hosts
-that lose that write stop before evaluating the gate: no duplicate probe, no duplicate turn, no
-duplicate isolated session.
+that lose that write stop before evaluating the gate: no duplicate probe and no duplicate turn.
 Which host wins is a race between their tickers and is not something you can pin down; that only
 one wins is.
 
@@ -284,30 +286,6 @@ is retired as soon as the turn is delivered, so that message is the last trace t
 fired. A turn that got as far as running a tool keeps everything either way, since there is real work behind
 it. Failures are recorded regardless: `meka serve` logs them and sends a `schedule.fired` webhook
 with `status: "failed"`.
-
-## Isolated jobs
-
-By default a job's turn joins the conversation that created it, so you come back to a session
-containing what happened while you were away.
-
-Pass `isolated: true` and the turn runs in a fresh session instead. Isolated runs are ordinary
-sessions, so `meka session list` and `meka session export` can see them.
-
-An isolated fire runs on the **provider profile of the session that created the job**, not on the
-server's default, and its fresh session records that profile like any other. A job scheduled from a
-session on `work` keeps billing `work` after you point `default_provider` somewhere else, which is
-the same rule the job's permission level and working directory already follow.
-
-The trade is cost against continuity, and neither side is the default answer. Isolation is cheaper
-for anything recurring, because the creating conversation's history is not replayed on every fire,
-and it keeps a job firing every two minutes from filling the conversation you actually talk in with
-its own results. But an isolated turn remembers nothing said in the parent, so a job whose value
-depends on that memory (a look-back at something the agent itself did, a watcher that should notice
-it has already reported this) is worse in isolation no matter how well the prompt is written. Reach
-for it when the job is self-contained, and leave it off when it is not.
-
-**Only `meka serve` honours `isolated`.** The REPL and ACP each drive one conversation per session,
-so a job that asked for isolation runs in that conversation instead, with a warning saying so.
 
 ## Unattended turns and permissions
 
@@ -451,9 +429,7 @@ keep working, so jobs left over from before the flag was flipped can still be li
 ## Tips
 
 - Write the prompt for a reader who has no context. The conversation that created the job may be
-  long over, and for an isolated job it was never there at all.
-- Reach for `isolated: true` when a recurring job is self-contained; the token difference is large.
-  Leave it off when the job needs to remember what happened in the conversation that created it.
+  long over, and after a compaction the turn that created it may not have survived.
 - Reach for a gate whenever the answer is usually "nothing happened".
 - Keep gate probes fast and read-only. They run on every tick, and a gate that changes something
   is a side effect on a timer.

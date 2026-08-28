@@ -2236,18 +2236,6 @@ async fn run_interactive(
                     }
                 }
                 for wakeup in fired {
-                    // The REPL has one agent and one conversation, so an isolated job runs here
-                    // like any other. Said out loud rather than silently downgraded: the tool
-                    // offers the flag and `meka serve` honours it, so a job behaving differently
-                    // depending on which host happened to fire it is exactly the kind of thing
-                    // nobody would think to check.
-                    if wakeup.job.isolated {
-                        tracing::warn!(
-                            "job {} asked for an isolated session; the REPL runs it in this \
-                             conversation instead. Run `meka serve` for isolated jobs.",
-                            wakeup.job.short_id()
-                        );
-                    }
                     let prompt = wakeup.render_prompt();
                     match run_turn_interruptible(
                         &agent,

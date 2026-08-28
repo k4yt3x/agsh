@@ -139,9 +139,10 @@ host `/tmp` including every X11, D-Bus and tmux socket in it, which is a route s
 the sandbox. The cost is that a session started with `cd /tmp` has no write boundary, which is the
 safe direction to fail.
 
-The flag reaches the REPL, one-shot runs, ACP sessions, and isolated scheduled fires under
-`meka serve`. It does **not** reach sessions created through `POST /v1/sessions`, which are
-single-root by design.
+The flag reaches the REPL, one-shot runs, and ACP sessions. It does **not** reach sessions created
+through `POST /v1/sessions`, which are single-root by design, and therefore does not reach a
+scheduled turn under `meka serve` either: those run in the session the job belongs to, which the
+HTTP API created.
 
 ### `-p`, `--provider <NAME>`
 

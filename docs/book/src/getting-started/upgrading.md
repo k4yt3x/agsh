@@ -51,6 +51,39 @@ better answer, since it survives without the variable being set.
 Nothing else about a server moves. `env`, `args` and `headers` stay in `config.toml` with `${VAR}`
 expansion, because they configure a process or a request and merely *may* contain a secret.
 
+**`isolated` scheduled jobs are gone; every job fires in the session that created it.** The mode ran
+a job's turn in a fresh session rather than the conversation that made it, to avoid replaying that
+conversation's history. Only `meka serve` ever honoured it: the REPL and ACP already ran such a job
+in the open conversation, with a warning, so for two of the three hosts nothing changes at all.
+
+Existing jobs are not deleted and do not need touching. The store drops the column and the job keeps
+its schedule and its prompt, firing into the session it belongs to from then on.
+
+What it cost is why it went. The fire inherited the creating session's authority (its permission
+level, its working directory, its provider profile, its MCP servers) and dropped the conversation,
+which is where anything you told the agent that never reached a memory or an instructions file
+lives. Its result landed in a session nothing linked to, and the turn could not even cancel its own
+job, because `schedule_cancel` resolves against the session it is running in.
+
+`meka acp` and `meka serve` clients: `POST /v1/sessions/{id}/schedule` now rejects `isolated` with a
+422 naming the field, rather than accepting and ignoring it. `GET /v1/schedule` and the
+`schedule.fired` webhook no longer carry it either.
+
+If you were relying on the mode, an external timer does the same job with the level and profile
+stated outright instead of inherited:
+
+```bash
+meka --oneshot --permission read --provider work "summarise today's alerts"
+```
+
+Often a gate is the better answer: it means a frequent job takes no turn at all on the ticks where
+nothing happened, which saves more than skipping the history did.
+
+**A scheduled job is refused on a sub-agent session.** `POST /v1/sessions/{id}/schedule` answers 422
+if the session was spawned by another. Sub-agents never had the `schedule_*` tools, so no job meka
+created can be affected; what this closes is a client planting one directly, which would have woken
+the worker without the tool restrictions or memory grants it was spawned under.
+
 **A resume now starts at the level the session recorded.** Both CLI hosts do this: the REPL and
 `meka --oneshot -c` / `-r`. The scripted one is where a silent change matters most, since a
 `--oneshot` run that passes no `--permission` used to start at the config default and now starts at

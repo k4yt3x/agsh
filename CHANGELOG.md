@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `schedule_create` drops `isolated`; every job fires in the session that created it.
+- **Breaking:** `POST /v1/sessions/{id}/schedule` rejects `isolated`; job views and webhooks drop it.
+- **Breaking:** a scheduled job is refused on a sub-agent session, naming the one to use instead.
 - **Breaking:** MCP `auth_token` and `client_secret` move out of `config.toml` into the database.
 - **Breaking:** `meka mcp add` drops `--auth-token` and `--client-secret`; use the `-stdin` forms.
 - **Breaking:** `meka mcp logout` clears every stored credential, not only the OAuth tokens.
@@ -35,7 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--provider`, `--model`, `--base-url` and `--permission` on a resume repin the session.
 - A session whose recorded profile is not configured is refused by name, never silently redirected.
 - A profile's credential is checked when a session first needs it, not when a host starts up.
-- An isolated scheduled job runs on the profile of the session that created it.
 - A resume is no longer blocked by an ambiguous `default_provider` it does not use.
 - `meka session import` refuses an archive with no profile when nothing can supply one.
 - `meka provider remove` warns when it clears `default_provider`, and how many sessions it strands.
@@ -46,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A scheduled job can always cancel itself from the turn it wakes; an isolated fire could not.
 - `meka provider add` destroyed every profile when `providers` was written as an inline table.
 - `meka provider remove` on the same config reported the opposite of what it did.
 - Spawning a sub-agent of a session that no longer exists returned an id with no row behind it.

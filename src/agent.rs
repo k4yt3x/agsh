@@ -439,9 +439,8 @@ pub struct Agent {
     ///
     /// Empty for every agent that is handed a session id, which is most of them: `meka serve` and
     /// `meka acp` lock at `POST /v1/sessions` and `session/new`, and a sub-agent's row is created
-    /// by the spawning tool. It fills for the REPL's first turn, for a fresh `--oneshot`, and
-    /// for an isolated scheduled fire -- the three places where [`Self::run_turn_retaining`]
-    /// is the thing that creates the session.
+    /// by the spawning tool. It fills for the REPL's first turn and for a fresh `--oneshot`, the
+    /// two places where [`Self::run_turn_retaining`] is the thing that creates the session.
     ///
     /// Shared with the host through [`Self::session_lock_slot`] rather than held privately,
     /// because the host outlives the turn and has to be able to replace the lock (`/fork`) and

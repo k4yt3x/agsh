@@ -13,8 +13,6 @@
 use std::sync::Arc;
 
 use crate::{
-    conversation::Conversation,
-    frontend::SilentFrontend,
     schedule::{FireOutcome, SchedulerScope, Wakeup},
     server::{reattach, state::ServerState},
 };
@@ -50,18 +48,15 @@ pub fn spawn(state: ServerState) -> tokio::task::JoinHandle<()> {
 /// as long as that REPL stayed open. Declining here instead is precisely what [`SchedulerScope`]
 /// documents its predicate variant for.
 ///
-/// An `isolated` job is exempt, because the question does not apply to it: [`run_isolated`] reads
-/// the creating session's row and then runs in a conversation of its own, never taking that
-/// session's lock. Declining one here would leave it to whichever host holds the lock, and neither
-/// the REPL nor ACP honours `isolated` -- both run it in the conversation they have open, with a
-/// warning. The exemption keeps serve eligible so the flag can be honoured at all; it does not make
-/// serve the winner. Which host takes a given occurrence is a race between their tickers, but only
-/// a race for *which*: `prepare` claims the occurrence with a compare-and-swap
-/// (`ScheduleStore::claim_occurrence`), so the hosts that lose it return before running the gate.
+/// Every job fires in the session that owns it, so this is asked of every one of them and the
+/// answer is always about that session. Which host takes a given occurrence, among those that
+/// answer yes, is a race between their tickers, but only a race for *which*: `prepare` claims the
+/// occurrence with a compare-and-swap (`ScheduleStore::claim_occurrence`), so the hosts that lose
+/// it return before running the gate.
 ///
-/// Otherwise there are two ways to be runnable, and the order matters. A resident session is
-/// runnable by definition, and has to be checked first because *this* process is the one holding
-/// its file lock -- probing would report our own sessions as busy. Everything else is a lock probe:
+/// There are two ways to be runnable, and the order matters. A resident session is runnable by
+/// definition, and has to be checked first because *this* process is the one holding its file lock
+/// -- probing would report our own sessions as busy. Everything else is a lock probe:
 /// `lock_session` already uses a non-blocking `try_write`, so taking the lock and dropping it is a
 /// cheap, synchronous "is anyone else on this".
 ///
@@ -75,7 +70,6 @@ fn runnable_here(
     let session_manager = state.shared.session_manager.clone();
     Arc::new(move |job: &crate::schedule::ScheduledJob| {
         runnable(
-            job,
             || {
                 // `try_read` rather than `read`: the map is briefly write-locked while a session
                 // loads, and blocking a sweep behind that is worse than skipping a tick.
@@ -91,13 +85,12 @@ fn runnable_here(
                 // Not "someone else has it" but "we could not ask": a lock file owned by another
                 // user, an unwritable or swept lock directory, file descriptors exhausted.
                 // Declining is still the right answer -- a host that cannot take the lock cannot
-                // run the turn either -- but this must be loud. The symptom is a
-                // *partial* outage: resident sessions and isolated jobs keep firing
-                // while everything else silently stops, which looks like nothing
-                // being scheduled rather than like a fault. A persistent cause
-                // repeating every sweep is noisy on purpose; it is the same
-                // reasoning as the `held_over` line below, that a bound on coverage nobody is told
-                // about reads as "everything ran".
+                // run the turn either -- but this must be loud. The symptom is a *partial* outage:
+                // jobs on resident sessions keep firing while everything else silently stops, which
+                // looks like nothing being scheduled rather than like a fault. A persistent cause
+                // repeating every sweep is noisy on purpose; it is the same reasoning as the
+                // `held_over` line below, that a bound on coverage nobody is told about reads as
+                // "everything ran".
                 Err(error) => {
                     tracing::warn!(
                         "cannot take the session lock for job {}: {}; it will not fire here",
@@ -123,19 +116,12 @@ enum Residency {
 /// The rule [`runnable_here`] applies, separated from the state it reads so its short-circuits are
 /// under test.
 ///
-/// Both inputs are deferred rather than passed by value, because *not consulting them* is the
-/// substance. An isolated job must not reach either: it has no relationship with its creating
-/// session beyond one row read. And `lock_is_free` must not be consulted unless the session is
-/// already known not to be ours, since a resident session's lock is held by this very process and
-/// probing it would report every session we serve as busy.
-fn runnable(
-    job: &crate::schedule::ScheduledJob,
-    residency: impl FnOnce() -> Residency,
-    lock_is_free: impl FnOnce() -> bool,
-) -> bool {
-    if job.isolated {
-        return true;
-    }
+/// `lock_is_free` is deferred rather than passed by value because *not consulting it* is the
+/// substance: it must not be asked unless the session is already known not to be ours, since a
+/// resident session's lock is held by this very process and probing it would report every session
+/// we serve as busy. `residency` is a closure only so the test can watch whether the other one was
+/// reached.
+fn runnable(residency: impl FnOnce() -> Residency, lock_is_free: impl FnOnce() -> bool) -> bool {
     match residency() {
         Residency::Resident => true,
         Residency::NotResident => lock_is_free(),
@@ -303,11 +289,7 @@ async fn deliver_ready_outcomes(state: &ServerState) -> std::ops::ControlFlow<()
 /// whose session has gone missing or whose provider call failed.
 async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
     let job_id = wakeup.job.short_id().to_string();
-    let outcome = if wakeup.job.isolated {
-        run_isolated(&state, &wakeup).await
-    } else {
-        run_in_session(&state, &wakeup).await
-    };
+    let outcome = run_in_session(&state, &wakeup).await;
     // Announced whatever the outcome, because "the 3am job ran and failed" and "the 3am job never
     // fired" need very different responses from whoever is watching, and without this both look
     // like silence. Deferral is excluded deliberately: the occurrence was handed back, not spent,
@@ -318,7 +300,6 @@ async fn run_wakeup(state: ServerState, wakeup: Wakeup) -> FireOutcome {
             serde_json::json!({
                 "job_id": wakeup.job.id,
                 "session_id": wakeup.job.session_id,
-                "isolated": wakeup.job.isolated,
                 "status": status,
             }),
         );
@@ -532,144 +513,11 @@ async fn run_prompt_in_session(
     Ok(())
 }
 
-/// Run the prompt in a fresh session, leaving the creating conversation untouched.
-///
-/// A new top-level session rather than a sub-agent: the run is then a first-class thing
-/// `meka session list` can show and `meka session export` can dump, where a sub-agent's report
-/// would have nowhere to go once the tool call that would have carried it does not exist.
-async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunError> {
-    // The creating session's permission, not the process default: an isolated run is the same job
-    // with a cheaper context, and should not quietly gain authority by moving house.
-    //
-    // Read from the row rather than through `ensure_session_loaded`, which would rebuild the whole
-    // runtime -- agent, tool registry, MCP attachment -- and leave it resident. For a job firing on
-    // a short interval that would pin the parent session in memory permanently, which is the exact
-    // cost `isolated` exists to avoid.
-    let summary = state
-        .shared
-        .session_manager
-        .session_info(wakeup.job.session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session {} no longer exists", wakeup.job.session_id))?;
-    let enabled = state.shared.config.enabled_permissions;
-    let permission = crate::permission::parse_recorded_permission(
-        summary.permission.as_deref(),
-        &format_args!("session {}", wakeup.job.session_id),
-    )
-    .filter(|parsed| enabled.is_enabled(*parsed))
-    .unwrap_or(state.shared.config.permission);
-    let permission = crate::permission::SharedPermission::new(permission, enabled);
-
-    // The creating session's directory, for the same reason as its permission: an isolated run is
-    // the same job with a cheaper context. Falling through to the process cwd would put the shell
-    // and file tools wherever the `meka serve` unit was launched from, which under systemd is `/`.
-    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
-        summary
-            .cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from(".")),
-    ));
-    // Empty, exactly like every other session this process builds.
-    //
-    // This used to seed from `state.shared.config.writable_roots` on the reasoning that an isolated
-    // fire "is that session's job, run with a cheaper context, not a different one". The reasoning
-    // was backwards: `POST /v1/sessions` and re-attach both pass `Vec::new()`, so the creating
-    // session never held those roots, and the fire was strictly *more* capable than the session it
-    // belongs to -- the one path by which a `workspace` session wrote outside its own fence. It was
-    // also reachable by a token holding only `schedule:w`, since `isolated` sits outside the
-    // `sessions:w` upgrade that guards `gate`.
-    //
-    // If `--writable-root` should reach HTTP sessions, it has to reach the interactive ones too;
-    // that is a request field, not a side door through the scheduler.
-    let roots: crate::workspace::SharedRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
-    // Counted as an in-flight turn for the whole of the fire.
-    //
-    // `wait_for_turns_to_unwind` polls `state.concurrent_turns` and each session entry's
-    // `in_flight`; an isolated fire creates a session that is never in `state.sessions` and took no
-    // guard, so the drain saw an idle process and aborted this turn mid-flight -- undoing the
-    // shutdown fix for precisely the unattended work it was written to protect.
-    let _drain_guard =
-        crate::server::state::TurnGuard::mark_process_busy(Arc::clone(&state.concurrent_turns));
-
-    let (agent, registry) = crate::build_session_agent(
-        &state.shared,
-        // The creating session's profile, for the same reason its permission is read above: an
-        // isolated run is that session's job in a fresh conversation, not a different session's.
-        Some(wakeup.job.session_id),
-        permission,
-        Arc::new(SilentFrontend),
-        cwd,
-        roots,
-        // The HTTP surface has no context gauge of its own; the session owns the counter.
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        // An isolated fire has no reader for any of the three: it runs silent and its session is
-        // never in `state.sessions`.
-        Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    )
-    .await?;
-
-    // `run_turn` rather than `run_scheduled_turn`, though this is a scheduled fire. Withdrawing the
-    // prompt here would leave an *empty* session row, which is worse noise in `meka session list`
-    // than a session holding one unanswered message -- and unlike an in-session fire, a failure
-    // costs a row rather than a share of a conversation the user has to keep reading. Retention is
-    // the lever for these, not withdrawal.
-    //
-    // `None` makes `run_turn` create the session row, so the isolated run gets its own id.
-    let mut session_uuid = None;
-    let mut messages = Conversation::new();
-    let outcome = agent
-        .run_turn(
-            &mut session_uuid,
-            &mut messages,
-            wakeup.render_prompt(),
-            Vec::new(),
-            state.shutdown.child_token(),
-        )
-        .await;
-
-    // Before the `?`, so a failed run cleans up too. `build_session_agent` hands the registry to
-    // the MCP manager, which holds a *strong* clone; an isolated agent is discarded at the end of
-    // this function, so without a detach every fire leaves one behind. An hourly isolated job adds
-    // 24 a day, indefinitely, each pinning a whole dead tool set and lengthening every
-    // `tools/list_changed` fan-out. Sessions get this from `handle_close_session`, the GC and
-    // `DELETE /v1/sessions/{id}`; an isolated fire has no such moment but the end of its own turn.
-    if let Some(manager) = state.shared.mcp_manager.as_ref() {
-        manager.detach_registry(&registry).await;
-    }
-    outcome?;
-
-    if let Some(id) = session_uuid {
-        tracing::info!(
-            "scheduled job {} ran in isolated session {}",
-            wakeup.job.short_id(),
-            id
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
     use super::{Residency, runnable};
-
-    fn job(isolated: bool) -> crate::schedule::ScheduledJob {
-        crate::schedule::ScheduledJob {
-            attempts: 0,
-            id: "7f3a1b2c".to_string(),
-            session_id: uuid::Uuid::nil(),
-            schedule: crate::schedule::Schedule::parse_every("1h").expect("parses"),
-            prompt: "check the news".to_string(),
-            gate: None,
-            isolated,
-            created_at: chrono::Utc::now(),
-            last_fired_at: None,
-            next_fire_at: chrono::Utc::now(),
-        }
-    }
 
     /// The ordering that makes the probe safe. Every session `meka serve` has loaded is one whose
     /// file lock *this process* holds, so probing a resident session would report it busy and the
@@ -678,7 +526,6 @@ mod tests {
     fn test_a_resident_session_is_never_probed() {
         let probed = Cell::new(false);
         let takeable = runnable(
-            &job(false),
             || Residency::Resident,
             || {
                 probed.set(true);
@@ -697,35 +544,11 @@ mod tests {
     /// not avoid -- it runs the command first and finds out afterwards.
     #[test]
     fn test_a_session_another_process_holds_is_declined() {
-        assert!(!runnable(&job(false), || Residency::NotResident, || false));
+        assert!(!runnable(|| Residency::NotResident, || false));
         assert!(
-            runnable(&job(false), || Residency::NotResident, || true),
+            runnable(|| Residency::NotResident, || true),
             "a free lock is ours to take"
         );
-    }
-
-    /// An isolated job runs in a conversation of its own and never touches the session that created
-    /// it, so that session's lock says nothing about whether this host can run the job. Declining
-    /// would hand it to whatever holds the lock -- a REPL, which does not honour `isolated` and
-    /// would fire it into the operator's conversation instead.
-    #[test]
-    fn test_an_isolated_job_is_not_gated_on_its_creating_session() {
-        let consulted = Cell::new(false);
-        let takeable = runnable(
-            &job(true),
-            || {
-                consulted.set(true);
-                Residency::NotResident
-            },
-            || {
-                consulted.set(true);
-                false
-            },
-        );
-        assert!(takeable, "the creating session's state is beside the point");
-        assert!(!consulted.get(), "so neither input is even read");
-        // And the rule it bypasses really would have refused an ordinary job in the same state.
-        assert!(!runnable(&job(false), || Residency::NotResident, || false));
     }
 
     /// An unreadable session map means we cannot rule out being the holder, so the probe would be
@@ -734,7 +557,6 @@ mod tests {
     fn test_an_unreadable_session_map_declines_rather_than_probing() {
         let probed = Cell::new(false);
         let takeable = runnable(
-            &job(false),
             || Residency::Unknown,
             || {
                 probed.set(true);

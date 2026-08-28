@@ -146,15 +146,6 @@ impl Tool for ScheduleCreateTool {
                             }
                         },
                         "required": ["check"]
-                    },
-                    "isolated": {
-                        "type": "boolean",
-                        "description": "Run in a fresh session instead of this conversation. \
-                                        Cheaper for a recurring job: this conversation's history \
-                                        is not replayed on every fire and the fires do not pile \
-                                        up in it. The trade is continuity, since the turn recalls \
-                                        nothing said here and its result does not appear here. \
-                                        Only `meka serve` honours it."
                     }
                 },
                 "required": ["prompt"]
@@ -179,7 +170,6 @@ impl Tool for ScheduleCreateTool {
         let now = Utc::now();
         let schedule = parse_schedule(&input, now, tool_name)?;
         let gate = self.parse_gate(&input, tool_name)?;
-        let isolated = input["isolated"].as_bool().unwrap_or(false);
 
         let existing = self
             .session_manager
@@ -213,7 +203,6 @@ impl Tool for ScheduleCreateTool {
             schedule,
             prompt: prompt.to_string(),
             gate,
-            isolated,
             created_at: now,
             last_fired_at: None,
             next_fire_at,
@@ -239,9 +228,6 @@ impl Tool for ScheduleCreateTool {
         );
         if job.gate.is_some() {
             summary.push_str(" Gated: a turn happens only when the gate says so.");
-        }
-        if job.isolated {
-            summary.push_str(" Runs in a fresh session, so its result will not appear here.");
         }
         summary.push_str(&format!(
             " Cancel with schedule_cancel(\"{}\").",
@@ -431,9 +417,6 @@ impl Tool for ScheduleListTool {
                 self.config.gate_tools.as_deref(),
             ) {
                 rendered.push_str(&format!("  NOT FIRING: {}\n", reason));
-            }
-            if job.isolated {
-                rendered.push_str("  runs in a fresh session\n");
             }
             rendered.push_str(&format!("  prompt: {}\n", job.prompt));
         }
@@ -724,7 +707,6 @@ mod tests {
                     last_output: None,
                     permission: Permission::Read,
                 }),
-                isolated: false,
                 created_at: now,
                 last_fired_at: None,
                 next_fire_at: schedule.next_after(now).expect("has a next fire"),
