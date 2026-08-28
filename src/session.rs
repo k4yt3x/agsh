@@ -1,6 +1,6 @@
 //! SQLite-backed session store. The tables this module owns are `sessions` and `messages` for the
 //! conversation, `tool_outputs` for results too large to keep inline (referenced from the
-//! conversation by handle), `provider_credentials` and `mcp_oauth_credentials` for secrets, and
+//! conversation by handle), `provider_credentials` and `mcp_credentials` for secrets, and
 //! `scheduled_jobs` and `background_tasks` for work the agent starts and does not wait for. They
 //! are not the whole database, and this module does not define them: they and the memory store's
 //! tables are created by [`migrations`], the single ledger that also brings an older store forward.
@@ -3054,6 +3054,52 @@ impl SessionManager {
     }
 }
 
+/// Which kind of secret a `mcp_credentials` row holds, and therefore how its `secret` column is to
+/// be read.
+///
+/// Stored rather than inferred from the value's shape. Sniffing would make every reader depend on
+/// what rmcp's serialisation happens to look like this week, which is a fact about someone else's
+/// system and would go stale with nothing to notice.
+///
+/// Three variants rather than "secret or not", because a server can hold two at once and they are
+/// not interchangeable: a confidential `auth = "oauth"` client keeps its long-lived
+/// [`Self::ClientSecret`] *and* the [`Self::OAuth`] bundle obtained with it, and a token refresh
+/// must rewrite only the second. That is what `(server_name, kind)` keys the table on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpCredentialKind {
+    /// A static token sent verbatim as `Authorization: Bearer <token>`. It *is* the credential:
+    /// nothing is exchanged for it and meka never rewrites it.
+    Bearer,
+    /// The client half of an OAuth client's identity, presented to an authorization server to
+    /// obtain an access token. Long-lived, and meka never rewrites it either.
+    ClientSecret,
+    /// An rmcp OAuth bundle, obtained by the authorization-code flow and refreshed in place by the
+    /// adapter. The only kind meka itself rewrites.
+    OAuth,
+}
+
+impl McpCredentialKind {
+    /// The stored discriminator. Values are part of the schema, so they are written out here rather
+    /// than derived from the variant names, which are free to be renamed.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::ClientSecret => "client_secret",
+            Self::OAuth => "oauth",
+        }
+    }
+
+    /// What to call this kind when telling the user about it. Deliberately not [`Self::as_str`]:
+    /// that one is a schema value and must not drift to suit a sentence.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer token",
+            Self::ClientSecret => "client secret",
+            Self::OAuth => "OAuth tokens",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TokenStore {
     connection: Arc<Connection>,
@@ -3320,18 +3366,28 @@ impl TokenStore {
             })
     }
 
-    pub async fn load_mcp_credentials(&self, server_name: &str) -> Result<Option<String>> {
+    /// One server's stored secret of `kind`, or `None`.
+    ///
+    /// Matching on `kind` as well as the name is what makes "this server has no bearer" and "this
+    /// server has an OAuth bundle" different answers, rather than handing an OAuth blob to a caller
+    /// that would read it as a token.
+    pub async fn load_mcp_credentials(
+        &self,
+        server_name: &str,
+        kind: McpCredentialKind,
+    ) -> Result<Option<String>> {
         let server_name = server_name.to_string();
+        let kind = kind.as_str();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT credentials_json FROM mcp_oauth_credentials WHERE server_name = ?1",
-                    rusqlite::params![server_name],
+                    "SELECT secret FROM mcp_credentials WHERE server_name = ?1 AND kind = ?2",
+                    rusqlite::params![server_name, kind],
                     |row| row.get::<_, String>(0),
                 );
 
                 match result {
-                    Ok(json) => Ok(Some(json)),
+                    Ok(secret) => Ok(Some(secret)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                     Err(error) => Err(error),
                 }
@@ -3352,6 +3408,10 @@ impl TokenStore {
     /// `load`/`save` pair, so the losing process keeps using its own token for the rest of its run.
     /// What it does guarantee is that the *stored* credential is never moved backwards, which is
     /// what the next process to start will load.
+    ///
+    /// Scoped to the `oauth` row because that is the only kind anything refreshes. A bearer and a
+    /// client secret are written once by the user and read thereafter, so a compare-and-swap over
+    /// them would arbitrate a race that cannot happen.
     pub async fn replace_mcp_credentials(
         &self,
         server_name: &str,
@@ -3365,8 +3425,8 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE mcp_oauth_credentials SET credentials_json = ?3, updated_at = ?4 \
-                     WHERE server_name = ?1 AND credentials_json = ?2",
+                    "UPDATE mcp_credentials SET secret = ?3, updated_at = ?4 \
+                     WHERE server_name = ?1 AND secret = ?2 AND kind = 'oauth'",
                     rusqlite::params![server_name, expected_json, json, now],
                 )
             })
@@ -3377,22 +3437,33 @@ impl TokenStore {
             })
     }
 
-    /// Persist (or replace) an MCP server's credentials unconditionally, for a caller whose
-    /// credentials are not derived from a stored set: the interactive authorisation flow.
-    pub async fn save_mcp_credentials(&self, server_name: &str, json: &str) -> Result<()> {
+    /// Persist (or replace) one of an MCP server's secrets unconditionally, for a caller whose
+    /// value is not derived from a stored one: `meka mcp add` / `login` reading from stdin, and the
+    /// interactive authorisation flow depositing its first bundle.
+    ///
+    /// The conflict target is the whole key, so writing one kind leaves the server's other kinds
+    /// untouched. That is what lets a confidential client hold its client secret while its OAuth
+    /// bundle is replaced.
+    pub async fn save_mcp_credentials(
+        &self,
+        server_name: &str,
+        kind: McpCredentialKind,
+        secret: &str,
+    ) -> Result<()> {
         let server_name = server_name.to_string();
-        let json = json.to_string();
+        let kind = kind.as_str();
+        let secret = secret.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(server_name) DO UPDATE SET
-                         credentials_json = excluded.credentials_json,
+                    "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(server_name, kind) DO UPDATE SET
+                         secret = excluded.secret,
                          updated_at = excluded.updated_at",
-                    rusqlite::params![server_name, json, now],
+                    rusqlite::params![server_name, kind, secret, now],
                 )?;
                 Ok(())
             })
@@ -3402,12 +3473,40 @@ impl TokenStore {
             })
     }
 
+    /// Drop just one of a server's secrets.
+    ///
+    /// `meka mcp login` clears the OAuth row before running the flow, so a stale bundle cannot be
+    /// picked up mid-authorisation. It must leave the other kinds alone: a confidential client's
+    /// `client_secret` is an *input* to the flow it is about to run, and clearing everything would
+    /// delete the credential the login needs to succeed.
+    pub async fn clear_mcp_credentials_of_kind(
+        &self,
+        server_name: &str,
+        kind: McpCredentialKind,
+    ) -> Result<()> {
+        let server_name = server_name.to_string();
+        let kind = kind.as_str();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM mcp_credentials WHERE server_name = ?1 AND kind = ?2",
+                    rusqlite::params![server_name, kind],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to clear MCP credentials: {}", error))
+            })
+    }
+
+    /// Drop every secret this server has, whatever kind. `meka mcp logout` and `remove`.
     pub async fn clear_mcp_credentials(&self, server_name: &str) -> Result<()> {
         let server_name = server_name.to_string();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "DELETE FROM mcp_oauth_credentials WHERE server_name = ?1",
+                    "DELETE FROM mcp_credentials WHERE server_name = ?1",
                     rusqlite::params![server_name],
                 )?;
                 Ok(())
@@ -3418,16 +3517,44 @@ impl TokenStore {
             })
     }
 
-    /// Every MCP server name that has stored OAuth credentials, sorted.
+    /// Whether this server has a stored credential at all, whatever kind.
+    ///
+    /// `meka mcp remove` asks this rather than loading, because it is about to delete every kind
+    /// and only needs to know there is something to delete. Loading with a guessed kind would make
+    /// a server that authenticates the other way look like a name that does not exist.
+    pub async fn has_mcp_credentials(&self, server_name: &str) -> Result<bool> {
+        let server_name = server_name.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM mcp_credentials WHERE server_name = ?1",
+                    rusqlite::params![server_name],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to look up MCP credentials: {}", error))
+            })
+    }
+
+    /// Every MCP server name that has a stored credential of any kind, sorted.
     ///
     /// The counterpart to [`Self::list_credential_profiles`], and stale for the same reason:
-    /// deleting an `[[mcp.servers]]` entry by hand strands its OAuth bundle here. `meka mcp list`
-    /// diffs the result against the configured servers.
+    /// deleting an `[[mcp.servers]]` entry by hand strands its secret here. `meka mcp list` diffs
+    /// the result against the configured servers.
+    ///
+    /// Kind-agnostic on purpose: an orphaned bearer is exactly as much of a leak as an orphaned
+    /// OAuth bundle, and the report exists to name what is still lying around.
     pub async fn list_mcp_credential_servers(&self) -> Result<Vec<String>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
+                // DISTINCT because the table is keyed by `(server_name, kind)`: a confidential
+                // OAuth client holds two rows and a bearer beside them would make three, and this
+                // answers "which servers have a secret", not "how many secrets are there".
                 let mut statement = connection.prepare(
-                    "SELECT server_name FROM mcp_oauth_credentials ORDER BY server_name",
+                    "SELECT DISTINCT server_name FROM mcp_credentials ORDER BY server_name",
                 )?;
                 let servers = statement
                     .query_map([], |row| row.get::<_, String>(0))?
@@ -6415,7 +6542,7 @@ mod tests {
 
         assert!(
             store
-                .load_mcp_credentials("srv")
+                .load_mcp_credentials("srv", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load absent")
                 .is_none(),
@@ -6423,12 +6550,16 @@ mod tests {
         );
 
         store
-            .save_mcp_credentials("srv", r#"{"tokens":{"access_token":"at1"}}"#)
+            .save_mcp_credentials(
+                "srv",
+                crate::session::McpCredentialKind::OAuth,
+                r#"{"tokens":{"access_token":"at1"}}"#,
+            )
             .await
             .expect("save");
         assert_eq!(
             store
-                .load_mcp_credentials("srv")
+                .load_mcp_credentials("srv", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
                 .as_deref(),
@@ -6437,12 +6568,16 @@ mod tests {
 
         // Upsert: second save replaces the first.
         store
-            .save_mcp_credentials("srv", r#"{"tokens":{"access_token":"at2"}}"#)
+            .save_mcp_credentials(
+                "srv",
+                crate::session::McpCredentialKind::OAuth,
+                r#"{"tokens":{"access_token":"at2"}}"#,
+            )
             .await
             .expect("save again");
         assert_eq!(
             store
-                .load_mcp_credentials("srv")
+                .load_mcp_credentials("srv", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
                 .as_deref(),
@@ -6452,7 +6587,7 @@ mod tests {
         store.clear_mcp_credentials("srv").await.expect("clear");
         assert!(
             store
-                .load_mcp_credentials("srv")
+                .load_mcp_credentials("srv", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load after clear")
                 .is_none()
@@ -6464,18 +6599,201 @@ mod tests {
         let manager = test_manager().await;
         let store = manager.token_store();
         store
-            .save_mcp_credentials("a", "alpha")
+            .save_mcp_credentials("a", crate::session::McpCredentialKind::OAuth, "alpha")
             .await
             .expect("save a");
         store
-            .save_mcp_credentials("b", "beta")
+            .save_mcp_credentials("b", crate::session::McpCredentialKind::OAuth, "beta")
             .await
             .expect("save b");
         store.clear_mcp_credentials("a").await.expect("clear a");
-        assert!(store.load_mcp_credentials("a").await.unwrap().is_none());
+        assert!(
+            store
+                .load_mcp_credentials("a", crate::session::McpCredentialKind::OAuth)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            store.load_mcp_credentials("b").await.unwrap().as_deref(),
+            store
+                .load_mcp_credentials("b", crate::session::McpCredentialKind::OAuth)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("beta")
+        );
+    }
+
+    /// One server is one name in the listing, however many secrets it holds.
+    ///
+    /// The listing is a set of server names, and the composite key makes it tempting to forget
+    /// that: a confidential OAuth client has two rows, and `meka mcp list` would name it twice in
+    /// the orphaned-credential report, which reads as two different strandings to clean up.
+    #[tokio::test]
+    async fn a_server_with_several_kinds_is_listed_once() {
+        use crate::session::McpCredentialKind;
+
+        let manager = test_manager().await;
+        let store = manager.token_store();
+        for kind in [
+            McpCredentialKind::Bearer,
+            McpCredentialKind::ClientSecret,
+            McpCredentialKind::OAuth,
+        ] {
+            store
+                .save_mcp_credentials("api", kind, "not-a-real-secret")
+                .await
+                .expect("save");
+        }
+        store
+            .save_mcp_credentials("docs", McpCredentialKind::OAuth, "not-a-real-secret")
+            .await
+            .expect("save");
+
+        assert_eq!(
+            store.list_mcp_credential_servers().await.expect("list"),
+            vec!["api".to_string(), "docs".to_string()],
+            "three kinds on one server is still one name"
+        );
+    }
+
+    /// The case `PRIMARY KEY (server_name, kind)` exists for.
+    ///
+    /// A confidential `auth = "oauth"` client holds two secrets at once: the long-lived client
+    /// secret it authenticates *with*, and the bundle it obtained. Refreshing the bundle must not
+    /// touch the secret. Under a `server_name`-only key these collide, and the server would work
+    /// until its first token refresh and fail from then on.
+    #[tokio::test]
+    async fn one_server_holds_a_client_secret_and_an_oauth_bundle_at_once() {
+        use crate::session::McpCredentialKind;
+
+        let manager = test_manager().await;
+        let store = manager.token_store();
+
+        store
+            .save_mcp_credentials(
+                "api",
+                McpCredentialKind::ClientSecret,
+                "cs-not-a-real-secret",
+            )
+            .await
+            .expect("save client secret");
+        store
+            .save_mcp_credentials("api", McpCredentialKind::OAuth, r#"{"access_token":"at1"}"#)
+            .await
+            .expect("save bundle");
+
+        // A refresh: rmcp's adapter compare-and-swaps the bundle it last read.
+        assert!(
+            store
+                .replace_mcp_credentials(
+                    "api",
+                    r#"{"access_token":"at1"}"#,
+                    r#"{"access_token":"at2"}"#,
+                )
+                .await
+                .expect("refresh"),
+            "the refresh should have matched the stored bundle"
+        );
+
+        assert_eq!(
+            store
+                .load_mcp_credentials("api", McpCredentialKind::OAuth)
+                .await
+                .expect("load bundle")
+                .as_deref(),
+            Some(r#"{"access_token":"at2"}"#),
+            "the refresh should have moved the bundle"
+        );
+        assert_eq!(
+            store
+                .load_mcp_credentials("api", McpCredentialKind::ClientSecret)
+                .await
+                .expect("load client secret")
+                .as_deref(),
+            Some("cs-not-a-real-secret"),
+            "the refresh must not have touched the client secret"
+        );
+    }
+
+    /// The two strings a kind carries answer to different masters: `as_str` is schema and must
+    /// never move, `label` is prose and is free to. Printing the schema token where the prose
+    /// belongs is the drift worth pinning, since it reads as almost right.
+    #[test]
+    fn a_kind_says_one_thing_to_the_schema_and_another_to_the_user() {
+        use crate::session::McpCredentialKind;
+
+        for (kind, stored, shown) in [
+            (McpCredentialKind::Bearer, "bearer", "bearer token"),
+            (
+                McpCredentialKind::ClientSecret,
+                "client_secret",
+                "client secret",
+            ),
+            (McpCredentialKind::OAuth, "oauth", "OAuth tokens"),
+        ] {
+            assert_eq!(kind.as_str(), stored, "the stored discriminator moved");
+            assert_eq!(kind.label(), shown, "the label the user reads moved");
+            assert_ne!(
+                kind.label(),
+                kind.as_str(),
+                "a label that is the schema value is a schema token leaking into the UI"
+            );
+        }
+    }
+
+    /// `mcp login` clears before authorising, and must clear only what it is about to replace.
+    #[tokio::test]
+    async fn clearing_one_kind_leaves_the_others() {
+        use crate::session::McpCredentialKind;
+
+        let manager = test_manager().await;
+        let store = manager.token_store();
+        for (kind, secret) in [
+            (McpCredentialKind::Bearer, "bearer-not-a-real-token"),
+            (McpCredentialKind::ClientSecret, "cs-not-a-real-secret"),
+            (McpCredentialKind::OAuth, r#"{"access_token":"at1"}"#),
+        ] {
+            store
+                .save_mcp_credentials("api", kind, secret)
+                .await
+                .expect("save");
+        }
+
+        store
+            .clear_mcp_credentials_of_kind("api", McpCredentialKind::OAuth)
+            .await
+            .expect("clear oauth");
+
+        assert!(
+            store
+                .load_mcp_credentials("api", McpCredentialKind::OAuth)
+                .await
+                .expect("load oauth")
+                .is_none()
+        );
+        assert!(
+            store
+                .load_mcp_credentials("api", McpCredentialKind::Bearer)
+                .await
+                .expect("load bearer")
+                .is_some(),
+            "clearing the OAuth bundle must leave the bearer"
+        );
+        assert!(
+            store
+                .load_mcp_credentials("api", McpCredentialKind::ClientSecret)
+                .await
+                .expect("load client secret")
+                .is_some(),
+            "clearing the OAuth bundle must leave the client secret, which the login needs"
+        );
+        assert!(
+            store
+                .has_mcp_credentials("api")
+                .await
+                .expect("has any after clearing one kind"),
+            "two kinds remain, so the server still has credentials"
         );
     }
 
@@ -6778,7 +7096,11 @@ mod tests {
             .expect("memory store");
         let store = manager.token_store();
         store
-            .save_mcp_credentials("docs", "{\"token\":\"original\"}")
+            .save_mcp_credentials(
+                "docs",
+                crate::session::McpCredentialKind::OAuth,
+                "{\"token\":\"original\"}",
+            )
             .await
             .expect("save");
 
@@ -6806,7 +7128,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .load_mcp_credentials("docs")
+                .load_mcp_credentials("docs", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
                 .as_deref(),
@@ -6935,7 +7257,11 @@ mod tests {
             .await
             .expect("save archive");
         store
-            .save_mcp_credentials("linear", r#"{"tokens":{"access_token":"at"}}"#)
+            .save_mcp_credentials(
+                "linear",
+                crate::session::McpCredentialKind::OAuth,
+                r#"{"tokens":{"access_token":"at"}}"#,
+            )
             .await
             .expect("save linear");
 

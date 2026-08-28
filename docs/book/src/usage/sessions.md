@@ -113,7 +113,7 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 ([background work](./background.md)), `memories` and its `memories_fts` full-text index
 ([memory](./memory.md)), `prompt_history` (the REPL's
 [input history](./interactive-mode.md#input-history)), and `provider_credentials` and
-`mcp_oauth_credentials` (secrets, never in `config.toml`).
+`mcp_credentials` (secrets, never in `config.toml`).
 
 **sessions**, one row per session:
 

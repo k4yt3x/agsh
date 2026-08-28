@@ -531,8 +531,22 @@ pub enum McpAction {
     /// List a server's advertised tools with their resolved permissions
     Tools { name: String },
     /// Authenticate a server interactively (OAuth assumed for HTTP)
-    Login { name: String },
-    /// Revoke cached credentials for a server
+    ///
+    /// With neither flag, runs the OAuth authorization-code flow. With one, stores the secret read
+    /// from stdin and exits, which is also how an existing one is rotated.
+    Login {
+        /// Name of a server in config.toml
+        name: String,
+
+        /// Store a static bearer token read from stdin
+        #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
+        auth_token_stdin: bool,
+
+        /// Store an OAuth client secret read from stdin
+        #[arg(long = "client-secret-stdin")]
+        client_secret_stdin: bool,
+    },
+    /// Clear every stored credential for a server, revoking OAuth first
     Logout { name: String },
     /// Add a server to config.toml
     ///
@@ -540,7 +554,6 @@ pub enum McpAction {
     ///   meka mcp add pg npx -y @modelcontextprotocol/server-postgres
     ///   meka mcp add notion https://mcp.notion.com/mcp
     ///   meka mcp add api https://api.example.com/mcp --auth-token-stdin
-    ///   meka mcp add api https://api.example.com/mcp --auth-token '${API_TOKEN}'
     ///   meka mcp add notion https://mcp.notion.com/mcp --auth oauth
     // `rustdoc::bare_urls` normally turns URLs like https://example into auto-links, but these doc
     // lines are ALSO the text clap prints for `meka mcp add --help`. Angle-brackets would leak into
@@ -574,26 +587,23 @@ pub enum McpAction {
         #[arg(long, value_parser = parse_mcp_auth_kind)]
         auth: Option<McpAuthKind>,
 
-        /// Static bearer token for HTTP (mutually exclusive with --auth)
-        #[arg(long, conflicts_with = "auth_token_stdin")]
-        auth_token: Option<String>,
-
-        /// Read the bearer token from stdin instead of the command line.
+        /// Read a static bearer token from stdin (excludes --auth)
         ///
-        /// A token passed as an argument is visible in `ps` output and in the shell history of
-        /// every user on the machine.
-        #[arg(long = "auth-token-stdin")]
+        /// The token is kept in meka's database, never in config.toml. There is no flag that takes
+        /// it as an argument, because an argument is visible in `ps` output and in the shell
+        /// history of every user on the machine.
+        #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
         /// OAuth / client-credentials client ID
         #[arg(long)]
         client_id: Option<String>,
 
-        /// OAuth / client-credentials client secret
-        #[arg(long, conflicts_with = "client_secret_stdin")]
-        client_secret: Option<String>,
-
-        /// Read the client secret from stdin instead of the command line.
+        /// Read the OAuth client secret from stdin
+        ///
+        /// Kept in meka's database rather than config.toml, and read from stdin rather than an
+        /// argument, for the same reasons as the bearer token above. One command reads one secret,
+        /// so this cannot be combined with --auth-token-stdin.
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
 

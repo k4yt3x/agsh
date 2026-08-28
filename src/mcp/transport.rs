@@ -41,6 +41,10 @@ pub fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
 pub(super) fn build_http_transport_config(
     server_name: &str,
     config: &McpServerConfig,
+    // The server's stored bearer, already read from `mcp_credentials`. Passed in rather than
+    // looked up here because this function is sync and the store is not, and because a
+    // transport has no business knowing where a secret lives.
+    bearer: Option<&str>,
 ) -> Result<rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig> {
     let url = config
         .url
@@ -53,8 +57,8 @@ pub(super) fn build_http_transport_config(
     let mut transport_config =
         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url);
 
-    if let Some(token) = &config.auth_token {
-        transport_config = transport_config.auth_header(token.clone());
+    if let Some(token) = bearer {
+        transport_config = transport_config.auth_header(token.to_string());
     }
 
     // Merge dynamic headers from the optional `headers_helper` script on top of the static
@@ -224,6 +228,68 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    fn http_server(name: &str) -> McpServerConfig {
+        // Parsed rather than constructed field-by-field, so a field added to `McpServerConfig`
+        // does not silently make this fixture unrepresentative of what a user actually writes.
+        let toml = format!(
+            "name = \"{}\"\ntransport = \"http\"\nurl = \"https://api.example.com/mcp\"\n",
+            name
+        );
+        toml::from_str(&toml).expect("the fixture parses")
+    }
+
+    /// The one place a stored bearer becomes a request header. Everything upstream of here can be
+    /// right and the server still sees no `Authorization` if this drops it.
+    #[test]
+    fn a_stored_bearer_becomes_the_authorization_header() {
+        let config = build_http_transport_config(
+            "api",
+            &http_server("api"),
+            Some("bearer-not-a-real-token"),
+        )
+        .expect("builds");
+
+        assert_eq!(&*config.uri, "https://api.example.com/mcp");
+        assert_eq!(
+            config.auth_header.as_deref(),
+            Some("bearer-not-a-real-token")
+        );
+    }
+
+    /// A server that authenticates through a flow has no stored bearer, and must send no
+    /// `Authorization` of its own: rmcp's auth layer sets that header itself.
+    #[test]
+    fn no_bearer_means_no_authorization_header() {
+        let config = build_http_transport_config("api", &http_server("api"), None).expect("builds");
+        assert!(config.auth_header.is_none());
+    }
+
+    /// The bearer and `headers` are separate inputs and both have to survive.
+    #[test]
+    fn a_bearer_and_custom_headers_coexist() {
+        let mut server = http_server("api");
+        server.headers = Some(
+            [("X-Tenant-Id".to_string(), "acme".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let config = build_http_transport_config("api", &server, Some("bearer-not-a-real-token"))
+            .expect("builds");
+
+        assert_eq!(
+            config.auth_header.as_deref(),
+            Some("bearer-not-a-real-token")
+        );
+        assert_eq!(
+            config
+                .custom_headers
+                .get(&reqwest::header::HeaderName::from_static("x-tenant-id"))
+                .and_then(|value| value.to_str().ok()),
+            Some("acme")
+        );
+    }
 
     #[test]
     fn parse_header_lines_basic() {

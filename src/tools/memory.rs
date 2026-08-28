@@ -1298,22 +1298,23 @@ mod tests {
             "the long-named row must open: {opened}"
         );
 
-        // Straight at the column, which is the only way to produce this.
+        // Straight at the column, which is the only way to produce this: meka's own write doors
+        // refuse this name, so only a hand-edited store or another tool can have put it there.
         memories
-            .plant_row_for_test("legacy.note", "from an older meka")
+            .plant_row_for_test("hand.edited", "put here past the write doors")
             .await
             .expect("plant the row");
 
         let found = output_text(
             &read
                 .execute(
-                    serde_json::json!({ "name": "legacy.note" }),
+                    serde_json::json!({ "name": "hand.edited" }),
                     CancellationToken::new(),
                 )
                 .await
                 .expect("a row the index shows the model must be one it can open"),
         );
-        assert!(found.contains("from an older meka"), "{found}");
+        assert!(found.contains("put here past the write doors"), "{found}");
 
         // And it can be got rid of, which is what makes the store unwedgeable.
         assert!(
@@ -1321,7 +1322,7 @@ mod tests {
                 memories: memories.clone(),
             }
             .execute(
-                serde_json::json!({ "name": "legacy.note" }),
+                serde_json::json!({ "name": "hand.edited" }),
                 CancellationToken::new()
             )
             .await
@@ -1329,7 +1330,7 @@ mod tests {
             "and one it can remove"
         );
         assert!(
-            memories.get("legacy.note").await.expect("get").is_none(),
+            memories.get("hand.edited").await.expect("get").is_none(),
             "the row is really gone, not merely reported gone"
         );
     }

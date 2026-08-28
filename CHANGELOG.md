@@ -18,9 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every HTTP session body reports `provider`, and `model_override` / `base_url_override` when set.
 - `meka session export` / `import` carry the provider profile and its overrides.
 - `meka provider login --api-key-stdin` rotates an API key without prompting or losing the profile.
+- `meka mcp login --auth-token-stdin` / `--client-secret-stdin` set or rotate a server's secret.
+- `meka mcp get` reports which kinds of credential a server has stored, without printing them.
 
 ### Changed
 
+- **Breaking:** MCP `auth_token` and `client_secret` move out of `config.toml` into the database.
+- **Breaking:** `meka mcp add` drops `--auth-token` and `--client-secret`; use the `-stdin` forms.
+- **Breaking:** `meka mcp logout` clears every stored credential, not only the OAuth tokens.
+- A stored bearer and an `[auth]` block are mutually exclusive; where both exist, the block wins.
+- `meka mcp add` refuses a name that still holds a credential, rather than silently reusing it.
 - **Breaking:** `GET /v1/info` drops `provider` and `model`; `GET /v1/providers` reports both.
 - **Breaking:** `meka acp` / `meka serve` refuse `-c`, `-r`, `--model` and `--base-url`.
 - **Breaking:** the REPL and `--oneshot` resume at the recorded permission level, not the default.
@@ -33,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka session import` refuses an archive with no profile when nothing can supply one.
 - `meka provider remove` warns when it clears `default_provider`, and how many sessions it strands.
 - `meka provider list` flags an unresolvable `default_provider` and a credential it cannot read.
-- `meka provider add` writes the profile before the credential, so a failed write leaks no secret.
+- `meka provider add` writes the profile before the credential, so a failed write strands neither.
 - `GET /v1/sessions/{id}/context` omits `window` for a profile it cannot resolve.
 - `GET /v1/health/ready` reports a provider as configured when any profile is, not just the default.
 

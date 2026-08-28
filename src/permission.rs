@@ -265,7 +265,7 @@ pub fn parse_recorded_permission(
         Ok(permission) => Some(permission),
         Err(error) => {
             tracing::warn!(
-                "{subject} records permission '{raw}', which meka can no longer read ({error}); \
+                "{subject} records permission '{raw}', which is not one meka recognises ({error}); \
                  falling back to the configured level for this run"
             );
             None

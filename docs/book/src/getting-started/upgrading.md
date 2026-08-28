@@ -4,8 +4,52 @@ Most upgrades are a binary swap: replace the old executable with the new one and
 
 ## 0.43 to 0.44
 
-A binary swap, and the store migrates itself as promised below. Two behaviour changes are worth
+A binary swap, and the store migrates itself as promised below, **unless you authenticate an MCP
+server with `auth_token` or `client_secret`**, which are no longer config keys. Read the next
+section first if you do; meka will refuse to start otherwise. Then two behaviour changes worth
 knowing before you resume an existing session, and two more if you run `meka serve` or `meka acp`.
+
+**MCP secrets moved out of `config.toml`.** `auth_token` on a server, and `client_secret` in a
+`[mcp.servers.auth]` block, are gone. Both were secrets sitting in a plaintext file people commit
+and sync; they now live in meka's database beside the OAuth tokens, which is where provider
+credentials have always been.
+
+meka cannot move them for you. The store migrates itself because it has a ledger recording what it
+has already done; `config.toml` has none and may be older or newer than the binary at any moment, so
+a key left behind is a parse error naming the key and the line rather than a value silently ignored:
+
+```console
+$ meka mcp list
+Error: configuration error: failed to parse …/config.toml: TOML parse error at line 12, column 1
+   |
+12 | auth_token = "…"
+   | ^^^^^^^^^^
+unknown field `auth_token`, expected one of `name`, `transport`, …
+```
+
+For each server, delete the line and store the secret instead. Which command depends on which key
+you deleted, and the two are alternatives, not a sequence: a bearer belongs to a server with no
+`[auth]` block, a client secret to one that has it.
+
+```console
+$ # for a server whose `auth_token` you deleted (no [auth] block):
+$ pass show api-token | meka mcp login api --auth-token-stdin
+
+$ # for a server whose [auth] block's `client_secret` you deleted:
+$ pass show acme-secret | meka mcp login acme --client-secret-stdin
+```
+
+`meka mcp get <name>` then lists the kinds it holds without printing any of them. `--auth-token` and
+`--client-secret` are gone from `meka mcp add` for the same reason: an argument is visible in `ps`
+output and in the shell history of every user on the machine. Use the `-stdin` forms, which `add`
+also takes.
+
+If you were using `auth_token = "${API_TOKEN}"` to keep the token out of the file, a header does the
+same job and still expands: `headers = { Authorization = "Bearer ${API_TOKEN}" }`. Storing it is the
+better answer, since it survives without the variable being set.
+
+Nothing else about a server moves. `env`, `args` and `headers` stay in `config.toml` with `${VAR}`
+expansion, because they configure a process or a request and merely *may* contain a secret.
 
 **A resume now starts at the level the session recorded.** Both CLI hosts do this: the REPL and
 `meka --oneshot -c` / `-r`. The scripted one is where a silent change matters most, since a

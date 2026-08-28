@@ -2936,17 +2936,16 @@ async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
 /// overruns it is swept to `interrupted` when the session is next opened.
 const BACKGROUND_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Resolve a secret that may have come from an argument or from stdin.
+/// Read a secret from stdin when its `--…-stdin` flag was passed, and return `None` when it was
+/// not.
 ///
-/// Errors when both were given rather than picking one, and when stdin held nothing: a caller that
-/// asked for a token and got an empty one should hear about it here, not from the server later.
-fn read_optional_secret_from_stdin(
-    argument: Option<String>,
-    from_stdin: bool,
-    label: &str,
-) -> anyhow::Result<Option<String>> {
+/// stdin is read to end, so exactly one secret can be taken per command; the flags that reach here
+/// conflict with each other in clap for that reason. An empty stream is an error rather than
+/// `None`: a caller that asked for a token and got nothing should hear it here, not from the server
+/// later.
+fn read_secret_from_stdin(from_stdin: bool, label: &str) -> anyhow::Result<Option<String>> {
     if !from_stdin {
-        return Ok(argument);
+        return Ok(None);
     }
     use std::io::Read as _;
     let mut buffer = String::new();
@@ -2982,7 +2981,9 @@ async fn run_mcp_subcommand(
     let token_store = session_manager.token_store();
     match action {
         cli::McpAction::List => mcp::cli::run_list(&config.mcp_servers, None, &token_store).await?,
-        cli::McpAction::Get { name } => mcp::cli::run_get(&config.mcp_servers, name).await?,
+        cli::McpAction::Get { name } => {
+            mcp::cli::run_get(&config.mcp_servers, name, &token_store).await?
+        }
         cli::McpAction::Reconnect { name } => {
             mcp::cli::run_reconnect(&config.mcp_servers, &token_store, name).await?
         }
@@ -2995,8 +2996,36 @@ async fn run_mcp_subcommand(
             )
             .await?
         }
-        cli::McpAction::Login { name } => {
-            mcp::cli::run_login(&config.mcp_servers, &token_store, name).await?
+        cli::McpAction::Login {
+            name,
+            auth_token_stdin,
+            client_secret_stdin,
+        } => {
+            use crate::session::McpCredentialKind;
+
+            // Clap rejects both flags at once, so at most one of these reads stdin.
+            let stored = match (
+                read_secret_from_stdin(*auth_token_stdin, "auth token")?,
+                read_secret_from_stdin(*client_secret_stdin, "client secret")?,
+            ) {
+                (Some(token), _) => Some((McpCredentialKind::Bearer, token)),
+                (None, Some(secret)) => Some((McpCredentialKind::ClientSecret, secret)),
+                (None, None) => None,
+            };
+
+            match stored {
+                Some((kind, secret)) => {
+                    mcp::cli::run_store_secret(
+                        &config.mcp_servers,
+                        &token_store,
+                        name,
+                        kind,
+                        &secret,
+                    )
+                    .await?
+                }
+                None => mcp::cli::run_login(&config.mcp_servers, &token_store, name).await?,
+            }
         }
         cli::McpAction::Logout { name } => {
             mcp::cli::run_logout(&config.mcp_servers, &token_store, name).await?
@@ -3009,10 +3038,8 @@ async fn run_mcp_subcommand(
             env,
             header,
             auth,
-            auth_token,
             auth_token_stdin,
             client_id,
-            client_secret,
             client_secret_stdin,
             signing_key,
             signing_algorithm,
@@ -3036,20 +3063,12 @@ async fn run_mcp_subcommand(
                     env: env.clone(),
                     header: header.clone(),
                     auth: auth.clone(),
-                    // A secret read from stdin never appears in `ps` or shell history. Both are
-                    // read here rather than in `run_add` so the two stdin flags cannot both consume
-                    // the same stream and silently take each other's value.
-                    auth_token: read_optional_secret_from_stdin(
-                        auth_token.clone(),
-                        *auth_token_stdin,
-                        "auth token",
-                    )?,
+                    // Read here rather than in `run_add` because stdin is a process-wide resource
+                    // and this is the layer that owns it. Clap has already rejected both flags at
+                    // once, so at most one of these two reads the stream.
+                    auth_token: read_secret_from_stdin(*auth_token_stdin, "auth token")?,
                     client_id: client_id.clone(),
-                    client_secret: read_optional_secret_from_stdin(
-                        client_secret.clone(),
-                        *client_secret_stdin,
-                        "client secret",
-                    )?,
+                    client_secret: read_secret_from_stdin(*client_secret_stdin, "client secret")?,
                     signing_key: signing_key.clone(),
                     signing_algorithm: signing_algorithm.clone(),
                     scope: scope.clone(),

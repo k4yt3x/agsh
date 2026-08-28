@@ -124,12 +124,6 @@ pub fn expand_server_config(config: &mut McpServerConfig) -> Vec<String> {
         }
         *headers = new_headers;
     }
-    if let Some(token) = &config.auth_token {
-        let (expanded, missing) = expand_env_vars(token, lookup);
-        record(missing);
-        config.auth_token = Some(expanded);
-    }
-
     all_missing
 }
 
@@ -216,5 +210,52 @@ mod tests {
         let (out, missing) = expand_env_vars("ümlaut ${M} 末", fixed(&[]));
         assert_eq!(out, "ümlaut ${M} 末");
         assert_eq!(missing, vec!["M".to_string()]);
+    }
+
+    /// The walk over a whole server, rather than the substitution itself.
+    ///
+    /// Uses names that are never set and the `:-default` form, so it exercises both directions
+    /// without touching the process environment, which the rest of the suite shares.
+    #[test]
+    fn the_walk_expands_every_field_and_reports_what_it_could_not_resolve() {
+        let mut config: McpServerConfig = toml::from_str(
+            r#"
+name = "api"
+transport = "http"
+url = "https://${MEKA_TEST_UNSET_HOST:-example.test}/mcp"
+headers = { X-Tenant = "${MEKA_TEST_UNSET_TENANT}", X-Fixed = "plain" }
+"#,
+        )
+        .expect("the fixture parses");
+
+        let missing = expand_server_config(&mut config);
+
+        assert_eq!(
+            config.url.as_deref(),
+            Some("https://example.test/mcp"),
+            "a default must be applied"
+        );
+        let headers = config.headers.as_ref().expect("headers");
+        assert_eq!(
+            headers.get("X-Tenant").map(String::as_str),
+            Some("${MEKA_TEST_UNSET_TENANT}"),
+            "an unresolvable name is left literal rather than blanked"
+        );
+        assert_eq!(headers.get("X-Fixed").map(String::as_str), Some("plain"));
+        assert_eq!(
+            missing,
+            vec!["MEKA_TEST_UNSET_TENANT".to_string()],
+            "only the one with no default is reported, and the warning depends on this list"
+        );
+    }
+
+    /// A server with nothing to expand reports nothing, so startup is silent.
+    #[test]
+    fn the_walk_reports_nothing_when_there_is_nothing_to_resolve() {
+        let mut config: McpServerConfig = toml::from_str(
+            "name = \"api\"\ntransport = \"http\"\nurl = \"https://example.test/mcp\"\n",
+        )
+        .expect("the fixture parses");
+        assert!(expand_server_config(&mut config).is_empty());
     }
 }

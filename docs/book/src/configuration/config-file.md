@@ -835,8 +835,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `args` | No | Arguments to pass to the command. |
 | `env` | No | Environment variables to set for the spawned process (stdio only). The child does **not** inherit meka's environment; see below. |
 | `url` | HTTP only | URL of the MCP server endpoint. |
-| `auth_token` | No | Bearer token for HTTP authentication (sent as `Authorization: Bearer <token>`). |
-| `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with `auth_token`. |
+| `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with a stored bearer token. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
 | `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` at connect-time (HTTP only). Executed with `MEKA_MCP_SERVER_NAME` / `MEKA_MCP_SERVER_URL` in env; 15 s timeout. |
 | `permission` | No | Server-wide permission override. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. See *Permission resolution* below. |
@@ -996,15 +995,19 @@ Tool and resource descriptions returned from MCP servers are truncated at 2048 c
 
 ### Environment variable substitution
 
-Every string field listed above (command, args, env values, url, headers values, auth_token) supports `${VAR}` and `${VAR:-default}` expansion from the process environment. Missing variables with no default leave the literal `${VAR}` in place and log a warning at startup. Use this to avoid committing secrets:
+Every string field listed above (command, args, env values, url, headers values) supports `${VAR}` and `${VAR:-default}` expansion from the process environment. Missing variables with no default leave the literal `${VAR}` in place and log a warning at startup. Use this to avoid committing secrets:
 
 ```toml
 [[mcp.servers]]
 name = "github"
 transport = "http"
 url = "https://mcp.github.com"
-auth_token = "${GITHUB_MCP_TOKEN}"
+headers = { X-Api-Key = "${GITHUB_MCP_TOKEN}" }
 ```
+
+`env`, `args` and `headers` may *contain* a secret, but they are not one: `env` sets a subprocess's whole environment, `args` carries connection strings, and `headers` carries `X-Tenant-Id` as readily as `X-Api-Key`. meka cannot tell which is which, so they stay in `config.toml` and `${VAR}` is how you keep a value out of it.
+
+A bearer token and an OAuth client secret are unambiguously secrets, so they are not config at all. They live in meka's database and are set with `meka mcp add --auth-token-stdin` / `--client-secret-stdin`, or afterwards with `meka mcp login`. See [Credentials](#credentials).
 
 ### Environment variables
 
@@ -1026,8 +1029,23 @@ Manage configured servers without editing `config.toml` by hand:
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
 | `meka mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |
 | `meka mcp tools <name>` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. |
-| `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. |
-| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear the stored credentials. |
+| `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. |
+| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |
+
+#### Credentials
+
+An MCP server's bearer token, OAuth client secret and OAuth token bundle are stored in meka's database (`mcp_credentials`, keyed by server name and kind), never in `config.toml`. This is the same rule providers follow, and for the same reason: `config.toml` is a plaintext file people commit, sync and share.
+
+Each is read from stdin so it never reaches `ps` output or your shell history. One command reads one secret, so `--auth-token-stdin` and `--client-secret-stdin` cannot be combined:
+
+```console
+$ pass show notion-token | meka mcp add notion https://mcp.notion.com/mcp --auth-token-stdin
+$ pass show acme-secret | meka mcp login acme --client-secret-stdin
+```
+
+A confidential OAuth client holds two at once: the long-lived client secret it authenticates with, and the refreshable bundle it obtained. Store the secret first, then run `meka mcp login <name>` to complete the flow. Refreshing the bundle leaves the client secret alone.
+
+`meka mcp get <name>` lists which kinds a server has, without printing any of them. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
 
 #### `meka mcp add` flags
 
@@ -1037,10 +1055,9 @@ Manage configured servers without editing `config.toml` by hand:
 | `--env KEY=VALUE` | Environment variable for stdio (repeatable). |
 | `--header KEY=VALUE` | HTTP header (repeatable). |
 | `--auth <oauth\|client-credentials\|client-credentials-jwt>` | Configure the `[auth]` block. |
-| `--auth-token <TOKEN>` | Static bearer token. Mutually exclusive with `--auth`. Passing a secret as an argument puts it in `ps` output and your shell history; prefer `--auth-token-stdin`, or the `'${VAR}'` form, which is expanded from the environment at connect time. |
-| `--auth-token-stdin` | Read the static bearer token from stdin instead of the command line. Conflicts with `--auth-token`. |
-| `--client-secret-stdin` | Read the OAuth client secret from stdin instead of the command line. Conflicts with `--client-secret`. |
-| `--client-id`, `--client-secret` | OAuth / client-credentials client identifiers. |
+| `--auth-token-stdin` | Read a static bearer token from stdin and store it. Mutually exclusive with `--auth`. |
+| `--client-secret-stdin` | Read an OAuth client secret from stdin and store it. Required by `--auth client-credentials`. |
+| `--client-id` | OAuth / client-credentials client identifier. Not a secret, so it goes in `config.toml`. |
 | `--signing-key <PATH>`, `--signing-algorithm <ALG>` | JWT signing material (`client-credentials-jwt` only). |
 | `--scope <SCOPE>` | OAuth scope (repeatable). |
 | `--redirect-port <PORT>` | Fixed OAuth redirect port (default: ephemeral). |
@@ -1082,7 +1099,7 @@ authorized 'notion'
 
 4. **`--no-login`**: skips step 2. The entry is still persisted and the probe's hint is still printed; run `meka mcp login <name>` when ready. Useful for scripted setup or when you expect to edit `[auth]` by hand.
 
-The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
+The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token-stdin` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
 
 #### Remote hosts / SSH sessions
 
@@ -1150,13 +1167,14 @@ In addition to tools, meka exposes MCP resources and prompts through several bui
 
 ### `[mcp.servers.auth]`
 
-OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with `auth_token`.
+OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with a stored bearer token.
+
+The client secret is not a field here. It is a secret, so it lives in the database: set it with `meka mcp add --client-secret-stdin` or `meka mcp login <name> --client-secret-stdin`. See [Credentials](#credentials).
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `type` | Yes | Auth method: `"client_credentials"`, `"client_credentials_jwt"`, or `"oauth"` |
 | `client_id` | Varies | OAuth client ID (required for client_credentials/jwt, optional for oauth with dynamic registration) |
-| `client_secret` | Varies | Client secret (required for client_credentials, optional for oauth) |
 | `scopes` | No | OAuth scopes to request |
 | `resource` | No | Resource parameter ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)), client_credentials only |
 | `signing_key_path` | JWT only | Path to PEM private key file |
@@ -1188,12 +1206,13 @@ permission = "read"
 
 #### HTTP server with authentication
 
+The bearer token is not in the file. Store it once with `meka mcp add api https://api.example.com/mcp --auth-token-stdin`, or `meka mcp login api --auth-token-stdin` for a server that already exists.
+
 ```toml
 [[mcp.servers]]
 name = "api"
 transport = "http"
 url = "https://api.example.com/mcp"
-auth_token = "your-bearer-token"
 permission = "unrestricted"
 
 [mcp.servers.headers]
@@ -1244,9 +1263,10 @@ permission = "unrestricted"
 [mcp.servers.auth]
 type = "client_credentials"
 client_id = "my-client-id"
-client_secret = "my-client-secret"
 scopes = ["read", "write"]
 ```
+
+`client_credentials` needs a client secret, which is stored rather than written here: pass `--client-secret-stdin` to `meka mcp add`, or `meka mcp login api --client-secret-stdin` afterwards.
 
 #### HTTP server with JWT client credentials
 

@@ -892,7 +892,6 @@ mod tests {
             args: None,
             env: None,
             url: None,
-            auth_token: None,
             headers: None,
             headers_helper: None,
             auth: None,

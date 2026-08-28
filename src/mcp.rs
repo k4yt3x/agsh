@@ -1959,7 +1959,6 @@ pub(crate) mod tests {
             args: None,
             env: None,
             url: Some("https://example".to_string()),
-            auth_token: None,
             headers: None,
             headers_helper: None,
             auth: None,

@@ -148,6 +148,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_record_their_model_overrides",
         step: Step::Rust(sessions_record_their_model_overrides),
     },
+    Migration {
+        name: "mcp_credentials_hold_every_kind",
+        step: Step::Rust(mcp_credentials_hold_every_kind),
+    },
 ];
 
 /// What [`plan`] decided, and what [`apply`] will do about it.
@@ -458,18 +462,28 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
         ));
     }
     let mut missing = Vec::new();
-    for object in BASELINE_OBJECTS {
-        let present: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = ?1",
-                [object],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                MekaError::Database(format!("failed to inspect the store's objects: {}", error))
-            })?;
-        if present == 0 {
-            missing.push(*object);
+    for names in BASELINE_OBJECTS {
+        let mut found = false;
+        for name in *names {
+            let present: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    MekaError::Database(format!("failed to inspect the store's objects: {}", error))
+                })?;
+            if present > 0 {
+                found = true;
+                break;
+            }
+        }
+        // Reported under the baseline's own name. A store that reaches here has none of the later
+        // ones either, and naming a table this meka would create under a different name would send
+        // the reader looking for the wrong thing in their backup.
+        if !found && let Some(baseline) = names.first() {
+            missing.push(*baseline);
         }
     }
     if !missing.is_empty() {
@@ -497,16 +511,25 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
 /// Deliberately a separate list rather than parsed out of the SQL: it is the *question* asked of an
 /// old store, which is frozen for the same reason the migration is, whereas the SQL is the answer
 /// given to a new one. A later migration that adds a table does not belong here.
-const BASELINE_OBJECTS: &[&str] = &[
-    "background_tasks",
-    "mcp_oauth_credentials",
-    "memories",
-    "memories_fts",
-    "messages",
-    "provider_credentials",
-    "scheduled_jobs",
-    "sessions",
-    "tool_outputs",
+///
+/// Each entry is every name the object may legitimately appear under, first the baseline's. More
+/// than one only where a later step **renamed** a table the baseline created, because the question
+/// this list asks is whether the store was fully built rather than left half written, and a rename
+/// does not make it less so. A store that was carried forward and then lost its `user_version`
+/// shows the new name, and refusing it would tell the user their complete store was half-built.
+/// This is the one list allowed to know that, for the reason [`classify_by_shape`] gives about
+/// itself.
+const BASELINE_OBJECTS: &[&[&str]] = &[
+    &["background_tasks"],
+    // Renamed by `mcp_credentials_hold_every_kind` once it held more than OAuth bundles.
+    &["mcp_oauth_credentials", "mcp_credentials"],
+    &["memories"],
+    &["memories_fts"],
+    &["messages"],
+    &["provider_credentials"],
+    &["scheduled_jobs"],
+    &["sessions"],
+    &["tool_outputs"],
 ];
 
 fn table_columns(connection: &rusqlite::Connection, table: &str) -> Result<Vec<String>> {
@@ -894,6 +917,69 @@ fn sessions_record_their_model_overrides(
     Ok(())
 }
 
+/// One table for every MCP secret, not only the OAuth ones.
+///
+/// `mcp_oauth_credentials` was named for the only kind it could hold. A server's static bearer and
+/// its `client_secret` stopped being config keys in this release and land here beside the OAuth
+/// bundles, so the name had become a lie about its own contents.
+///
+/// `kind` is what a reader consults to know how to interpret `secret`, and it exists so that
+/// nothing has to guess from the value's shape. Sniffing would be the same mistake as version
+/// sniffing: a rule about what some other component's JSON happens to look like, which goes stale
+/// with nothing to notice. The column is `secret` rather than the old `credentials_json` because
+/// only one of the three kinds is JSON; a bearer and a client secret are the string itself.
+///
+/// **The key is `(server_name, kind)`, and that is the whole reason this is a rebuild rather than a
+/// rename.** One server can hold two secrets at once: `McpAuthConfig::OAuth` takes an optional
+/// `client_secret`, so a confidential client has a long-lived secret *and* the refreshable bundle
+/// obtained with it. Under the old `server_name` primary key those two collide, and the first token
+/// refresh silently overwrites the client secret. That server then works until the refresh and
+/// fails afterwards, which is about the worst shape a failure can take. SQLite cannot alter a
+/// primary key, so the table is built anew and the rows copied across.
+///
+/// Every row that already exists came from the authorization-code flow, which is the only one that
+/// ever persisted anything, so they all copy over as `oauth` and there is nothing to work out.
+fn mcp_credentials_hold_every_kind(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    };
+
+    // Guarded on the target for the reason the module docs give: a store that lost its
+    // `user_version` replays every step after the baseline, and a second pass would otherwise fail
+    // on `CREATE TABLE` and refuse that store on every start afterwards.
+    if table_exists("mcp_credentials")? {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "CREATE TABLE mcp_credentials (
+            server_name TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            secret      TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (server_name, kind)
+        )",
+    )?;
+    // Absent only for a store built by a release that never created it, which the baseline check in
+    // `classify_by_shape` has already ruled out for anything this reaches. Guarded anyway, because
+    // a step that assumes its predecessor's output is the assumption the replay rule exists to
+    // break.
+    if table_exists("mcp_oauth_credentials")? {
+        transaction.execute_batch(
+            "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at)
+             SELECT server_name, 'oauth', credentials_json, updated_at FROM mcp_oauth_credentials",
+        )?;
+        transaction.execute_batch("DROP TABLE mcp_oauth_credentials")?;
+    }
+    Ok(())
+}
+
 /// The profile named by the only stored credential, when there is exactly one.
 ///
 /// Ambiguity is not resolved by picking: with two credentials there is no evidence here about which
@@ -1277,6 +1363,110 @@ mod tests {
             provider_of(&connection, "carried"),
             "chosen",
             "a replay only fills what is empty"
+        );
+    }
+
+    /// The OAuth rows a 0.42 store holds arrive in the new table under kind `oauth`, and the table
+    /// they came from is gone. Nothing outside this module may know it ever existed, which is only
+    /// true if the copy is complete.
+    #[test]
+    fn every_oauth_credential_carries_over_and_the_old_table_goes() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at) \
+                 VALUES ('docs', '{\"access_token\":\"at1\"}', '2026-01-01T00:00:00Z'), \
+                        ('api',  '{\"access_token\":\"at2\"}', '2026-01-02T00:00:00Z')",
+            )
+            .expect("two authorised servers");
+
+        let plan = plan(&connection).expect("classified");
+        apply(&mut connection, plan, &Context::adopting(Some("p"))).expect("migrated");
+
+        let mut statement = connection
+            .prepare("SELECT server_name, kind, secret, updated_at FROM mcp_credentials ORDER BY 1")
+            .expect("the new table exists");
+        let rows: Vec<(String, String, String, String)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "api".to_string(),
+                    "oauth".to_string(),
+                    "{\"access_token\":\"at2\"}".to_string(),
+                    "2026-01-02T00:00:00Z".to_string(),
+                ),
+                (
+                    "docs".to_string(),
+                    "oauth".to_string(),
+                    "{\"access_token\":\"at1\"}".to_string(),
+                    "2026-01-01T00:00:00Z".to_string(),
+                ),
+            ],
+            "every row carries over, at kind oauth, with its timestamp"
+        );
+
+        let old: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'mcp_oauth_credentials'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query");
+        assert_eq!(old, 0, "the table named for one kind is gone");
+    }
+
+    /// Rule 3, for the step that rebuilds a table rather than altering one. A bare `CREATE TABLE`
+    /// here would fail with `table … already exists` and refuse the store on every start.
+    #[test]
+    fn a_replay_neither_fails_nor_discards_a_stored_credential() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at) \
+                 VALUES ('docs', '{\"access_token\":\"at1\"}', '2026-01-01T00:00:00Z')",
+            )
+            .expect("one authorised server");
+        let first = plan(&connection).expect("classified");
+        apply(&mut connection, first, &Context::adopting(Some("first"))).expect("migrated");
+
+        // A secret acquired after the migration, of a kind the old table could not hold.
+        connection
+            .execute_batch(
+                "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at) \
+                 VALUES ('docs', 'client_secret', 'cs-not-a-real-secret', '2026-02-01T00:00:00Z')",
+            )
+            .expect("a client secret beside the bundle");
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(
+            &mut connection,
+            replayed,
+            &Context::adopting(Some("second")),
+        )
+        .expect("the replay must not fail");
+
+        let kinds: Vec<String> = connection
+            .prepare("SELECT kind FROM mcp_credentials WHERE server_name = 'docs' ORDER BY 1")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(
+            kinds,
+            vec!["client_secret".to_string(), "oauth".to_string()],
+            "a replay leaves both secrets where they were"
         );
     }
 

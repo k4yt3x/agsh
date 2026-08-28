@@ -519,6 +519,40 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
     });
 }
 
+/// Which stored bearer, if any, belongs on the transport: the `[auth]` block wins, and a bearer
+/// beside one is dropped rather than sent alongside it.
+///
+/// rmcp consults the authorization flow only when the transport carries no `auth_header`, so
+/// passing both would send the static bearer on every request and leave the token the flow obtained
+/// unused -- a server that fails while holding a valid credential. `mcp add` and `mcp login` both
+/// refuse to *create* that pairing, but `config.toml` is a supported surface: adding an `[auth]`
+/// block by hand to a server that already has a stored bearer reaches it without passing either
+/// door. This is the point where the ambiguity would do harm, so it is resolved here, in favour of
+/// the block the user can see in their config over the row they cannot.
+///
+/// A free function rather than three lines inside [`connect_server`], because that function needs a
+/// live server and a store to reach and nothing could test the decision in place. The rule is worth
+/// more than the wiring around it.
+fn bearer_for_transport(
+    server_name: &str,
+    bearer: Option<String>,
+    auth: Option<&crate::config::McpAuthConfig>,
+) -> Option<String> {
+    match (bearer, auth) {
+        (Some(_), Some(_)) => {
+            tracing::warn!(
+                "server '{}' has both a stored bearer and an [auth] block; ignoring the bearer and \
+                 authenticating through the block. Run `meka mcp logout {}` to drop the bearer, or \
+                 remove the [auth] block to use it",
+                server_name,
+                server_name
+            );
+            None
+        }
+        (bearer, _) => bearer,
+    }
+}
+
 /// Connect to an MCP server, dispatching to the auth or no-auth path.
 ///
 /// The returned future is `!Send` when the server config uses OAuth, because rmcp's auth module
@@ -618,7 +652,24 @@ pub(super) async fn connect_server(
                     message: "http transport requires 'url' field".to_string(),
                 })?;
 
-            let transport_config = build_http_transport_config(server_name, config)?;
+            // The server's static bearer, if it has one. Absent for a server that authenticates
+            // through a flow instead, and absent when this host has no store at all (the mock
+            // harness), which is the same "send no Authorization header" as before.
+            let bearer = match token_store {
+                Some(store) => {
+                    store
+                        .load_mcp_credentials(
+                            server_name,
+                            crate::session::McpCredentialKind::Bearer,
+                        )
+                        .await?
+                }
+                None => None,
+            };
+
+            let bearer = bearer_for_transport(server_name, bearer, config.auth.as_ref());
+            let transport_config =
+                build_http_transport_config(server_name, config, bearer.as_deref())?;
 
             if let Some(auth_config) = &config.auth {
                 super::auth::connect_http_with_oauth(
@@ -653,7 +704,44 @@ mod tests {
     use tokio::sync::{Mutex, RwLock};
 
     use super::*;
-    use crate::config::{McpServerConfig, McpTransport};
+    use crate::config::{McpAuthConfig, McpServerConfig, McpTransport};
+
+    /// A stored bearer and an `[auth]` block cannot both be honoured, and rmcp resolves the tie the
+    /// wrong way round: it consults the authorization flow only when the transport carries no
+    /// `auth_header`, so passing both sends the bearer and wastes the token the flow obtained.
+    ///
+    /// `mcp add` and `mcp login` refuse to create the pairing, but hand-editing `config.toml`
+    /// reaches it without passing either. This is the last door, and the only one that decides what
+    /// actually goes on the wire.
+    #[test]
+    fn an_auth_block_suppresses_a_stored_bearer() {
+        let oauth = McpAuthConfig::OAuth {
+            client_id: None,
+            scopes: None,
+            redirect_port: None,
+        };
+
+        assert_eq!(
+            bearer_for_transport("api", Some("bearer-not-a-real-token".to_string()), None),
+            Some("bearer-not-a-real-token".to_string()),
+            "with no [auth] block the bearer is the whole authentication and must be sent"
+        );
+        assert_eq!(
+            bearer_for_transport(
+                "api",
+                Some("bearer-not-a-real-token".to_string()),
+                Some(&oauth)
+            ),
+            None,
+            "beside an [auth] block it must be dropped, or it shadows the flow's own token"
+        );
+        assert_eq!(
+            bearer_for_transport("api", None, Some(&oauth)),
+            None,
+            "and a server with no bearer sends no Authorization header of its own"
+        );
+        assert_eq!(bearer_for_transport("api", None, None), None);
+    }
 
     /// A dead server is retried every five minutes for the life of the process. Announcing each
     /// attempt buried an idle REPL prompt in identical warnings long after the user had read the
@@ -715,7 +803,6 @@ mod tests {
             args: None,
             env: None,
             url: Some("https://example".to_string()),
-            auth_token: None,
             headers: None,
             headers_helper: None,
             auth: None,

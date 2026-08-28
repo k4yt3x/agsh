@@ -28,7 +28,7 @@ pub async fn revoke_stored_token(
     server_name: &str,
 ) -> std::result::Result<(), String> {
     let Some(json) = token_store
-        .load_mcp_credentials(server_name)
+        .load_mcp_credentials(server_name, crate::session::McpCredentialKind::OAuth)
         .await
         .map_err(|error| format!("load credentials: {}", error))?
     else {
@@ -297,18 +297,39 @@ pub(super) async fn connect_http_with_oauth(
     token_store: Option<&TokenStore>,
     handler: MekaClientHandler,
 ) -> Result<McpRunningService> {
+    // The client half of this server's identity, from the store. Loaded once here rather than in
+    // each arm: `client-credentials` requires one, `oauth` takes one only for a confidential
+    // client, and `client-credentials-jwt` signs instead of sharing a secret and wants none.
+    let client_secret = match token_store {
+        Some(store) => {
+            store
+                .load_mcp_credentials(server_name, crate::session::McpCredentialKind::ClientSecret)
+                .await?
+        }
+        None => None,
+    };
+
     let auth_manager = match auth_config {
         McpAuthConfig::ClientCredentials {
             client_id,
-            client_secret,
             scopes,
             resource,
         } => {
+            // Required for this flow, and there is nothing to fall back to: without it meka cannot
+            // prove which client it is and the token endpoint will refuse.
+            let secret = client_secret.as_deref().ok_or_else(|| MekaError::McpAuth {
+                server_name: server_name.to_string(),
+                message: format!(
+                    "no client secret stored for '{}'. Run `meka mcp login {} \
+                     --client-secret-stdin`",
+                    server_name, server_name
+                ),
+            })?;
             authenticate_client_credentials(
                 server_name,
                 url,
                 client_id,
-                client_secret,
+                secret,
                 scopes.as_deref(),
                 resource.as_deref(),
             )
@@ -334,10 +355,11 @@ pub(super) async fn connect_http_with_oauth(
         }
         McpAuthConfig::OAuth {
             client_id,
-            client_secret,
             scopes,
             redirect_port,
         } => {
+            // Optional here: a public client has none, and a confidential one's is whatever the
+            // store holds. Either way this is the only place it can come from now.
             authenticate_oauth_authorization_code(
                 server_name,
                 url,
@@ -1117,7 +1139,7 @@ impl CredentialStore for SqliteCredentialStore {
     async fn load(&self) -> std::result::Result<Option<StoredCredentials>, AuthError> {
         match self
             .token_store
-            .load_mcp_credentials(&self.server_name)
+            .load_mcp_credentials(&self.server_name, crate::session::McpCredentialKind::OAuth)
             .await
         {
             Ok(Some(json)) => {
@@ -1163,7 +1185,11 @@ impl CredentialStore for SqliteCredentialStore {
                 })?,
             LastRead::Nothing => {
                 self.token_store
-                    .save_mcp_credentials(&self.server_name, &json)
+                    .save_mcp_credentials(
+                        &self.server_name,
+                        crate::session::McpCredentialKind::OAuth,
+                        &json,
+                    )
                     .await
                     .map_err(|error| {
                         AuthError::InternalError(format!(
@@ -1208,8 +1234,17 @@ impl CredentialStore for SqliteCredentialStore {
         // Back to `Nothing` rather than to `Superseded`: a clear is this process deciding the row
         // should hold nothing, so a fresh authorisation after it is entitled to write.
         self.remember(LastRead::Nothing);
+        // Only the bundle this adapter owns. rmcp calls `clear` when the authorization server's
+        // issuer changes, meaning the tokens it holds are bound to an issuer that is no longer the
+        // right one -- a statement about the tokens and nothing else. A confidential client's
+        // `client_secret` is not bound to an issuer, was typed by the user, and after this change
+        // meka is its only holder, so clearing every kind here would send them back to the
+        // provider to reissue one that was never invalid.
         self.token_store
-            .clear_mcp_credentials(&self.server_name)
+            .clear_mcp_credentials_of_kind(
+                &self.server_name,
+                crate::session::McpCredentialKind::OAuth,
+            )
             .await
             .map_err(|error| {
                 AuthError::InternalError(format!(
@@ -1251,7 +1286,11 @@ mod tests {
         let json =
             |client_id: &str| serde_json::to_string(&credentials(client_id)).expect("serialize");
         token_store
-            .save_mcp_credentials("docs", &json("original"))
+            .save_mcp_credentials(
+                "docs",
+                crate::session::McpCredentialKind::OAuth,
+                &json("original"),
+            )
             .await
             .expect("seed");
 
@@ -1264,7 +1303,11 @@ mod tests {
 
         // Another process re-authenticates while this adapter holds what it read.
         token_store
-            .save_mcp_credentials("docs", &json("theirs"))
+            .save_mcp_credentials(
+                "docs",
+                crate::session::McpCredentialKind::OAuth,
+                &json("theirs"),
+            )
             .await
             .expect("the other process writes");
 
@@ -1274,7 +1317,7 @@ mod tests {
             .expect("a lost swap is reported, not raised");
         assert_eq!(
             token_store
-                .load_mcp_credentials("docs")
+                .load_mcp_credentials("docs", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
                 .as_deref(),
@@ -1287,12 +1330,128 @@ mod tests {
         adapter.save(credentials("ours-again")).await.expect("save");
         assert_eq!(
             token_store
-                .load_mcp_credentials("docs")
+                .load_mcp_credentials("docs", crate::session::McpCredentialKind::OAuth)
                 .await
                 .expect("load")
                 .as_deref(),
             Some(json("theirs").as_str()),
             "and every write after it must lose too, rather than reverting to a blind upsert"
+        );
+    }
+
+    /// rmcp calls `clear` when the authorization server's issuer changes. That is a statement
+    /// about the tokens it holds, not about the client secret they were obtained with.
+    ///
+    /// The secret was typed by the user and, since it stopped being a config key, meka is its only
+    /// holder. Clearing every kind here would make an issuer migration at the provider silently
+    /// cost the user a credential that was never invalid, discovered only when the next login
+    /// fails for want of it.
+    #[tokio::test]
+    async fn the_adapter_clears_only_the_bundle_it_owns() {
+        use crate::session::McpCredentialKind;
+
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
+        let token_store = manager.token_store();
+        for (kind, secret) in [
+            (McpCredentialKind::ClientSecret, "cs-not-a-real-secret"),
+            (McpCredentialKind::Bearer, "bearer-not-a-real-token"),
+            (McpCredentialKind::OAuth, r#"{"client_id":"x"}"#),
+        ] {
+            token_store
+                .save_mcp_credentials("docs", kind, secret)
+                .await
+                .expect("seed");
+        }
+
+        let adapter = SqliteCredentialStore {
+            token_store: token_store.clone(),
+            server_name: "docs".to_string(),
+            last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
+        };
+        adapter.clear().await.expect("clear");
+
+        assert!(
+            token_store
+                .load_mcp_credentials("docs", McpCredentialKind::OAuth)
+                .await
+                .expect("load")
+                .is_none(),
+            "the bundle bound to the old issuer must go"
+        );
+        assert_eq!(
+            token_store
+                .load_mcp_credentials("docs", McpCredentialKind::ClientSecret)
+                .await
+                .expect("load")
+                .as_deref(),
+            Some("cs-not-a-real-secret"),
+            "the client secret is not bound to an issuer and must survive"
+        );
+        assert_eq!(
+            token_store
+                .load_mcp_credentials("docs", McpCredentialKind::Bearer)
+                .await
+                .expect("load")
+                .as_deref(),
+            Some("bearer-not-a-real-token"),
+            "nor is a bearer this adapter never owned"
+        );
+    }
+
+    /// The other half: a save that should land, does.
+    ///
+    /// Both of the adapter's arms are exercised, because a `save` that quietly writes nothing is
+    /// invisible for the life of the process, which keeps using the token it holds in memory. The
+    /// user finds out at the next start, when the credential loaded is the one from before the
+    /// refresh, expired.
+    #[tokio::test]
+    async fn a_save_that_should_land_reaches_the_store() {
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
+        let token_store = manager.token_store();
+        let credentials = |client_id: &str| -> StoredCredentials {
+            serde_json::from_value(serde_json::json!({ "client_id": client_id }))
+                .expect("the shape rmcp stores")
+        };
+        let json =
+            |client_id: &str| serde_json::to_string(&credentials(client_id)).expect("serialize");
+        let stored = async || {
+            token_store
+                .load_mcp_credentials("docs", crate::session::McpCredentialKind::OAuth)
+                .await
+                .expect("load")
+        };
+
+        let adapter = SqliteCredentialStore {
+            token_store: token_store.clone(),
+            server_name: "docs".to_string(),
+            last_read: std::sync::Arc::new(std::sync::Mutex::new(LastRead::Nothing)),
+        };
+
+        // The blind-upsert arm: the interactive flow depositing a first bundle.
+        adapter.save(credentials("first")).await.expect("save");
+        assert_eq!(
+            stored().await.as_deref(),
+            Some(json("first").as_str()),
+            "the first bundle must reach the store"
+        );
+
+        // The compare-and-swap arm: a refresh of what this adapter last read.
+        adapter.load().await.expect("load").expect("just written");
+        adapter.save(credentials("refreshed")).await.expect("save");
+        assert_eq!(
+            stored().await.as_deref(),
+            Some(json("refreshed").as_str()),
+            "an uncontended refresh must land"
         );
     }
 

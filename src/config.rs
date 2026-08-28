@@ -749,7 +749,6 @@ pub struct McpServerConfig {
     pub args: Option<Vec<String>>,
     pub env: Option<std::collections::HashMap<String, String>>,
     pub url: Option<String>,
-    pub auth_token: Option<String>,
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// Optional path to an executable that, when run, prints dynamic HTTP headers to stdout in
     /// `Name: Value\n` form. Merged over [`Self::headers`] (dynamic wins). Useful for SSO flows
@@ -818,12 +817,20 @@ pub enum McpTransport {
     Http,
 }
 
-#[derive(Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// How an HTTP MCP server authenticates. The secret itself is never here: it lives in
+/// `mcp_credentials`, keyed by server name, exactly as a provider profile's key lives in
+/// `provider_credentials`. This block says *which* flow to run and with what public
+/// parameters.
+///
+/// `deny_unknown_fields` so a key this does not model is refused rather than silently
+/// dropped, which is the same strictness [`McpServerConfig`] already has. A secret quietly
+/// ignored is worse than one refused: the connect fails later, somewhere else, for a reason
+/// that names nothing.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpAuthConfig {
     ClientCredentials {
         client_id: String,
-        client_secret: String,
         scopes: Option<Vec<String>>,
         resource: Option<String>,
     },
@@ -837,13 +844,12 @@ pub enum McpAuthConfig {
     #[serde(rename = "oauth")]
     OAuth {
         client_id: Option<String>,
-        client_secret: Option<String>,
         scopes: Option<Vec<String>>,
         redirect_port: Option<u16>,
     },
 }
 
-/// Redacts the value of every header and environment entry, and `auth_token`.
+/// Redacts the value of every header and environment entry.
 ///
 /// `headers` and `env` are the two places a user is most likely to put a bearer token, and a
 /// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
@@ -869,13 +875,6 @@ impl std::fmt::Debug for McpServerConfig {
             .field("args", &self.args)
             .field("env", &redact_map(&self.env))
             .field("url", &self.url)
-            .field(
-                "auth_token",
-                &self
-                    .auth_token
-                    .as_ref()
-                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
-            )
             .field("headers", &redact_map(&self.headers))
             .field("headers_helper", &self.headers_helper)
             .field("auth", &self.auth)
@@ -888,61 +887,6 @@ impl std::fmt::Debug for McpServerConfig {
             .field("disabled", &self.disabled)
             .field("required", &self.required)
             .finish()
-    }
-}
-
-/// Redacts `client_secret`, for the same reason as [`McpServerConfig`]'s impl. The flow's name and
-/// its `client_id` stay, because those are what an auth failure is diagnosed from.
-impl std::fmt::Debug for McpAuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ClientCredentials {
-                client_id,
-                client_secret,
-                scopes,
-                resource,
-            } => f
-                .debug_struct("ClientCredentials")
-                .field("client_id", client_id)
-                .field(
-                    "client_secret",
-                    &format_args!("[REDACTED len={}]", client_secret.len()),
-                )
-                .field("scopes", scopes)
-                .field("resource", resource)
-                .finish(),
-            Self::ClientCredentialsJwt {
-                client_id,
-                signing_key_path,
-                signing_algorithm,
-                scopes,
-                resource,
-            } => f
-                .debug_struct("ClientCredentialsJwt")
-                .field("client_id", client_id)
-                .field("signing_key_path", signing_key_path)
-                .field("signing_algorithm", signing_algorithm)
-                .field("scopes", scopes)
-                .field("resource", resource)
-                .finish(),
-            Self::OAuth {
-                client_id,
-                client_secret,
-                scopes,
-                redirect_port,
-            } => f
-                .debug_struct("OAuth")
-                .field("client_id", client_id)
-                .field(
-                    "client_secret",
-                    &client_secret
-                        .as_ref()
-                        .map(|secret| format_args!("[REDACTED len={}]", secret.len()).to_string()),
-                )
-                .field("scopes", scopes)
-                .field("redirect_port", redirect_port)
-                .finish(),
-        }
     }
 }
 
@@ -2259,8 +2203,9 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
 /// Write `content` to `path` atomically: serialise to a `<name>.<pid>.<seq>.tmp` beside it,
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
 /// Unix, unless a symlink redirected the write out of meka's own tree) and holds the final file to
-/// at most 0600 on Unix, so `auth_token` / OAuth-derived secrets aren't group- or world-readable
-/// regardless of the user's umask or of what mode the target already had.
+/// at most 0600 on Unix. meka's own secrets live in the database, but an MCP server's `headers` and
+/// `env` are the user's to fill and may hold one verbatim, so the file is kept off-limits to group
+/// and other regardless of the user's umask or of what mode the target already had.
 ///
 /// Not config-specific despite living here: the same durability and permission guarantees are what
 /// the skill store under the config dir wants, so `meka skill` bodies go through it too.
@@ -2382,11 +2327,11 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     //
     // Two failures meet here and only this rule avoids both. Handing the target the temp's fresh
     // 0600 unconditionally re-moded a file meka did not create, which is wrong for a `config.toml`
-    // a dotfile manager owns. But simply carrying the old mode across is worse: it left
-    // `auth_token = "sk-..."` sitting in a world-readable file after an ordinary `meka mcp add`,
-    // because the write follows the symlink out of meka's 0700 directory and the group and other
-    // bits came along. Narrowing keeps a deliberately *tighter* mode like 0400 and refuses to
-    // publish a looser one into a file meka is putting secrets in.
+    // a dotfile manager owns. But simply carrying the old mode across is worse: it left a
+    // hand-written `headers = { Authorization = "Bearer sk-..." }` sitting in a world-readable file
+    // after any ordinary `meka mcp` edit, because the write follows the symlink out of meka's 0700
+    // directory and the group and other bits came along. Narrowing keeps a deliberately *tighter*
+    // mode like 0400 and refuses to publish a looser one.
     //
     // Said out loud when it bites, because it is a change to something the user set.
     #[cfg(unix)]
@@ -3572,12 +3517,14 @@ mod tests {
     }
 
     /// The redacting `Debug` impls exist to keep a secret out of a log, and until this test there
-    /// was nothing asserting any of them: all three could have been deleted and the suite would
-    /// have stayed green while `{:?}` started printing bearer tokens again.
+    /// was nothing asserting any of them: each could have been deleted and the suite would have
+    /// stayed green while `{:?}` started printing secrets again.
+    ///
+    /// `McpAuthConfig` is no longer among them and needs none: its secret lives in
+    /// `mcp_credentials`, so every field it still carries is public configuration.
     #[test]
     fn a_secret_never_reaches_a_debug_rendering() {
         let mut server = fixture_server("s");
-        server.auth_token = Some("tok-AUTHTOKEN".to_string());
         server.headers = Some(std::collections::HashMap::from([(
             "Authorization".to_string(),
             "Bearer HEADERSECRET".to_string(),
@@ -3588,13 +3535,12 @@ mod tests {
         )]));
         server.auth = Some(McpAuthConfig::ClientCredentials {
             client_id: "public-client-id".to_string(),
-            client_secret: "CLIENTSECRET".to_string(),
             scopes: None,
             resource: None,
         });
 
         let rendered = format!("{:?}", server);
-        for secret in ["tok-AUTHTOKEN", "HEADERSECRET", "ENVSECRET", "CLIENTSECRET"] {
+        for secret in ["HEADERSECRET", "ENVSECRET"] {
             assert!(
                 !rendered.contains(secret),
                 "'{secret}' leaked into {rendered}"
@@ -3605,15 +3551,6 @@ mod tests {
         assert!(rendered.contains("API_KEY"), "{rendered}");
         assert!(rendered.contains("public-client-id"), "{rendered}");
         assert!(rendered.contains("REDACTED"), "{rendered}");
-
-        let oauth = McpAuthConfig::OAuth {
-            client_id: Some("public-client-id".to_string()),
-            client_secret: Some("OAUTHSECRET".to_string()),
-            scopes: None,
-            redirect_port: None,
-        };
-        let rendered = format!("{:?}", oauth);
-        assert!(!rendered.contains("OAUTHSECRET"), "{rendered}");
 
         let serve_token = ResolvedServeToken {
             token: "SERVETOKEN".to_string(),
@@ -3671,7 +3608,6 @@ mod tests {
             args: None,
             env: None,
             url: Some("https://example".to_string()),
-            auth_token: None,
             headers: None,
             headers_helper: None,
             auth: None,
@@ -5192,7 +5128,6 @@ url = "https://api.example.com/mcp"
 [mcp.servers.auth]
 type = "client_credentials"
 client_id = "my-client"
-client_secret = "my-secret"
 scopes = ["read", "write"]
 resource = "https://api.example.com"
 "#;
@@ -5203,12 +5138,10 @@ resource = "https://api.example.com"
         match auth {
             McpAuthConfig::ClientCredentials {
                 client_id,
-                client_secret,
                 scopes,
                 resource,
             } => {
                 assert_eq!(client_id, "my-client");
-                assert_eq!(client_secret, "my-secret");
                 assert_eq!(
                     scopes.as_deref(),
                     Some(["read".to_string(), "write".to_string()].as_slice())
@@ -5275,12 +5208,10 @@ redirect_port = 9000
         match auth {
             McpAuthConfig::OAuth {
                 client_id,
-                client_secret,
                 scopes,
                 redirect_port,
             } => {
                 assert_eq!(client_id.as_deref(), Some("my-app"));
-                assert!(client_secret.is_none());
                 assert_eq!(
                     scopes.as_deref(),
                     Some(["repo".to_string(), "user".to_string()].as_slice())
@@ -5308,12 +5239,10 @@ type = "oauth"
         match auth {
             McpAuthConfig::OAuth {
                 client_id,
-                client_secret,
                 scopes,
                 redirect_port,
             } => {
                 assert!(client_id.is_none());
-                assert!(client_secret.is_none());
                 assert!(scopes.is_none());
                 assert!(redirect_port.is_none());
             }
@@ -5328,12 +5257,53 @@ type = "oauth"
 name = "simple"
 transport = "http"
 url = "https://api.example.com/mcp"
-auth_token = "bearer-token"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let servers = config.mcp.unwrap().servers.unwrap();
         assert!(servers[0].auth.is_none());
-        assert_eq!(servers[0].auth_token.as_deref(), Some("bearer-token"));
+    }
+
+    /// A secret in `config.toml` is refused, not ignored.
+    ///
+    /// `auth_token` and `client_secret` moved into `mcp_credentials`, and the only thing standing
+    /// between a user with an old config and a silently unauthenticated server is
+    /// `deny_unknown_fields`. Dropped instead of refused, the key would parse away and the connect
+    /// would fail later with a 401 that names nothing; `McpAuthConfig` in particular did not carry
+    /// the attribute until this change, so its `client_secret` would have vanished quietly.
+    ///
+    /// The message is deliberately serde's own. Naming the retired key specially would be code that
+    /// remembers a previous version, which only the migration ledger may do.
+    #[test]
+    fn a_secret_left_in_config_is_refused_rather_than_ignored() {
+        let bearer = r#"
+[[mcp.servers]]
+name = "simple"
+transport = "http"
+url = "https://api.example.com/mcp"
+auth_token = "bearer-token"
+"#;
+        let error = toml::from_str::<ConfigFile>(bearer).expect_err("a retired key must not parse");
+        assert!(
+            error.to_string().contains("auth_token"),
+            "the refusal must name the offending key: {error}"
+        );
+
+        let secret = r#"
+[[mcp.servers]]
+name = "simple"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "client_credentials"
+client_id = "my-client"
+client_secret = "my-secret"
+"#;
+        let error = toml::from_str::<ConfigFile>(secret).expect_err("a retired key must not parse");
+        assert!(
+            error.to_string().contains("client_secret"),
+            "the refusal must name the offending key: {error}"
+        );
     }
 
     #[test]
@@ -5944,11 +5914,11 @@ thinking = "budgeted"
     /// An existing file's mode is preserved, but never left looser than 0600.
     ///
     /// Two failures meet here. Handing the target the temp's fresh 0600 unconditionally re-modes a
-    /// file meka did not create. Carrying the old mode across verbatim is worse: it left an
-    /// `auth_token` in a world-readable `config.toml` after an ordinary `meka mcp add`, because the
-    /// write follows a dotfile manager's symlink out of meka's 0700 directory and the group and
-    /// other bits came with it. Narrowing keeps a deliberately tighter mode and refuses a looser
-    /// one.
+    /// file meka did not create. Carrying the old mode across verbatim is worse: it left a
+    /// hand-written `Authorization` header in a world-readable `config.toml` after any ordinary
+    /// `meka mcp` edit, because the write follows a dotfile manager's symlink out of meka's 0700
+    /// directory and the group and other bits came with it. Narrowing keeps a deliberately tighter
+    /// mode and refuses a looser one.
     #[cfg(unix)]
     #[test]
     fn write_file_atomic_never_leaves_a_rewritten_file_looser_than_0600() {
