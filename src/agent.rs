@@ -65,6 +65,112 @@ use crate::{
 /// context window.
 pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
+/// A session's provider binding, resolved into everything that follows from it.
+///
+/// One struct with one producer (`crate::resolved_binding`) because these are not independent
+/// facts: they all come from the same `[providers.<name>]` block, and a caller that took the
+/// provider and left the window behind would gauge the new model against the old one's size.
+/// Building a session and switching one mid-conversation both go through it, so neither can
+/// derive a subset the other does not.
+#[derive(Clone)]
+pub struct ResolvedBinding {
+    pub provider: Arc<dyn Provider>,
+    pub binding: crate::session::SessionProvider,
+    /// What the context gauge and the auto-compaction threshold read.
+    pub context_window: u64,
+    /// Whether this profile's model accepts image input. The agent does not read it: admitting an
+    /// attachment is the host's decision, made before a turn exists.
+    ///
+    /// The two hosts that make it reach the answer differently, and neither keeps a per-session
+    /// copy any more. `serve` reads it off this struct through `SessionEntry::binding`, which is
+    /// the cell [`Agent::set_provider`] writes, so a `PATCH` moves the flag with the agent. ACP
+    /// reads the session row per prompt instead, because its `session/set_config_option` must not
+    /// block its dispatch loop on the runtime mutex and so may leave the agent a turn behind the
+    /// row; see `acp::session_accepts_images`. ACP does keep one connection-wide copy,
+    /// `ServerState::vision`, which is a different fact: `initialize` answers the advertised
+    /// `image` capability before any session exists.
+    pub vision: bool,
+}
+
+/// What a session runs on, published for the collaborators that outlive a single turn.
+///
+/// [`Agent::set_provider`] is the only writer, which is why this is a handle rather than a second
+/// copy of the truth: it is the same arrangement `SharedPermission` and the context-token counter
+/// already use for values the agent owns and others must watch.
+///
+/// It exists because a mid-session switch has to reach two things the agent does not own.
+/// `agent_spawn` and `agent_followup` build a worker from the parent's provider, and the
+/// `context_*` tools report the window the model is being gauged against. Both used to hold a copy
+/// taken when the session was assembled, so `/provider`, `PATCH /v1/sessions/{id}` and ACP's
+/// `session/set_config_option` moved the agent and left them behind: a worker spawned afterwards
+/// ran on the profile the user had just left, and billed that account, while the child's own row
+/// recorded the new one.
+#[derive(Clone)]
+pub struct PublishedBinding {
+    resolved: Arc<std::sync::RwLock<ResolvedBinding>>,
+    /// Held separately from `resolved` because `ContextGauge` reads it on every `context_check`
+    /// and has no business knowing what a provider is.
+    window: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl PublishedBinding {
+    /// `window` is supplied rather than made here, for the reason
+    /// [`crate::AgentAssembly`]'s `context_tokens` gives about its own handle: a frontend gauge --
+    /// the REPL prompt indicator, ACP's `usage_update` -- is built before the agent exists and has
+    /// to hold the same cell. Made internally, each host kept a second copy and re-stored it by
+    /// hand beside every `set_provider` call, which is four hand-written pairs enforcing what one
+    /// handle can. The caller's seed value is irrelevant; this overwrites it.
+    ///
+    /// Two hosts pass a throwaway instead. `serve`'s `SessionEntry` is built *after* the agent, so
+    /// it goes the other way and takes the handle back out through [`Agent::published_binding`];
+    /// `--oneshot` prints one answer and exits, so nothing watches its window at all.
+    pub fn new(resolved: &ResolvedBinding, window: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        window.store(
+            resolved.context_window,
+            std::sync::atomic::Ordering::Release,
+        );
+        Self {
+            resolved: Arc::new(std::sync::RwLock::new(resolved.clone())),
+            window,
+        }
+    }
+
+    /// A cell nobody outside watches, for a sub-agent: it has no prompt gauge and no session entry.
+    pub fn detached(resolved: &ResolvedBinding) -> Self {
+        Self::new(resolved, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    /// A poisoned lock costs nothing here: the guarded value is one owner's `ResolvedBinding`, and
+    /// a writer that panicked mid-store left it whole either way.
+    pub fn current(&self) -> ResolvedBinding {
+        match self.resolved.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// The handle [`crate::tools::context::ContextGauge`] holds.
+    pub fn window(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.window)
+    }
+
+    /// The current window, for a reader that wants the number rather than the cell.
+    pub fn context_window(&self) -> u64 {
+        self.window.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn store(&self, resolved: &ResolvedBinding) {
+        match self.resolved.write() {
+            Ok(mut guard) => *guard = resolved.clone(),
+            Err(poisoned) => *poisoned.into_inner() = resolved.clone(),
+        }
+        self.window.store(
+            resolved.context_window,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// Token budget for the verbatim tail a compaction keeps: about a tenth of the window, floored and
 /// capped so a small window still keeps something usable and a large one doesn't carry half the
 /// conversation past the boundary.
@@ -112,8 +218,8 @@ pub struct AgentOptions {
     /// inheriting one) can be `None`.
     pub context_messages: Option<usize>,
     /// When true, the agent auto-compacts the conversation once a turn's input tokens cross
-    /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of [`Self::context_window`]. Requires `context_window >
-    /// 0`.
+    /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of the session's context window. Requires a window above
+    /// zero.
     pub auto_compact: bool,
     /// When true, a compaction is preceded by a *checkpoint turn*: the agent itself, holding its
     /// real system prompt and memory index, decides what survives and writes durable notes for
@@ -122,8 +228,6 @@ pub struct AgentOptions {
     /// Off means every compaction uses [`Agent::summarize_via_provider`], which is also the
     /// unconditional path for [`CompactOrigin::Emergency`] regardless of this flag.
     pub compact_checkpoint: bool,
-    /// Provider's advertised context window in tokens. Drives auto-compact.
-    pub context_window: u64,
     /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
     /// `--instructions` overrides the config-file value.
     pub user_instructions: Option<String>,
@@ -285,10 +389,30 @@ fn checkpoint_instruction(request: &CompactRequest) -> String {
 /// session. A turn fans out tool calls (in parallel via `join_all`) and persists every assistant
 /// and tool-result message to the session store.
 ///
-/// `Agent` is held across turns but not across providers; switching providers requires a fresh
-/// instance.
+/// `Agent` is held across turns *and* across providers: [`Self::set_provider`] moves a live one, so
+/// a switch keeps the conversation, the session lock and the background-task registry. `/provider`,
+/// `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option` all land there.
 pub struct Agent {
     provider: Arc<dyn Provider>,
+    /// What [`Self::provider`] was built from, recorded on any session this agent creates.
+    ///
+    /// The whole binding rather than the profile name alone, because the name alone is not enough
+    /// to rebuild this provider: a run given `--model` builds one the profile does not describe,
+    /// and a row recording only the profile would send the next resume to a different model.
+    ///
+    /// Carried alongside the provider rather than derived from it: a built provider knows its
+    /// backend and model but not which named profile asked for them, and the name is what a
+    /// session records and later resolves by.
+    provider_binding: crate::session::SessionProvider,
+    /// Where [`Self::set_provider`] republishes the binding for collaborators that hold a handle.
+    ///
+    /// Always present, including for a sub-agent, which gets a [`PublishedBinding::detached`] cell
+    /// seeded from its parent's: a worker has no prompt gauge and no session entry watching it,
+    /// but it still publishes, so [`Self::set_provider`] needs no branch and
+    /// [`Self::auto_compact_threshold`] reads a real window rather than a zero, which it takes for
+    /// "unknown" and answers by switching auto-compaction off for the whole worker. The
+    /// `context_*` tools are not the payoff here; a sub-agent is registered none of them.
+    published_binding: PublishedBinding,
     tool_registry: ToolRegistry,
     session_manager: SessionManager,
     shared_permission: SharedPermission,
@@ -371,9 +495,13 @@ pub struct Agent {
     /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
     /// Cleared between turns by `persist_oversized_results`.
     scratchpad_hints: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    /// Tools that have already been the subject of a [`Self::schema_advisory`]. Never cleared: the
-    /// advisory lives on in the conversation, so a second copy teaches nothing and costs context
-    /// on every later call.
+    /// Tools that have already been the subject of a [`Self::schema_advisory`]. Held rather than
+    /// re-sent, because the advisory lives on in the conversation and a second copy teaches
+    /// nothing while costing context on every later call.
+    ///
+    /// Cleared by [`Self::compact_session`], for the reason the read tracker beside it is: a
+    /// summary may have taken the advisory with it, and the set is a claim about a conversation
+    /// that no longer exists.
     schema_advisories_sent: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Live handles for background tool calls this agent started. Empty and inert unless
     /// `[background] enabled`; shared with the `task_*` tools and the REPL so all three act on one
@@ -713,7 +841,12 @@ impl TurnRecovery {
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: Arc<dyn Provider>,
+        // The whole binding, as one already-published cell, rather than a provider and a profile
+        // to be reconciled here. `set_provider` writes through it, so an agent built without one
+        // could move itself and leave `agent_spawn` and the context gauge on the profile the
+        // session had left -- the exact bug this type exists to prevent, reachable by a host
+        // forgetting a separate setter call. There is no such call any more.
+        published_binding: PublishedBinding,
         tool_registry: ToolRegistry,
         session_manager: SessionManager,
         shared_permission: SharedPermission,
@@ -727,12 +860,15 @@ impl Agent {
         roots: SharedRoots,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
+        let resolved = published_binding.current();
         Self {
-            provider,
+            provider: resolved.provider,
+            provider_binding: resolved.binding,
+            options,
+            published_binding,
             tool_registry,
             session_manager,
             shared_permission,
-            options,
             todo_list,
             last_rendered_todo: tokio::sync::RwLock::new(None),
             last_rendered_world: tokio::sync::RwLock::new(None),
@@ -767,14 +903,77 @@ impl Agent {
         }
     }
 
-    /// Swap the provider after construction. Used by the ACP integration test path
-    /// (`MEKA_MOCK_PROVIDER=1`) so the test can drive a scripted
-    /// [`crate::provider::mock::MockProvider`] without going through the credential / HTTP-client
-    /// setup that `create_agent_from_config` performs for real providers. Debug builds only;
-    /// release builds don't include it.
-    #[cfg(debug_assertions)]
-    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = provider;
+    /// Move this agent onto another provider profile, mid-conversation.
+    ///
+    /// Every surface that offers the switch lands here: `/provider`, `PATCH /v1/sessions/{id}` and
+    /// ACP's `session/set_config_option`. All three parts move together because all three describe
+    /// one profile: a binding that disagreed with the provider beside it would make the row a lie,
+    /// and a context window left behind would gauge the new model against the old one's size and
+    /// compact at the wrong point (or never).
+    pub fn set_provider(&mut self, resolved: ResolvedBinding) {
+        // Published first, so a collaborator that reads between the two can only be early rather
+        // than left on the profile the session is leaving.
+        self.published_binding.store(&resolved);
+        self.provider = resolved.provider;
+        self.provider_binding = resolved.binding;
+    }
+
+    /// The window this agent gauges against, and the one every collaborator watching the published
+    /// cell sees.
+    ///
+    /// Read rather than mirrored onto a field of its own. It used to be `options.context_window`,
+    /// kept true by an assignment here and another in `Agent::new` -- two hand-written statements
+    /// enforcing what the cell already guarantees, which is precisely the shape that broke when a
+    /// third holder was added and only two of them were remembered.
+    pub(crate) fn context_window(&self) -> u64 {
+        self.published_binding.context_window()
+    }
+
+    /// Move the window without a whole profile switch, for the tests that drive the
+    /// auto-compaction guards. Goes through the published cell rather than poking an atomic, so
+    /// the binding a test leaves behind is one the agent could actually be in.
+    #[cfg(test)]
+    pub(crate) fn set_context_window_for_test(&mut self, window: u64) {
+        let mut resolved = self.published_binding.current();
+        resolved.context_window = window;
+        self.set_provider(resolved);
+    }
+
+    /// The occupancy above which a turn compacts, or `None` when auto-compaction cannot apply.
+    ///
+    /// `None` for auto-compaction switched off, and for a zero window, which is not a small window
+    /// but "unknown": a threshold of zero would compact every turn including the first.
+    ///
+    /// One function because there are three sites that need it -- the reactive check after a turn,
+    /// the proactive projection before one, and the overflow-recovery guard -- and they were three
+    /// hand-written copies of `window * PERCENT / 100` behind three hand-written copies of the same
+    /// two-part guard. Three copies of one formula is three chances to fix a bug in two of them,
+    /// and a mutation sweep found every one of the nineteen operators involved could be flipped
+    /// with the suite still green.
+    pub(crate) fn auto_compact_threshold(&self) -> Option<u64> {
+        if !self.options.auto_compact {
+            return None;
+        }
+        let window = self.context_window();
+        (window > 0).then(|| window * AUTO_COMPACT_THRESHOLD_PERCENT / 100)
+    }
+
+    /// The cell this agent publishes into, as `agent_spawn` and `context_check` hold it.
+    ///
+    /// For a host that has to watch the binding but cannot exist before the agent does: `serve`'s
+    /// `SessionEntry` is built from the assembled agent, so it takes the handle out rather than
+    /// being handed one in the way the window cell is (that has to go the other way, because the
+    /// frontend holding it is a constructor argument).
+    pub fn published_binding(&self) -> PublishedBinding {
+        self.published_binding.clone()
+    }
+
+    /// What this agent runs on, for a host that has to report it.
+    ///
+    /// The session's own binding, which is not the process default once a resume or a switch has
+    /// happened, and the only thing a status display may read if it is to agree with the turn.
+    pub fn provider_binding(&self) -> &crate::session::SessionProvider {
+        &self.provider_binding
     }
 
     /// The slot holding the lock on a session this agent created, for a host that has to outlive
@@ -811,7 +1010,13 @@ impl Agent {
     /// [`crate::mcp::McpClientManager::install_tools_on`] wires up.
     #[allow(clippy::too_many_arguments)]
     pub fn new_subagent(
-        provider: Arc<dyn Provider>,
+        // What the parent runs on *now*, whole. A sub-agent runs the parent's work onward on the
+        // parent's account, so it inherits rather than resolving one of its own -- and it inherits
+        // the window with the provider rather than from `parent_options`, which is a clone frozen
+        // when the session was assembled and cannot hear about a switch. Taking the two from
+        // different places is how a worker came to talk to one profile while gauging against the
+        // size of another.
+        parent_binding: ResolvedBinding,
         tool_registry: ToolRegistry,
         session_manager: SessionManager,
         shared_permission: SharedPermission,
@@ -849,7 +1054,6 @@ impl Agent {
             // mattered. It reaches its own memory only if the spawn granted it any, so a worker
             // with no memory access still gets the better summary and simply has nowhere to write.
             compact_checkpoint: parent_options.compact_checkpoint,
-            context_window: parent_options.context_window,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
@@ -863,7 +1067,10 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
         let sub_cwd: SharedCwd = Arc::new(RwLock::new(parent_path));
         let mut agent = Self::new(
-            provider,
+            // Its own cell, seeded from what the parent runs on *now*. A worker has no prompt
+            // gauge and no session entry watching it, and it never switches, so nothing outside
+            // needs the handle.
+            PublishedBinding::detached(&parent_binding),
             tool_registry,
             session_manager,
             shared_permission,
@@ -899,7 +1106,7 @@ impl Agent {
         (
             self.last_context_tokens
                 .load(std::sync::atomic::Ordering::Relaxed),
-            self.options.context_window,
+            self.context_window(),
         )
     }
 
@@ -920,7 +1127,7 @@ impl Agent {
             used: self
                 .last_context_tokens
                 .load(std::sync::atomic::Ordering::Relaxed),
-            window: self.options.context_window,
+            window: self.context_window(),
             compact_at_percent: self
                 .options
                 .auto_compact
@@ -1167,6 +1374,7 @@ impl Agent {
                     Some(self.shared_permission.get().to_string()),
                     None,
                     None,
+                    self.provider_binding.clone(),
                 )
                 .await?;
             let id = created.id;
@@ -1187,17 +1395,16 @@ impl Agent {
         // Auto-compact if the last turn's context occupancy exceeded the threshold fraction of the
         // context window. This runs between turns (not mid-tool-loop) so the stable base_messages
         // invariant is preserved.
-        if self.options.auto_compact && self.options.context_window > 0 {
+        if let Some(threshold) = self.auto_compact_threshold() {
             let last_tokens = self
                 .last_context_tokens
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if last_tokens > threshold && messages.len() > 1 {
                 tracing::info!(
                     "auto-compacting: {} tokens in context exceeds {}% of the {} window",
                     last_tokens,
                     AUTO_COMPACT_THRESHOLD_PERCENT,
-                    self.options.context_window
+                    self.context_window()
                 );
                 if let Err(error) = self
                     .compact_session(
@@ -1407,16 +1614,17 @@ impl Agent {
         // compact before sending if it would cross the threshold. `estimate_messages`
         // under-reads (no tool schemas), so this is a floor that complements, not replaces,
         // the reactive check and the overflow recovery below.
-        if self.options.auto_compact && self.options.context_window > 0 && messages.len() > 1 {
+        if let Some(threshold) = self.auto_compact_threshold()
+            && messages.len() > 1
+        {
             let projected = crate::tokens::estimate_messages(messages.as_slice())
                 .saturating_add(crate::tokens::estimate_text(&system_prompt));
-            let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if projected > threshold {
                 tracing::info!(
                     "proactive compaction: projected {} input tokens exceeds {}% of the {} window",
                     projected,
                     AUTO_COMPACT_THRESHOLD_PERCENT,
-                    self.options.context_window
+                    self.context_window()
                 );
                 if let Err(error) = self
                     .compact_session(
@@ -1592,8 +1800,7 @@ impl Agent {
                 let (mut assistant_message, stop_reason, usage) = match call_result {
                     Ok(value) => value,
                     Err(MekaError::ContextOverflow(message))
-                        if self.options.auto_compact
-                            && self.options.context_window > 0
+                        if self.auto_compact_threshold().is_some()
                             && messages.len() > 1
                             && recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
                     {
@@ -2913,7 +3120,7 @@ impl Agent {
         // largest recent suffix that fits a token budget (~10% of the window, capped), snapped back
         // to a clean user boundary so tool_use/tool_result pairs are never orphaned.
         let (to_summarize, to_keep) = if keep_recent {
-            let keep_budget = compaction_tail_budget(self.options.context_window);
+            let keep_budget = compaction_tail_budget(self.context_window());
             compute_compaction_split(messages.as_slice(), keep_budget)
         } else {
             // Keeping nothing means the summary has to cover everything, tail included. Only the
@@ -3027,6 +3234,15 @@ impl Agent {
         // the next turn re-state it in full. Compaction re-caches the conversation anyway, so the
         // extra tokens cost nothing that wasn't already spent.
         *self.last_rendered_world.write().await = None;
+
+        // And the same for the schema advisories. Each one records "the model has already been
+        // shown how this tool's arguments go wrong", which was true of a conversation the summary
+        // has just replaced. Left standing, a model that repeats the mistake after a boundary gets
+        // no hint for the rest of the session.
+        match self.schema_advisories_sent.lock() {
+            Ok(mut sent) => sent.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
 
         // Seed the live context gauge with an estimate of the compacted working set so `/status`
         // (and the prompt indicator) immediately reflect the smaller size; the next real turn
@@ -3941,6 +4157,44 @@ mod tests {
     use super::*;
     use crate::provider::ToolResultContent;
 
+    /// The switch has to reach the collaborators that outlive a turn, not just the agent's own
+    /// fields. `agent_spawn` built a worker from a provider cloned when the session was assembled
+    /// and `context_check` reported a window frozen at the same moment, so a session moved by
+    /// `/provider`, `PATCH` or `session/set_config_option` went on spawning workers that billed the
+    /// account it had just left, while the child's row recorded the new profile.
+    #[tokio::test]
+    async fn a_switch_reaches_everything_holding_the_published_binding() {
+        let first: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (mut agent, _session_manager) = test_agent(Arc::clone(&first)).await;
+        // The agent's own cell, which is what `agent_spawn` and `context_check` hold.
+        agent.set_provider(ResolvedBinding {
+            provider: Arc::clone(&first),
+            binding: crate::session::SessionProvider::from("alpha".to_string()),
+            context_window: 32_000,
+            vision: true,
+        });
+        let published = agent.published_binding();
+        let gauge = published.window();
+        assert_eq!(published.current().binding.profile, "alpha");
+        assert_eq!(gauge.load(std::sync::atomic::Ordering::Acquire), 32_000);
+
+        let second: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        agent.set_provider(ResolvedBinding {
+            provider: Arc::clone(&second),
+            binding: crate::session::SessionProvider::from("beta".to_string()),
+            context_window: 500_000,
+            vision: false,
+        });
+
+        assert_eq!(published.current().binding.profile, "beta");
+        assert!(Arc::ptr_eq(&published.current().provider, &second));
+        assert_eq!(gauge.load(std::sync::atomic::Ordering::Acquire), 500_000);
+        assert_eq!(agent.provider_binding().profile, "beta");
+        assert_eq!(agent.context_window(), 500_000);
+    }
+
     /// Minimal in-memory agent driving `provider`: no tools, no skills, no memories, silent
     /// frontend. Enough to exercise `run_turn`'s recovery arms, which touch none of that.
     /// Same harness, but with a frontend that records what the turn emitted.
@@ -4039,7 +4293,7 @@ mod tests {
         // A real row: `compact_session` refuses outright without one, which is what made an earlier
         // attempt at this test fail for a reason unrelated to the invariant.
         let created = session_manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("create session");
         let mut session_id = Some(created);
@@ -4080,16 +4334,182 @@ mod tests {
         );
     }
 
+    /// The number three separate sites divide by, pinned exactly.
+    ///
+    /// Every operator in `window * PERCENT / 100` and in the guard around it used to be flippable
+    /// with the suite still green: nineteen surviving mutants across the reactive check, the
+    /// proactive projection and the overflow-recovery arm. The tests that drove compaction all
+    /// *forced* it, so they proved the machinery runs and said nothing about when it starts. A
+    /// wrong threshold is silent either way -- compact every turn and lose history, or never
+    /// compact and have the provider reject the turn.
+    #[tokio::test]
+    async fn the_auto_compaction_threshold_is_eighty_percent_of_the_window() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
+        let (mut agent, _manager) = test_agent(provider).await;
+
+        agent.options.auto_compact = true;
+        agent.set_context_window_for_test(200_000);
+        assert_eq!(
+            agent.auto_compact_threshold(),
+            Some(160_000),
+            "80% of 200k; a `*`/`/` slip here moves the trigger by orders of magnitude"
+        );
+
+        agent.set_context_window_for_test(1_000_000);
+        assert_eq!(agent.auto_compact_threshold(), Some(800_000));
+
+        // Not "a tiny window": a zero window means meka does not know the size, and a threshold of
+        // zero would compact on the very first turn, before there is anything to summarise.
+        agent.set_context_window_for_test(0);
+        assert_eq!(
+            agent.auto_compact_threshold(),
+            None,
+            "an unknown window must disable auto-compaction, not set the trigger to zero"
+        );
+
+        agent.set_context_window_for_test(200_000);
+        agent.options.auto_compact = false;
+        assert_eq!(
+            agent.auto_compact_threshold(),
+            None,
+            "the config switch must win over any window"
+        );
+    }
+
+    /// The reactive check fires *above* the threshold, not at it, and never on one message.
+    ///
+    /// [`Agent::auto_compact_threshold`] pins the number; this pins the comparisons that read it.
+    /// Every operator here could be flipped with the suite green, because the tests that reached
+    /// compaction all forced it and none approached the boundary. `>=` is the interesting one: it
+    /// would compact a session sitting exactly on 80%, and since a compaction resets occupancy well
+    /// below the line it would not loop, just fire one turn early, forever, invisibly.
+    #[tokio::test]
+    async fn the_reactive_compaction_fires_above_the_threshold_and_not_at_it() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let round = || {
+            vec![
+                MockEvent::Text {
+                    text: "ok".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        // Turn one's stream, then the summariser turn two triggers, then turn two's own stream.
+        let provider = Arc::new(MockProvider::from_rounds(vec![round(), round(), round()]));
+        let handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (mut agent, _manager) = test_agent_that_compacts(handle).await;
+
+        let occupancy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        agent.set_context_tokens(Arc::clone(&occupancy));
+        let threshold = agent
+            .auto_compact_threshold()
+            .expect("the compacting harness enables auto-compaction");
+        assert_eq!(threshold, 160_000, "80% of the harness's 200k window");
+
+        // Long enough that the split has a head and a tail to work with.
+        let mut messages = Conversation::new();
+        for index in 0..4 {
+            messages.append(Message::user(format!("question {index}")));
+            messages.append(Message::assistant_text(format!("answer {index}")));
+        }
+
+        // Exactly on the line. `>` must not fire here; `>=` would.
+        occupancy.store(threshold, std::sync::atomic::Ordering::Relaxed);
+        let mut session_id = None;
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "first".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(
+            provider.completions().len(),
+            0,
+            "occupancy exactly at the threshold must not compact: the check is `>`, not `>=`"
+        );
+
+        // One token over. The turn writes the counter itself, so re-arm it first.
+        occupancy.store(threshold + 1, std::sync::atomic::Ordering::Relaxed);
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "second".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "one token over the threshold must compact, or the window is never respected"
+        );
+    }
+
+    /// A conversation with nothing to summarise is left alone however full it is.
+    ///
+    /// The `messages.len() > 1` half of the same guard. Relaxed to `>= 1` it would try to compact a
+    /// single message, which is the one shape the splitter cannot produce a summary from.
+    #[tokio::test]
+    async fn a_single_message_conversation_is_never_auto_compacted() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Text {
+                text: "ok".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let handle: Arc<dyn Provider> = Arc::clone(&provider) as Arc<dyn Provider>;
+        let (mut agent, _manager) = test_agent_that_compacts(handle).await;
+
+        let occupancy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        agent.set_context_tokens(Arc::clone(&occupancy));
+        // Far over the line, so only the message count can be what holds compaction back.
+        occupancy.store(10_000_000, std::sync::atomic::Ordering::Relaxed);
+
+        let mut messages = Conversation::new();
+        messages.append(Message::user("the only thing said so far".to_string()));
+
+        let mut session_id = None;
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "and now this".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(
+            provider.completions().len(),
+            0,
+            "a one-message conversation has no summary to make, whatever the occupancy says"
+        );
+    }
+
     /// A harness that can actually reach the emergency-compaction arm.
     ///
-    /// The default one cannot: it sets `auto_compact: false` and `context_window: 0`, and the guard
+    /// The default one cannot: it sets `auto_compact: false` and a zero window, and the guard
     /// requires both, so a test driving `FailContextOverflow` through `test_agent` proves only that
     /// the *guard* short-circuits. It was written specifically to close that gap and did not.
     async fn test_agent_that_compacts(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
         let (mut agent, session_manager) =
             test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await;
         agent.options.auto_compact = true;
-        agent.options.context_window = 200_000;
+        agent.set_context_window_for_test(200_000);
         (agent, session_manager)
     }
 
@@ -4097,9 +4517,10 @@ mod tests {
         provider: Arc<dyn Provider>,
         registry: crate::tools::ToolRegistry,
     ) -> (Agent, SessionManager) {
-        let session_manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("in-memory db");
+        let session_manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
         let options = AgentOptions {
             streaming: true,
             sandboxed_shell: false,
@@ -4107,13 +4528,17 @@ mod tests {
             context_messages: None,
             auto_compact: false,
             compact_checkpoint: false,
-            context_window: 0,
             user_instructions: None,
             mcp_grace: std::time::Duration::from_secs(0),
             system_prompt_override: Some("test".to_string()),
         };
         let agent = Agent::new(
-            provider,
+            PublishedBinding::detached(&ResolvedBinding {
+                provider,
+                binding: crate::session::SessionProvider::from("test-profile".to_string()),
+                context_window: 0,
+                vision: true,
+            }),
             registry,
             session_manager.clone(),
             SharedPermission::new(
@@ -4147,9 +4572,10 @@ mod tests {
     #[tokio::test]
     async fn a_turn_whose_store_breaks_does_not_announce_every_memory_as_deleted() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let session_manager = SessionManager::open(Some(&temp.path().join("meka.db")))
-            .await
-            .expect("open");
+        let session_manager =
+            SessionManager::open(Some(&temp.path().join("meka.db")), &Default::default())
+                .await
+                .expect("open");
         let memories = session_manager.memory_store(true);
         memories
             .write(crate::memory::store::WriteRequest {
@@ -7076,7 +7502,7 @@ mod tests {
         ) -> (Agent, SessionManager) {
             let (mut agent, session_manager) = test_agent_with_registry(provider, registry).await;
             agent.options.compact_checkpoint = true;
-            agent.options.context_window = 40_000;
+            agent.set_context_window_for_test(40_000);
             (agent, session_manager)
         }
 
@@ -7086,7 +7512,7 @@ mod tests {
         ) -> (Agent, SessionManager) {
             let (mut agent, session_manager) = test_agent(provider).await;
             agent.options.compact_checkpoint = checkpoint;
-            agent.options.context_window = 40_000;
+            agent.set_context_window_for_test(40_000);
             (agent, session_manager)
         }
 
@@ -7098,7 +7524,7 @@ mod tests {
         ) -> CompactOutcome {
             let mut session_id = Some(
                 session_manager
-                    .create_session(None)
+                    .create_session(None, "test-profile".to_string())
                     .await
                     .expect("create session"),
             );
@@ -7583,7 +8009,7 @@ mod tests {
             let mut messages = conversation();
             let mut session_id = Some(
                 session_manager
-                    .create_session(None)
+                    .create_session(None, "test-profile".to_string())
                     .await
                     .expect("create session"),
             );
@@ -7656,7 +8082,7 @@ mod tests {
             let (agent, session_manager) = agent_with_checkpoint(provider, false).await;
             let mut session_id = Some(
                 session_manager
-                    .create_session(None)
+                    .create_session(None, "test-profile".to_string())
                     .await
                     .expect("create session"),
             );

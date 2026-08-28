@@ -62,7 +62,12 @@ pub struct ContextGauge {
     /// reporting.
     pub overhead: Arc<AtomicU64>,
     /// The model's window, or zero when meka has no metadata for it.
-    pub window: u64,
+    ///
+    /// A handle rather than a value because a session can move onto another profile mid-run, and a
+    /// window frozen when the tools were registered reported the old profile's size to the model
+    /// for the rest of the session. Written by `Agent::set_provider` through
+    /// [`crate::agent::PublishedBinding`].
+    pub window: Arc<AtomicU64>,
     /// Occupancy at which auto-compaction fires, or `None` when it is off.
     pub compact_at_percent: Option<u64>,
 }
@@ -104,7 +109,7 @@ impl Tool for ContextCheckTool {
     ) -> Result<ToolOutput> {
         let used = self.gauge.used.load(Ordering::Relaxed);
         let overhead = self.gauge.overhead.load(Ordering::Relaxed);
-        let window = self.gauge.window;
+        let window = self.gauge.window.load(Ordering::Relaxed);
 
         let mut report = String::new();
 
@@ -341,7 +346,7 @@ mod tests {
         ContextGauge {
             used: Arc::new(AtomicU64::new(used)),
             overhead: Arc::new(AtomicU64::new(overhead)),
-            window,
+            window: Arc::new(AtomicU64::new(window)),
             compact_at_percent: compact_at,
         }
     }
@@ -349,9 +354,12 @@ mod tests {
     async fn check(gauge: ContextGauge) -> String {
         let tool = ContextCheckTool {
             gauge,
-            session_manager: SessionManager::open(Some(std::path::Path::new(":memory:")))
-                .await
-                .expect("in-memory db"),
+            session_manager: SessionManager::open(
+                Some(std::path::Path::new(":memory:")),
+                &Default::default(),
+            )
+            .await
+            .expect("in-memory db"),
             session_id: Arc::new(RwLock::new(None)),
         };
         let output = tool

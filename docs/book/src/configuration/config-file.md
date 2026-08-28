@@ -51,7 +51,9 @@ For each run meka picks one profile using this precedence:
 3. The sole profile, if exactly one is configured.
 
 If none of these resolve (no profiles configured, or more than one with no `default_provider` /
-`--provider`), meka errors and points you at `meka provider add` / `meka provider use`. There is no
+`--provider`), meka errors and points you at `meka provider add` / `meka provider use`. Resuming a
+session is the exception: it runs on the profile it recorded and never consults this, so an
+ambiguous default does not block `meka -c`. There is no
 environment-variable tier for provider selection; the config file (plus the per-run CLI flag) is the
 source of truth.
 
@@ -170,6 +172,8 @@ The model's context window (total tokens it can hold), used for the `/status` ga
 
 meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request - but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
 
+The window belongs to the session, not to the process: each session is measured against the profile it recorded, so two sessions in one `meka serve` can sit on profiles with different windows.
+
 ```toml
 [providers.work]
 type           = "openai-chat-completions"
@@ -197,7 +201,9 @@ thinking = "budgeted"
 
 ### `vision`
 
-Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so the ACP frontend stops advertising and accepting images (see [ACP](../usage/acp.md)).
+Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so attachments are refused rather than sent to a model that cannot read them.
+
+Refusal is per session, from the profile that session recorded, on both ACP and `POST /v1/sessions/{id}/turn`. What ACP *advertises* in `promptCapabilities.image` is necessarily per connection: `initialize` is answered before any session exists, so it reports the default profile's flag. A client on a vision-capable connection can still have its attachment refused by a session pinned to a text-only profile. See [ACP](../usage/acp.md).
 
 ```toml
 [providers.local]
@@ -242,11 +248,11 @@ config file.
 
 | Command | Action |
 |---|---|
-| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). Sets `default_provider` when it's the first profile. |
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--type` and `--model` as flags too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. Becomes `default_provider` whenever none is set. |
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
-| `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
-| `meka provider remove <name>` | Delete the stored credential from the database and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. |
+| `meka provider login <name> [--api-key-stdin]` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every other setting on the profile is kept, which `remove` + `add` would not do. |
+| `meka provider remove <name>` | Delete the stored credential from the database and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. Warns if it clears a `default_provider` that other profiles are still competing for, and if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --provider <name>`). |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
 

@@ -1280,6 +1280,133 @@ pub struct ProviderProfile {
     pub redact_thinking: Option<bool>,
 }
 
+/// The values that override a profile's own for one run or one session.
+///
+/// Separate from [`ProviderProfile`] because they arrive from somewhere else and outlive nothing:
+/// `--model` and `--base-url` are typed per invocation, and a session records its own. Passing them
+/// in rather than reading a global is what lets one process resolve two profiles differently.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileOverrides {
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub thinking: Option<crate::provider::ThinkingMode>,
+}
+
+/// One profile resolved into everything needed to build a provider for it.
+///
+/// This exists because a provider is no longer a property of the process. A session names the
+/// profile it runs with, so any given turn may need a profile that is not the configured default,
+/// and the resolution that used to happen once at startup has to be callable per profile name.
+///
+/// `context_window` and `vision` ride along despite not reaching
+/// [`crate::provider::ProviderBuilder`]: both are stated per profile, so a session that switches
+/// profile has to re-derive them or it keeps gauging its context against the window of a model it
+/// is no longer talking to.
+#[derive(Debug, Clone)]
+pub struct ProfileSettings {
+    /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
+    pub backend: String,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub client_id: Option<String>,
+    pub oauth_token_url: Option<String>,
+    pub device_id: String,
+    pub redact_thinking: bool,
+    pub thinking: crate::provider::ThinkingMode,
+    pub effort: Option<String>,
+    pub context_window: Option<u64>,
+    pub vision: bool,
+    pub max_output_tokens: Option<u64>,
+}
+
+/// The active profile's name, read straight off disk without resolving anything else.
+///
+/// Exists for the one caller that opens the store *before* config is resolved: the `meka provider`
+/// subcommands deliberately skip [`ResolvedConfig::from_cli`] to avoid its sandbox probe, and
+/// opening the store is what carries an older one forward. Without this, which command a user
+/// happened to run first would decide what their existing sessions record as their provider.
+///
+/// *Selection* errors are dropped rather than reported: the caller is on its way to a command that
+/// works fine with no provider configured, and neither of the two things this feeds needs the
+/// reason. The migration context takes an absent name as "nothing resolved" and leaves those rows
+/// alone; `session::cli::plan_import` refuses the import rather than writing a session that cannot
+/// run. A config that could not be **read** is a different answer and is raised, via
+/// [`load_config_file_or_err`], for the reason that function already gives: "empty" and "your
+/// profiles are gone" are indistinguishable to a caller with no `validate()` behind it.
+///
+/// The ledger is the sharpest instance of that. It stamps whatever this returns onto every session
+/// that predates meka recording a provider, once and irreversibly, so swallowing a parse error here
+/// converted one typo in `config.toml` into every session permanently recorded against no profile,
+/// with `default_provider` naming a perfectly good one three lines above the typo. Nothing said so:
+/// the store was stamped at head, the step never ran again, and the command exited 0.
+pub fn default_profile_on_disk(requested: Option<&str>) -> crate::error::Result<Option<String>> {
+    let config_file = load_config_file_or_err()?;
+    let (source, requested) = match requested {
+        Some(name) => (ProfileRequest::Flag, Some(name.to_string())),
+        None => (
+            ProfileRequest::DefaultProvider,
+            config_file.default_provider.clone(),
+        ),
+    };
+    let (active, _error) = select_active_profile(requested, source, &config_file.providers);
+    Ok(active)
+}
+
+/// Resolve one named profile, applying the overrides and the `[session]`-level fallbacks.
+///
+/// `session_context_window` is `[session].context_window`, which a profile's own value takes
+/// precedence over; the call sites in `main.rs` apply [`crate::provider::DEFAULT_CONTEXT_WINDOW`]
+/// when both are unset.
+pub fn resolve_profile(
+    profile: &ProviderProfile,
+    overrides: &ProfileOverrides,
+    session_context_window: Option<u64>,
+    // Received rather than resolved here, because resolving it is not a pure function: for a
+    // `claude-subscription` profile that states none, [`resolve_device_id`] mints one and rewrites
+    // the user's `config.toml` under the config lock. This runs per request now (every
+    // `resolved_binding`, every `binding_context_window`, every `/status`), and the profiles the
+    // registry holds are a snapshot, so a resolver called from in here never saw the value it had
+    // just persisted: it minted a new identifier, and wrote the config again, every single time.
+    device_id: String,
+) -> ProfileSettings {
+    ProfileSettings {
+        backend: profile.backend.clone(),
+        model: overrides.model.clone().or_else(|| profile.model.clone()),
+        base_url: overrides
+            .base_url
+            .clone()
+            .or_else(|| profile.base_url.clone()),
+        client_id: profile.client_id.clone(),
+        oauth_token_url: profile.oauth_token_url.clone(),
+        device_id,
+        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
+        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
+        redact_thinking: profile.redact_thinking.unwrap_or(true),
+        thinking: overrides.thinking.or(profile.thinking).unwrap_or_default(),
+        // Pure passthrough for every backend: whatever the profile sets goes to the provider
+        // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
+        // the provider applies its own default. An invalid value is the user's to own.
+        effort: profile.effort.clone(),
+        context_window: profile.context_window.or(session_context_window),
+        vision: profile.vision.unwrap_or(true),
+        max_output_tokens: profile.max_output_tokens,
+    }
+}
+
+/// The `claude-subscription` device identifier for one profile, seeding and persisting one when the
+/// profile states none.
+///
+/// Empty for every other backend. Deliberately separate from [`resolve_profile`], which callers
+/// reach on every request: this one writes `config.toml`, so it belongs where a caller can arrange
+/// to ask exactly once. [`crate::provider::ProviderRegistry`] memoises it per profile.
+pub(crate) fn resolve_device_id(
+    backend: &str,
+    profile_name: &str,
+    configured: Option<&str>,
+) -> String {
+    device_id::resolve(Some(backend), Some(profile_name), configured)
+}
+
 /// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
 /// `--resume` flags.
 ///
@@ -1318,7 +1445,53 @@ pub struct ResolvedConfig {
     /// `None` when no profile could be selected.
     pub provider_name: Option<String>,
     /// Name of the active profile, used as the DB key for its credential.
+    ///
+    /// The process default only. A session records the profile it runs with and resolves that one
+    /// out of [`Self::providers`] instead, which is why the map below is retained rather than
+    /// dropped once this name is picked.
     pub active_profile: Option<String>,
+    /// The profile `default_provider` picks, ignoring `--provider`.
+    ///
+    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate meka
+    /// recording one, which is a guess it makes once and cannot revisit, so the answer must not
+    /// depend on a flag the first invocation after an upgrade happened to carry: `meka --provider
+    /// side "..."` would otherwise move a whole history onto `side` because of one run. Everything
+    /// else wants [`Self::active_profile`], where the flag is the point.
+    pub configured_default_profile: Option<String>,
+    /// The permission level the user asked for on this run with `--permission` or
+    /// `MEKA_PERMISSION`, when the request was honoured.
+    ///
+    /// Distinct from [`Self::permission`], which is the resolved level and is set whether or not
+    /// anyone asked for it. Resuming needs the two apart: a session runs at the level it recorded,
+    /// and only an explicit request overrides that.
+    pub requested_permission: Option<Permission>,
+    /// The model and endpoint the user named on the command line with `--model` / `--base-url`.
+    ///
+    /// Recorded on the session rather than applied for one run, for the same reason
+    /// [`Self::requested_profile`] is: a per-run override leaves the row describing a session that
+    /// no longer exists, and the next resume drifts back to the profile's model without saying so.
+    pub requested_model: Option<String>,
+    pub requested_base_url: Option<String>,
+    /// `--thinking` for this run, applied to whichever profile a session resolves to.
+    ///
+    /// Held raw rather than folded into [`Self::thinking`], which is the *default profile's*
+    /// resolved mode and so is the wrong value to hand a session on another profile. The flag
+    /// stopped reaching the provider entirely when profiles became per-session: the only overrides
+    /// that survived were a session's own model and base URL, and `thinking` is not one a session
+    /// pins.
+    pub requested_thinking: Option<crate::provider::ThinkingMode>,
+    /// The profile the user named on the command line with `--provider`, if any.
+    ///
+    /// Distinct from [`Self::active_profile`], which is the *resolved* default and is set whether
+    /// or not anyone asked for it. Resuming needs to tell the two apart: a session runs on the
+    /// profile it recorded, and only an explicit request rewrites that.
+    pub requested_profile: Option<String>,
+    /// Every configured profile, by name.
+    ///
+    /// Kept so a provider can be built for a profile that is not the process default. Selection
+    /// picks one name at startup, but a session names its own, and resolving that one needs the
+    /// profile still to be here.
+    pub providers: std::collections::BTreeMap<String, ProviderProfile>,
     /// Set when profile selection failed (no profiles, ambiguous, or an unknown name); surfaced by
     /// [`Self::validate`] with guidance to run `meka provider add` / `use`.
     pub provider_error: Option<String>,
@@ -1331,9 +1504,6 @@ pub struct ResolvedConfig {
     /// user believes they supplied is worse than not starting.
     pub instructions_error: Option<String>,
     pub model: Option<String>,
-    pub base_url: Option<String>,
-    pub client_id: Option<String>,
-    pub oauth_token_url: Option<String>,
     pub permission: Permission,
     pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
@@ -1378,19 +1548,17 @@ pub struct ResolvedConfig {
     pub thinking: crate::provider::ThinkingMode,
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
-    /// Stable per-device identifier for `claude-subscription`'s `metadata.user_id`. Empty string
-    /// for non-`claude-subscription` providers (the value is ignored downstream).
-    pub device_id: String,
-    /// The user's explicit reasoning-effort override for every backend (Claude
-    /// `output_config.effort`, OpenAI `reasoning.effort`). Passed through verbatim; `None` leaves
-    /// the field off the request, so the provider applies its own default.
-    pub effort: Option<String>,
-    /// `claude-subscription`: when true, request `redacted_thinking` blocks via
-    /// `redact-thinking-2026-02-12` beta. Default true.
-    pub redact_thinking: bool,
     pub auto_compact: bool,
     pub compact_checkpoint: bool,
-    pub context_window: Option<u64>,
+    /// `[session].context_window` verbatim, *before* any profile is applied to it.
+    ///
+    /// Unresolved on purpose, and the one flat field here that must stay that way. It is the seed
+    /// [`crate::provider::ProviderRegistry`] hands `resolve_profile` for every profile it builds,
+    /// so a value that had already been through the *active* profile would become that profile's
+    /// window for every other profile that states none: a session on a small local model would
+    /// gauge itself against the big cloud default and never compact, and the reverse pairing would
+    /// compact every turn. Resolving it here and again per profile is the same mistake twice.
+    pub session_context_window: Option<u64>,
     /// Maximum sub-agent recursion depth. `1` lets the root agent spawn but denies its sub-agents
     /// the same; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s depth
     /// budget in `main.rs`.
@@ -2013,8 +2181,9 @@ fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
 /// back. Two of those interleaving means the second write is computed from a snapshot taken before
 /// the first, so the first is silently discarded -- `write_file_atomic` makes each *write* atomic,
 /// which does nothing for a lost update. This is not a hypothetical race between two humans running
-/// CLI commands: `device_id::persist` runs from `ResolvedConfig::from_cli` on every start for a
-/// `claude-subscription` profile without one, so an ordinary launch races `meka mcp add`.
+/// CLI commands: an ordinary launch races `meka mcp add`, because `device_id::persist` runs from
+/// `ProviderRegistry::device_id_for` the first time a `claude-subscription` profile that states
+/// none is resolved.
 ///
 /// The lock lives beside the file rather than on it, because the editors replace the file by rename
 /// and a lock held on the replaced inode would guard nothing.
@@ -2312,12 +2481,16 @@ pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
 /// out-of-set overrides (e.g. `--permission ask` when `ask` is disabled) warn and clamp to the
 /// configured default rather than refusing to start, mirroring the `[tools.tool_permissions]`
 /// warn-and-skip pattern.
+///
+/// The third element is the level the user asked for on this run and got, or `None` when the level
+/// came from the config file or the built-in default. Resuming needs the distinction: a session
+/// runs at the level it recorded, and only an explicit request overrides that.
 fn resolve_permission(
     cli_permission: Option<Permission>,
     env_permission: Option<&str>,
     file_default: Option<&str>,
     file_enabled: Option<&[String]>,
-) -> (Permission, EnabledPermissions) {
+) -> (Permission, EnabledPermissions, Option<Permission>) {
     let enabled = match file_enabled {
         Some(list) => {
             let parsed: Vec<Permission> = list
@@ -2401,20 +2574,22 @@ fn resolve_permission(
     });
 
     let raw_choice = cli_permission.or(env_override);
-    let permission = match raw_choice {
-        Some(mode) if enabled.is_enabled(mode) => mode,
+    // A request that had to be clamped is not a request that was honoured, so it does not
+    // suppress a resumed session's recorded level either.
+    let requested = match raw_choice {
+        Some(mode) if enabled.is_enabled(mode) => Some(mode),
         Some(mode) => {
             tracing::warn!(
                 "requested start mode '{}' is not in [permissions].enabled; using '{}'",
                 mode,
                 resolved_default
             );
-            resolved_default
+            None
         }
-        None => resolved_default,
+        None => None,
     };
 
-    (permission, enabled)
+    (requested.unwrap_or(resolved_default), enabled, requested)
 }
 
 /// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
@@ -2555,12 +2730,25 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
     }
 }
 
+/// Which tier asked for the profile [`select_active_profile`] could not find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileRequest {
+    /// `--provider <name>` on this run.
+    Flag,
+    /// `default_provider` in `config.toml`, which is also what `meka provider use` writes.
+    DefaultProvider,
+}
+
 /// Resolve which provider profile is active given an explicit request (from `--provider` or
 /// `default_provider`) and the configured profiles. Returns `(active_profile, provider_error)`:
 /// exactly one is `Some`. A deferred error string (rather than a hard failure) keeps `from_cli`
 /// infallible; `validate()` surfaces it later with guidance.
 pub(crate) fn select_active_profile(
     requested: Option<String>,
+    // Where `requested` came from, because the remedy differs. Telling someone who just typed
+    // `--provider typo` to "pass `--provider`" is advice they have already taken; telling someone
+    // whose `default_provider` names a deleted profile to run `meka provider list` is not enough.
+    source: ProfileRequest,
     providers: &std::collections::BTreeMap<String, ProviderProfile>,
 ) -> (Option<String>, Option<String>) {
     match requested {
@@ -2572,10 +2760,14 @@ pub(crate) fn select_active_profile(
         Some(name) => (
             None,
             Some(format!(
-                "no provider profile named '{}' (configured: {}). Pass `--provider` or set \
-                 `default_provider`.",
+                "no provider profile named '{}' (configured: {}). {}",
                 name,
-                providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                providers.keys().cloned().collect::<Vec<_>>().join(", "),
+                match source {
+                    ProfileRequest::Flag => "Pass a configured name to `--provider`.",
+                    ProfileRequest::DefaultProvider =>
+                        "Fix `default_provider` in config.toml, or run `meka provider use <name>`.",
+                }
             )),
         ),
         None => match providers.len() {
@@ -2587,11 +2779,15 @@ pub(crate) fn select_active_profile(
                 ),
             ),
             1 => (providers.keys().next().cloned(), None),
+            // Names `meka provider use`, which is what actually writes `default_provider`.
+            // Saying only "set `default_provider`" sends the reader to hand-edit a file for
+            // something a command does, and this state is most often reached by
+            // `meka provider remove` dropping a pointer to the profile it deleted.
             _ => (
                 None,
                 Some(format!(
-                    "multiple provider profiles configured ({}); set `default_provider` or pass \
-                     `--provider <name>`.",
+                    "multiple provider profiles configured ({}); run `meka provider use <name>` \
+                     to pick a default, or pass `--provider <name>`.",
                     providers.keys().cloned().collect::<Vec<_>>().join(", ")
                 )),
             ),
@@ -2606,10 +2802,21 @@ impl ResolvedConfig {
         // Select the active profile: `--provider` flag, else `default_provider`, else the sole
         // profile. Absence / ambiguity / unknown name becomes a deferred error surfaced by
         // `validate()` so `from_cli` stays infallible.
-        let (active_profile, provider_error) = select_active_profile(
-            cli.provider
-                .clone()
-                .or_else(|| config_file.default_provider.clone()),
+        let (profile_request, requested_active) = match cli.provider.clone() {
+            Some(name) => (ProfileRequest::Flag, Some(name)),
+            None => (
+                ProfileRequest::DefaultProvider,
+                config_file.default_provider.clone(),
+            ),
+        };
+        let (active_profile, provider_error) =
+            select_active_profile(requested_active, profile_request, &providers);
+        // Resolved a second time without the flag, for the ledger. Its error is discarded: a
+        // default nothing can pick is already reported by the resolution above, and the migration's
+        // own fallbacks handle having no answer.
+        let (configured_default_profile, _) = select_active_profile(
+            config_file.default_provider.clone(),
+            ProfileRequest::DefaultProvider,
             &providers,
         );
         let active = active_profile.as_ref().and_then(|name| providers.get(name));
@@ -2743,20 +2950,38 @@ impl ResolvedConfig {
         // Provider config comes from the active profile (no env tier); the credential is loaded
         // from the DB in main.rs by `active_profile`. CLI `--model` / `--base-url` override the
         // profile's values for this run.
-        let provider_name = active.map(|profile| profile.backend.clone());
-
-        let model = cli
-            .model
-            .clone()
-            .or_else(|| active.and_then(|profile| profile.model.clone()));
-
-        let base_url = cli
-            .base_url
-            .clone()
-            .or_else(|| active.and_then(|profile| profile.base_url.clone()));
+        //
+        // Resolved through the same [`resolve_profile`] any other profile goes through, so the
+        // process default is not a second, subtly different derivation of the same twelve fields.
+        // The flat fields below are this profile's; a session naming a different one resolves it
+        // again by name.
+        let active_overrides = ProfileOverrides {
+            model: cli.model.clone(),
+            base_url: cli.base_url.clone(),
+            thinking: cli.thinking,
+        };
+        // The profile's `device_id` verbatim, never a freshly seeded one. Seeding writes
+        // `config.toml`, and the flat fields below are read only to answer "what would a brand-new
+        // session get"; the provider a session actually runs on is built by
+        // [`crate::provider::ProviderRegistry`], which is where the seed belongs and where it
+        // happens once.
+        let active_settings = active.map(|profile| {
+            resolve_profile(
+                profile,
+                &active_overrides,
+                file_session.context_window,
+                profile.device_id.clone().unwrap_or_default(),
+            )
+        });
+        let provider_name = active_settings
+            .as_ref()
+            .map(|settings| settings.backend.clone());
+        let model = active_settings
+            .as_ref()
+            .and_then(|settings| settings.model.clone());
 
         let file_permissions = config_file.permissions.unwrap_or_default();
-        let (permission, enabled_permissions) = resolve_permission(
+        let (permission, enabled_permissions, requested_permission) = resolve_permission(
             cli.permission,
             std::env::var("MEKA_PERMISSION").ok().as_deref(),
             file_permissions.default.as_deref(),
@@ -2767,19 +2992,6 @@ impl ResolvedConfig {
         // at: a `meka serve --permission read` must not run a gate a write-mode session authored.
         let schedule =
             ResolvedScheduleConfig::resolve(config_file.schedule, permission, enabled_permissions);
-
-        // Compute device_id before the struct literal so we can borrow `provider_name` and
-        // `active_profile` here without conflicting with the field moves below.
-        let device_id = device_id::resolve(
-            provider_name.as_deref(),
-            active_profile.as_deref(),
-            active.and_then(|profile| profile.device_id.as_deref()),
-        );
-        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
-        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
-        let redact_thinking = active
-            .and_then(|profile| profile.redact_thinking)
-            .unwrap_or(true);
 
         // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
         // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
@@ -2826,13 +3038,17 @@ impl ResolvedConfig {
             writable_roots: cli.writable_root.clone(),
             provider_name,
             active_profile,
+            configured_default_profile,
+            requested_permission,
+            requested_model: cli.model.clone(),
+            requested_base_url: cli.base_url.clone(),
+            requested_thinking: cli.thinking,
+            requested_profile: cli.provider.clone(),
+            providers,
             provider_error,
             config_error,
             instructions_error,
             model,
-            base_url,
-            client_id: active.and_then(|profile| profile.client_id.clone()),
-            oauth_token_url: active.and_then(|profile| profile.oauth_token_url.clone()),
             permission,
             enabled_permissions,
             streaming: !cli.no_stream,
@@ -2867,9 +3083,10 @@ impl ResolvedConfig {
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
             retention_days: file_session.retention_days,
-            thinking: cli
-                .thinking
-                .or_else(|| active.and_then(|profile| profile.thinking))
+            thinking: active_settings
+                .as_ref()
+                .map(|settings| settings.thinking)
+                .or(cli.thinking)
                 .unwrap_or_default(),
             thinking_budget_tokens: cli.thinking_budget.unwrap_or_else(|| {
                 file_thinking
@@ -2877,24 +3094,21 @@ impl ResolvedConfig {
                     .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
             }),
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
-            device_id,
-            // Pure passthrough for every backend: whatever the profile sets goes to the provider
-            // verbatim (the provider trims and lowercases it). Unset means the field is omitted
-            // and the provider applies its own default. An invalid value is the user's to own.
-            effort: active.and_then(|profile| profile.effort.clone()),
-            redact_thinking,
             auto_compact: file_session.auto_compact.unwrap_or(true),
             compact_checkpoint: file_session.compact_checkpoint.unwrap_or(true),
-            // Precedence: profile > `[session].context_window`. The call sites in `main.rs` apply
-            // `DEFAULT_CONTEXT_WINDOW` when both are unset.
-            context_window: active
-                .and_then(|profile| profile.context_window)
-                .or(file_session.context_window),
+            // Carried through unresolved; see the field. The profile > `[session]` precedence is
+            // applied once, per profile, in `resolve_profile`, and the call sites in `main.rs`
+            // apply `DEFAULT_CONTEXT_WINDOW` when both are unset.
+            session_context_window: file_session.context_window,
             subagent_max_depth: file_session
                 .subagent_max_depth
                 .unwrap_or(DEFAULT_SUBAGENT_MAX_DEPTH),
-            vision: active.and_then(|profile| profile.vision).unwrap_or(true),
-            max_output_tokens: active.and_then(|profile| profile.max_output_tokens),
+            vision: active_settings
+                .as_ref()
+                .is_none_or(|settings| settings.vision),
+            max_output_tokens: active_settings
+                .as_ref()
+                .and_then(|settings| settings.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
             user_instructions,
@@ -2962,9 +3176,7 @@ impl ResolvedConfig {
         if let Some(error) = &self.config_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
-        if let Some(error) = &self.provider_error {
-            return Err(crate::error::MekaError::Config(error.clone()));
-        }
+        self.validate_default_profile()?;
         if let Some(error) = &self.instructions_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
@@ -3036,6 +3248,35 @@ impl ResolvedConfig {
                 humantime_serde::re::humantime::format_duration(self.schedule.gate_timeout),
             )));
         }
+        Ok(())
+    }
+
+    /// Everything this run needs to be true of the **process default** profile: that one could be
+    /// picked at all, that its backend is one meka speaks, and that it names a model.
+    ///
+    /// Skipped entirely for a resume, because a resumed session answers all three from its own row
+    /// and never reads [`Self::active_profile`]. Each is re-asked against the profile that actually
+    /// applies, with a message naming it: `look_up_profile` for the first,
+    /// [`crate::provider::ProviderBuilder::build`]'s fallthrough for the second,
+    /// [`crate::provider::ProviderRegistry::build`] for the third.
+    ///
+    /// Firing these unconditionally did two bad things. A session whose profile was still
+    /// configured could not be resumed at all, though its row held the answer and
+    /// `meka session list` printed it. And a session whose profile *had* been deleted was refused
+    /// with whichever of these tripped first rather than with the specific "this session runs on
+    /// provider profile 'work', which is not configured" -- a generic message masking a precise
+    /// one, and only when two or more profiles happened to remain.
+    ///
+    /// Deferred, not dropped: a resume that finds no session, or a row with no recorded profile,
+    /// still needs a default, and `resolve_session_provider` carries
+    /// [`Self::provider_error`] into that path so the same guidance appears there.
+    fn validate_default_profile(&self) -> crate::error::Result<()> {
+        if self.session_resume.is_some() {
+            return Ok(());
+        }
+        if let Some(error) = &self.provider_error {
+            return Err(crate::error::MekaError::Config(error.clone()));
+        }
         match self.provider_name.as_deref() {
             None => {
                 return Err(crate::error::MekaError::Config(
@@ -3061,6 +3302,7 @@ impl ResolvedConfig {
             )));
         }
         validate_max_output_tokens(
+            self.active_profile.as_deref().unwrap_or("?"),
             self.provider_name.as_deref(),
             self.max_output_tokens,
             self.thinking,
@@ -3075,7 +3317,14 @@ impl ResolvedConfig {
 /// must exceed it. Surfaced as a config error with clear guidance rather than a provider 400
 /// mid-turn. The other two modes send no `budget_tokens` and have no such constraint, and neither
 /// do the OpenAI backends.
-fn validate_max_output_tokens(
+///
+/// Asked once per *profile*, never once per process: the values it reads are stated per profile, so
+/// a run that resumes a session onto one profile must not be refused over another's settings, and
+/// that session's own pairing must still be checked. [`ResolvedConfig::validate_default_profile`]
+/// asks it of the process default; [`crate::provider::ProviderRegistry::build`] asks it of
+/// whichever profile a session actually names.
+pub(crate) fn validate_max_output_tokens(
+    profile: &str,
     provider_name: Option<&str>,
     max_output_tokens: Option<u64>,
     thinking: crate::provider::ThinkingMode,
@@ -3092,10 +3341,10 @@ fn validate_max_output_tokens(
     let budgeted = matches!(thinking, crate::provider::ThinkingMode::Budgeted);
     if speaks_messages && budgeted && max_output <= thinking_budget_tokens {
         return Err(crate::error::MekaError::Config(format!(
-            "max_output_tokens ({}) must exceed the thinking budget ({}) for an Anthropic Messages \
-             profile with thinking = \"budgeted\"; raise max_output_tokens or lower \
-             [thinking].budget_tokens.",
-            max_output, thinking_budget_tokens,
+            "profile '{}': max_output_tokens ({}) must exceed the thinking budget ({}) for an \
+             Anthropic Messages profile with thinking = \"budgeted\"; raise max_output_tokens or \
+             lower [thinking].budget_tokens.",
+            profile, max_output, thinking_budget_tokens,
         )));
     }
     Ok(())
@@ -3180,9 +3429,9 @@ mod device_id {
     }
 
     pub(super) fn persist(path: &Path, profile: &str, id: &str) -> std::io::Result<()> {
-        // This is the writer that made the race ordinary rather than theoretical: it runs from
-        // `ResolvedConfig::from_cli` on every start for a `claude-subscription` profile without a
-        // device id, so a plain `meka` launch competes with whatever `meka mcp add` is
+        // This is the writer that made the race ordinary rather than theoretical: it runs the first
+        // time `ProviderRegistry::device_id_for` resolves a `claude-subscription` profile that
+        // states no device id, so a plain `meka` launch competes with whatever `meka mcp add` is
         // doing in the next terminal.
         let _lock = super::lock_config_file()?;
         let contents = std::fs::read_to_string(path).unwrap_or_default();
@@ -3822,13 +4071,96 @@ type = "claude-subscription"
             .collect()
     }
 
+    /// An override beats the profile, and an absent one leaves the profile's value alone.
+    ///
+    /// Both directions matter: `--model` has to reach the request, and a profile that states a
+    /// model must not be blanked by the flag being unset.
+    #[test]
+    fn an_override_wins_and_absence_keeps_the_profile_value() {
+        let profile = ProviderProfile {
+            backend: "anthropic-messages".to_string(),
+            model: Some("from-profile".to_string()),
+            base_url: Some("https://profile.example".to_string()),
+            ..Default::default()
+        };
+
+        let overridden = resolve_profile(
+            &profile,
+            &ProfileOverrides {
+                model: Some("from-flag".to_string()),
+                ..Default::default()
+            },
+            None,
+            String::new(),
+        );
+        assert_eq!(overridden.model.as_deref(), Some("from-flag"));
+        assert_eq!(
+            overridden.base_url.as_deref(),
+            Some("https://profile.example"),
+            "an unset override leaves the profile's own value"
+        );
+
+        let untouched =
+            resolve_profile(&profile, &ProfileOverrides::default(), None, String::new());
+        assert_eq!(untouched.model.as_deref(), Some("from-profile"));
+    }
+
+    /// The two fields that default *on*, and the one that falls back to `[session]`.
+    ///
+    /// A profile saying nothing must resolve the way a profile-less run did, or switching a session
+    /// onto a bare profile would silently turn images or redacted thinking off.
+    #[test]
+    fn an_unstated_profile_resolves_to_the_documented_defaults() {
+        let bare = ProviderProfile {
+            backend: "openai-chat-completions".to_string(),
+            ..Default::default()
+        };
+        let settings = resolve_profile(
+            &bare,
+            &ProfileOverrides::default(),
+            Some(200_000),
+            String::new(),
+        );
+
+        assert!(settings.vision, "vision defaults on");
+        assert!(settings.redact_thinking, "redact_thinking defaults on");
+        assert_eq!(
+            settings.context_window,
+            Some(200_000),
+            "falls back to `[session].context_window`"
+        );
+        assert_eq!(settings.effort, None, "no effort means the provider's own");
+    }
+
+    /// A profile's own window beats `[session].context_window`, which is the whole reason a
+    /// per-profile value exists: one small model among several must not drag the rest down.
+    #[test]
+    fn a_profiles_context_window_beats_the_session_default() {
+        let profile = ProviderProfile {
+            backend: "anthropic-messages".to_string(),
+            context_window: Some(32_000),
+            ..Default::default()
+        };
+        let settings = resolve_profile(
+            &profile,
+            &ProfileOverrides::default(),
+            Some(1_000_000),
+            String::new(),
+        );
+        assert_eq!(settings.context_window, Some(32_000));
+    }
+
     #[test]
     fn test_select_active_profile_explicit_request_wins() {
         let providers = profiles_from(&[
             ("work", "claude-subscription"),
             ("personal", "openai-chat-completions"),
         ]);
-        let (active, error) = select_active_profile(Some("personal".to_string()), &providers);
+        let (active, error) = select_active_profile(
+            Some("personal".to_string()),
+            ProfileRequest::Flag,
+            &providers,
+        );
         assert_eq!(active.as_deref(), Some("personal"));
         assert!(error.is_none());
     }
@@ -3836,7 +4168,8 @@ type = "claude-subscription"
     #[test]
     fn test_select_active_profile_sole_profile_when_no_request() {
         let providers = profiles_from(&[("only", "anthropic-messages")]);
-        let (active, error) = select_active_profile(None, &providers);
+        let (active, error) =
+            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
         assert_eq!(active.as_deref(), Some("only"));
         assert!(error.is_none());
     }
@@ -3844,7 +4177,8 @@ type = "claude-subscription"
     #[test]
     fn test_select_active_profile_zero_profiles_errors() {
         let providers = profiles_from(&[]);
-        let (active, error) = select_active_profile(None, &providers);
+        let (active, error) =
+            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
         assert!(active.is_none());
         assert!(error.expect("error expected").contains("provider add"));
     }
@@ -3855,7 +4189,8 @@ type = "claude-subscription"
             ("work", "claude-subscription"),
             ("personal", "openai-chat-completions"),
         ]);
-        let (active, error) = select_active_profile(None, &providers);
+        let (active, error) =
+            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
         assert!(active.is_none());
         let error = error.expect("error expected");
         assert!(error.contains("multiple provider profiles"));
@@ -3866,7 +4201,11 @@ type = "claude-subscription"
     #[test]
     fn test_select_active_profile_unknown_name_errors() {
         let providers = profiles_from(&[("work", "claude-subscription")]);
-        let (active, error) = select_active_profile(Some("missing".to_string()), &providers);
+        let (active, error) = select_active_profile(
+            Some("missing".to_string()),
+            ProfileRequest::Flag,
+            &providers,
+        );
         assert!(active.is_none());
         assert!(
             error
@@ -4115,6 +4454,7 @@ max_output_tokens = 64000
         // rejected mid-turn, which is exactly what this check exists to pre-empt.
         for backend in ["claude-subscription", "anthropic-messages"] {
             let result = validate_max_output_tokens(
+                "work",
                 Some(backend),
                 Some(5_000),
                 ThinkingMode::Budgeted,
@@ -4128,6 +4468,7 @@ max_output_tokens = 64000
         }
         assert!(
             validate_max_output_tokens(
+                "work",
                 Some("claude-subscription"),
                 Some(20_000),
                 ThinkingMode::Budgeted,
@@ -4141,14 +4482,21 @@ max_output_tokens = 64000
         // no longer inferred, it is stated.
         for mode in [ThinkingMode::Adaptive, ThinkingMode::Off] {
             assert!(
-                validate_max_output_tokens(Some("claude-subscription"), Some(5_000), mode, 10_000)
-                    .is_ok(),
+                validate_max_output_tokens(
+                    "work",
+                    Some("claude-subscription"),
+                    Some(5_000),
+                    mode,
+                    10_000
+                )
+                .is_ok(),
                 "{mode:?}"
             );
         }
         // Non-Claude backends have no such constraint either, whatever the mode.
         assert!(
             validate_max_output_tokens(
+                "work",
                 Some("openai-chat-completions"),
                 Some(100),
                 ThinkingMode::Budgeted,
@@ -4159,6 +4507,7 @@ max_output_tokens = 64000
         // No override at all.
         assert!(
             validate_max_output_tokens(
+                "work",
                 Some("anthropic-messages"),
                 None,
                 ThinkingMode::Budgeted,
@@ -5235,6 +5584,90 @@ read_file = "ask"
         );
     }
 
+    /// The active profile's window must not become every other profile's fallback.
+    ///
+    /// `session_context_window` is the seed `ProviderRegistry` hands `resolve_profile` for *each*
+    /// profile, so folding the active profile into it here applies that profile twice: a profile
+    /// stating no window inherited the default profile's, which is the exact defect per-profile
+    /// windows exist to prevent. Live-reproducible before the fix as `GET
+    /// /v1/sessions/{id}/context` reporting the default profile's number for a session on another
+    /// profile.
+    ///
+    /// Touches process env, so it serializes against any other env-var test in this file via
+    /// [`CONFIG_DIR_ENV_LOCK`].
+    #[test]
+    fn the_session_window_seed_is_not_the_active_profiles_window() {
+        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
+        use clap::Parser;
+
+        let resolve_with = |config: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("config.toml"), config).expect("write config.toml");
+            // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with any other env-var test.
+            unsafe {
+                std::env::set_var("MEKA_CONFIG_DIR", dir.path());
+            }
+            let resolved = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
+            // SAFETY: same as above; the guard is held for the full set→read→clear cycle.
+            unsafe {
+                std::env::remove_var("MEKA_CONFIG_DIR");
+            }
+            resolved
+        };
+
+        let profile_only = resolve_with(
+            r#"
+default_provider = "big"
+
+[providers.big]
+type = "anthropic-messages"
+model = "big-model"
+context_window = 999000
+
+[providers.small]
+type = "anthropic-messages"
+model = "small-model"
+"#,
+        );
+        assert_eq!(
+            profile_only.session_context_window, None,
+            "a profile's own window is not a `[session]` default for the other profiles"
+        );
+        assert_eq!(
+            profile_only
+                .providers
+                .get("small")
+                .map(|profile| resolve_profile(
+                    profile,
+                    &ProfileOverrides::default(),
+                    profile_only.session_context_window,
+                    String::new(),
+                ))
+                .and_then(|settings| settings.context_window),
+            None,
+            "a profile stating no window resolves to none, so the documented default applies"
+        );
+
+        let with_session_block = resolve_with(
+            r#"
+default_provider = "big"
+
+[session]
+context_window = 200000
+
+[providers.big]
+type = "anthropic-messages"
+model = "big-model"
+context_window = 999000
+"#,
+        );
+        assert_eq!(
+            with_session_block.session_context_window,
+            Some(200_000),
+            "`[session].context_window` is still carried through for profiles that state none"
+        );
+    }
+
     /// Touches process env, so it serializes against any other env-var test in this file via
     /// [`CONFIG_DIR_ENV_LOCK`].
     #[test]
@@ -5686,7 +6119,7 @@ thinking = "budgeted"
 
     #[test]
     fn test_resolve_permission_no_config() {
-        let (perm, enabled) = resolve_permission(None, None, None, None);
+        let (perm, enabled, _requested) = resolve_permission(None, None, None, None);
         assert_eq!(perm, Permission::Read);
         assert_eq!(enabled, EnabledPermissions::DEFAULT);
     }
@@ -5694,7 +6127,7 @@ thinking = "budgeted"
     #[test]
     fn test_resolve_permission_explicit_enabled_all() {
         let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
-        let (_perm, enabled) = resolve_permission(None, None, None, Some(&list));
+        let (_perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
         assert!(enabled.is_enabled(Permission::Ask));
         assert_eq!(enabled.iter().count(), 5);
     }
@@ -5702,7 +6135,7 @@ thinking = "budgeted"
     #[test]
     fn test_resolve_permission_invalid_entry_warns_and_drops() {
         let list = enabled_strings(&["read", "lol", "unrestricted"]);
-        let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
+        let (perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
         assert_eq!(
             enabled,
             enabled_set(&[Permission::Read, Permission::Unrestricted])
@@ -5719,7 +6152,7 @@ thinking = "budgeted"
     #[test]
     fn an_enabled_list_that_yields_nothing_falls_back_to_read_alone() {
         for list in [enabled_strings(&[]), enabled_strings(&["write"])] {
-            let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
+            let (perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
             assert_eq!(enabled, enabled_set(&[Permission::Read]), "for {list:?}");
             assert!(
                 !enabled.is_enabled(Permission::Unrestricted),
@@ -5732,7 +6165,7 @@ thinking = "budgeted"
     #[test]
     fn test_resolve_permission_default_not_in_enabled_clamps() {
         let list = enabled_strings(&["read", "write"]);
-        let (perm, _enabled) = resolve_permission(None, None, Some("ask"), Some(&list));
+        let (perm, _enabled, _requested) = resolve_permission(None, None, Some("ask"), Some(&list));
         // `ask` is filtered out → fall back to Read because it's enabled.
         assert_eq!(perm, Permission::Read);
     }
@@ -5740,20 +6173,22 @@ thinking = "budgeted"
     #[test]
     fn test_resolve_permission_default_not_in_enabled_no_read_falls_to_lowest() {
         let list = enabled_strings(&["ask", "write"]);
-        let (perm, _enabled) = resolve_permission(None, None, Some("none"), Some(&list));
+        let (perm, _enabled, _requested) =
+            resolve_permission(None, None, Some("none"), Some(&list));
         // none isn't enabled, Read isn't either → lowest enabled is Ask.
         assert_eq!(perm, Permission::Ask);
     }
 
     #[test]
     fn test_resolve_permission_invalid_default_falls_back() {
-        let (perm, _enabled) = resolve_permission(None, None, Some("weird"), None);
+        let (perm, _enabled, _requested) = resolve_permission(None, None, Some("weird"), None);
         assert_eq!(perm, Permission::Read);
     }
 
     #[test]
     fn test_resolve_permission_explicit_default_used() {
-        let (perm, _enabled) = resolve_permission(None, None, Some("unrestricted"), None);
+        let (perm, _enabled, _requested) =
+            resolve_permission(None, None, Some("unrestricted"), None);
         assert_eq!(perm, Permission::Unrestricted);
     }
 
@@ -5761,27 +6196,30 @@ thinking = "budgeted"
     fn test_resolve_permission_cli_override_disabled_clamps_to_default() {
         // `ask` not enabled → CLI request for ask warns and clamps to the configured default
         // (Read).
-        let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, None);
+        let (perm, _enabled, _requested) =
+            resolve_permission(Some(Permission::Ask), None, None, None);
         assert_eq!(perm, Permission::Read);
     }
 
     #[test]
     fn test_resolve_permission_cli_override_enabled_wins() {
         let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
-        let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, Some(&list));
+        let (perm, _enabled, _requested) =
+            resolve_permission(Some(Permission::Ask), None, None, Some(&list));
         assert_eq!(perm, Permission::Ask);
     }
 
     #[test]
     fn test_resolve_permission_env_override_used() {
-        let (perm, _enabled) = resolve_permission(None, Some("unrestricted"), None, None);
+        let (perm, _enabled, _requested) =
+            resolve_permission(None, Some("unrestricted"), None, None);
         assert_eq!(perm, Permission::Unrestricted);
     }
 
     #[test]
     fn test_resolve_permission_env_override_disabled_clamps() {
         // env asks for ask, but ask isn't in DEFAULT enabled set.
-        let (perm, _enabled) = resolve_permission(None, Some("ask"), None, None);
+        let (perm, _enabled, _requested) = resolve_permission(None, Some("ask"), None, None);
         assert_eq!(perm, Permission::Read);
     }
 
@@ -5790,7 +6228,7 @@ thinking = "budgeted"
     /// by default rather than by rule, and reversing the precedence leaves the test green.
     #[test]
     fn test_resolve_permission_cli_beats_env() {
-        let (perm, _enabled) =
+        let (perm, _enabled, _requested) =
             resolve_permission(Some(Permission::None), Some("unrestricted"), None, None);
         assert_eq!(perm, Permission::None);
     }

@@ -843,7 +843,13 @@ impl MemoryStore {
         connection
             .call(|connection| -> std::result::Result<_, MekaError> {
                 let plan = crate::session::migrations::plan(connection)?;
-                crate::session::migrations::apply(connection, plan)?;
+                // Nothing to carry forward: this store is created empty by this very call, so the
+                // step that gives existing sessions a provider has no rows to give one to.
+                crate::session::migrations::apply(
+                    connection,
+                    plan,
+                    &crate::session::migrations::Context::default(),
+                )?;
                 reconcile_index(connection).map_err(|error| {
                     MekaError::Database(format!("failed to reconcile the memory index: {error}"))
                 })

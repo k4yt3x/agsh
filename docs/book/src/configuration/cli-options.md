@@ -103,6 +103,11 @@ meka --permission ask
 
 Default: `read`.
 
+Recorded on the session, so a resume comes back at the level the session was last at rather than at
+the default. Passing `--permission` alongside `-c` / `-r` repins it, the way `--provider` does. A
+level that is no longer in `[permissions].enabled` is not granted on resume: the session drops to
+the configured default with a warning.
+
 ### `--writable-root <PATH>`
 
 Add a directory to the workspace, so writes may land there at `workspace` permission. Repeatable.
@@ -140,8 +145,9 @@ single-root by design.
 
 ### `-p`, `--provider <NAME>`
 
-Select which configured provider profile to use for this run. Takes the name of a profile from
-`[providers.<name>]`, overriding `default_provider` in the config file.
+Select which configured provider profile a session runs on. Takes the name of a profile from
+`[providers.<name>]`, overriding `default_provider` in the config file. The choice outlives the run:
+on a new session it is what gets recorded, and on a resume it rewrites the row.
 
 ```bash
 meka -p work
@@ -150,17 +156,29 @@ meka --provider work
 
 The value is a profile name (e.g. `work`, `personal`), not a backend type. List configured profiles with `meka provider list`.
 
+A new session records the profile it runs on, so `meka -c` later comes back on it rather than on
+`default_provider`. Passing `--provider` alongside `-c` / `-r` **repins** the session: the row is
+rewritten and it keeps that profile from then on. See
+[what a resume restores](../usage/sessions.md#what-a-resume-restores).
+
 ### `-m`, `--model <MODEL>`
 
-Override the active profile's model for this run.
+Override the active profile's model.
 
 ```bash
 meka -m gpt-5.6-sol
 ```
 
+Recorded on the session like `--provider`, so a resume keeps it. A session that was never given one
+follows whatever its profile says, which means editing the profile in `config.toml` moves it.
+
+The three flags are one statement together: a resume that names any of them states the session's
+whole binding, so `meka -c --provider work` clears a model override that belonged to the previous
+profile, and `meka -c --model gpt-5.6-sol` keeps the profile and replaces the model.
+
 ### `--base-url <URL>`
 
-Override the active profile's API base URL for this run.
+Override the active profile's API base URL. Recorded on the session in the same way as `--model`.
 
 ```bash
 meka --base-url http://localhost:11434/v1

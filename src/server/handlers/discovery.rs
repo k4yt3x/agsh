@@ -78,7 +78,12 @@ pub async fn ready(State(state): State<ServerState>) -> impl IntoResponse {
         .session_exists(uuid::Uuid::nil())
         .await
         .is_ok();
-    let provider_configured = state.shared.config.provider_name.is_some();
+    // Reads the configured profiles, which is what `provider_configured` is documented to report: a
+    // profile exists in `config.toml`. Reading the *default* profile's backend answered a different
+    // question that happens to coincide -- `build_shared_deps` refuses to start a host with no
+    // resolvable default, so neither expression can be false here -- and a host whose sessions each
+    // name their own profile is not one the default speaks for.
+    let provider_configured = !state.shared.config.providers.is_empty();
 
     let mcp_healthy = match state.shared.mcp_manager.as_ref() {
         Some(manager) => !any_required_server_failed(&manager.enabled_not_connected().await),

@@ -14,7 +14,10 @@
 //! prompt is the cached prefix, so a large instruction set is billed once and re-read from cache on
 //! every later turn. Re-reading it per turn would either invalidate that prefix whenever the file
 //! changed or push the text into the conversation, where it would compete with actual context. The
-//! cost is that edits take effect on the next run.
+//! cost is that edits take effect on the next run -- which for `meka serve` and `meka acp` means
+//! the next *restart*, since one process serves every session. Documented for users at
+//! `docs/book/src/configuration/overview.md` § "When edits take effect", beside the same caveat
+//! about `config.toml`.
 
 use std::path::{Path, PathBuf};
 

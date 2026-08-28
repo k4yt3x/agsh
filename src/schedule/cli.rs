@@ -402,10 +402,16 @@ mod tests {
     /// deleting the filter left all 2452 tests green.
     #[tokio::test]
     async fn a_level_the_enabled_set_excludes_is_not_treated_as_the_session_level() {
-        let manager = crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("open in-memory database");
+        let session = manager
+            .create_session(None, "test-profile".to_string())
             .await
-            .expect("open in-memory database");
-        let session = manager.create_session(None).await.expect("create session");
+            .expect("create session");
         manager
             .update_session_permission(session, "unrestricted")
             .await

@@ -28,6 +28,30 @@ use crate::{
     workspace::SharedCwd,
 };
 
+/// How a failed [`crate::build_session_agent`] reaches the caller.
+///
+/// A configuration problem is the caller's to fix, not a server fault, and its message is meka's
+/// own rather than an upstream provider's, so it goes back verbatim. The two cases are a session
+/// pinned to a profile that has since left `config.toml`, and a profile that is configured but has
+/// no stored credential; both refusals name the profile and what to do about it, and sanitising
+/// them to "internal server error; consult server logs" left the one actionable sentence in a file
+/// the caller cannot read.
+///
+/// Shared by re-attach and by session creation because they were not shared before, and creation
+/// was the half that got the 500 -- which is also the half a fresh `meka serve` hits first, since a
+/// profile's credential is now checked when a session first asks for it rather than at startup.
+pub(crate) fn agent_build_problem(id: Uuid, context: &str, error: anyhow::Error) -> ProblemDetail {
+    match error.downcast_ref::<crate::error::MekaError>() {
+        Some(crate::error::MekaError::Config(message)) => ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            message.clone(),
+        )
+        .with("session_id", id.to_string()),
+        _ => ProblemDetail::internal_sanitized(context, error).with("session_id", id.to_string()),
+    }
+}
+
 /// Assert a session exists, without building anything.
 ///
 /// The counterpart to [`ensure_session_loaded`] for read-only handlers. Reconstruction builds an
@@ -70,7 +94,11 @@ static RECONSTRUCTION_LOCKS: std::sync::LazyLock<
 /// Acquire the reconstruction lock for `id`, creating it on first use. Entries whose only remaining
 /// owner is the map are dropped on the way past, so it stays bounded by concurrent reconstructions
 /// rather than by every session the process has ever loaded.
-async fn lock_session_reconstruction(id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+///
+/// Also taken by the dormant-repin path in `handlers::sessions`, which decides what to write on the
+/// strength of the session *not* being resident and must not have that stop being true while it
+/// writes.
+pub(crate) async fn lock_session_reconstruction(id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
     let lock = {
         let mut registry = match RECONSTRUCTION_LOCKS.lock() {
             Ok(guard) => guard,
@@ -244,6 +272,7 @@ pub async fn ensure_session_loaded(
     let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (agent, tool_registry) = crate::build_session_agent(
         &state.shared,
+        Some(id),
         shared_permission.clone(),
         frontend_dyn,
         cwd.clone(),
@@ -251,14 +280,18 @@ pub async fn ensure_session_loaded(
         Arc::new(std::sync::RwLock::new(Vec::new())),
         Arc::clone(&context_used),
         Arc::clone(&context_overhead),
+        // Nothing here holds a window gauge built before the agent, the way the REPL prompt and
+        // ACP's frontend do, so this handle is supplied only to be adopted; the entry reads it
+        // back through `published_binding` below.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await
-    .map_err(|error| {
-        ProblemDetail::internal_sanitized("failed to rebuild session agent", error)
-            .with("session_id", id.to_string())
-    })?;
+    .map_err(|error| agent_build_problem(id, "failed to rebuild session agent", error))?;
 
     let background_tasks = agent.background_tasks();
+    // Out of the assembled agent, which resolved it from the row: an evicted session comes back on
+    // exactly the profile it recorded, admitting exactly the attachments that profile can read.
+    let binding = agent.published_binding();
     let runtime = SessionRuntime {
         session_uuid: id,
         messages: conversation,
@@ -281,6 +314,7 @@ pub async fn ensure_session_loaded(
         token_id: summary.token_id.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         permission: shared_permission,
+        binding,
         cwd,
         background_tasks,
         tool_registry,
@@ -405,5 +439,38 @@ mod tests {
             held <= 2,
             "released reconstruction locks are never swept; the map grows per session id: {held}"
         );
+    }
+
+    /// A configuration refusal is the caller's to fix and its message is meka's own, so it goes
+    /// back verbatim with a 422. Creation used to sanitise it to a 500, which is where a fresh
+    /// `meka serve` lands first: the profile is configured but has no credential, and the one
+    /// sentence saying so went to a log file the caller cannot read.
+    #[test]
+    fn a_configuration_refusal_reaches_the_caller_instead_of_becoming_a_500() {
+        let id = Uuid::new_v4();
+        let problem = agent_build_problem(
+            id,
+            "failed to build session agent",
+            anyhow::Error::new(crate::error::MekaError::Config(
+                "provider profile 'work' has no stored credential".to_string(),
+            )),
+        );
+        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let detail = problem.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("no stored credential"),
+            "the actionable sentence must survive: {detail}"
+        );
+
+        // Anything else is a server fault and stays sanitised, so an upstream provider's message
+        // cannot reach a client through this door.
+        let opaque = agent_build_problem(
+            id,
+            "failed to build session agent",
+            anyhow::anyhow!("upstream said something with a token in it"),
+        );
+        assert_eq!(opaque.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let sanitised = opaque.detail.clone().unwrap_or_default();
+        assert!(!sanitised.contains("token in it"), "{sanitised}");
     }
 }

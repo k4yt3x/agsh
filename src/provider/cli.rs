@@ -32,7 +32,13 @@ const CODEX_SCOPES: &str =
 const CODEX_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Dispatch a `meka provider` subcommand.
-pub async fn run(action: &ProviderAction, token_store: &TokenStore) -> anyhow::Result<()> {
+pub async fn run(
+    action: &ProviderAction,
+    // Taken whole rather than as a bare `TokenStore` because `remove` has to say how many sessions
+    // it is about to strand, and only the session table can answer that.
+    session_manager: &crate::session::SessionManager,
+) -> anyhow::Result<()> {
+    let token_store = &session_manager.token_store();
     match action {
         ProviderAction::Add {
             name,
@@ -61,8 +67,11 @@ pub async fn run(action: &ProviderAction, token_store: &TokenStore) -> anyhow::R
         }
         ProviderAction::List => run_list(token_store).await,
         ProviderAction::Use { name } => run_use(name),
-        ProviderAction::Remove { name } => run_remove(name, token_store).await,
-        ProviderAction::Login { name } => run_login(name, token_store).await,
+        ProviderAction::Remove { name } => run_remove(name, token_store, session_manager).await,
+        ProviderAction::Login {
+            name,
+            api_key_stdin,
+        } => run_login(name, *api_key_stdin, token_store).await,
     }
 }
 
@@ -87,6 +96,45 @@ async fn run_add(
 ) -> anyhow::Result<()> {
     if name.trim().is_empty() {
         anyhow::bail!("profile name cannot be empty");
+    }
+    // Every prompt below reads the same stdin the key is piped on, so one that fires under
+    // `--api-key-stdin` eats the secret and then fails with "API key cannot be empty", naming the
+    // wrong field entirely; with two lines piped, line one would be written to `config.toml` as a
+    // `base_url`. `resolve_tuning` already suppressed the advanced prompt for this reason; the
+    // three above it -- backend, model and base URL -- did not. The two required ones are refused
+    // up front rather than prompted into a pipe, and the optional base URL takes the backend
+    // default.
+    if api_key_stdin {
+        // `--type` first and alone, because neither check below can be asked without knowing the
+        // backend.
+        let Some(backend) = type_flag else {
+            anyhow::bail!(
+                "`--api-key-stdin` reads the key from stdin, so it cannot prompt for --type. Pass \
+                 it as a flag."
+            );
+        };
+        let backend = validate_backend(backend)?;
+        // Ahead of the missing-`--model` check so a subscription profile hears the real objection
+        // rather than being asked for a flag that would not have saved it. The same refusal
+        // `meka provider login` makes: `acquire_credential` ignores this flag for a backend that
+        // opens a browser, so a script piping a key would hang on a flow it cannot see while the
+        // key it piped went unread.
+        if !matches!(credential_kind(backend), Some(CredentialKind::ApiKey)) {
+            anyhow::bail!(
+                "'{}' authenticates through the browser and has no API key to read from stdin. \
+                 Run `meka provider add {} --type {}` without `--api-key-stdin`.",
+                backend,
+                name,
+                backend
+            );
+        }
+        if model_flag.is_none() {
+            anyhow::bail!(
+                "`--api-key-stdin` reads the key from stdin, so it cannot prompt for --model. \
+                 Pass it as a flag. `--base-url` is optional; omitting it accepts the backend \
+                 default."
+            );
+        }
     }
     // Hard-fails on an unparseable config rather than warning: this guard is the only thing
     // standing between `provider add <existing>` and `upsert_profile_document` replacing the
@@ -127,6 +175,10 @@ async fn run_add(
 
     let base_url = match base_url_flag {
         Some(url) => Some(url),
+        // Under `--api-key-stdin` the guard above has already established that the two required
+        // flags were given; this one is optional, so an absent value takes the backend default
+        // rather than prompting into the pipe the key is on.
+        None if api_key_stdin => None,
         None => {
             // Shows the endpoint an empty answer accepts, matching the model prompt above. Unlike
             // the model, an empty answer writes nothing: pinning the default into the profile would
@@ -157,16 +209,26 @@ async fn run_add(
     // interactive prompts above (which read stdin) before this ensures nothing reads stdin after.
     let credential = acquire_credential(&backend, api_key_stdin, None).await?;
 
+    // The profile before the secret, so the half that lands first is the visible half. A config
+    // write can fail for ordinary reasons -- a read-only directory, a full disk -- and doing it
+    // second left a credential in the database that no profile named: `provider list` reports it as
+    // an orphan, but only if the user thinks to look. This way round, the failure leaves a profile
+    // with no credential, which the next run refuses by name and tells you to `meka provider
+    // login`.
+    write_profile(name, &backend, model.as_str(), base_url.as_deref(), &tuning)?;
     token_store
         .save_provider_credential(name, &credential)
         .await?;
-    write_profile(name, &backend, model.as_str(), base_url.as_deref(), &tuning)?;
 
     tracing::info!("added provider profile '{}'", name);
     Ok(())
 }
 
-async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
+async fn run_login(
+    name: &str,
+    api_key_stdin: bool,
+    token_store: &TokenStore,
+) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
     let Some(profile) = config_file.providers.get(name) else {
         anyhow::bail!(
@@ -175,8 +237,34 @@ async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
             name
         );
     };
-    let credential =
-        acquire_credential(&profile.backend, false, profile.client_id.as_deref()).await?;
+    // Before the guard below, which asks `credential_kind` a question it answers `None` to for a
+    // backend it does not recognise. Without this, a typo'd `type` was diagnosed as a browser login
+    // and the user was sent to run the command again without the flag, only to meet the real error
+    // then. `run_add` has always validated first; this is the same order.
+    validate_backend(&profile.backend)?;
+    // `acquire_credential` ignores the flag for a backend that logs in through the browser, and a
+    // script piping a key to one would hang on an OAuth flow it cannot see. The profile names its
+    // backend, so this is answerable before anything opens.
+    if api_key_stdin
+        && !matches!(
+            credential_kind(&profile.backend),
+            Some(CredentialKind::ApiKey)
+        )
+    {
+        anyhow::bail!(
+            "profile '{}' is a '{}' profile, which authenticates through the browser and has no \
+             API key to read from stdin. Run `meka provider login {}` without `--api-key-stdin`.",
+            name,
+            profile.backend,
+            name
+        );
+    }
+    let credential = acquire_credential(
+        &profile.backend,
+        api_key_stdin,
+        profile.client_id.as_deref(),
+    )
+    .await?;
     token_store
         .save_provider_credential(name, &credential)
         .await?;
@@ -184,7 +272,11 @@ async fn run_login(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
+async fn run_remove(
+    name: &str,
+    token_store: &TokenStore,
+    session_manager: &crate::session::SessionManager,
+) -> anyhow::Result<()> {
     // Deliberately does not require a configured profile: this is the only path that deletes a
     // credential, so it has to work on one whose `[providers.<name>]` block was deleted by hand.
     // Both sides are read before either is touched so the confirmation can say which of them
@@ -192,7 +284,15 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // nothing. `open_document` rather than the parsed config on purpose: `remove` must still run on
     // a config.toml that meka can't deserialize, since it is one of the ways such a file gets
     // repaired.
-    let has_credential = token_store.load_provider_credential(name).await?.is_some();
+    //
+    // Asks whether the row is *there*, not whether it parses. `load_provider_credential` fails on a
+    // credential it cannot deserialize, which stopped the command before the delete -- so the one
+    // surface that removes a corrupt row refused to, on the grounds that it was corrupt.
+    let has_credential = token_store
+        .list_credential_profiles()
+        .await?
+        .iter()
+        .any(|profile| profile == name);
 
     // Probed under its own short-lived guard, and the guard dropped before the `await` below.
     //
@@ -204,10 +304,9 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // no CLI invocation can lose anything to; one long one costs correctness.
     let has_profile = {
         let (_lock, _path, document) = open_document()?;
-        document
-            .get("providers")
-            .and_then(|item| item.as_table())
-            .is_some_and(|providers| providers.contains_key(name))
+        profile_names(&document)
+            .iter()
+            .any(|profile| profile == name)
     };
 
     if !has_profile && !has_credential {
@@ -224,10 +323,49 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     let (_lock, path, mut document) = open_document()?;
     // Written even with no profile to remove: `default_provider` can still point at the name, and
     // dropping that dangling pointer is exactly the cleanup this case is for.
-    remove_profile_document(&mut document, name);
+    let was_default = document
+        .get("default_provider")
+        .and_then(|item| item.as_str())
+        == Some(name);
+    let removed_profile = remove_profile_document(&mut document, name);
     config::write_file_atomic(&path, &document.to_string())?;
 
-    if has_profile {
+    // Losing the default is not a detail: with two or more profiles left, nothing picks one, and
+    // the next `meka` with no `--provider` stops with an error about a setting the user did not
+    // knowingly change. Said at `warn!` rather than `info!` because it needs a follow-up action
+    // and is visible at the default verbosity.
+    if was_default {
+        let remaining = profile_names(&document);
+        if remaining.len() > 1 {
+            tracing::warn!(
+                "'{}' was the default provider, so `default_provider` is now unset and no profile \
+                 is picked for a new session. Run `meka provider use <name>` to choose one of: {}",
+                name,
+                remaining.join(", ")
+            );
+        }
+    }
+
+    // Sessions pinned to the profile are what makes a removal consequential, and they are silent
+    // otherwise: the refusal arrives whenever the user next resumes one, which may be days later
+    // and in another directory. The store is already open, so this costs one count.
+    match session_manager.count_sessions_on_provider(name).await {
+        Ok(0) => {}
+        Ok(pinned) => tracing::warn!(
+            "{} session(s) run on '{}' and will refuse to resume until it is configured again. \
+             Move one with `meka -r <id> --provider <name>`",
+            pinned,
+            name
+        ),
+        // Not worth failing the removal over: the profile and its credential are already gone, and
+        // this is advisory.
+        Err(error) => tracing::debug!("could not count sessions on '{}': {}", name, error),
+    }
+
+    // What the write actually did, not what a probe predicted: the two disagreed whenever
+    // `providers` was spelled in a way `as_table` could not see, and the message that came out was
+    // the opposite of the truth.
+    if removed_profile {
         tracing::info!("removed provider profile '{}'", name);
     } else {
         tracing::info!(
@@ -266,9 +404,21 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
     let default = config_file.default_provider.as_deref();
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(config_file.providers.len());
     for (name, profile) in &config_file.providers {
+        // The error arm is its own answer, not a "no". `load_provider_credential` fails on a row it
+        // cannot deserialize, and reporting that as "never logged in" sends the user to
+        // `meka provider login`, which writes a new credential over a row they were never told was
+        // corrupt.
         let authed = match token_store.load_provider_credential(name).await {
             Ok(Some(_)) => "yes",
-            _ => "no",
+            Ok(None) => "no",
+            Err(error) => {
+                tracing::warn!(
+                    "could not read the stored credential for '{}': {}",
+                    name,
+                    error
+                );
+                "unreadable"
+            }
         };
         let default_marker = if Some(name.as_str()) == default {
             "*"
@@ -291,6 +441,18 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
             &rows
         )
     );
+    // A `default_provider` naming nothing renders as a table with no `*`, which is exactly what "no
+    // default set" looks like, and the next `meka` run then fails on a setting the user believes is
+    // fine. This listing is where they come to check, so it is where the discrepancy belongs.
+    if let Some(default) = default
+        && !config_file.providers.contains_key(default)
+    {
+        eprintln!(
+            "`default_provider` names '{}', which is not configured. Run `meka provider use \
+             <name>` to point it at one of the profiles above.",
+            crate::render::sanitize_for_display(default)
+        );
+    }
     report_orphaned_profiles(&orphans);
     Ok(())
 }
@@ -465,17 +627,19 @@ fn open_document() -> anyhow::Result<(
 }
 
 /// Borrow the `[providers]` table as a real (header) table, creating it implicit if absent. Without
-/// this, auto-vivifying `document["providers"][name]` produces an *inline* table, which both
-/// renders the whole block on one line and makes `as_table_mut()` return `None` (so removals
-/// silently fail).
+/// this, auto-vivifying `document["providers"][name]` produces an *inline* table, which renders the
+/// whole block on one line.
+///
+/// A `providers` that is present but written some other way is refused, not replaced. Both
+/// spellings deserialize, so `provider list` and the duplicate guard see the same profiles either
+/// way; treating "not a header table" as "absent" overwrote the lot. `providers = { work = … }`
+/// plus one `meka provider add home` left a file naming only `home`, with `work`'s credential
+/// orphaned in the database and `default_provider` pointing at a profile that was no longer there,
+/// silently and with exit 0.
 fn ensure_providers_table(
     document: &mut toml_edit::DocumentMut,
 ) -> anyhow::Result<&mut toml_edit::Table> {
-    if document
-        .get("providers")
-        .map(|item| !item.is_table())
-        .unwrap_or(true)
-    {
+    if document.get("providers").is_none() {
         let mut table = toml_edit::Table::new();
         // Implicit so the parent emits `[providers.<name>]` headers rather than a bare
         // `[providers]`.
@@ -485,7 +649,26 @@ fn ensure_providers_table(
     document
         .get_mut("providers")
         .and_then(|item| item.as_table_mut())
-        .ok_or_else(|| anyhow::anyhow!("config 'providers' is not a table"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`providers` in config.toml is not a section, so meka cannot add a profile to it \
+                 without rewriting the rest. Spell each profile as its own `[providers.<name>]` \
+                 section and run this again"
+            )
+        })
+}
+
+/// The configured profile names, whichever way `providers` is spelled.
+///
+/// `as_table_like` rather than `as_table` because an inline `providers = { … }` deserializes and so
+/// is a config meka runs on; a probe that could not see it reported profiles as absent while they
+/// were in the file.
+fn profile_names(document: &toml_edit::DocumentMut) -> Vec<String> {
+    document
+        .get("providers")
+        .and_then(|item| item.as_table_like())
+        .map(|providers| providers.iter().map(|(name, _)| name.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// Insert or replace `[providers.<name>]` in `document`, defaulting to it if no `default_provider`
@@ -526,13 +709,18 @@ fn upsert_profile_document(
 
 /// Remove `[providers.<name>]` from `document`, clearing `default_provider` if it pointed at the
 /// removed profile. Pure mutation, unit-testable.
-fn remove_profile_document(document: &mut toml_edit::DocumentMut, name: &str) {
-    if let Some(providers) = document
+///
+/// Answers whether a profile was actually removed, because the caller cannot tell from anywhere
+/// else. Inferring it from a separate `as_table` probe made `remove` report the opposite of what it
+/// did on an inline `providers`: the profile probed as absent, so the command deleted the
+/// credential, dropped `default_provider`, left `[providers.<name>]` untouched in the file, and
+/// said "no profile was configured" about one `meka provider list` still shows.
+fn remove_profile_document(document: &mut toml_edit::DocumentMut, name: &str) -> bool {
+    let removed = document
         .get_mut("providers")
-        .and_then(|item| item.as_table_mut())
-    {
-        providers.remove(name);
-    }
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|providers| providers.remove(name))
+        .is_some();
     // If this profile was the default, drop the dangling pointer.
     if document
         .get("default_provider")
@@ -541,6 +729,7 @@ fn remove_profile_document(document: &mut toml_edit::DocumentMut, name: &str) {
     {
         document.as_table_mut().remove("default_provider");
     }
+    removed
 }
 
 fn write_profile(
@@ -1431,8 +1620,14 @@ pub async fn run_account_subcommand(
 
     let token_store = session_manager.token_store();
     let config_file = config::load_config_file_or_err()?;
-    let requested = profile_arg.or_else(|| config_file.default_provider.clone());
-    let (name, error) = config::select_active_profile(requested, &config_file.providers);
+    let (source, requested) = match profile_arg {
+        Some(name) => (config::ProfileRequest::Flag, Some(name)),
+        None => (
+            config::ProfileRequest::DefaultProvider,
+            config_file.default_provider.clone(),
+        ),
+    };
+    let (name, error) = config::select_active_profile(requested, source, &config_file.providers);
     let name = name.ok_or_else(|| {
         anyhow::anyhow!(error.unwrap_or_else(|| "no provider configured".to_string()))
     })?;
@@ -1692,10 +1887,13 @@ mod tests {
     }
 
     async fn memory_token_store() -> TokenStore {
-        crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("memory store")
-            .token_store()
+        crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store")
+        .token_store()
     }
 
     /// The credential table is keyed by profile name and nothing prunes it, so a hand-deleted
@@ -1725,6 +1923,70 @@ mod tests {
         assert_eq!(orphans, vec!["archive".to_string()]);
     }
 
+    /// The sibling of `login_refuses_a_piped_key_for_a_browser_backend`, and asserted together
+    /// because the two commands taking the same flag must answer it the same way. `add` knows the
+    /// backend too: `--api-key-stdin` requires `--type`, so the refusal can come before the browser
+    /// opens rather than after a script has hung on it.
+    #[tokio::test]
+    async fn add_refuses_a_piped_key_for_a_browser_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "").expect("write config");
+        let store = memory_token_store().await;
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_add(
+            "sub",
+            Some("claude-subscription"),
+            Some("claude-opus-5".to_string()),
+            None,
+            ProfileTuning::default(),
+            true,
+            &store,
+        )
+        .await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("a piped key for an OAuth backend must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("claude-subscription"), "{error}");
+        assert!(error.contains("browser"), "{error}");
+        // Nothing was written: the refusal lands before the config document is even opened.
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.is_empty(), "{contents}");
+    }
+
+    /// `acquire_credential` ignores `--api-key-stdin` for a backend that logs in through the
+    /// browser, so without this a script piping a key to a subscription profile would sit on an
+    /// OAuth flow it cannot see while its key went unread. `login` knows the backend from the
+    /// profile, so it can say so before anything opens.
+    #[tokio::test]
+    async fn login_refuses_a_piped_key_for_a_browser_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers.sub]\ntype = \"claude-subscription\"\nmodel = \"claude-opus-5\"\n",
+        )
+        .expect("write config");
+        let store = memory_token_store().await;
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_login("sub", true, &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("a piped key for an OAuth backend must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("claude-subscription"), "{error}");
+        assert!(error.contains("browser"), "{error}");
+    }
+
     /// `remove` is the only path that deletes a credential, so requiring a configured profile would
     /// leave a hand-deleted profile's secret unreachable from every surface meka has.
     #[tokio::test]
@@ -1735,7 +1997,13 @@ mod tests {
             "default_provider = \"work\"\n",
         )
         .expect("write config");
-        let store = memory_token_store().await;
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
+        let store = manager.token_store();
         store
             .save_provider_credential("work", &AuthCredential::ApiKey("key".to_string()))
             .await
@@ -1745,7 +2013,7 @@ mod tests {
         // that touches it, and the guard is held across the whole set → run → clear cycle.
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let result = run_remove("work", &store).await;
+        let result = run_remove("work", &store, &manager).await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
         result.expect("removing an orphaned credential succeeds");
 
@@ -1773,12 +2041,18 @@ mod tests {
             "[providers.work]\ntype = \"anthropic-messages\"\nmodel = \"claude-opus-5\"\n",
         )
         .expect("write config");
-        let store = memory_token_store().await;
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
+        let store = manager.token_store();
 
         // SAFETY: as above.
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let result = run_remove("typo", &store).await;
+        let result = run_remove("typo", &store, &manager).await;
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
 
         let error = match result {
@@ -2204,6 +2478,67 @@ mod tests {
         assert!(config.providers.contains_key("personal"));
         // base_url is omitted when None.
         assert!(!document.to_string().contains("base_url"));
+    }
+
+    /// `providers = { work = { … } }` is valid TOML that serde reads, so `provider list` and the
+    /// duplicate guard both see `work`. Treating "not a header table" as "absent" and overwriting
+    /// destroyed it: one `provider add home` left a config naming only `home`, `work`'s credential
+    /// orphaned in the database, and `default_provider` pointing at a profile that was gone --
+    /// silently, with exit 0.
+    #[test]
+    fn adding_a_profile_refuses_an_inline_providers_table_rather_than_replacing_it() {
+        let mut document = "default_provider = \"work\"\n\
+             providers = { work = { type = \"anthropic-messages\", model = \"m1\" } }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        let error = upsert_profile_document(
+            &mut document,
+            "home",
+            "openai-responses",
+            "m2",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect_err("an inline `providers` must be refused, not overwritten");
+        assert!(
+            error.to_string().contains("is not a section"),
+            "the refusal must say what to do about it: {error}"
+        );
+        let config: config::ConfigFile =
+            toml::from_str(&document.to_string()).expect("re-parse config");
+        assert!(
+            config.providers.contains_key("work"),
+            "the existing profile must survive a refused add"
+        );
+        assert_eq!(config.default_provider.as_deref(), Some("work"));
+    }
+
+    /// The other half of the same bug. Removal *is* safe on either spelling, and the caller cannot
+    /// infer whether it happened from a separate `as_table` probe: that probe said "absent" while
+    /// the profile was in the file, so `remove` deleted the credential, dropped
+    /// `default_provider`, left `[providers.work]` in place, and reported "no profile was
+    /// configured" about one `meka provider list` still showed.
+    #[test]
+    fn removing_a_profile_reaches_an_inline_providers_table_and_says_it_did() {
+        let mut document = "default_provider = \"work\"\n\
+             providers = { work = { type = \"anthropic-messages\", model = \"m1\" }, \
+             side = { type = \"openai-responses\", model = \"m2\" } }\n"
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse");
+        assert!(
+            remove_profile_document(&mut document, "work"),
+            "a profile that was there must be reported as removed"
+        );
+        let config: config::ConfigFile =
+            toml::from_str(&document.to_string()).expect("re-parse config");
+        assert!(!config.providers.contains_key("work"));
+        assert!(config.providers.contains_key("side"));
+        assert_eq!(config.default_provider, None);
+
+        assert!(
+            !remove_profile_document(&mut document, "work"),
+            "a second removal has nothing to remove and must say so"
+        );
     }
 
     #[test]

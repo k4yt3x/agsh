@@ -71,6 +71,24 @@ pub struct SessionEntry {
     /// Permission cell, hoisted out of the runtime mutex so `PATCH /sessions/{id}` can
     /// flip it without contending with a long-running turn.
     pub permission: SharedPermission,
+    /// What this session runs on, as the agent inside the runtime mutex publishes it.
+    ///
+    /// Hoisted beside `context_used` and for the same reason: `GET /context` reports occupancy and
+    /// the turn handler decides whether to admit an image, and both do so at exactly the moment an
+    /// in-flight turn is holding that mutex. Reading the process-wide `agent_options` instead
+    /// reported the *default* profile's window for every session, whatever profile it ran on.
+    ///
+    /// A handle rather than copies of the two facts read off it. `PATCH /v1/sessions/{id}` moved
+    /// the window and the vision flag by hand next to its `set_provider` call, which is one
+    /// hand-written assignment per fact per switch site, all of them enforcing what
+    /// [`crate::agent::Agent::set_provider`] already does for whoever holds this.
+    ///
+    /// Safe here and *not* on ACP's session entry, which reads the row instead: `PATCH` writes the
+    /// row and then *awaits* the runtime mutex, so this cell trails the row only from that write
+    /// until an in-flight turn hands the mutex back, and never past the response. ACP's
+    /// `session/set_config_option` must not block its dispatch loop on that mutex, so its agent
+    /// lags the row until the next turn; see `acp::session_accepts_images`.
+    pub binding: crate::agent::PublishedBinding,
     /// Per-session working directory, hoisted for the same reason.
     pub cwd: SharedCwd,
     /// A clone of the session's tool registry, hoisted so `GET /v1/sessions/{id}/tools` can read

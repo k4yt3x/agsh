@@ -99,6 +99,13 @@ pub enum SessionAction {
         /// Hidden by default, so the view stays on conversations you started.
         #[arg(long)]
         include_children: bool,
+        /// Show each session's model and endpoint overrides
+        ///
+        /// A session pins its provider profile, and may pin a model or base URL
+        /// on top of it. The short listing shows only the profile, so an
+        /// override is invisible; this adds the two columns that carry it.
+        #[arg(short = 'l', long)]
+        long: bool,
     },
     /// Export a session as Markdown or JSON
     Export {
@@ -194,8 +201,8 @@ pub enum ProviderAction {
     /// Prompts for any of type/model/base-url not passed as flags, offers an
     /// optional advanced step (thinking, context window, effort), then acquires
     /// the secret (OAuth login for the subscription backends, API-key prompt for
-    /// the rest) and stores it in the database. Sets the default provider when
-    /// this is the first profile.
+    /// the rest) and stores it in the database. Becomes the default provider
+    /// whenever no `default_provider` is set, not only for the first profile.
     Add {
         /// Profile name (e.g. `work`, `personal`).
         name: String,
@@ -250,9 +257,20 @@ pub enum ProviderAction {
         name: String,
     },
     /// Re-authenticate an existing provider profile
+    ///
+    /// Keeps every other setting on the profile. Rotating a key with
+    /// `remove` + `add` instead rebuilds the whole table, discarding
+    /// `context_window`, `effort`, `thinking` and the rest.
     Login {
         /// Profile name to re-authenticate.
         name: String,
+        /// Read the API key from stdin instead of prompting
+        ///
+        /// For scripted key rotation, the same as on `meka provider add`.
+        /// API-key backends only; the subscription backends authenticate
+        /// through the browser and have no key to read.
+        #[arg(long = "api-key-stdin")]
+        api_key_stdin: bool,
     },
 }
 
@@ -702,15 +720,15 @@ pub struct Cli {
     #[arg(long = "writable-root", value_name = "PATH")]
     pub writable_root: Vec<std::path::PathBuf>,
 
-    /// Provider profile to use this run (overrides default_provider)
+    /// Provider profile for this session; on a resume, repins it
     #[arg(short = 'p', long = "provider")]
     pub provider: Option<String>,
 
-    /// Override the active profile's model for this run
+    /// Model for this session, overriding its profile's
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
 
-    /// API base URL, for any endpoint serving the profile's protocol
+    /// Endpoint for this session, overriding its profile's
     #[arg(long = "base-url")]
     pub base_url: Option<String>,
 
@@ -973,6 +991,7 @@ mod tests {
                     SessionAction::List {
                         limit,
                         include_children,
+                        long: _,
                     },
             }) => {
                 assert_eq!(limit, 20);

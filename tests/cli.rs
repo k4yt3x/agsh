@@ -751,3 +751,386 @@ fn an_unresolvable_writable_root_warns_without_failing_the_run() {
         "a root that exists must not warn: {stderr}"
     );
 }
+
+/// `--continue`, `--resume`, `--model` and `--base-url` name *this run's session*, and neither
+/// long-lived host has one: each creates a session per `session/new` or `POST /v1/sessions`. They
+/// used to parse and do nothing, which was worse than it sounds. `GET /v1/info` went on reporting a
+/// `--model` no session ever used, and `-c` / `-r` set `session_resume`, which switches off the
+/// default-profile check a host with no configured default needs most: `meka -c acp` then wrote a
+/// session row naming the empty profile and failed its first turn complaining about a session it
+/// had created moments earlier.
+#[test]
+fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for host in ["acp", "serve"] {
+        for flag in [
+            vec!["--continue"],
+            vec!["--resume", "0e5f"],
+            vec!["--model", "some-model"],
+            vec!["--base-url", "https://example.invalid"],
+        ] {
+            // Isolated, like every other CLI test. A regression in the guard would otherwise reach
+            // the host's real startup, and `meka serve` would bind the port in the *developer's*
+            // `config.toml` and run until the harness gave up -- a hang rather than a failure.
+            let mut args = flag.clone();
+            args.push(host);
+            let output = run_isolated(dir.path(), &args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "meka {} {host} should be refused, got: {stderr}",
+                flag.join(" ")
+            );
+            assert!(
+                stderr.contains(flag[0]) && stderr.contains("one run's session"),
+                "meka {} {host} must say why: {stderr}",
+                flag.join(" ")
+            );
+        }
+    }
+}
+
+/// A `config.toml` meka cannot parse must not stop the commands that exist to repair one.
+///
+/// `meka mcp remove` and `meka provider remove` edit the raw document through `toml_edit` and never
+/// parse it into a `ConfigFile`, which is exactly what makes them the way out of a config an
+/// unknown key or a bad value has made unloadable. Gating the whole subcommand path on a readable
+/// config closed that door: the fix for "the ledger must not adopt a profile it inferred from a
+/// parse error" was briefly applied one level too high, and every subcommand refused.
+///
+/// The ledger's own protection is asserted where it lives, in
+/// `session::migrations::tests::an_unreadable_config_refuses_to_stamp_carried_sessions_but_not_an_empty_store`:
+/// a store with sessions to stamp is refused and left at its old version, and one with nothing to
+/// stamp opens normally. That split is what lets both properties hold at once.
+#[test]
+fn an_unparseable_config_still_lets_the_commands_that_repair_it_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_dir = dir.path().join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    // Valid TOML that `serde` rejects, which is the shape the repair path is for:
+    // `deny_unknown_fields` refuses the whole file over one stray key, while `toml_edit` still
+    // parses it, so the document can be edited even though the config cannot be loaded. A
+    // *syntax* error defeats `toml_edit` too and has never been repairable from the CLI; that
+    // is not what this guards.
+    let config = "default_provider = \"work\"\n\n[providers.work]\ntype = \
+                  \"anthropic-messages\"\nmodel = \"some-model\"\nstray_unknown_key = 1\n";
+    std::fs::write(config_dir.join("config.toml"), config).expect("write config.toml");
+
+    let output = run_isolated(dir.path(), &["provider", "remove", "work"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`meka provider remove` must run on the very config it exists to repair: {stderr}"
+    );
+    let after = std::fs::read_to_string(config_dir.join("config.toml")).expect("read config back");
+    assert!(
+        !after.contains("[providers.work]"),
+        "the profile was not actually removed, so the repair did not happen:\n{after}"
+    );
+
+    // The readers are the other half of the split and must keep refusing: answering "No MCP servers
+    // configured" out of a file meka could not read would state something false.
+    // `run_mcp_subcommand` branches on exactly this, and the two halves are what let a broken
+    // config be both survivable and repairable.
+    //
+    // A second directory, because the repair above has by now *fixed* the first one: removing the
+    // profile took the stray key with it.
+    let unrepaired = tempfile::tempdir().expect("tempdir");
+    let unrepaired_config = unrepaired.path().join("meka");
+    std::fs::create_dir_all(&unrepaired_config).expect("config dir");
+    std::fs::write(unrepaired_config.join("config.toml"), config).expect("write config.toml");
+    let output = run_isolated(unrepaired.path(), &["mcp", "list"]);
+    assert!(
+        !output.status.success(),
+        "`meka mcp list` must not answer out of a config it could not read"
+    );
+}
+
+/// `--provider` is deliberately *not* refused above: it selects which configured profile the host
+/// defaults to, which is a property of the host rather than of one session. A guard that lumped it
+/// in with the four would take a real capability away.
+#[test]
+fn a_long_lived_host_still_takes_provider() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One configured profile, so the refusal is "no profile named X" rather than "no profiles
+    // configured". Seeded rather than inherited: run un-isolated, this test read the developer's
+    // own `config.toml` and passed only because it happened to have a profile in it.
+    let config_dir = dir.path().join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "default_provider = \"work\"\n\n[providers.work]\ntype = \"anthropic-messages\"\n\
+         model = \"m\"\n",
+    )
+    .expect("write config");
+
+    let output = run_isolated(dir.path(), &[
+        "--provider",
+        "definitely-not-configured",
+        "serve",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no provider profile named"),
+        "--provider must reach profile selection rather than the flag guard: {stderr}"
+    );
+}
+
+/// Write a `config.toml` with `profiles` configured and `default_provider` naming `default`.
+///
+/// Every endpoint is port 9, which discards, so a turn that got as far as the network could not
+/// reach anything. The tests below never get that far: they run with the scripted provider.
+fn write_provider_config(dir: &std::path::Path, default: &str, profiles: &[&str]) {
+    let config_dir = dir.join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    let mut config = format!(
+        "default_provider = \"{default}\"\n\n[permissions]\ndefault = \"read\"\nenabled = \
+         [\"read\"]\n"
+    );
+    for profile in profiles {
+        config.push_str(&format!(
+            "\n[providers.{profile}]\ntype = \"openai-chat-completions\"\nmodel = \
+             \"{profile}-model\"\nbase_url = \"http://127.0.0.1:9/\"\n"
+        ));
+    }
+    std::fs::write(config_dir.join("config.toml"), config).expect("write config.toml");
+}
+
+/// Run one `meka` turn against the scripted mock provider, which is how these tests get a session
+/// row without a credential or a network.
+///
+/// The mock is compiled into debug builds only (`MEKA_MOCK_PROVIDER=1`), which is what `cargo test`
+/// builds; `tests/multiprocess.rs` rests on the same thing.
+fn run_scripted(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let script = dir.join("script.json");
+    std::fs::write(
+        &script,
+        r#"[[{"kind":"text","text":"ok"},{"kind":"message_end","stop_reason":"end_turn"}]]"#,
+    )
+    .expect("write the provider script");
+    meka()
+        .args(args)
+        .env("MEKA_CONFIG_DIR", dir.join("meka"))
+        .env("MEKA_DATA_DIR", dir.join("data").join("meka"))
+        .env("XDG_CONFIG_HOME", dir)
+        .env("HOME", dir)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("MEKA_MOCK_PROVIDER", "1")
+        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn meka {:?}: {}", args, error))
+}
+
+/// The store an isolated run left behind, read directly: what is being set up is a row shape no
+/// command produces on purpose.
+fn store(dir: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(dir.join("data").join("meka").join("meka.db"))
+        .expect("open the store")
+}
+
+/// The id of the one session a test made.
+fn only_session(dir: &std::path::Path) -> String {
+    store(dir)
+        .query_row("SELECT id FROM sessions", [], |row| row.get::<_, String>(0))
+        .expect("exactly one session")
+}
+
+/// Resuming a session whose recorded profile has left `config.toml` must fail the process, not just
+/// print about it.
+///
+/// The interactive host rendered the refusal and returned `Ok(())`, so `meka -r <id>; echo $?` said
+/// `0` for a session it had refused to open and every supervisor and wrapper script read that as
+/// success. `--oneshot` on the same session, and a fresh session with an unresolvable
+/// `default_provider` in either mode, all exited 1 already; the resume path in the REPL host was
+/// alone in not doing so.
+#[test]
+fn resuming_a_session_whose_profile_is_gone_exits_nonzero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "ghost", &["alpha", "ghost"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(
+        created.status.success(),
+        "the first turn should have created a session: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let id = only_session(dir.path());
+
+    // What `meka provider remove ghost` or a hand edit leaves behind: the row still names it.
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+
+    let refused = run_isolated(dir.path(), &["-r", &id]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("is not configured"),
+        "the resume should have been refused by name: {stderr}"
+    );
+    assert!(
+        !refused.status.success(),
+        "a refused resume must exit non-zero, got {:?}: {stderr}",
+        refused.status
+    );
+    // The hint adds the one thing the refusal above it cannot: the session id, and the only command
+    // that rewrites a row's binding.
+    assert!(
+        stderr.contains(&format!("meka -r {id} --provider alpha")),
+        "the hint should give the command that repins this session: {stderr}"
+    );
+    // And it adds nothing else. `provider add` here would have to invent the deleted profile's
+    // `--type` and `--model`, which meka never saw: `ghost` may have been `openai-responses` on
+    // another model, so the command would create a different profile under the name the session
+    // wants. The refusal above already says to restore it from config.toml, which is the honest
+    // version of the same advice.
+    assert!(
+        !stderr.contains("provider add"),
+        "the hint must not suggest recreating a profile whose type and model it cannot know: \
+         {stderr}"
+    );
+}
+
+/// `--provider` on a resume rewrites the row, which is the whole point of it being a repin rather
+/// than a per-run override.
+///
+/// `apply_session_repin` could be replaced with `Ok(())` and every test stayed green: the resume
+/// succeeded, the run used the new profile for its one turn, and the row silently kept the old one,
+/// so the *next* resume went back. The row is the fact; this asserts the row.
+#[test]
+fn a_resume_with_provider_rewrites_the_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha", "beta"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(
+        created.status.success(),
+        "the first turn should have created a session: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let id = only_session(dir.path());
+    assert_eq!(recorded_profile(dir.path(), &id), "alpha");
+
+    let moved = run_scripted(dir.path(), &[
+        "-r",
+        &id,
+        "--provider",
+        "beta",
+        "--oneshot",
+        "hi",
+    ]);
+    assert!(
+        moved.status.success(),
+        "the repinned resume should run: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert_eq!(
+        recorded_profile(dir.path(), &id),
+        "beta",
+        "the row must hold the new profile, or the next resume goes back to the old one"
+    );
+}
+
+/// A `--provider` naming nothing configured is refused before anything is written, by the check
+/// that reads the configured set rather than by the later failure to build a provider.
+///
+/// Both refuse, which is why this asserts the *message*: dropping the `!` from the membership test
+/// inverts it, so a configured name bails and an unconfigured one falls through to fail later with
+/// different wording. Exit code alone cannot tell those apart.
+#[test]
+fn a_resume_with_an_unconfigured_provider_is_refused_by_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(created.status.success());
+    let id = only_session(dir.path());
+
+    let refused = run_scripted(dir.path(), &[
+        "-r",
+        &id,
+        "--provider",
+        "ghost",
+        "--oneshot",
+        "hi",
+    ]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "must not run: {stderr}");
+    assert!(
+        stderr.contains("`meka provider list` shows the configured ones"),
+        "the refusal must come from the membership check, not from a later build failure: {stderr}"
+    );
+    assert_eq!(
+        recorded_profile(dir.path(), &id),
+        "alpha",
+        "a refused repin must leave the row alone"
+    );
+}
+
+/// `--model` on its own repins the model, without `--base-url` beside it.
+///
+/// The condition is `model.is_some() || base_url.is_some()`; as `&&` it needs both, so `--model`
+/// alone silently applied to nothing and the row kept whatever it had.
+#[test]
+fn a_resume_with_model_alone_repins_the_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(created.status.success());
+    let id = only_session(dir.path());
+
+    let moved = run_scripted(dir.path(), &[
+        "-r",
+        &id,
+        "--model",
+        "pinned-model",
+        "--oneshot",
+        "hi",
+    ]);
+    assert!(
+        moved.status.success(),
+        "the resume should run: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let recorded: Option<String> = store(dir.path())
+        .query_row(
+            "SELECT model_override FROM sessions WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .expect("the session row");
+    assert_eq!(
+        recorded.as_deref(),
+        Some("pinned-model"),
+        "`--model` alone must reach the row"
+    );
+}
+
+/// A setup failure that is *not* a missing profile must not offer to repin the session.
+///
+/// The gate could be replaced with `true` and nothing noticed, which turns every failed start into
+/// advice to move a session that is bound exactly where it belongs. Here the profile is configured
+/// and merely has no credential, so repinning fixes nothing.
+#[test]
+fn a_credential_failure_does_not_advise_repinning_a_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(created.status.success());
+    let id = only_session(dir.path());
+
+    // No `MEKA_MOCK_PROVIDER`, so the real credential lookup runs and finds nothing stored.
+    let refused = run_isolated(dir.path(), &["-r", &id]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("no stored credential"),
+        "this test needs the credential failure, not some other one: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Move this session onto"),
+        "the session's profile is configured, so repinning is the wrong advice: {stderr}"
+    );
+}
+
+/// The profile a session's row currently names.
+fn recorded_profile(dir: &std::path::Path, id: &str) -> String {
+    store(dir)
+        .query_row("SELECT provider FROM sessions WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .expect("the session row")
+}

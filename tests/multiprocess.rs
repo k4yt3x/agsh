@@ -467,6 +467,27 @@ fn record_a_run_then_decline(log: &Path) -> String {
     }
 }
 
+/// A command that runs for a few seconds and then leaves a file behind, spelled for the host's own
+/// shell.
+///
+/// The sibling of [`record_a_run_then_decline`], and it was missed when that one was written: the
+/// POSIX spelling `printf done > …` has no `printf` in PowerShell, so on Windows the command died
+/// the instant its sleep ended and the proof file was never written. The test then read that as the
+/// product having thrown a completed task's outcome away, which is the one thing it exists to deny,
+/// so the Windows leg of CI failed on a claim about the shell rather than about meka. `sleep` needs
+/// no such treatment; PowerShell aliases it to `Start-Sleep`.
+fn sleep_then_leave_proof(seconds: u32, proof: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "Start-Sleep -Seconds {}; Set-Content -LiteralPath '{}' -Value 'done'",
+            seconds,
+            proof.display()
+        )
+    } else {
+        format!("sleep {}; printf done > '{}'", seconds, proof.display())
+    }
+}
+
 /// How many lines a gate command has appended to its log, which is how many times it ran.
 fn gate_runs(log: &Path) -> usize {
     std::fs::read_to_string(log)
@@ -583,7 +604,7 @@ fn a_second_process_cannot_sweep_a_running_background_task() {
         [
             {"kind": "tool_use_start", "id": "tu_1", "name": "execute_command"},
             {"kind": "tool_use_end", "input": {
-                "command": format!("sleep 4; printf done > '{}'", proof.display()),
+                "command": sleep_then_leave_proof(4, &proof),
                 "background": true,
             }},
             {"kind": "message_end", "stop_reason": "tool_use"},
@@ -866,17 +887,29 @@ fn two_processes_migrating_one_store_apply_it_once() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read the version");
-    assert_eq!(version, 2, "the store reached head");
+    // A floor rather than an equality. This test is about two processes racing, not about how long
+    // the ledger is, and pinning the exact head would make every appended migration edit a
+    // concurrency test for no reason. The columns below are what actually prove the steps ran.
+    assert!(version >= 3, "the store reached head, got {version}");
 
-    for column in ["claimed_by", "gate_kind"] {
+    for (table, column) in [
+        ("scheduled_jobs", "claimed_by"),
+        ("scheduled_jobs", "gate_kind"),
+        ("sessions", "provider"),
+    ] {
         let occurrences: i64 = connection
             .query_row(
-                "SELECT count(*) FROM pragma_table_info('scheduled_jobs') WHERE name = ?1",
-                [column],
+                "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                [table, column],
                 |row| row.get(0),
             )
             .expect("count the column");
-        assert_eq!(occurrences, 1, "`{column}` should exist exactly once");
+        // Exactly once is the point: a second `ADD COLUMN` would have failed the process outright,
+        // but a step that ran twice in one process would show up here.
+        assert_eq!(
+            occurrences, 1,
+            "`{table}.{column}` should exist exactly once"
+        );
     }
 
     let backups = std::fs::read_dir(cluster.data_dir())
@@ -891,5 +924,250 @@ fn two_processes_migrating_one_store_apply_it_once() {
     assert_eq!(
         backups, 1,
         "one migration means one backup, not one per process"
+    );
+}
+
+/// Two profiles on unreachable endpoints, so the connection error names the URL a turn was sent to.
+///
+/// No credential is needed to reach a socket, but meka refuses a profile that has none before it
+/// gets that far, so one is planted directly. The value is never sent anywhere: both base URLs
+/// point at port 9, which discards.
+fn cluster_with_two_unreachable_profiles() -> Cluster {
+    let cluster = Cluster::new("");
+    // Rewritten whole rather than appended: `default_provider` is a top-level key and
+    // `Cluster::new` ends its template inside `[permissions]`, so anything appended lands in that
+    // table. The store already exists by here, which is all the constructor was needed for.
+    std::fs::write(
+        cluster.config_dir().join("config.toml"),
+        r#"
+default_provider = "alpha"
+
+[providers.alpha]
+type = "openai-chat-completions"
+model = "alpha-model"
+base_url = "http://127.0.0.1:9/alpha"
+
+[providers.beta]
+type = "openai-chat-completions"
+model = "beta-model"
+base_url = "http://127.0.0.1:9/beta"
+
+[permissions]
+default = "read"
+enabled = ["read", "unrestricted"]
+"#,
+    )
+    .expect("write config.toml");
+
+    let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
+    for profile in ["alpha", "beta"] {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO provider_credentials (profile, credentials_json, \
+                 updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    profile,
+                    r#"{"ApiKey":"not-a-real-key"}"#,
+                    "2026-01-01T00:00:00Z"
+                ],
+            )
+            .expect("plant a credential");
+    }
+    cluster
+}
+
+/// One `meka` process, then another, with no flag between them.
+///
+/// A real turn against the real provider stack, with the mock explicitly off: what is being checked
+/// is which endpoint the second process *sends to*, and a scripted provider sends nowhere. The
+/// connection failure names the URL, which is the observation.
+fn turn_reaches(cluster: &Cluster, args: &[&str]) -> String {
+    let output = cluster
+        .meka(args)
+        .env("MEKA_MOCK_PROVIDER", "0")
+        .output()
+        .unwrap_or_else(|error| panic!("spawn meka {:?}: {}", args, error));
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The regression this whole arrangement exists for, across two real processes.
+///
+/// In-process coverage cannot see it: the drift was that a *second* invocation resolved the
+/// provider from config rather than from the row, and a test that never leaves the process has no
+/// second invocation to be wrong.
+#[test]
+fn a_second_process_resumes_on_the_provider_the_first_one_used() {
+    let cluster = cluster_with_two_unreachable_profiles();
+
+    let first = turn_reaches(&cluster, &[
+        "--oneshot",
+        "-p",
+        "beta",
+        "--permission",
+        "read",
+        "hello",
+    ]);
+    assert!(
+        first.contains("127.0.0.1:9/beta"),
+        "the first turn should go to the profile it named, got: {first}"
+    );
+
+    // No `--provider`: everything this process knows about the session comes off its row.
+    let resumed = turn_reaches(&cluster, &[
+        "--oneshot",
+        "-c",
+        "--permission",
+        "read",
+        "again",
+    ]);
+    assert!(
+        resumed.contains("127.0.0.1:9/beta"),
+        "the resume must stay on `beta` rather than falling back to the default, got: {resumed}"
+    );
+}
+
+/// `--model` is recorded the same way `--provider` is, so the model does not drift back either.
+///
+/// The sibling defect: a session pinned its profile but the run's model override was dropped on the
+/// floor, so the next process ran the profile's model instead of the one the user asked for.
+#[test]
+fn a_second_process_resumes_on_the_model_the_first_one_was_given() {
+    let cluster = cluster_with_two_unreachable_profiles();
+
+    turn_reaches(&cluster, &[
+        "--oneshot",
+        "-p",
+        "beta",
+        "-m",
+        "pinned-model",
+        "--permission",
+        "read",
+        "hello",
+    ]);
+
+    let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
+    let recorded: (String, Option<String>) = connection
+        .query_row(
+            "SELECT provider, model_override FROM sessions LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the row");
+    assert_eq!(recorded.0, "beta");
+    assert_eq!(
+        recorded.1.as_deref(),
+        Some("pinned-model"),
+        "the run's `--model` belongs on the row, not just on the provider it built"
+    );
+}
+
+/// A profile deleted from `config.toml` is refused by name rather than silently replaced.
+///
+/// The failure this guards is the quiet one: falling back to the default would run the conversation
+/// on another account and bill it, which is exactly what recording the profile was for.
+#[test]
+fn a_second_process_refuses_a_profile_that_is_no_longer_configured() {
+    let cluster = cluster_with_two_unreachable_profiles();
+    turn_reaches(&cluster, &[
+        "--oneshot",
+        "-p",
+        "beta",
+        "--permission",
+        "read",
+        "hello",
+    ]);
+
+    let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
+    connection
+        .execute("UPDATE sessions SET provider = 'retired'", [])
+        .expect("the profile leaves config.toml");
+    drop(connection);
+
+    let refused = turn_reaches(&cluster, &[
+        "--oneshot",
+        "-c",
+        "--permission",
+        "read",
+        "again",
+    ]);
+    assert!(
+        refused.contains("retired"),
+        "the refusal should name the profile, got: {refused}"
+    );
+    assert!(
+        !refused.contains("127.0.0.1:9/"),
+        "nothing should have been sent anywhere, got: {refused}"
+    );
+}
+
+/// A resume must not be blocked by a *default* it does not use.
+///
+/// `meka provider remove <the default>` drops `default_provider` with two profiles still
+/// configured, and every later `meka -c` stopped there -- on a session whose row named a profile
+/// that was still perfectly configured, and which `meka session list` printed correctly.
+#[test]
+fn a_resume_is_not_blocked_by_an_ambiguous_default_it_does_not_use() {
+    let cluster = cluster_with_two_unreachable_profiles();
+    turn_reaches(&cluster, &[
+        "--oneshot",
+        "-p",
+        "beta",
+        "--permission",
+        "read",
+        "hello",
+    ]);
+
+    // Retire the default, leaving `alpha` and `beta` and no way to pick between them. Stripping
+    // the key is the whole of it: `provider remove alpha` used to stand here, which *deleted*
+    // `alpha` and left `beta` as the sole profile -- unambiguous, and coincidentally the very
+    // profile the assertion looks for, so the test passed with the fix reverted.
+    std::fs::write(
+        cluster.config_dir().join("config.toml"),
+        std::fs::read_to_string(cluster.config_dir().join("config.toml"))
+            .expect("read config")
+            .replace("default_provider = \"alpha\"\n", ""),
+    )
+    .expect("drop the default");
+
+    let resumed = turn_reaches(&cluster, &[
+        "--oneshot",
+        "-c",
+        "--permission",
+        "read",
+        "again",
+    ]);
+    assert!(
+        resumed.contains("127.0.0.1:9/beta"),
+        "the resume should run on the profile its row names, got: {resumed}"
+    );
+}
+
+/// A run that genuinely needs a default still stops at startup, with the guidance intact.
+///
+/// The counterpart to the test above: deferring the check for a resume must not defer it for a
+/// fresh session, which has no row to read and really cannot proceed.
+#[test]
+fn a_fresh_run_still_stops_when_no_default_can_be_picked() {
+    let cluster = cluster_with_two_unreachable_profiles();
+    std::fs::write(
+        cluster.config_dir().join("config.toml"),
+        std::fs::read_to_string(cluster.config_dir().join("config.toml"))
+            .expect("read config")
+            .replace("default_provider = \"alpha\"\n", ""),
+    )
+    .expect("drop the default");
+
+    let refused = turn_reaches(&cluster, &["--oneshot", "--permission", "read", "hello"]);
+    assert!(
+        refused.contains("multiple provider profiles configured"),
+        "a fresh run needs a default and must say so: {refused}"
+    );
+    assert!(
+        refused.contains("meka provider use"),
+        "the message should name the command that sets one: {refused}"
+    );
+    assert!(
+        !refused.contains("127.0.0.1:9/"),
+        "nothing should have been sent anywhere: {refused}"
     );
 }

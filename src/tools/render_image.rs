@@ -138,7 +138,7 @@ mod tests {
     use crate::{provider::ToolResultContent, tools::tests::text_content};
 
     async fn test_manager() -> SessionManager {
-        SessionManager::open(Some(Path::new(":memory:")))
+        SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open in-memory db")
     }
@@ -209,7 +209,10 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
 
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         // Trailing newline mimics how command-pipe output typically lands in the scratchpad.
         manager
             .save_tool_output(session_id, "frame", &format!("{}\n", encoded))
@@ -232,7 +235,10 @@ mod tests {
     #[tokio::test]
     async fn test_render_image_missing_scratchpad_entry() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let tool = build_tool(manager, Some(session_id));
 
         let result = tool

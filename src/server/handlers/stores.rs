@@ -725,7 +725,11 @@ pub struct ProviderView {
     pub backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Whether this is the profile the server is running.
+    /// Whether this is the profile a session gets when it names none.
+    ///
+    /// Not "the profile the server is running": the server runs no profile of its own now, and
+    /// each session runs on the one its row records. This marks only the default `POST
+    /// /v1/sessions` applies to a body with no `provider`.
     pub active: bool,
 }
 
@@ -736,10 +740,15 @@ pub struct ProvidersResponse {
 
 /// `GET /v1/providers`: configured provider profiles, names and models only.
 ///
-/// Read-only by design. Provider selection is config-only with no environment tier, precisely so an
-/// ambient value can never silently rebind which account a named profile bills; a per-session or
-/// per-request override would reintroduce exactly that. No credentials are returned: they live in
-/// the database, keyed by profile name, and never transit this API.
+/// Read-only by design, and the distinction is which fact is being written. A session *may* name a
+/// profile (`POST /v1/sessions`) and move to another (`PATCH /v1/sessions/{id}`), because that
+/// records a choice on one session's own row where the user can see it. What no request may do is
+/// edit the profiles themselves: what `work` means, and therefore which account it bills, comes
+/// from `config.toml` and nothing else. Letting a request redefine a profile is how an ambient
+/// value silently rebinds an account, which is the same reason there is no environment tier.
+///
+/// No credentials are returned: they live in the database, keyed by profile name, and never transit
+/// this API.
 #[utoipa::path(
     get,
     path = "/v1/providers",

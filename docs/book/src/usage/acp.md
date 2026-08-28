@@ -20,6 +20,8 @@ A few flags are worth knowing:
 | `-vv` | `debug` (per-request JSON-RPC diagnostics). |
 | `RUST_LOG=meka=trace` | Trace level. |
 
+Four flags are refused rather than ignored: `-c`, `-r`, `--model` and `--base-url`. All four name one run's session, and this host creates one per `session/new`, each naming its own provider profile. Set `model` and `base_url` on the profile in `config.toml` instead, or have the client name a `provider` per session. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
+
 On startup, after the client's `initialize` arrives, meka logs `ACP client connected: <name> <version>` so you can confirm the client identity in `-v` mode.
 
 ## What meka advertises (`agentCapabilities`)
@@ -33,7 +35,7 @@ These are returned in `InitializeResponse.agentCapabilities`:
 - **`sessionCapabilities.close`**: the client may release the active session slot.
 - **`sessionCapabilities.additionalDirectories`**: the client may send extra workspace roots on `session/new`, `session/load`, and `session/resume` (see [Multi-root workspaces](#multi-root-workspaces)).
 - **`promptCapabilities.embeddedContext: true`**: the client may inline @-mentioned file contents as embedded `resource` blocks (see [Prompt turn](#prompt-turn)).
-- **`promptCapabilities.image`**: follows the active profile's `vision` flag (default `true`; set `vision = false` in `[providers.<name>]` for a text-only model). When `true`, the client may attach `image` blocks.
+- **`promptCapabilities.image`**: follows the *default* profile's `vision` flag (default `true`; set `vision = false` in `[providers.<name>]` for a text-only model). Per connection rather than per session, because `initialize` is answered before any session exists. Whether a given `session/prompt` accepts an image block is decided per session from the profile that session runs on, so a session moved onto a text-only profile refuses attachments even on a connection that advertised `image`.
 
 `mcpCapabilities` is intentionally **not** advertised. meka is itself an MCP client, but the servers it consumes are configured via meka's own `config.toml` rather than the `mcpServers` field on `session/new`. Advertising HTTP/SSE while silently ignoring the client's array would have been misleading; the marker will return when client-supplied MCP server connections are actually implemented.
 
@@ -94,6 +96,7 @@ meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessi
 - **`session/close { sessionId }`**: cancels any in-flight prompt, releases the on-disk session lock, and removes the entry from the map.
 - **`session/cancel { sessionId }`**: interrupts the active `session/prompt`. The response carries `stopReason: "cancelled"`. If a cancel arrives between turns (after one prompt completed and before the next is installed), meka latches the signal and cancels the next prompt immediately on arrival.
 - **`session/set_mode { sessionId, modeId }`**: flips the agent's `Permission` cell. Modes outside `[permissions].enabled` from the config become JSON-RPC errors. On success, meka emits `session/update: current_mode_update`. The flip is atomic and applies to the *next* tool call within an in-flight turn; no need to wait for the turn to finish.
+- **`session/set_config_option { sessionId, configId, value }`**: sets one of the two entries in `configOptions`. Returns the full list with its new values. See [Session config options](#session-config-options).
 
 ## Prompt turn
 
@@ -144,6 +147,9 @@ meka's `Permission` levels map 1:1 to ACP `SessionMode` ids:
 
 The full mode picker is advertised on every session-creation response (`NewSessionResponse.modes`, `LoadSessionResponse.modes`, `ResumeSessionResponse.modes`) but only the modes in `[permissions].enabled` from your `config.toml` are listed; picking a disabled mode would just error.
 
+The same picker is also advertised as a `configOptions` entry, so a client that reads either field
+gets it; see below.
+
 When the active mode is `ask`, write-gated tools trigger a `session/request_permission` round-trip. Clients render four options:
 
 - **Allow**: run this call only.
@@ -156,6 +162,40 @@ The sticky options name the tool because that is exactly their scope: the decisi
 Sticky decisions live in meka's process memory; they reset on session close.
 
 A prompt left unanswered for 30 minutes is denied, and the turn carries on. This is a backstop against a client that is connected but will never reply (an editor whose UI thread has wedged, or a harness that speaks ACP without implementing prompts), not a deadline on you: `session/cancel` already resolves a prompt the moment you stop the turn, and without the backstop a client that does neither holds the session's runtime mutex indefinitely, blocking `session/close` and `session/set_mode` behind it. Denying rather than allowing on expiry is deliberate: an unanswered prompt is not consent.
+
+## Session config options
+
+Every session-creation response also carries `configOptions`, a list of `select` pickers a client
+can render and change with `session/set_config_option`. meka advertises two, in this order:
+
+| `configId` | Category | Values | Meaning |
+|------------|----------|--------|---------|
+| `permission` | `mode` | The ids in `[permissions].enabled` | The same picker as `modes`, so it sits beside the one below |
+| `provider` | `model` | The profile names in your `config.toml` | The provider profile this session runs on |
+
+`permission` is deliberately advertised twice, once here and once in the legacy `modes` field. A
+client that only understands `modes` keeps the picker it has; one that reads `configOptions` gets
+permission and provider adjacent rather than in two unrelated menus. Setting it through either route
+does the same thing, and neither picker is left stale: `session/set_mode` pushes a
+`current_mode_update` and a `config_option_update`, while `session/set_config_option` pushes a
+`current_mode_update` and returns the whole refreshed list in its response.
+
+A session whose recorded profile has since left `config.toml` cannot be loaded at all:
+`session/load` fails while building the runtime, so there is no entry for
+`session/set_config_option` to change. Restore the profile in `config.toml`, or move the session
+with `meka -r <id> --provider <name>` from a shell, and load it again.
+
+Changing `provider` rewrites the session's row, so it holds for every later turn and for a resume
+from any surface, not just for this connection. This is the same change `/provider` makes in the
+REPL and `PATCH /v1/sessions/{id}` makes over HTTP. Switching mid-conversation is allowed and is
+your call: a thinking block is tagged with the provider that produced it and is not replayed to a
+different one, so from the next turn the model no longer sees the reasoning recorded under the old
+provider.
+
+If a turn is in flight, the row moves immediately and the change is held until that turn finishes;
+the live agent takes it at the top of the next turn rather than mid-loop. Reasoning effort is deliberately not offered: which tiers a
+model accepts is a fact about the provider's system, and a fixed dropdown would be meka asserting
+it. It stays on the profile.
 
 ## Slash commands
 

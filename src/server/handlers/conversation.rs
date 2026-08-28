@@ -362,16 +362,43 @@ pub async fn context(
         .and_then(|entry| entry.runtime.try_lock().ok())
         .map(|runtime| runtime.messages.len());
 
-    // `agent_options`, not the raw config: this is the window the agent actually runs with, after
-    // profile precedence and the default. Reading `config.context_window` would report the
-    // unresolved `Option` and disagree with the gauge it is being divided into.
-    let options = &state.shared.agent_options;
-    let compact_at_percent = options
+    // Per session, not per process: a session runs on the profile it recorded, and two sessions on
+    // one server can have different windows. Reading the shared `agent_options` reported the
+    // *default* profile's window for every one of them, which is the denominator every percentage
+    // below is divided by.
+    // A session GC has evicted is the common case, not the edge one: the default idle timeout is
+    // hours, and any session the CLI created was never resident here at all. Falling back to the
+    // shared `agent_options` reported the *server default's* window for every one of them, which is
+    // the very thing the per-session handle above exists to stop. The row is the answer, and this
+    // handler already holds it.
+    let window_raw = match entry.as_ref() {
+        Some(entry) => Some(entry.binding.context_window()),
+        None => {
+            let recorded = state
+                .shared
+                .session_manager
+                .recorded_provider(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to read session provider", error)
+                        .with("session_id", id.to_string())
+                })?;
+            // `None` for a session whose row is gone, and for one whose profile no longer resolves.
+            // Both answer "meka cannot say", which `window` already encodes; the server default
+            // would be a number about a different profile.
+            recorded.and_then(|binding| {
+                crate::binding_context_window(&state.shared.providers, &binding)
+            })
+        }
+    };
+    let compact_at_percent = state
+        .shared
+        .agent_options
         .auto_compact
         .then_some(crate::agent::AUTO_COMPACT_THRESHOLD_PERCENT);
     let used = (used_raw > 0).then_some(used_raw);
     let overhead = (overhead_raw > 0).then_some(overhead_raw);
-    let window = (options.context_window > 0).then_some(options.context_window);
+    let window = window_raw.filter(|window| *window > 0);
     Ok(Json(ContextResponse {
         session_id: id,
         used,
@@ -703,7 +730,14 @@ pub async fn import(
     }
     // Version mismatch and an empty session list both surface here, as 422 rather than 500: the
     // envelope is the caller's, so a rejection is a statement about their input.
-    let (records, root_new_id) = crate::session::cli::plan_import(export).map_err(|error| {
+    // An archive that names no profile adopts this server's default, which is the same profile
+    // `POST /v1/sessions` gives a body that names none.
+    let (records, root_new_id) = crate::session::cli::plan_import(
+        export,
+        Some(&state.shared.default_profile),
+        crate::session::cli::EndpointOverride::Refused,
+    )
+    .map_err(|error| {
         ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,

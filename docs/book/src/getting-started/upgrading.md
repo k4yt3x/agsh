@@ -2,6 +2,49 @@
 
 Most upgrades are a binary swap: replace the old executable with the new one and carry on. This page covers the ones that are not.
 
+## 0.43 to 0.44
+
+A binary swap, and the store migrates itself as promised below. Two behaviour changes are worth
+knowing before you resume an existing session, and two more if you run `meka serve` or `meka acp`.
+
+**A resume now starts at the level the session recorded.** Both CLI hosts do this: the REPL and
+`meka --oneshot -c` / `-r`. The scripted one is where a silent change matters most, since a
+`--oneshot` run that passes no `--permission` used to start at the config default and now starts at
+whatever the session was last set to. A session you created with `--permission unrestricted` comes
+back at `unrestricted` without the flag. Before, the row said one thing and the run did another;
+every other surface already read the row, and these two were the ones that did not. Pass
+`--permission` on the resume to move it. A level that is no longer in `[permissions].enabled` is not
+granted: the session drops to the configured default with a warning.
+
+**A session now runs on the provider profile it was created with.** Every existing session is
+recorded as running on your current default profile, which is what they were in fact running on, so
+nothing moves. From here `meka -p openai` then `meka -c` stays on `openai`. If nothing could be
+resolved when the migration ran (no profile configured yet), sessions are left without one and say
+so; resume such a session once with `--provider <name>` to record it. The migration says which
+profile it recorded and on how many sessions; run once with `-v` if you want to see it.
+
+**`GET /v1/info` no longer returns `provider` or `model`.** Read them from `GET /v1/providers`
+instead, which lists every configured profile with its `name`, its `type` (the backend), its
+`model`, and `active: true` on the one a session gets when it names none. The old fields held the
+default profile's *backend* under the name `provider`, while `provider` on `POST /v1/sessions` names
+a *profile*, so a client that read one and posted it to the other got a 422. They were duplicates of
+the `active` row besides.
+
+**`meka acp` and `meka serve` refuse `-c`, `-r`, `--model` and `--base-url`.** All four name one
+run's session, and a long-lived host has no such thing: it creates one per `session/new` or per
+`POST /v1/sessions`, each naming its own profile. They used to be accepted and quietly misapplied,
+which was worse than it sounds: `GET /v1/info` went on reporting a `--model` no session ever used,
+and `-c` / `-r` switched off the default-profile check a host with no default needs most. Set
+`model` and `base_url` on the profile in `config.toml`, or name a `provider` per session. `--provider`
+is still accepted, because it selects which configured profile the host defaults to, which is a
+property of the host rather than of one session.
+
+Also on the HTTP side, and not a break: `PATCH /v1/sessions/{id}` with a body naming only a provider
+now works on a session that is not loaded, which is how you move one whose profile has left
+`config.toml`. It takes the session lock to do it, so if you run more than one `meka` on the same
+store, send it to whichever process has the session; another one answers `409` `session-locked`
+rather than moving a row the running host would ignore.
+
 ## 0.42 to 0.43
 
 Nothing to do. Start 0.43 and it brings the store forward itself, on the first open, before anything reads it.

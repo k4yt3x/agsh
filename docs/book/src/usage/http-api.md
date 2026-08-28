@@ -28,6 +28,8 @@ scopes = ["sessions:r", "sessions:w"]
 
 On startup the server logs the bind address and begins accepting requests. All endpoints (except health probes and OpenAPI docs) require a valid `Authorization: Bearer <token>` header.
 
+Four flags are refused rather than ignored: `-c`, `-r`, `--model` and `--base-url`. All four name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own provider profile. Set `model` and `base_url` on the profile in `config.toml` instead, or pass `provider` on the create request. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
+
 > **TLS**: `meka serve` speaks plain HTTP. For production, front it with a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel).
 
 ## Quick example
@@ -103,23 +105,56 @@ A session is a persistent conversation with its own working directory, permissio
 POST   /v1/sessions           Create a session
 GET    /v1/sessions           List sessions (paginated)
 GET    /v1/sessions/{id}      Get session details
-PATCH  /v1/sessions/{id}      Update permission or cwd
+PATCH  /v1/sessions/{id}      Update permission, cwd or provider
 DELETE /v1/sessions/{id}      Close and clean up
 POST   /v1/sessions/{id}/fork Branch a copy off a session
 ```
 
-When creating a session, specify the working directory and optionally a permission level and capabilities:
+When creating a session, specify the working directory and optionally a permission level, a provider
+profile, and capabilities:
 
 ```json
 {
   "cwd": "/home/user/project",
   "permission": "workspace",
+  "provider": "work",
   "capabilities": {
     "supports_reasoning_stream": false,
     "supports_permission_prompts": true
   }
 }
 ```
+
+`provider` names a profile in the server's `config.toml`; `GET /v1/providers` lists them, and a name
+that is not configured is a `422`. Omitted, it is the server's own default profile. The session keeps
+it for the rest of its life and every session response echoes it back as `provider`, so a client can
+confirm which account a session bills.
+
+To move a live session onto another profile, `PATCH /v1/sessions/{id}` with `{"provider": "other"}`.
+That rewrites the session's row, so it holds for a resume from any surface rather than for this
+request. Switching mid-conversation is allowed and is your call: a thinking block is tagged with the
+provider that produced it and is not replayed to a different one, so from the next turn the model no
+longer sees the reasoning recorded under the old provider. Like the other `PATCH` fields, it is a
+`409` when a turn is already in flight; cancel first. (One admitted between the check and the agent
+swap makes the swap wait for that turn rather than fail, so the request can take as long as the turn
+does. The row has already moved by then, and the agent follows when the turn ends.)
+
+A `PATCH` naming a provider **restates the session's whole binding**, so it clears any `model` or
+`base_url` override the session was carrying. That is deliberate: an override belonging to the
+profile you are leaving has no business following you onto one that may not have that model. It
+applies even when the body names the profile the session is already on, which is how you clear a
+stale override without moving profile.
+
+If you run more than one `meka` on the same store, send the `PATCH` to whichever process has the
+session. A body naming only a provider is the one `PATCH` that works on a session this server has
+not loaded, and it takes the session lock to do it, so a session another process is running answers
+`409` `session-locked` rather than moving a row that process would go on ignoring. Only the host
+holding a session may change what it runs on.
+
+A body naming **only** `provider` is also the rescue for a session whose profile has left
+`config.toml`: it moves the row without building an agent, so it works on a session that cannot
+currently run. Adding `permission` or `cwd` to the same body loses that, because those need a loaded
+session and loading one is exactly what fails; send the provider on its own first.
 
 The `cwd` field is validated on create and patch:
 
@@ -159,9 +194,28 @@ The body is optional and inherits everything by default. The only field is `cwd`
 { "cwd": "/home/user/other-project" }
 ```
 
-Permission and capabilities are inherited and remain changeable afterwards via
+Permission, capabilities and the provider profile are inherited and remain changeable afterwards via
 `PATCH /v1/sessions/{id}`. Sub-agent child transcripts are not copied, and the fork records no link
 back to its source. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
+
+#### Importing an archive
+
+`POST /v1/sessions/import` recreates a session tree from a `meka session export` archive under fresh
+ids. Two rules differ from the CLI's `meka session import`, both because the archive arrives as
+request data rather than from the operator's own disk:
+
+- **A pinned endpoint is refused.** An archive whose session carries a `base_url_override` gets a
+  `422` naming the session. Honouring it would let anyone holding `sessions:w` point a session at a
+  URL of their choosing, and the profile's stored credential would be sent there on the next turn.
+  Import such an archive with `meka session import`, where the archive and the config are both
+  yours.
+- **A profile is adopted, not carried blindly.** An archive naming no provider profile takes the
+  server's default, the same one `POST /v1/sessions` applies to a body with no `provider`. If the
+  server has no default to give, the import is refused rather than creating a session that cannot
+  run.
+
+Everything else about the archive is honoured as the CLI honours it; see
+[Exporting a Session](./sessions.md#exporting-a-session).
 
 #### Detecting an in-flight turn
 
@@ -211,8 +265,11 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
        \"images\": [{\"media_type\": \"image/png\", \"data\": \"$(base64 -w0 diagram.png)\"}]}"
 ```
 
-- **Requires vision.** Attaching an image to a profile with `vision = false` returns `422`. Check
-  `vision` on [`GET /v1/info`](#discovery-endpoints) before sending one.
+- **Requires vision.** Attaching an image to a session whose profile has `vision = false` returns
+  `422`. The check is per session, from the profile that session recorded, so a session created with
+  `provider` or moved by a `PATCH` follows that profile rather than the server default. `vision` on
+  [`GET /v1/info`](#discovery-endpoints) reports the *default* profile's flag, which answers for a
+  session created without naming one.
 - **`media_type` is a hint.** If it doesn't name a supported format, the payload's magic bytes are
   used instead, so `application/octet-stream` still works for a real image.
 - **Formats.** PNG, JPEG, GIF, WebP, and BMP pass through; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS,
@@ -618,8 +675,9 @@ These endpoints help clients inspect the server's capabilities at runtime.
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
-| `GET /v1/health/ready` | None | Readiness probe: 200 if the provider and DB are healthy and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `provider_configured`, and `mcp_servers_healthy` (boolean, no server names). |
-| `GET /v1/info` | Any read scope | Server version, model, capabilities. `vision` reports whether `POST /turn` accepts [image attachments](#image-attachments) |
+| `GET /v1/health/ready` | None | Readiness probe: 200 if the DB is healthy, at least one provider profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `provider_configured`, and `mcp_servers_healthy` (boolean, no server names). **`provider_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
+| `GET /v1/providers` | Any read scope | Configured provider profiles: `name`, `type`, `model`, and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
+| `GET /v1/info` | Any read scope | Server version and permission surface. `vision` reports whether the *default* profile accepts [image attachments](#image-attachments); a session on another profile follows that one. Carries no provider or model: `GET /v1/providers` reports both per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |
 | `GET /v1/openapi.json` | None, and off unless `[serve].docs` is set | OpenAPI 3 spec |
@@ -813,7 +871,7 @@ Key points:
 |--------|------|------|-------------|
 | GET | `/v1/health/live` | None | Liveness probe |
 | GET | `/v1/health/ready` | None | Readiness probe |
-| GET | `/v1/info` | read | Server info |
+| GET | `/v1/info` | read | Server version and permission surface |
 | GET | `/v1/skills` | read | Installed skills |
 | GET | `/v1/mcp` | read | MCP server status |
 | POST | `/v1/sessions` | `sessions:w` | Create session |

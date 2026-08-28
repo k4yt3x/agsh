@@ -51,11 +51,28 @@ use crate::{
     agent::{Agent, AgentOptions},
     config::ResolvedConfig,
     permission::SharedPermission,
-    provider::{AuthCredential, ProviderBuilder},
     repl::ReplEvent,
     session::{SessionManager, TokenStore},
     tools::ToolRegistry,
 };
+
+/// A failure whose message has already been printed in meka's own format.
+///
+/// Returning the error itself would print it twice, since `main`'s `anyhow::Result` prints whatever
+/// it is given; returning `Ok(())` is what the interactive host used to do, which told every
+/// supervisor and wrapper script that a session it had refused to open was a successful run. This
+/// carries the exit status and nothing else, so the host keeps its own rendering (colour, and the
+/// provider hint underneath) and still fails.
+#[derive(Debug)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("already reported")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -105,6 +122,14 @@ fn main() -> anyhow::Result<()> {
     {
         std::process::exit(130);
     }
+
+    // Same shape, one line further along: the host has printed this one already, so all that is
+    // left of it is the status. Both arms sit below `release_process_grants` for that reason.
+    if let Err(error) = &result
+        && error.downcast_ref::<AlreadyReported>().is_some()
+    {
+        std::process::exit(1);
+    }
     result
 }
 
@@ -122,14 +147,53 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     {
         let cli_ref = &cli;
         return runtime.block_on(async move {
-            let session_manager = SessionManager::open(None).await?;
+            // Read off disk rather than from a `ResolvedConfig` this path deliberately does not
+            // build. Opening the store is what migrates it, and a store carried forward by
+            // `meka provider list` must record the same profile one carried forward by `meka`
+            // would.
+            //
+            // Two values, and the difference matters. The ledger takes the one `default_provider`
+            // picks, ignoring `--provider`: it stamps a profile onto every session that predates
+            // meka recording one, once and irreversibly, and that must not turn on a flag the
+            // first invocation after an upgrade happened to carry. `meka session import` takes the
+            // flag-aware one, where choosing per run is exactly what `--provider` is for.
+            // An unreadable `config.toml` is carried to the ledger as itself rather than collapsing
+            // into "nothing resolved", because the two must not produce the same write: the adopt
+            // step runs once and irreversibly, so a parse error used to strand every existing
+            // session against no profile with nothing said. It is not turned into a hard error
+            // here, though, because `meka mcp remove` and `meka provider remove` edit the raw
+            // document through `toml_edit` and are how a user *repairs* such a file; refusing every
+            // subcommand would close the only door out. The migration refuses instead, and only
+            // when it actually has rows to stamp.
+            let (default_profile, context) = match config::default_profile_on_disk(None) {
+                Ok(adopted) => {
+                    let flag_aware = config::default_profile_on_disk(cli_ref.provider.as_deref())?;
+                    (
+                        flag_aware,
+                        session::migrations::Context::adopting(adopted.as_deref()),
+                    )
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "config.toml could not be read, so this run cannot say which profile \
+                         anything should adopt: {}",
+                        error
+                    );
+                    (None, session::migrations::Context::on_unreadable_config())
+                }
+            };
+            let session_manager = SessionManager::open(None, &context).await?;
             match command {
                 cli::Command::Provider { action } => {
-                    let token_store = session_manager.token_store();
-                    provider::cli::run(action, &token_store).await
+                    provider::cli::run(action, &session_manager).await
                 }
                 cli::Command::Session { action } => {
-                    crate::session::cli::run_session_subcommand(&session_manager, action).await
+                    crate::session::cli::run_session_subcommand(
+                        &session_manager,
+                        action,
+                        default_profile.as_deref(),
+                    )
+                    .await
                 }
                 cli::Command::History { action } => {
                     run_history_subcommand(&session_manager, action).await
@@ -175,6 +239,36 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             "`-c` no longer takes a session id; use `-r {prompt}` to resume that session, \
              or `-c` alone to continue the most recent one"
         ));
+    }
+
+    // Refused rather than ignored. These four name *this run's session*, and a long-lived host has
+    // no such thing: it creates a session per `session/new` or `POST /v1/sessions`, each naming its
+    // own profile. Accepting them silently was worse than it sounds, because `GET /v1/info` went on
+    // reporting a `--model` no session ever used, and `-c` / `-r` set `session_resume`, which
+    // switches off the default-profile check a host with no default needs most.
+    //
+    // `--provider` is deliberately not in this list: it selects which configured profile the host
+    // defaults to, which is a property of the host rather than of one session.
+    if acp_mode || serve_mode {
+        let host = if acp_mode { "acp" } else { "serve" };
+        let offending = [
+            (cli.continue_last, "--continue"),
+            (cli.resume.is_some(), "--resume"),
+            (cli.model.is_some(), "--model"),
+            (cli.base_url.is_some(), "--base-url"),
+        ]
+        .into_iter()
+        .filter_map(|(given, flag)| given.then_some(flag))
+        .collect::<Vec<_>>();
+        if !offending.is_empty() {
+            anyhow::bail!(
+                "`meka {}` does not take {}: they name one run's session, and this host creates \
+                 one per request. Set `model` / `base_url` on the profile, or name a `provider` \
+                 per session.",
+                host,
+                offending.join(", ")
+            );
+        }
     }
 
     let mut config = ResolvedConfig::from_cli(&cli);
@@ -287,7 +381,11 @@ async fn async_main(
         crate::sandbox::WarnContext::Startup,
     );
 
-    let session_manager = SessionManager::open(None).await?;
+    let session_manager = SessionManager::open(
+        None,
+        &session::migrations::Context::adopting(config.configured_default_profile.as_deref()),
+    )
+    .await?;
     let token_store = session_manager.token_store();
 
     // Opt-in only, and never by size. Conversation history is not reproducible, and a byte budget
@@ -389,8 +487,20 @@ async fn async_main(
 #[derive(Clone)]
 pub struct SharedDeps {
     pub config: Arc<ResolvedConfig>,
+    /// The profile a session created here takes when it names none.
+    ///
+    /// A `String` and not the `Option` on [`ResolvedConfig`], because `build_shared_deps` runs
+    /// `validate()` first and a host that reaches this point has one. Resolving it once, where
+    /// that guarantee is established, is what lets `session/new` and `POST /v1/sessions` take
+    /// it without a branch for a state they cannot observe; both used to carry one, and
+    /// neither could be tested or reached.
+    pub default_profile: String,
     pub session_manager: SessionManager,
-    pub provider: Arc<dyn provider::Provider>,
+    /// Providers by profile, built on demand.
+    ///
+    /// A registry rather than one `Arc<dyn Provider>` because a session records the profile it
+    /// runs with, and one `meka serve` may host sessions naming different ones.
+    pub providers: Arc<provider::ProviderRegistry>,
     pub mcp_manager: Option<Arc<mcp::McpClientManager>>,
     pub mcp_context: Arc<mcp::McpClientContext>,
     pub skills: Arc<skills::SkillCache>,
@@ -425,6 +535,210 @@ fn warn_on_stale_tool_config(
     );
 }
 
+/// What a session runs on: its profile, and any per-session override of that profile's model or
+/// endpoint.
+///
+/// One door, so every place that runs a turn answers the question the same way. A session that
+/// exists names its binding on its row and that is what it gets; anything else would move the
+/// conversation to a provider it was not having, drop the reasoning it recorded (a thinking block
+/// is not replayed across providers) and bill a different account.
+///
+/// `None` is a session that does not exist yet, which takes the configured default and this run's
+/// `--model` / `--base-url`, and records all three the moment its row is written.
+///
+/// Takes the three values it decides between rather than the whole [`ResolvedConfig`], so the
+/// decision can be exercised on its own. Which of a recorded binding and the process default wins
+/// is the entire question here, and a door that could only be reached through a fully resolved
+/// config could not be asked it directly.
+pub async fn resolve_session_provider(
+    session_manager: &SessionManager,
+    // The process default, or the reason there is not one. A reason rather than a bare absence
+    // because it is the only useful thing to say when this falls through: "no profile could be
+    // picked" is not actionable, while "multiple profiles configured (work, side); run
+    // `meka provider use <name>`" is. `validate()` no longer raises it for a resume, so this is
+    // where it surfaces.
+    default_profile: std::result::Result<&str, &str>,
+    requested_model: Option<&str>,
+    requested_base_url: Option<&str>,
+    session_id: Option<uuid::Uuid>,
+) -> anyhow::Result<crate::session::SessionProvider> {
+    if let Some(session_id) = session_id
+        && let Some(recorded) = session_manager.recorded_provider(session_id).await?
+    {
+        return Ok(recorded);
+    }
+    Ok(crate::session::SessionProvider {
+        profile: default_profile
+            .map_err(|reason| anyhow::anyhow!("{}", reason))?
+            .to_string(),
+        model_override: requested_model.map(str::to_string),
+        base_url_override: requested_base_url.map(str::to_string),
+    })
+}
+
+/// [`resolve_session_provider`] for a caller that has a whole [`ResolvedConfig`] to hand.
+pub async fn provider_for_config(
+    session_manager: &SessionManager,
+    config: &ResolvedConfig,
+    session_id: Option<uuid::Uuid>,
+) -> anyhow::Result<crate::session::SessionProvider> {
+    resolve_session_provider(
+        session_manager,
+        // Exactly one of the two is set; see `select_active_profile`. The fallback text is for a
+        // shape that pairing rules out rather than for a case anyone expects to hit.
+        config.active_profile.as_deref().ok_or_else(|| {
+            config
+                .provider_error
+                .as_deref()
+                .unwrap_or("no provider profile is configured; run `meka provider add`")
+        }),
+        config.requested_model.as_deref(),
+        config.requested_base_url.as_deref(),
+        session_id,
+    )
+    .await
+}
+
+/// The profile a session records, when `config.toml` no longer has it.
+///
+/// The one failure `--provider` is the fix for, and the only one worth naming a session in a hint
+/// about: a profile that is configured but unusable (no stored credential, an endpoint that
+/// refuses) is not moved by repinning the row.
+///
+/// The recorded name is compared against the configured set and nothing else, with no test for the
+/// empty one a migrated store can hold. `""` is a name that resolves to nothing, which is exactly
+/// what this asks, so it answers correctly without this function having to know where it came
+/// from.
+///
+/// The name itself is not returned, because nothing needs it: the refusal already printed names the
+/// profile, and the hint this gates adds only the repin command.
+///
+/// A read failure answers `false`: this runs only to decorate an error that has already been
+/// printed, and failing the process over the decoration would replace a useful message with a
+/// useless one.
+async fn recorded_profile_is_gone(
+    session_manager: &SessionManager,
+    config: &ResolvedConfig,
+    session_id: uuid::Uuid,
+) -> bool {
+    match session_manager.recorded_provider(session_id).await {
+        Ok(Some(binding)) => !config.providers.contains_key(&binding.profile),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                "could not read session {}'s recorded profile for the setup hint: {}",
+                session_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Turn a session's binding into the provider it names and the per-profile facts that come with it.
+///
+/// The one producer of [`agent::ResolvedBinding`], so building a session and moving one
+/// mid-conversation cannot disagree about what a profile means. Before this existed, the window and
+/// the vision flag were read once per process from the *default* profile: a session pinned to a
+/// 32k profile gauged itself against the default's window, so auto-compaction never fired and the
+/// provider rejected the turn instead.
+pub async fn resolved_binding(
+    providers: &provider::ProviderRegistry,
+    binding: crate::session::SessionProvider,
+) -> anyhow::Result<agent::ResolvedBinding> {
+    let (provider, settings) = providers
+        .build(&binding.profile, &binding.overrides())
+        .await?;
+    Ok(agent::ResolvedBinding {
+        provider,
+        // The documented default, not a guess at the model: meka does not infer a window from a
+        // model name, so a profile that states none gets the one value the docs name.
+        context_window: settings
+            .context_window
+            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW),
+        vision: settings.vision,
+        binding,
+    })
+}
+
+/// Whether a session's profile accepts image input, answered without building its provider.
+///
+/// For the hosts that must decide whether to admit an attachment before a turn exists. A profile
+/// that cannot resolve answers `false`: that session's next turn is going to fail on the same
+/// profile, and taking the attachment first would only add a second failure further in.
+///
+/// Reads the same `ProfileSettings` [`resolved_binding`] does, so the answer a host caches cannot
+/// drift from the one the agent was built with.
+pub fn binding_accepts_images(
+    providers: &provider::ProviderRegistry,
+    binding: &crate::session::SessionProvider,
+) -> bool {
+    providers
+        .settings(&binding.profile, &binding.overrides())
+        .map(|settings| settings.vision)
+        .unwrap_or(false)
+}
+
+/// A session's context window, answered without building its provider.
+///
+/// The sibling of [`binding_accepts_images`], for a host that reports occupancy without reaching
+/// through the runtime mutex an in-flight turn is holding. Same source, so the reported window is
+/// the one the agent gauges against.
+/// `None` for a binding that cannot resolve, which is not the same as the documented default: that
+/// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
+/// invites a client to divide by a number meka has no reason to believe.
+pub fn binding_context_window(
+    providers: &provider::ProviderRegistry,
+    binding: &crate::session::SessionProvider,
+) -> Option<u64> {
+    providers
+        .settings(&binding.profile, &binding.overrides())
+        .ok()
+        .map(|settings| {
+            settings
+                .context_window
+                .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW)
+        })
+}
+
+/// The provider registry for the two CLI hosts (the REPL and `--oneshot`), built the way
+/// [`build_shared_deps`] builds ACP's and `serve`'s so all four resolve a profile identically.
+fn cli_provider_registry(
+    config: &ResolvedConfig,
+    token_store: TokenStore,
+    session_stats: Arc<stats::SessionStats>,
+) -> anyhow::Result<Arc<provider::ProviderRegistry>> {
+    let providers = Arc::new(provider::ProviderRegistry::new(
+        config,
+        token_store,
+        session_stats,
+    ));
+
+    // Debug-only, and the same install `run_acp` and `run_serve` make. It reaches the REPL and
+    // `--oneshot` because the questions two `meka` processes raise about each other -- who holds a
+    // session's lock while a first turn runs, whose background task the other sweeps -- are
+    // questions about the CLI entry point, and no harness could ask them while the only scriptable
+    // surfaces were ACP and HTTP.
+    #[cfg(debug_assertions)]
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+        let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
+        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
+        providers.install_scripted(Arc::new(crate::provider::mock::MockProvider::from_rounds(
+            rounds,
+        )));
+    }
+
+    Ok(providers)
+}
+
+/// [`resolve_session_provider`] for the hosts that carry a [`SharedDeps`].
+pub async fn provider_for_session(
+    shared: &SharedDeps,
+    session_id: Option<uuid::Uuid>,
+) -> anyhow::Result<crate::session::SessionProvider> {
+    provider_for_config(&shared.session_manager, &shared.config, session_id).await
+}
+
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
 /// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
@@ -432,41 +746,28 @@ fn warn_on_stale_tool_config(
 pub async fn build_shared_deps(
     config: ResolvedConfig,
     session_manager: SessionManager,
-    credential: AuthCredential,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<SharedDeps> {
     config.validate()?;
+    // The one place the "a long-lived host has a default profile" guarantee becomes a type.
+    // `validate()` has just enforced it: `validate_default_profile` is skipped only for a resume,
+    // and `-c` / `-r` are refused for both hosts precisely so that exception cannot apply here.
+    let default_profile = config.active_profile.clone().ok_or_else(|| {
+        anyhow::anyhow!(config.provider_error.clone().unwrap_or_else(|| {
+            "no provider profile is configured; run `meka provider add`".to_string()
+        }))
+    })?;
 
-    let provider_name = config
-        .provider_name
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("provider_name missing after validation"))?;
-    let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
-    let token_store = session_manager.token_store();
-
-    let model = config
-        .model
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("model missing after validation"))?;
     let session_stats = Arc::new(stats::SessionStats::default());
-    let provider = ProviderBuilder::new(provider_name, credential, model)
-        .base_url(config.base_url.clone())
-        .client_id(config.client_id.clone())
-        .credential_key(config.active_profile.clone())
-        .oauth_token_url(config.oauth_token_url.clone())
-        .token_store(if needs_token_store {
-            Some(Arc::new(token_store))
-        } else {
-            None
-        })
-        .thinking(config.thinking, config.thinking_budget_tokens)
-        .device_id(config.device_id.clone())
-        .effort(config.effort.clone())
-        .redact_thinking(config.redact_thinking)
-        .max_output_tokens(config.max_output_tokens)
-        .session_stats(Some(Arc::clone(&session_stats)))
-        .build()?;
+    // Nothing is built here. The registry resolves a profile and loads its credential when a
+    // session first asks, because which profiles this process will need is a property of the
+    // sessions it ends up serving rather than of its configuration.
+    let providers = Arc::new(provider::ProviderRegistry::new(
+        &config,
+        session_manager.token_store(),
+        Arc::clone(&session_stats),
+    ));
 
     let sandbox_capability: crate::sandbox::SandboxCapability = match &config.backend_probe {
         crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
@@ -496,9 +797,6 @@ pub async fn build_shared_deps(
     );
     warn_on_stale_tool_config(&config, &builtin_filter);
 
-    let context_window = config
-        .context_window
-        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -506,7 +804,6 @@ pub async fn build_shared_deps(
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
         compact_checkpoint: config.compact_checkpoint,
-        context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_grace: config.mcp_grace,
         system_prompt_override: None,
@@ -522,8 +819,9 @@ pub async fn build_shared_deps(
 
     Ok(SharedDeps {
         config: Arc::new(config),
+        default_profile,
         session_manager,
-        provider,
+        providers,
         mcp_manager,
         mcp_context,
         skills,
@@ -546,7 +844,10 @@ struct AgentAssembly<'a> {
     sandbox_backend: crate::config::SandboxBackend,
     backend_probe: crate::sandbox::BackendProbe,
     session_manager: SessionManager,
-    provider: Arc<dyn provider::Provider>,
+    /// The whole binding rather than the provider and its profile separately, because
+    /// [`assemble_agent`] has to publish it: the sub-agent and `context_*` tools hold a handle so
+    /// a mid-session switch reaches them.
+    resolved: agent::ResolvedBinding,
     mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
     skills: Arc<skills::SkillCache>,
     /// Whether this agent gets `skill_write` / `skill_delete`, from `[skills] agent_managed`.
@@ -584,6 +885,12 @@ struct AgentAssembly<'a> {
     /// handle, so a caller wanting to read it later has to supply it rather than adopt one after
     /// the fact.
     context_overhead: Arc<std::sync::atomic::AtomicU64>,
+    /// The live window, supplied for the same reason `context_tokens` is: the host's own gauge --
+    /// the REPL prompt indicator, ACP's `usage_update` -- exists before the agent and must be the
+    /// same cell rather than a copy re-stored by hand next to every provider switch. `serve` and
+    /// `--oneshot` have no such gauge and pass a throwaway; `serve` takes the handle back out of
+    /// the assembled agent instead, and `--oneshot` prints one answer and exits.
+    context_window: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Per-session agent assembly used by both the ACP session builder and the REPL's
@@ -592,10 +899,13 @@ struct AgentAssembly<'a> {
 /// `agent_spawn` and the MCP resource meta-tools, attaches the registry to the MCP manager, and
 /// finally constructs the `Agent` itself.
 ///
-/// **MCP attach-before-connector invariant**: the caller is expected to either (a) already have run
-/// `start_connector` (ACP path: `build_shared_deps` does this once) or (b) call
-/// `start_connector` *after* this returns (REPL path). Either way, the registry must be attached
-/// before any connector activity, so initial tool-list discoveries reach this session's registry.
+/// The order this runs in relative to `start_connector` does not matter. `build_shared_deps` runs
+/// the connector once for ACP and `serve`, before any session exists; the REPL runs it after this
+/// returns. Either way every attached registry converges on the same tool set, because
+/// [`crate::mcp::McpClientManager::update_server_tools`] writes the snapshot before fanning out and
+/// [`crate::mcp::McpClientManager::attach_registry`] replays the whole of it. What a late attach
+/// costs is latency, not state: a session created while a slow server is still connecting sees that
+/// server's tools when it lands.
 async fn assemble_agent(
     bundle: AgentAssembly<'_>,
     shared_permission: SharedPermission,
@@ -633,15 +943,22 @@ async fn assemble_agent(
         (bundle.background.clone(), background_tasks.clone()),
     )?;
 
+    // Published before the tools that read it are registered, and handed to the agent below, which
+    // is its only writer. This is what makes `/provider` and its two siblings reach `agent_spawn`
+    // and the `context_*` gauge instead of moving the agent alone. The window cell comes from the
+    // caller, so the host's own gauge *is* this one rather than a copy it has to re-store.
+    let published_binding =
+        agent::PublishedBinding::new(&bundle.resolved, Arc::clone(&bundle.context_window));
+
     // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `agent_spawn`); `>= 1`
     // seeds the root's soft recursion budget. The `absolute_depth` starts at 0 for the root.
     if bundle.subagent_max_depth >= 1 {
         crate::tools::subagent::register_subagent_tools(
             &tool_registry,
             crate::tools::subagent::AgentSpawnTool {
-                provider: Arc::clone(&bundle.provider),
                 parent_permission: shared_permission.clone(),
                 tool_builder_params: crate::tools::subagent::ToolBuilderParams {
+                    live_binding: published_binding.clone(),
                     web_client: bundle.web_client.clone(),
                     sandbox_enabled: bundle.sandbox_enabled,
                     sandbox_capability: bundle.sandbox_capability.clone(),
@@ -686,7 +1003,7 @@ async fn assemble_agent(
         crate::tools::context::ContextGauge {
             used: Arc::clone(&bundle.context_tokens),
             overhead: Arc::clone(&bundle.context_overhead),
-            window: bundle.agent_options.context_window,
+            window: published_binding.window(),
             compact_at_percent: bundle
                 .agent_options
                 .auto_compact
@@ -704,13 +1021,12 @@ async fn assemble_agent(
         // specific one is called.
         crate::tools::mcp_resources::register_all(&tool_registry, Arc::clone(manager));
         // Attach this session's registry so the MCP connector and tools/list_changed handler
-        // propagate updates into it. Must happen before the connector kicks off; otherwise initial
-        // server-state updates miss the registry.
+        // propagate updates into it, and so it picks up whatever has already been discovered.
         manager.attach_registry(tool_registry.clone()).await;
     }
 
     let mut agent = Agent::new(
-        Arc::clone(&bundle.provider),
+        published_binding,
         tool_registry.clone(),
         bundle.session_manager.clone(),
         shared_permission,
@@ -743,8 +1059,15 @@ async fn assemble_agent(
 /// The returned `ToolRegistry` is the one already attached to the MCP manager; callers (the ACP
 /// `session/new` handler) keep a handle so they can pass it to
 /// [`crate::mcp::McpClientManager::detach_registry`] on `session/close`.
+// The other top-level agent-assembly entry point, and the same reasoning as
+// `create_agent_from_config`: splitting these up would force every host to pre-bundle unrelated
+// collaborators just to appease the arg-count lint.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_session_agent(
     shared: &SharedDeps,
+    // Which session this agent serves, or `None` for one that does not exist yet. It decides which
+    // provider profile the agent runs on: see `provider_for_session`.
+    session_id: Option<uuid::Uuid>,
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::workspace::SharedCwd,
@@ -755,7 +1078,16 @@ pub async fn build_session_agent(
     // because the `Agent` that writes it lives inside that mutex. `meka serve` retains both so
     // `GET /v1/sessions/{id}/context` never blocks on a turn.
     context_overhead: Arc<std::sync::atomic::AtomicU64>,
+    // The cell this session's window is published into, so a host reporting occupancy holds the
+    // same one the agent gauges against rather than a copy it re-stores on every switch.
+    context_window: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
+    let resolved = resolved_binding(
+        &shared.providers,
+        provider_for_session(shared, session_id).await?,
+    )
+    .await?;
+    let agent_options = shared.agent_options.clone();
     let bundle = AgentAssembly {
         schedule: shared.config.schedule.clone(),
         background: shared.config.background.clone(),
@@ -765,18 +1097,19 @@ pub async fn build_session_agent(
         sandbox_backend: shared.config.sandbox_backend,
         backend_probe: shared.config.backend_probe.clone(),
         session_manager: shared.session_manager.clone(),
-        provider: Arc::clone(&shared.provider),
+        resolved,
         mcp_manager: shared.mcp_manager.as_ref(),
         skills: shared.skills.clone(),
         skills_agent_managed: shared.config.skills_agent_managed,
         memories: shared.memories.clone(),
         builtin_filter: shared.builtin_filter.clone(),
-        agent_options: shared.agent_options.clone(),
+        agent_options,
         session_stats: Arc::clone(&shared.session_stats),
         subagent_max_depth: shared.config.subagent_max_depth,
         subagents: shared.config.subagents.clone(),
         context_tokens,
         context_overhead,
+        context_window,
     };
     assemble_agent(bundle, shared_permission, frontend, cwd, roots).await
 }
@@ -787,60 +1120,27 @@ pub async fn build_session_agent(
 #[allow(clippy::too_many_arguments)]
 async fn create_agent_from_config(
     config: &ResolvedConfig,
+    // The session this agent is for, or `None` for a fresh one. A resumed session runs on the
+    // profile it recorded, which is what keeps `meka -c` on the provider the conversation was had
+    // with.
+    session_id: Option<uuid::Uuid>,
     session_manager: SessionManager,
     shared_permission: SharedPermission,
-    token_store: TokenStore,
-    credential: AuthCredential,
+    providers: &Arc<provider::ProviderRegistry>,
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
     frontend: Arc<dyn frontend::Frontend>,
     cwd: crate::workspace::SharedCwd,
     session_stats: Arc<stats::SessionStats>,
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    context_window: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
-    let provider_name = config
-        .provider_name
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("provider_name missing after validation"))?;
-    let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
-
-    let model = config
-        .model
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("model missing after validation"))?;
-    let provider = ProviderBuilder::new(provider_name, credential, model)
-        .base_url(config.base_url.clone())
-        .client_id(config.client_id.clone())
-        .credential_key(config.active_profile.clone())
-        .oauth_token_url(config.oauth_token_url.clone())
-        .token_store(if needs_token_store {
-            Some(Arc::new(token_store))
-        } else {
-            None
-        })
-        .thinking(config.thinking, config.thinking_budget_tokens)
-        .device_id(config.device_id.clone())
-        .effort(config.effort.clone())
-        .redact_thinking(config.redact_thinking)
-        .max_output_tokens(config.max_output_tokens)
-        .session_stats(Some(Arc::clone(&session_stats)))
-        .build()?;
-
-    // Debug-only, and the same swap `run_acp` and `run_serve` make after `build_shared_deps`. It
-    // reaches the REPL and `--oneshot` because the questions two `meka` processes raise about each
-    // other -- who holds a session's lock while a first turn runs, whose background task the other
-    // sweeps -- are questions about the CLI entry point, and no harness could ask them while the
-    // only scriptable surfaces were ACP and HTTP.
-    #[cfg(debug_assertions)]
-    let provider = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
-        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
-        Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds))
-            as Arc<dyn provider::Provider>
-    } else {
-        provider
-    };
+    let resolved = resolved_binding(
+        providers,
+        provider_for_config(&session_manager, config, session_id).await?,
+    )
+    .await?;
 
     let sandbox_capability: crate::sandbox::SandboxCapability = match &config.backend_probe {
         crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
@@ -878,9 +1178,6 @@ async fn create_agent_from_config(
     // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
     // sub-agents to inherit `sandboxed_shell` / `context_messages` / the auto-compaction settings
     // via `Agent::new_subagent`. `user_instructions` is deliberately not among them.
-    let context_window = config
-        .context_window
-        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -888,7 +1185,6 @@ async fn create_agent_from_config(
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
         compact_checkpoint: config.compact_checkpoint,
-        context_window,
         user_instructions: config.user_instructions.clone(),
         mcp_grace: config.mcp_grace,
         // Parent builds its system prompt dynamically per-turn via context::build_system_prompt.
@@ -905,7 +1201,7 @@ async fn create_agent_from_config(
         sandbox_backend: config.sandbox_backend,
         backend_probe: config.backend_probe.clone(),
         session_manager: session_manager.clone(),
-        provider: Arc::clone(&provider),
+        resolved,
         mcp_manager,
         skills: skills.clone(),
         skills_agent_managed: config.skills_agent_managed,
@@ -919,6 +1215,7 @@ async fn create_agent_from_config(
         // The REPL reads occupancy through `/status`, which goes via the agent it owns outright;
         // nothing here needs a separate handle on the overhead counter.
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_window,
     };
     let (agent, _tool_registry) = assemble_agent(
         bundle,
@@ -936,10 +1233,10 @@ async fn create_agent_from_config(
 
     if let Some(manager) = mcp_manager {
         // Kick off the background connector. Each server's adapters are pushed through
-        // `manager.update_server_tools` and then fan out to every attached registry. Safe to call
-        // after any number of `attach_registry`s; idempotent on second call. (The ACP path does
-        // this once in `build_shared_deps`; the REPL path does it here, after `assemble_agent`
-        // has attached the single registry.)
+        // `manager.update_server_tools`, which records them and fans them out to every attached
+        // registry. Idempotent on second call. (The ACP path does this once in
+        // `build_shared_deps`; the REPL path does it here, after `assemble_agent` has attached the
+        // single registry.)
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(config));
     }
 
@@ -1242,25 +1539,6 @@ async fn run_oneshot(
     if prompt.trim().is_empty() {
         anyhow::bail!("the prompt must be a non-empty string");
     }
-    // `ask` has nowhere to ask from here: `oneshot_frontend` is built on a channel whose receiver
-    // is dropped, so every approval request fails to send and the tool is refused. Say so once,
-    // up front, rather than letting the run look like the model simply chose not to use its
-    // tools.
-    if config.permission == crate::permission::Permission::Ask {
-        tracing::warn!(
-            "permission is 'ask' but one-shot mode has no interactive prompt: every tool that \
-             needs approval will be denied. Use --permission workspace or unrestricted, or drop \
-             --oneshot."
-        );
-    }
-    let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
-    if config.permission == crate::permission::Permission::Read {
-        crate::sandbox::warn_if_sandbox_issues(
-            &crate::sandbox::SandboxState::from_config(&config),
-            crate::sandbox::WarnContext::InitialReadMode,
-        );
-    }
-    let credential = resolve_credential(&config, &token_store).await?;
     let session_stats = Arc::new(stats::SessionStats::default());
     // Oneshot has no REPL, so approval requests can't reach a human. The channel below is
     // intentionally disconnected on the receiver side: `ReplFrontend::request_permission`'s `send`
@@ -1284,25 +1562,58 @@ async fn run_oneshot(
             std::path::PathBuf::from(".")
         }),
     ));
+    // Resolved before the agent is built, not after: which session this is decides which provider
+    // profile the agent runs on and which level it runs at, and the agent carries both.
+    let ResumedSession {
+        mut session_id,
+        mut messages,
+        lock: _session_lock,
+        permission: start_permission,
+        repin,
+    } = resolve_session_resume(&session_manager, &config).await?;
+
+    let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions);
+    if start_permission == crate::permission::Permission::Read {
+        crate::sandbox::warn_if_sandbox_issues(
+            &crate::sandbox::SandboxState::from_config(&config),
+            crate::sandbox::WarnContext::InitialReadMode,
+        );
+    }
+    // `ask` has nowhere to ask from here: `oneshot_frontend` is built on a channel whose receiver
+    // is dropped, so every approval request fails to send and the tool is refused. Say so once,
+    // up front, rather than letting the run look like the model simply chose not to use its tools.
+    //
+    // Against the level the run actually starts at, which a resumed session brings with it, rather
+    // than against the configured default.
+    if start_permission == crate::permission::Permission::Ask {
+        tracing::warn!(
+            "permission is 'ask' but one-shot mode has no interactive prompt: every tool that \
+             needs approval will be denied. Use --permission workspace or unrestricted, or drop \
+             --oneshot."
+        );
+    }
+
+    let providers = cli_provider_registry(&config, token_store, Arc::clone(&session_stats))?;
+    // Before the agent, because the agent resolves the row: a repin that has not landed yet would
+    // build this run on the binding the session is leaving.
+    if let (Some(id), Some(binding)) = (session_id, repin) {
+        apply_session_repin(&session_manager, &providers, id, binding).await?;
+    }
     let agent = create_agent_from_config(
         &config,
+        session_id,
         session_manager.clone(),
         shared_permission,
-        token_store,
-        credential,
+        &providers,
         mcp_manager.as_ref(),
         oneshot_frontend,
         cwd,
         Arc::clone(&session_stats),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // `--oneshot` prints one answer and exits; nothing reads a live gauge.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
-
-    // `--continue` / `--resume` apply here just as they do interactively: run one turn against an
-    // existing conversation and exit. The lock is bound rather than dropped so it is held for the
-    // duration of the turn.
-    let (mut session_id, mut messages, _session_lock) =
-        resolve_session_resume(&session_manager, &config).await?;
 
     match run_turn_interruptible(
         &agent,
@@ -1398,18 +1709,24 @@ async fn run_interactive(
         }),
     ));
 
-    let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
-    if config.permission == crate::permission::Permission::Read {
+    // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
+    // before the first prompt, and before the permission cell exists because a resumed session
+    // brings its own level.
+    let ResumedSession {
+        mut session_id,
+        mut messages,
+        lock: resumed_lock,
+        permission: start_permission,
+        repin,
+    } = resolve_session_resume(&session_manager, &config).await?;
+
+    let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions);
+    if start_permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
             &crate::sandbox::SandboxState::from_config(&config),
             crate::sandbox::WarnContext::InitialReadMode,
         );
     }
-
-    // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
-    // before the first prompt.
-    let (mut session_id, mut messages, resumed_lock) =
-        resolve_session_resume(&session_manager, &config).await?;
 
     if !messages.is_empty() {
         match config.resume_show_recent {
@@ -1488,11 +1805,15 @@ async fn run_interactive(
     // hold it; the agent adopts the same atomic via `set_context_tokens`. Seeded with an
     // estimate when resuming so the gauge isn't blank until the first new turn measures the
     // context exactly.
-    // The same two-step the agent below uses, so the gauge and the compaction threshold can never
-    // disagree: the configured window, else the documented default.
-    let context_window = config
-        .context_window
-        .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
+    // A handle, seeded from the process default and corrected to the session's own window as soon
+    // as the agent below resolves it. It cannot be read from `config` and left alone: this session
+    // may be pinned to another profile, and `/provider` may move it again, and a prompt dividing by
+    // a window the agent is not gauging against contradicts `/status` on the very next line.
+    let context_window_gauge = Arc::new(std::sync::atomic::AtomicU64::new(
+        config
+            .session_context_window
+            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW),
+    ));
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     if !messages.is_empty() {
         context_tokens.store(
@@ -1500,48 +1821,34 @@ async fn run_interactive(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    let context_indicator = config
-        .show_context_in_prompt
-        .then(|| (Arc::clone(&context_tokens), context_window));
+    let context_indicator = config.show_context_in_prompt.then(|| {
+        (
+            Arc::clone(&context_tokens),
+            Arc::clone(&context_window_gauge),
+        )
+    });
 
     // Shared with reedline: the scheduler watcher sets it, `read_line` polls it and returns
     // `Signal::ExternalBreak` so a due job can interrupt an idle prompt.
     let schedule_wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let repl_wake = Arc::clone(&schedule_wake);
 
-    let repl_handle = tokio::task::spawn_blocking(move || {
-        repl::run_repl(
-            repl_permission,
-            show_path_in_prompt,
-            context_indicator,
-            input_style,
-            initial_turn_pending,
-            repl_sandbox_state,
-            input_sender,
-            agent_event_receiver,
-            repl_cwd,
-            repl_mcp_server_names,
-            repl_skill_roots,
-            repl_history_db_path,
-            repl_wake,
-            repl::CommandSpacing {
-                newline_after_prompt: config.newline_after_prompt,
-                newline_before_prompt: config.newline_before_prompt,
-            },
-        );
-    });
+    // What `/provider` reports and rewrites. Seeded through the same door the agent resolves with,
+    // so a resumed session shows the profile it recorded rather than the configured default. A
+    // session that cannot resolve one never reaches a prompt at all, so the default keeps the seed
+    // total.
+    let current_provider = Arc::new(std::sync::RwLock::new(match &repin {
+        // The repin has not been committed yet (it waits for the registry, below), but it is what
+        // the row will say by the time anything reads this cell.
+        Some(binding) => binding.profile.clone(),
+        None => provider_for_config(&session_manager, &config, session_id)
+            .await
+            .map(|binding| binding.profile)
+            .unwrap_or_default(),
+    }));
+    let repl_current_provider = Arc::clone(&current_provider);
+    let repl_configured_providers: Vec<String> = config.providers.keys().cloned().collect();
 
-    // Try to create the agent (may fail if config is incomplete)
-    let credential = match resolve_credential(&config, &token_store).await {
-        Ok(credential) => credential,
-        Err(error) => {
-            render::render_error(&error);
-            render::render_provider_setup_hint();
-            drop(agent_event_sender);
-            repl_handle.await?;
-            return Ok(());
-        }
-    };
     // A resumed session continues its lifetime `/status` totals; a fresh session (or a load
     // failure) starts empty.
     let session_stats = match session_id {
@@ -1557,32 +1864,96 @@ async fn run_interactive(
     // Kept back from the move below so the scheduler can read the *current* level rather than the
     // one this process started at. See the `run_due` call in the `Wake` arm.
     let scheduler_permission = shared_permission.clone();
+    // Held past agent construction, unlike the other hosts', because `/provider` rebuilds one
+    // mid-session and the cache is what makes the profile it left reusable when it comes back.
+    let providers =
+        match cli_provider_registry(&config, token_store.clone(), Arc::clone(&session_stats)) {
+            Ok(providers) => providers,
+            Err(error) => {
+                render::render_error(&error);
+                return Err(AlreadyReported.into());
+            }
+        };
+    // Before the agent, because the agent resolves the row: a repin that has not landed yet would
+    // build this run on the binding the session is leaving.
+    if let (Some(id), Some(binding)) = (session_id, repin)
+        && let Err(error) = apply_session_repin(&session_manager, &providers, id, binding).await
+    {
+        render::render_error(&error);
+        return Err(AlreadyReported.into());
+    }
     let mut agent = match create_agent_from_config(
         &config,
+        session_id,
         session_manager.clone(),
         shared_permission,
-        token_store.clone(),
-        credential,
+        &providers,
         mcp_manager.as_ref(),
         Arc::clone(&repl_frontend),
         Arc::clone(&cwd),
         Arc::clone(&session_stats),
         Arc::clone(&context_tokens),
+        // The prompt's own gauge, handed in rather than seeded and corrected: it *is* the cell the
+        // agent publishes into, so `/provider` cannot move one without the other.
+        Arc::clone(&context_window_gauge),
     )
     .await
     {
         Ok(agent) => agent,
         Err(error) => {
             render::render_error(&error);
-            render::render_provider_setup_hint();
-            drop(agent_event_sender);
-            repl_handle.await?;
-            return Ok(());
+            let gone = match session_id {
+                Some(id) => recorded_profile_is_gone(&session_manager, &config, id).await,
+                None => false,
+            };
+            // The default when there is one, so the suggested move is the profile the rest of this
+            // config already runs on. With no profile at all there is nowhere to move to, and the
+            // generic setup example is the more useful answer.
+            let move_to = config
+                .active_profile
+                .as_deref()
+                .or_else(|| config.providers.keys().next().map(String::as_str));
+            render::render_provider_setup_hint(session_id.filter(|_| gone).zip(move_to).map(
+                |(session_id, move_to)| render::MissingSessionProfile {
+                    session_id,
+                    move_to,
+                },
+            ));
+            return Err(AlreadyReported.into());
         }
     };
     // Point the agent's live context counter at the same atomic the REPL prompt holds, so the
     // prompt gauge tracks what the agent writes after each turn (and the resume seed above).
     agent.set_context_tokens(Arc::clone(&context_tokens));
+
+    // Spawned once there is an agent to answer it, which is what makes every refusal above final.
+    // Started before the agent, the prompt outlived a failed construction: the loop below never
+    // ran, so `/provider` -- the one way to move a session off a profile that has left
+    // `config.toml` -- was sent to nobody and waited for an answer that could not come, and the
+    // user was left typing into a shell that ignored them.
+    let repl_handle = tokio::task::spawn_blocking(move || {
+        repl::run_repl(
+            repl_permission,
+            show_path_in_prompt,
+            context_indicator,
+            input_style,
+            initial_turn_pending,
+            repl_sandbox_state,
+            input_sender,
+            agent_event_receiver,
+            repl_cwd,
+            repl_mcp_server_names,
+            repl_skill_roots,
+            repl_history_db_path,
+            repl_wake,
+            repl_current_provider,
+            repl_configured_providers,
+            repl::CommandSpacing {
+                newline_after_prompt: config.newline_after_prompt,
+                newline_before_prompt: config.newline_before_prompt,
+            },
+        );
+    });
 
     // One slot for the session lock from here on, whichever way the session was reached: the agent
     // fills it the moment it creates one, and a resumed session's lock -- taken above, before the
@@ -1682,6 +2053,80 @@ async fn run_interactive(
                         id,
                         error
                     );
+                }
+            }
+            // The row moves first. If recording the change failed but the agent had already
+            // switched, the next `meka -c` would silently go back to the old profile, which is the
+            // surprise this whole feature exists to remove.
+            ReplEvent::ProviderChange(name) => {
+                // A labelled block rather than `continue`, so every way out passes the `Done`
+                // below. Without it this was the one forwarded command that did not hand the
+                // prompt back, and the REPL thread painted the next prompt while this task was
+                // still deciding what to print: the confirmation, or the error, landed on top of
+                // the line the user had started typing.
+                'switch: {
+                    // Membership first, so a typo gets a message about a name the user just typed
+                    // rather than `look_up_profile`'s, which is written for a session whose
+                    // recorded profile went missing and speaks about restoring `config.toml`.
+                    if !config.providers.contains_key(&name) {
+                        render::render_error(&format!(
+                            "no provider profile named '{}' (configured: {})",
+                            name,
+                            config
+                                .providers
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        break 'switch;
+                    }
+                    // The profile as configured, with no overrides: `/provider` is the user
+                    // restating the whole binding, so a model override left over from another
+                    // profile does not ride along onto one that may not have that model.
+                    let resolved = match resolved_binding(
+                        &providers,
+                        crate::session::SessionProvider::from(name.clone()),
+                    )
+                    .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            render::render_error(&error);
+                            break 'switch;
+                        }
+                    };
+                    if let Some(id) = session_id {
+                        match session_manager
+                            .set_recorded_provider(id, &resolved.binding)
+                            .await
+                        {
+                            // No row: the session was deleted from under this process, so there is
+                            // nothing to switch and the next turn will fail on its own terms.
+                            Ok(false) => {
+                                render::render_error(&format!("session {} no longer exists", id));
+                                break 'switch;
+                            }
+                            Ok(true) => {}
+                            Err(error) => {
+                                render::render_error(&error);
+                                break 'switch;
+                            }
+                        }
+                    }
+                    // The prompt gauge is the cell the agent publishes into, so this moves it too.
+                    agent.set_provider(resolved);
+                    match current_provider.write() {
+                        Ok(mut guard) => *guard = name.clone(),
+                        Err(poisoned) => *poisoned.into_inner() = name.clone(),
+                    }
+                    eprintln!("Provider profile set to: {}", name);
+                }
+                if agent_event_sender
+                    .send(repl::AgentToReplEvent::Done)
+                    .is_err()
+                {
+                    break;
                 }
             }
             ReplEvent::Wake => {
@@ -2330,14 +2775,29 @@ async fn run_interactive(
                         let snap = agent.session_stats_snapshot();
                         let (context_tokens, context_window) = agent.context_usage();
                         let effort = agent.resolved_effort();
+                        // This session's profile, not the process default's. Reading `config` here
+                        // reported the default profile's model and backend beside a window and an
+                        // effort that came from the session's, so `/status` and `/provider`
+                        // contradicted each other on any resume onto a non-default profile.
+                        let binding = agent.provider_binding().clone();
+                        let settings = providers.settings(&binding.profile, &binding.overrides());
                         render::render_session_status(
                             &snap,
                             &render::ModelStatus {
-                                model: config.model.as_deref(),
-                                profile: config.active_profile.as_deref(),
-                                backend: config.provider_name.as_deref(),
+                                model: settings
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|settings| settings.model.as_deref()),
+                                profile: Some(binding.profile.as_str()),
+                                backend: settings
+                                    .as_ref()
+                                    .ok()
+                                    .map(|settings| settings.backend.as_str()),
                                 effort: effort.as_deref(),
-                                thinking: config.thinking,
+                                thinking: settings
+                                    .as_ref()
+                                    .map(|settings| settings.thinking)
+                                    .unwrap_or_default(),
                             },
                             messages.len(),
                             context_tokens,
@@ -2634,7 +3094,13 @@ async fn run_tools_subcommand(
 
             // Build with no filter so the catalogue carries every tool's hardcoded level; overlay
             // the real filter for status/source.
-            let session_manager = SessionManager::open(None).await?;
+            let session_manager = SessionManager::open(
+                None,
+                &session::migrations::Context::adopting(
+                    config.configured_default_profile.as_deref(),
+                ),
+            )
+            .await?;
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
             let sandbox_capability = match &config.backend_probe {
@@ -2689,12 +3155,18 @@ async fn run_tools_subcommand(
                 crate::tools::context::ContextGauge {
                     used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     overhead: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                    window: 0,
+                    window: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     compact_at_percent: None,
                 },
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 config.compact_checkpoint,
-                SessionManager::open(None).await?,
+                SessionManager::open(
+                    None,
+                    &session::migrations::Context::adopting(
+                        config.configured_default_profile.as_deref(),
+                    ),
+                )
+                .await?,
                 std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             );
 
@@ -2924,31 +3396,6 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
     }
 }
 
-async fn resolve_credential(
-    config: &ResolvedConfig,
-    token_store: &TokenStore,
-) -> anyhow::Result<AuthCredential> {
-    // Debug-only, matching `server::resolve_serve_credential`: the scripted provider replaces
-    // whatever this returns, so the harness needn't seed a credential it will never use.
-    #[cfg(debug_assertions)]
-    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        return Ok(AuthCredential::ApiKey("mock-provider".to_string()));
-    }
-
-    let Some(profile) = config.active_profile.as_deref() else {
-        anyhow::bail!("no provider configured. Run `meka provider add <name>` to set one up.");
-    };
-    match token_store.load_provider_credential(profile).await? {
-        Some(credential) => Ok(credential),
-        None => Err(anyhow::anyhow!(
-            "provider profile '{}' has no stored credential. Run `meka provider login {}` to \
-             authenticate.",
-            profile,
-            profile
-        )),
-    }
-}
-
 fn reprint_last_message(messages: &[provider::Message], render_mode: render::RenderMode) {
     let Some(last) = messages.last() else {
         return;
@@ -2999,16 +3446,35 @@ fn hold_session_lock(slot: &session::SessionLockSlot, lock: Option<session::File
     }
 }
 
+/// What `meka -c` / `-r` resolved to, and the settings the resumed session brings with it.
+struct ResumedSession {
+    session_id: Option<uuid::Uuid>,
+    messages: conversation::Conversation,
+    lock: Option<session::FileLock>,
+    /// The level this run starts at: the session's recorded one, unless `--permission` asked for
+    /// something else, and the configured default for a run that resumed nothing.
+    permission: crate::permission::Permission,
+    /// The binding `--provider` / `--model` / `--base-url` asked this session to move to, still
+    /// uncommitted. Carried out rather than written here because the row must not move until the
+    /// binding is known to produce a provider, and that needs a registry this runs before.
+    repin: Option<crate::session::SessionProvider>,
+}
+
 async fn resolve_session_resume(
     session_manager: &SessionManager,
     config: &ResolvedConfig,
-) -> anyhow::Result<(
-    Option<uuid::Uuid>,
-    conversation::Conversation,
-    Option<session::FileLock>,
-)> {
+) -> anyhow::Result<ResumedSession> {
+    let fresh = || ResumedSession {
+        session_id: None,
+        messages: conversation::Conversation::new(),
+        lock: None,
+        permission: config.permission,
+        // A run that resumed nothing has no row to repin: the flags become this session's binding
+        // when `resolve_session_provider` builds it, and are recorded when the row is created.
+        repin: None,
+    };
     let resolved = match &config.session_resume {
-        None => return Ok((None, conversation::Conversation::new(), None)),
+        None => return Ok(fresh()),
         // `--continue` on a store with no sessions yet is not an error: there is simply nothing to
         // pick up, so the run starts fresh.
         Some(crate::config::SessionResume::Last) => session_manager.last_session_id().await?,
@@ -3017,16 +3483,141 @@ async fn resolve_session_resume(
         }
     };
     let Some(id) = resolved else {
-        return Ok((None, conversation::Conversation::new(), None));
+        return Ok(fresh());
     };
 
     let lock = session_manager.lock_session(id)?;
+    // `--provider` on a resume repins the session rather than applying for this run alone. A
+    // per-run override would leave the row disagreeing with the conversation it describes, and the
+    // next resume would silently move back; rewriting it keeps the row the answer to "what does
+    // this session run on".
+    //
+    // Only computed here. `apply_session_repin` commits it, once the profile is known to produce a
+    // provider.
+    let repin = if let Some(requested) = &config.requested_profile {
+        if !config.providers.contains_key(requested) {
+            anyhow::bail!(
+                "provider profile `{}` is not configured; `meka provider list` shows the \
+                 configured ones",
+                requested
+            );
+        }
+        Some(crate::session::SessionProvider {
+            profile: requested.clone(),
+            model_override: config.requested_model.clone(),
+            base_url_override: config.requested_base_url.clone(),
+        })
+    } else if config.requested_model.is_some() || config.requested_base_url.is_some() {
+        // `--model` / `--base-url` without `--provider` moves those two on the profile the session
+        // already names. Naming any of the three states the whole binding, so a run that gives only
+        // `--model` also clears a stale endpoint override; that is what makes the flags a way to
+        // undo as well as to set.
+        let Some(recorded) = session_manager.recorded_provider(id).await? else {
+            anyhow::bail!("session not found: {}", id);
+        };
+        Some(crate::session::SessionProvider {
+            profile: recorded.profile,
+            model_override: config.requested_model.clone(),
+            base_url_override: config.requested_base_url.clone(),
+        })
+    } else {
+        None
+    };
+
+    // The level the session recorded, unless this run asked for a different one. Every other
+    // surface already resolves permission this way -- ACP, the HTTP API, the scheduler's fire door
+    // and `meka schedule` all read the row through `parse_recorded_permission` -- and both CLI
+    // hosts ignored it, this function being what the REPL and `--oneshot` share, so a session
+    // created at `unrestricted` came back at the config default while its row still claimed
+    // otherwise. `--oneshot` is the worse half: a scripted run whose level silently differs from
+    // the one the session was created with has nobody watching it.
+    let recorded = session_manager.session_info(id).await?;
+    let permission = config.requested_permission.or_else(|| {
+        crate::permission::parse_recorded_permission(
+            recorded
+                .as_ref()
+                .and_then(|info| info.permission.as_deref()),
+            &format_args!("session {}", id),
+        )
+        .filter(|level| {
+            // A level the operator has since removed from `[permissions].enabled` is not one this
+            // run may take, so the session drops to the configured default rather than being
+            // granted authority the configuration withdrew.
+            if config.enabled_permissions.is_enabled(*level) {
+                return true;
+            }
+            tracing::warn!(
+                "session {} records permission '{}', which is no longer in \
+                 [permissions].enabled; starting at '{}'",
+                id,
+                level,
+                config.permission
+            );
+            false
+        })
+    });
+    // `--permission` rewrites the row for the reason `/permission` already does: a scheduled gate
+    // is re-checked against it, and leaving it stale means another process acts on a level the user
+    // has moved away from.
+    if let Some(requested) = config.requested_permission
+        && recorded
+            .as_ref()
+            .and_then(|info| info.permission.as_deref())
+            != Some(requested.to_string().as_str())
+        && let Err(error) = session_manager
+            .update_session_permission(id, &requested.to_string())
+            .await
+    {
+        tracing::warn!(
+            "could not record permission `{}` on session {}: {}. Another meka process may still \
+             act on this session's previous level",
+            requested,
+            id,
+            error
+        );
+    }
+
     render::render_session_id("Continuing session", &id.to_string());
     if config.newline_after_prompt {
         eprintln!();
     }
     let messages = load_session_messages(session_manager, id).await?;
-    Ok((Some(id), messages, Some(lock)))
+    Ok(ResumedSession {
+        session_id: Some(id),
+        messages,
+        lock: Some(lock),
+        permission: permission.unwrap_or(config.permission),
+        repin,
+    })
+}
+
+/// Commit a `--provider` / `--model` / `--base-url` repin, once the binding it names is known to
+/// produce a provider.
+///
+/// The row moves last, deliberately. Writing it first and only then discovering that the profile
+/// has no stored credential leaves the session pinned to something that cannot run, and the binding
+/// it had is nowhere in the output, so the next plain resume fails the same way with nothing left
+/// to say what it used to be. Both other surfaces that offer this switch build the provider before
+/// they write: `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option`.
+async fn apply_session_repin(
+    session_manager: &SessionManager,
+    providers: &provider::ProviderRegistry,
+    session_id: uuid::Uuid,
+    binding: crate::session::SessionProvider,
+) -> anyhow::Result<()> {
+    let resolved = resolved_binding(providers, binding).await?;
+    if !session_manager
+        .set_recorded_provider(session_id, &resolved.binding)
+        .await?
+    {
+        anyhow::bail!("session not found: {}", session_id);
+    }
+    tracing::info!(
+        "repinned session {} to provider profile `{}`",
+        session_id,
+        resolved.binding.profile
+    );
+    Ok(())
 }
 
 /// Whether a string is plausibly a session id rather than a prompt: hex digits and hyphens only,
@@ -3126,6 +3717,103 @@ async fn load_session_messages(
 mod tests {
     use super::*;
 
+    async fn store() -> SessionManager {
+        // `:memory:`, spelled out. `None` is not "no path": it is *the default path*, so this
+        // helper was creating sessions in the developer's own `~/.local/share/meka/meka.db` on
+        // every `cargo test`, and migrating and backing it up on the way in.
+        SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &session::migrations::Context::default(),
+        )
+        .await
+        .expect("an in-memory store opens")
+    }
+
+    /// The regression the whole feature exists for, at the one door every turn-running site goes
+    /// through: a session that named a profile keeps it, whatever the process default now is.
+    #[tokio::test]
+    async fn a_recorded_binding_beats_the_process_default() {
+        let manager = store().await;
+        let id = manager
+            .create_session(None, crate::session::SessionProvider {
+                profile: "openaiprof".to_string(),
+                model_override: Some("gpt-5".to_string()),
+                base_url_override: None,
+            })
+            .await
+            .expect("create");
+
+        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), None, None, Some(id))
+            .await
+            .expect("resolves");
+
+        assert_eq!(resolved.profile, "openaiprof");
+        assert_eq!(resolved.model_override.as_deref(), Some("gpt-5"));
+    }
+
+    /// A session that does not exist yet is the only case the configured default answers, and this
+    /// run's `--model` / `--base-url` ride along so the row records them at creation.
+    #[tokio::test]
+    async fn a_session_that_does_not_exist_yet_takes_the_default_and_this_runs_overrides() {
+        let manager = store().await;
+
+        let resolved = resolve_session_provider(
+            &manager,
+            Ok("claudeprof"),
+            Some("claude-opus-5"),
+            Some("https://example.invalid/v1"),
+            None,
+        )
+        .await
+        .expect("resolves");
+
+        assert_eq!(resolved.profile, "claudeprof");
+        assert_eq!(resolved.model_override.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            resolved.base_url_override.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+    }
+
+    /// With nothing configured there is no profile to fall back to, and inventing one would be the
+    /// silent redirection this door exists to prevent.
+    #[tokio::test]
+    async fn no_configured_profile_is_an_error_rather_than_an_empty_one() {
+        let manager = store().await;
+
+        let error = resolve_session_provider(
+            &manager,
+            Err("no provider profiles configured. Run `meka provider add <name>`."),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("nothing to resolve to");
+
+        assert!(
+            error.to_string().contains("meka provider add"),
+            "the refusal should say how to fix it: {error}"
+        );
+    }
+
+    /// The reason travels: `validate()` no longer raises an ambiguous default for a resume, so a
+    /// resume that *does* fall through to needing one has to carry the message that says what to
+    /// do rather than a generic "nothing configured".
+    #[tokio::test]
+    async fn a_resume_that_needs_a_default_reports_why_there_is_none() {
+        let manager = store().await;
+        let ambiguous = "multiple provider profiles configured (personal, side); run \
+                         `meka provider use <name>` to pick a default, or pass `--provider <name>`.";
+
+        // `None` session id: `-c` on a store with nothing to resume lands here.
+        let error = resolve_session_provider(&manager, Err(ambiguous), None, None, None)
+            .await
+            .expect_err("no default to fall back to");
+
+        assert_eq!(error.to_string(), ambiguous);
+    }
+
     /// A REPL sweep is evaluated against the level the session is at now, not the one it launched
     /// with.
     ///
@@ -3189,9 +3877,10 @@ mod tests {
     /// meant "today's", and unrecoverable, so it is refused rather than run.
     #[tokio::test]
     async fn test_delete_older_than_zero_days_is_refused() {
-        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("in-memory db");
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
         let error = crate::session::cli::delete_sessions(&manager, &[], false, Some(0))
             .await
             .expect_err("zero must be refused");
@@ -3202,11 +3891,18 @@ mod tests {
     /// `delete_all_sessions` would pass every error-path test in this file while wiping the DB.
     #[tokio::test]
     async fn test_delete_older_than_days_deletes_only_the_old() {
-        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
+        let old = manager
+            .create_session(None, "test-profile".to_string())
             .await
-            .expect("in-memory db");
-        let old = manager.create_session(None).await.expect("create old");
-        let recent = manager.create_session(None).await.expect("create recent");
+            .expect("create old");
+        let recent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create recent");
         let backdated = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
         manager
             .set_session_updated_at_for_test(old, &backdated)
@@ -3224,9 +3920,10 @@ mod tests {
     /// No selector at all should say what the options are, not silently do nothing.
     #[tokio::test]
     async fn test_delete_with_no_selector_explains_itself() {
-        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("in-memory db");
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
         let error = crate::session::cli::delete_sessions(&manager, &[], false, None)
             .await
             .expect_err("no selector must be an error");

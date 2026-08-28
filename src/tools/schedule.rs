@@ -547,10 +547,14 @@ mod tests {
         Arc<RwLock<Option<Uuid>>>,
         SessionManager,
     ) {
-        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("open in-memory database");
+        let session = manager
+            .create_session(None, "test-profile".to_string())
             .await
-            .expect("open in-memory database");
-        let session = manager.create_session(None).await.expect("create session");
+            .expect("create session");
         let session_id = Arc::new(RwLock::new(Some(session)));
         let tool = ScheduleCreateTool {
             session_manager: manager.clone(),

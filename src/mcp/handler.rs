@@ -71,29 +71,10 @@ impl ClientHandler for MekaClientHandler {
             // the manager itself; no explicit permission needs to be threaded here.
             match manager.discover_tools_for_server(&server_name).await {
                 Ok(adapters) => {
-                    // Match the initial-registration path: only mark non-eager tools deferred.
-                    // Compute the deferred set before we erase the adapters into `Arc<dyn Tool>`,
-                    // since `raw_name`/`server_config` live on the concrete type.
-                    let deferred_names: Vec<String> = adapters
-                        .iter()
-                        .filter(|adapter| {
-                            !crate::mcp::tool_should_eager_load(
-                                adapter.server_config(),
-                                adapter.raw_name(),
-                            )
-                        })
-                        .map(|adapter| adapter.definition().name)
-                        .collect();
-                    let new_tools: Vec<Arc<dyn Tool>> = adapters
-                        .into_iter()
-                        .map(|a| Arc::new(a) as Arc<dyn Tool>)
-                        .collect();
-                    // Routes through every attached registry so all active sessions observe the
-                    // updated tool set.
-                    manager.update_server_tools(&server_name, new_tools).await;
-                    if !deferred_names.is_empty() {
-                        manager.mark_deferred_on_attached(&deferred_names).await;
-                    }
+                    // The same door the initial registration goes through, so a refresh cannot
+                    // classify a tool differently from the listing it replaces. Routes through
+                    // every attached registry so all active sessions observe the updated tool set.
+                    manager.register_server_tools(&server_name, adapters).await;
                     tracing::info!("MCP server '{}' tool registry refreshed", server_name);
                 }
                 Err(error) => {

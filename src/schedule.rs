@@ -1068,7 +1068,28 @@ fn parked_reason(job: &ScheduledJob) -> String {
 /// exactly like a healthy watcher with nothing to report. The marker existed for that
 /// indistinguishability and covered only half of it.
 fn standing_probe_failure(job: &ScheduledJob) -> Option<String> {
-    let (failures, error) = probe_failure(&job.id)?;
+    let (failures, error, witness) = {
+        let held = match PROBE_FAILURES.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        held.get(&job.id).cloned()?
+    };
+    // The verdict is this process's, but the job is not. Only the host that wins `claim_occurrence`
+    // evaluates, and `isolated` jobs are exempt from the session-residency filter, so a second
+    // `meka serve` on the same store can take over every occurrence and heal the gate without this
+    // process ever hearing. Nothing here re-enters the counting path in that case, so without this
+    // check the marker stood forever: the model was told, every turn, that a job firing hourly was
+    // dead.
+    //
+    // Neither half of the witness is written by the failing path -- it persists no `fired_at` and
+    // no baseline, deliberately -- so either of them having moved is proof of a successful
+    // evaluation since. The gap it cannot close is a gate that keeps evaluating, keeps declining,
+    // and keeps producing the identical output: an unchanged row cannot testify to anything.
+    if witness != probe_witness(job) {
+        clear_probe_failure(&job.id);
+        return None;
+    }
     if failures < PROBE_FAILURES_BEFORE_REPORTING {
         return None;
     }
@@ -1529,6 +1550,20 @@ pub enum FireOutcome {
     /// finding the session's file lock held by a REPL: that REPL has its own watcher and will run
     /// the job itself, so the occurrence is restored rather than burnt.
     Deferred,
+    /// This host owns the job and could not run it, and trying again immediately would not help.
+    ///
+    /// The claim is left to expire rather than released or completed, which is the treatment a
+    /// panicking turn already gets and for the same reason: releasing puts `next_fire_at` back in
+    /// the past, so the occurrence comes due on the very next sweep and a gated job re-runs its
+    /// probe every `poll_interval`; completing spends the occurrence, which for a one-shot deletes
+    /// the row and loses the job outright. Waiting out `claim_lease` retries at a cadence a blip
+    /// survives and a persistent fault does not, and `MAX_CLAIM_ATTEMPTS` still parks it in the
+    /// end.
+    ///
+    /// The concrete case is a session whose recorded provider profile no longer resolves: running
+    /// the turn would bill an account the row does not name, and the cause may be a configuration
+    /// error the user has yet to fix or a transient `SQLITE_BUSY` from another meka process.
+    Unrunnable,
 }
 
 /// Which jobs a scheduler instance is responsible for.
@@ -1738,6 +1773,18 @@ where
                     continue;
                 }
             };
+            if outcome == FireOutcome::Unrunnable {
+                // Neither released nor completed; see the variant. Same handling as the panicking
+                // turn above, and for the same reason: the retry is paced by `claim_lease` rather
+                // than by `poll_interval`, so a transient cause survives and a persistent one is
+                // parked by `MAX_CLAIM_ATTEMPTS` instead of spinning.
+                tracing::warn!(
+                    "job {} could not be run by this host; its claim is left to expire, so the \
+                     retry waits out [schedule].claim_lease",
+                    original.short_id()
+                );
+                continue;
+            }
             if outcome == FireOutcome::Deferred {
                 tracing::debug!("job {} deferred; releasing the lease", original.short_id());
                 // Also `warn!`: propagating would take the rest of the sweep with it, and a lease
@@ -1853,7 +1900,22 @@ fn declined_for_permission_first_time(job_id: &str, reason: &str) -> bool {
     }
 }
 
-/// Consecutive failed probe evaluations per job, with the last reason.
+/// What a job's row said when a probe failure was counted against it.
+///
+/// Neither half is written by the failing path -- it persists no `fired_at` and no baseline,
+/// deliberately -- so either of them moving is proof that *something else* evaluated this gate
+/// afterwards and got an answer. See [`standing_probe_failure`].
+type ProbeWitness = (Option<DateTime<Utc>>, Option<String>);
+
+/// The witness for `job` as its row stands now.
+fn probe_witness(job: &ScheduledJob) -> ProbeWitness {
+    (
+        job.last_fired_at,
+        job.gate.as_ref().and_then(|gate| gate.last_output.clone()),
+    )
+}
+
+/// Consecutive failed probe evaluations per job, with the last reason and the row as it stood.
 ///
 /// In memory rather than on the row, which is a real limitation and the right trade. Persisting it
 /// would mean a schema change and a write on every failed evaluation, to report a condition that a
@@ -1862,9 +1924,17 @@ fn declined_for_permission_first_time(job_id: &str, reason: &str) -> bool {
 /// which are the three that both run jobs and render `[Scheduled]`. `meka schedule list` is a
 /// separate process and sees nothing here, which is the same thing it already does with tool gates
 /// it cannot resolve.
-static PROBE_FAILURES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (u32, String)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+///
+/// The [`ProbeWitness`] is what keeps that from becoming a *wrong* answer rather than a missing
+/// one. Only the host that wins `claim_occurrence` evaluates, and which host that is, is a race
+/// between their tickers; a host that recorded two failures and then stopped winning would go on
+/// telling its resident session's model that a job firing every hour is dead, forever, because
+/// nothing else in this process ever re-enters the counting path.
+static PROBE_FAILURES: std::sync::LazyLock<std::sync::Mutex<ProbeFailures>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How many consecutive failures, the last one's reason, and the row they were counted against.
+type ProbeFailures = std::collections::HashMap<String, (u32, String, ProbeWitness)>;
 
 /// How many consecutive failures before a broken probe is reported as a standing condition.
 ///
@@ -1883,26 +1953,29 @@ static PROBE_FAILURES: std::sync::LazyLock<
 const PROBE_FAILURES_BEFORE_REPORTING: u32 = 2;
 
 /// Count one failed evaluation against a job and return the running total.
-fn record_probe_failure(job_id: &str, error: &str) -> u32 {
+fn record_probe_failure(job: &ScheduledJob, error: &str) -> u32 {
     let mut held = match PROBE_FAILURES.lock() {
         Ok(held) => held,
         Err(poisoned) => poisoned.into_inner(),
     };
     let entry = held
-        .entry(job_id.to_string())
-        .or_insert_with(|| (0, String::new()));
+        .entry(job.id.clone())
+        .or_insert_with(|| (0, String::new(), (None, None)));
     entry.0 = entry.0.saturating_add(1);
     entry.1 = error.to_string();
+    entry.2 = probe_witness(job);
     entry.0
 }
 
-/// What this process knows about a job's recent probe failures.
+/// What this process knows about a job's recent probe failures: how many, and why the last one
+/// failed.
 fn probe_failure(job_id: &str) -> Option<(u32, String)> {
     let held = match PROBE_FAILURES.lock() {
         Ok(held) => held,
         Err(poisoned) => poisoned.into_inner(),
     };
-    held.get(job_id).cloned()
+    held.get(job_id)
+        .map(|(failures, error, _)| (*failures, error.clone()))
 }
 
 /// Forget a job's probe failures, on an evaluation that worked or on the job going away.
@@ -2337,7 +2410,9 @@ async fn prepare(
                     // condition is standing rather than momentary. The log alone reaches only
                     // whoever is reading it, and a scheduled job exists precisely because nobody
                     // is.
-                    let failures = record_probe_failure(&job.id, &error);
+                    // The row as it stands *now* -- before this arm's own disposal, which writes
+                    // neither half of the witness. See [`standing_probe_failure`].
+                    let failures = record_probe_failure(&job, &error);
                     tracing::warn!(
                         "gate for job {} failed: {} (failure {})",
                         job.short_id(),
@@ -4130,11 +4205,17 @@ mod tests {
         /// inherited by accident.
         async fn at_host_permission(host_permission: crate::permission::Permission) -> Self {
             let manager = std::sync::Arc::new(
-                crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
-                    .await
-                    .expect("open in-memory database"),
+                crate::session::SessionManager::open(
+                    Some(std::path::Path::new(":memory:")),
+                    &Default::default(),
+                )
+                .await
+                .expect("open in-memory database"),
             );
-            let session_id = manager.create_session(None).await.expect("create session");
+            let session_id = manager
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session");
             Self {
                 manager,
                 session_id,
@@ -4149,7 +4230,7 @@ mod tests {
         /// A second session in the same database, for the per-session budget tests.
         async fn another_session(&self) -> uuid::Uuid {
             self.manager
-                .create_session(None)
+                .create_session(None, "test-profile".to_string())
                 .await
                 .expect("create session")
         }
@@ -6525,6 +6606,85 @@ mod tests {
             reported.contains("the host died"),
             "with no gate there is no probe that could have failed, so the crash can be named: \
              {reported}"
+        );
+    }
+
+    /// A standing "this gate is broken" verdict retires itself once the row shows otherwise.
+    ///
+    /// The counter is per process and only the host that wins `claim_occurrence` ever touches it.
+    /// `isolated` jobs are exempt from the session-residency filter and which host wins is a race
+    /// between their tickers, so a second `meka serve` on the same store can take over every
+    /// occurrence and heal the gate while this process's count stays where it stopped. The marker
+    /// then stood forever: the model was told, every turn, that a job firing hourly was dead.
+    ///
+    /// Driven in one process rather than two. Advancing `last_fired_at` here is exactly what the
+    /// other host's `complete_claim` writes, and the counter it has to convince lives in this
+    /// process either way, so a second one would add wall-clock and no signal. It would add
+    /// *coverage*, though: `GET /v1/schedule` does put this verdict on a wire
+    /// (`server::handlers::jobs` renders it as `withheld`), so a two-host test is constructible
+    /// and would exercise the convergence end to end rather than at the predicate.
+    #[tokio::test]
+    async fn a_probe_verdict_stands_down_when_another_host_has_evaluated_the_gate() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate("true", GatePredicate::Succeeded, None)),
+                chrono::Duration::minutes(1),
+            )
+            .await;
+        clear_probe_failure(&job.id);
+
+        for _ in 0..PROBE_FAILURES_BEFORE_REPORTING {
+            record_probe_failure(&job, "server said no such tool");
+        }
+        assert!(
+            standing_probe_failure(&job).is_some(),
+            "two failures with nothing to contradict them is a standing condition"
+        );
+
+        // What the other host's `complete_claim` writes when it fires the job. The failing path
+        // writes neither this nor the baseline, so it cannot be this process's own doing.
+        let mut fired = job.clone();
+        fired.last_fired_at = Some(Utc::now());
+        assert!(
+            standing_probe_failure(&fired).is_none(),
+            "the job has fired since the last failure was counted, so somebody evaluated this \
+             gate and got an answer"
+        );
+        assert!(
+            standing_probe_failure(&job).is_none(),
+            "and the verdict is dropped rather than merely suppressed, so it does not come back \
+             the next time this process reads the pre-fire row"
+        );
+    }
+
+    /// A changed baseline is the other half: a gate that evaluates and declines never advances
+    /// `last_fired_at`, but a successful evaluation still records what it saw.
+    #[tokio::test]
+    async fn a_probe_verdict_also_stands_down_on_a_baseline_another_host_recorded() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job(
+                Schedule::parse_every("1h").expect("parses"),
+                Some(gate("true", GatePredicate::Changed, Some("old"))),
+                chrono::Duration::minutes(1),
+            )
+            .await;
+        clear_probe_failure(&job.id);
+
+        for _ in 0..PROBE_FAILURES_BEFORE_REPORTING {
+            record_probe_failure(&job, "server said no such tool");
+        }
+        assert!(standing_probe_failure(&job).is_some());
+
+        let mut evaluated = job.clone();
+        if let Some(gate) = evaluated.gate.as_mut() {
+            gate.last_output = Some("new".to_string());
+        }
+        assert!(
+            standing_probe_failure(&evaluated).is_none(),
+            "a baseline this process did not write means the gate answered somewhere else"
         );
     }
 

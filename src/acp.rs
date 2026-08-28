@@ -49,7 +49,7 @@ use agent_client_protocol::{
     schema::v1::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
-        ContentBlock, ContentChunk, CurrentModeUpdate, Diff, EmbeddedResource,
+        ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, Diff, EmbeddedResource,
         EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, ImageContent,
         Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
         ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
@@ -57,12 +57,15 @@ use agent_client_protocol::{
         PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
         ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
         ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities, SessionId,
-        SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionModeRequest, SetSessionModeResponse, StopReason, ToolCall, ToolCallContent,
-        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-        UnstructuredCommandInput, Usage, UsageUpdate, WriteTextFileRequest,
+        SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+        SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+        SessionListCapabilities, SessionMode, SessionModeId, SessionModeState, SessionNotification,
+        SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+        ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, Usage, UsageUpdate,
+        WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -84,7 +87,7 @@ use crate::{
     },
     mcp,
     permission::{Permission, SharedPermission},
-    provider::{AuthCredential, ContentBlock as MekaContentBlock, Role, ToolResultContent},
+    provider::{ContentBlock as MekaContentBlock, Role, ToolResultContent},
     session::SessionManager,
     skills::SkillCache,
     tools::todo::{TodoItem, TodoStatus},
@@ -216,11 +219,17 @@ pub struct AcpFrontend {
     transport_dead: Arc<std::sync::atomic::AtomicBool>,
     /// Live context-occupancy counter shared with this session's agent (it writes the value after
     /// each round via [`Agent::set_context_tokens`]); read on every `TokenUsage` event to emit an
-    /// ACP `usage_update` so editors show "tokens used / context window". `context_window` holds
-    /// the resolved window for the `size` field, set once the agent is built (`0` until then,
-    /// which suppresses the update).
+    /// ACP `usage_update` so editors show "tokens used / context window".
     context_tokens: Arc<std::sync::atomic::AtomicU64>,
-    context_window: std::sync::atomic::AtomicU64,
+    /// The resolved window for the `usage_update` `size` field, and the same cell the agent
+    /// publishes into on every provider switch. `0` until the agent is built, which suppresses the
+    /// update.
+    ///
+    /// Shared rather than pushed. ACP was the one host that kept its own copy and had it re-stored
+    /// by hand from `session/set_config_option`, which meant a mid-turn switch reported occupancy
+    /// measured against the profile the turn was still running on, divided by the window of the
+    /// one it had not moved to yet.
+    context_window: Arc<std::sync::atomic::AtomicU64>,
     /// Accumulated live output per in-flight tool call, keyed by `tool_use_id`. ACP replaces a
     /// tool call's whole `content` array on each update rather than appending to it, so the
     /// running total has to be kept somewhere; the emitter sends deltas, and this is where
@@ -361,6 +370,7 @@ fn terminal_meta(key: &str, payload: serde_json::Value) -> agent_client_protocol
 }
 
 impl AcpFrontend {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         connection: ConnectionTo<Client>,
         session_id: SessionId,
@@ -368,6 +378,7 @@ impl AcpFrontend {
         client_state: SharedClientState,
         transport_dead: Arc<std::sync::atomic::AtomicBool>,
         context_tokens: Arc<std::sync::atomic::AtomicU64>,
+        context_window: Arc<std::sync::atomic::AtomicU64>,
         cancellation: Arc<std::sync::RwLock<CancellationToken>>,
     ) -> Self {
         Self {
@@ -379,7 +390,7 @@ impl AcpFrontend {
             client_state,
             transport_dead,
             context_tokens,
-            context_window: std::sync::atomic::AtomicU64::new(0),
+            context_window,
             live_output: std::sync::Mutex::new(std::collections::HashMap::new()),
             cancellation,
         }
@@ -427,13 +438,6 @@ impl AcpFrontend {
         work: impl std::future::Future<Output = T>,
     ) -> std::result::Result<T, FrontendError> {
         race_against_cancellation(what, &self.current_cancellation(), work).await
-    }
-
-    /// Record the resolved context-window size for this session's model, used as the `size` of the
-    /// ACP `usage_update`. Called once the agent is built (its window resolution is authoritative).
-    fn set_context_window(&self, window: u64) {
-        self.context_window
-            .store(window, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mark the stdio transport as dead. Called from `emit` and the `session/load` replay loop
@@ -1672,6 +1676,200 @@ fn build_mode_state(permission: &SharedPermission) -> SessionModeState {
     SessionModeState::new(mode_id_for(permission.get()), modes)
 }
 
+/// The `configOptions` id for the permission picker, which duplicates the legacy `modes` field.
+///
+/// Both are advertised, the way the reference adapter does it: `modes` and `configOptions` are
+/// separate response fields rendered in separate places, so a client that only understands `modes`
+/// keeps its picker, and one that understands `configOptions` gets permission and provider side by
+/// side rather than in two unrelated menus.
+const PERMISSION_CONFIG_ID: &str = "permission";
+
+/// The `configOptions` id for the provider picker. There is no legacy field for this one.
+const PROVIDER_CONFIG_ID: &str = "provider";
+
+/// The permission picker as a `configOptions` entry. The same enabled set [`build_mode_state`]
+/// exposes, for the same reason: a level the client cannot actually be granted has no business in
+/// the list.
+fn permission_config_option(permission: &SharedPermission) -> SessionConfigOption {
+    SessionConfigOption::select(
+        PERMISSION_CONFIG_ID,
+        "Permission",
+        SessionConfigValueId::from(permission.get().to_string()),
+        permission
+            .enabled()
+            .iter()
+            .map(|mode| {
+                SessionConfigSelectOption::new(
+                    SessionConfigValueId::from(mode.to_string()),
+                    mode_display_name(mode),
+                )
+                .description(mode_description(mode))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .category(SessionConfigOptionCategory::Mode)
+    .description("What the agent may do without asking.")
+}
+
+/// The provider picker as a `configOptions` entry.
+///
+/// `current` may name no configured profile, which is what a session whose profile was deleted from
+/// `config.toml` looks like. Nothing is invented for it: no option matches, so a client renders
+/// "nothing selected", which is the truth. Inventing a selection would show a profile the session
+/// is not going to run on.
+fn provider_config_option(
+    profiles: &std::collections::BTreeMap<String, crate::config::ProviderProfile>,
+    current: &str,
+) -> SessionConfigOption {
+    SessionConfigOption::select(
+        PROVIDER_CONFIG_ID,
+        "Provider",
+        SessionConfigValueId::from(current.to_string()),
+        profiles
+            .iter()
+            .map(|(name, profile)| {
+                let option = SessionConfigSelectOption::new(
+                    SessionConfigValueId::from(name.clone()),
+                    name.clone(),
+                );
+                // The model, when the profile names one. A profile that leaves it to the provider
+                // has nothing truthful to put here, and inventing a label would be meka asserting
+                // a fact about someone else's system.
+                match &profile.model {
+                    Some(model) => option.description(model.clone()),
+                    None => option,
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .category(SessionConfigOptionCategory::Model)
+    .description("The provider profile this session runs on.")
+}
+
+/// Build the `configOptions` list advertised on every session-creation response and returned by
+/// `session/set_config_option`.
+///
+/// The provider's current value is read from the session row rather than from the live agent: the
+/// row is what the next turn resolves against, and the agent is behind the runtime mutex that an
+/// in-flight prompt holds.
+async fn build_config_options(
+    shared: &crate::SharedDeps,
+    permission: &SharedPermission,
+    session_uuid: Option<uuid::Uuid>,
+) -> Vec<SessionConfigOption> {
+    let current_provider = match session_uuid {
+        Some(session_uuid) => shared
+            .session_manager
+            .recorded_provider(session_uuid)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    "could not read the recorded provider for session {}: {}",
+                    session_uuid,
+                    error
+                );
+                None
+            })
+            .map(|recorded| recorded.profile)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    vec![
+        permission_config_option(permission),
+        provider_config_option(&shared.config.providers, &current_provider),
+    ]
+}
+
+/// Whether a session's profile accepts image input.
+///
+/// Read from the row on every prompt rather than cached on the session entry, because the row is
+/// what [`apply_recorded_binding`] puts that same prompt's turn on: a copy taken when the session
+/// was created described whichever profile it started on, and every writer of the row had to
+/// remember to push a new value at it.
+///
+/// **`serve` answers the same question differently, on purpose.** It reads
+/// `SessionEntry::binding`, the cell the agent publishes into
+/// (`crate::server::handlers::turn`), because its `PATCH` moves the agent under the runtime mutex
+/// before returning, so the published binding and the row cannot disagree. ACP cannot do that: it
+/// must not block the dispatch loop on that mutex, so a switch made mid-turn leaves the agent
+/// behind until the next turn applies it, and a published binding would report the profile the
+/// session is *leaving*. The row is the only thing both hosts agree is authoritative, and it is
+/// the one ACP has to read.
+///
+/// A session whose profile cannot resolve answers `false`; its next prompt fails on that same
+/// profile either way, and taking an attachment first would only add a second failure.
+async fn session_accepts_images(state: &ServerState, session_uuid: uuid::Uuid) -> bool {
+    match crate::provider_for_session(&state.shared, Some(session_uuid)).await {
+        Ok(binding) => crate::binding_accepts_images(&state.shared.providers, &binding),
+        Err(error) => {
+            tracing::warn!(
+                "could not resolve the provider for session {} to decide image support: {}",
+                session_uuid,
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Move a session's agent onto whatever its row currently names, before a turn runs on it.
+///
+/// **The row is the carrier, and the only one.** `session/set_config_option` writes it before it
+/// reaches for the runtime mutex, precisely so a switch it cannot apply is not lost; this is what
+/// applies it. That used to be a resolved binding parked on the session entry, which only
+/// `session/prompt` drained -- so a scheduled fire or a background-outcome turn ran on the profile
+/// the user had left, and billed that account, while the row, both pickers and the reported window
+/// all said otherwise. A parked value was a second carrier of a fact the row already held, and it
+/// could lose to any other writer of that row.
+///
+/// Cheap when nothing has changed: one indexed row read and a comparison, with no resolution at all
+/// unless the two differ.
+///
+/// Must be called under the runtime mutex, which is what makes "the agent this turn is about to
+/// use" the thing being moved.
+async fn apply_recorded_binding(
+    state: &ServerState,
+    runtime: &mut SessionRuntime,
+) -> anyhow::Result<()> {
+    let Some(recorded) = state
+        .shared
+        .session_manager
+        .recorded_provider(runtime.session_uuid)
+        .await?
+    else {
+        // No row, so nothing names a profile to move to. Reachable only for a session deleted from
+        // under a live entry; its turn is going to fail on the write either way.
+        return Ok(());
+    };
+    if &recorded == runtime.agent.provider_binding() {
+        return Ok(());
+    }
+    let profile = recorded.profile.clone();
+    let resolved = crate::resolved_binding(&state.shared.providers, recorded).await?;
+    runtime.agent.set_provider(resolved);
+    tracing::info!(
+        "session {} moved onto provider profile `{}`",
+        runtime.session_uuid,
+        profile
+    );
+    Ok(())
+}
+
+/// Push a `config_option_update` so a client's pickers reflect a change it did not make, whether
+/// that was another surface repinning the session or meka's own `session/set_mode` handler.
+async fn emit_config_options(
+    state: &ServerState,
+    entry: &SessionEntry,
+    session_uuid: Option<uuid::Uuid>,
+) {
+    let options = build_config_options(&state.shared, &entry.permission, session_uuid).await;
+    send_session_update(
+        &entry.frontend.connection,
+        &entry.frontend.session_id,
+        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+    );
+}
+
 /// Slash commands meka handles entirely agent-side: they render text and end the turn with no model
 /// call, unlike skills (which resolve to prompt text and run the model). `(name, description)`.
 const LOCAL_COMMANDS: &[(&str, &str)] = &[
@@ -1729,7 +1927,14 @@ fn build_status_text(runtime: &SessionRuntime, shared: &crate::SharedDeps) -> St
     let snap = runtime.agent.session_stats_snapshot();
     let (used, window) = runtime.agent.context_usage();
     let mut out = String::from("meka session status\n");
-    if let Some(model) = shared.config.model.as_deref() {
+    // This session's profile, not the process default's: two ACP sessions on one connection may sit
+    // on different profiles, and the effort and context lines below already come from this one.
+    let binding = runtime.agent.provider_binding();
+    if let Ok(settings) = shared
+        .providers
+        .settings(&binding.profile, &binding.overrides())
+        && let Some(model) = settings.model.as_deref()
+    {
         let _ = writeln!(out, "  Model:    {model}");
     }
     if let Some(effort) = runtime.agent.resolved_effort() {
@@ -1944,8 +2149,11 @@ struct ServerState {
     /// Shared with every per-session `AcpFrontend`; see the field on `AcpFrontend` for the
     /// stdio-level rationale.
     transport_dead: Arc<std::sync::atomic::AtomicBool>,
-    /// Resolved per-profile vision flag (`[providers.<name>].vision`, default `true`). Gates the
-    /// advertised `image` prompt capability and whether `session/prompt` accepts image blocks.
+    /// The default profile's `vision` flag, and the only thing the advertised `image` prompt
+    /// capability can be built from: `initialize` is answered before any session exists, so the
+    /// capability is necessarily a property of the connection. Whether a given `session/prompt`
+    /// *accepts* an image block is per session, from that session's own row; see
+    /// [`session_accepts_images`].
     vision: bool,
 }
 
@@ -2299,46 +2507,30 @@ pub async fn run_acp(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
-    // Resolve provider credentials the same way the REPL path does.
-    let credential = resolve_credential_for_acp(&config, &session_manager.token_store()).await?;
-
-    // Capture the resolved per-profile vision flag before `config` is moved into
-    // `build_shared_deps`. It gates the advertised `image` prompt capability and image ingest
-    // below.
+    // Capture the default profile's vision flag before `config` is moved into `build_shared_deps`.
+    // It gates the advertised `image` prompt capability, which `initialize` has to answer before
+    // any session exists. Whether a given `session/prompt` admits an image is per session and comes
+    // off that session's row; this is only what a prompt naming an id that is not a UUID falls back
+    // to.
     let vision = config.vision;
 
     // Build process-wide shared deps once. Sessions hold an `Arc<SharedDeps>` and read fields by
     // reference; no work happens here that needs to be re-run per session.
     let shared = Arc::new(
-        super::build_shared_deps(
-            config,
-            session_manager,
-            credential,
-            mcp_manager,
-            mcp_context,
-        )
-        .await?,
+        super::build_shared_deps(config, session_manager, mcp_manager, mcp_context).await?,
     );
 
-    // Test-only: swap in a scripted provider when the integration harness asks for it. The real
-    // provider built above is dropped unused. Only compiled in debug builds. We rebuild SharedDeps
-    // with the mock provider before installing it.
+    // Test-only: hand the registry a scripted provider to return for every profile. Only compiled
+    // in debug builds. Installed rather than swapped into a rebuilt `SharedDeps`, so a harness
+    // driving sessions on different profiles gets the script for all of them.
     #[cfg(debug_assertions)]
-    let shared = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
-        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds));
-        // Replace just the provider field, inheriting the rest from the real SharedDeps.
-        // `SharedDeps: Clone` keeps this one-line and means future field additions are picked up
-        // automatically; Rust still enforces the exhaustive struct literal at compile time on top.
-        let new_inner = crate::SharedDeps {
-            provider: mock,
-            ..(*shared).clone()
-        };
+        shared.providers.install_scripted(Arc::new(
+            crate::provider::mock::MockProvider::from_rounds(rounds),
+        ));
         tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
-        Arc::new(new_inner)
-    } else {
-        shared
-    };
+    }
 
     let client_state = SharedClientState::default();
     let transport_dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2468,6 +2660,10 @@ pub async fn run_acp(
                     if let Err(error) = validate_additional_roots(&req.additional_directories) {
                         return responder.respond_with_error(error);
                     }
+                    // A new session runs on the host's default. `session/load` reads the one the
+                    // session recorded instead, which is what stops a resume moving the
+                    // conversation to another provider.
+                    let profile = state.shared.default_profile.clone();
                     // Created and locked in one step, the lock taken *before* the row exists: a
                     // row committed ahead of its lock is one `meka session delete --all` can
                     // enumerate and sweep out from under this handler. See
@@ -2475,7 +2671,7 @@ pub async fn run_acp(
                     let (session_uuid, session_lock) = match state
                         .shared
                         .session_manager
-                        .create_session_locked(Some(req.cwd.clone()), None, None, None)
+                        .create_session_locked(Some(req.cwd.clone()), None, None, None, profile)
                         .await
                     {
                         Ok((created, lock)) => (created.id, lock),
@@ -2573,9 +2769,15 @@ pub async fn run_acp(
                     // Push the initial skill palette + the configured mode picker so the editor's
                     // UI is populated before the user types their first prompt.
                     let modes = build_mode_state(&permission);
+                    let config_options =
+                        build_config_options(&state.shared, &permission, Some(session_uuid)).await;
                     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-                    responder.respond(NewSessionResponse::new(session_id).modes(modes))
+                    responder.respond(
+                        NewSessionResponse::new(session_id)
+                            .modes(modes)
+                            .config_options(config_options),
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2660,6 +2862,24 @@ pub async fn run_acp(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: SetSessionConfigOptionRequest,
+                            responder,
+                            cx: ConnectionTo<Client>| {
+                    // Spawned rather than run inline for the reason `session/close` spells out:
+                    // this one reaches the session runtime, and parking the dispatch loop on
+                    // anything a turn holds deadlocks every session in the process.
+                    let state_for_spawn = Arc::clone(&state);
+                    cx.spawn(async move {
+                        handle_set_session_config_option(state_for_spawn, req, responder).await
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             {
                 let state = Arc::clone(&state);
@@ -2719,6 +2939,24 @@ async fn run_prompt_turn(
     req: PromptRequest,
     responder: agent_client_protocol::Responder<PromptResponse>,
 ) -> Result<(), agent_client_protocol::Error> {
+    // This session's profile decides whether an image block is admissible, not the connection's:
+    // the `image` prompt capability is answered at `initialize`, before any session exists, but
+    // what a session can actually read follows the provider it recorded.
+    //
+    // An id that is not a uuid falls back to the advertised flag. Every session key in the map is
+    // `session_uuid.to_string()`, so such an id names no session and the turn is refused either
+    // way; the fallback only picks which refusal the client is given, never whether an attachment
+    // is admitted.
+    //
+    // Read before the runtime mutex, and so before `apply_recorded_binding` puts the turn on the
+    // profile the row names. Both read the same row, so a `session/set_config_option` landing
+    // between them could admit an image against the outgoing profile's flag. That window is one
+    // request wide and strictly narrower than the cached flag this replaced, which was stale from
+    // the switch until the following turn.
+    let session_vision = match uuid::Uuid::parse_str(req.session_id.0.as_ref()) {
+        Ok(session_uuid) => session_accepts_images(&state, session_uuid).await,
+        Err(_) => state.vision,
+    };
     // Accept `text` + `resource_link` (the ACP baseline) + embedded `resource` and, when the
     // profile has vision enabled, `image`. Other content variants get rejected below.
     let mut prompt_text = String::new();
@@ -2752,7 +2990,7 @@ async fn run_prompt_turn(
             // `Image` is accepted only when the active profile advertised the `image` capability
             // (vision on). Normalize the payload through the shared image pipeline so the size cap
             // and format conversion match tool-result images.
-            ContentBlock::Image(image) if state.vision => match decode_acp_image(image) {
+            ContentBlock::Image(image) if session_vision => match decode_acp_image(image) {
                 Ok(source) => images.push(source),
                 Err(message) => {
                     return responder.respond_with_error(invalid_params_error(format!(
@@ -2814,6 +3052,17 @@ async fn run_prompt_turn(
             ));
         }
     };
+
+    // Under the lock and before the first round, so a switch made while the previous turn held this
+    // mutex takes effect on this one. Refused rather than run on the old profile: the client asked
+    // for a specific account, and answering from another one silently is the failure the whole
+    // per-session binding exists to prevent.
+    if let Err(error) = apply_recorded_binding(&state, &mut runtime).await {
+        return responder.respond_with_error(invalid_params_error(format!(
+            "cannot run this turn on the provider profile this session is recorded against: {}",
+            error
+        )));
+    }
 
     // Install a fresh cancellation token inside the locked scope so the cancel handler (which reads
     // the sibling cell) always sees the token for the turn currently using the runtime.
@@ -3164,9 +3413,14 @@ async fn handle_load_session(
     // Refresh the palette + advertise the current mode set: the editor was reopened, so its UI
     // starts blank.
     let modes = build_mode_state(&permission);
+    let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-    responder.respond(LoadSessionResponse::new().modes(modes))
+    responder.respond(
+        LoadSessionResponse::new()
+            .modes(modes)
+            .config_options(config_options),
+    )
 }
 
 /// `session/list`: paginated index of persisted sessions, filtered by cwd when the client asks.
@@ -3401,9 +3655,14 @@ async fn handle_resume_session(
     state.sessions.write().await.insert(session_id_str, entry);
 
     let modes = build_mode_state(&permission);
+    let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-    responder.respond(ResumeSessionResponse::new().modes(modes))
+    responder.respond(
+        ResumeSessionResponse::new()
+            .modes(modes)
+            .config_options(config_options),
+    )
 }
 
 /// Delete a fork whose runtime could not be built, so a failed `session/fork` doesn't leave a full
@@ -3585,9 +3844,14 @@ async fn handle_fork_session(
     tracing::info!("session/fork: {} forked into {}", source_uuid, session_uuid);
 
     let modes = build_mode_state(&permission);
+    let config_options = build_config_options(&state.shared, &permission, Some(session_uuid)).await;
     emit_available_commands(&cx, &session_id, &state.shared.skills).await;
 
-    responder.respond(ForkSessionResponse::new(session_id).modes(modes))
+    responder.respond(
+        ForkSessionResponse::new(session_id)
+            .modes(modes)
+            .config_options(config_options),
+    )
 }
 
 /// `session/close`: remove a session from the active map. Cancels any in-flight prompt for that
@@ -3721,7 +3985,195 @@ async fn handle_set_session_mode(
         &entry.frontend.session_id,
         SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id_for(permission))),
     );
+    // The same change again for clients reading `configOptions` rather than `modes`. Both are
+    // advertised, so both have to be kept current or the two pickers disagree about the level the
+    // session is at.
+    emit_config_options(&state, &entry, uuid::Uuid::parse_str(&session_id_str).ok()).await;
     responder.respond(SetSessionModeResponse::new())
+}
+
+/// `session/set_config_option`: the `configOptions` counterpart to `session/set_mode`, which is how
+/// a client changes the session's provider profile.
+///
+/// The permission option does the same three things `session/set_mode` does -- set the cell, record
+/// the row, push a `current_mode_update` -- so a client driving either one gets the same result and
+/// both pickers agree. It does not *call* that handler: this one answers with the refreshed
+/// `configOptions` list rather than pushing it, which is the response shape the method has.
+async fn handle_set_session_config_option(
+    state: Arc<ServerState>,
+    req: SetSessionConfigOptionRequest,
+    responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id_str = req.session_id.0.as_ref().to_string();
+    let entry = {
+        let sessions = state.sessions.read().await;
+        match sessions.get(&session_id_str) {
+            Some(entry) => {
+                entry.touch();
+                entry.clone()
+            }
+            None => {
+                return responder.respond_with_error(invalid_params_error("no such session"));
+            }
+        }
+    };
+    let Some(value) = req.value.as_value_id() else {
+        return responder.respond_with_error(invalid_params_error(
+            "both configuration options take a string value",
+        ));
+    };
+    let value = value.0.as_ref().to_string();
+    let session_uuid = uuid::Uuid::parse_str(&session_id_str).ok();
+
+    match req.config_id.0.as_ref() {
+        PERMISSION_CONFIG_ID => {
+            let Some(permission) = parse_mode_id(&value) else {
+                return responder.respond_with_error(invalid_params_error(format!(
+                    "unknown mode id: {}",
+                    value
+                )));
+            };
+            if let Err(disabled) = entry.permission.try_set(permission) {
+                return responder.respond_with_error(invalid_params_error(format!(
+                    "mode '{}' is not enabled in this configuration",
+                    disabled.0
+                )));
+            }
+            // The row matters here for the same reason it does in `session/set_mode`: a scheduled
+            // gate is re-checked against it, and `session/list` reports it.
+            if let Some(session_uuid) = session_uuid
+                && let Err(error) = state
+                    .shared
+                    .session_manager
+                    .update_session_permission(session_uuid, &permission.to_string())
+                    .await
+            {
+                tracing::warn!(
+                    "could not persist the new permission for session {}: {}",
+                    session_uuid,
+                    error
+                );
+            }
+            // `modes` is still advertised, so its picker has to hear about a change made through
+            // the other one.
+            send_session_update(
+                &entry.frontend.connection,
+                &entry.frontend.session_id,
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode_id_for(permission))),
+            );
+        }
+        PROVIDER_CONFIG_ID => {
+            let Some(session_uuid) = session_uuid else {
+                return responder.respond_with_error(invalid_params_error(
+                    "this session has no row, so its provider cannot be changed",
+                ));
+            };
+            if !state.shared.config.providers.contains_key(&value) {
+                // Names the configured set, as the REPL and the HTTP API both do. A client picking
+                // from `configOptions` cannot reach this, but one setting the id from a script or a
+                // stale config can, and "not configured" alone gives it nothing to correct to.
+                return responder.respond_with_error(invalid_params_error(format!(
+                    "provider profile `{}` is not configured (configured: {})",
+                    value,
+                    state
+                        .shared
+                        .config
+                        .providers
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            // The profile as configured, with no overrides: setting the provider through a picker
+            // is the client restating the whole binding, and a model override left over from
+            // another profile has no business riding along onto one that may not have that model.
+            let resolved = match crate::resolved_binding(
+                &state.shared.providers,
+                crate::session::SessionProvider::from(value.clone()),
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return responder.respond_with_error(invalid_params_error(format!(
+                        "cannot use provider profile `{}`: {}",
+                        value, error
+                    )));
+                }
+            };
+            // Setting the option to what it already is writes nothing. A picker re-sends its
+            // current value readily -- a client rebuilding its UI, a user reselecting the
+            // highlighted row -- and each write bumps `updated_at`, which is what the GC scanner's
+            // idle timer reads, so a client polling its own pickers could keep a session resident
+            // forever. `PATCH /v1/sessions/{id}` already filters the no-op; this is the same rule.
+            let recorded = match state
+                .shared
+                .session_manager
+                .recorded_provider(session_uuid)
+                .await
+            {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    return responder.respond_with_error(invalid_params_error(format!(
+                        "could not read the recorded provider: {}",
+                        error
+                    )));
+                }
+            };
+            // The row first, so a write that fails leaves the session on the profile it was
+            // already recorded against rather than on one no later resume would resolve.
+            if recorded.as_ref() != Some(&resolved.binding) {
+                match state
+                    .shared
+                    .session_manager
+                    .set_recorded_provider(session_uuid, &resolved.binding)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return responder.respond_with_error(invalid_params_error(
+                            "this session no longer exists",
+                        ));
+                    }
+                    Err(error) => {
+                        return responder.respond_with_error(invalid_params_error(format!(
+                            "could not record the provider: {}",
+                            error
+                        )));
+                    }
+                }
+            }
+            // Unlike permission, which lives in an atomic the tool-call path reads live, the
+            // provider is owned by the `Agent` behind the runtime mutex. An in-flight prompt holds
+            // that mutex for the whole turn, and blocking the dispatch loop on it is the deadlock
+            // `session/close` documents; `try_lock` turns the wait into an answer the client can
+            // act on.
+            //
+            // Nothing is parked on a lost `try_lock`, and nothing needs to be: the row is already
+            // written, and every turn entry point reads it through `apply_recorded_binding` before
+            // its first round. A parked binding was a second carrier of a fact the row already
+            // held, only one of the three entry points drained it, and it could lose to any other
+            // writer of that row.
+            match entry.runtime.try_lock() {
+                Ok(mut runtime) => runtime.agent.set_provider(resolved),
+                Err(_) => tracing::info!(
+                    "session {} has a turn in flight; the provider change takes effect on the next \
+                     turn",
+                    session_uuid
+                ),
+            }
+        }
+        unknown => {
+            return responder.respond_with_error(invalid_params_error(format!(
+                "unknown configuration option: {}",
+                unknown
+            )));
+        }
+    }
+
+    let options = build_config_options(&state.shared, &entry.permission, session_uuid).await;
+    responder.respond(SetSessionConfigOptionResponse::new(options))
 }
 
 /// Build a fresh [`SessionRuntime`] from the process-wide
@@ -3763,6 +4215,10 @@ async fn build_session_runtime(
     // Shared with the agent (adopted inside `build_session_agent`) so the frontend can read the
     // current context occupancy when emitting `usage_update`.
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The window the same `usage_update` divides by, made here for the same reason: the frontend
+    // exists before the agent and has to hold the cell the agent publishes into, rather than a copy
+    // something has to remember to re-store beside every provider switch.
+    let context_window = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
     // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
     let cancellation = Arc::new(std::sync::RwLock::new(CancellationToken::new()));
@@ -3773,12 +4229,16 @@ async fn build_session_runtime(
         client_state.clone(),
         Arc::clone(transport_dead),
         Arc::clone(&context_tokens),
+        Arc::clone(&context_window),
         cancellation,
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
     let (agent, tool_registry) = crate::build_session_agent(
         shared,
+        // The row already exists by here, for `session/new` as well as `session/load`, so a loaded
+        // session resolves the profile it recorded rather than whatever this process defaults to.
+        Some(session_uuid),
         permission.clone(),
         frontend,
         Arc::clone(&cwd),
@@ -3787,12 +4247,9 @@ async fn build_session_runtime(
         // ACP reports occupancy through `usage_update`, driven by the counter above; it has no
         // separate reader for the fixed overhead, so a fresh handle is all it needs.
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_window,
     )
     .await?;
-    // Capture the resolved window so the frontend's `usage_update` reports the same size the REPL
-    // gauge would. The counter itself is adopted inside `build_session_agent`, which also builds
-    // `context_check` around it; setting it here instead would leave that tool on a dead atomic.
-    acp_frontend.set_context_window(agent.context_usage().1);
 
     Ok(SessionRuntime {
         session_id_str,
@@ -3804,35 +4261,6 @@ async fn build_session_runtime(
         frontend: acp_frontend,
         tool_registry,
     })
-}
-
-/// Mirrors `main::resolve_credential` but stays in this module to avoid widening `main`'s
-/// visibility for an ACP-only call site.
-async fn resolve_credential_for_acp(
-    config: &ResolvedConfig,
-    token_store: &crate::session::TokenStore,
-) -> anyhow::Result<AuthCredential> {
-    // Debug-only: when the integration harness sets `MEKA_MOCK_PROVIDER=1`, `run_acp` swaps in
-    // a scripted provider and discards the real one built from this credential. Return a
-    // placeholder so the harness needn't seed a credential into the database.
-    #[cfg(debug_assertions)]
-    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        return Ok(AuthCredential::ApiKey("mock-acp-provider".to_string()));
-    }
-
-    let Some(profile) = config.active_profile.as_deref() else {
-        anyhow::bail!("meka acp requires a configured provider; run `meka provider add <name>`");
-    };
-    token_store
-        .load_provider_credential(profile)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "provider profile '{}' has no stored credential; run `meka provider login {}`",
-                profile,
-                profile
-            )
-        })
 }
 
 #[cfg(test)]
@@ -4616,6 +5044,107 @@ mod tests {
         assert_eq!(
             build_mode_state(&permission).current_mode_id.0.as_ref(),
             "unrestricted"
+        );
+    }
+
+    fn select_options(option: &SessionConfigOption) -> Vec<(String, Option<String>)> {
+        use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+        match &option.kind {
+            SessionConfigKind::Select(select) => match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(|option| {
+                        (
+                            option.value.0.as_ref().to_string(),
+                            option.description.clone(),
+                        )
+                    })
+                    .collect(),
+                other => panic!("expected an ungrouped select, got {:?}", other),
+            },
+            other => panic!("expected a select option, got {:?}", other),
+        }
+    }
+
+    fn current_value(option: &SessionConfigOption) -> String {
+        use agent_client_protocol::schema::v1::SessionConfigKind;
+        match &option.kind {
+            SessionConfigKind::Select(select) => select.current_value.0.as_ref().to_string(),
+            other => panic!("expected a select option, got {:?}", other),
+        }
+    }
+
+    fn test_profiles(
+        entries: &[(&str, Option<&str>)],
+    ) -> std::collections::BTreeMap<String, crate::config::ProviderProfile> {
+        entries
+            .iter()
+            .map(|(name, model)| {
+                (name.to_string(), crate::config::ProviderProfile {
+                    backend: "anthropic-messages".to_string(),
+                    model: model.map(str::to_string),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    /// The `configOptions` permission entry must offer exactly what the `modes` picker offers, or a
+    /// client driving one of the two pickers is looking at a different set of levels from a client
+    /// driving the other.
+    #[test]
+    fn the_permission_config_option_matches_the_mode_picker() {
+        use crate::permission::{EnabledPermissions, SharedPermission};
+        let enabled =
+            EnabledPermissions::from_modes([Permission::Read, Permission::Ask]).expect("non-empty");
+        let permission = SharedPermission::new(Permission::Read, enabled);
+
+        let option = permission_config_option(&permission);
+        let offered: Vec<String> = select_options(&option)
+            .into_iter()
+            .map(|(value, _description)| value)
+            .collect();
+        let modes: Vec<String> = build_mode_state(&permission)
+            .available_modes
+            .iter()
+            .map(|mode| mode.id.0.as_ref().to_string())
+            .collect();
+
+        assert_eq!(offered, modes);
+        assert_eq!(current_value(&option), "read");
+        assert_eq!(option.id.0.as_ref(), PERMISSION_CONFIG_ID);
+    }
+
+    /// A profile that states no model must not acquire one here: the description is shown to the
+    /// user as a fact about the profile, and meka does not know what an unstated model resolves to.
+    #[test]
+    fn a_provider_option_describes_only_a_stated_model() {
+        let profiles = test_profiles(&[("work", Some("claude-opus-5")), ("personal", None)]);
+
+        let option = provider_config_option(&profiles, "personal");
+
+        assert_eq!(option.id.0.as_ref(), PROVIDER_CONFIG_ID);
+        assert_eq!(current_value(&option), "personal");
+        assert_eq!(select_options(&option), vec![
+            ("personal".to_string(), None),
+            ("work".to_string(), Some("claude-opus-5".to_string())),
+        ],);
+    }
+
+    /// A session pinned to a profile that has since left `config.toml` selects nothing rather than
+    /// silently presenting some other profile as the one it runs on.
+    #[test]
+    fn a_provider_no_longer_configured_selects_nothing() {
+        let profiles = test_profiles(&[("work", None)]);
+
+        let option = provider_config_option(&profiles, "retired");
+
+        assert_eq!(current_value(&option), "retired");
+        assert!(
+            !select_options(&option)
+                .iter()
+                .any(|(value, _description)| value == "retired"),
+            "a profile that is gone must not appear among the choices"
         );
     }
 

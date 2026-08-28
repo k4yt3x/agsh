@@ -1353,7 +1353,7 @@ mod tests {
     };
 
     async fn test_manager() -> SessionManager {
-        SessionManager::open(Some(Path::new(":memory:")))
+        SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("failed to open in-memory database")
     }
@@ -1395,7 +1395,10 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("outside");
 
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "report", "FINDINGS")
             .await
@@ -1459,7 +1462,10 @@ mod tests {
     #[tokio::test]
     async fn test_persist_oversized_results_replaces_large_text() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let large_text = "x".repeat(MAX_INLINE_RESULT_BYTES + 1000);
         let assistant_msg =
@@ -1509,7 +1515,10 @@ mod tests {
     #[tokio::test]
     async fn spilled_outputs_from_different_calls_do_not_overwrite_each_other() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let mut names = Vec::new();
         for (call_id, body) in [("call-turn1", 'a'), ("call-turn3", 'b')] {
@@ -1553,7 +1562,10 @@ mod tests {
     #[tokio::test]
     async fn test_persist_oversized_results_leaves_small_text() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let small_text = "hello world".to_string();
         let assistant_msg =
@@ -1586,7 +1598,10 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_scratchpad_save() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
@@ -1625,7 +1640,10 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_scratchpad_not_requested() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let assistant_msg = make_assistant_message(vec![(
             "call-1",
@@ -1657,7 +1675,10 @@ mod tests {
         // (as an input-source param) instead of `scratchpad` (the output-destination convention),
         // the agent-layer save must not touch the pre-existing scratchpad entry.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "img", "original base64 data")
@@ -1703,7 +1724,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_write() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let tool = ScratchpadWriteTool {
             session_manager: manager.clone(),
@@ -1732,7 +1756,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_write_overwrites() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "notes", "old content")
@@ -1764,7 +1791,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_read() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "data", "line1\nline2\nline3\n")
@@ -1795,7 +1825,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_read_with_offset_and_limit() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "abc", "abcdefghij")
@@ -1825,7 +1858,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_read_search_mode() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(
@@ -1861,7 +1897,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_read_not_found() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let tool = ScratchpadReadTool {
             session_manager: manager,
@@ -1882,7 +1921,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_edit_overwrite() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "doc", "old content")
@@ -1916,7 +1958,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_edit_replacement() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "doc", "hello world hello")
@@ -1949,7 +1994,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_edit_replace_all() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "doc", "foo bar foo baz foo")
@@ -1989,7 +2037,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_list_empty() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let tool = ScratchpadListTool {
             session_manager: manager,
@@ -2009,7 +2060,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_list_with_entries() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "notes", "content one")
@@ -2043,7 +2097,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_delete() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "temp", "temp data")
@@ -2077,7 +2134,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_delete_not_found() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let tool = ScratchpadDeleteTool {
             session_manager: manager,
@@ -2101,7 +2161,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_read_falls_back_to_parent() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2135,7 +2198,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_prefers_child_when_both_present() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2172,7 +2238,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_read_blocks_names_not_in_allowlist() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2205,7 +2274,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_list_respects_allowlist() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2257,7 +2329,10 @@ mod tests {
         // When no inheritance is configured, the list behaves exactly as before: no extra section,
         // no parent enumeration.
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2289,7 +2364,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_list_unified_table_has_origin_column() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2339,7 +2417,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_write_is_rejected() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2381,7 +2462,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_edit_is_rejected() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2417,7 +2501,10 @@ mod tests {
     #[tokio::test]
     async fn test_inherited_scratchpad_delete_is_rejected() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2457,7 +2544,10 @@ mod tests {
         // the parent actually granted; otherwise child sessions stay free to use any name.)
         // Parent's row is untouched.
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2505,8 +2595,14 @@ mod tests {
     #[tokio::test]
     async fn test_sessions_have_independent_scratchpads() {
         let manager = test_manager().await;
-        let session1 = manager.create_session(None).await.expect("create");
-        let session2 = manager.create_session(None).await.expect("create");
+        let session1 = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let session2 = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session1, "shared_name", "session1 data")
@@ -2535,7 +2631,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session_removes_scratchpad() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "data", "content")
@@ -2554,7 +2653,10 @@ mod tests {
     #[tokio::test]
     async fn test_clear_messages_removes_scratchpad() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         manager
             .save_tool_output(session_id, "data", "content")
@@ -2576,7 +2678,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_edit_read_list_delete_integration() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let sid = test_session_id(session_id);
 
         let write_tool = ScratchpadWriteTool {
@@ -2657,7 +2762,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_load_file_happy_path() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("input.txt");
         tokio::fs::write(&path, "hello scratchpad")
@@ -2692,7 +2800,10 @@ mod tests {
         // Regression: a relative path must resolve against the session cwd (like `read_file`), not
         // the process cwd, so `scratchpad_load_file` tracks `/cd`.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         tokio::fs::write(dir.path().join("rel.txt"), "relative contents")
             .await
@@ -2729,7 +2840,10 @@ mod tests {
     async fn test_scratchpad_save_file_resolves_relative_path_against_cwd() {
         // Regression: a relative save path must land under the session cwd, not the process cwd.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "report", "final analysis")
             .await
@@ -2774,7 +2888,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_save_file_contends_with_write_file_for_the_same_path() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "report", "final analysis")
             .await
@@ -2849,7 +2966,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_save_file_refuses_to_replace_an_existing_file() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "report", "scratchpad bytes")
             .await
@@ -2909,7 +3029,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_load_file_rejects_inherited_name() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -2950,7 +3073,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_load_file_rejects_image_with_mime() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pic.png");
         // Minimal PNG signature + IHDR chunk bytes, enough for `infer` to fingerprint without
@@ -2992,7 +3118,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_load_file_unknown_binary_has_no_mime_line() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("blob.bin");
         // A short run of 0xFF bytes won't match any `infer` signature.
@@ -3027,7 +3156,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_save_file_happy_path() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "report", "final analysis")
             .await
@@ -3063,7 +3195,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_save_file_reads_inherited_from_parent() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -3104,7 +3239,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_save_file_missing_entry_errors() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.txt");
 
@@ -3133,7 +3271,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_rename_happy_path() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "draft", "payload")
             .await
@@ -3167,7 +3308,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_rename_source_not_found() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let tool = ScratchpadRenameTool {
             session_manager: manager.clone(),
@@ -3197,7 +3341,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_rename_target_already_exists() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "src", "src-content")
             .await
@@ -3236,7 +3383,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_rename_blocks_inherited_source() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -3273,7 +3423,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_rename_blocks_inherited_target() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -3315,7 +3468,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_merge_concat_with_headers_default() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         for (name, body) in [("a", "first"), ("b", "second"), ("c", "third")] {
             manager
                 .save_tool_output(session_id, name, body)
@@ -3354,7 +3510,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_merge_json_array_parses_valid_and_quotes_invalid() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "obj", r#"{"k":1}"#)
             .await
@@ -3401,7 +3560,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_merge_blocks_inherited_target() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -3436,7 +3598,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_merge_reads_inherited_sources() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -3476,7 +3641,10 @@ mod tests {
     #[tokio::test]
     async fn test_scratchpad_merge_missing_source_aborts_without_writing() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_tool_output(session_id, "real", "stuff")
             .await

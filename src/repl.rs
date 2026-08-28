@@ -73,6 +73,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "[none|read|workspace|ask|unrestricted]",
     },
     CommandSpec {
+        name: "provider",
+        aliases: &[],
+        help: "Show or change the provider profile this session runs on",
+        arg_hint: "[profile]",
+    },
+    CommandSpec {
         name: "compact",
         aliases: &[],
         help: "Summarize and compact the session, optionally saying what to keep",
@@ -243,12 +249,17 @@ fn submit_aware_input_painter(
 }
 
 /// Tab completer for slash commands. The data needed to complete arguments (MCP server names,
-/// skill names) is snapshotted at construction because reedline re-invokes `complete()` on every
-/// keystroke while the menu is open, so a per-keystroke filesystem scan like the skill walk
-/// (which reads every `SKILL.md`) must never live in the hot path.
+/// skill names) is snapshotted rather than gathered here, because reedline re-invokes `complete()`
+/// on every keystroke while the menu is open, so a per-keystroke filesystem scan like the skill
+/// walk (which reads every `SKILL.md`) must never live in the hot path.
 struct SlashCompleter {
     mcp_server_names: Vec<String>,
-    skill_names: Vec<String>,
+    /// Refreshed once per prompt by the loop below rather than frozen at construction. With
+    /// `[skills] agent_managed`, `skill_write` and `skill_delete` change the set mid-session; a
+    /// frozen list went on offering a skill the agent had deleted, and `/skill <name>` then failed
+    /// on a name Tab had just supplied.
+    skill_names: Arc<std::sync::RwLock<Vec<String>>>,
+    provider_names: Vec<String>,
     cwd: crate::workspace::SharedCwd,
 }
 
@@ -323,8 +334,18 @@ impl SlashCompleter {
                 token_start,
                 pos,
             ),
+            "provider" if argument_index == 1 => terminal_suggestions(
+                self.provider_names.iter().cloned(),
+                prefix,
+                token_start,
+                pos,
+            ),
             "skill" if argument_index == 1 => {
-                terminal_suggestions(self.skill_names.iter().cloned(), prefix, token_start, pos)
+                let names = match self.skill_names.read() {
+                    Ok(names) => names.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                terminal_suggestions(names, prefix, token_start, pos)
             }
             "mcp" if argument_index == 1 => terminal_suggestions(
                 MCP_SUBCOMMANDS.iter().map(|keyword| keyword.to_string()),
@@ -443,9 +464,13 @@ struct MekaPrompt {
 
 /// Shared handle to the live context-token counter plus the model window, for the optional prompt
 /// gauge. The counter is the agent's `last_context_tokens` (updated after each turn / on compact).
+///
+/// Both are handles. The window used to be a `u64` read from the process default profile before the
+/// agent existed, so a session resumed onto another profile, or moved by `/provider`, kept dividing
+/// by a window it was not being gauged against, and the prompt and `/status` disagreed.
 struct ContextIndicator {
     tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    window: u64,
+    window: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ContextIndicator {
@@ -453,14 +478,15 @@ impl ContextIndicator {
     /// the window is unknown.
     fn render(&self) -> Option<String> {
         let tokens = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
-        if tokens == 0 || self.window == 0 {
+        let window = self.window.load(std::sync::atomic::Ordering::Relaxed);
+        if tokens == 0 || window == 0 {
             return None;
         }
-        let pct = ((tokens as f64 / self.window as f64) * 100.0).round() as u64;
+        let pct = ((tokens as f64 / window as f64) * 100.0).round() as u64;
         Some(format!(
             "{}/{} {}%",
             crate::render::format_token_count(tokens),
-            crate::render::format_token_count(self.window),
+            crate::render::format_token_count(window),
             pct
         ))
     }
@@ -671,6 +697,8 @@ pub enum SlashCommand {
     Clear,
     Session,
     Permission(Option<String>),
+    /// `/provider [name]`: show which profile this session runs on, or move it to another.
+    Provider(Option<String>),
     /// `/compact [instructions]`: compact now, optionally saying what to keep or drop.
     Compact(Option<String>),
     Export,
@@ -761,6 +789,12 @@ pub enum ReplEvent {
     /// database *without* waiting for a turn, because the whole point of the withdrawal is that
     /// Shift+Tab-ing down and walking away stops a gate.
     PermissionChanged(crate::permission::Permission),
+    /// The user asked to move this session onto another provider profile.
+    ///
+    /// Sent rather than done here for the same reason as `PermissionChanged`: the REPL thread is
+    /// not async and holds neither the session manager nor the provider registry. The agent side
+    /// resolves the name, rebuilds the provider and records it on the row.
+    ProviderChange(String),
     Exit,
 }
 
@@ -804,6 +838,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
         "tasks" => Some(parse_tasks_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
+        "provider" => Some(SlashCommand::Provider(argument)),
         "compact" => Some(SlashCommand::Compact(argument)),
         "rewind" => Some(SlashCommand::Rewind(
             argument
@@ -1042,7 +1077,10 @@ impl CommandSpacing {
 pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
-    context_indicator: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
+    context_indicator: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    )>,
     input_style: nu_ansi_term::Style,
     initial_turn_pending: bool,
     sandbox_state: crate::sandbox::SandboxState,
@@ -1059,6 +1097,11 @@ pub fn run_repl(
     // polls it inside `read_line` and returns `Signal::ExternalBreak`, which is what lets a wakeup
     // interrupt an idle prompt instead of waiting for the user to press Enter.
     wake: Arc<AtomicBool>,
+    // Which profile this session runs on, and every profile configured. The first is shared
+    // because the agent side changes it; the second is a snapshot because `config.toml` is
+    // read once.
+    current_provider: Arc<std::sync::RwLock<String>>,
+    configured_providers: Vec<String>,
     // `[display]` blank-line spacing, for the commands this thread answers itself. The ones it
     // forwards are bracketed by the agent loop, and a turn's own output by `TurnStarted` /
     // `TurnFinished`; all three read the same two config values so the setting means one thing
@@ -1085,18 +1128,32 @@ pub fn run_repl(
         }
     });
 
-    // Snapshot skill names once. Discovery reads every `SKILL.md`, so it must not run per
-    // keystroke inside the completer. A skill added mid-session will not autocomplete until
-    // restart, but `/skill` execution rediscovers live, so a stale snapshot never yields an
-    // invalid command.
-    let skill_names: Vec<String> = crate::skills::discover_skills_in_roots(&skill_roots)
-        .skills
-        .into_iter()
-        .map(|skill| skill.name)
-        .collect();
+    // Checked once per prompt, not per keystroke, and re-read only when the files have actually
+    // moved. Frozen at construction it was simply wrong under `[skills] agent_managed`, where
+    // `skill_write` and `skill_delete` move the set mid-session; re-discovered unconditionally it
+    // parsed every `SKILL.md` before drawing every prompt and reprinted the unloadable-skill
+    // warnings with it. `SkillNameWatch` is the stat-and-compare `SkillCache` makes on the agent
+    // side, for a caller that cannot await it.
+    let skill_names = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let refresh_skill_names = {
+        let skill_names = Arc::clone(&skill_names);
+        let watch =
+            std::cell::RefCell::new(crate::skills::SkillNameWatch::new(skill_roots.clone()));
+        move || {
+            let Some(discovered) = watch.borrow_mut().refresh() else {
+                return;
+            };
+            match skill_names.write() {
+                Ok(mut names) => *names = discovered,
+                Err(poisoned) => *poisoned.into_inner() = discovered,
+            }
+        }
+    };
+    refresh_skill_names();
     let completer = SlashCompleter {
         mcp_server_names,
         skill_names,
+        provider_names: configured_providers.clone(),
         cwd: cwd.clone(),
     };
 
@@ -1137,6 +1194,10 @@ pub fn run_repl(
         // so log lines route through the printer (cleanly above the live prompt) while it's active
         // and go straight to stderr otherwise (e.g. during a turn), surfacing immediately instead
         // of buffering until the turn ends and the next prompt is drawn.
+        // Between turns, so a skill the agent has just written or deleted is what Tab offers. Once
+        // per prompt is the right cadence for the stat pass, and it happens while the user has not
+        // started typing; the parse behind it only runs when the stats have moved.
+        refresh_skill_names();
         RELAY.set_at_prompt(true);
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
@@ -1196,6 +1257,46 @@ pub fn run_repl(
                             {
                                 eprintln!("Failed to clear terminal.");
                             }
+                            continue;
+                        }
+                        Some(SlashCommand::Provider(argument)) => {
+                            spacing.after_prompt();
+                            match argument {
+                                None => {
+                                    let current = current_provider
+                                        .read()
+                                        .map(|guard| guard.clone())
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                                    eprintln!("Current provider profile: {}", current);
+                                    if !configured_providers.is_empty() {
+                                        eprintln!(
+                                            "Configured: {}",
+                                            configured_providers.join(", ")
+                                        );
+                                    }
+                                }
+                                Some(name) => {
+                                    let name = name.trim().to_string();
+                                    // Resolved and recorded on the agent side, which owns both the
+                                    // registry and the session row; this thread only asks. Waited
+                                    // on like every other forwarded command: the agent prints the
+                                    // outcome, and a prompt painted before it arrives lands under
+                                    // whatever the user types next.
+                                    if input_sender.send(ReplEvent::ProviderChange(name)).is_err() {
+                                        // Loud, and the end of the shell: the profile a session
+                                        // runs on is only moved on the agent's side, so a debug
+                                        // log here left the user looking at a prompt that had
+                                        // silently declined to do the one thing they asked for.
+                                        render::render_error(
+                                            &"the agent stopped; the provider was not changed",
+                                        );
+                                        break;
+                                    } else if !wait_for_agent(&agent_event_receiver) {
+                                        break;
+                                    }
+                                }
+                            }
+                            spacing.before_prompt();
                             continue;
                         }
                         Some(SlashCommand::Permission(argument)) => {
@@ -1400,6 +1501,12 @@ pub fn run_repl(
 
 /// Wait for the agent to signal it is done, while also handling tool approval requests that arrive
 /// in Ask mode.
+///
+/// `false` means the agent side is gone, and every caller leaves the shell on it. It is said out
+/// loud rather than returned quietly because the alternative, seen live, is a shell that accepts
+/// `/provider` and `/session` and answers neither: everything those commands do happens on the
+/// agent's side of this channel, so without a word here the user is left typing into something that
+/// ignores them.
 fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>) -> bool {
     loop {
         match agent_event_receiver.recv() {
@@ -1413,7 +1520,10 @@ fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEv
             Ok(AgentToReplEvent::McpProgress(update)) => {
                 render_progress_update(&update);
             }
-            Err(_) => return false,
+            Err(_) => {
+                render::render_error(&"the agent stopped; leaving the shell");
+                return false;
+            }
         }
     }
 }
@@ -3284,7 +3394,8 @@ mod tests {
     fn empty_completer() -> SlashCompleter {
         SlashCompleter {
             mcp_server_names: Vec::new(),
-            skill_names: Vec::new(),
+            skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
+            provider_names: Vec::new(),
             cwd: crate::workspace::test_cwd(),
         }
     }
@@ -3292,7 +3403,11 @@ mod tests {
     fn completer_at(cwd: crate::workspace::SharedCwd) -> SlashCompleter {
         SlashCompleter {
             mcp_server_names: vec!["postgres".into(), "github".into()],
-            skill_names: vec!["search".into(), "deep-research".into()],
+            skill_names: Arc::new(std::sync::RwLock::new(vec![
+                "search".into(),
+                "deep-research".into(),
+            ])),
+            provider_names: Vec::new(),
             cwd,
         }
     }
@@ -3396,6 +3511,36 @@ mod tests {
         let suggestions = completer.suggestions("/skill sea", 10);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "search");
+    }
+
+    /// The completer follows the skill set rather than the one it was built with.
+    ///
+    /// It used to hold a `Vec<String>` frozen at construction. With `[skills] agent_managed`,
+    /// `skill_write` and `skill_delete` move that set mid-session, so Tab went on offering a skill
+    /// the agent had deleted and `/skill <name>` then failed on a name Tab had just supplied. The
+    /// prompt loop refreshes the shared handle before every `read_line`; this is the half of that
+    /// arrangement a unit test can reach.
+    #[test]
+    fn the_skill_completer_follows_a_set_that_changes_under_it() {
+        let completer = completer_at(crate::workspace::test_cwd());
+        assert_eq!(
+            completer.suggestions("/skill sea", 10).len(),
+            1,
+            "the fixture starts with `search` installed"
+        );
+
+        match completer.skill_names.write() {
+            Ok(mut names) => *names = vec!["deploy".into()],
+            Err(poisoned) => *poisoned.into_inner() = vec!["deploy".into()],
+        }
+
+        assert!(
+            completer.suggestions("/skill sea", 10).is_empty(),
+            "a deleted skill must stop being offered"
+        );
+        let suggestions = completer.suggestions("/skill dep", 10);
+        assert_eq!(suggestions.len(), 1, "and a new one must start");
+        assert_eq!(suggestions[0].value, "deploy");
     }
 
     #[test]
@@ -3970,6 +4115,7 @@ mod tests {
             Some(SlashCommand::Clear) => "Clear",
             Some(SlashCommand::Session) => "Session",
             Some(SlashCommand::Permission(_)) => "Permission",
+            Some(SlashCommand::Provider(_)) => "Provider",
             Some(SlashCommand::Compact(_)) => "Compact",
             Some(SlashCommand::Export) => "Export",
             Some(SlashCommand::Fork) => "Fork",

@@ -78,6 +78,9 @@ pub struct SessionMetaRow {
     pub additional_roots: Vec<PathBuf>,
     /// The terms a sub-agent was spawned under, as stored JSON. `None` on every top-level session.
     pub subagent_spec_json: Option<String>,
+    /// What the session runs on, so an export carries it and an import can restore it rather than
+    /// landing every imported session on the empty profile no configuration can name.
+    pub provider: SessionProvider,
 }
 
 /// Per-surface overrides applied to the copy produced by [`SessionManager::fork_session`]. Each
@@ -111,6 +114,10 @@ pub struct ImportSessionRecord {
     /// top-level sessions and for archives written before the field existed; an imported sub-agent
     /// without it can be read and deleted but not resumed.
     pub subagent_spec_json: Option<String>,
+    /// What the imported session runs on. The caller settles this: an archive that carries a
+    /// profile keeps it, and one written before the field existed adopts the importing
+    /// installation's default, which is the only thing that can be known about it here.
+    pub provider: SessionProvider,
     pub stats: crate::stats::SessionStatsSnapshot,
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub events: Vec<(String, crate::conversation::Event)>,
@@ -137,6 +144,9 @@ pub struct SessionSummary {
     /// API persists this so `POST /v1/sessions` with an explicit `permission` field survives
     /// GC-eviction + re-attach.
     pub permission: Option<String>,
+    /// What this session runs on: the profile that resolved when the row was written, plus
+    /// whatever it overrides of that profile's model and endpoint.
+    pub provider: SessionProvider,
     /// Per-session capability flags, as a serialized
     /// [`crate::server::http_frontend::SessionCapabilities`]. Deliberately not enumerated here:
     /// the flag set has grown twice, and each restatement went stale silently. NULL on the
@@ -154,6 +164,44 @@ pub struct SessionSummary {
     /// receiving a flat list in which a worker is indistinguishable from the agent that dispatched
     /// it.
     pub parent_id: Option<Uuid>,
+}
+
+/// What a session runs on: the profile it names, plus any per-session override of that profile's
+/// model or endpoint.
+///
+/// The two overrides are `Option` because absence is honest rather than missing: every session has
+/// a profile, and a session with no override follows whatever `config.toml` currently says for that
+/// profile, so editing the profile moves the session with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionProvider {
+    pub profile: String,
+    pub model_override: Option<String>,
+    pub base_url_override: Option<String>,
+}
+
+impl SessionProvider {
+    /// The override half, in the shape [`crate::provider::ProviderRegistry`] takes.
+    ///
+    /// `thinking` is deliberately absent: it is a per-profile encoding the user states because
+    /// neither meka nor the provider can determine it, not something a session pins.
+    pub fn overrides(&self) -> crate::config::ProfileOverrides {
+        crate::config::ProfileOverrides {
+            model: self.model_override.clone(),
+            base_url: self.base_url_override.clone(),
+            thinking: None,
+        }
+    }
+}
+
+impl From<String> for SessionProvider {
+    /// A profile with no overrides, which is what every caller that only names one wants.
+    fn from(profile: String) -> Self {
+        Self {
+            profile,
+            model_override: None,
+            base_url_override: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -669,7 +717,15 @@ fn is_free(path: &Path) -> bool {
 }
 
 impl SessionManager {
-    pub async fn open(path: Option<&Path>) -> Result<Self> {
+    /// Open the store, bringing its schema forward if it is behind.
+    ///
+    /// `context` carries the facts a migration cannot work out for itself; see
+    /// [`migrations::Context`]. It is a parameter rather than something read here because this
+    /// function must not know what a provider profile is: the ledger is the only place allowed to
+    /// act on an older meka's store, and config is the only place that knows which profile is the
+    /// default. A caller with nothing to carry forward passes the default, which every test does
+    /// because a store it just created has no sessions to carry.
+    pub async fn open(path: Option<&Path>, context: &migrations::Context) -> Result<Self> {
         let database_path = match path {
             Some(path) => path.to_path_buf(),
             None => default_database_path()?,
@@ -782,7 +838,7 @@ impl SessionManager {
             lock_dir,
             database_path,
         };
-        manager.initialize_schema().await?;
+        manager.initialize_schema(context).await?;
         manager.prune_orphan_lock_files().await;
         Ok(manager)
     }
@@ -793,7 +849,7 @@ impl SessionManager {
         &self.database_path
     }
 
-    async fn initialize_schema(&self) -> Result<()> {
+    async fn initialize_schema(&self, context: &migrations::Context) -> Result<()> {
         // Serialise schema work across processes.
         //
         // Two things below need it, and neither is safe on its own. The migration run decides what
@@ -844,6 +900,7 @@ impl SessionManager {
         // read -- dies the same way. A rare, loud, retryable startup error is the accepted half of
         // that trade.
         let database_path = self.database_path.clone();
+        let context = context.clone();
         let (plan, backup) = self
             .connection
             .call(move |connection| -> std::result::Result<_, MekaError> {
@@ -859,7 +916,7 @@ impl SessionManager {
                 } else {
                     None
                 };
-                migrations::apply(connection, plan)?;
+                migrations::apply(connection, plan, &context)?;
                 // Reconciliation rather than creation, and outside the ledger for that reason: it
                 // asks whether this database's FTS triggers are the ones this build requires and
                 // makes them so, which is as true of a store created a minute ago as of one carried
@@ -899,8 +956,12 @@ impl SessionManager {
     /// Leaves the row unlocked, so a sweep can reach it before anyone claims it. Every host that
     /// creates a session a turn will run against wants [`Self::create_session_locked`] instead;
     /// this one is reached from tests.
-    pub async fn create_session(&self, cwd: Option<std::path::PathBuf>) -> Result<Uuid> {
-        self.create_session_with_metadata(cwd, None, None, None)
+    pub async fn create_session(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        provider: impl Into<SessionProvider>,
+    ) -> Result<Uuid> {
+        self.create_session_with_metadata(cwd, None, None, None, provider)
             .await
             .map(|created| created.id)
     }
@@ -919,9 +980,17 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
+        provider: impl Into<SessionProvider>,
     ) -> Result<CreatedSession> {
-        self.insert_session_row(Uuid::new_v4(), cwd, permission, capabilities_json, token_id)
-            .await
+        self.insert_session_row(
+            Uuid::new_v4(),
+            cwd,
+            permission,
+            capabilities_json,
+            token_id,
+            provider.into(),
+        )
+        .await
     }
 
     /// Create a session and take its lock, in that order: the lock **before** the row.
@@ -953,13 +1022,124 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
+        provider: impl Into<SessionProvider>,
     ) -> Result<(CreatedSession, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
         let lock = self.claim_a_fresh_id(session_id);
         let created = self
-            .insert_session_row(session_id, cwd, permission, capabilities_json, token_id)
+            .insert_session_row(
+                session_id,
+                cwd,
+                permission,
+                capabilities_json,
+                token_id,
+                provider.into(),
+            )
             .await?;
         Ok((created, lock))
+    }
+
+    /// How many sessions run on one provider profile.
+    ///
+    /// For `meka provider remove`, which otherwise strands them silently: the refusal only arrives
+    /// when the user next resumes one, which can be long after the removal and somewhere else.
+    pub async fn count_sessions_on_provider(&self, profile: &str) -> Result<u64> {
+        let profile = profile.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                // Top-level only, matching what `meka session list` shows and what the warning's
+                // own advice can act on. A sub-agent row copies its parent's binding, so counting
+                // children reported a number many times what the user could see, about rows that
+                // `meka -r <id> --provider <name>` is not for.
+                connection.query_row(
+                    "SELECT COUNT(*) FROM sessions
+                     WHERE provider = ?1 AND parent_session_id IS NULL",
+                    rusqlite::params![profile],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| {
+                MekaError::Database(format!("failed to count sessions on a provider: {}", error))
+            })
+    }
+
+    /// What this session runs on, as recorded on its row.
+    ///
+    /// `None` means the session is gone. Every other answer is a profile name that resolved when it
+    /// was written: every door that mints a session resolves one first and refuses without it, so
+    /// there is no such thing as a session this meka created with none. The empty string is still
+    /// reachable, on a carried-forward row the migration could resolve no profile for, and needs no
+    /// branch here: like a name that has since left `config.toml`, it is refused by
+    /// [`crate::provider::ProviderRegistry::settings`], by name.
+    pub async fn recorded_provider(&self, session_id: Uuid) -> Result<Option<SessionProvider>> {
+        let id = session_id.to_string();
+        self.connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT provider, model_override, base_url_override FROM sessions \
+                         WHERE id = ?1",
+                        [&id],
+                        |row| {
+                            Ok(SessionProvider {
+                                profile: row.get(0)?,
+                                model_override: row.get(1)?,
+                                base_url_override: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read the session's provider: {}", error))
+            })
+    }
+
+    /// Move a session onto another provider binding, permanently.
+    ///
+    /// The CLI's `/provider` and `--provider` repin and ACP's `session/set_config_option` land
+    /// here; the HTTP surfaces move the same three columns through
+    /// [`Self::update_session_metadata_atomic`], which writes them in one statement with permission
+    /// and cwd. Either door leaves the row stating what the session actually runs with, rather than
+    /// the drift the columns exist to remove: overriding for one run and leaving the row saying
+    /// something else.
+    ///
+    /// All three columns are written together because they describe one thing. A caller that means
+    /// to keep an override has to say so, which is what stops a repin from silently carrying one
+    /// profile's model onto another.
+    pub async fn set_recorded_provider(
+        &self,
+        session_id: Uuid,
+        provider: &SessionProvider,
+    ) -> Result<bool> {
+        let id = session_id.to_string();
+        let provider = provider.clone();
+        let changed = self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET provider = ?2, model_override = ?3, \
+                     base_url_override = ?4, updated_at = ?5 WHERE id = ?1",
+                    rusqlite::params![
+                        id,
+                        provider.profile,
+                        provider.model_override,
+                        provider.base_url_override,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to record the session's provider: {}",
+                    error
+                ))
+            })?;
+        Ok(changed > 0)
     }
 
     /// Take the lock on an id that is about to become a row.
@@ -991,6 +1171,7 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
+        provider: SessionProvider,
     ) -> Result<CreatedSession> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
@@ -999,8 +1180,9 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, cwd, permission, capabilities_json, token_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO sessions (id, created_at, updated_at, cwd, permission, \
+                     capabilities_json, token_id, provider, model_override, base_url_override)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         session_id.to_string(),
                         created_at_for_db,
@@ -1009,6 +1191,9 @@ impl SessionManager {
                         permission,
                         capabilities_json,
                         token_id,
+                        provider.profile,
+                        provider.model_override,
+                        provider.base_url_override,
                     ],
                 )?;
                 Ok(())
@@ -1048,12 +1233,18 @@ impl SessionManager {
         let now = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
 
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
+        let inserted = self
+            .connection
+            .call(move |connection| -> rusqlite::Result<bool> {
+                let rows = connection.execute(
+                    // The whole binding is selected from the parent rather than passed in: a
+                    // sub-agent runs the parent's conversation onward, so the two must not be able
+                    // to disagree about what that runs on.
                     "INSERT INTO sessions
-                         (id, created_at, updated_at, parent_session_id, cwd, subagent_spec_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (id, created_at, updated_at, parent_session_id, cwd, subagent_spec_json,
+                          provider, model_override, base_url_override)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, provider, model_override, base_url_override
+                     FROM sessions WHERE id = ?4",
                     rusqlite::params![
                         session_id.to_string(),
                         now,
@@ -1063,12 +1254,32 @@ impl SessionManager {
                         subagent_spec_json,
                     ],
                 )?;
-                Ok(())
+                Ok(rows > 0)
             })
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to create child session: {}", error))
             })?;
+
+        // A parent that is gone selects no row, so this statement inserts nothing and succeeds.
+        // Reading the count back is what keeps that an error: the `VALUES` form this replaced was
+        // refused by `parent_session_id`'s foreign key, and without the check a spawn would hand
+        // back an id with no row behind it -- a worker the model is told about, holding a lock file
+        // for a session that never existed, whose first `save_message` dies on the constraint
+        // instead. [`Self::fork_session_into`] reads its own count for the same reason.
+        if !inserted {
+            // Nothing was written, so the claim protects nothing and its file is garbage from the
+            // moment it exists. The id is a fresh v4, so no one else can hold it.
+            drop(lock);
+            let path = self.lock_dir.join(format!("{}.lock", session_id));
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::debug!("could not remove {}: {}", path.display(), error);
+            }
+            return Err(MekaError::Database(format!(
+                "cannot spawn a sub-agent of session {}: it no longer exists",
+                parent
+            )));
+        }
 
         Ok((session_id, lock))
     }
@@ -1196,14 +1407,17 @@ impl SessionManager {
                 let rows = txn.execute(
                     "INSERT INTO sessions (
                          id, created_at, updated_at, parent_session_id, cwd, permission,
-                         capabilities_json, token_id, additional_roots_json, stat_turns,
+                         capabilities_json, token_id, additional_roots_json, provider,
+                         model_override, base_url_override, stat_turns,
                          stat_input_tokens, stat_output_tokens,
                          stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                          stat_redactions, stat_redacted_images, stat_redacted_bytes
                      )
                      SELECT ?1, ?2, ?2, NULL, COALESCE(?3, cwd), permission,
                             capabilities_json, ?4,
-                            CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, stat_turns,
+                            CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, provider,
+                            model_override, base_url_override,
+                            stat_turns,
                             stat_input_tokens, stat_output_tokens,
                             stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                             stat_redactions, stat_redacted_images, stat_redacted_bytes
@@ -1491,6 +1705,7 @@ impl SessionManager {
             capabilities_json: Option<String>,
             additional_roots_json: Option<String>,
             subagent_spec_json: Option<String>,
+            provider: SessionProvider,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String)>,
             tool_outputs: Vec<(String, String)>,
@@ -1514,6 +1729,7 @@ impl SessionManager {
                 capabilities_json: record.capabilities_json,
                 additional_roots_json: encode_additional_roots(&record.additional_roots)?,
                 subagent_spec_json: record.subagent_spec_json,
+                provider: record.provider,
                 stats: record.stats,
                 events,
                 tool_outputs: record.tool_outputs,
@@ -1527,10 +1743,11 @@ impl SessionManager {
                         "INSERT INTO sessions (
                              id, created_at, updated_at, parent_session_id, cwd, permission,
                              capabilities_json, additional_roots_json, subagent_spec_json,
+                             provider, model_override, base_url_override,
                              stat_turns, stat_input_tokens, stat_output_tokens,
                              stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                              stat_redactions, stat_redacted_images, stat_redacted_bytes
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1541,6 +1758,9 @@ impl SessionManager {
                             session.capabilities_json,
                             session.additional_roots_json,
                             session.subagent_spec_json,
+                            session.provider.profile,
+                            session.provider.model_override,
+                            session.provider.base_url_override,
                             session.stats.turns as i64,
                             session.stats.input_tokens as i64,
                             session.stats.output_tokens as i64,
@@ -1658,7 +1878,8 @@ impl SessionManager {
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
                             s.cwd, s.permission, s.capabilities_json, s.additional_roots_json,
-                            s.subagent_spec_json
+                            s.subagent_spec_json, s.provider, s.model_override,
+                            s.base_url_override
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -1684,6 +1905,11 @@ impl SessionManager {
                             row.get::<_, Option<String>>(7)?.as_deref(),
                         ),
                         subagent_spec_json: row.get(8)?,
+                        provider: SessionProvider {
+                            profile: row.get(9)?,
+                            model_override: row.get(10)?,
+                            base_url_override: row.get(11)?,
+                        },
                     })
                 })?;
                 let mut out = Vec::new();
@@ -1945,7 +2171,7 @@ impl SessionManager {
     ///
     /// `cwd_filter`, if `Some`, restricts the result set to sessions whose persisted `cwd` matches
     /// the given path. Rows with NULL `cwd` are excluded: a session created by
-    /// `create_session(None)` recorded no cwd to match against.
+    /// `create_session(None, "test-profile".to_string())` recorded no cwd to match against.
     ///
     /// `cursor`, if `Some`, is a previous `next_cursor` value from this method; rows are returned
     /// strictly *after* the cursor in `(updated_at, id) DESC` order. Returns `(rows, next_cursor)`;
@@ -1987,7 +2213,7 @@ impl SessionManager {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider, s.model_override, s.base_url_override,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -2025,7 +2251,12 @@ impl SessionManager {
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
                     let parent_id: Option<String> = row.get(8)?;
-                    let preview: String = row.get(9)?;
+                    let provider = SessionProvider {
+                        profile: row.get(9)?,
+                        model_override: row.get(10)?,
+                        base_url_override: row.get(11)?,
+                    };
+                    let preview: String = row.get(12)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2036,6 +2267,7 @@ impl SessionManager {
                         additional_roots_json,
                         token_id,
                         parent_id,
+                        provider,
                         preview,
                     ))
                 })?;
@@ -2052,6 +2284,7 @@ impl SessionManager {
                         additional_roots_json,
                         token_id,
                         parent_id,
+                        provider,
                         preview,
                     ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
@@ -2065,6 +2298,7 @@ impl SessionManager {
                         preview,
                         cwd: cwd.map(PathBuf::from),
                         permission,
+                        provider,
                         capabilities_json,
                         additional_roots: decode_additional_roots(additional_roots_json.as_deref()),
                         token_id,
@@ -2094,7 +2328,7 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider, s.model_override, s.base_url_override,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -2114,7 +2348,12 @@ impl SessionManager {
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
                     let parent_id: Option<String> = row.get(8)?;
-                    let preview: String = row.get(9)?;
+                    let provider = SessionProvider {
+                        profile: row.get(9)?,
+                        model_override: row.get(10)?,
+                        base_url_override: row.get(11)?,
+                    };
+                    let preview: String = row.get(12)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2125,6 +2364,7 @@ impl SessionManager {
                         additional_roots_json,
                         token_id,
                         parent_id,
+                        provider,
                         preview,
                     ))
                 })?;
@@ -2140,6 +2380,7 @@ impl SessionManager {
                             additional_roots_json,
                             token_id,
                             parent_id,
+                            provider,
                             preview,
                         ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
@@ -2152,6 +2393,7 @@ impl SessionManager {
                             preview: truncate_preview(&preview, 80),
                             cwd: cwd.map(PathBuf::from),
                             permission,
+                            provider,
                             additional_roots: decode_additional_roots(
                                 additional_roots_json.as_deref(),
                             ),
@@ -2374,19 +2616,23 @@ impl SessionManager {
     /// path's `to_string_lossy()` form (UTF-8 is the only column type SQLite has). Returns the
     /// number of rows updated (0 if the session id doesn't exist).
     ///
-    /// Apply both `permission` and `cwd` updates in a single SQLite transaction so a DB
-    /// failure between the two writes can't leave a half-applied state on disk.  Either
-    /// column may be `None` to skip that field.  `updated_at` is recomputed inside the
-    /// transaction so the timestamp matches the commit, not the call.  The individual
-    /// `update_session_cwd` / `update_session_permission` methods remain for callers
-    /// that only need a single-column write.
+    /// Apply `permission`, `cwd` and `provider` updates in a single SQLite transaction so a DB
+    /// failure between the writes can't leave a half-applied state on disk.  Any of them may be
+    /// `None` to skip that field.  `updated_at` is recomputed inside the transaction so the
+    /// timestamp matches the commit, not the call.  The individual `update_session_cwd` /
+    /// `update_session_permission` / `set_recorded_provider` methods remain for callers that only
+    /// need a single-column write.
     pub async fn update_session_metadata_atomic(
         &self,
         session_id: Uuid,
         new_permission: Option<String>,
         new_cwd: Option<std::path::PathBuf>,
+        // The whole binding, never just its profile. Writing `provider` alone would leave the
+        // overrides of the profile being left behind on the row, so the next process to resume the
+        // session would send it to an endpoint this one never used.
+        new_provider: Option<SessionProvider>,
     ) -> Result<()> {
-        if new_permission.is_none() && new_cwd.is_none() {
+        if new_permission.is_none() && new_cwd.is_none() && new_provider.is_none() {
             return Ok(());
         }
         let now = chrono::Utc::now().to_rfc3339();
@@ -2405,6 +2651,19 @@ impl SessionManager {
                     txn.execute(
                         "UPDATE sessions SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
                         rusqlite::params![cwd, now, id_string],
+                    )?;
+                }
+                if let Some(ref provider) = new_provider {
+                    txn.execute(
+                        "UPDATE sessions SET provider = ?1, model_override = ?2, \
+                         base_url_override = ?3, updated_at = ?4 WHERE id = ?5",
+                        rusqlite::params![
+                            provider.profile,
+                            provider.model_override,
+                            provider.base_url_override,
+                            now,
+                            id_string
+                        ],
                     )?;
                 }
                 txn.commit()?;
@@ -2877,6 +3136,47 @@ impl TokenStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// A value that changes whenever a profile's stored credential does, without reading the
+    /// credential.
+    ///
+    /// For a holder that built something *from* a credential and needs to know whether the thing it
+    /// built is still the right one. [`crate::provider::ProviderRegistry`] is the caller: it keeps
+    /// a built provider for reuse, and the writer that supersedes the credential is usually
+    /// another process (`meka provider login` while `meka serve` runs), so a push cannot reach
+    /// it. Comparing this against the value the provider was built from is the whole check.
+    ///
+    /// `None` for a profile with no stored credential, which is a distinct answer from any version:
+    /// a memo built while one existed must not survive `meka provider remove`.
+    ///
+    /// The row's `updated_at` rather than a digest of the credential, because the point is to avoid
+    /// pulling a secret into memory for a comparison. Every writer here stamps it
+    /// ([`Self::save_provider_credential`], [`Self::replace_provider_credential`]), so a write the
+    /// value of which happens to be unchanged still moves it, and the cost is a rebuild rather than
+    /// a wrong answer.
+    pub async fn provider_credential_version(&self, profile: &str) -> Result<Option<String>> {
+        let profile = profile.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let result = connection.query_row(
+                    "SELECT updated_at FROM provider_credentials WHERE profile = ?1",
+                    rusqlite::params![profile],
+                    |row| row.get::<_, String>(0),
+                );
+                match result {
+                    Ok(version) => Ok(Some(version)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to read provider credential version: {}",
+                    error
+                ))
+            })
     }
 
     /// Replace a provider's credential only if the stored one is still what the caller derived its
@@ -3367,9 +3667,138 @@ mod tests {
     use super::*;
 
     async fn test_manager() -> SessionManager {
-        SessionManager::open(Some(Path::new(":memory:")))
+        SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("failed to open in-memory database")
+    }
+
+    /// The regression this whole arrangement exists for: a session created on one profile must
+    /// still name that profile afterwards, so resuming it does not silently move the conversation.
+    #[tokio::test]
+    async fn a_session_keeps_the_provider_it_was_created_on() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session(None, "openaiprof".to_string())
+            .await
+            .expect("create");
+
+        assert_eq!(
+            manager.recorded_provider(id).await.expect("read"),
+            Some(SessionProvider::from("openaiprof".to_string()))
+        );
+    }
+
+    /// Repinning is what every "change the provider" surface lands on, and it has to stick.
+    #[tokio::test]
+    async fn a_session_can_be_moved_to_another_provider() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session(None, "openaiprof".to_string())
+            .await
+            .expect("create");
+
+        assert!(
+            manager
+                .set_recorded_provider(id, &SessionProvider::from("claudeprof".to_string()))
+                .await
+                .expect("repin"),
+            "the row was there to update"
+        );
+        assert_eq!(
+            manager.recorded_provider(id).await.expect("read"),
+            Some(SessionProvider::from("claudeprof".to_string()))
+        );
+    }
+
+    /// A session that is gone reads as absent rather than as a profile named nothing, so a caller
+    /// can tell "no such session" from "this session runs on ''".
+    #[tokio::test]
+    async fn a_missing_session_has_no_recorded_provider() {
+        let manager = test_manager().await;
+        assert_eq!(
+            manager
+                .recorded_provider(Uuid::new_v4())
+                .await
+                .expect("read"),
+            None
+        );
+        assert!(
+            !manager
+                .set_recorded_provider(
+                    Uuid::new_v4(),
+                    &SessionProvider::from("anything".to_string())
+                )
+                .await
+                .expect("update"),
+            "a repin that matched no row says so rather than reporting success"
+        );
+    }
+
+    /// The sibling of the provider drift: `meka -m <model> -c` then plain `meka -c` used to fall
+    /// back to whatever the profile says, so the session quietly changed model.
+    #[tokio::test]
+    async fn a_session_keeps_the_model_it_was_pinned_to() {
+        let manager = test_manager().await;
+        let pinned = SessionProvider {
+            profile: "openaiprof".to_string(),
+            model_override: Some("gpt-5".to_string()),
+            base_url_override: Some("https://example.invalid/v1".to_string()),
+        };
+        let id = manager
+            .create_session(None, pinned.clone())
+            .await
+            .expect("create");
+
+        assert_eq!(
+            manager.recorded_provider(id).await.expect("read"),
+            Some(pinned)
+        );
+    }
+
+    /// Every write door states the whole binding, so repinning the profile through one of them
+    /// cannot leave another profile's model attached to it.
+    #[tokio::test]
+    async fn repinning_the_profile_states_the_whole_binding() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session(None, SessionProvider {
+                profile: "openaiprof".to_string(),
+                model_override: Some("gpt-5".to_string()),
+                base_url_override: None,
+            })
+            .await
+            .expect("create");
+
+        manager
+            .set_recorded_provider(id, &SessionProvider::from("claudeprof".to_string()))
+            .await
+            .expect("repin");
+
+        assert_eq!(
+            manager.recorded_provider(id).await.expect("read"),
+            Some(SessionProvider::from("claudeprof".to_string())),
+            "the model that belonged to the old profile does not ride along"
+        );
+    }
+
+    /// A sub-agent runs the parent's work onward, so it must bill the parent's account.
+    #[tokio::test]
+    async fn a_child_session_inherits_its_parents_provider() {
+        let manager = test_manager().await;
+        let parent = manager
+            .create_session(None, "openaiprof".to_string())
+            .await
+            .expect("parent");
+        let (child, _lock) = manager
+            .create_child_session(parent, None, None)
+            .await
+            .expect("child");
+
+        assert_eq!(
+            manager.recorded_provider(child).await.expect("read"),
+            Some(SessionProvider::from("openaiprof".to_string())),
+            "inherited rather than defaulted"
+        );
     }
 
     /// `MEKA_DATA_DIR` has to be absolute, for a sharper version of the reason `MEKA_CONFIG_DIR`
@@ -3416,7 +3845,10 @@ mod tests {
         use crate::{conversation::Event, provider::Message};
 
         let id = manager
-            .create_session(Some(PathBuf::from("/work/main")))
+            .create_session(
+                Some(PathBuf::from("/work/main")),
+                "test-profile".to_string(),
+            )
             .await
             .expect("create session");
         // Enough alternating turns that a copy which reordered the conversation would show it
@@ -3818,14 +4250,173 @@ mod tests {
             "stat_redactions",
             "stat_redacted_images",
             "stat_redacted_bytes",
+            // These three are last, and in ledger order, because migrations appended them and the
+            // fresh path replays those same steps rather than creating the columns inline, so both
+            // orders agree.
+            //
+            // All copied by a fork: a fork continues the same conversation and so has to keep
+            // running on the same thing. Resetting any of them would make forking one more door
+            // that switches provider without saying so.
+            "provider",
+            "model_override",
+            "base_url_override",
         ]);
+    }
+
+    /// The sibling of `fork_copies_every_session_column`, for the door that had no such guard and
+    /// was therefore the one that forgot: `import_sessions` wrote neither the profile nor its two
+    /// overrides, so every imported session landed on the empty profile no configuration can name,
+    /// and the resume hint the command printed named a session that could not resume.
+    #[tokio::test]
+    async fn import_writes_the_whole_binding() {
+        let manager = test_manager().await;
+        let id = Uuid::new_v4();
+        manager
+            .import_sessions(vec![ImportSessionRecord {
+                new_id: id,
+                new_parent_id: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                cwd: None,
+                permission: None,
+                capabilities_json: None,
+                additional_roots: Vec::new(),
+                subagent_spec_json: None,
+                provider: SessionProvider {
+                    profile: "work".to_string(),
+                    model_override: Some("gpt-5".to_string()),
+                    base_url_override: Some("https://example.invalid/v1".to_string()),
+                },
+                stats: crate::stats::SessionStatsSnapshot::default(),
+                events: Vec::new(),
+                tool_outputs: Vec::new(),
+            }])
+            .await
+            .expect("import");
+
+        assert_eq!(
+            manager.recorded_provider(id).await.expect("read"),
+            Some(SessionProvider {
+                profile: "work".to_string(),
+                model_override: Some("gpt-5".to_string()),
+                base_url_override: Some("https://example.invalid/v1".to_string()),
+            })
+        );
+    }
+
+    /// A `PATCH /v1/sessions/{id}` naming a provider restates the whole binding, so the overrides
+    /// of the profile it is leaving must not survive on the row. They did: the handler passed only
+    /// the profile name, so the row said one endpoint and the live agent used another, and which
+    /// one a turn reached depended on whether the server or the CLI happened to be running it.
+    #[tokio::test]
+    async fn moving_a_session_atomically_clears_the_old_profile_s_overrides() {
+        let manager = test_manager().await;
+        let created = manager
+            .create_session(None, SessionProvider {
+                profile: "alpha".to_string(),
+                model_override: Some("pinned".to_string()),
+                base_url_override: Some("https://alpha.invalid".to_string()),
+            })
+            .await
+            .expect("create");
+
+        manager
+            .update_session_metadata_atomic(
+                created,
+                None,
+                None,
+                Some(SessionProvider::from("beta".to_string())),
+            )
+            .await
+            .expect("move the session");
+
+        assert_eq!(
+            manager.recorded_provider(created).await.expect("read"),
+            Some(SessionProvider::from("beta".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_on_a_provider_are_counted_for_the_removal_warning() {
+        let manager = test_manager().await;
+        for profile in ["work", "work", "side"] {
+            manager
+                .create_session(None, profile.to_string())
+                .await
+                .expect("create");
+        }
+        assert_eq!(
+            manager
+                .count_sessions_on_provider("work")
+                .await
+                .expect("count"),
+            2
+        );
+        assert_eq!(
+            manager
+                .count_sessions_on_provider("gone")
+                .await
+                .expect("count"),
+            0
+        );
+    }
+
+    /// The count is what `meka provider remove` warns with, beside advice that only applies to a
+    /// top-level session. A sub-agent row copies its parent's binding, so counting children made
+    /// the warning cite a number many times what `meka session list` shows.
+    #[tokio::test]
+    async fn a_provider_count_leaves_out_the_workers_a_session_spawned() {
+        let manager = test_manager().await;
+        let parent = manager
+            .create_session(None, "work".to_string())
+            .await
+            .expect("create parent");
+        for _ in 0..3 {
+            let (_id, lock) = manager
+                .create_child_session(parent, None, None)
+                .await
+                .expect("spawn a worker");
+            lock.expect("claim the worker's lock");
+        }
+        assert_eq!(
+            manager
+                .count_sessions_on_provider("work")
+                .await
+                .expect("count"),
+            1,
+            "three workers on the parent's profile are not three more sessions to move"
+        );
+    }
+
+    /// A spawn against a parent that is gone must fail, not hand back an id with no row behind it.
+    ///
+    /// The statement is an `INSERT … SELECT` so the child copies the parent's binding rather than
+    /// being told it, and that form selects nothing and succeeds where the `VALUES` it replaced was
+    /// refused by `parent_session_id`'s foreign key. Unchecked, the model is told about a worker
+    /// that does not exist, a lock file is held for it, and the failure resurfaces as a raw
+    /// constraint violation on the worker's first saved message.
+    #[tokio::test]
+    async fn spawning_from_a_session_that_is_gone_is_refused() {
+        let manager = test_manager().await;
+        let Err(error) = manager
+            .create_child_session(Uuid::new_v4(), None, None)
+            .await
+        else {
+            panic!("a missing parent must refuse the spawn");
+        };
+        assert!(
+            error.to_string().contains("no longer exists"),
+            "the refusal must name what went wrong: {error}"
+        );
     }
 
     #[tokio::test]
     async fn additional_roots_round_trip_through_the_database() {
         let manager = test_manager().await;
         let id = manager
-            .create_session(Some(PathBuf::from("/work/main")))
+            .create_session(
+                Some(PathBuf::from("/work/main")),
+                "test-profile".to_string(),
+            )
             .await
             .expect("create session");
 
@@ -3861,7 +4452,10 @@ mod tests {
     async fn empty_additional_roots_clears_the_stored_list() {
         let manager = test_manager().await;
         let id = manager
-            .create_session(Some(PathBuf::from("/work/main")))
+            .create_session(
+                Some(PathBuf::from("/work/main")),
+                "test-profile".to_string(),
+            )
             .await
             .expect("create session");
         manager
@@ -3925,7 +4519,7 @@ mod tests {
     async fn on_disk_lock_dir_survives_the_manager() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("meka.db");
-        let manager = SessionManager::open(Some(&db_path))
+        let manager = SessionManager::open(Some(&db_path), &Default::default())
             .await
             .expect("open on-disk database");
         let lock_dir = manager.lock_dir.clone();
@@ -3949,7 +4543,10 @@ mod tests {
         };
 
         let manager = test_manager().await;
-        let sid = manager.create_session(None).await.expect("create session");
+        let sid = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
 
         let user_event = Event::Append(Message::user("hello"));
         let assistant_event = Event::Append(Message {
@@ -4058,7 +4655,10 @@ mod tests {
         };
 
         let manager = test_manager().await;
-        let sid = manager.create_session(None).await.expect("create session");
+        let sid = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
 
         let image = ImageSource {
             source_type: "base64".to_string(),
@@ -4115,7 +4715,10 @@ mod tests {
         use crate::conversation::Event;
 
         let manager = test_manager().await;
-        let sid = manager.create_session(None).await.expect("create session");
+        let sid = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
 
         // Written by hand rather than through `save_event`, so what is under test is the decoder
         // alone: nothing here would notice the encoder changing which role it writes.
@@ -4144,7 +4747,10 @@ mod tests {
     #[tokio::test]
     async fn test_load_events_skips_unknown_role() {
         let manager = test_manager().await;
-        let sid = manager.create_session(None).await.expect("create session");
+        let sid = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         manager
             .save_message(sid, "user", "real")
             .await
@@ -4168,7 +4774,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("data").join("meka.db");
 
-        let _manager = SessionManager::open(Some(&db_path))
+        let _manager = SessionManager::open(Some(&db_path), &Default::default())
             .await
             .expect("open session");
 
@@ -4210,7 +4816,7 @@ mod tests {
     async fn test_create_session() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         assert!(
@@ -4224,7 +4830,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_stats_persist_round_trip() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
 
         // A fresh row starts at all-zero (columns default to 0).
         let fresh = manager
@@ -4274,7 +4883,7 @@ mod tests {
     async fn test_save_and_load_messages() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
 
@@ -4305,7 +4914,7 @@ mod tests {
         assert!(manager.last_session_id().await.expect("failed").is_none());
 
         let session_id = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         let last = manager
@@ -4329,7 +4938,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_unique_match() {
         let manager = test_manager().await;
         let id = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         // First 8 hex chars (before the first dash), guaranteed unique for a freshly-generated
@@ -4346,7 +4955,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_no_match() {
         let manager = test_manager().await;
         manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         let matches = manager
@@ -4362,7 +4971,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_rejects_non_hex_chars() {
         let manager = test_manager().await;
         manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         // SQL `%` and `_` wildcards must not slip through as prefix chars.
@@ -4383,7 +4992,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_empty_prefix_matches_nothing() {
         let manager = test_manager().await;
         manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
         let matches = manager
@@ -4400,7 +5009,7 @@ mod tests {
     async fn test_session_locking_acquire_and_release() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("failed to create session");
 
@@ -4424,7 +5033,10 @@ mod tests {
     #[tokio::test]
     async fn test_prune_orphan_lock_files() {
         let manager = test_manager().await;
-        let live = manager.create_session(None).await.expect("create");
+        let live = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let live_lock = manager.lock_dir.join(format!("{}.lock", live));
         let orphan_lock = manager.lock_dir.join(format!("{}.lock", Uuid::new_v4()));
@@ -4472,7 +5084,7 @@ mod tests {
             blocker.execute_batch("COMMIT;").expect("release");
         });
 
-        let manager = SessionManager::open(Some(&db_path))
+        let manager = SessionManager::open(Some(&db_path), &Default::default())
             .await
             .expect("a contended first open must wait, not fail");
         released.join().expect("the writer thread finishes");
@@ -4524,7 +5136,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session_removes_lock_file() {
         let manager = test_manager().await;
-        let session = manager.create_session(None).await.expect("create");
+        let session = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let lock_path = manager.lock_dir.join(format!("{}.lock", session));
         std::fs::write(&lock_path, "").expect("write lock");
 
@@ -4546,7 +5161,10 @@ mod tests {
     #[tokio::test]
     async fn test_deleting_a_session_another_process_holds_is_refused() {
         let manager = test_manager().await;
-        let session = manager.create_session(None).await.expect("create");
+        let session = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let _held = manager.lock_session(session).expect("hold the session");
 
         match manager.delete_session_unless_attached(session).await {
@@ -4568,8 +5186,14 @@ mod tests {
     #[tokio::test]
     async fn test_the_retention_sweep_spares_a_session_that_is_open() {
         let manager = test_manager().await;
-        let open = manager.create_session(None).await.expect("create");
-        let stale = manager.create_session(None).await.expect("create");
+        let open = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let stale = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let long_ago = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         for session in [open, stale] {
             manager
@@ -4624,7 +5248,9 @@ mod tests {
             .await
             .expect("hide the table");
 
-        let refused = manager.create_session_locked(None, None, None, None).await;
+        let refused = manager
+            .create_session_locked(None, None, None, None, "test-profile".to_string())
+            .await;
 
         assert!(
             refused.is_err(),
@@ -4662,7 +5288,10 @@ mod tests {
     #[tokio::test]
     async fn a_fork_is_locked_before_the_copy_exists() {
         let manager = test_manager().await;
-        let source = manager.create_session(None).await.expect("create");
+        let source = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let locks_before = std::fs::read_dir(&manager.lock_dir)
             .expect("read the lock dir")
             .count();
@@ -4709,8 +5338,14 @@ mod tests {
     #[tokio::test]
     async fn the_sweep_re_checks_its_own_condition_inside_the_delete() {
         let manager = test_manager().await;
-        let scheduled = manager.create_session(None).await.expect("create");
-        let ordinary = manager.create_session(None).await.expect("create");
+        let scheduled = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let ordinary = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .schedule_store()
             .create_scheduled_job(&crate::schedule::ScheduledJob {
@@ -4746,8 +5381,14 @@ mod tests {
     #[tokio::test]
     async fn test_delete_all_spares_a_session_that_is_open() {
         let manager = test_manager().await;
-        let open = manager.create_session(None).await.expect("create");
-        let other = manager.create_session(None).await.expect("create");
+        let open = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let other = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let _held = manager.lock_session(open).expect("hold the session");
 
         let sweep = manager.delete_all_sessions().await.expect("delete all");
@@ -4768,7 +5409,7 @@ mod tests {
         std::fs::write(&orphan, "").expect("write orphan");
 
         // A fresh DB has no sessions, so the planted file is an orphan.
-        let _manager = SessionManager::open(Some(&db_path))
+        let _manager = SessionManager::open(Some(&db_path), &Default::default())
             .await
             .expect("open should succeed");
         assert!(
@@ -4792,8 +5433,14 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_sessions() {
         let manager = test_manager().await;
-        let session1 = manager.create_session(None).await.expect("failed");
-        let session2 = manager.create_session(None).await.expect("failed");
+        let session1 = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
+        let session2 = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
 
         manager
             .save_message(session1, "user", "msg1")
@@ -4816,7 +5463,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_expired_sessions() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("failed");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
         manager
             .save_message(session_id, "user", "hello")
             .await
@@ -4861,7 +5511,10 @@ mod tests {
     #[tokio::test]
     async fn retention_spares_the_parent_of_a_child_that_has_a_scheduled_job() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("create parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -4912,8 +5565,14 @@ mod tests {
     #[tokio::test]
     async fn retention_spares_a_session_that_still_has_a_scheduled_job() {
         let manager = test_manager().await;
-        let watcher = manager.create_session(None).await.expect("create");
-        let plain = manager.create_session(None).await.expect("create");
+        let watcher = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let plain = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
 
         let job = crate::schedule::ScheduledJob {
             attempts: 0,
@@ -4967,8 +5626,14 @@ mod tests {
     #[tokio::test]
     async fn test_delete_expired_sessions_keeps_recent() {
         let manager = test_manager().await;
-        let old_session = manager.create_session(None).await.expect("failed");
-        let new_session = manager.create_session(None).await.expect("failed");
+        let old_session = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
+        let new_session = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
 
         manager
             .save_message(old_session, "user", "old")
@@ -5008,7 +5673,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_expired_sessions_survives_absurd_windows() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         manager
             .save_message(session_id, "user", "hello")
             .await
@@ -5027,7 +5695,10 @@ mod tests {
     #[tokio::test]
     async fn test_clear_messages() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("failed");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("failed");
 
         manager
             .save_message(session_id, "user", "hello")
@@ -5149,7 +5820,10 @@ mod tests {
         // The canonical regression: user types a prompt, turn runs, `meka session list` must show
         // the prompt, not `<context>`, not the permission/environment metadata.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         let user_prompt = "find all Rust files under src/";
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, user_prompt);
@@ -5199,7 +5873,10 @@ mod tests {
             ("ask", crate::permission::Permission::Ask),
             ("unrestricted", crate::permission::Permission::Unrestricted),
         ] {
-            let session_id = manager.create_session(None).await.expect("create_session");
+            let session_id = manager
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create_session");
             let prompt = format!("ask at {} level", label);
             let stored = mock_run_turn_user_message(*permission, &prompt);
             manager
@@ -5228,7 +5905,10 @@ mod tests {
         // Long prompts are capped at 80 chars with a trailing ellipsis. The cap must apply to the
         // user's prompt, not the wrapper.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         let long_prompt = "a".repeat(150);
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, &long_prompt);
@@ -5261,7 +5941,10 @@ mod tests {
         // Multiple turns in one session: preview must be the FIRST user prompt, not a later one.
         // `ORDER BY id ASC LIMIT 1` guarantees this; guard against that being changed.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         for (i, prompt) in ["first prompt", "second prompt", "third prompt"]
             .iter()
@@ -5292,7 +5975,10 @@ mod tests {
         // Multi-line user prompts collapse to the first line in the list view. The remaining lines
         // are not leaked.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         let stored = mock_run_turn_user_message(
             crate::permission::Permission::Read,
@@ -5316,9 +6002,18 @@ mod tests {
         // Each session's preview is its own first user turn: no cross-contamination from neighbour
         // sessions.
         let manager = test_manager().await;
-        let a = manager.create_session(None).await.expect("create_session");
-        let b = manager.create_session(None).await.expect("create_session");
-        let c = manager.create_session(None).await.expect("create_session");
+        let a = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let b = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let c = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         for (sid, prompt) in [(a, "alpha"), (b, "beta"), (c, "gamma")] {
             let stored = mock_run_turn_user_message(crate::permission::Permission::Read, prompt);
@@ -5349,7 +6044,10 @@ mod tests {
         // A session with zero user messages (e.g. created but Ctrl-C'd before first dispatch) falls
         // back to an empty string; it should not panic or render `<no user msg>` scaffolding.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         let (summaries, _next_cursor) = manager
             .list_sessions(10, false, None, None)
@@ -5365,7 +6063,10 @@ mod tests {
         // starting with `[Conversation summary from session compaction]`. That has no `<context>`
         // wrapper; `list_sessions` should surface the summary's first line, not an empty preview.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
 
         let summary_msg = "[Conversation summary from session compaction]\n\nSummary text here\n\n\
              [Post-compaction context]\n\n…";
@@ -5391,7 +6092,10 @@ mod tests {
         // by any other path carries none -- `import_sessions` replays whatever an archive held --
         // and then the stored string IS the prompt, so the preview equals it.
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create_session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
         manager
             .save_message(session_id, "user", "prompt without any wrapper")
             .await
@@ -5409,11 +6113,14 @@ mod tests {
     async fn test_session_metadata_round_trips() {
         let manager = test_manager().await;
 
-        // The NULL shape the REPL and ACP get from `create_session_locked(cwd, None, None, None)`:
-        // permission and capabilities unset, so the re-attach helper falls back to the process
-        // default.
+        // The NULL shape the REPL and ACP get from `create_session_locked`, which they call with
+        // permission, capabilities and token id all `None`: unset, so the re-attach helper falls
+        // back to the process default.
         let plain = manager
-            .create_session(Some(std::path::PathBuf::from("/tmp/plain")))
+            .create_session(
+                Some(std::path::PathBuf::from("/tmp/plain")),
+                "test-profile".to_string(),
+            )
             .await
             .expect("create plain");
         let plain_info = manager
@@ -5431,6 +6138,7 @@ mod tests {
                 Some("read".to_string()),
                 Some(r#"{"supports_reasoning_stream":true}"#.to_string()),
                 Some("token_fp_1234".to_string()),
+                "test-profile".to_string(),
             )
             .await
             .expect("create with metadata");
@@ -5472,7 +6180,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_child_session_writes_parent_id() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("create parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -5492,7 +6203,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_default_hides_children() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("create parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create parent");
         let _child = manager
             .create_child_session(parent, None, None)
             .await
@@ -5519,7 +6233,7 @@ mod tests {
         let manager = test_manager().await;
         let cwd = PathBuf::from("/home/agent/proj-a");
         let sid = manager
-            .create_session(Some(cwd.clone()))
+            .create_session(Some(cwd.clone()), "test-profile".to_string())
             .await
             .expect("create");
 
@@ -5547,11 +6261,11 @@ mod tests {
         let cwd_a = PathBuf::from("/home/agent/proj-a");
         let cwd_b = PathBuf::from("/home/agent/proj-b");
         let a = manager
-            .create_session(Some(cwd_a.clone()))
+            .create_session(Some(cwd_a.clone()), "test-profile".to_string())
             .await
             .expect("create a");
         let _b = manager
-            .create_session(Some(cwd_b.clone()))
+            .create_session(Some(cwd_b.clone()), "test-profile".to_string())
             .await
             .expect("create b");
 
@@ -5575,16 +6289,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_cwd_filter_excludes_null_cwd_rows() {
-        // A session created by `create_session(None)` recorded no cwd, so it can never match a cwd
-        // filter: NULL is not equal to a TEXT value in SQL.
+        // A session created by `create_session(None, "test-profile".to_string())` recorded no cwd,
+        // so it can never match a cwd filter: NULL is not equal to a TEXT value in SQL.
         let manager = test_manager().await;
         let cwd = PathBuf::from("/home/agent/proj");
         let with_cwd = manager
-            .create_session(Some(cwd.clone()))
+            .create_session(Some(cwd.clone()), "test-profile".to_string())
             .await
             .expect("create with cwd");
         let _without_cwd = manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("create without cwd");
 
@@ -5603,7 +6317,10 @@ mod tests {
         // once with monotonically older updated_at.
         let mut ids = Vec::new();
         for _ in 0..5 {
-            let id = manager.create_session(None).await.expect("create");
+            let id = manager
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create");
             // `created_at`/`updated_at` use chrono::Utc::now(); pause to ensure each row's
             // timestamp is strictly newer (RFC3339 millisecond resolution).
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -5647,7 +6364,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session_cascades_to_children() {
         let manager = test_manager().await;
-        let parent = manager.create_session(None).await.expect("create parent");
+        let parent = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create parent");
         let child = manager
             .create_child_session(parent, None, None)
             .await
@@ -5761,7 +6481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth_token_round_trip_preserves_all_fields() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -5804,7 +6524,7 @@ mod tests {
     async fn test_oauth_token_round_trip_account_id_optional() {
         // Claude OAuth doesn't populate `account_id`; make sure round-tripping a `None` value
         // works without losing other fields.
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -5844,7 +6564,7 @@ mod tests {
     /// isolated.
     #[tokio::test]
     async fn test_oauth_token_two_providers_independent() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -5896,7 +6616,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_key_credential_round_trip() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -5921,7 +6641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_provider_credential_removes_entry() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -5959,7 +6679,7 @@ mod tests {
     /// loser adopts the winner's credential instead, so the store and the issuer agree.
     #[tokio::test]
     async fn test_a_refresh_cannot_overwrite_a_credential_it_did_not_read() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6012,7 +6732,7 @@ mod tests {
     /// back an account the user had just removed, and it would come back working.
     #[tokio::test]
     async fn test_a_refresh_does_not_resurrect_a_removed_profile() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6053,7 +6773,7 @@ mod tests {
     /// already replaced.
     #[tokio::test]
     async fn test_an_mcp_refresh_cannot_overwrite_credentials_it_did_not_read() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6101,7 +6821,7 @@ mod tests {
     /// the whole reason the file is named after the profile rather than the database.
     #[tokio::test]
     async fn test_the_credential_lock_is_per_profile() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6142,7 +6862,7 @@ mod tests {
     /// long as it takes.
     #[tokio::test]
     async fn test_the_credential_lock_handles_a_profile_name_that_is_not_a_file_name() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6186,7 +6906,7 @@ mod tests {
     /// invisible one: a live API key or OAuth refresh token no surface can report or remove.
     #[tokio::test]
     async fn test_credential_listings_name_every_stored_row() {
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("memory store");
         let store = manager.token_store();
@@ -6274,7 +6994,10 @@ mod tests {
     #[tokio::test]
     async fn test_scheduled_job_round_trips_through_the_database() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let written = job_fixture(
             &manager,
             session_id,
@@ -6335,7 +7058,10 @@ mod tests {
     #[tokio::test]
     async fn test_background_task_round_trips_through_the_database() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let written = task_fixture(&manager, session_id, "cargo test --all").await;
 
         let running = manager
@@ -6386,7 +7112,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_delivered_outcome_is_not_delivered_again() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let task = task_fixture(&manager, session_id, "sleep 60").await;
         manager
             .background_store()
@@ -6420,7 +7149,10 @@ mod tests {
     #[tokio::test]
     async fn test_the_sweep_retires_tasks_left_running_by_a_dead_process() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         task_fixture(&manager, session_id, "sleep 600").await;
 
         let swept = manager
@@ -6460,7 +7192,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_swept_outcome_is_pending_for_a_process_that_started_nothing() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         task_fixture(&manager, session_id, "sleep 400").await;
 
         // A fresh process takes the session: it holds no handles, and the sweep is all it knows.
@@ -6484,7 +7219,10 @@ mod tests {
     #[tokio::test]
     async fn test_the_first_terminal_write_wins() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let task = task_fixture(&manager, session_id, "sleep 600").await;
 
         manager
@@ -6523,7 +7261,10 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_background_task_by_prefix() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let task = task_fixture(&manager, session_id, "sleep 60").await;
 
         let found = manager
@@ -6547,7 +7288,10 @@ mod tests {
     #[tokio::test]
     async fn test_deleting_a_session_cascades_to_its_background_tasks() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         task_fixture(&manager, session_id, "sleep 600").await;
 
         manager
@@ -6570,7 +7314,10 @@ mod tests {
     #[tokio::test]
     async fn test_deleting_a_session_cascades_to_its_scheduled_jobs() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         job_fixture(
             &manager,
             session_id,
@@ -6598,7 +7345,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_all_includes_jobs_beyond_any_due_horizon() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let far_future = chrono::Utc::now() + chrono::Duration::days(365 * 200);
         job_fixture(
             &manager,
@@ -6631,7 +7381,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_due_selects_only_jobs_whose_time_has_come() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         job_fixture(
             &manager,
             session_id,
@@ -6662,7 +7415,10 @@ mod tests {
     #[tokio::test]
     async fn test_stamping_a_fire_persists_the_anchor_for_the_next_process() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let job = job_fixture(
             &manager,
             session_id,
@@ -6714,7 +7470,10 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_resolves_an_id_prefix_and_reports_ambiguity() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let job = job_fixture(
             &manager,
             session_id,
@@ -6754,7 +7513,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_row_with_a_half_written_gate_is_skipped_not_downgraded() {
         let manager = test_manager().await;
-        let session_id = manager.create_session(None).await.expect("create session");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
         let job = job_fixture(
             &manager,
             session_id,
@@ -6956,7 +7718,7 @@ mod tests {
             .expect("plant");
         }
 
-        let error = SessionManager::open(Some(&database_path))
+        let error = SessionManager::open(Some(&database_path), &Default::default())
             .await
             .err()
             .expect("the migration refuses rather than proceeding without a backup");
@@ -7002,7 +7764,7 @@ mod tests {
                 .expect("the baseline builds");
         }
 
-        let manager = SessionManager::open(Some(&database_path))
+        let manager = SessionManager::open(Some(&database_path), &Default::default())
             .await
             .expect("the store migrates on open");
         drop(manager);
@@ -7032,12 +7794,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let database_path = temp_dir.path().join("meka.db");
         drop(
-            SessionManager::open(Some(&database_path))
+            SessionManager::open(Some(&database_path), &Default::default())
                 .await
                 .expect("first open"),
         );
         drop(
-            SessionManager::open(Some(&database_path))
+            SessionManager::open(Some(&database_path), &Default::default())
                 .await
                 .expect("second open"),
         );
@@ -7072,11 +7834,11 @@ mod tests {
 
         let one = tokio::spawn({
             let database_path = database_path.clone();
-            async move { SessionManager::open(Some(&database_path)).await }
+            async move { SessionManager::open(Some(&database_path), &Default::default()).await }
         });
         let other = tokio::spawn({
             let database_path = database_path.clone();
-            async move { SessionManager::open(Some(&database_path)).await }
+            async move { SessionManager::open(Some(&database_path), &Default::default()).await }
         });
         let first = one
             .await

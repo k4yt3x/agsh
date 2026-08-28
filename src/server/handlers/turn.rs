@@ -268,7 +268,6 @@ pub async fn submit_turn(
             "`message` must be a non-empty string, or at least one image must be attached",
         ));
     }
-    let images = decode_turn_images(&body.images, state.shared.config.vision)?;
     let message = if let Some(skill_name) = body.options.skill.as_deref() {
         let snapshot = state.shared.skills.current().await;
         let skill = snapshot.find(skill_name).ok_or_else(|| {
@@ -325,6 +324,12 @@ pub async fn submit_turn(
             (entry, guard)
         }
     };
+
+    // Decoded here rather than beside the other body validation above, because whether an
+    // attachment is admissible is a fact about *this session's* profile, and the session is not
+    // resolved until now. A refusal drops `turn_guard` on the way out, so a rejected attachment
+    // still leaves the session idle rather than reporting a turn in flight.
+    let images = decode_turn_images(&body.images, entry.binding.current().vision)?;
 
     if body.stream {
         // SSE responses are streamed live and aren't a single envelope we can cache.

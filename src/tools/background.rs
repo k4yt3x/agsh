@@ -294,11 +294,12 @@ mod tests {
     use crate::{background::BackgroundTask, provider::ContentBlock};
 
     async fn context() -> (TaskContext, Uuid) {
-        let session_manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("in-memory db");
+        let session_manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
         let session_id = session_manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("create session");
         (

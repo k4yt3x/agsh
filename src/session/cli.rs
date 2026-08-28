@@ -61,6 +61,17 @@ pub(crate) struct ExportedSession {
     /// come back unfollowable rather than unimportable.
     #[serde(default)]
     subagent_spec_json: Option<String>,
+    /// The provider profile the session ran on, and any override of that profile's model or
+    /// endpoint. `#[serde(default)]` for the same reason as the two fields above: an archive
+    /// written before meka recorded this is still importable, and [`plan_import`] settles the
+    /// empty case against the importing installation's default rather than storing a profile no
+    /// configuration can name.
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model_override: Option<String>,
+    #[serde(default)]
+    base_url_override: Option<String>,
     stats: crate::stats::SessionStatsSnapshot,
     events: Vec<ExportedEvent>,
     tool_outputs: std::collections::BTreeMap<String, String>,
@@ -160,6 +171,9 @@ pub(crate) async fn build_session_export(
             capabilities_json: meta.capabilities_json,
             additional_roots: meta.additional_roots,
             subagent_spec_json: meta.subagent_spec_json,
+            provider: meta.provider.profile,
+            model_override: meta.provider.model_override,
+            base_url_override: meta.provider.base_url_override,
             stats,
             events,
             tool_outputs,
@@ -181,6 +195,7 @@ pub(crate) async fn build_session_export(
 pub(crate) async fn import_session(
     session_manager: &SessionManager,
     input: &str,
+    default_profile: Option<&str>,
 ) -> anyhow::Result<()> {
     let raw = if input == "-" {
         use std::io::Read as _;
@@ -194,7 +209,7 @@ pub(crate) async fn import_session(
 
     let export: SessionExport = serde_json::from_str(&raw)
         .map_err(|error| anyhow::anyhow!("invalid session export JSON: {}", error))?;
-    let (records, root_new_id) = plan_import(export)?;
+    let (records, root_new_id) = plan_import(export, default_profile, EndpointOverride::Trusted)?;
 
     let count = records.len();
     session_manager.import_sessions(records).await?;
@@ -316,6 +331,27 @@ pub(crate) async fn fork_session_command(
     Ok(())
 }
 
+/// Whether an archive's recorded API endpoint may be honoured.
+///
+/// A session's `base_url_override` decides where its turns are sent, while the *credential* comes
+/// from whichever profile the row names. Honouring an attacker-supplied one therefore posts the
+/// profile's stored key to an endpoint of their choosing, which is why the two doors answer
+/// differently: `meka session import` reads a file the user chose on a machine they control, and
+/// `POST /v1/sessions/import` reads a request body from anything holding a `sessions:w` token.
+///
+/// Refused rather than silently dropped. A caller who supplied one is asking for something meka
+/// will not do, and importing the session anyway against a *different* endpoint than the archive
+/// names would be its own quiet surprise.
+///
+/// `model_override` is deliberately not covered: it names a model at the profile's own endpoint,
+/// which is where that credential was always going.
+pub(crate) enum EndpointOverride {
+    /// `meka session import`: the archive and the config are both the user's own.
+    Trusted,
+    /// `POST /v1/sessions/import`: the archive is request data.
+    Refused,
+}
+
 /// Turn a deserialized [`SessionExport`] into the parents-first
 /// [`crate::session::ImportSessionRecord`] list to persist, plus the freshly-minted root session
 /// ID. Validates the format version, mints a new ID per session, and remaps parent links (a parent
@@ -323,6 +359,12 @@ pub(crate) async fn fork_session_command(
 /// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
 pub(crate) fn plan_import(
     export: SessionExport,
+    // What an archive that names no profile adopts. Settled here rather than at the reader because
+    // an import is where a session enters *this* installation, and this installation's default is
+    // the only thing that can be known about an archive that names none. `None` refuses the import
+    // rather than writing a session that cannot run.
+    default_profile: Option<&str>,
+    endpoint: EndpointOverride,
 ) -> anyhow::Result<(Vec<crate::session::ImportSessionRecord>, uuid::Uuid)> {
     if export.format_version != SESSION_EXPORT_FORMAT_VERSION {
         anyhow::bail!(
@@ -383,6 +425,37 @@ pub(crate) fn plan_import(
             capabilities_json: session.capabilities_json,
             additional_roots: session.additional_roots,
             subagent_spec_json: session.subagent_spec_json,
+            provider: crate::session::SessionProvider {
+                profile: if session.provider.is_empty() {
+                    // Refused rather than left blank. A session with no profile cannot run, so
+                    // importing one is writing a row whose only future is a refusal the user has
+                    // to work backwards from -- and it would put a state into the store that no
+                    // other door can produce, which every reader would then have to know about.
+                    let Some(default_profile) = default_profile else {
+                        anyhow::bail!(
+                            "this archive names no provider profile, and no default is configured \
+                             to give it one. Run `meka provider use <name>`, or import with \
+                             `meka --provider <name> session import`"
+                        );
+                    };
+                    default_profile.to_string()
+                } else {
+                    session.provider
+                },
+                model_override: session.model_override,
+                base_url_override: match endpoint {
+                    EndpointOverride::Trusted => session.base_url_override,
+                    EndpointOverride::Refused if session.base_url_override.is_some() => {
+                        anyhow::bail!(
+                            "this archive pins session '{}' to its own API endpoint, which cannot \
+                             be accepted over the HTTP API. Import it with `meka session import` \
+                             if the archive is yours",
+                            session.id
+                        );
+                    }
+                    EndpointOverride::Refused => None,
+                },
+            },
             stats: session.stats,
             events: session
                 .events
@@ -440,12 +513,18 @@ pub(crate) fn parents_first_order(
 pub(crate) async fn run_session_subcommand(
     session_manager: &SessionManager,
     action: &cli::SessionAction,
+    // The profile an archive that names none adopts on `import`. The caller reads two answers off
+    // disk, and this is the flag-aware one, so `meka --provider work session import` chooses per
+    // run; the migration context gets the other, which ignores `--provider` because it stamps rows
+    // once and irreversibly. Unused by every other action here.
+    default_profile: Option<&str>,
 ) -> anyhow::Result<()> {
     match action {
         cli::SessionAction::List {
             limit,
             include_children,
-        } => list_sessions(session_manager, *limit, *include_children).await,
+            long,
+        } => list_sessions(session_manager, *limit, *include_children, *long).await,
         cli::SessionAction::Export {
             session_id,
             output,
@@ -465,7 +544,9 @@ pub(crate) async fn run_session_subcommand(
             all,
             older_than_days,
         } => delete_sessions(session_manager, session_ids, *all, *older_than_days).await,
-        cli::SessionAction::Import { input } => import_session(session_manager, input).await,
+        cli::SessionAction::Import { input } => {
+            import_session(session_manager, input, default_profile).await
+        }
         cli::SessionAction::Fork { session_id } => {
             fork_session_command(session_manager, *session_id).await
         }
@@ -523,6 +604,11 @@ pub(crate) async fn list_sessions(
     session_manager: &SessionManager,
     limit: u32,
     include_children: bool,
+    // Whether to show the model and endpoint a session overrode its profile with. Off by default
+    // because most sessions have neither, and a table with two empty columns is worse than a table
+    // without them; on request because an override is otherwise invisible on every surface, which
+    // is what let a stale one survive unnoticed.
+    long: bool,
 ) -> anyhow::Result<()> {
     let (sessions, _next_cursor) = session_manager
         .list_sessions(limit, include_children, None, None)
@@ -536,17 +622,36 @@ pub(crate) async fn list_sessions(
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|session| {
-            vec![
+            let mut row = vec![
                 session.id.to_string(),
                 format_timestamp(&session.updated_at),
-                session.preview.clone(),
-            ]
+                // Sanitised for the same reason every other authored cell in a meka table is: the
+                // value is a config key the user chose, and a table is not a place to reproduce
+                // control characters verbatim.
+                render::sanitize_for_display(&session.provider.profile),
+            ];
+            if long {
+                // Sanitised and dashed on the same terms as the profile above: both come from a
+                // flag the user typed, and an absent override is a real answer worth showing.
+                let dash_or = |value: &Option<String>| {
+                    value
+                        .as_deref()
+                        .map(render::sanitize_for_display)
+                        .unwrap_or_else(|| "-".to_string())
+                };
+                row.push(dash_or(&session.provider.model_override));
+                row.push(dash_or(&session.provider.base_url_override));
+            }
+            row.push(session.preview.clone());
+            row
         })
         .collect();
-    print!(
-        "{}",
-        render::format_columns(&["ID", "Updated", "Preview"], &rows)
-    );
+    let headers: &[&str] = if long {
+        &["ID", "Updated", "Provider", "Model", "Base URL", "Preview"]
+    } else {
+        &["ID", "Updated", "Provider", "Preview"]
+    };
+    print!("{}", render::format_columns(headers, &rows));
 
     Ok(())
 }
@@ -827,7 +932,7 @@ mod tests {
             root_session_id: "r".into(),
             sessions: Vec::new(),
         };
-        assert!(plan_import(export).is_err());
+        assert!(plan_import(export, None, EndpointOverride::Trusted).is_err());
     }
 
     #[tokio::test]
@@ -839,13 +944,16 @@ mod tests {
             provider::{ContentBlock, ImageSource, Message, Role, ToolResultContent},
         };
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
 
         // Root session with a representative mix of events: plain text, an input image, a
         // reasoning block, a tool_use/tool_result pair, and a compaction boundary.
-        let root = manager.create_session(None).await.expect("root");
+        let root = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("root");
         let image = ImageSource {
             source_type: "base64".to_string(),
             media_type: "image/png".to_string(),
@@ -937,7 +1045,8 @@ mod tests {
         let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
 
         // Import under fresh IDs.
-        let (records, root_new_id) = plan_import(reparsed).expect("plan");
+        let (records, root_new_id) =
+            plan_import(reparsed, None, EndpointOverride::Trusted).expect("plan");
         assert_ne!(root_new_id, root, "import mints a new id");
         manager.import_sessions(records).await.expect("import");
 
@@ -1041,11 +1150,17 @@ mod tests {
     async fn a_refused_session_does_not_abandon_the_rest_of_the_list() {
         use std::path::Path;
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
-        let held = manager.create_session(None).await.expect("create");
-        let after = manager.create_session(None).await.expect("create");
+        let held = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let after = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let _lock = manager
             .lock_session(held)
             .expect("another process holds it");
@@ -1078,10 +1193,13 @@ mod tests {
     async fn test_fork_and_lock_holds_both_locks_at_the_handoff() {
         use std::path::Path;
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
-        let source = manager.create_session(None).await.expect("create");
+        let source = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
         let source_lock = manager.lock_session(source).expect("lock source");
 
         let handoff = fork_and_lock(&manager, source).await.expect("fork");
@@ -1108,7 +1226,7 @@ mod tests {
     async fn test_fork_and_lock_reports_a_missing_source() {
         use std::path::Path;
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
         assert!(matches!(
@@ -1125,11 +1243,14 @@ mod tests {
     async fn test_session_export_preserves_additional_roots() {
         use std::path::{Path, PathBuf};
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
         let root = manager
-            .create_session(Some(PathBuf::from("/work/main")))
+            .create_session(
+                Some(PathBuf::from("/work/main")),
+                "test-profile".to_string(),
+            )
             .await
             .expect("root");
         let roots = vec![PathBuf::from("/work/shared"), PathBuf::from("/work/docs")];
@@ -1141,7 +1262,8 @@ mod tests {
         let export = build_session_export(&manager, root).await.expect("export");
         let json = serde_json::to_string(&export).expect("serialize");
         let reparsed: SessionExport = serde_json::from_str(&json).expect("deserialize");
-        let (records, new_id) = plan_import(reparsed).expect("plan");
+        let (records, new_id) =
+            plan_import(reparsed, None, EndpointOverride::Trusted).expect("plan");
         manager.import_sessions(records).await.expect("import");
 
         assert_eq!(
@@ -1179,8 +1301,112 @@ mod tests {
             }],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
-        let (records, _) = plan_import(export).expect("plan");
+        let (records, _) =
+            plan_import(export, Some("work"), EndpointOverride::Trusted).expect("plan");
         assert!(records[0].additional_roots.is_empty());
+        assert_eq!(
+            records[0].provider.profile, "work",
+            "an archive naming no profile adopts this installation's default"
+        );
+    }
+
+    /// An archive naming no profile, imported where nothing can supply one, is refused.
+    ///
+    /// The alternative was writing the profile empty, which is the only way a session with no
+    /// provider could enter the store other than through the ledger. That row cannot run, its
+    /// refusal arrives whenever the user next resumes it, and its existence forced every reader to
+    /// know about a state nothing else produces. Refusing keeps the invariant every other door
+    /// already holds to: a session that exists names a profile that resolved when it was written.
+    #[test]
+    fn an_archive_with_no_profile_is_refused_when_nothing_can_supply_one() {
+        let json = serde_json::json!({
+            "format_version": SESSION_EXPORT_FORMAT_VERSION,
+            "meka_version": "0.0.0",
+            "exported_at": "2020-01-01T00:00:00Z",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": null,
+                "capabilities_json": null,
+                "stats": crate::stats::SessionStatsSnapshot::default(),
+                "events": [],
+                "tool_outputs": {},
+            }],
+        });
+        let export: SessionExport = serde_json::from_value(json).expect("deserialize");
+        let Err(error) = plan_import(export, None, EndpointOverride::Trusted) else {
+            panic!("no default and no recorded profile must refuse the import");
+        };
+        assert!(
+            error.to_string().contains("--provider"),
+            "the refusal must name what supplies one: {error}"
+        );
+    }
+
+    /// An archive cannot choose where a session's turns are sent when it arrived over HTTP.
+    ///
+    /// `base_url_override` decides the endpoint; the *credential* comes from whichever configured
+    /// profile the row names. Honouring an archive-supplied endpoint therefore posts that profile's
+    /// stored key wherever the archive says, and `POST /v1/sessions/import` takes its archive from
+    /// a request body behind nothing but a `sessions:w` token. `meka session import` keeps it:
+    /// there the archive and the config are both the user's own.
+    #[test]
+    fn an_imported_endpoint_override_is_refused_over_http_and_kept_on_the_cli() {
+        let archive = |base_url: serde_json::Value| {
+            serde_json::json!({
+                "format_version": SESSION_EXPORT_FORMAT_VERSION,
+                "meka_version": "0.0.0",
+                "exported_at": "2020-01-01T00:00:00Z",
+                "root_session_id": "11111111-1111-4111-8111-111111111111",
+                "sessions": [{
+                    "id": "11111111-1111-4111-8111-111111111111",
+                    "parent_id": null,
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "cwd": null,
+                    "permission": null,
+                    "capabilities_json": null,
+                    "provider": "work",
+                    "base_url_override": base_url,
+                    "stats": crate::stats::SessionStatsSnapshot::default(),
+                    "events": [],
+                    "tool_outputs": {},
+                }],
+            })
+        };
+
+        let hostile: SessionExport =
+            serde_json::from_value(archive(serde_json::json!("https://elsewhere.invalid/v1")))
+                .expect("deserialize");
+        let Err(error) = plan_import(hostile, None, EndpointOverride::Refused) else {
+            panic!("an archive naming its own endpoint must not be importable over HTTP");
+        };
+        assert!(
+            error.to_string().contains("endpoint"),
+            "the refusal must say what it objects to: {error}"
+        );
+
+        // The same archive on the CLI is the user importing their own backup.
+        let mine: SessionExport =
+            serde_json::from_value(archive(serde_json::json!("https://elsewhere.invalid/v1")))
+                .expect("deserialize");
+        let (records, _) = plan_import(mine, None, EndpointOverride::Trusted).expect("plan");
+        assert_eq!(
+            records[0].provider.base_url_override.as_deref(),
+            Some("https://elsewhere.invalid/v1"),
+            "the CLI must keep the endpoint the archive records"
+        );
+
+        // And an archive with no endpoint of its own imports over HTTP as normal.
+        let plain: SessionExport =
+            serde_json::from_value(archive(serde_json::Value::Null)).expect("deserialize");
+        let (records, _) = plan_import(plain, None, EndpointOverride::Refused).expect("plan");
+        assert_eq!(records[0].provider.base_url_override, None);
+        assert_eq!(records[0].provider.profile, "work");
     }
 
     /// Regression: import restored the export's `updated_at`, and retention GC deletes by that
@@ -1190,7 +1416,7 @@ mod tests {
     async fn test_import_survives_retention_gc() {
         use std::path::Path;
 
-        let manager = SessionManager::open(Some(Path::new(":memory:")))
+        let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
             .await
             .expect("open");
         let stale = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
@@ -1203,6 +1429,7 @@ mod tests {
             capabilities_json: None,
             additional_roots: Vec::new(),
             subagent_spec_json: None,
+            provider: crate::session::SessionProvider::from("test-profile".to_string()),
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
             tool_outputs: Vec::new(),

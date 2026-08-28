@@ -47,19 +47,27 @@ model = "claude-opus-5"
 
 ## Selecting a Provider
 
-meka uses the profile named by `--provider <name>` (per run), else `default_provider`, else the sole
-profile. Switch the default with `meka provider use <name>`:
+A **new** session runs on the profile named by `--provider <name>`, else `default_provider`, else
+the sole profile. Switch the default with `meka provider use <name>`:
 
 ```bash
-meka --provider work     # this run only
+meka --provider work     # pick the profile this session starts on
 meka provider use work   # persist as default_provider
 ```
 
 There is no environment-variable override for provider selection.
 
+A **resumed** session ignores all three and runs on the profile it recorded, so `meka -c` stays
+where the conversation was had whatever `default_provider` currently says. `--provider` on a resume
+is not a per-run override either: it **repins** the session, rewriting the row so every later resume
+keeps it. `meka session list` shows what each session runs on, and `--long` adds any model or
+endpoint override on top. You can also move a live session with `/provider <name>` in the REPL,
+`PATCH /v1/sessions/{id}` over HTTP, or the Provider picker in an ACP client. See
+[Sessions](../usage/sessions.md#what-a-resume-restores).
+
 ## Pointing a backend somewhere else
 
-Every API-key backend takes a `base_url` (or `--base-url` for one run), so the protocol you pick is independent of who serves it:
+Every API-key backend takes a `base_url` (or `--base-url`, which is recorded on the session the way `--provider` is), so the protocol you pick is independent of who serves it:
 
 | Server | Chat Completions | Responses | Anthropic Messages |
 |--------|------------------|-----------|--------------------|

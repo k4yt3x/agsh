@@ -179,7 +179,7 @@ pub struct McpClientManager {
     /// here as each server reaches `Connected`, and `on_tool_list_changed` writes here on dynamic
     /// updates. New sessions read this snapshot at [`Self::attach_registry`] time to backfill MCP
     /// tools into their fresh per-session registry.
-    tools_snapshot: tokio::sync::RwLock<HashMap<String, Vec<Arc<dyn crate::tools::Tool>>>>,
+    tools_snapshot: tokio::sync::RwLock<HashMap<String, ServerTools>>,
     /// Registries currently observing MCP tool updates. Sessions attach at `session/new` (or REPL
     /// startup) and detach at `session/close`. Updates from the connector or notification handler
     /// propagate to every entry.
@@ -189,6 +189,55 @@ pub struct McpClientManager {
     /// the connect did. Set by [`Self::start_connector`]; a manager that never started one
     /// (tests) falls back to [`DEFAULT_MCP_REQUEST_TIMEOUT`].
     connect_timeout: OnceLock<std::time::Duration>,
+}
+
+/// What one server's latest `tools/list` produced: the tools, and which of them ship deferred.
+///
+/// Both halves in one value because they are one fact about one listing, and a registry given only
+/// the first half is wrong in a way nothing reports -- the tools arrive and every one of them looks
+/// eager. That was the bug: the snapshot held the tools alone, so `attach_registry` could only
+/// replay the tools, and `mark_deferred_on_attached` fanned the marks out to whichever registries
+/// happened to be attached at discovery time. On `meka serve` and `meka acp` that is *none* of them
+/// (`start_connector` runs in `build_shared_deps`, before any session exists), so lazy MCP loading
+/// was inert on both hosts and every `mcp__*` schema shipped on every request.
+///
+/// The classification has to happen here, before the erasure into `Arc<dyn Tool>`:
+/// [`tool_should_eager_load`] needs the raw name and the server config, and the trait object
+/// exposes neither. Anything that erases first has already lost the ability to ask.
+#[derive(Clone)]
+struct ServerTools {
+    tools: Vec<Arc<dyn crate::tools::Tool>>,
+    /// Namespaced (`mcp__server__tool`) names, matching what a registry's deferred set holds.
+    deferred: Vec<String>,
+}
+
+impl ServerTools {
+    fn from_adapters(adapters: Vec<McpToolAdapter>) -> Self {
+        use crate::tools::Tool as _;
+        let deferred = adapters
+            .iter()
+            .filter(|adapter| !tool_should_eager_load(adapter.server_config(), adapter.raw_name()))
+            .map(|adapter| adapter.definition().name)
+            .collect();
+        Self {
+            tools: adapters
+                .into_iter()
+                .map(|adapter| Arc::new(adapter) as Arc<dyn crate::tools::Tool>)
+                .collect(),
+            deferred,
+        }
+    }
+
+    /// Put this listing into one registry.
+    ///
+    /// Marks after replacing, because [`crate::tools::ToolRegistry::replace_server_tools`] drops
+    /// the deferred marks of the names it removes.
+    fn apply_to(&self, server_name: &str, registry: &crate::tools::ToolRegistry) {
+        registry.replace_server_tools(server_name, self.tools.clone());
+        for name in &self.deferred {
+            registry.mark_deferred(name);
+        }
+    }
 }
 
 /// Lifecycle state of a single MCP server. Transitions:
@@ -258,10 +307,18 @@ pub struct ServerEntry {
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
-    /// Optional `InitializeResult.instructions` captured on the first `Connected` transition.
-    /// Immutable for the lifetime of the connection per the MCP spec, so reconnects don't reset
-    /// it.
-    pub(crate) instructions: OnceLock<Option<String>>,
+    /// Optional `InitializeResult.instructions`, restamped on every `Connected` transition.
+    ///
+    /// This was a `OnceLock`, justified by the MCP spec's "instructions are immutable for the
+    /// lifetime of the connection". True, and about the wrong lifetime: a reconnect *is* a new
+    /// connection with a new `InitializeResult`, while this entry outlives both. So a redeployed
+    /// server's first handshake kept riding [`crate::context::WorldSnapshot`] into the model's
+    /// context every turn for the rest of the process.
+    ///
+    /// A `std::sync::RwLock` and not a `tokio` one because
+    /// [`McpClientManager::server_instructions`] is synchronous and is called while building
+    /// the per-turn context; the guard is never held across an await.
+    pub(crate) instructions: std::sync::RwLock<Option<String>>,
     /// `[mcp].connect_timeout_seconds`, copied here so the request helpers that run outside the
     /// manager can honour it. Without it [`bounded`] fell back to its own constant and a
     /// configured timeout applied to `tools/list` but silently not to `resources/read` or
@@ -285,9 +342,32 @@ impl ServerEntry {
     }
 
     /// Returns the server's `InitializeResult.instructions` (sanitised + truncated to
-    /// [`MAX_MCP_DESCRIPTION_LENGTH`]) if the server advertised one during the handshake.
-    pub fn instructions(&self) -> Option<&str> {
-        self.instructions.get().and_then(|opt| opt.as_deref())
+    /// [`MAX_MCP_DESCRIPTION_LENGTH`]) if the current connection advertised one.
+    pub fn instructions(&self) -> Option<String> {
+        self.instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record what a handshake's `InitializeResult` said, replacing whatever the previous one said.
+    ///
+    /// Takes the raw string rather than the service, so the sanitising and the truncating live in
+    /// one place and can be exercised without a peer.
+    pub(crate) fn record_instructions(&self, raw: Option<String>) {
+        let captured = raw.map(|raw| {
+            truncate(
+                &crate::mcp::sanitize::sanitize_text(&raw),
+                MAX_MCP_DESCRIPTION_LENGTH,
+            )
+        });
+        // Unconditional, including the `None` a reconnect to a server that has stopped advertising
+        // instructions produces. Anything else would leave the previous connection's text standing
+        // as if the new one had repeated it.
+        *self
+            .instructions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured;
     }
 
     /// Snapshot of the current lifecycle state. `Connected` carries an `Arc<McpRunningService>`
@@ -415,6 +495,12 @@ impl ServerEntry {
 
             match result {
                 Ok(Ok(new_service)) => {
+                    self.record_instructions(
+                        new_service
+                            .peer()
+                            .peer_info()
+                            .and_then(|info| info.instructions.clone()),
+                    );
                     *self.state.write().await = ServerState::Connected {
                         service: Arc::new(new_service),
                     };
@@ -423,6 +509,7 @@ impl ServerEntry {
                         self.server_name,
                         attempt + 1
                     );
+                    self.relist_after_reconnect().await;
                     return Ok(());
                 }
                 Ok(Err(error)) => {
@@ -452,6 +539,47 @@ impl ServerEntry {
             server_name: self.server_name.clone(),
             message: format!("exhausted {} reconnect attempts", max_attempts),
         }))
+    }
+
+    /// Re-list this server's tools after a reconnect has swapped in a new transport.
+    ///
+    /// A reconnect used to end at the transport, on the reasoning that the tool adapters already
+    /// exist and resolve the live peer at dispatch time. That is true of *dispatch* and not of the
+    /// *list*: the peer on the other side is a new session with a new `InitializeResult`, and a
+    /// fresh `initialize` produces no `tools/list_changed` because the client is expected to list.
+    /// So a server redeployed with a tool dropped kept being advertised, and one added was never
+    /// learned.
+    ///
+    /// Inline rather than spawned: the four resource and prompt retry sites reconnect and then
+    /// immediately retry their request, and a listing that lands after the retry would leave the
+    /// window this exists to close. The cost is one `tools/list` on a connection that has just
+    /// completed a full handshake.
+    ///
+    /// A failure here is a `warn!` rather than a failed reconnect. The transport is back, which is
+    /// what the caller asked for, and the stale tool set is the condition that already held.
+    async fn relist_after_reconnect(&self) {
+        let Some(manager) = self
+            .client_context
+            .manager()
+            .and_then(|manager| manager.upgrade())
+        else {
+            // No manager means nothing is holding a registry to update -- the shape the unit tests
+            // build, and the shape a shutting-down process ends in.
+            return;
+        };
+        match manager.refresh_server_tools(&self.server_name).await {
+            Ok(count) => tracing::info!(
+                "MCP server '{}' re-registered {} tool(s) after reconnect",
+                self.server_name,
+                count
+            ),
+            Err(error) => tracing::warn!(
+                "MCP server '{}' reconnected but re-listing its tools failed, so meka is still \
+                 advertising the previous set: {}",
+                self.server_name,
+                error
+            ),
+        }
     }
 }
 
@@ -579,7 +707,7 @@ impl McpClientManager {
                     ServerState::Pending
                 }),
                 reconnect_lock: Mutex::new(()),
-                instructions: OnceLock::new(),
+                instructions: std::sync::RwLock::new(None),
                 request_timeout: OnceLock::new(),
                 dropped_tools: std::sync::atomic::AtomicUsize::new(0),
             });
@@ -612,20 +740,35 @@ impl McpClientManager {
     /// `on_tool_list_changed` when a server signals a dynamic update.
     ///
     /// The snapshot is what new sessions read at attach time; the propagation keeps existing
-    /// sessions in sync without requiring them to re-attach.
-    pub async fn update_server_tools(
-        &self,
-        server_name: &str,
-        tools: Vec<Arc<dyn crate::tools::Tool>>,
-    ) {
+    /// sessions in sync without requiring them to re-attach. Both are given the whole
+    /// [`ServerTools`], so a registry that attaches later cannot end up with a different
+    /// eager-vs-deferred split from one that was already here.
+    async fn update_server_tools(&self, server_name: &str, tools: ServerTools) {
+        // Snapshot first, then fan out. [`Self::attach_registry`] does the mirror image, and the
+        // pairing is what closes the window where a registry attaching concurrently is missed by
+        // the fan-out *and* attaches before the snapshot names the update.
         self.tools_snapshot
             .write()
             .await
             .insert(server_name.to_string(), tools.clone());
         let registries = self.attached_registries.read().await;
         for registry in registries.iter() {
-            registry.replace_server_tools(server_name, tools.clone());
+            tools.apply_to(server_name, registry);
         }
+    }
+
+    /// [`Self::update_server_tools`] for a caller holding the concrete adapters.
+    ///
+    /// The one door for all three discovery paths (the connector's first `tools/list`, the refresh
+    /// a `tools/list_changed` notification triggers, and the re-list [`Self::refresh_server_tools`]
+    /// runs after a reconnect), so none of them can classify a tool differently from the others.
+    pub(super) async fn register_server_tools(
+        &self,
+        server_name: &str,
+        adapters: Vec<McpToolAdapter>,
+    ) {
+        self.update_server_tools(server_name, ServerTools::from_adapters(adapters))
+            .await;
     }
 
     /// Attach a per-session registry to receive live MCP tool updates. Pushes the registry into the
@@ -635,7 +778,8 @@ impl McpClientManager {
     /// ordering (read snapshot, then push) has a window where an update can land between the
     /// snapshot read and the push, with the registry missing it forever.
     ///
-    /// `replace_server_tools` is idempotent, so the double-write when both paths fire is harmless.
+    /// [`ServerTools::apply_to`] is idempotent, so the double-write when both paths fire is
+    /// harmless.
     ///
     /// Sessions call this at `session/new` (after building their per-session
     /// [`crate::tools::ToolRegistry`]) and pair it with [`Self::detach_registry`] at
@@ -651,7 +795,7 @@ impl McpClientManager {
             .push(registry.clone());
         let snapshot = self.tools_snapshot.read().await;
         for (server_name, tools) in snapshot.iter() {
-            registry.replace_server_tools(server_name, tools.clone());
+            tools.apply_to(server_name, &registry);
         }
     }
 
@@ -661,18 +805,6 @@ impl McpClientManager {
     pub async fn detach_registry(&self, registry: &crate::tools::ToolRegistry) {
         let mut registries = self.attached_registries.write().await;
         registries.retain(|other| !crate::tools::ToolRegistry::same_inner(other, registry));
-    }
-
-    /// Mark a batch of tool names as deferred across every attached registry. Called after
-    /// [`Self::update_server_tools`] when some of the newly-registered adapters are lazy-load only;
-    /// the agent's tools-array build then skips them until they're explicitly requested.
-    pub async fn mark_deferred_on_attached(&self, tool_names: &[String]) {
-        let registries = self.attached_registries.read().await;
-        for registry in registries.iter() {
-            for name in tool_names {
-                registry.mark_deferred(name);
-            }
-        }
     }
 
     /// The bound to put on an MCP request made outside the connector.
@@ -823,7 +955,7 @@ impl McpClientManager {
         let snapshot = self.tools_snapshot.read().await;
         snapshot
             .values()
-            .flatten()
+            .flat_map(|server| server.tools.iter())
             .find(|tool| tool.definition().name == name)
             .map(Arc::clone)
     }
@@ -832,21 +964,35 @@ impl McpClientManager {
         self.servers.keys().cloned().collect()
     }
 
-    /// Returns `(server_name, instructions)` pairs for every connected server that advertised an
-    /// `InitializeResult.instructions` string during the handshake. Already sanitised and truncated
-    /// to [`MAX_MCP_DESCRIPTION_LENGTH`]. Used by the agent loop to splice MCP server instructions
-    /// into the per-turn context.
+    /// Returns `(server_name, instructions)` pairs for every connected server whose current
+    /// handshake advertised an `InitializeResult.instructions` string. Already sanitised and
+    /// truncated to [`MAX_MCP_DESCRIPTION_LENGTH`]. Used by the agent loop to splice MCP server
+    /// instructions into the per-turn context.
     pub fn server_instructions(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {
             if let Some(text) = entry.instructions()
                 && !text.trim().is_empty()
             {
-                out.push((name.clone(), text.to_string()));
+                out.push((name.clone(), text));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Re-run one server's `tools/list` and publish the result.
+    ///
+    /// The repair a *reconnect* needs. A fresh `initialize` produces no `tools/list_changed` -- the
+    /// client is expected to list -- so a server redeployed with a different tool set is invisible
+    /// until something asks again. Errors propagate rather than publishing an empty set: a failed
+    /// list means meka does not know what the server has, which is not the same as knowing it has
+    /// nothing.
+    pub(crate) async fn refresh_server_tools(&self, server_name: &str) -> Result<usize> {
+        let adapters = self.discover_tools_for_server(server_name).await?;
+        let count = adapters.len();
+        self.register_server_tools(server_name, adapters).await;
+        Ok(count)
     }
 
     pub async fn discover_tools_for_server(
@@ -985,8 +1131,6 @@ impl McpClientManager {
     /// Idempotent and safe to call concurrently from separate `agent_spawn` invocations operating
     /// on distinct sub-agent registries.
     pub async fn install_tools_on(self: &Arc<Self>, registry: &crate::tools::ToolRegistry) {
-        use crate::tools::Tool as _;
-
         // Sub-agent registries come through here rather than `attach_registry`, so this is where
         // they pick up the back-reference `load_tool` needs to explain an unconnected server. A
         // sub-agent that reaches for a dead server's tool should get the same answer the parent
@@ -1018,32 +1162,19 @@ impl McpClientManager {
             if adapters.is_empty() {
                 continue;
             }
-            let deferred_names: Vec<String> = adapters
-                .iter()
-                .filter(|adapter| {
-                    !crate::mcp::tool_should_eager_load(adapter.server_config(), adapter.raw_name())
-                })
-                .map(|adapter| adapter.definition().name.clone())
-                .collect();
-            let arc_adapters: Vec<Arc<dyn crate::tools::Tool>> = adapters
-                .into_iter()
-                .map(|adapter| Arc::new(adapter) as Arc<dyn crate::tools::Tool>)
-                .collect();
-            registry.replace_server_tools(&name, arc_adapters);
-            for deferred in &deferred_names {
-                registry.mark_deferred(deferred);
-            }
+            ServerTools::from_adapters(adapters).apply_to(&name, registry);
         }
     }
 
     /// Heal one server on demand, picking the right repair for the state it is actually in.
     ///
     /// The dispatch is the whole point, because the two repairs are not interchangeable.
-    /// [`ServerEntry::reconnect`] only swaps the transport, which is all a *previously connected*
-    /// server needs: its tool adapters already exist and resolve the live peer at dispatch time.
-    /// An entry that failed its initial connect never reached `discover_and_register_tools`, so
-    /// healing it that way would leave a server reporting `connected` while exposing no tools at
-    /// all. [`connector::connect_one`] re-registers tools and is the right call there.
+    /// [`ServerEntry::reconnect`] reopens a transport that has closed under a state still claiming
+    /// `Connected`, and no-ops when it has not. An entry that is `Failed` has no transport to
+    /// reopen and never reached tool discovery in the first place, so
+    /// [`connector::connect_one`] -- which does the whole handshake -- is the right call there.
+    /// Both end in a `tools/list`, because a new connection is a new session and its tool set is
+    /// only knowable by asking.
     ///
     /// A `Failed` server is already being retried in the background with exponential backoff, so
     /// this is an impatience button rather than the only route back: it collapses the wait for an
@@ -1099,7 +1230,8 @@ impl McpClientManager {
                 // Bounded here rather than inside: `ServerEntry::reconnect` retries an HTTP
                 // transport up to five times with its own backoff and wraps none of it in a
                 // timeout, so an endpoint that blackholes connections would hold this request far
-                // past the budget the caller passed in.
+                // past the budget the caller passed in. The re-list it ends with carries its own
+                // bound, so this covers the whole of it either way.
                 tokio::time::timeout(connect_timeout, entry.reconnect())
                     .await
                     .map_err(|_| MekaError::McpConnection {
@@ -2435,10 +2567,201 @@ pub(crate) mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            instructions: OnceLock::new(),
+            instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// `eager_load_tools` decides the split, against a real `tools/list`.
+    ///
+    /// The sibling of `a_registry_attaching_after_discovery_still_learns_which_tools_are_deferred`,
+    /// which hands [`ServerTools`] its `deferred` list ready-made and so proves only that the list
+    /// is *carried*. This proves it is *computed*: the classification needs the raw name and the
+    /// server config, neither of which survives the erasure into `Arc<dyn Tool>`, so it has to
+    /// happen inside `from_adapters` on the discovery path.
+    ///
+    /// Deliberately not a `#[cfg(test)]` construction of an adapter: the thing that broke on
+    /// `serve` and `acp` was the *path*, so this drives `connect_one` against a live stdio peer
+    /// with no registry attached at discovery time, which is the ordering both hosts use.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_defers_every_tool_the_eager_allowlist_does_not_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("stub.json");
+        std::fs::write(&state, r#"{"tools": ["search", "create_page"]}"#)
+            .expect("write the stub's state");
+
+        let mut config = bare_server_config("notion");
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("python3".to_string());
+        config.args = Some(vec![
+            format!(
+                "{}/tests/fixtures/mcp_stub_server.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            state.display().to_string(),
+        ]);
+        config.eager_load_tools = Some(vec!["search".to_string()]);
+
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(&[config], None, None, Arc::clone(&context))
+            .await
+            .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let entry = manager
+            .servers
+            .get("notion")
+            .cloned()
+            .expect("the configured entry");
+
+        // No registry attached yet: `build_shared_deps` starts the connector before any session
+        // exists, so this is the ordering that made the marks vanish.
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            None,
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+
+        let registry = crate::tools::ToolRegistry::new();
+        manager.attach_registry(registry.clone()).await;
+
+        assert!(
+            registry.get("mcp__notion__search").is_some()
+                && registry.get("mcp__notion__create_page").is_some(),
+            "both tools must arrive, or the split below means nothing: {:?}",
+            entry.state().await.label()
+        );
+        assert!(
+            !registry.is_deferred("mcp__notion__search"),
+            "`eager_load_tools` names `search`, so it must ship in the cacheable prefix"
+        );
+        assert!(
+            registry.is_deferred("mcp__notion__create_page"),
+            "and everything the allowlist does not name must ship deferred"
+        );
+    }
+
+    /// A reconnect is a new session with the server, and its tool set is only knowable by asking.
+    ///
+    /// The reconnect path used to end at the transport, justified by "the tool adapters already
+    /// exist and resolve the live peer at dispatch time" -- true of dispatch, and not of the list.
+    /// A fresh `initialize` produces no `tools/list_changed`, because the client is the one
+    /// expected to list, so a server redeployed with a tool dropped kept being advertised for the
+    /// life of the process and one added was never learned.
+    ///
+    /// Driven against a real peer, because the whole claim is about what happens on the wire. The
+    /// stub serves one `tools/list` and exits, which both delivers the first tool set and closes
+    /// the transport under meka, and it re-reads its state file on every request, so the second
+    /// connection advertises the second set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_re_lists_a_server_whose_tools_have_changed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("stub.json");
+        let write_state = |tools: &str| {
+            std::fs::write(
+                &state,
+                format!(r#"{{"tools": [{}], "exit_after": 1}}"#, tools),
+            )
+            .expect("write the stub's state")
+        };
+        write_state(r#""search""#);
+
+        let mut config = bare_server_config("stub");
+        config.transport = McpTransport::Stdio;
+        config.url = None;
+        config.command = Some("python3".to_string());
+        config.args = Some(vec![
+            format!(
+                "{}/tests/fixtures/mcp_stub_server.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            state.display().to_string(),
+        ]);
+
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(&[config], None, None, Arc::clone(&context))
+            .await
+            .expect("prepare");
+        context.set_manager(Arc::downgrade(&manager));
+        let registry = crate::tools::ToolRegistry::new();
+        manager.attach_registry(registry.clone()).await;
+        let entry = manager
+            .servers
+            .get("stub")
+            .cloned()
+            .expect("the configured entry");
+
+        connector::connect_one(
+            Arc::clone(&entry),
+            Arc::clone(&manager),
+            None,
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            registry.get("mcp__stub__search").is_some(),
+            "the stub's first tool set must land, or nothing below means anything: {:?}",
+            entry.state().await.label()
+        );
+
+        // The stub exited after serving that list, so the transport is closing. What the *next*
+        // connection advertises is written before the reconnect that spawns it.
+        write_state(r#""create_page""#);
+        for _ in 0..200 {
+            if entry.needs_reconnect().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            entry.needs_reconnect().await,
+            "the stub was supposed to exit and close the transport"
+        );
+
+        entry.reconnect().await.expect("reconnect");
+
+        assert!(
+            registry.get("mcp__stub__create_page").is_some(),
+            "a reconnect must learn the tool the redeployed server added"
+        );
+        assert!(
+            registry.get("mcp__stub__search").is_none(),
+            "and must stop advertising the one it dropped"
+        );
+    }
+
+    /// Instructions belong to a connection, and the entry outlives the connection.
+    ///
+    /// This was a `OnceLock`, justified by the spec's "immutable for the lifetime of the
+    /// connection". A reconnect is a new connection, so a server redeployed with different
+    /// instructions -- or with none -- kept feeding the first handshake's text into the model's
+    /// context every turn for the life of the process.
+    #[test]
+    fn a_later_handshake_replaces_what_the_previous_one_said() {
+        let entry = pending_entry("notion", McpTransport::Http);
+
+        entry.record_instructions(Some("call search first".to_string()));
+        assert_eq!(entry.instructions().as_deref(), Some("call search first"));
+
+        entry.record_instructions(Some("search was removed".to_string()));
+        assert_eq!(
+            entry.instructions().as_deref(),
+            Some("search was removed"),
+            "a second handshake's instructions must supersede the first's"
+        );
+
+        entry.record_instructions(None);
+        assert_eq!(
+            entry.instructions(),
+            None,
+            "a handshake that advertises none must clear the previous text rather than leave it \
+             standing as if it had been repeated"
+        );
     }
 
     /// Shutdown must run while the manager is still shared.
@@ -2899,6 +3222,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// A tool with a chosen name and nothing else. An empty `Vec` to `replace_server_tools` is a
+    /// no-op and would not exercise the propagation path at all, so the fixture has to publish
+    /// something distinctively named.
+    struct FixtureTool {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FixtureTool {
+        fn definition(&self) -> crate::provider::ToolDefinition {
+            crate::provider::ToolDefinition::new(
+                self.name.clone(),
+                "fixture".to_string(),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+        }
+
+        fn required_permission(&self) -> Permission {
+            Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> crate::error::Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::text("ok".to_string(), false))
+        }
+    }
+
+    /// Discovery happens before any session exists on `meka serve` and `meka acp` --
+    /// `start_connector` runs in `build_shared_deps`, `attach_registry` at `session/new` -- so a
+    /// deferred mark that is only pushed to the registries attached *at discovery time* reaches
+    /// nothing on either host. Lazy MCP loading was silently inert there: every `mcp__*` schema
+    /// shipped on every request, and `tool_catalogue` called them enabled.
+    ///
+    /// The sibling of `attach_registry_races_with_update_without_losing_tools`, which asserts the
+    /// tools arrive and says nothing about how they arrive marked.
+    #[tokio::test]
+    async fn a_registry_attaching_after_discovery_still_learns_which_tools_are_deferred() {
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(&[], None, None, context)
+            .await
+            .expect("prepare");
+
+        manager
+            .update_server_tools("notion", ServerTools {
+                tools: vec![
+                    Arc::new(FixtureTool {
+                        name: "mcp__notion__search".to_string(),
+                    }),
+                    Arc::new(FixtureTool {
+                        name: "mcp__notion__create_page".to_string(),
+                    }),
+                ],
+                deferred: vec!["mcp__notion__create_page".to_string()],
+            })
+            .await;
+
+        // Attached only now, which is the ordering both long-lived hosts actually use.
+        let registry = crate::tools::ToolRegistry::new();
+        manager.attach_registry(registry.clone()).await;
+
+        assert!(
+            registry.get("mcp__notion__create_page").is_some(),
+            "the backfill must still deliver the tool itself"
+        );
+        assert!(
+            registry.is_deferred("mcp__notion__create_page"),
+            "a tool discovered before this registry existed must still arrive deferred"
+        );
+        assert!(
+            !registry.is_deferred("mcp__notion__search"),
+            "and an eager one must not be swept up with it"
+        );
+    }
+
     /// `update_server_tools` racing against `attach_registry` must not lose updates: every
     /// published tool list must reach every session that attaches before or during the publish,
     /// with no silent miss window. Regression guard for the race fixed in
@@ -2908,39 +3308,7 @@ pub(crate) mod tests {
     async fn attach_registry_races_with_update_without_losing_tools() {
         use std::sync::Arc;
 
-        use crate::{
-            permission::Permission,
-            provider::ToolDefinition,
-            tools::{Tool, ToolOutput},
-        };
-
-        // Minimal fixture so each server publishes a distinctively-named tool. An empty Vec to
-        // `replace_server_tools` is a no-op and wouldn't actually exercise the propagation path.
-        struct FixtureTool {
-            name: String,
-        }
-        #[async_trait::async_trait]
-        impl Tool for FixtureTool {
-            fn definition(&self) -> ToolDefinition {
-                ToolDefinition::new(
-                    self.name.clone(),
-                    "race fixture".to_string(),
-                    serde_json::json!({"type": "object", "properties": {}}),
-                )
-            }
-
-            fn required_permission(&self) -> Permission {
-                Permission::Read
-            }
-
-            async fn execute(
-                &self,
-                _input: serde_json::Value,
-                _cancellation: tokio_util::sync::CancellationToken,
-            ) -> crate::error::Result<ToolOutput> {
-                Ok(ToolOutput::text("ok".to_string(), false))
-            }
-        }
+        use crate::tools::Tool;
 
         // Empty config: we don't need real servers to exercise the snapshot/registry plumbing,
         // just the manager methods.
@@ -2964,7 +3332,12 @@ pub(crate) mod tests {
                 let tool: Arc<dyn Tool> = Arc::new(FixtureTool {
                     name: format!("mcp__{}__ping", name),
                 });
-                manager.update_server_tools(&name, vec![tool]).await;
+                manager
+                    .update_server_tools(&name, ServerTools {
+                        tools: vec![tool],
+                        deferred: Vec::new(),
+                    })
+                    .await;
             }));
         }
         let mut attach_handles = Vec::new();

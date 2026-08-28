@@ -21,24 +21,38 @@ fn require_any_read_scope(principal: &Principal) -> Result<(), ProblemDetail> {
     scope::require_any(principal, ANY_READ_SCOPES)
 }
 
+/// What this server is, for a client deciding how to talk to it.
+///
+/// Deliberately carries no provider or model. It used to report both, as the default profile's
+/// backend and model, and `provider` in particular held a *backend* (`anthropic-messages`) while
+/// the `provider` field on `POST /v1/sessions` holds a *profile* (`work`). One word, two meanings,
+/// one API: a client that read one and posted it to the other got a 422. `GET /v1/providers`
+/// already answers both questions and names them apart -- `name` for the profile, `type` for the
+/// backend -- and marks the default with `active`, so the fields here were a duplicate in the wrong
+/// vocabulary rather than the only way to learn anything.
 #[derive(Serialize, ToSchema)]
 pub struct InfoResponse {
     pub version: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
     pub default_permission: String,
     pub enabled_permissions: Vec<String>,
-    /// Whether the active profile accepts image attachments on `POST /turn`. The HTTP analogue of
+    /// Whether the server's *default* profile accepts image attachments. The HTTP analogue of
     /// ACP's `promptCapabilities.image`, so a client can tell whether attaching one is worth the
     /// base64 payload instead of discovering it from a 422.
+    ///
+    /// Server-wide, like everything else on this endpoint, and therefore only an answer for a
+    /// session created without naming a `provider`. `POST /turn` decides per session from the
+    /// profile that session recorded, so a session on another profile can differ.
     pub vision: bool,
 }
 
-/// `GET /v1/info`: server identity + model surface. Authenticated; admits any token holding at
-/// least one read scope (see [`crate::server::scope::ANY_READ_SCOPES`]). Tokens with only write
-/// scopes get 403. The broad-read fallback is intentional: a token configured for `sessions:r` to
-/// surface session listings can also see the server's own version/model identity without operators
-/// having to grant it anything else.
+/// `GET /v1/info`: server identity and the permission surface. Authenticated; admits any token
+/// holding at least one read scope (see [`crate::server::scope::ANY_READ_SCOPES`]). Tokens with
+/// only write scopes get 403. The broad-read fallback is intentional: a token configured for
+/// `sessions:r` to surface session listings can also see the server's own identity without
+/// operators having to grant it anything else.
+///
+/// For which provider profiles exist and which one a session gets by default, see
+/// `GET /v1/providers`.
 #[utoipa::path(
     get,
     path = "/v1/info",
@@ -58,8 +72,6 @@ pub async fn info(
     let config = &state.shared.config;
     Ok(Json(InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        provider: config.provider_name.clone(),
-        model: config.model.clone(),
         default_permission: config.permission.to_string(),
         enabled_permissions: config
             .enabled_permissions

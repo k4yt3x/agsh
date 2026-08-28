@@ -44,13 +44,26 @@ impl ServeTestHarness {
     /// Spawn `meka serve` with a single `sessions:r + sessions:w` token and the mock
     /// provider. Returns once the server has logged its listening address.
     fn spawn(config_toml: &str, script: serde_json::Value) -> Self {
-        Self::spawn_with(config_toml, script, "sk_test_token", &[
+        Self::spawn_with("", config_toml, script, "sk_test_token", &[
+            "sessions:r",
+            "sessions:w",
+        ])
+    }
+
+    /// [`Self::spawn`] plus a top-level prelude, for the keys that cannot live inside a table.
+    ///
+    /// `extra_config` is injected *inside* `[serve]`, which is right for `max_body_bytes` and its
+    /// neighbours and impossible for `default_provider`: a second profile makes the default
+    /// ambiguous, and the key that resolves it has to precede every table header.
+    fn spawn_with_prelude(prelude: &str, config_toml: &str, script: serde_json::Value) -> Self {
+        Self::spawn_with(prelude, config_toml, script, "sk_test_token", &[
             "sessions:r",
             "sessions:w",
         ])
     }
 
     fn spawn_with(
+        prelude: &str,
         extra_config: &str,
         script: serde_json::Value,
         token: &str,
@@ -83,7 +96,7 @@ impl ServeTestHarness {
             // `[[serve.tokens]]` array-of-tables) so callers can set `max_body_bytes`,
             // `idle_timeout`, etc. without colliding with the per-token block.
             let config = format!(
-                r#"
+                r#"{prelude}
 [providers.mock]
 type = "anthropic-messages"
 model = "claude-sonnet-4-5"
@@ -105,6 +118,7 @@ bind = "{bind}"
 token = "{token}"
 scopes = [{scopes_str}]
 "#,
+                prelude = prelude,
                 bind = bind,
                 token = token,
                 scopes_str = scopes_str,
@@ -299,7 +313,7 @@ fn invalid_bearer_token_returns_401_auth_invalid() {
 fn insufficient_scope_returns_403() {
     // Token only has sessions:r, no sessions:w.
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     let response = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({"cwd": "/tmp"}))
@@ -671,7 +685,7 @@ fn fork_rejects_a_relative_cwd_and_an_unknown_session() {
 #[test]
 fn fork_requires_write_scope() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     let response = harness
         .request(
             reqwest::Method::POST,
@@ -1241,6 +1255,7 @@ fn cancel_idempotent_when_no_turn_in_flight() {
 #[test]
 fn oversize_body_returns_413() {
     let harness = ServeTestHarness::spawn_with(
+        "",
         "max_body_bytes = 1024\n",
         mock_simple_turn(),
         "sk_test_token",
@@ -1351,7 +1366,7 @@ fn ready_probe_reports_subsystem_health() {
 #[test]
 fn patch_without_write_scope_returns_403() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     // Create a session via a *second* token that has write scope, then PATCH via the read-
     // only token. The harness only supports a single token, so this test exercises the
     // negative path by attempting PATCH on a session ID the read-only token couldn't even
@@ -1387,6 +1402,7 @@ fn re_attach_to_evicted_session_continues_conversation() {
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
+        "",
         // Aggressive GC: evict after 1s of idle, scan every 1s. Test waits 3s between turns.
         "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
         script,
@@ -1600,11 +1616,13 @@ fn max_concurrent_turns_returns_429_across_sessions() {
             { "kind": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let harness =
-        ServeTestHarness::spawn_with("max_concurrent_turns = 1\n", script, "sk_test_token", &[
-            "sessions:r",
-            "sessions:w",
-        ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "max_concurrent_turns = 1\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
 
     // Two distinct sessions.
     let mut ids = Vec::new();
@@ -2459,6 +2477,56 @@ fn info_reports_the_vision_capability() {
     assert_eq!(body["vision"], true);
 }
 
+/// `/v1/info` carries no provider or model, and `/v1/providers` answers both.
+///
+/// It used to report the default profile's backend under the name `provider`, while the `provider`
+/// field on `POST /v1/sessions` names a *profile*: one word, two meanings, one API, and a client
+/// that read one and posted it to the other got a 422. The fields were also duplicates, since the
+/// `active: true` row below already carries the same two facts under names that tell them apart.
+#[test]
+fn info_carries_no_provider_or_model_because_providers_does() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_provider = \"mock\"\n",
+        r#"
+[providers.side]
+type = "openai-chat-completions"
+model = "gpt-5"
+"#,
+        mock_simple_turn(),
+    );
+
+    let info: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/info")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        info.get("provider").is_none() && info.get("model").is_none(),
+        "neither belongs here; `/v1/providers` names them apart: {info}"
+    );
+
+    let providers: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/providers")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let rows = providers["providers"].as_array().expect("providers");
+    let active = rows
+        .iter()
+        .find(|row| row["active"] == true)
+        .expect("one profile is the default");
+    // `name` is the profile, which is what `POST /v1/sessions` takes; `type` is the backend. Both
+    // present, and distinguishable, which is the whole reason `/v1/info` need not repeat them.
+    assert_eq!(active["name"], "mock", "{providers}");
+    assert!(active["type"].is_string(), "{providers}");
+    assert!(
+        rows.iter().any(|row| row["name"] == "side"),
+        "every configured profile is listed, not just the default: {providers}"
+    );
+}
+
 /// Two concurrent turns on two different sessions complete in roughly the same wall time
 /// as a single turn; i.e. the agent loop doesn't serialize across sessions.
 #[test]
@@ -2942,7 +3010,7 @@ fn turn_options_unknown_skill_returns_422() {
 #[test]
 fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     let broken = harness.home().join("meka").join("skills").join("wrecked");
     std::fs::create_dir_all(&broken).expect("mkdir");
     std::fs::write(
@@ -3072,7 +3140,7 @@ fn delete_while_turn_in_flight_returns_409() {
 #[test]
 fn delete_without_write_scope_returns_403() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     let response = harness
         .request(
             reqwest::Method::DELETE,
@@ -3100,6 +3168,7 @@ fn created_at_survives_gc_and_reattach() {
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
+        "",
         "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
         script,
         "sk_test_token",
@@ -3226,7 +3295,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
 fn discovery_endpoints_share_read_scope_set() {
     // Token scoped to `mcp:r` only: must be admitted on all three discovery endpoints.
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_mcp_only", &["mcp:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_mcp_only", &["mcp:r"]);
     for path in ["/v1/info", "/v1/skills", "/v1/mcp"] {
         let response = harness
             .request(reqwest::Method::GET, path)
@@ -3246,7 +3315,9 @@ fn discovery_endpoints_share_read_scope_set() {
 #[test]
 fn discovery_endpoints_admit_skills_only_token() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_skills_only", &["skills:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_skills_only", &[
+            "skills:r",
+        ]);
     for path in ["/v1/info", "/v1/skills", "/v1/mcp"] {
         let response = harness
             .request(reqwest::Method::GET, path)
@@ -3266,6 +3337,7 @@ fn discovery_endpoints_admit_skills_only_token() {
 #[test]
 fn delete_on_idle_true_removes_db_row_on_eviction() {
     let harness = ServeTestHarness::spawn_with(
+        "",
         "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\ndelete_on_idle = true\n",
         mock_simple_turn(),
         "sk_test_token",
@@ -3457,8 +3529,9 @@ fn blocking_turn_response_carries_tool_calls_messages_and_usage() {
 /// `insufficient_scope_returns_403` which tests r-only → 403 on write).
 #[test]
 fn write_only_token_cannot_read_sessions() {
-    let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_w_only", &["sessions:w"]);
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_w_only", &[
+        "sessions:w",
+    ]);
     let response = harness
         .request(reqwest::Method::GET, "/v1/sessions")
         .send()
@@ -4302,6 +4375,7 @@ fn an_isolated_fire_runs_at_its_session_level_not_the_server_default() {
         { "kind": "message_end", "stop_reason": "end_turn" }
     ]]);
     let harness = ServeTestHarness::spawn_with(
+        "",
         "\n[schedule]\npoll_interval = \"1s\"\n",
         script,
         "sk_test_token",
@@ -4447,6 +4521,68 @@ fn context_endpoint_reports_window_and_totals() {
     );
 }
 
+/// A session gauges itself against its own profile's window, not the server default's.
+///
+/// The failure this guards is silent and expensive: `agent_options` is built once per process from
+/// the default profile, so a session pinned to a 32k model was measured against the default's
+/// window. Auto-compaction never reached its threshold and the provider rejected the turn for
+/// exceeding a context meka thought was 97% free.
+#[test]
+fn context_window_follows_the_session_profile_not_the_server_default() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_provider = \"mock\"\n",
+        r#"
+[providers.small]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+context_window = 32000
+"#,
+        mock_simple_turn(),
+    );
+
+    let mut windows = std::collections::BTreeMap::new();
+    for provider in ["mock", "small"] {
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "provider": provider,
+            }))
+            .send()
+            .expect("send");
+        assert_eq!(
+            create.status(),
+            201,
+            "create on `{provider}` failed: {}",
+            create.text().unwrap_or_default()
+        );
+        let id = create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let context: serde_json::Value = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/context", id),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        windows.insert(provider, context["window"].as_u64().expect("window"));
+    }
+
+    assert_eq!(
+        windows["small"], 32_000,
+        "the session's own profile states 32000: {windows:?}"
+    );
+    assert_ne!(
+        windows["mock"], windows["small"],
+        "a profile that states no window must not inherit one that does: {windows:?}"
+    );
+}
+
 /// `used` is absent rather than `0` when nothing has measured the window. Zero would read as
 /// "empty" to any client that divides by `window`, which is exactly wrong for a re-attached
 /// session holding a long conversation.
@@ -4485,7 +4621,7 @@ fn context_endpoint_omits_used_before_any_turn() {
 #[test]
 fn context_endpoint_requires_sessions_read_scope() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:w"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:w"]);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
@@ -4585,7 +4721,7 @@ fn compact_accepts_an_empty_body() {
 #[test]
 fn compact_requires_sessions_write_scope() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:r"]);
     let response = harness
         .request(
             reqwest::Method::POST,
@@ -4811,7 +4947,7 @@ fn import_rejects_a_malformed_envelope() {
 /// rather than answering 204 over a job that is still firing.
 #[test]
 fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
         "schedule:r",
@@ -4886,6 +5022,7 @@ fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
 #[test]
 fn creating_a_job_is_refused_when_scheduling_is_disabled() {
     let harness = ServeTestHarness::spawn_with(
+        "",
         "\n[schedule]\nenabled = false\n",
         mock_simple_turn(),
         "sk_test_token",
@@ -4933,7 +5070,7 @@ fn creating_a_job_is_refused_when_scheduling_is_disabled() {
 /// bake an absolute host path into `SKILL.md`, once more per edit cycle.
 #[test]
 fn a_skill_body_round_trips_through_get_and_put() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "skills:r", "skills:w",
     ]);
     let body = "# Deploy\n\nRun `scripts/deploy.sh` and report the exit code.\n";
@@ -4979,7 +5116,7 @@ fn a_skill_body_round_trips_through_get_and_put() {
 /// does. Resetting it would make the obvious edit demote a skill out of the index the model reads.
 #[test]
 fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "skills:r", "skills:w", "memory:r", "memory:w",
     ]);
     for (store, path) in [
@@ -5030,8 +5167,9 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
 fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
-    let harness =
-        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+    let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
+        "schedule:r",
+    ]);
 
     let session = harness
         .client
@@ -5120,8 +5258,9 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
 fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
-    let harness =
-        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+    let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
+        "schedule:r",
+    ]);
 
     let session = |permission: &str| -> String {
         harness
@@ -5188,8 +5327,9 @@ fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
 fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
-    let harness =
-        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+    let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
+        "schedule:r",
+    ]);
 
     let session = harness
         .client
@@ -5258,8 +5398,9 @@ fn a_read_only_built_in_tool_gate_is_accepted_at_read() {
 fn a_schedule_scoped_token_sees_a_gate_without_its_command() {
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\", \"schedule:r\", \"schedule:w\"]\n";
-    let harness =
-        ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+    let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
+        "schedule:r",
+    ]);
 
     let id = harness
         .client
@@ -5340,7 +5481,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
     // session so that setup is not what fails.
     let config = "\n[[serve.tokens]]\ntoken = \"sk_test_full\"\n\
                   scopes = [\"sessions:r\", \"sessions:w\"]\n";
-    let harness = ServeTestHarness::spawn_with(config, mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", config, mock_simple_turn(), "sk_test_token", &[
         "schedule:r",
         "schedule:w",
     ]);
@@ -5399,7 +5540,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
 /// to route on `type`. Reporting it as `auth-scope` sends them to re-provision a token forever.
 #[test]
 fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
         "schedule:r",
@@ -5442,7 +5583,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
 
 #[test]
 fn scheduled_job_create_list_and_cancel_round_trip() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
         "schedule:r",
@@ -5530,7 +5671,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
 /// would produce a job firing on a schedule nobody asked for.
 #[test]
 fn scheduled_job_rejects_two_schedules() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
         "schedule:r",
@@ -5568,7 +5709,7 @@ fn scheduled_job_rejects_two_schedules() {
 fn schedule_endpoints_require_the_schedule_scopes() {
     // A token that can drive turns but was never granted the schedule scopes must not be able to
     // plant unattended work.
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
     ]);
@@ -5736,7 +5877,7 @@ const STORE_SCOPES: &[&str] = &[
 #[test]
 fn skill_write_read_and_delete_round_trip() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
 
     let write = harness
         .request(reqwest::Method::PUT, "/v1/skills/greet-user")
@@ -5832,6 +5973,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
     let shared_root = tempfile::tempdir().expect("tempdir");
     let shared = shared_root.path().to_path_buf();
     let harness = ServeTestHarness::spawn_with(
+        "",
         &format!("\n[skills]\nextra_paths = ['{}']\n", shared.display()),
         mock_simple_turn(),
         "sk_test_token",
@@ -5900,7 +6042,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
 #[test]
 fn getting_a_broken_skill_says_why_rather_than_404() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     let broken = harness.home().join("meka").join("skills").join("wrecked");
     std::fs::create_dir_all(&broken).expect("mkdir");
     std::fs::write(
@@ -5936,7 +6078,7 @@ fn getting_a_broken_skill_says_why_rather_than_404() {
 #[test]
 fn skill_write_without_a_body_preserves_the_existing_one() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     harness
         .request(reqwest::Method::PUT, "/v1/skills/keeper")
         .json(&serde_json::json!({"description": "first", "body": "original body"}))
@@ -5970,7 +6112,7 @@ fn skill_write_without_a_body_preserves_the_existing_one() {
 #[test]
 fn skill_write_rejects_a_traversing_name() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     for bad in ["..", "a%2Fb", "has space"] {
         let response = harness
             .request(reqwest::Method::PUT, &format!("/v1/skills/{}", bad))
@@ -5989,7 +6131,7 @@ fn skill_write_rejects_a_traversing_name() {
 #[test]
 fn skill_write_rejects_an_empty_description() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     let response = harness
         .request(reqwest::Method::PUT, "/v1/skills/blank")
         .json(&serde_json::json!({"description": "   "}))
@@ -6005,7 +6147,7 @@ fn skill_write_rejects_an_empty_description() {
 /// A read scope must not admit a write. The catalogue is flat: neither implies the other.
 #[test]
 fn skill_write_requires_the_write_scope() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
         "skills:r",
@@ -6030,7 +6172,7 @@ fn skill_write_requires_the_write_scope() {
 #[test]
 fn memory_write_read_list_and_delete_round_trip() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
 
     let write = harness
         .request(reqwest::Method::PUT, "/v1/memory/deploy-policy")
@@ -6159,7 +6301,7 @@ fn memory_write_read_list_and_delete_round_trip() {
 /// must not be able to read the user's notes, let alone empty them.
 #[test]
 fn memory_endpoints_require_the_memory_scopes() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
     ]);
@@ -6183,7 +6325,7 @@ fn memory_endpoints_require_the_memory_scopes() {
 
 #[test]
 fn memory_read_scope_does_not_grant_writes() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "memory:r",
     ]);
@@ -6269,7 +6411,7 @@ fn providers_endpoint_lists_profiles_and_marks_the_active_one() {
 
 #[test]
 fn mcp_tools_for_an_unknown_server_is_404() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "mcp:r",
         "mcp:w",
@@ -6296,7 +6438,7 @@ fn mcp_tools_for_an_unknown_server_is_404() {
 /// trigger it.
 #[test]
 fn mcp_reconnect_requires_the_mcp_write_scope() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "mcp:r",
     ]);
@@ -6569,7 +6711,7 @@ fn reattach_on_an_unknown_session_is_404() {
 #[test]
 fn reattach_requires_sessions_read_scope() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["sessions:w"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["sessions:w"]);
     let response = harness
         .request(
             reqwest::Method::GET,
@@ -7278,7 +7420,7 @@ fn webhook_without_a_secret_sends_no_signature_header() {
 #[test]
 fn missing_store_resources_report_not_found_rather_than_session_not_found() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     for path in ["/v1/skills/no-such-skill", "/v1/memory/no-such-memory"] {
         let response = harness
             .request(reqwest::Method::GET, path)
@@ -7298,7 +7440,7 @@ fn missing_store_resources_report_not_found_rather_than_session_not_found() {
 /// scope. The palette at `GET /v1/skills` is a listing and stays broadly readable.
 #[test]
 fn reading_a_skill_body_requires_the_skills_read_scope() {
-    let harness = ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &[
+    let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
     ]);
@@ -7538,7 +7680,7 @@ fn compact_marks_the_session_in_flight() {
 #[test]
 fn instructions_require_sessions_read_not_merely_any_read_scope() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", &["schedule:r"]);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &["schedule:r"]);
     let response = harness
         .request(reqwest::Method::GET, "/v1/instructions")
         .send()
@@ -7598,7 +7740,7 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
     assert_eq!(
         body["window"], 1_000_000,
         "the harness configures no context_window, so this is the documented default; reading \
-         `config.context_window` instead would have reported nothing at all: {}",
+         `config.session_context_window` instead would have reported nothing at all: {}",
         body
     );
 
@@ -7630,7 +7772,7 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
 #[test]
 fn a_same_length_rewrite_is_visible_immediately() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     let first: serde_json::Value = harness
         .request(reqwest::Method::PUT, "/v1/skills/tick")
         .json(&serde_json::json!({"description": "same length", "priority": 3, "body": "b"}))
@@ -8216,7 +8358,7 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
 #[test]
 fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
     let harness =
-        ServeTestHarness::spawn_with("", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
 
     // Names that survive routing as a single path segment but cannot name a directory in the store.
     // `..` is deliberately not among them: axum normalises it away before the handler sees it, so
@@ -8320,5 +8462,386 @@ fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
     assert_ne!(
         first["turn_id"], second["turn_id"],
         "the second session replayed the first turn rather than running its own"
+    );
+}
+
+/// `PATCH` moves a session that is not resident, without building an agent for it.
+///
+/// The rescue path for a session whose recorded profile has left `config.toml`. Reviving it to
+/// apply the change is the one thing that cannot work in that state, because rebuilding the agent
+/// resolves the very profile that is gone, so the documented recovery used to be refused by the
+/// failure it was meant to repair. Exercised on a *healthy* dormant session, since a genuinely
+/// stranded one cannot be created through this API; what it pins is that no agent is built, which
+/// is what makes the stranded case work.
+#[test]
+fn patch_moves_a_dormant_session_without_reviving_it() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_provider = \"mock\"\n",
+        r#"
+[providers.other]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+context_window = 32000
+"#,
+        mock_simple_turn(),
+    );
+
+    // Imported rather than created: `POST /v1/sessions` leaves an entry resident, which takes the
+    // path this test is not about. An import writes rows and nothing else.
+    let created = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let source = created.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let envelope: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/export?format=json", source),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let imported: serde_json::Value = harness
+        .request(reqwest::Method::POST, "/v1/sessions/import")
+        .json(&envelope)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let id = imported["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .json(&serde_json::json!({"provider": "other"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        200,
+        "a dormant session must be movable: {}",
+        patched.text().unwrap_or_default()
+    );
+    let body: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(body["provider"], "other", "{body}");
+    assert_eq!(
+        body["turn_in_flight"], false,
+        "a session with no agent has no turn: {body}"
+    );
+
+    // The name of this test, actually asserted. `message_count` is `Some` only while an entry is
+    // resident (`conversation.rs` reads it through `entry.runtime`), and `GET /context` does not
+    // itself revive one, so its absence is the residency signal.
+    //
+    // Without this the test proved nothing: with the whole dormant branch dead, `patch_session`
+    // falls through to `ensure_session_loaded`, revives the session, and returns a byte-identical
+    // body. Every assertion above still passed. Verified by prefixing the branch with `if false
+    // &&`.
+    let context: serde_json::Value = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/context", id),
+        )
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        context["message_count"].is_null(),
+        "the repin revived the session instead of moving it dormant: {context}"
+    );
+
+    // The row moved, and reading it back does not depend on an entry either.
+    let fetched: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(fetched["provider"], "other", "{fetched}");
+}
+
+/// A dormant repin and the reconstruction that follows it must agree about the profile.
+///
+/// `repin_dormant_session` decides what to write on the strength of the session not being resident,
+/// then awaits five times before writing: `require_session_exists`, resolving the profile (which
+/// may build a provider and load a credential), reading the recorded binding, the write itself, and
+/// the re-read. Nothing re-checked residency and nothing serialised against reconstruction, so any
+/// turn, scheduler fire, compaction or rewind arriving in that window rebuilt the agent from the
+/// *old* profile and inserted it. The row then moved and the response quoted the new profile, while
+/// the session ran, billed and gauged the old one until it was evicted again -- hours, at the
+/// default idle timeout.
+///
+/// The race itself is not reproducible from out here: it needs a reconstruction to land inside
+/// those five awaits, and nothing over HTTP can be timed that precisely. What is asserted is the
+/// post-condition the fix guarantees -- that after the repin, the row and the *live agent* rebuilt
+/// from it name the same profile -- which is exactly what the race broke. The serialisation itself
+/// lives in `repin_dormant_session`, which now holds `lock_session_reconstruction` for its whole
+/// body and re-checks residency under it.
+#[test]
+fn a_dormant_repin_and_the_agent_rebuilt_after_it_agree() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_provider = \"mock\"\n",
+        r#"idle_timeout = "1s"
+gc_scan_interval = "1s"
+
+[providers.small]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+context_window = 32000
+"#,
+        mock_turns(2),
+    );
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "provider": "mock",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        create.status(),
+        201,
+        "{}",
+        create.text().unwrap_or_default()
+    );
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // One turn, so there is a conversation to count. `message_count` is the residency signal
+    // below: it is read through the entry's own runtime mutex and is simply absent once the entry
+    // is gone, and `/context` deliberately never revives a session, so polling it cannot keep this
+    // one alive.
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "hello"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+
+    let context_path = format!("/v1/sessions/{}/context", id);
+    let context: serde_json::Value = harness
+        .request(reqwest::Method::GET, &context_path)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        context["message_count"].is_u64(),
+        "the live entry must be readable while the session is resident, or the eviction check \
+         below proves nothing: {context}"
+    );
+
+    // Now let the GC scanner drop it, so the PATCH takes the dormant path rather than the resident
+    // one.
+    let dormant_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let context: serde_json::Value = harness
+            .request(reqwest::Method::GET, &context_path)
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if context["message_count"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < dormant_by,
+            "the session never left the live map; GC is not evicting it"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .json(&serde_json::json!({"provider": "small"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        200,
+        "{}",
+        patched.text().unwrap_or_default()
+    );
+    let patched: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(patched["provider"], "small", "{patched}");
+
+    // The PATCH must have taken the dormant path, not revived the session and used the resident
+    // one. Without this the test could not tell the two apart: the resident path reaches the same
+    // row and the same `set_provider`, so the turn below agrees either way, and the whole dormant
+    // branch could be deleted with this test still green. Verified by prefixing it with
+    // `if false &&`.
+    let after_patch: serde_json::Value = harness
+        .request(reqwest::Method::GET, &context_path)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        after_patch["message_count"].is_null(),
+        "the repin revived the session, so it did not exercise the dormant path: {after_patch}"
+    );
+
+    // Reconstructs the agent from the row. Before the fix this is the request that, arriving a
+    // moment earlier, would have raced the repin and won.
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "hello"}))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
+
+    let context: serde_json::Value = harness
+        .request(reqwest::Method::GET, &context_path)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        context["window"].as_u64(),
+        Some(32_000),
+        "the live agent is gauging against a different profile from the one its row names: \
+         {context}"
+    );
+    let session: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(session["provider"], "small", "{session}");
+}
+
+/// A `PATCH` naming a provider on a session that is still **resident** must move both the row and
+/// the live agent, and a name the server does not have must be refused before either.
+///
+/// Both existing provider tests reach `repin_dormant_session` instead: one patches a freshly
+/// imported session, the other waits for GC to evict it first. So the resident branch had no
+/// coverage, and a mutation sweep showed it -- flipping its no-op filter to `==` writes the row
+/// only when it is *already* correct, which turns every real switch into a silent no-op, and
+/// `require_configured_profile` could return `Ok(())` and let a typo be recorded on the row.
+///
+/// The window is what proves the *agent* moved rather than only the row: it comes off the cell
+/// `set_provider` publishes into, and the two profiles here state different ones.
+#[test]
+fn a_resident_patch_moves_the_agent_and_refuses_an_unconfigured_profile() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_provider = \"mock\"\n",
+        r#"
+[providers.small]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+context_window = 32000
+"#,
+        mock_turns(1),
+    );
+
+    // A name the config does not have, refused and leaving nothing behind.
+    //
+    // Two things make that true and only one of them is `require_configured_profile`: the row is
+    // written *before* the agent is built, so the up-front check is what produces the good message,
+    // and `SessionRollback` is what deletes the orphan when the build fails anyway. Removing the
+    // check leaves both the 422 and the empty listing intact, so this pair is deliberately a
+    // statement of the contract rather than a discriminator -- the rollback guard is the half worth
+    // pinning, because losing *it* strands a session pinned to a profile that resolves to nothing.
+    let bad_create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "provider": "ghost",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        bad_create.status(),
+        422,
+        "an unconfigured profile must be refused: {}",
+        bad_create.text().unwrap_or_default()
+    );
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "a refused create must leave no session behind: {listed}"
+    );
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "provider": "mock",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let context_path = format!("/v1/sessions/{}/context", id);
+
+    // Resident, and never evicted: no GC wait here, which is what makes this the other branch.
+    let before: serde_json::Value = harness
+        .request(reqwest::Method::GET, &context_path)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        before["message_count"].is_u64(),
+        "the session must still be resident for this test to mean anything: {before}"
+    );
+
+    let refused = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .json(&serde_json::json!({"provider": "ghost"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "a resident session must refuse an unconfigured profile too: {}",
+        refused.text().unwrap_or_default()
+    );
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .json(&serde_json::json!({"provider": "small"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        200,
+        "{}",
+        patched.text().unwrap_or_default()
+    );
+    let body: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(body["provider"], "small", "the row must move: {body}");
+
+    let after: serde_json::Value = harness
+        .request(reqwest::Method::GET, &context_path)
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        after["window"], 32000,
+        "the live agent must gauge against the new profile's window, not the old one: {after}"
     );
 }

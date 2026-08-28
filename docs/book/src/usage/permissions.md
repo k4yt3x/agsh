@@ -56,6 +56,12 @@ It likewise does **not** reach a session created through `POST /v1/sessions`: th
 and meka does not report your `--writable-root` back to the client as though the client had asked
 for it.
 
+Because it belongs to the process, it is not recorded on the session either, and resuming a session
+does not bring it back: pass it again. This is the difference between it and the provider profile
+and permission level, which *are* recorded and *do* come back. Writing it to the row would mean a
+`meka serve` sharing the data directory could later grant those roots to a job it fires, on the
+authority of a flag that process was never given.
+
 The same set governs both halves, derived once so they cannot disagree: the file tools check it
 before writing, and the shell sandbox is built from it. A refusal from `write_file` names the roots
 so the agent can retry somewhere valid.

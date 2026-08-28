@@ -22,7 +22,7 @@ use crate::{
         auth::Principal,
         errors::{ErrorKind, ProblemDetail},
         http_frontend::{HttpFrontend, SessionCapabilities},
-        reattach::ensure_session_loaded,
+        reattach::{agent_build_problem, ensure_session_loaded, require_session_exists},
         scope,
         state::{ServerState, SessionEntry, SessionRuntime},
     },
@@ -98,6 +98,10 @@ pub struct CreateSessionRequest {
     /// Permission level the session starts in. Defaults to the server's configured default
     /// from `[permissions].default` (typically `read`). Must be in the enabled set.
     pub permission: Option<String>,
+    /// Provider profile the session runs on, and keeps for the rest of its life unless a later
+    /// PATCH moves it. Defaults to the server's own default profile. Must name a profile in
+    /// `config.toml`; `GET /v1/providers` lists them.
+    pub provider: Option<String>,
     /// Per-session capability flags. See the HTTP API docs § "Capabilities".
     #[serde(default)]
     pub capabilities: CapabilitiesBody,
@@ -162,6 +166,17 @@ pub struct SessionResponse {
     #[schema(value_type = Option<String>)]
     pub cwd: Option<std::path::PathBuf>,
     pub permission: String,
+    /// The provider profile this session runs on.
+    pub provider: String,
+    /// The model this session runs, when it overrides its profile's. Absent means the profile's
+    /// own, so a client reading it back sees the same thing `meka session list --long` prints
+    /// rather than having to infer that `provider` tells the whole story -- which it does not for
+    /// a session created with `--model` or `--base-url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// The endpoint this session runs against, when it overrides its profile's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url_override: Option<String>,
     pub title: String,
     /// Per-session capability flags declared at create time (or re-attach), echoed back so clients
     /// can confirm the settings their session actually ended up with.
@@ -205,6 +220,36 @@ pub struct ListSessionsResponse {
     pub sessions: Vec<SessionResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// Reject a provider profile the server does not have configured, naming the ones it does.
+///
+/// The 422 is what keeps a typo from being recorded on the row: a name that resolves to nothing
+/// would fail every subsequent turn on that session, and the write is what makes it stick.
+fn require_configured_profile(state: &ServerState, name: &str) -> Result<(), ProblemDetail> {
+    if state.shared.config.providers.contains_key(name) {
+        return Ok(());
+    }
+    let configured: Vec<&str> = state
+        .shared
+        .config
+        .providers
+        .keys()
+        .map(String::as_str)
+        .collect();
+    Err(ProblemDetail::new(
+        ErrorKind::InvalidBody,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "provider profile `{}` is not configured; configured profiles: {}",
+            name,
+            if configured.is_empty() {
+                "none".to_string()
+            } else {
+                configured.join(", ")
+            }
+        ),
+    ))
 }
 
 /// Validate a caller-supplied `cwd` path. Rejects:
@@ -343,6 +388,14 @@ pub async fn create_session(
     // Persist `permission` and `capabilities` so a GC-evicted session re-attaches with the
     // same shape the client created it with.
     let capabilities_json = serde_json::to_string(&capabilities).ok();
+    // The profile this session will run with for the rest of its life, unless a PATCH moves it.
+    let profile = match body.provider {
+        Some(name) => {
+            require_configured_profile(&state, &name)?;
+            name
+        }
+        None => state.shared.default_profile.clone(),
+    };
     // Created and locked in one step, the lock taken *before* the row exists. A row committed
     // ahead of its lock is visible to `meka session delete --all`, which enumerates at delete
     // time, takes the lock nobody holds yet, and cascades the session away underneath this
@@ -355,6 +408,7 @@ pub async fn create_session(
             Some(permission.to_string()),
             capabilities_json,
             Some(principal.token_id.clone()),
+            profile.clone(),
         )
         .await
         .map_err(|error| ProblemDetail::internal_sanitized("failed to create session", error))?;
@@ -379,6 +433,7 @@ pub async fn create_session(
     let context_overhead = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (agent, tool_registry) = crate::build_session_agent(
         &state.shared,
+        Some(session_uuid),
         shared_permission.clone(),
         frontend_dyn,
         cwd.clone(),
@@ -386,11 +441,18 @@ pub async fn create_session(
         Arc::new(std::sync::RwLock::new(Vec::new())),
         Arc::clone(&context_used),
         Arc::clone(&context_overhead),
+        // Nothing here holds a window gauge built before the agent, the way the REPL prompt and
+        // ACP's frontend do, so this handle is supplied only to be adopted; the entry reads it
+        // back through `published_binding` below.
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await
-    .map_err(|error| ProblemDetail::internal_sanitized("failed to build session agent", error))?;
+    .map_err(|error| agent_build_problem(session_uuid, "failed to build session agent", error))?;
 
     let background_tasks = agent.background_tasks();
+    // Taken out of the assembled agent rather than rebuilt here, so the entry watches the cell
+    // `set_provider` writes instead of a snapshot something has to remember to refresh.
+    let binding = agent.published_binding();
     let runtime = SessionRuntime {
         session_uuid,
         messages: Conversation::new(),
@@ -402,6 +464,7 @@ pub async fn create_session(
         token_id: Some(principal.token_id.clone()),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         permission: shared_permission,
+        binding,
         cwd: cwd.clone(),
         background_tasks,
         tool_registry,
@@ -445,6 +508,11 @@ pub async fn create_session(
             last_turn_at: None,
             cwd: Some(cwd_path),
             permission: permission.to_string(),
+            provider: profile,
+            // `POST /v1/sessions` names a profile and nothing else, so a session created here
+            // never has one.
+            model_override: None,
+            base_url_override: None,
             title,
             capabilities,
             turn_in_flight: false,
@@ -589,6 +657,21 @@ pub async fn fork_session(
         .as_ref()
         .map(|info| info.preview.clone())
         .unwrap_or_default();
+    // Read back rather than copied off the source entry for the same reason `parent_id` is: the
+    // fork's row is what the next turn on it will resolve, so the response should quote that.
+    let forked_provider = forked_info
+        .as_ref()
+        .map(|info| info.provider.profile.clone())
+        .unwrap_or_default();
+    let forked_overrides = forked_info
+        .as_ref()
+        .map(|info| {
+            (
+                info.provider.model_override.clone(),
+                info.provider.base_url_override.clone(),
+            )
+        })
+        .unwrap_or_default();
 
     Ok((
         StatusCode::CREATED,
@@ -599,6 +682,9 @@ pub async fn fork_session(
             last_turn_at: None,
             cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
+            provider: forked_provider,
+            model_override: forked_overrides.0,
+            base_url_override: forked_overrides.1,
             title,
             capabilities: entry.capabilities,
             turn_in_flight: false,
@@ -686,6 +772,9 @@ pub async fn list_sessions(
                 last_turn_at,
                 cwd: row.cwd,
                 permission,
+                provider: row.provider.profile,
+                model_override: row.provider.model_override,
+                base_url_override: row.provider.base_url_override,
                 title: row.preview,
                 capabilities,
                 turn_in_flight,
@@ -742,6 +831,19 @@ pub async fn get_session(
             .as_ref()
             .map(|info| info.preview.clone())
             .unwrap_or_default();
+        let provider = info
+            .as_ref()
+            .map(|info| info.provider.profile.clone())
+            .unwrap_or_default();
+        let overrides = info
+            .as_ref()
+            .map(|info| {
+                (
+                    info.provider.model_override.clone(),
+                    info.provider.base_url_override.clone(),
+                )
+            })
+            .unwrap_or_default();
         let last_turn_at = entry
             .last_turn_at_wall
             .read()
@@ -754,6 +856,9 @@ pub async fn get_session(
             last_turn_at,
             cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
+            provider,
+            model_override: overrides.0,
+            base_url_override: overrides.1,
             title,
             capabilities: entry.capabilities,
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
@@ -783,11 +888,142 @@ pub async fn get_session(
         last_turn_at: None,
         cwd: summary.cwd,
         permission: summary.permission.unwrap_or_default(),
+        provider: summary.provider.profile,
+        model_override: summary.provider.model_override,
+        base_url_override: summary.provider.base_url_override,
         title: summary.preview,
         capabilities,
         turn_in_flight: false,
         parent_id: summary.parent_id,
     }))
+}
+
+/// Move a session that is not resident onto another provider profile, without building an agent
+/// for it.
+///
+/// The rescue path for a session whose recorded profile is no longer configured. Nothing here needs
+/// the agent: the row is the thing being changed, there is no in-flight turn to conflict with and
+/// no in-memory mirror to update, and the response comes off the row the way `GET` already answers
+/// for an evicted session. The profile is still resolved first, so a body naming one that cannot
+/// produce a provider is refused before the row moves, exactly as on the resident path.
+///
+/// `Ok(None)` means the session became resident after all, and the caller must take the resident
+/// path so the agent moves with the row. Everything below rests on "not resident", and the check
+/// that established it is several awaits behind: resolving a profile can build a provider and load
+/// a credential, and any turn, scheduler fire, compaction or rewind arriving meanwhile rebuilds the
+/// agent from the *old* profile and inserts it. Writing the row then left the session running,
+/// billing and gauging the profile it had left, with `GET /v1/sessions` reporting the new one, for
+/// as long as it stayed resident. Holding the reconstruction lock for the whole body is what makes
+/// the re-check below conclusive rather than another sample.
+///
+/// The reconstruction lock answers for *this* process only, so the session lock is taken too. Every
+/// other writer of `sessions.provider` already holds it -- a CLI resume, `/provider`, ACP's
+/// `session/set_config_option`, and this handler's own resident path, which is resident here and so
+/// holds it through the entry -- which makes "you may move a session's binding only while you own
+/// the session" an invariant rather than a coincidence. Without it, a second `meka serve` on the
+/// same store answered `200` for a session the first one was running: the row moved, `GET
+/// /v1/sessions` on *both* reported the new profile, and the host actually holding the session went
+/// on building requests for the old one until eviction. Reproduced over HTTP against two servers.
+async fn repin_dormant_session(
+    state: &ServerState,
+    id: Uuid,
+    profile: &str,
+) -> Result<Option<Json<SessionResponse>>, ProblemDetail> {
+    let _reconstruction = crate::server::reattach::lock_session_reconstruction(id).await;
+    if state.sessions.read().await.contains_key(&id) {
+        return Ok(None);
+    }
+    require_session_exists(state, id).await?;
+    // `session-locked`, the same code `ensure_session_loaded` answers a cross-process conflict
+    // with, and for the same reason: this is another process owning the session, not an in-process
+    // turn. Held for the rest of the body, so nothing can attach between here and the write.
+    let _session = state
+        .shared
+        .session_manager
+        .lock_session(id)
+        .map_err(|error| {
+            ProblemDetail::new(
+                ErrorKind::SessionLocked,
+                StatusCode::CONFLICT,
+                format!(
+                    "another meka process is running this session, so its provider cannot be \
+                     changed from here; move it where it is running, or stop that process: {}",
+                    error
+                ),
+            )
+            .with("session_id", id.to_string())
+        })?;
+    require_configured_profile(state, profile)?;
+    let resolved = crate::resolved_binding(
+        &state.shared.providers,
+        crate::session::SessionProvider::from(profile.to_string()),
+    )
+    .await
+    // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
+    .map_err(|error| {
+        agent_build_problem(
+            id,
+            &format!("failed to resolve provider profile `{}`", profile),
+            error,
+        )
+    })?;
+
+    let current = state
+        .shared
+        .session_manager
+        .recorded_provider(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to read session provider", error)
+        })?;
+    // Skipped when nothing changes, so a no-op PATCH does not advance `updated_at` that clients
+    // watch for changes. The whole binding, for the reason the resident path gives.
+    if current.as_ref() != Some(&resolved.binding) {
+        state
+            .shared
+            .session_manager
+            .update_session_metadata_atomic(id, None, None, Some(resolved.binding))
+            .await
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized(
+                    "failed to persist session metadata atomically",
+                    error,
+                )
+            })?;
+    }
+
+    // Re-read rather than patching the pre-write copy, so `updated_at` and `provider` are what the
+    // store now holds.
+    let summary = state
+        .shared
+        .session_manager
+        .session_info(id)
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to look up session", error))?
+        .ok_or_else(|| {
+            ProblemDetail::new(
+                ErrorKind::SessionNotFound,
+                StatusCode::NOT_FOUND,
+                format!("session '{}' does not exist", id),
+            )
+            .with("session_id", id.to_string())
+        })?;
+    Ok(Some(Json(SessionResponse {
+        id: summary.id,
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+        last_turn_at: None,
+        cwd: summary.cwd,
+        permission: summary.permission.unwrap_or_default(),
+        provider: summary.provider.profile,
+        model_override: summary.provider.model_override,
+        base_url_override: summary.provider.base_url_override,
+        title: summary.preview,
+        capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
+        // Not resident, and nothing could have made it so while the reconstruction lock was held.
+        turn_in_flight: false,
+        parent_id: summary.parent_id,
+    })))
 }
 
 /// PATCH /v1/sessions/{id}: update mutable session knobs (permission, cwd) on a live session
@@ -830,10 +1066,34 @@ pub async fn patch_session(
         )
     })?;
 
+    // A body that names only a provider is the documented way to move a session whose recorded
+    // profile has left `config.toml`, and reviving it to apply the change is the one thing that
+    // cannot work in that state: `ensure_session_loaded` rebuilds the agent, which resolves the
+    // very profile that is gone, so the rescue was refused by the failure it was meant to
+    // repair. A session already resident falls through to the path below, because
+    // `ensure_session_loaded` returns it without rebuilding and its live agent has to move with
+    // the row.
+    if body.permission.is_none()
+        && body.cwd.is_none()
+        && let Some(name) = body.provider.as_deref()
+        && !state.sessions.read().await.contains_key(&id)
+        && let Some(response) = repin_dormant_session(&state, id, name).await?
+    {
+        return Ok(response);
+    }
+
     let entry = ensure_session_loaded(&state, id).await?;
 
     // Reject PATCH while a turn is in-flight: the agent snapshots cwd/permission at turn
     // start, but tools read them live, creating a split-brain within one iteration.
+    //
+    //
+    // A read and not an `InFlightGuard`, deliberately. That guard means "this session is busy with
+    // turn-like work", and claiming it here would make two concurrent PATCHes conflict when they
+    // should simply serialise -- metadata edits are not turns, and a client that sends two is not
+    // doing anything wrong. The cost is that a turn admitted between this load and the agent swap
+    // below makes that swap wait for it, which is slow rather than wrong: the row has already
+    // moved, and the swap lands correctly afterwards.
     if entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0 {
         return Err(turn_in_flight_conflict(
             id,
@@ -871,6 +1131,38 @@ pub async fn patch_session(
         }
         None => None,
     };
+    // Built before the DB write for the same reason the other two are validated first: a profile
+    // that cannot produce a provider must not reach the row, and building it here means the 422
+    // covers a missing credential as well as a missing profile.
+    let new_provider = match body.provider.as_deref() {
+        Some(name) => {
+            require_configured_profile(&state, name)?;
+            // The profile as configured, with no overrides: a `PATCH` naming a provider is the
+            // client restating the whole binding, so a model override left over from another
+            // profile does not ride along onto one that may not have that model.
+            Some(
+                crate::resolved_binding(
+                    &state.shared.providers,
+                    crate::session::SessionProvider::from(name.to_string()),
+                )
+                .await
+                // Not a blanket 422: `resolved_binding` reaches `provider_credential_version` and
+                // `load_provider_credential`, so a locked or unreadable store arrives here as
+                // `MekaError::Database`, and formatting it into the body answered "your request is
+                // invalid" with an internal message attached. `agent_build_problem` is the
+                // discriminator the rest of this surface already uses -- `Config` verbatim, because
+                // naming the profile is the whole point, everything else sanitised into a 500.
+                .map_err(|error| {
+                    agent_build_problem(
+                        id,
+                        &format!("failed to resolve provider profile `{}`", name),
+                        error,
+                    )
+                })?,
+            )
+        }
+        None => None,
+    };
 
     // Filter out no-op fields so a PATCH that doesn't change anything skips the DB write
     // and doesn't advance `updated_at` (used by clients for change detection).
@@ -878,7 +1170,24 @@ pub async fn patch_session(
         new_permission.filter(|parsed| entry.permission.get() != *parsed);
     let cwd_change: Option<std::path::PathBuf> =
         new_cwd.filter(|path| crate::workspace::cwd_snapshot(&entry.cwd) != *path);
-    let mutated = permission_change.is_some() || cwd_change.is_some();
+    let provider_change = match new_provider {
+        Some(resolved) => {
+            let current = state
+                .shared
+                .session_manager
+                .recorded_provider(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to read session provider", error)
+                })?;
+            // The whole binding, not just the profile name. A `PATCH` naming a provider restates
+            // the binding entire, so one that names the profile the session already runs on is
+            // still how a stale model or endpoint override is cleared.
+            (current.as_ref() != Some(&resolved.binding)).then_some(resolved)
+        }
+        None => None,
+    };
+    let mutated = permission_change.is_some() || cwd_change.is_some() || provider_change.is_some();
     if mutated {
         state
             .shared
@@ -887,6 +1196,9 @@ pub async fn patch_session(
                 id,
                 permission_change.map(|perm| perm.to_string()),
                 cwd_change.clone(),
+                provider_change
+                    .as_ref()
+                    .map(|resolved| resolved.binding.clone()),
             )
             .await
             .map_err(|error| {
@@ -912,6 +1224,15 @@ pub async fn patch_session(
         }
         if let Some(path) = cwd_change {
             *crate::server::poisoned::write(&entry.cwd, "patch_session::cwd") = path;
+        }
+        // The live agent moves last, and only after the row it must agree with. An `await` and not
+        // a `try_lock`: the row has already moved, and a resident session's next turn runs on the
+        // agent rather than re-reading the row, so refusing to swap would leave the two
+        // disagreeing until eviction. See the in-flight note at the top of the handler.
+        if let Some(resolved) = provider_change {
+            // One call, not three. The window and the vision flag the entry reports both come off
+            // the cell `set_provider` publishes into, so moving the agent moves them.
+            entry.runtime.lock().await.agent.set_provider(resolved);
         }
     }
 
@@ -950,6 +1271,16 @@ pub async fn patch_session(
         last_turn_at,
         cwd: Some(cwd_snapshot),
         permission: entry.permission.get().to_string(),
+        provider: info
+            .as_ref()
+            .map(|info| info.provider.profile.clone())
+            .unwrap_or_default(),
+        model_override: info
+            .as_ref()
+            .and_then(|info| info.provider.model_override.clone()),
+        base_url_override: info
+            .as_ref()
+            .and_then(|info| info.provider.base_url_override.clone()),
         title,
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
@@ -968,6 +1299,14 @@ pub struct PatchSessionRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub cwd: Option<std::path::PathBuf>,
+    /// Provider profile to move the session onto. Must name a profile in `config.toml`. Absent →
+    /// keep current.
+    ///
+    /// Switching mid-conversation is allowed and is the client's call. Thinking blocks are tagged
+    /// with the provider that produced them and are not replayed to a different one, so the
+    /// reasoning recorded so far stops being visible to the model from the next turn onward.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// Build the 409 returned when a mutating session operation races an in-flight turn. The
@@ -1102,4 +1441,105 @@ pub async fn delete_session(
         }
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The dormant repin must hold the reconstruction lock and re-check residency under it.
+    ///
+    /// Asserted against the source rather than at runtime, for the same reason
+    /// `session::migrations`' own rules are: the invariant is not reachable from a test. Proving it
+    /// needs a reconstruction to land inside the five awaits this function makes, and nothing over
+    /// HTTP can be timed that precisely; proving it in-process needs a whole `ServerState`, which
+    /// needs a `ResolvedConfig`, which is only constructible by pointing a process-global env var
+    /// at a config file. `tests/serve.rs`'s
+    /// `a_dormant_repin_and_the_agent_rebuilt_after_it_agree` covers what is reachable -- that the
+    /// PATCH takes the dormant path at all, and that the row and the agent rebuilt from it agree
+    /// afterwards -- but not the serialisation, which only shows up under a race it cannot create.
+    ///
+    /// So this is what stands between a future edit and a silent regression. What it defends: the
+    /// function decides what to write on the strength of the session *not* being resident, then
+    /// awaits five times before writing. Without the lock, any turn, scheduler fire, compaction or
+    /// rewind arriving meanwhile rebuilds the agent from the *old* profile; the row then moves and
+    /// the session runs, bills and gauges the profile it had left until it is evicted -- hours, at
+    /// the default idle timeout.
+    #[test]
+    fn the_dormant_repin_serialises_against_reconstruction() {
+        let source = include_str!("sessions.rs");
+        let body = source
+            .split("async fn repin_dormant_session(")
+            .nth(1)
+            .expect("the function this test is about")
+            .split("\n/// ")
+            .next()
+            .expect("splitting always yields a first part");
+        assert!(
+            body.contains("session_info(id)"),
+            "the scanned region no longer covers the function body, so this test proves nothing"
+        );
+        let lock = body.find("lock_session_reconstruction(id)").expect(
+            "the repin must hold the reconstruction lock, or the residency it decided on can \
+                 stop being true while it writes",
+        );
+        let recheck = body
+            .find("state.sessions.read().await.contains_key(&id)")
+            .expect(
+                "and it must re-check residency under that lock, returning `Ok(None)` so the \
+                 caller takes the resident path and the agent moves with the row",
+            );
+        let write = body.find("update_session_metadata_atomic").expect(
+            "the write this whole arrangement exists to protect is no longer in this function",
+        );
+        assert!(
+            lock < recheck && recheck < write,
+            "the lock must be taken first, the residency re-checked under it, and only then the \
+             row written; found lock@{lock} recheck@{recheck} write@{write}"
+        );
+        // The re-check has to *act*, not merely look. Replacing its `return Ok(None)` with a log
+        // line leaves all three positions intact and reinstates the race, which is how this test
+        // read as coverage while proving nothing; verified green with exactly that edit.
+        assert!(
+            body.get(recheck..write)
+                .is_some_and(|arm| arm.contains("return Ok(None)")),
+            "the residency re-check must hand the caller back to the resident path, not just \
+             observe that the session came back"
+        );
+        // Presence is not enough: `let _ = lock_session_reconstruction(id).await` compiles, reads
+        // as a lock, and drops the guard at the end of that very statement, so every await after
+        // it runs unprotected. That one-character edit kept this test green while reinstating the
+        // whole race, which is the only way this file can regress silently.
+        assert!(
+            body.contains("let _reconstruction ="),
+            "the guard must be bound to a name, not `let _ =`, which drops it immediately and \
+             leaves the five awaits below it unserialised"
+        );
+        assert!(
+            !body.contains("drop(_reconstruction"),
+            "and it must live to the end of the function; dropping it early is the same defect as \
+             never binding it"
+        );
+
+        // The reconstruction lock is per process, so it says nothing about a second `meka serve`
+        // on the same store. Reproduced over HTTP before this: server B answered `200` for a
+        // session server A was running, the row moved, and A went on building requests for the old
+        // profile while both servers' `GET /v1/sessions` reported the new one. Every other writer
+        // of `sessions.provider` holds the session lock; this is the one that did not.
+        let session = body
+            .find("lock_session(id)")
+            .expect("the repin must own the session it is repinning, not just the process's map");
+        assert!(
+            session < write,
+            "the session lock must be held before the row moves; found session@{session} \
+             write@{write}"
+        );
+        assert!(
+            body.contains("let _session ="),
+            "and bound to a name: `let _ =` drops the guard at the end of its own statement, which \
+             is the same silent regression as never taking it"
+        );
+        assert!(
+            !body.contains("drop(_session"),
+            "and it must live to the end of the function, for the same reason"
+        );
+    }
 }

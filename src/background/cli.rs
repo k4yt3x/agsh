@@ -138,10 +138,14 @@ mod tests {
     use crate::background::BackgroundTask;
 
     async fn manager_with_session() -> (SessionManager, uuid::Uuid) {
-        let manager = SessionManager::open(Some(std::path::Path::new(":memory:")))
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
+        let session = manager
+            .create_session(None, "test-profile".to_string())
             .await
-            .expect("in-memory db");
-        let session = manager.create_session(None).await.expect("create session");
+            .expect("create session");
         (manager, session)
     }
 

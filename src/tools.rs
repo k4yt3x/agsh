@@ -2555,7 +2555,7 @@ pub(crate) mod tests {
         let registry = test_registry().await;
         registry.enable_background();
         for tool in background::build(
-            SessionManager::open(Some(std::path::Path::new(":memory:")))
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
                 .await
                 .expect("in-memory db"),
             Arc::new(RwLock::new(None)),
@@ -2608,9 +2608,10 @@ pub(crate) mod tests {
         filter: BuiltinToolFilter,
         skills_managed: bool,
     ) -> ToolRegistry {
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("failed to open in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("failed to open in-memory database");
         let shared_session_id = Arc::new(RwLock::new(None));
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
@@ -2662,9 +2663,10 @@ pub(crate) mod tests {
             crate::permission::Permission::Workspace,
             crate::permission::EnabledPermissions::ALL,
         );
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory database");
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             crate::config::WebClientConfig::default(),
@@ -2734,9 +2736,10 @@ pub(crate) mod tests {
             crate::permission::Permission::Workspace,
             crate::permission::EnabledPermissions::ALL,
         );
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory database");
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             crate::config::WebClientConfig::default(),
@@ -3647,9 +3650,10 @@ pub(crate) mod tests {
     /// point of the config switch.
     #[tokio::test]
     async fn test_disabled_stores_register_no_tools() {
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("failed to open in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("failed to open in-memory database");
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let registry = ToolRegistry::build_default(
@@ -3787,9 +3791,10 @@ pub(crate) mod tests {
             crate::permission::Permission::None,
             crate::permission::EnabledPermissions::ALL,
         );
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory database");
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             crate::config::WebClientConfig::default(),
@@ -4240,9 +4245,10 @@ pub(crate) mod tests {
             BuiltinToolFilter::from_config(None, vec!["search_web".to_string()], HashMap::new());
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("failed to open in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("failed to open in-memory database");
         let shared_session_id = Arc::new(RwLock::new(None));
         let registry = ToolRegistry::build_for_subagent(
             crate::config::WebClientConfig::default(),
@@ -4307,9 +4313,10 @@ pub(crate) mod tests {
     ) -> ToolRegistry {
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("failed to open in-memory database");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("failed to open in-memory database");
         ToolRegistry::build_for_subagent(
             crate::config::WebClientConfig::default(),
             crate::permission::SharedPermission::new(

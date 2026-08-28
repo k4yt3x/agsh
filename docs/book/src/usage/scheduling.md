@@ -293,6 +293,11 @@ containing what happened while you were away.
 Pass `isolated: true` and the turn runs in a fresh session instead. Isolated runs are ordinary
 sessions, so `meka session list` and `meka session export` can see them.
 
+An isolated fire runs on the **provider profile of the session that created the job**, not on the
+server's default, and its fresh session records that profile like any other. A job scheduled from a
+session on `work` keeps billing `work` after you point `default_provider` somewhere else, which is
+the same rule the job's permission level and working directory already follow.
+
 The trade is cost against continuity, and neither side is the default answer. Isolation is cheaper
 for anything recurring, because the creating conversation's history is not replayed on every fire,
 and it keeps a job firing every two minutes from filling the conversation you actually talk in with

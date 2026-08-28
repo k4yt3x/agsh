@@ -59,6 +59,7 @@ struct AcpTestHarness {
     #[allow(dead_code)]
     stderr_handle: std::thread::JoinHandle<String>,
     config_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
     next_id: u64,
     window: Duration,
 }
@@ -164,6 +165,7 @@ impl AcpTestHarnessBuilder {
             reader,
             stderr_handle,
             config_dir,
+            data_dir,
             next_id: 0,
             window,
         };
@@ -209,6 +211,12 @@ impl AcpTestHarness {
 
     fn config_dir(&self) -> &Path {
         &self.config_dir
+    }
+
+    /// The store the spawned process is using, for a test that has to act as a *second* writer of a
+    /// row meka reads. See `tests/multiprocess.rs` for the same reasoning at length.
+    fn database(&self) -> std::path::PathBuf {
+        self.data_dir.join("meka.db")
     }
 
     /// Send a JSON-RPC request and return the parsed response. Uses
@@ -5728,4 +5736,316 @@ enabled = ["read", "ask", "unrestricted"]
          {}",
         loaded
     );
+}
+
+/// A turn runs on the profile the session's *row* names, not on whichever one the agent happened
+/// to be assembled with.
+///
+/// ACP used to park a resolved binding on the session entry whenever `session/set_config_option`
+/// could not take the runtime mutex, and only `session/prompt` drained it. So a scheduled fire or a
+/// background-outcome turn ran on the profile the user had left, and billed that account, while the
+/// row, both pickers and the reported window all said otherwise. The park is gone: the row is the
+/// only carrier, and all three turn entry points read it.
+///
+/// The row is moved here by a second connection to the store rather than through
+/// `session/set_config_option`, for the reason `tests/multiprocess.rs` gives at length: what is
+/// being checked is that meka reads a change it did not make itself, which is exactly the position
+/// the out-of-band entry points are in.
+///
+/// `/status` is the observation because it reports the model off `runtime.agent`'s own binding, and
+/// it runs as a turn -- so it goes through the same door a scheduled fire does.
+#[test]
+fn an_acp_turn_follows_the_provider_its_row_names() {
+    let config_toml = r#"
+default_provider = "alpha"
+
+[providers.alpha]
+type = "anthropic-messages"
+model = "model-from-alpha"
+
+[providers.beta]
+type = "anthropic-messages"
+model = "model-from-beta"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, None);
+    let sid = harness.new_session();
+
+    let id = harness.prompt(&sid, "/status");
+    let (updates, _response) = harness.collect_updates(&sid, id);
+    assert!(
+        agent_text(&updates).contains("model-from-alpha"),
+        "the session should start on the default profile; updates: {:?}",
+        updates
+    );
+
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let moved = connection
+        .execute("UPDATE sessions SET provider = 'beta' WHERE id = ?1", [
+            &sid,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+    drop(connection);
+
+    let id = harness.prompt(&sid, "/status");
+    let (updates, _response) = harness.collect_updates(&sid, id);
+    let text = agent_text(&updates);
+    assert!(
+        text.contains("model-from-beta"),
+        "the turn ran on the profile the agent was built with rather than the one its row names; \
+         updates: {:?}",
+        updates
+    );
+    assert!(
+        !text.contains("model-from-alpha"),
+        "and must not still be reporting the old one: {:?}",
+        updates
+    );
+}
+
+/// Every `agent_message_chunk` in `updates`, concatenated.
+fn agent_text(updates: &[serde_json::Value]) -> String {
+    updates
+        .iter()
+        .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|value| value["params"]["update"]["content"]["text"].as_str())
+        .collect()
+}
+
+/// Whether an attachment is admissible follows the session's *row*, not a flag cached when the
+/// session was created.
+///
+/// `docs/book/src/usage/acp.md` promises that a session moved onto a text-only profile refuses
+/// attachments even on a connection whose `initialize` advertised `image`, and nothing defended it:
+/// the entry carried a `vision` boolean that `session/set_config_option` pushed at, so every test
+/// that moved a profile also moved the flag by hand and could not tell the two apart.
+///
+/// The row is moved here by a second connection to the store, exactly as
+/// `an_acp_turn_follows_the_provider_its_row_names` does and for the same reason: what is being
+/// checked is that meka reads a change it did not make in this process.
+#[test]
+fn an_acp_prompt_judges_an_image_against_the_profile_its_row_names() {
+    let config_toml = r#"
+default_provider = "seeing"
+
+[providers.seeing]
+type = "anthropic-messages"
+model = "model-with-eyes"
+vision = true
+
+[providers.blind]
+type = "anthropic-messages"
+model = "model-without-eyes"
+vision = false
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, None);
+    let sid = harness.new_session();
+
+    let image = |sid: &str| {
+        serde_json::json!({
+            "sessionId": sid,
+            "prompt": [{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]
+        })
+    };
+
+    // On `seeing`, the block is admitted: it gets past parsing and fails later, on the empty mock
+    // script, rather than being refused as an unsupported content type.
+    let accepted = harness.request("session/prompt", image(&sid));
+    let rendered = accepted.to_string();
+    assert!(
+        !rendered.contains("vision"),
+        "a vision-enabled profile must admit the block: {accepted}"
+    );
+
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let moved = connection
+        .execute("UPDATE sessions SET provider = 'blind' WHERE id = ?1", [
+            &sid,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+    drop(connection);
+
+    let rejected = harness.request("session/prompt", image(&sid));
+    assert_invalid_params(
+        &rejected,
+        "image block after the row moved to a text-only profile",
+    );
+    assert!(
+        rejected.to_string().contains("vision"),
+        "the refusal must name why: {rejected}"
+    );
+}
+
+/// A scheduled fire is a turn, so it runs on the profile the session's row names -- or it does not
+/// run at all.
+///
+/// This is the entry point the defect was actually about. ACP used to park a resolved binding on
+/// the session entry and only `session/prompt` drained it, so a fire went on billing the account
+/// the user had left. `an_acp_turn_follows_the_provider_its_row_names` covers the prompt path,
+/// which already worked; this covers `run_wakeup`, which did not.
+///
+/// The row is moved to a profile that is not configured, because that is the one difference a
+/// scripted provider cannot hide: the mock stands in for every profile, so a fire on the wrong one
+/// is indistinguishable from a fire on the right one *unless* the right one cannot resolve. With
+/// the fix the job defers and nothing reaches the editor; without it the turn runs on whatever the
+/// agent was assembled with and the reply arrives.
+#[test]
+fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "kind": "tool_use_end", "input": {
+                "prompt": "ACP_DELIVERED_MARKER",
+                "at": "2s"
+            }},
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "scheduled" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        // Only reached if the fire runs on the agent's own profile instead of the row's.
+        [
+            { "kind": "text", "text": "ACP_SCHEDULED_REPLY" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::builder()
+        .config(ACP_SCHEDULE_CONFIG)
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&sid, id);
+
+    // Somebody other than this connection repins the session onto a profile that has since left
+    // `config.toml` -- the state `look_up_profile` refuses by name.
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let moved = connection
+        .execute("UPDATE sessions SET provider = 'retired' WHERE id = ?1", [
+            &sid,
+        ])
+        .expect("repin the session");
+    assert_eq!(moved, 1, "the repin matched no row");
+    drop(connection);
+
+    // Past the 2s due time and several 1s ticks.
+    std::thread::sleep(Duration::from_secs(6));
+    let updates = harness.drain_unsolicited_updates(&sid);
+    let rendered = format!("{:#?}", updates);
+
+    assert!(
+        !rendered.contains("ACP_SCHEDULED_REPLY"),
+        "the fire ran on the profile the agent was assembled with rather than the one its row \
+         names; updates were:\n{}",
+        rendered
+    );
+    assert!(
+        !rendered.contains("ACP_DELIVERED_MARKER"),
+        "and its prompt must not have been pushed either, since no turn should have started; \
+         updates were:\n{}",
+        rendered
+    );
+}
+
+/// `session/set_config_option` is how an ACP client moves a session onto another provider profile,
+/// and until now nothing drove it at all.
+///
+/// A mutation sweep replaced the whole handler with `Ok(())`, emptied `build_config_options`,
+/// deleted the `!` from its configured-profile check and flipped the `!=` that decides whether the
+/// row is written, and the suite stayed green through every one. The row is what the next turn
+/// resolves against, so a switch that does not reach it is a switch that did not happen; this
+/// asserts the row by reading the value back out of `configOptions`, which
+/// `build_config_options` sources from the row rather than from the live agent.
+#[test]
+fn acp_set_config_option_moves_the_session_onto_another_profile() {
+    const CONFIG: &str = r#"
+default_provider = "mock"
+
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[providers.other]
+type = "openai-responses"
+model = "gpt-5.6-sol"
+
+[permissions]
+default = "read"
+enabled = ["read", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::spawn(CONFIG, None);
+    let cwd = harness.config_dir.clone();
+    let created = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let sid = created["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // The pickers are advertised at creation, so a client has something to render before the first
+    // prompt.
+    let provider_option = |response: &serde_json::Value| -> serde_json::Value {
+        response["result"]["configOptions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no configOptions: {}", response))
+            .iter()
+            .find(|option| option["id"] == "provider")
+            .unwrap_or_else(|| panic!("no provider option: {}", response))
+            .clone()
+    };
+    let created_option = provider_option(&created);
+    assert_eq!(
+        created_option["currentValue"], "mock",
+        "a new session starts on the host default: {created_option}"
+    );
+    let offered: Vec<String> = created_option["options"]
+        .as_array()
+        .expect("select options")
+        .iter()
+        .map(|option| option["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(offered, vec!["mock".to_string(), "other".to_string()]);
+
+    // The switch itself. `currentValue` comes back off the row, so this fails if the row was not
+    // written -- which is exactly what flipping the no-op filter to `==` produces.
+    let switched = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "other" }),
+    );
+    assert_eq!(
+        provider_option(&switched)["currentValue"],
+        "other",
+        "the row must name the new profile: {switched}"
+    );
+
+    // And a name the config does not have is refused rather than recorded, because a row naming
+    // nothing would fail every later turn on this session.
+    let refused = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "ghost" }),
+    );
+    assert!(
+        refused["error"].is_object(),
+        "an unconfigured profile must be refused: {refused}"
+    );
+    // Against the whole error object: ACP puts the detail in `data`, and `message` is the generic
+    // JSON-RPC "Invalid params".
+    let detail = refused["error"].to_string();
+    assert!(
+        detail.contains("not configured"),
+        "the refusal should name the problem and list the configured profiles: {detail}"
+    );
+
+    // The refusal must not have moved the row on its way out.
+    let after = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "other" }),
+    );
+    assert_eq!(provider_option(&after)["currentValue"], "other");
 }

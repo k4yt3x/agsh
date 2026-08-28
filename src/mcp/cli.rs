@@ -1859,10 +1859,13 @@ mod tests {
     }
 
     async fn memory_token_store() -> TokenStore {
-        crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("memory store")
-            .token_store()
+        crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store")
+        .token_store()
     }
 
     /// OAuth bundles are keyed by server name and nothing prunes them, so a hand-deleted

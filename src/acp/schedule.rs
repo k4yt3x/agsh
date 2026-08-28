@@ -102,29 +102,12 @@ pub(super) fn spawn_background_poller(
                         continue;
                     }
                 };
-                let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-                if let Err(error) = state
-                    .shared
-                    .session_manager
-                    .background_store()
-                    .mark_background_tasks_delivered(&ids)
-                    .await
-                {
-                    tracing::warn!(
-                        "failed to stamp background outcomes as delivered: {}",
-                        error
-                    );
-                    continue;
-                }
                 // Supervised for the reason the `meka serve` twin documents at
                 // src/server/schedule.rs:175: this runs a whole agent turn, so anything in the
                 // tool loop can panic, and nothing joins this handle -- losing it would strand
                 // the batch that was just stamped `delivered` and every outcome after it, with no
                 // error anywhere. This is the sibling that did not get the guard.
-                let sweep = std::panic::AssertUnwindSafe(deliver_outcomes(
-                    &entry,
-                    crate::background::render_outcomes(&ready),
-                ));
+                let sweep = std::panic::AssertUnwindSafe(deliver_outcomes(&state, &entry, &ready));
                 if let Err(panic) = futures::FutureExt::catch_unwind(sweep).await {
                     tracing::error!(
                         "background outcome delivery panicked ({}); continuing",
@@ -139,13 +122,59 @@ pub(super) fn spawn_background_poller(
 /// Run one outcome report inside an open session, mirroring `run_wakeup`'s ordering: take the lock
 /// first, then show the prompt, so the transcript reads trigger-then-reply and the report never
 /// lands in the middle of a turn the user typed.
-async fn deliver_outcomes(entry: &super::SessionEntry, prompt: String) {
+///
+/// Stamps the batch `delivered` itself, and only once the turn is certain to run on the right
+/// profile. Stamping in the caller instead meant a binding failure discarded outcomes the user was
+/// waiting on: `list_undelivered_background_tasks` filters on `delivered_at IS NULL`, so there is
+/// no re-delivery path, and the failure is not always permanent -- `recorded_provider` and
+/// `credential_for` are both database reads that can come back `SQLITE_BUSY` when another meka
+/// process is mid-write. Stamped here, that tick drops the batch and the next one picks it up.
+///
+/// Still stamped *before* the turn, which is the deliberate part and unchanged: an outcome that
+/// reliably wedges the process must not be redelivered on every restart.
+async fn deliver_outcomes(
+    state: &Arc<super::ServerState>,
+    entry: &super::SessionEntry,
+    ready: &[crate::background::BackgroundTask],
+) {
     // A turn is activity whoever started it. Without this the idle sweep sees a session whose only
     // traffic is out-of-band as untouched since the user last typed, and evicts it after 24h --
     // taking its schedule out of scope permanently, since `run_due` skips jobs whose session is not
     // in the live map. `meka serve` stamps on this same path (src/server/schedule.rs:525).
     entry.touch();
     let mut runtime = entry.runtime.lock().await;
+
+    // This turn is a turn like any other, so it runs on the profile the row names -- not on
+    // whichever one the agent happened to be assembled with. Returned before the batch is stamped,
+    // so the outcomes survive to the next tick instead of being destroyed by a failure that may be
+    // a transient `SQLITE_BUSY`.
+    if let Err(error) = super::apply_recorded_binding(state, &mut runtime).await {
+        tracing::warn!(
+            "holding a background outcome report for session {}: its recorded provider could not \
+             be resolved, and running the turn on another profile would bill the wrong account. It \
+             is retried on the next sweep: {}",
+            runtime.session_uuid,
+            error
+        );
+        return;
+    }
+
+    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+    if let Err(error) = state
+        .shared
+        .session_manager
+        .background_store()
+        .mark_background_tasks_delivered(&ids)
+        .await
+    {
+        tracing::warn!(
+            "failed to stamp background outcomes as delivered: {}",
+            error
+        );
+        return;
+    }
+
+    let prompt = crate::background::render_outcomes(ready);
     entry.frontend.push_out_of_band_prompt(&prompt);
 
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -210,6 +239,31 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
     // lock came free.
     let mut runtime = entry.runtime.lock().await;
 
+    // The row names the profile this session runs on, and a fire is a turn on that session. Without
+    // this the job ran on whichever profile the agent was assembled with: a switch made through
+    // `session/set_config_option` while a turn was in flight reached `session/prompt` and nothing
+    // else, so the scheduler kept billing the account the user had left.
+    //
+    // `Unrunnable`, which is neither of the other two on purpose. `Deferred` means "another host
+    // should take this" and releases the lease, putting `next_fire_at` back in the past so the
+    // occurrence is due on the very next sweep: right for the closed-session arm above, wrong here,
+    // because ACP is the only host for its own session and `prepare` evaluates the *gate* before
+    // offering the wakeup, so a job gated on a shell command would re-run that probe every
+    // `poll_interval`. `Ran` is worse: it spends the occurrence, which for a one-shot deletes the
+    // row, so a `SQLITE_BUSY` from another meka process mid-write would lose the job outright.
+    // Leaving the claim to expire retries at `claim_lease` cadence, which a blip survives and a
+    // real misconfiguration does not.
+    if let Err(error) = super::apply_recorded_binding(&state, &mut runtime).await {
+        tracing::warn!(
+            "job {} did not run: its session's recorded provider could not be resolved, and \
+             running the turn on another profile would bill the wrong account. Fix the profile, or \
+             move the session with `meka -r <id> --provider <name>`: {}",
+            job_id,
+            error
+        );
+        return FireOutcome::Unrunnable;
+    }
+
     // Now that the session is ours, the transcript reads in order: the trigger, then the reply.
     entry.frontend.push_scheduled_prompt(&wakeup);
 
@@ -250,4 +304,61 @@ pub(super) fn out_of_band_prompt_update(prompt: &str) -> SessionUpdate {
     SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
         prompt.to_string(),
     ))))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The binding check must come *before* the batch is stamped `delivered`.
+    ///
+    /// Asserted against the source, and honestly weaker than a behavioural test: nothing in the
+    /// suite drives ACP background-outcome delivery at all, which a mutation sweep confirmed by
+    /// replacing `deliver_outcomes` with `()` and staying green. Until that coverage exists this is
+    /// what stands between a future edit and a silent regression, so it checks *order* rather than
+    /// mere presence -- the same lesson `the_dormant_repin_serialises_against_reconstruction`
+    /// learned when a one-character edit defeated a contains-only assertion.
+    ///
+    /// What it defends: `list_undelivered_background_tasks` filters on `delivered_at IS NULL`, so a
+    /// stamped batch has no re-delivery path. Stamping first meant a provider lookup that came back
+    /// `SQLITE_BUSY` -- an ordinary occurrence with a second meka process on the store -- destroyed
+    /// a report the user was waiting on, with one `warn!` and nothing else.
+    #[test]
+    fn a_background_outcome_is_stamped_only_once_its_turn_can_run() {
+        let source = include_str!("schedule.rs");
+        let body = source
+            .split("async fn deliver_outcomes(")
+            .nth(1)
+            .expect("the function this test is about")
+            .split("\n/// ")
+            .next()
+            .expect("splitting always yields a first part");
+
+        let binding = body
+            .find("apply_recorded_binding")
+            .expect("the turn must run on the profile the row names");
+        let stamp = body
+            .find("mark_background_tasks_delivered")
+            .expect("the batch is stamped here, or this test is watching the wrong function");
+        let turn = body
+            .find("run_turn")
+            .expect("the turn this whole ordering is about is no longer in this function");
+        assert!(
+            binding < stamp,
+            "the binding must be resolved before the batch is stamped, so a failure leaves the \
+             outcomes for the next sweep instead of destroying them; found binding@{binding} \
+             stamp@{stamp}"
+        );
+        // Order alone is not the invariant, and asserting only order made this test blind: deleting
+        // the `return;` leaves the sequence intact while the failure falls through to stamp the
+        // batch and run the turn on the wrong profile. Verified green with that one line removed.
+        let arm = body.get(binding..stamp).expect("ordered above");
+        assert!(
+            arm.contains("return;"),
+            "a binding failure must return before the stamp, not merely be logged before it"
+        );
+        assert!(
+            stamp < turn,
+            "but the stamp must still precede the turn: an outcome that reliably wedges the \
+             process must not be redelivered on every restart; found stamp@{stamp} turn@{turn}"
+        );
+    }
 }

@@ -16,7 +16,7 @@ use crate::{
     conversation::Conversation,
     error::{MekaError, Result},
     permission::{EnabledPermissions, Permission, SharedPermission},
-    provider::{Provider, ToolDefinition},
+    provider::ToolDefinition,
     session::SessionManager,
 };
 
@@ -29,6 +29,14 @@ const SUBAGENT_ABSOLUTE_MAX_DEPTH: usize = 16;
 /// Parameters needed to build a fresh ToolRegistry for sub-agents.
 #[derive(Clone)]
 pub struct ToolBuilderParams {
+    /// What the parent runs on *now*. Ambient like every other field here, and inherited rather
+    /// than chosen: a sub-agent continues the parent's work on the parent's account.
+    ///
+    /// A live handle rather than the binding itself, because these tools are registered once when
+    /// the session is assembled and the parent may move afterwards. A copy taken at registration
+    /// sent every worker spawned after a `/provider` switch to the profile the user had just left,
+    /// billing that account, while the worker's own row recorded the new one.
+    pub live_binding: crate::agent::PublishedBinding,
     pub web_client: crate::config::WebClientConfig,
     pub sandbox_enabled: bool,
     pub sandbox_capability: crate::sandbox::SandboxCapability,
@@ -225,7 +233,6 @@ impl SubagentSpec {
 }
 
 pub struct AgentSpawnTool {
-    pub provider: Arc<dyn Provider>,
     pub parent_permission: SharedPermission,
     pub tool_builder_params: ToolBuilderParams,
     /// Everything a sub-agent spawned by *this* tool is denied. Seeded from `[subagents]` at the
@@ -663,7 +670,6 @@ impl Tool for AgentSpawnTool {
         // follow up on, and deleting that would discard work.
         let sub_agent = match build_subagent(
             &self.tool_builder_params,
-            &self.provider,
             &spec,
             // The parent's live handle. `resolve_subagent_permission` has already clamped the
             // spec against it, so this re-derives the same starting level -- but it also stays
@@ -751,7 +757,6 @@ impl Tool for AgentSpawnTool {
 /// (seeded from config) and a nested level (derived from the parent's).
 pub fn register_subagent_tools(registry: &ToolRegistry, spawn: AgentSpawnTool) -> Result<()> {
     let params = spawn.tool_builder_params.clone();
-    let provider = Arc::clone(&spawn.provider);
     // The permission of the agent this registry belongs to. `AgentSpawnTool` clamps new workers
     // against it; `AgentFollowupTool` clamps rehydrated ones against it too.
     let spawn_permission = spawn.parent_permission.clone();
@@ -771,7 +776,6 @@ pub fn register_subagent_tools(registry: &ToolRegistry, spawn: AgentSpawnTool) -
     tools.push((
         "agent_followup",
         Arc::new(AgentFollowupTool {
-            provider,
             parent_permission: spawn_permission,
             tool_builder_params: params.clone(),
             in_flight,
@@ -957,7 +961,6 @@ impl Tool for AgentListTool {
 
 /// Asks a sub-agent another question, on top of everything it already did.
 pub struct AgentFollowupTool {
-    pub provider: Arc<dyn Provider>,
     /// The level of the agent holding this tool, read live at each call. A worker never runs above
     /// it, so switching the session down to `read` reaches workers spawned while it was at
     /// `unrestricted`.
@@ -1162,7 +1165,6 @@ impl Tool for AgentFollowupTool {
 
         let sub_agent = build_subagent(
             &self.tool_builder_params,
-            &self.provider,
             &spec,
             &self.parent_permission,
             parent_sid,
@@ -1330,7 +1332,6 @@ impl Tool for AgentDeleteTool {
 #[allow(clippy::too_many_arguments)]
 async fn build_subagent(
     params: &ToolBuilderParams,
-    provider: &Arc<dyn Provider>,
     spec: &SubagentSpec,
     // The parent's live handle, not a snapshot of its level. Taking a `Permission` here is what
     // let a worker outlive its parent's downgrade: the value was read once and frozen into a fresh
@@ -1341,6 +1342,15 @@ async fn build_subagent(
     sub_cwd: crate::workspace::SharedCwd,
     tool_name: &'static str,
 ) -> Result<Agent> {
+    // Read at spawn time, not at registration: the parent may have switched profile since this
+    // tool was registered, and a worker runs on what its parent runs on *now*.
+    let parent_binding = params.live_binding.current();
+    // A worker's window comes off `parent_binding` inside `Agent::new_subagent`, not from
+    // `params.parent_options`, which was cloned when the session was assembled and cannot hear
+    // about a switch. Taking the provider from one and the window from the other is how a worker
+    // came to talk to a 32k profile while auto-compacting at 80% of the 1M one the session had
+    // left: it never compacted, and the provider refused its turn instead.
+    let parent_options = params.parent_options.clone();
     let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
     let effective_permission = spec.effective_permission(parent_permission.get());
     let denials = spec.denials();
@@ -1414,6 +1424,9 @@ async fn build_subagent(
         spec.remaining_depth >= 1 && spec.absolute_depth < SUBAGENT_ABSOLUTE_MAX_DEPTH;
     if allow_nested_spawn {
         let child_params = ToolBuilderParams {
+            // The *parent's* handle, not a snapshot of what it currently holds: a switch the user
+            // makes later must reach the whole subtree's future spawns, not just its first level.
+            live_binding: params.live_binding.clone(),
             parent_shared_session_id: sub_shared_session_id.clone(),
             parent_cwd: Arc::clone(&sub_cwd),
             parent_roots: Arc::clone(&params.parent_roots),
@@ -1427,12 +1440,11 @@ async fn build_subagent(
             // grandchild something it was not given itself.
             parent_options: AgentOptions {
                 user_instructions: granted_instructions.clone(),
-                ..params.parent_options.clone()
+                ..parent_options.clone()
             },
             ..params.clone()
         };
         register_subagent_tools(&sub_registry, AgentSpawnTool {
-            provider: Arc::clone(provider),
             // The worker's own (already clamped) permission is the ceiling for anything it spawns,
             // so a downgrade the parent made reaches the whole subtree.
             parent_permission: sub_shared_perm.clone(),
@@ -1480,11 +1492,11 @@ async fn build_subagent(
         ));
 
     Ok(Agent::new_subagent(
-        Arc::clone(provider),
+        parent_binding,
         sub_registry,
         params.session_manager.clone(),
         sub_shared_perm,
-        &params.parent_options,
+        &parent_options,
         sub_system_prompt,
         sub_todo_list,
         sub_shared_session_id,
@@ -1781,6 +1793,7 @@ fn build_subagent_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Provider;
 
     #[test]
     fn test_subagent_system_prompt_reflects_inherited_permission() {
@@ -2143,7 +2156,7 @@ mod tests {
     }
 
     async fn test_session_manager() -> SessionManager {
-        SessionManager::open(Some(std::path::Path::new(":memory:")))
+        SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
             .await
             .expect("in-memory session manager")
     }
@@ -2218,6 +2231,51 @@ mod tests {
             remaining_depth: 2,
             absolute_depth: 1,
         }
+    }
+
+    /// The window has to come off the same live binding as the provider.
+    ///
+    /// `build_subagent` reads the provider from `live_binding.current()` but used to take the
+    /// window from `parent_options`, a clone frozen when the session was assembled. After a
+    /// `/provider`, `PATCH` or `set_config_option` switch the two disagreed, and a worker talked to
+    /// the new profile while auto-compacting against the size of the one the session had left: on
+    /// the way down it never compacted and the provider refused its turn, on the way up it
+    /// compacted from the first round.
+    ///
+    /// `parent_options` no longer carries a window at all, so the two can no longer be taken from
+    /// different places. This stays as the behavioural check that the worker gauges against what
+    /// `binding_on` published (200_000) rather than any default.
+    #[tokio::test]
+    async fn a_worker_gauges_against_the_window_its_parent_runs_on_now() {
+        let session_manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory store");
+        let parent_session = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create parent");
+        let params = test_params(
+            session_manager.clone(),
+            Arc::new(RwLock::new(Some(parent_session))),
+        );
+        let worker = build_subagent(
+            &params,
+            &test_spec(Permission::Read),
+            &SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            parent_session,
+            Uuid::new_v4(),
+            crate::workspace::test_cwd(),
+            "agent_spawn",
+        )
+        .await
+        .expect("build the worker");
+
+        assert_eq!(
+            worker.context_usage().1,
+            200_000,
+            "the worker must gauge against the profile its parent runs on now"
+        );
     }
 
     #[test]
@@ -2381,6 +2439,32 @@ mod tests {
         ]
     }
 
+    /// A published binding wrapping one provider, for a test that does not care about the profile.
+    fn test_binding() -> crate::agent::PublishedBinding {
+        binding_on(Arc::new(crate::provider::mock::MockProvider::from_rounds(
+            Vec::new(),
+        )))
+    }
+
+    fn binding_on(provider: Arc<dyn Provider>) -> crate::agent::PublishedBinding {
+        crate::agent::PublishedBinding::detached(&crate::agent::ResolvedBinding {
+            provider,
+            binding: crate::session::SessionProvider::from("test-profile".to_string()),
+            context_window: 200_000,
+            vision: true,
+        })
+    }
+
+    impl ToolBuilderParams {
+        /// Point these params at one provider, the way `assemble_agent` points the real ones at the
+        /// session's. A method rather than a field write so a test reads as "the parent is running
+        /// on this", which is what `live_binding` means.
+        fn on_provider(mut self, provider: Arc<dyn Provider>) -> Self {
+            self.live_binding = binding_on(provider);
+            self
+        }
+    }
+
     /// A parent agent's `ToolBuilderParams` pointing at `session_manager`, with `parent_permission`
     /// as the ceiling and no MCP manager attached.
     fn test_params(
@@ -2388,6 +2472,7 @@ mod tests {
         parent_session: Arc<RwLock<Option<Uuid>>>,
     ) -> ToolBuilderParams {
         ToolBuilderParams {
+            live_binding: test_binding(),
             web_client: crate::config::WebClientConfig::default(),
             sandbox_enabled: false,
             sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
@@ -2412,7 +2497,6 @@ mod tests {
                 context_messages: None,
                 auto_compact: false,
                 compact_checkpoint: false,
-                context_window: 0,
                 user_instructions: Some("never inherited by a worker".to_string()),
                 mcp_grace: std::time::Duration::ZERO,
                 system_prompt_override: None,
@@ -2430,7 +2514,7 @@ mod tests {
     async fn test_spawn_followup_and_delete_round_trip() {
         let session_manager = test_session_manager().await;
         let parent_sid = session_manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("parent session");
         let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
@@ -2442,12 +2526,11 @@ mod tests {
         let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
 
         let spawn = AgentSpawnTool {
-            provider: Arc::clone(&provider),
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params.clone(),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
@@ -2492,12 +2575,11 @@ mod tests {
         assert!(listed.contains(&agent_id.to_string()), "{listed}");
 
         let followup = AgentFollowupTool {
-            provider: Arc::clone(&provider),
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params.clone(),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let second = super::super::tests::text_content(
@@ -2566,7 +2648,10 @@ mod tests {
     #[tokio::test]
     async fn a_followup_is_refused_while_something_else_holds_the_worker() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
         let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
         // Never reached: the refusal happens before any turn runs, which is the point.
@@ -2601,12 +2686,11 @@ mod tests {
         let _held = held.expect("the spawn's own claim");
 
         let followup = AgentFollowupTool {
-            provider: Arc::clone(&provider),
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params.clone(),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let refused = followup
@@ -2630,7 +2714,10 @@ mod tests {
     #[tokio::test]
     async fn test_followup_drops_a_worker_when_the_session_is_restricted() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
         // A path unique to this run: a shared one would leave a file behind on the failing case and
         // make the *next* run fail for the wrong reason.
@@ -2686,9 +2773,8 @@ mod tests {
             EnabledPermissions::from_modes([Permission::Read]).expect("set"),
         );
         let followup = AgentFollowupTool {
-            provider,
             parent_permission: restricted,
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         followup
@@ -2730,7 +2816,10 @@ mod tests {
     #[tokio::test]
     async fn test_followup_applies_denials_config_gained_since_the_spawn() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("ok"),
@@ -2765,9 +2854,8 @@ mod tests {
             .0;
 
         let followup = AgentFollowupTool {
-            provider,
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         followup
@@ -2852,11 +2940,10 @@ mod tests {
     ) -> Result<SubagentSpec> {
         let session_manager = params.session_manager.clone();
         let spawn = AgentSpawnTool {
-            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("done"),
-            ])),
             parent_permission: SharedPermission::new(parent_permission, EnabledPermissions::ALL),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(vec![text_round("done")]),
+            )),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
@@ -2882,7 +2969,10 @@ mod tests {
     #[tokio::test]
     async fn test_grants_default_to_nothing() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
 
         let spec = spawn_and_read_spec(
@@ -2901,7 +2991,10 @@ mod tests {
     #[tokio::test]
     async fn test_grants_are_recorded_when_asked_for() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
 
         let spec = spawn_and_read_spec(
@@ -2921,7 +3014,10 @@ mod tests {
     #[tokio::test]
     async fn test_memory_write_is_refused_not_clamped() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
@@ -2952,7 +3048,10 @@ mod tests {
     #[tokio::test]
     async fn test_a_worker_cannot_grant_more_than_it_holds() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let mut params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
         // Stand in for a worker that was itself granted nothing: no memory, and no copy of the
         // instructions to pass on. This is exactly what `build_subagent` hands a nested
@@ -2990,7 +3089,10 @@ mod tests {
         use crate::provider::mock::{MockEvent, MockStopReason};
 
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
@@ -3021,12 +3123,11 @@ mod tests {
             ]));
 
         let spawn = AgentSpawnTool {
-            provider,
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(provider),
             inherited_denials: ToolDenials::default(),
             // Deep enough that the worker gets its own `agent_spawn`.
             remaining_depth: 2,
@@ -3083,21 +3184,25 @@ mod tests {
     #[tokio::test]
     async fn test_a_redirected_report_carries_no_agent_header() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
         );
         let spawn = AgentSpawnTool {
-            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("the findings"),
-                text_round("the findings"),
-            ])),
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(vec![
+                    text_round("the findings"),
+                    text_round("the findings"),
+                ]),
+            )),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
@@ -3288,18 +3393,22 @@ mod tests {
     #[tokio::test]
     async fn test_denying_agent_spawn_takes_the_lifecycle_tools_with_it() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
         );
         let spawn = |params: ToolBuilderParams| AgentSpawnTool {
-            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new())),
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(Vec::new()),
+            )),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
@@ -3342,7 +3451,10 @@ mod tests {
     #[tokio::test]
     async fn test_delete_is_refused_while_a_followup_holds_the_worker() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = session_manager
             .create_child_session(
                 parent_sid,
@@ -3405,7 +3517,10 @@ mod tests {
         };
 
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = session_manager
             .create_child_session(
                 parent_sid,
@@ -3502,7 +3617,10 @@ mod tests {
         );
 
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let mut params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
@@ -3510,11 +3628,10 @@ mod tests {
         params.skills = skills;
 
         let spawn = AgentSpawnTool {
-            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("never runs"),
-            ])),
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(vec![text_round("never runs")]),
+            )),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 0,
             absolute_depth: 0,
@@ -3571,7 +3688,10 @@ mod tests {
         }
 
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let mut params = test_params(
             session_manager.clone(),
             Arc::new(RwLock::new(Some(parent_sid))),
@@ -3579,11 +3699,10 @@ mod tests {
         params.skills = crate::skills::SkillCache::for_root(Some(root));
 
         let spawn = AgentSpawnTool {
-            provider: Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("never runs"),
-            ])),
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
-            tool_builder_params: params,
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(vec![text_round("never runs")]),
+            )),
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
@@ -3621,9 +3740,12 @@ mod tests {
     #[tokio::test]
     async fn test_followup_and_delete_refuse_a_session_that_is_not_the_parent() {
         let session_manager = test_session_manager().await;
-        let owner = session_manager.create_session(None).await.expect("owner");
+        let owner = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("owner");
         let stranger = session_manager
-            .create_session(None)
+            .create_session(None, "test-profile".to_string())
             .await
             .expect("stranger");
         let child = session_manager
@@ -3642,12 +3764,11 @@ mod tests {
         );
 
         let followup = AgentFollowupTool {
-            provider,
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: params.clone(),
+            tool_builder_params: params.clone().on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let error = followup
@@ -3689,7 +3810,10 @@ mod tests {
     #[tokio::test]
     async fn test_followup_refuses_a_worker_with_no_recorded_spec() {
         let session_manager = test_session_manager().await;
-        let parent_sid = session_manager.create_session(None).await.expect("parent");
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
         let child = session_manager
             .create_child_session(parent_sid, None, None)
             .await
@@ -3701,7 +3825,6 @@ mod tests {
                 text_round("should never run"),
             ]));
         let followup = AgentFollowupTool {
-            provider,
             parent_permission: SharedPermission::new(
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
@@ -3709,7 +3832,8 @@ mod tests {
             tool_builder_params: test_params(
                 session_manager,
                 Arc::new(RwLock::new(Some(parent_sid))),
-            ),
+            )
+            .on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let error = followup

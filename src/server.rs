@@ -41,38 +41,6 @@ use crate::{
     session::SessionManager,
 };
 
-/// Resolve the provider credential for `meka serve` from the active profile's database entry.
-///
-/// Debug-only: when the integration harness sets `MEKA_MOCK_PROVIDER=1`, `run_serve` swaps in a
-/// scripted provider and discards the real one built from this credential, so a placeholder is
-/// returned and the harness needn't seed a credential into the database.
-async fn resolve_serve_credential(
-    config: &ResolvedConfig,
-    session_manager: &SessionManager,
-) -> anyhow::Result<crate::provider::AuthCredential> {
-    #[cfg(debug_assertions)]
-    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        return Ok(crate::provider::AuthCredential::ApiKey(
-            "mock-provider".to_string(),
-        ));
-    }
-
-    match config.active_profile.as_deref() {
-        Some(profile) => session_manager
-            .token_store()
-            .load_provider_credential(profile)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "provider profile '{}' has no stored credential; run `meka provider login {}`",
-                    profile,
-                    profile
-                )
-            }),
-        None => anyhow::bail!("meka serve requires a configured provider; run `meka provider add`"),
-    }
-}
-
 /// Run meka as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
 /// graceful-shutdown drain completes). The signature mirrors [`crate::acp::run_acp`] for
 /// consistency with the existing dispatch in `main::async_main`.
@@ -105,34 +73,20 @@ pub async fn run_serve(
     let max_body_bytes = serve.max_body_bytes;
     let bind_addr = serve.bind.clone();
 
-    let credential = resolve_serve_credential(&config, &session_manager).await?;
-
     let shared = Arc::new(
-        crate::build_shared_deps(
-            config,
-            session_manager,
-            credential,
-            mcp_manager,
-            mcp_context,
-        )
-        .await?,
+        crate::build_shared_deps(config, session_manager, mcp_manager, mcp_context).await?,
     );
 
     #[cfg(debug_assertions)]
-    let shared = if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         let rounds = crate::provider::mock::load_script_from_env()
             .map_err(|error| anyhow::anyhow!("load mock provider script: {}", error))?
             .unwrap_or_default();
-        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds));
-        let new_inner = crate::SharedDeps {
-            provider: mock,
-            ..(*shared).clone()
-        };
+        shared.providers.install_scripted(Arc::new(
+            crate::provider::mock::MockProvider::from_rounds(rounds),
+        ));
         tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
-        Arc::new(new_inner)
-    } else {
-        shared
-    };
+    }
 
     if !serve.webhooks.is_empty() {
         // Named at startup because an outbound request is the one thing meka does that leaves the

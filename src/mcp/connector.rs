@@ -115,14 +115,11 @@ pub(super) async fn run_connector(
 /// `initial_backoff` is a parameter rather than a direct read of [`INITIAL_RETRY_BACKOFF`] so tests
 /// can drive the loop in milliseconds; the sole production call site passes the constant.
 ///
-/// This goes through [`connect_one`] rather than [`ServerEntry::reconnect`] because the two do
-/// different work: `reconnect` only swaps the transport, which is all a *previously connected*
-/// server needs since its tool adapters already exist and resolve the live peer through
-/// `require_connected` at dispatch time. An entry that failed its initial connect never got as far
-/// as `discover_and_register_tools`, so healing it with `reconnect` would leave a server that
-/// reports `connected` and exposes no tools.
+/// This goes through [`connect_one`] rather than [`ServerEntry::reconnect`], which does nothing for
+/// an entry that is not `Connected`: it exists to reopen a transport that has closed under a state
+/// still claiming otherwise, and a cold-start failure has no transport to reopen.
 ///
-/// `connect_one` re-registers tools through `McpClientManager::update_server_tools`, which fans out
+/// `connect_one` registers tools through `McpClientManager::register_server_tools`, which fans out
 /// to every attached per-session registry, so sessions created while the server was down pick up
 /// its tools when it recovers.
 ///
@@ -288,21 +285,14 @@ pub(crate) async fn connect_one(
 
     tracing::info!("connected to MCP server '{}'", server_name);
 
-    // Capture InitializeResult.instructions on the first Connected transition. Immutable per MCP
-    // spec so reconnects don't overwrite.
     // rmcp 2.1: `peer_info()` returns `Option<Arc<InitializeResult>>` (owned) rather than a borrow,
-    // so clone the instructions string out of the `Arc` before truncating.
-    let captured = connected
-        .peer()
-        .peer_info()
-        .and_then(|info| info.instructions.clone())
-        .map(|raw| {
-            crate::mcp::truncate(
-                &crate::mcp::sanitize::sanitize_text(&raw),
-                MAX_MCP_DESCRIPTION_LENGTH,
-            )
-        });
-    let _ = entry.instructions.set(captured);
+    // so the instructions string is cloned out of the `Arc`.
+    entry.record_instructions(
+        connected
+            .peer()
+            .peer_info()
+            .and_then(|info| info.instructions.clone()),
+    );
 
     // Flip state to Connected BEFORE tool registration so `list_all_tools` below goes through the
     // live peer via `require_connected`.
@@ -343,36 +333,18 @@ pub(crate) async fn connect_one(
 }
 
 /// Fetch `list_tools` from a just-connected server and route the resulting adapters through
-/// [`McpClientManager::update_server_tools`] so every attached per-session registry receives them.
-/// The deferred marker on tools that ship lazily is still applied via the manager's attached
-/// registries.
+/// [`McpClientManager::register_server_tools`], which records which of them ship deferred and
+/// carries both facts to every registry -- the ones attached now and the ones that attach later.
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
     manager: &Arc<McpClientManager>,
 ) -> Result<usize> {
-    use crate::tools::Tool as _;
     let adapters = build_mcp_adapters(entry, mcp_default_permission).await?;
-    // Decide which adapters should ship deferred BEFORE we erase the concrete type into `Arc<dyn
-    // Tool>`: `tool_should_eager_load` needs the raw name, which the trait object doesn't expose.
-    let deferred_names: Vec<String> = adapters
-        .iter()
-        .filter(|adapter| {
-            !crate::mcp::tool_should_eager_load(adapter.server_config(), adapter.raw_name())
-        })
-        .map(|adapter| adapter.definition().name.clone())
-        .collect();
     let registered_count = adapters.len();
-    let arc_adapters: Vec<Arc<dyn crate::tools::Tool>> = adapters
-        .into_iter()
-        .map(|a| Arc::new(a) as Arc<dyn crate::tools::Tool>)
-        .collect();
     manager
-        .update_server_tools(&entry.server_name, arc_adapters)
+        .register_server_tools(&entry.server_name, adapters)
         .await;
-    if !deferred_names.is_empty() {
-        manager.mark_deferred_on_attached(&deferred_names).await;
-    }
     Ok(registered_count)
 }
 
@@ -729,7 +701,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            instructions: std::sync::OnceLock::new(),
+            instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -779,7 +751,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            instructions: std::sync::OnceLock::new(),
+            instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -822,7 +794,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
-            instructions: OnceLock::new(),
+            instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -874,7 +846,7 @@ mod tests {
                 at: std::time::Instant::now(),
             }),
             reconnect_lock: Mutex::new(()),
-            instructions: OnceLock::new(),
+            instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         });

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A session records the provider profile, model and base URL it runs on, and a resume restores them.
+- A session's context window, vision flag and `max_output_tokens` come from its own profile.
+- `/provider [name]` in the REPL shows or changes the profile the session runs on.
+- `POST /v1/sessions` takes `provider`; `PATCH /v1/sessions/{id}` moves a session, loaded or not.
+- ACP advertises `configOptions` (permission and provider) and handles `session/set_config_option`.
+- `meka session list` gains a Provider column; `--long` adds the model and endpoint overrides.
+- Every HTTP session body reports `provider`, and `model_override` / `base_url_override` when set.
+- `meka session export` / `import` carry the provider profile and its overrides.
+- `meka provider login --api-key-stdin` rotates an API key without prompting or losing the profile.
+
+### Changed
+
+- **Breaking:** `GET /v1/info` drops `provider` and `model`; `GET /v1/providers` reports both.
+- **Breaking:** `meka acp` / `meka serve` refuse `-c`, `-r`, `--model` and `--base-url`.
+- **Breaking:** the REPL and `--oneshot` resume at the recorded permission level, not the default.
+- Existing sessions adopt `default_provider` when the store is brought forward.
+- `--provider`, `--model`, `--base-url` and `--permission` on a resume repin the session.
+- A session whose recorded profile is not configured is refused by name, never silently redirected.
+- A profile's credential is checked when a session first needs it, not when a host starts up.
+- An isolated scheduled job runs on the profile of the session that created it.
+- A resume is no longer blocked by an ambiguous `default_provider` it does not use.
+- `meka session import` refuses an archive with no profile when nothing can supply one.
+- `meka provider remove` warns when it clears `default_provider`, and how many sessions it strands.
+- `meka provider list` flags an unresolvable `default_provider` and a credential it cannot read.
+- `meka provider add` writes the profile before the credential, so a failed write leaks no secret.
+- `GET /v1/sessions/{id}/context` omits `window` for a profile it cannot resolve.
+- `GET /v1/health/ready` reports a provider as configured when any profile is, not just the default.
+
+### Fixed
+
+- `meka provider add` destroyed every profile when `providers` was written as an inline table.
+- `meka provider remove` on the same config reported the opposite of what it did.
+- Spawning a sub-agent of a session that no longer exists returned an id with no row behind it.
+- A rotated provider credential reaches a running `meka serve`, instead of being ignored until exit.
+- `meka serve` and `meka acp` now defer MCP tool schemas; both shipped every one on every request.
+- An MCP reconnect re-lists tools and re-reads instructions, instead of keeping the old set.
+- A broken scheduled gate stops being reported once another host has evaluated it successfully.
+- Compaction clears the tool-schema advisories it may have summarised away.
+- The REPL's `/skill` completion follows skills the agent adds or deletes mid-session.
+- `--api-key-stdin` no longer lets the model or base-URL prompt consume the piped key.
+- `--api-key-stdin` is refused for the subscription backends instead of silently opening a browser.
+
 ## [0.43.0] - 2026-08-26
 
 ### Added

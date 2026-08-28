@@ -18,6 +18,11 @@
 //! something else the day the gate types are refactored, years after the users it ran for stopped
 //! being able to notice.
 //!
+//! It may, though, *receive* a fact it cannot work out for itself. That is what [`Context`] carries
+//! and what separates it from the ban above: a function can change meaning under a frozen step, a
+//! `String` cannot. [`sessions_name_their_provider`] needs the profile a session with none recorded
+//! should adopt, `config.toml` is the only place that knows, and this module must not read it.
+//!
 //! **A migration must be safe to run twice.** `user_version` lives in the file header, and the
 //! standard SQLite round trip drops it: `sqlite3 old.db .dump | sqlite3 new.db` produces a store
 //! with the right schema and a version of 0 (plain `VACUUM` keeps it; `.dump` does not). Such a
@@ -60,6 +65,66 @@ enum Step {
     Sql(&'static str),
     /// A conversion SQL cannot express. Takes the transaction so it commits with everything else.
     Rust(fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>),
+    /// A conversion that also needs a fact only the caller can supply. See [`Context`].
+    Contextual(fn(&rusqlite::Transaction<'_>, &Context) -> rusqlite::Result<()>),
+}
+
+/// Facts a migration cannot work out for itself, supplied by the caller.
+///
+/// This is the one loosening of rule 2, and the line it draws is between *receiving* data and
+/// *calling* code to get it. `Gate::spec` can start meaning something else the day the gate types
+/// are refactored, years after the stores it ran against stopped being able to notice; a `String`
+/// cannot. So a migration may take one of these and may not reach for a function.
+///
+/// **Append only, like the ledger itself.** A shipped step's inputs are part of what is frozen
+/// about it: adding a field for a later step is additive and safe, but renaming or removing one
+/// silently rewrites what an already-run step would do.
+#[derive(Debug, Clone, Default)]
+pub struct Context {
+    /// The profile a session with no recorded one adopts, or empty when nothing resolves.
+    ///
+    /// Empty is not a sentinel the readers know about. No profile can be named `""` in a way that
+    /// resolves, so an empty value lands on the same "recorded profile is not configured" refusal
+    /// a deleted profile produces, which every reader already has to handle.
+    pub(crate) default_provider: String,
+    /// Why `default_provider` is empty, when it is: because nothing resolved, or because the
+    /// caller could not read `config.toml` at all.
+    ///
+    /// The two are not the same answer and must not produce the same write. "Nothing resolved" is
+    /// a fact about a config meka read; "could not read it" is meka knowing nothing, and
+    /// stamping every existing session against no profile on the strength of a parse error is
+    /// irreversible, since the step runs once and `user_version` moves with it. So a step that
+    /// would act on the value refuses instead, which aborts the transaction and leaves the
+    /// store exactly as it was for a later run with a readable config.
+    ///
+    /// A *separate* field rather than making `default_provider` an `Option`, because `Context` is
+    /// append-only for the same reason the ledger is: a shipped step's inputs are part of what is
+    /// frozen about it, and changing the type of one would silently rewrite what an already-run
+    /// step would have done.
+    pub(crate) config_unreadable: bool,
+}
+
+impl Context {
+    /// What a caller that has resolved a profile hands over. `None` means none resolved.
+    pub(crate) fn adopting(profile: Option<&str>) -> Self {
+        Self {
+            default_provider: profile.unwrap_or_default().to_string(),
+            config_unreadable: false,
+        }
+    }
+
+    /// What a caller hands over when `config.toml` could not be parsed or read.
+    ///
+    /// Deliberately still openable: a store already at head runs no step that consults this, so the
+    /// commands that exist to *repair* an unreadable config -- `meka mcp remove`, `meka provider
+    /// remove`, which edit the raw document through `toml_edit` and never parse it -- keep working.
+    /// Only a store that would actually adopt a profile is refused.
+    pub(crate) fn on_unreadable_config() -> Self {
+        Self {
+            default_provider: String::new(),
+            config_unreadable: true,
+        }
+    }
 }
 
 /// Every migration, in order. **Append only, and never edit a shipped entry**: users who already
@@ -74,6 +139,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "gates_become_kind_and_spec",
         step: Step::Rust(gates_become_kind_and_spec),
+    },
+    Migration {
+        name: "sessions_name_their_provider",
+        step: Step::Contextual(sessions_name_their_provider),
+    },
+    Migration {
+        name: "sessions_record_their_model_overrides",
+        step: Step::Rust(sessions_record_their_model_overrides),
     },
 ];
 
@@ -159,12 +232,17 @@ const RETIRED_INITIALISED_FLAG: u32 = 1;
 /// rebuild would otherwise have to change it, and would probably not notice why it had to.
 /// [`apply_steps`] runs `foreign_key_check` before committing, since nothing was enforcing
 /// references while the steps ran.
-pub(crate) fn apply(connection: &mut rusqlite::Connection, plan: Plan) -> Result<()> {
+pub(crate) fn apply(
+    connection: &mut rusqlite::Connection,
+    plan: Plan,
+    context: &Context,
+) -> Result<()> {
     if !plan.has_work() {
         return Ok(());
     }
-    let applied =
-        with_foreign_keys_suspended(connection, |connection| apply_steps(connection, plan))?;
+    let applied = with_foreign_keys_suspended(connection, |connection| {
+        apply_steps(connection, plan, context)
+    })?;
     // After the commit, so a migration that rolled back is not reported as applied.
     for name in applied {
         tracing::info!("applied schema migration '{}'", name);
@@ -228,7 +306,11 @@ fn with_foreign_keys_suspended<T>(
 /// first write: under WAL a deferred transaction that upgrades later can return `SQLITE_BUSY`
 /// without consulting the busy handler at all, which is the same reason
 /// [`crate::memory::store`] gives for its own writes.
-fn apply_steps(connection: &mut rusqlite::Connection, plan: Plan) -> Result<Vec<&'static str>> {
+fn apply_steps(
+    connection: &mut rusqlite::Connection,
+    plan: Plan,
+    context: &Context,
+) -> Result<Vec<&'static str>> {
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| {
@@ -244,6 +326,7 @@ fn apply_steps(connection: &mut rusqlite::Connection, plan: Plan) -> Result<Vec<
         match &migration.step {
             Step::Sql(sql) => transaction.execute_batch(sql),
             Step::Rust(step) => step(&transaction),
+            Step::Contextual(step) => step(&transaction, context),
         }
         .map_err(|error| {
             MekaError::Database(format!(
@@ -688,6 +771,144 @@ fn gates_become_kind_and_spec(transaction: &rusqlite::Transaction<'_>) -> rusqli
     Ok(())
 }
 
+/// 0.44: a session records the provider profile it runs with.
+///
+/// The column is `NOT NULL` because every session created from here on has a resolved profile at
+/// the moment it is written, so the readers get to assume one unconditionally. Existing rows have
+/// no such fact to recover, and this is the only place allowed to invent one.
+///
+/// The value is whatever the caller resolved as the default. When nothing resolved, the sole stored
+/// credential is a better guess than nothing: a store with sessions in it was used, and a single
+/// credential is almost certainly the profile that ran them. Two or more cannot be told apart from
+/// here, so those fall through to the empty string, which no configured profile can be named and so
+/// resolves to the refusal a deleted profile already produces.
+fn sessions_name_their_provider(
+    transaction: &rusqlite::Transaction<'_>,
+    context: &Context,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Guarded rather than bare, so a store that lost its `user_version` and replays this step does
+    // not fail with `duplicate column name` and refuse to open on every start afterwards.
+    if !columns.iter().any(|column| column == "provider") {
+        transaction
+            .execute_batch("ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT ''")?;
+    }
+
+    // Refused, not guessed. An unreadable `config.toml` means the caller could not tell us what
+    // these sessions should adopt, and this step gets one attempt: it runs once, `user_version`
+    // moves with it, and every row it stamps against no profile stays that way. Erroring aborts the
+    // transaction, so the store is untouched and a later run with a readable config migrates it
+    // correctly. The `ALTER TABLE` above is inside the same transaction and goes with it.
+    if context.config_unreadable {
+        let carried: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE provider = ''",
+            [],
+            |row| row.get(0),
+        )?;
+        if carried > 0 {
+            // `InvalidParameterName` carries an arbitrary message, which is the idiom `session.rs`
+            // already uses to surface a non-SQLite failure through a `rusqlite::Result`. Its
+            // `Display` prefixes the variant name, which reads oddly here but is the price of the
+            // one variant available without enabling a rusqlite feature for a single error path.
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "cannot record a provider for {} carried-forward session(s) while config.toml \
+                 cannot be read; fix the file and start meka again",
+                carried
+            )));
+        }
+    }
+
+    let adopted = if context.default_provider.is_empty() {
+        sole_credential(transaction)?.unwrap_or_default()
+    } else {
+        context.default_provider.clone()
+    };
+    if adopted.is_empty() {
+        // Only when there is something to say. Warning unconditionally fired on the literal first
+        // run of a fresh install, where the sessions table is empty and there is nothing to leave
+        // without a provider, and on every `meka provider add` before a default exists. A warning
+        // that appears when nothing is wrong teaches the reader to ignore the one that matters.
+        let stranded: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE provider = ''",
+            [],
+            |row| row.get(0),
+        )?;
+        if stranded > 0 {
+            tracing::warn!(
+                "no provider profile could be resolved, so {} existing session(s) were left \
+                 without one. Configure a provider, then resume such a session with --provider \
+                 once to say which it runs on; that is what records it",
+                stranded
+            );
+        }
+        return Ok(());
+    }
+    // Only the rows that have nothing, which is what makes a replay a no-op rather than a rewrite
+    // of a session someone has since moved to another profile.
+    let adopting = transaction.execute(
+        "UPDATE sessions SET provider = ?1 WHERE provider = ''",
+        rusqlite::params![&adopted],
+    )?;
+    // Said out loud, because for anyone with more than one account this is a guess. The alternative
+    // was leaving these sessions unresumable, so adopting is right; doing it silently is not, since
+    // a session that actually ran on the other account now names this one and resuming it bills
+    // here. `info!` and not `warn!` because it is a one-time lifecycle signpost that is simply
+    // correct for a single-profile install, and a warning that cries wolf for most readers is one
+    // the rest learn to skip.
+    if adopting > 0 {
+        tracing::info!(
+            "recorded provider profile '{}' on {} session(s) that predate meka recording one. \
+             Resume any that ran on a different profile once with --provider <name> to correct it",
+            adopted,
+            adopting
+        );
+    }
+    Ok(())
+}
+
+/// Add the two columns that hold a session's per-session model and endpoint.
+///
+/// Nullable with no backfill, and that is the correct value rather than a shortcut: absent means
+/// "whatever the profile says", which is exactly what every session written before these columns
+/// existed did. There is nothing to convert.
+fn sessions_record_their_model_overrides(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
+    // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
+    if !columns.iter().any(|column| column == "model_override") {
+        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT")?;
+    }
+    if !columns.iter().any(|column| column == "base_url_override") {
+        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN base_url_override TEXT")?;
+    }
+    Ok(())
+}
+
+/// The profile named by the only stored credential, when there is exactly one.
+///
+/// Ambiguity is not resolved by picking: with two credentials there is no evidence here about which
+/// of them ran any given session, and a confident wrong answer is worse than an admitted absence.
+fn sole_credential(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<Option<String>> {
+    let mut statement = transaction.prepare("SELECT profile FROM provider_credentials LIMIT 2")?;
+    let profiles = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    match profiles.as_slice() {
+        [only] => Ok(Some(only.clone())),
+        _ => Ok(None),
+    }
+}
+
 fn predicate_for(fire: &str) -> Option<&'static str> {
     match fire {
         "on-change" => Some("changed"),
@@ -705,7 +926,7 @@ fn predicate_for(fire: &str) -> Option<&'static str> {
 #[cfg(test)]
 pub(crate) fn create_for_test(connection: &mut rusqlite::Connection) -> Result<()> {
     let plan = plan(connection)?;
-    apply(connection, plan)
+    apply(connection, plan, &Context::default())
 }
 
 /// The baseline DDL, for a test that needs to plant a store shaped the way an older meka left one.
@@ -838,7 +1059,7 @@ mod tests {
         let mut carried_forward = store_as_0_42_left_it();
         let plan = plan(&carried_forward).expect("a 0.42 store is classified");
         assert_eq!(plan.from, 1, "the baseline is version 1, not a fresh store");
-        apply(&mut carried_forward, plan).expect("the remaining steps apply");
+        apply(&mut carried_forward, plan, &Context::default()).expect("the remaining steps apply");
 
         assert_eq!(
             fingerprint(&built_from_scratch),
@@ -886,7 +1107,7 @@ mod tests {
                 let body = match &migration.step {
                     Step::Sql(sql) => digest(sql),
                     // No body to hash. The name still pins its position in the order.
-                    Step::Rust(_) => 0,
+                    Step::Rust(_) | Step::Contextual(_) => 0,
                 };
                 (migration.name, digest(migration.name) ^ body)
             })
@@ -943,13 +1164,247 @@ mod tests {
         }
     }
 
+    fn plant_session(connection: &rusqlite::Connection, id: &str) {
+        connection
+            .execute(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES (?1, 'now', 'now')",
+                [id],
+            )
+            .expect("a session to carry forward");
+    }
+
+    fn plant_credential(connection: &rusqlite::Connection, profile: &str) {
+        connection
+            .execute(
+                "INSERT INTO provider_credentials (profile, credentials_json, updated_at) \
+                 VALUES (?1, '{}', 'now')",
+                [profile],
+            )
+            .expect("a credential");
+    }
+
+    fn provider_of(connection: &rusqlite::Connection, id: &str) -> String {
+        connection
+            .query_row("SELECT provider FROM sessions WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .expect("the row survives")
+    }
+
+    /// The ordinary upgrade: whatever the caller resolved is what existing sessions adopt.
+    #[test]
+    fn an_existing_session_adopts_the_resolved_default() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        let plan = plan(&connection).expect("classified");
+        apply(&mut connection, plan, &Context::adopting(Some("work"))).expect("migrated");
+
+        assert_eq!(provider_of(&connection, "carried"), "work");
+    }
+
+    /// With nothing resolved, one stored credential is the only evidence in the store about which
+    /// profile ran these sessions, and it is better than admitting nothing.
+    #[test]
+    fn a_sole_credential_stands_in_when_no_default_resolves() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        plant_credential(&connection, "the-only-one");
+        let plan = plan(&connection).expect("classified");
+        apply(&mut connection, plan, &Context::default()).expect("migrated");
+
+        assert_eq!(provider_of(&connection, "carried"), "the-only-one");
+    }
+
+    /// Two credentials say nothing about which ran any given session, so nothing is claimed. The
+    /// empty value is not special-cased anywhere: it simply does not name a configured profile.
+    #[test]
+    fn two_credentials_are_not_guessed_between() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        plant_credential(&connection, "one");
+        plant_credential(&connection, "two");
+        let plan = plan(&connection).expect("classified");
+        apply(&mut connection, plan, &Context::default()).expect("migrated");
+
+        assert_eq!(
+            provider_of(&connection, "carried"),
+            "",
+            "an ambiguous store is left saying nothing rather than guessing"
+        );
+    }
+
+    /// The caller's answer beats the store's, because config is the current statement of intent and
+    /// a credential can outlive the profile that used it.
+    #[test]
+    fn the_resolved_default_beats_a_sole_credential() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        plant_credential(&connection, "stale");
+        let plan = plan(&connection).expect("classified");
+        apply(&mut connection, plan, &Context::adopting(Some("current"))).expect("migrated");
+
+        assert_eq!(provider_of(&connection, "carried"), "current");
+    }
+
+    /// Rule 3. A store that lost its `user_version` replays every step, and this one must not fail
+    /// with `duplicate column name` nor overwrite a session that has since moved profile.
+    #[test]
+    fn a_replay_neither_fails_nor_rewrites_a_chosen_provider() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        let first = plan(&connection).expect("classified");
+        apply(&mut connection, first, &Context::adopting(Some("first"))).expect("migrated");
+
+        connection
+            .execute(
+                "UPDATE sessions SET provider = 'chosen' WHERE id = 'carried'",
+                [],
+            )
+            .expect("the user repins it");
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(
+            &mut connection,
+            replayed,
+            &Context::adopting(Some("second")),
+        )
+        .expect("the replay must not fail");
+
+        assert_eq!(
+            provider_of(&connection, "carried"),
+            "chosen",
+            "a replay only fills what is empty"
+        );
+    }
+
+    /// The override columns replay for the same reason the provider column does, and the failure
+    /// mode is worse: a bare `ADD COLUMN` would refuse the store on every start, permanently.
+    #[test]
+    fn a_replay_neither_fails_nor_clears_a_chosen_model() {
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "carried");
+        let first = plan(&connection).expect("classified");
+        apply(&mut connection, first, &Context::adopting(Some("first"))).expect("migrated");
+
+        connection
+            .execute(
+                "UPDATE sessions SET model_override = 'pinned' WHERE id = 'carried'",
+                [],
+            )
+            .expect("the user pins a model");
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(
+            &mut connection,
+            replayed,
+            &Context::adopting(Some("second")),
+        )
+        .expect("the replay must not fail");
+
+        let model: Option<String> = connection
+            .query_row(
+                "SELECT model_override FROM sessions WHERE id = 'carried'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read back");
+        assert_eq!(
+            model.as_deref(),
+            Some("pinned"),
+            "a replay adds the columns and converts nothing"
+        );
+    }
+
+    /// The step speaks exactly when it has something to say, and says which profile it chose.
+    ///
+    /// Both halves matter and both were wrong. It warned on the literal first run of a fresh
+    /// install, where there are no sessions to leave without a provider, which teaches a reader to
+    /// skip the message that does matter. And it adopted a profile for every carried-forward
+    /// session in silence: for anyone with two accounts that is a guess, and a session that ran on
+    /// the other one now names this one and bills here when resumed.
+    #[test]
+    fn the_step_reports_the_profile_it_adopted_and_only_then() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // INFO rather than WARN, because the adoption notice is a lifecycle signpost and the
+        // empty-profile complaint above it is a warning; capturing both keeps one test honest
+        // about which level each uses.
+        let migrate = |plant: bool, default: Option<&str>| -> String {
+            let capture = Capture(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+            let buffer = std::sync::Arc::clone(&capture.0);
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let mut connection = store_as_0_42_left_it();
+                if plant {
+                    plant_session(&connection, "carried");
+                }
+                let plan = plan(&connection).expect("classified");
+                apply(&mut connection, plan, &Context::adopting(default)).expect("migrated");
+            });
+            String::from_utf8_lossy(
+                &buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+            .into_owned()
+        };
+
+        let text = migrate(true, Some("work"));
+        assert!(
+            text.contains("recorded provider profile 'work'") && text.contains(" 1 session"),
+            "the adoption must name the profile and how many rows it touched: {text}"
+        );
+
+        // Nothing carried forward: the step still runs and still has nothing to report.
+        let text = migrate(false, Some("work"));
+        assert!(
+            !text.contains("recorded provider profile"),
+            "a store with no sessions has nothing to adopt: {text}"
+        );
+        let text = migrate(false, None);
+        assert!(
+            !text.contains("left without one"),
+            "a fresh install must not be warned about sessions it does not have: {text}"
+        );
+    }
+
     #[test]
     fn each_fire_mode_becomes_its_predicate() {
         for (fire, expected) in [("on-change", "changed"), ("on-success", "succeeded")] {
             let mut connection = store_as_0_42_left_it();
             plant_job(&connection, "job", Some("gh pr checks"), Some(fire));
             let plan = plan(&connection).expect("classified");
-            apply(&mut connection, plan).expect("converted");
+            apply(&mut connection, plan, &Context::default()).expect("converted");
 
             let (kind, spec) = gate_of(&connection, "job");
             assert_eq!(kind.as_deref(), Some("shell"));
@@ -968,7 +1423,7 @@ mod tests {
         let mut connection = store_as_0_42_left_it();
         plant_job(&connection, "job", Some(awkward), Some("on-change"));
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("converted");
+        apply(&mut connection, plan, &Context::default()).expect("converted");
 
         let (_, spec) = gate_of(&connection, "job");
         let spec: serde_json::Value =
@@ -994,7 +1449,7 @@ mod tests {
         plant_job(&connection, "half-written", Some("echo hi"), None);
         plant_job(&connection, "no-command", None, Some("on-change"));
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("converted");
+        apply(&mut connection, plan, &Context::default()).expect("converted");
 
         for id in ["unknown-fire", "half-written", "no-command"] {
             let (kind, spec) = gate_of(&connection, id);
@@ -1010,7 +1465,7 @@ mod tests {
     fn the_retired_columns_are_gone_and_the_lease_columns_are_present() {
         let mut connection = store_as_0_42_left_it();
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("converted");
+        apply(&mut connection, plan, &Context::default()).expect("converted");
 
         let columns = table_columns(&connection, "scheduled_jobs").expect("columns");
         for gone in ["gate_command", "gate_fire"] {
@@ -1043,7 +1498,7 @@ mod tests {
             .execute_batch("PRAGMA foreign_keys = ON;")
             .expect("enforcement on, as `SessionManager::open` leaves it");
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("migrated");
+        apply(&mut connection, plan, &Context::default()).expect("migrated");
 
         let enforcing: i64 = connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -1099,7 +1554,7 @@ mod tests {
         let mut clean = store_as_0_42_left_it();
         plant_job(&clean, "fine", Some("gh pr checks"), Some("on-change"));
         let clean_plan = plan(&clean).expect("classified");
-        apply(&mut clean, clean_plan).expect("converted");
+        apply(&mut clean, clean_plan, &Context::default()).expect("converted");
         assert!(
             !crate::render::log_capture::warnings().contains("left inert"),
             "a store whose gates all convert must not be warned about: {}",
@@ -1109,7 +1564,7 @@ mod tests {
         let mut damaged = store_as_0_42_left_it();
         plant_job(&damaged, "unreadable", Some("echo hi"), Some("on-tuesday"));
         let damaged_plan = plan(&damaged).expect("classified");
-        apply(&mut damaged, damaged_plan).expect("converted");
+        apply(&mut damaged, damaged_plan, &Context::default()).expect("converted");
         let warnings = crate::render::log_capture::warnings();
         assert!(warnings.contains("left inert"), "{warnings}");
         assert!(
@@ -1211,7 +1666,7 @@ mod tests {
             replayed.from, 1,
             "shape says the baseline is applied, which it is"
         );
-        apply(&mut connection, replayed).expect("the replay must not fail");
+        apply(&mut connection, replayed, &Context::default()).expect("the replay must not fail");
 
         assert_eq!(before, fingerprint(&connection), "the schema is unchanged");
         let (kind, spec) = gate_of(&connection, "j");
@@ -1240,7 +1695,8 @@ mod tests {
             .expect("an orphaned row");
 
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("the migration is not blocked by inherited damage");
+        apply(&mut connection, plan, &Context::default())
+            .expect("the migration is not blocked by inherited damage");
         assert_eq!(
             user_version(&connection).expect("version"),
             MIGRATIONS.len() as u32
@@ -1268,12 +1724,12 @@ mod tests {
         let mut connection = store_as_0_42_left_it();
         plant_job(&connection, "job", Some("echo hi"), Some("on-change"));
         let first = plan(&connection).expect("classified");
-        apply(&mut connection, first).expect("converted");
+        apply(&mut connection, first, &Context::default()).expect("converted");
         let before = fingerprint(&connection);
 
         let second = plan(&connection).expect("classified again");
         assert!(!second.has_work(), "a converted store has nothing pending");
-        apply(&mut connection, second).expect("a no-op");
+        apply(&mut connection, second, &Context::default()).expect("a no-op");
         assert_eq!(before, fingerprint(&connection), "nothing moved");
         assert_eq!(
             user_version(&connection).expect("version"),
@@ -1295,7 +1751,7 @@ mod tests {
             )
             .expect("a hand conversion");
         let plan = plan(&connection).expect("classified");
-        apply(&mut connection, plan).expect("the lease columns still arrive");
+        apply(&mut connection, plan, &Context::default()).expect("the lease columns still arrive");
 
         let columns = table_columns(&connection, "scheduled_jobs").expect("columns");
         for present in ["claimed_by", "claimed_until", "attempts"] {
@@ -1377,7 +1833,7 @@ mod tests {
             plan.from, 1,
             "the shape says the baseline is applied, and it is"
         );
-        apply(&mut connection, plan).expect("converted");
+        apply(&mut connection, plan, &Context::default()).expect("converted");
         let (kind, spec) = gate_of(&connection, "job");
         assert_eq!(kind.as_deref(), Some("shell"));
         assert!(
@@ -1414,11 +1870,68 @@ mod tests {
             plan.from, 0,
             "there is nothing of meka's here to carry forward"
         );
-        apply(&mut connection, plan).expect("the schema is built");
+        apply(&mut connection, plan, &Context::default()).expect("the schema is built");
         assert!(
             !table_columns(&connection, "sessions")
                 .expect("columns")
                 .is_empty()
+        );
+    }
+
+    /// An unreadable `config.toml` must not be turned into "no profile" and stamped.
+    ///
+    /// The adopt step runs once and `user_version` moves with it, so a value derived from a parse
+    /// error is written to every carried-forward session and never revisited: one typo, and 476
+    /// sessions permanently record no profile with nothing said. "Nothing resolved" and "I could
+    /// not read the file" are different answers and only the first may be adopted.
+    ///
+    /// The refusal is conditional on there being rows to stamp, which is what keeps `meka mcp
+    /// remove` and `meka provider remove` usable: those edit the raw document through `toml_edit`
+    /// and are how a user repairs such a config, so a store with nothing to migrate must still
+    /// open.
+    #[test]
+    fn an_unreadable_config_refuses_to_stamp_carried_sessions_but_not_an_empty_store() {
+        let mut carrying = store_as_0_42_left_it();
+        carrying
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES \
+                 ('11111111-1111-4111-8111-111111111111', '2020-01-01', '2020-01-01')",
+            )
+            .expect("a session that predates meka recording a provider");
+        let before = fingerprint(&carrying);
+
+        let carrying_plan = plan(&carrying).expect("classified");
+        assert!(carrying_plan.has_work());
+        let error = apply(
+            &mut carrying,
+            carrying_plan,
+            &Context::on_unreadable_config(),
+        )
+        .expect_err("a store with rows to stamp must refuse");
+        assert!(
+            error.to_string().contains("config.toml"),
+            "the refusal must name what has to be fixed: {error}"
+        );
+        assert_eq!(
+            before,
+            fingerprint(&carrying),
+            "the store must be exactly as it was, so a later run can migrate it correctly"
+        );
+        assert_eq!(
+            user_version(&carrying).expect("version"),
+            0,
+            "and the version must not move, or the step never runs again"
+        );
+
+        // Nothing to stamp, so nothing to get wrong: the repair commands keep working.
+        let mut empty = store_as_0_42_left_it();
+        let empty_plan = plan(&empty).expect("classified");
+        apply(&mut empty, empty_plan, &Context::on_unreadable_config())
+            .expect("a store with no carried sessions opens on an unreadable config");
+        assert_eq!(
+            user_version(&empty).expect("version"),
+            MIGRATIONS.len() as u32,
+            "and reaches head"
         );
     }
 
@@ -1442,7 +1955,7 @@ mod tests {
 
         let plan = plan(&connection).expect("classified");
         assert!(plan.has_work());
-        let error = apply(&mut connection, plan).expect_err("the step fails");
+        let error = apply(&mut connection, plan, &Context::default()).expect_err("the step fails");
         assert!(
             error.to_string().contains("The store is unchanged"),
             "{error}"

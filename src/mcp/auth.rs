@@ -1234,9 +1234,12 @@ mod tests {
     /// credential never moves backwards -- held only until the first race.
     #[tokio::test]
     async fn a_lost_swap_does_not_return_the_adapter_to_blind_writes() {
-        let manager = crate::session::SessionManager::open(Some(std::path::Path::new(":memory:")))
-            .await
-            .expect("memory store");
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
         let token_store = manager.token_store();
         // Built by deserializing rather than by a struct literal: `StoredCredentials` is
         // `#[non_exhaustive]`, so rmcp reserves the right to add a field and only its own crate may

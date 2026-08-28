@@ -2501,9 +2501,10 @@ mod tests {
             tools::ToolRegistry,
         };
 
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory session manager");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory session manager");
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
@@ -2631,9 +2632,10 @@ mod tests {
             tools::ToolRegistry,
         };
 
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory session manager");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
@@ -2776,9 +2778,10 @@ mod tests {
             tools::ToolRegistry,
         };
 
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory session manager");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
@@ -2897,9 +2900,10 @@ mod tests {
             tools::ToolRegistry,
         };
 
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory session manager");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory session manager");
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
@@ -3011,9 +3015,10 @@ mod tests {
             tools::ToolRegistry,
         };
 
-        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
-            .await
-            .expect("in-memory session manager");
+        let session_manager =
+            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory session manager");
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));

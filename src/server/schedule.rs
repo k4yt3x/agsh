@@ -594,12 +594,18 @@ async fn run_isolated(state: &ServerState, wakeup: &Wakeup) -> Result<(), RunErr
 
     let (agent, registry) = crate::build_session_agent(
         &state.shared,
+        // The creating session's profile, for the same reason its permission is read above: an
+        // isolated run is that session's job in a fresh conversation, not a different session's.
+        Some(wakeup.job.session_id),
         permission,
         Arc::new(SilentFrontend),
         cwd,
         roots,
         // The HTTP surface has no context gauge of its own; the session owns the counter.
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        // An isolated fire has no reader for any of the three: it runs silent and its session is
+        // never in `state.sessions`.
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;

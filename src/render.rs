@@ -2372,14 +2372,56 @@ pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);
 }
 
+/// A session whose recorded provider profile is not one the config has, and a profile it could be
+/// moved to, for [`render_provider_setup_hint`].
+///
+/// The caller establishes both facts before building this. The hint is only right when the row's
+/// own profile is what could not be resolved: it would otherwise send a user whose profile is
+/// merely missing its credential to repin a session that is bound exactly where it belongs. And
+/// there has to be somewhere to move it, so a config with no profiles at all gets the generic
+/// example instead of a command with nothing to put in it.
+pub struct MissingSessionProfile<'a> {
+    /// The session `--provider` would repin, which is the only thing that can rewrite the binding.
+    pub session_id: uuid::Uuid,
+    /// The configured profile to suggest moving to.
+    pub move_to: &'a str,
+}
+
 /// Print the provider-setup hint shown when the agent fails to initialize. Centralized so the
 /// wording stays in sync everywhere.
 ///
-/// Deliberately says nothing about *why* setup failed: both call sites print the error first, and
-/// it is as often a configured profile missing its credential as no profile at all.
-pub fn render_provider_setup_hint() {
-    eprintln!("Example: meka provider add work --type claude-subscription --model claude-opus-5");
-    eprintln!("Run `meka provider list` to see configured profiles.");
+/// **One line, because the error printed above it has already said everything else.**
+/// `provider::look_up_profile` names the profile the row wants, lists the configured ones, and
+/// tells the reader to restore it or move off it. The session id is the single fact it cannot
+/// reach, and `-r <id> --provider <name>` is the only command that rewrites a row's binding, so
+/// that is what this adds. It used to add two more lines: `Run meka provider list to see
+/// configured profiles`, which that error had just listed, and `Or bring the profile back: meka
+/// provider add <recorded> --type claude-subscription --model claude-opus-5`, which restated
+/// "add it back to config.toml" as a command that *invents the profile's type and model*. meka
+/// never saw the deleted profile; it may have been `openai-responses` on another model entirely,
+/// and running that line would create a different profile under the name the session wants. A
+/// wrong command is worse than no command.
+///
+/// `None` says nothing about *why* setup failed: the caller prints the error first, and it is as
+/// often a configured profile missing its credential as no profile at all. That case names no
+/// profile in its example either, because a literal name reads as a fact about the user's config
+/// rather than as a placeholder: `work` was hardcoded, so a user missing `ghost` was told to add
+/// `work`, and a user who already had a `work` profile was told to add one that existed. The type
+/// and model there are safe where the interpolated ones were not, because the line is labelled
+/// `Example:` and describes nothing that exists.
+pub fn render_provider_setup_hint(missing: Option<MissingSessionProfile<'_>>) {
+    match missing {
+        Some(missing) => eprintln!(
+            "Move this session onto a configured profile: meka -r {} --provider {}",
+            missing.session_id, missing.move_to
+        ),
+        None => {
+            eprintln!(
+                "Example: meka provider add <name> --type claude-subscription --model claude-opus-5"
+            );
+            eprintln!("Run `meka provider list` to see configured profiles.");
+        }
+    }
 }
 
 /// Walk backwards through `messages` and return the suffix that starts at the `n`th most recent

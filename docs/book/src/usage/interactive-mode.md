@@ -109,6 +109,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/clear` | Clear the terminal screen |
 | `/session` | Show the current session ID |
 | `/permission [none\|read\|workspace\|ask\|unrestricted]` | Show or set the permission level |
+| `/provider [profile]` | Show or change the provider profile this session runs on |
 | `/compact` | Summarize and compact the session history |
 | `/rewind [N]` | Drop the last `N` turns (default 1) from the conversation the model sees |
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
@@ -128,7 +129,8 @@ meka supports `/` prefix commands for controlling the shell:
 | `/usage` | Show the account's rate-limit usage (subscription providers): session/weekly windows, percent used, reset times |
 | `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
 
-Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not.
+Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, configured profile names for
+`/provider`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not.
 
 ### `/history`
 

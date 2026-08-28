@@ -637,6 +637,55 @@ fn snapshot_roots(
     Some(merged)
 }
 
+/// Skill names for a synchronous caller, recomputed only when the files under `roots` change.
+///
+/// [`SkillCache`] is the async equivalent and the one the agent uses; this exists because
+/// reedline's `Completer` is sync and the REPL loop that feeds it runs on its own blocking thread,
+/// so it cannot `await` `SkillCache::current`. What it must *not* do is re-discover
+/// unconditionally: [`discover_skills_in_roots`] reads and parses every `SKILL.md` under every root
+/// and warns per unloadable or shadowed one, so calling it before each prompt put a full tree parse
+/// on the path to drawing the prompt and reprinted those warnings after every turn, every `/help`,
+/// every `!cmd` and every bare Enter. The stat-and-compare below is the same check
+/// `SkillCache::current` makes for the same reason.
+pub(crate) struct SkillNameWatch {
+    roots: Vec<PathBuf>,
+    seen: Option<BTreeMap<PathBuf, (SystemTime, u64)>>,
+}
+
+impl SkillNameWatch {
+    pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
+        Self { roots, seen: None }
+    }
+
+    /// The current names, or `None` when nothing has changed since the last call.
+    ///
+    /// A root that cannot be stat'd contributes nothing rather than vetoing the snapshot, so the
+    /// snapshot moves and the re-read it triggers serves a list one root short; it does not serve
+    /// the last good names. Preserving those takes a veto, which is what [`snapshot_roots`] gives
+    /// [`SkillCache`] for meka's own root. Nothing here wants it: this drives tab completion, where
+    /// a name briefly absent costs a keystroke, and [`discover_skills_in_roots`] skips an
+    /// unreadable root too, so the completion list keeps saying what the agent's own list does.
+    pub(crate) fn refresh(&mut self) -> Option<Vec<String>> {
+        let mut now = BTreeMap::new();
+        for root in &self.roots {
+            if let Some(snapshot) = disk_snapshot(root) {
+                now.extend(snapshot);
+            }
+        }
+        if self.seen.as_ref() == Some(&now) {
+            return None;
+        }
+        self.seen = Some(now);
+        Some(
+            discover_skills_in_roots(&self.roots)
+                .skills
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect(),
+        )
+    }
+}
+
 /// Shared, atomically-swappable view of the skill list. Construction runs an initial
 /// [`discover_skills_in_roots`] pass so broken-skill warnings surface during agent startup (above
 /// the first REPL prompt) instead of during the first turn. Subsequent reads via
@@ -3938,6 +3987,47 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(super::write_skill(temp.path(), "../escape", "d", 5, None, Some("b")).is_err());
         assert!(super::write_skill(temp.path(), "a/b", "d", 5, None, Some("b")).is_err());
+    }
+
+    /// The REPL completer's refresh must be a stat pass, not a parse pass.
+    ///
+    /// It runs before every prompt, and `discover_skills_in_roots` reads and parses every
+    /// `SKILL.md` and warns per unloadable or shadowed one. Called unconditionally it put a full
+    /// tree parse in front of every prompt and reprinted those warnings after every turn, every
+    /// `/help`, every `!cmd` and every bare Enter, for the life of the session.
+    #[test]
+    fn the_name_watch_re_reads_only_when_the_files_move() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "deploy", &valid_frontmatter("ship it"));
+
+        let mut watch = super::SkillNameWatch::new(vec![temp.path().to_path_buf()]);
+        assert_eq!(
+            watch.refresh(),
+            Some(vec!["deploy".to_string()]),
+            "the first call has nothing to compare against, so it must read"
+        );
+        assert_eq!(
+            watch.refresh(),
+            None,
+            "an unchanged tree must not be re-parsed"
+        );
+        assert_eq!(watch.refresh(), None, "and must keep not being re-parsed");
+
+        write_skill(temp.path(), "seismograph", &valid_frontmatter("watch it"));
+        let after_add = watch.refresh().expect("a new skill is a change");
+        assert!(
+            after_add.contains(&"deploy".to_string())
+                && after_add.contains(&"seismograph".to_string()),
+            "both skills must be offered: {after_add:?}"
+        );
+        assert_eq!(watch.refresh(), None, "settled again after the change");
+
+        delete_skill(temp.path(), "deploy").expect("delete");
+        assert_eq!(
+            watch.refresh(),
+            Some(vec!["seismograph".to_string()]),
+            "a deleted skill must stop being offered, which is the case a frozen list got wrong"
+        );
     }
 
     #[test]
