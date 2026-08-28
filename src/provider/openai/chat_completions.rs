@@ -370,24 +370,21 @@ impl Provider for OpenAiChatCompletionsProvider {
             .send()
             .await
             .map_err(|error| {
-                MekaError::Provider(format!(
-                    "HTTP request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ))
+                crate::error::provider_transport_error("HTTP request failed", &error, None)
             })?;
 
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response
-            .text()
-            .await
-            .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
+        let response_text = response.text().await.map_err(|error| {
+            crate::error::provider_transport_error("failed to read response", &error, retry_after)
+        })?;
 
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Completion,
             ));
         }
 
@@ -419,20 +416,21 @@ impl Provider for OpenAiChatCompletionsProvider {
             .send()
             .await
             .map_err(|error| {
-                MekaError::Provider(format!(
-                    "HTTP request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ))
+                crate::error::provider_transport_error("HTTP request failed", &error, None)
             })?;
 
         let status = response.status();
         if !status.is_success() {
             let retry_after = crate::error::parse_retry_after(response.headers());
-            let response_text = response.text().await.unwrap_or_default();
+            let response_text = response.text().await.unwrap_or_else(|error| {
+                tracing::warn!("failed to read error response body: {}", error);
+                String::new()
+            });
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Completion,
             ));
         }
 

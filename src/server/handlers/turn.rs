@@ -171,6 +171,8 @@ pub struct NoticeView {
         (status = 422, description = "Invalid body", body = ProblemDetail),
         (status = 429, description = "Concurrency limit reached or idempotency-key cache full", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
+        (status = 502, description = "The provider refused or failed this turn. Read `type`: `/errors/provider` is worth resending after a pause, `/errors/context-overflow` is not until the conversation is shortened", body = ProblemDetail),
+        (status = 503, description = "An MCP server marked `required` was not connected, so the turn never reached the provider", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
 )]

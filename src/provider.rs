@@ -263,6 +263,127 @@ pub(crate) async fn await_credential_lock(
     }
 }
 
+/// How long an OAuth refresh round trip may take before it is abandoned.
+///
+/// A whole-request deadline is right here in a way it never is for a turn: this is a small request
+/// to a well-known endpoint and nothing legitimate about it takes minutes. It also runs behind the
+/// gate that serialises a profile's refreshes, and *inside* `complete`/`stream` via
+/// `ensure_valid_credential`, so a token endpoint that accepts the connection and then goes quiet
+/// would otherwise hold both the next refresher and the user's turn in progress.
+///
+/// It cannot usefully go below [`CONNECT_TIMEOUT`], which is the trap in tightening it: reqwest's
+/// per-request `timeout` runs from the start of connecting, not from the request being sent, so a
+/// value under 30 seconds would abandon a connection this same client is still willing to spend 30
+/// seconds establishing. The two numbers being equal means a slow connect can consume the whole
+/// refresh budget, which is the correct precedence -- the total is what bounds the user's wait.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Everything an OAuth refresh-token exchange needs, named rather than positional.
+///
+/// A struct because the alternative is six parameters of which five are `&str`, where transposing
+/// two of them still compiles and produces a request that fails at the issuer with a message about
+/// the wrong thing. Named fields make the two call sites say which is which.
+pub(crate) struct RefreshExchange<'a> {
+    pub(crate) client: &'a reqwest::Client,
+    /// The issuer's token endpoint.
+    pub(crate) token_url: &'a str,
+    /// The OAuth client this profile authenticated as.
+    pub(crate) client_id: &'a str,
+    /// The grant being spent. Single-use under rotation; see
+    /// [`crate::error::oauth_refresh_error`].
+    pub(crate) refresh_token: &'a str,
+    /// The profile whose credential this is, named in the error so a user knows which one to log
+    /// back in to.
+    pub(crate) profile: &'a str,
+    /// The call site's own description of the request, in the voice that site has always used
+    /// ("OAuth token refresh", "Codex OAuth token refresh"), so its messages do not all read
+    /// alike.
+    pub(crate) context: &'a str,
+}
+
+/// Spend a refresh token at an issuer's token endpoint and hand back its decoded response.
+///
+/// One copy of a branch both subscription backends used to keep their own version of. The shape was
+/// identical -- POST the grant, classify the answer, decode the payload -- and only the payload
+/// differs, so the generic parameter is exactly the part that was ever really different: Claude's
+/// issuer states `expires_in` and an account uuid, ChatGPT's states neither and has to be read out
+/// of the JWTs.
+///
+/// The duplication was not theoretical. A mutation sweep deleted the `!` from the Codex copy's
+/// `if !status.is_success()` and no test noticed, because the Claude copy was the one under test;
+/// two hand-written copies of a classification means two chances to get it wrong and two places to
+/// remember when it changes. Both call sites keep their own test even so, since each still has to
+/// prove it reaches this function at all.
+///
+/// Errors are classified where they belong rather than here: a call that got no answer through
+/// [`crate::error::provider_transport_error`], and an answered one through
+/// [`crate::error::oauth_refresh_error`], which is the function that knows a spent grant from an
+/// unwell server.
+pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
+    exchange: RefreshExchange<'_>,
+) -> Result<T> {
+    let response = exchange
+        .client
+        .post(exchange.token_url)
+        .timeout(REFRESH_TIMEOUT)
+        // One order for both backends, where they used to list the same three fields in two
+        // different orders. `serde_json` is built with `preserve_order`, so this does change the
+        // bytes the Claude endpoint receives; it cannot change what they mean, because a JSON
+        // object is an unordered collection (RFC 8259 §1) and nothing here is signed over. Worth
+        // saying only
+        // because this is the backend whose request shape is otherwise reproduced from a capture.
+        .json(&serde_json::json!({
+            "client_id": exchange.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": exchange.refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            // Retryable like any other call that got no answer. The grant's fate is the one
+            // wrinkle, and `oauth_refresh_error` records why a possible replay is still the better
+            // trade than ending a turn on a blip.
+            crate::error::provider_transport_error(
+                &format!("{} request failed", exchange.context),
+                &error,
+                None,
+            )
+        })?;
+
+    let status = response.status();
+    let retry_after = crate::error::parse_retry_after(response.headers());
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_else(|error| {
+            tracing::warn!(
+                "failed to read the OAuth refresh error body for '{}': {}",
+                exchange.profile,
+                error
+            );
+            String::new()
+        });
+        return Err(crate::error::oauth_refresh_error(
+            &format!("{} failed", exchange.context),
+            status,
+            &body,
+            retry_after,
+            exchange.profile,
+        ));
+    }
+
+    response.json::<T>().await.map_err(|error| {
+        crate::error::oauth_refresh_error(
+            &format!(
+                "{} returned a response that could not be read",
+                exchange.context
+            ),
+            status,
+            &crate::error::format_reqwest_error(&error),
+            None,
+            exchange.profile,
+        )
+    })
+}
+
 /// Persist a refreshed credential, and answer with the one that should actually be used.
 ///
 /// A refresh is derived from the credential it read, so it may only replace *that* credential.

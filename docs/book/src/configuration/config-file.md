@@ -845,7 +845,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
 | `trust_read_only_hint` | No | Whether this server's `readOnlyHint: true` may classify a tool as `read`. Defaults to `true`. Set `false` for a server you have not audited: its hints become advisory for display only, so its tools fall through to the strict `unrestricted` fallback, skipping `[mcp].default_permission` (a global convenience must not re-grant what a per-server audit decision refused). A `readOnlyHint: false` is still honoured either way, since it only raises the requirement. See *Permission resolution* below. |
 | `disabled` | No | When `true`, the server is skipped entirely at startup: no process is spawned, no HTTP connect is attempted. Flip it back with `meka mcp enable <name>` or by editing the config. Defaults to `false`. |
-| `required` | No | When `true`, a turn is rejected while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). When `false`, the session runs without it and its tools are simply absent. Defaults to `[mcp].strict` (itself `false`), so servers are optional unless they opt in. |
+| `required` | No | When `true`, a turn is rejected while this enabled server is not `Connected` (a `disabled` server is never started, so it never gates). Over the HTTP API that rejection is a 503 `/errors/mcp-unavailable` naming the servers. When `false`, the session runs without it and its tools are simply absent. Defaults to `[mcp].strict` (itself `false`), so servers are optional unless they opt in. |
 
 ### `[mcp]` top-level table
 
@@ -912,8 +912,11 @@ and the import paths `PYTHONPATH` / `NODE_PATH` / `VIRTUAL_ENV`, which change wh
 A server that genuinely needs one takes it explicitly:
 
 ```toml
-[mcp.servers.tooling.env]
-PYTHONPATH = "${PYTHONPATH}"
+[[mcp.servers]]
+name = "tooling"
+transport = "stdio"
+command = "my-tooling-server"
+env = { PYTHONPATH = "${PYTHONPATH}" }
 ```
 
 A server that genuinely needs a secret asks for it by name, and `${VAR}` still reads meka's

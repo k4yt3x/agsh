@@ -639,7 +639,9 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 
 > **Error detail redaction:** Validation errors (`422`) return a generic detail message (e.g. `"invalid session creation request body"`) rather than echoing internal field names or parser diagnostics. Consult the [OpenAPI spec](#endpoint-reference) for the expected request schema.
 >
-> A `502` says only that the provider rejected or failed the turn; it carries none of the provider's own response. An upstream refusal can contain account identifiers, rate-limit posture, and fragments of the request that triggered it, and none of that is meka's to publish to an HTTP caller. The full text goes to the server log, which is where an operator reads it.
+> A `502` on a turn says only that the provider rejected or failed it; it carries none of the provider's own response. An upstream refusal can contain account identifiers, rate-limit posture, and fragments of the request that triggered it, and none of that is meka's to publish to an HTTP caller. The full text goes to the server log, which is where an operator reads it. The same holds for the `503` a turn gets when a required MCP server is down: the server names travel, the connector's reason does not, since it has carried a command line and its path.
+>
+> The MCP endpoints under `/v1/mcp` are the deliberate exception, and the difference is who asked. A caller naming one server and asking why it will not connect is asking *for* that reason, so `GET /v1/mcp/{name}/tools` and `POST /v1/mcp/{name}/reconnect` do relay it. A caller asking for a completion is not, and does not get it.
 
 ### Error types
 
@@ -662,10 +664,16 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
-| `/errors/provider` | 502 | Upstream provider call failed |
+| `/errors/provider` | 502 | Upstream provider call failed. Covers both a transient outage and a permanent one such as a bad credential or a misconfigured `base_url`, so it carries no promise that resending helps |
+| `/errors/context-overflow` | 502 | The conversation exceeds the model's context window and could not be compacted further. **Do not retry unchanged**; shorten it first |
+| `/errors/mcp-unavailable` | 503 | An MCP server marked `required` was not connected, so the turn was refused before reaching the provider. The `servers` extension names them; each one's reason is in the server log |
 | `/errors/internal` | 500 | Unhandled server error |
 
 Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the same error shape, then close the connection.
+
+> The two 502s are the ones worth branching on. `/errors/provider` says the upstream would not serve this turn, and is worth one backed-off resend; it does not say meka retried first, because on a turn it does and on `/compact` it does not, and a permanent failure looks the same from here. `/errors/context-overflow` says the request itself no longer fits, and will not fit next time either: retrying it unchanged loops until your client gives up. Shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
+>
+> A `Retry-After` on a `/errors/provider` response is the upstream's own, relayed up to an hour; meka reads only the delta-seconds form, so an upstream that answers with an HTTP date sends none. Honour it in preference to your own backoff. `/errors/context-overflow` never carries one.
 
 ## Discovery endpoints
 

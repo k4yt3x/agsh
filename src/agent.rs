@@ -1760,6 +1760,7 @@ impl Agent {
                         // `Ok`), so `content_started` is always `false` here — every retryable
                         // failure is retried up to the cap regardless of prior attempts.
                         let mut retries = 0u32;
+                        let started = std::time::Instant::now();
                         loop {
                             match self
                                 .provider
@@ -1773,7 +1774,12 @@ impl Agent {
                                     break Ok((message, stop_reason, usage));
                                 }
                                 Err(error) => {
-                                    match should_retry_provider_error(&error, false, retries) {
+                                    match should_retry_provider_error(
+                                        &error,
+                                        false,
+                                        retries,
+                                        started.elapsed(),
+                                    ) {
                                         Some(delay) => {
                                             retries += 1;
                                             tracing::warn!(
@@ -2184,6 +2190,7 @@ impl Agent {
         cancellation: CancellationToken,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         let mut retries = 0u32;
+        let started = std::time::Instant::now();
         loop {
             let mut content_started = false;
             match self
@@ -2197,7 +2204,12 @@ impl Agent {
                 .await
             {
                 Ok(value) => return Ok(value),
-                Err(error) => match should_retry_provider_error(&error, content_started, retries) {
+                Err(error) => match should_retry_provider_error(
+                    &error,
+                    content_started,
+                    retries,
+                    started.elapsed(),
+                ) {
                     Some(delay) => {
                         retries += 1;
                         tracing::warn!(
@@ -3862,11 +3874,28 @@ fn elide_reason(reason: &str) -> String {
 /// (0-indexed, incremented by the caller only when this returns `Some`). `content_started` must
 /// always be `false` for the non-streaming path — nothing is ever partially visible there, so every
 /// retryable failure is retryable regardless of prior attempts within the same call.
+///
+/// `elapsed` is measured from the first attempt, and refuses a further one once the sequence has
+/// been running for [`crate::provider::retry::RETRY_BUDGET`]. That limits cost in a way the attempt
+/// cap alone does not: an attempt that fails by running out `read_timeout` costs 300 seconds, and
+/// three of those is fifteen minutes of waiting on a turn that fails anyway, plus up to three
+/// completions the provider may have generated and billed. It bounds where the next attempt may
+/// begin rather than where the sequence ends, since the attempt that spends the budget still runs
+/// to its own conclusion; `RETRY_BUDGET` says why a total cannot be bounded here. See also
+/// `crate::error::provider_transport_error` for why this cannot be done by refusing to retry
+/// timeouts instead.
+///
+/// Checked before the delay rather than after, so an exhausted budget surfaces the provider's own
+/// error immediately instead of sleeping first to say the same thing later.
 fn should_retry_provider_error(
     error: &MekaError,
     content_started: bool,
     retries: u32,
+    elapsed: std::time::Duration,
 ) -> Option<std::time::Duration> {
+    if elapsed >= crate::provider::retry::RETRY_BUDGET {
+        return None;
+    }
     match error {
         MekaError::RetryableProvider { retry_after, .. }
             if !content_started && retries < crate::provider::retry::MAX_PROVIDER_RETRIES =>
@@ -5079,6 +5108,76 @@ mod tests {
             "the retry sent {} messages against the original's {}; compaction achieved nothing",
             requests[1].messages.len(),
             requests[0].messages.len(),
+        );
+    }
+
+    /// A retryable failure on the first attempt costs a retry, not the turn.
+    ///
+    /// **What this does not guard, stated because it is easy to assume otherwise.** The mock hands
+    /// back a [`MekaError::RetryableProvider`] directly, so nothing here reaches
+    /// `provider_transport_error`, and reverting that function to return a bare `Provider` again
+    /// leaves this test passing. It was written for that fix and would have signed off on it
+    /// unchanged. The two tests that do bite are
+    /// `error::tests::a_provider_call_that_never_answered_is_retryable` for the rule and
+    /// `provider::anthropic::messages::tests::a_backend_that_could_not_reach_its_endpoint_reports_a_retryable_failure`
+    /// for the wiring.
+    ///
+    /// What it is still worth keeping for: it pins the half of the behaviour that made the fix a
+    /// classification change rather than a retry-loop change. The loop already did the right thing
+    /// with a failure typed this way, including leaving no trace of the failed attempt in the
+    /// conversation, which is what stops a later turn resending it.
+    #[tokio::test]
+    async fn test_run_turn_retries_a_call_that_never_answered() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailRetryable {
+                message: "HTTP request failed (body 2.0 MiB): connection reset".to_string(),
+                retry_after_secs: None,
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "Here is the chart.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, _session_manager) = test_agent(provider.clone()).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "read the chart".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn survives a first attempt that got no response");
+        assert_eq!(outcome, TurnOutcome::EndTurn);
+        assert_eq!(
+            provider.streams().len(),
+            2,
+            "one attempt that failed and one that did not"
+        );
+        assert!(
+            messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains("chart"))
+                ),
+            "the answer from the surviving attempt is what lands in the conversation"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.text_content().contains("connection reset")),
+            "and the failure that was retried away leaves no trace to resend"
         );
     }
 
@@ -6598,7 +6697,8 @@ mod tests {
 
     #[test]
     fn test_should_retry_provider_error_retries_when_no_content_and_under_cap() {
-        let delay = should_retry_provider_error(&retryable_error(), false, 0);
+        let delay =
+            should_retry_provider_error(&retryable_error(), false, 0, std::time::Duration::ZERO);
         assert!(delay.is_some());
     }
 
@@ -6607,7 +6707,7 @@ mod tests {
         // The core safety property: once the user has seen any output this attempt, a retryable
         // error must not trigger a retry (would duplicate/corrupt what's already shown).
         assert_eq!(
-            should_retry_provider_error(&retryable_error(), true, 0),
+            should_retry_provider_error(&retryable_error(), true, 0, std::time::Duration::ZERO),
             None
         );
     }
@@ -6618,7 +6718,8 @@ mod tests {
             should_retry_provider_error(
                 &retryable_error(),
                 false,
-                crate::provider::retry::MAX_PROVIDER_RETRIES
+                crate::provider::retry::MAX_PROVIDER_RETRIES,
+                std::time::Duration::ZERO,
             ),
             None
         );
@@ -6627,7 +6728,8 @@ mod tests {
             should_retry_provider_error(
                 &retryable_error(),
                 false,
-                crate::provider::retry::MAX_PROVIDER_RETRIES - 1
+                crate::provider::retry::MAX_PROVIDER_RETRIES - 1,
+                std::time::Duration::ZERO,
             )
             .is_some()
         );
@@ -6638,13 +6740,20 @@ mod tests {
         // A mid-stream transport failure (SSE decode error, dropped connection, idle timeout) is
         // retryable under the same content-started / cap guards as a RetryableProvider error.
         let stream_error = MekaError::StreamError("error decoding response body".to_string());
-        assert!(should_retry_provider_error(&stream_error, false, 0).is_some());
-        assert_eq!(should_retry_provider_error(&stream_error, true, 0), None);
+        assert!(
+            should_retry_provider_error(&stream_error, false, 0, std::time::Duration::ZERO)
+                .is_some()
+        );
+        assert_eq!(
+            should_retry_provider_error(&stream_error, true, 0, std::time::Duration::ZERO),
+            None
+        );
         assert_eq!(
             should_retry_provider_error(
                 &stream_error,
                 false,
-                crate::provider::retry::MAX_PROVIDER_RETRIES
+                crate::provider::retry::MAX_PROVIDER_RETRIES,
+                std::time::Duration::ZERO,
             ),
             None
         );
@@ -6653,16 +6762,62 @@ mod tests {
     #[test]
     fn test_should_retry_provider_error_ignores_non_retryable_errors() {
         assert_eq!(
-            should_retry_provider_error(&MekaError::Provider("bad request".to_string()), false, 0),
+            should_retry_provider_error(
+                &MekaError::Provider("bad request".to_string()),
+                false,
+                0,
+                std::time::Duration::ZERO
+            ),
             None
         );
         assert_eq!(
             should_retry_provider_error(
                 &MekaError::ContextOverflow("too long".to_string()),
                 false,
-                0
+                0,
+                std::time::Duration::ZERO,
             ),
             None
+        );
+    }
+
+    /// The budget stops a sequence the attempt cap alone would let run for fifteen minutes.
+    ///
+    /// The cap counts tries, not what they cost. Two retries of a failure that returns instantly is
+    /// three seconds of backoff; two retries of one that fails by running out `read_timeout` is
+    /// three times three hundred seconds, and on a non-streaming call up to three completions the
+    /// provider generated and charged for. This is the only thing standing between a user and that,
+    /// now that the classifier no longer refuses to retry timeouts (it could not tell a delivered
+    /// request from an undelivered one, and guessing made the common transient failure terminal).
+    ///
+    /// The error and the attempt count are held constant across the three cases, so the budget is
+    /// the only thing that can be deciding.
+    #[test]
+    fn test_should_retry_provider_error_stops_when_the_budget_is_spent() {
+        let under = crate::provider::retry::RETRY_BUDGET - std::time::Duration::from_secs(1);
+        assert!(
+            should_retry_provider_error(&retryable_error(), false, 0, under).is_some(),
+            "a sequence still inside its budget carries on"
+        );
+        assert_eq!(
+            should_retry_provider_error(
+                &retryable_error(),
+                false,
+                0,
+                crate::provider::retry::RETRY_BUDGET
+            ),
+            None,
+            "spending the budget exactly is spending it"
+        );
+        assert_eq!(
+            should_retry_provider_error(
+                &retryable_error(),
+                false,
+                0,
+                crate::provider::retry::RETRY_BUDGET * 2
+            ),
+            None,
+            "and overshooting it does not wrap back into retrying"
         );
     }
 
@@ -6673,7 +6828,7 @@ mod tests {
             retry_after: Some(std::time::Duration::from_secs(5)),
         };
         assert_eq!(
-            should_retry_provider_error(&error, false, 0),
+            should_retry_provider_error(&error, false, 0, std::time::Duration::ZERO),
             Some(std::time::Duration::from_secs(5))
         );
     }

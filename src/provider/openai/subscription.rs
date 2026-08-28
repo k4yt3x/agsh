@@ -64,11 +64,6 @@ pub struct ChatGptSubscriptionProvider {
     user_agent: String,
 }
 
-/// A token refresh is a small request to a well-known endpoint, and it runs while holding the gate
-/// that serialises every other caller's refresh. A whole-request deadline is right here in a way it
-/// never is for a turn: nothing legitimate takes minutes.
-const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl ChatGptSubscriptionProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -201,21 +196,23 @@ impl ChatGptSubscriptionProvider {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "Codex usage request failed: {}",
-                crate::error::format_reqwest_error(&error)
-            ))
+            crate::error::provider_transport_error("Codex usage request failed", &error, None)
         })?;
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read Codex usage response: {}", error))
+            crate::error::provider_transport_error(
+                "failed to read Codex usage response",
+                &error,
+                retry_after,
+            )
         })?;
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Auxiliary,
             ));
         }
         serde_json::from_str(&response_text)
@@ -359,37 +356,6 @@ impl ChatGptSubscriptionProvider {
     async fn refresh_oauth_token(&self, refresh_token: &str) -> Result<AuthCredential> {
         tracing::info!("refreshing Codex OAuth token");
 
-        let response = self
-            .client
-            .post(&self.oauth_token_url)
-            .timeout(REFRESH_TIMEOUT)
-            .json(&serde_json::json!({
-                "client_id": self.client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }))
-            .send()
-            .await
-            .map_err(|error| {
-                MekaError::Provider(format!(
-                    "Codex OAuth token refresh request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_else(|error| {
-                tracing::warn!("failed to read Codex OAuth refresh error body: {}", error);
-                String::new()
-            });
-            return Err(MekaError::Provider(format!(
-                "Codex OAuth token refresh failed ({}): {}",
-                status,
-                crate::error::render_error_body(&body)
-            )));
-        }
-
         #[derive(Deserialize)]
         struct RefreshResponse {
             id_token: Option<String>,
@@ -397,9 +363,19 @@ impl ChatGptSubscriptionProvider {
             refresh_token: Option<String>,
         }
 
-        let data: RefreshResponse = response.json().await.map_err(|error| {
-            MekaError::Provider(format!("failed to parse Codex refresh response: {}", error))
-        })?;
+        // The exchange itself is shared with the Claude backend; what is this backend's own is
+        // everything below, because ChatGPT's issuer states neither an expiry nor an account and
+        // both have to be read out of the JWTs it returns.
+        let data: RefreshResponse =
+            crate::provider::exchange_refresh_token(crate::provider::RefreshExchange {
+                client: &self.client,
+                token_url: &self.oauth_token_url,
+                client_id: &self.client_id,
+                refresh_token,
+                profile: &self.credential_key,
+                context: "Codex OAuth token refresh",
+            })
+            .await?;
 
         let access_token = data.access_token.ok_or_else(|| {
             MekaError::Provider("Codex refresh response missing access_token".to_string())
@@ -502,10 +478,7 @@ impl Provider for ChatGptSubscriptionProvider {
             .json(&body);
 
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "Codex HTTP request failed: {}",
-                crate::error::format_reqwest_error(&error)
-            ))
+            crate::error::provider_transport_error("Codex HTTP request failed", &error, None)
         })?;
 
         drive_responses_sse_stream(response, event_sender, cancellation).await
@@ -536,21 +509,23 @@ impl Provider for ChatGptSubscriptionProvider {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "Codex profile request failed: {}",
-                crate::error::format_reqwest_error(&error)
-            ))
+            crate::error::provider_transport_error("Codex profile request failed", &error, None)
         })?;
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
         let text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read Codex profile response: {}", error))
+            crate::error::provider_transport_error(
+                "failed to read Codex profile response",
+                &error,
+                retry_after,
+            )
         })?;
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &text,
                 retry_after,
+                crate::error::ProviderRequest::Auxiliary,
             ));
         }
         let parsed: CodexProfileResponse = serde_json::from_str(&text).map_err(|error| {
@@ -797,6 +772,87 @@ mod tests {
             None,
         )
         .expect("provider")
+    }
+
+    /// A stream that never started is retryable here too.
+    ///
+    /// The Codex sibling of the pair in `provider::anthropic::subscription`: its own `.send()`
+    /// site, so its own wiring into [`crate::error::provider_transport_error`] and its own chance
+    /// to regress to a bare `MekaError::Provider` that the agent loop discards. `test_credential`'s
+    /// expiry is a day out, so `ensure_valid_credential` takes no refresh round trip first.
+    #[tokio::test]
+    async fn a_stream_that_could_not_start_reports_a_retryable_failure() {
+        // Bound and dropped, so the port is refused rather than answered or hung.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        let provider = ChatGptSubscriptionProvider::new(
+            test_credential(),
+            "gpt-5".to_string(),
+            Some(format!("http://127.0.0.1:{port}/v1")),
+            None,
+            None,
+            None,
+            "test".to_string(),
+            Some("high".to_string()),
+            None,
+        )
+        .expect("provider");
+        let (sender, _receiver) = mpsc::channel(8);
+        let error = provider
+            .stream(
+                "",
+                &[Message::user("hello")],
+                &[],
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "a stream that never started must be retryable, got: {error}"
+        );
+    }
+
+    /// The history probe classifies a dead endpoint the same way the turn path does.
+    ///
+    /// Its own `.send()` and response-read, so its own chance to bypass the shared classifier.
+    ///
+    /// Nothing retries this -- its caller is `meka account stats`, outside any retry loop -- so
+    /// classifying it changes only how the failure reads. Worth pinning anyway: it is the same
+    /// classifier the turn path depends on, and a probe that stops calling it has grown its own
+    /// private rules.
+    #[tokio::test]
+    async fn the_history_probe_reports_a_dead_endpoint_as_retryable() {
+        // Bound and dropped, so the port is refused rather than answered or hung.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        let provider = ChatGptSubscriptionProvider::new(
+            test_credential(),
+            "gpt-5".to_string(),
+            Some(format!("http://127.0.0.1:{port}/v1")),
+            None,
+            None,
+            None,
+            "test".to_string(),
+            Some("high".to_string()),
+            None,
+        )
+        .expect("provider");
+        let error = provider
+            .fetch_history()
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "{error}"
+        );
     }
 
     /// This backend keeps the `include` its API-key sibling refuses to send.
@@ -1116,6 +1172,104 @@ mod tests {
         .expect("provider");
         let result = provider.ensure_valid_credential().await;
         assert!(matches!(result, Err(MekaError::Provider(ref m)) if m.contains("expired")));
+    }
+
+    /// The Codex refresh path classifies by what the token endpoint answered, like its Claude twin.
+    ///
+    /// The sibling of `anthropic::subscription::tests::
+    /// what_the_token_endpoint_answered_decides_whether_a_refresh_is_retried`. The classification
+    /// they exercise lives in one place (`crate::error::oauth_refresh_error`, reached through
+    /// `provider::exchange_refresh_token`), so this is a wiring test: what it proves is that *this*
+    /// backend reaches that path, with its own
+    /// `context`, and that its answer still comes back as this backend's own message. Both halves
+    /// have been wrong here before -- every answer used to become a bare `MekaError::Provider`, so
+    /// an outage at the token endpoint killed a turn `ensure_valid_credential` was called from the
+    /// middle of, and a mutation sweep later showed the Codex copy of that branch was the one no
+    /// test could see.
+    #[tokio::test]
+    async fn what_the_codex_token_endpoint_answered_decides_whether_a_refresh_is_retried() {
+        for (status_line, body, retryable) in [
+            (
+                "503 Service Unavailable",
+                r#"{"error":"temporarily_unavailable"}"#,
+                true,
+            ),
+            ("400 Bad Request", r#"{"error":"invalid_grant"}"#, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock OAuth endpoint");
+            let local = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                // One read is enough to know the request arrived; the response follows whatever
+                // was sent, and the body is small enough to land in a single segment.
+                if socket.read(&mut scratch).await.is_err() {
+                    return;
+                }
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                if socket.shutdown().await.is_err() {
+                    tracing::debug!("mock Codex refresh endpoint did not shut down cleanly");
+                }
+            });
+
+            let credential = AuthCredential::OAuthToken {
+                access_token: "stale".to_string(),
+                refresh_token: Some("rt".to_string()),
+                expires_at: Some(crate::provider::now_epoch_millis()),
+                account_id: None,
+            };
+            let provider = ChatGptSubscriptionProvider::new(
+                credential,
+                "gpt-5".to_string(),
+                None,
+                None,
+                Some(format!("http://{}/", local)),
+                None,
+                "work".to_string(),
+                None,
+                None,
+            )
+            .expect("build test provider");
+
+            let error = provider
+                .ensure_valid_credential()
+                .await
+                .expect_err("the endpoint did not hand back a usable token");
+
+            // The `Codex` prefix is asserted because both backends now compose their messages from
+            // one shared exchange, and this is the half that would lose its own voice if the
+            // `context` a call site passes stopped being read.
+            match error {
+                MekaError::RetryableProvider { message, .. } if retryable => assert!(
+                    message.starts_with("Codex OAuth token refresh failed ("),
+                    "{status_line}: {message}"
+                ),
+                MekaError::Provider(message) if !retryable => {
+                    assert!(
+                        message.starts_with("Codex OAuth token refresh"),
+                        "{status_line}: {message}"
+                    );
+                    assert!(
+                        message.contains("meka provider login work"),
+                        "{status_line} should name the profile to log in to: {message}"
+                    );
+                }
+                other => panic!("{status_line} was classified wrongly: {other}"),
+            }
+        }
     }
 
     #[tokio::test]

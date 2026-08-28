@@ -767,6 +767,7 @@ pub(super) async fn drive_responses_sse_stream(
             status,
             &response_text,
             retry_after,
+            crate::error::ProviderRequest::Completion,
         ));
     }
 

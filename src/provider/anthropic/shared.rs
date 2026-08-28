@@ -73,6 +73,19 @@ pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit req
 /// resize cost).
 pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
 
+/// The request body's size in MiB, to one decimal, for the error a failed send reports.
+///
+/// One decimal rather than integer division, which truncates: every body from 2.0 to just under 3.0
+/// MiB reported "2 MiB", and this is the number a user quotes in a bug report about a request the
+/// provider would not take.
+///
+/// Called from inside the `map_err` closure rather than beside the length it reads, so the `String`
+/// is allocated on the failure path only. Every provider request pays for what happens here, and
+/// the value is read by none of the ones that succeed.
+pub(super) fn body_size_mib(bytes: usize) -> String {
+    format!("{:.1}", bytes as f64 / 1_048_576.0)
+}
+
 /// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both the non-streaming response
 /// parser and the SSE driver. Anthropic emits the same shape (`input_tokens`, `output_tokens`,
 /// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both places. Missing fields default
@@ -570,6 +583,7 @@ pub(super) async fn drive_claude_sse_stream(
             status,
             &response_text,
             retry_after,
+            crate::error::ProviderRequest::Completion,
         ));
     }
 

@@ -80,7 +80,7 @@ pub struct CompactResponse {
         (status = 409, description = "Turn in flight; cancel first", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, or nothing to compact", body = ProblemDetail),
-        (status = 502, description = "Provider call failed", body = ProblemDetail),
+        (status = 502, description = "The provider refused or failed the summarising turn. `/errors/context-overflow` here means the conversation will not fit even to summarise it", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
 )]

@@ -77,11 +77,6 @@ pub struct ClaudeSubscriptionProvider {
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
-/// A token refresh is a small request to a well-known endpoint, and it runs while holding the
-/// credential write lock that serialises every other caller's refresh. A whole-request deadline is
-/// right here in a way it never is for a turn: nothing legitimate takes minutes.
-const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl ClaudeSubscriptionProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -395,37 +390,6 @@ impl ClaudeSubscriptionProvider {
     ) -> Result<AuthCredential> {
         tracing::info!("refreshing Claude OAuth token");
 
-        let response = self
-            .client
-            .post(&self.oauth_token_url)
-            .timeout(REFRESH_TIMEOUT)
-            .json(&serde_json::json!({
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": self.client_id,
-            }))
-            .send()
-            .await
-            .map_err(|error| {
-                MekaError::Provider(format!(
-                    "OAuth token refresh request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_else(|error| {
-                tracing::warn!("failed to read Claude OAuth refresh error body: {}", error);
-                String::new()
-            });
-            return Err(MekaError::Provider(format!(
-                "OAuth token refresh failed ({}): {}",
-                status,
-                crate::error::render_error_body(&body)
-            )));
-        }
-
         #[derive(Deserialize)]
         struct RefreshResponse {
             access_token: String,
@@ -439,9 +403,19 @@ impl ClaudeSubscriptionProvider {
             uuid: String,
         }
 
-        let data: RefreshResponse = response.json().await.map_err(|error| {
-            MekaError::Provider(format!("failed to parse refresh response: {}", error))
-        })?;
+        // Only the shape of the answer is this backend's own; posting the grant and judging what
+        // came back is the same act for every issuer, and lives in one place so it cannot drift
+        // between the two subscription backends (see `provider::exchange_refresh_token`).
+        let data: RefreshResponse =
+            crate::provider::exchange_refresh_token(crate::provider::RefreshExchange {
+                client: &self.client,
+                token_url: &self.oauth_token_url,
+                client_id: &self.client_id,
+                refresh_token,
+                profile: &self.credential_key,
+                context: "OAuth token refresh",
+            })
+            .await?;
 
         // Saturating rather than wrapping: a nonsense `expires_in` should read as "far future" and
         // let the 401 correct it, not overflow to a past instant and refresh on every request.
@@ -607,7 +581,7 @@ impl Provider for ClaudeSubscriptionProvider {
         } else {
             body_json
         };
-        let body_size_mib = body_json.len() / 1_048_576;
+        let body_length = body_json.len();
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
         let betas = self.compute_betas(!tools.is_empty());
@@ -622,26 +596,29 @@ impl Provider for ClaudeSubscriptionProvider {
         );
 
         let response = request.body(body_json).send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "HTTP request failed (body {} MiB): {}",
-                body_size_mib,
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error(
+                &format!(
+                    "HTTP request failed (body {} MiB)",
+                    shared::body_size_mib(body_length)
+                ),
+                &error,
+                None,
+            )
         })?;
 
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
         remember_request_id(response.headers());
-        let response_text = response
-            .text()
-            .await
-            .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
+        let response_text = response.text().await.map_err(|error| {
+            crate::error::provider_transport_error("failed to read response", &error, retry_after)
+        })?;
 
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Completion,
             ));
         }
 
@@ -680,7 +657,7 @@ impl Provider for ClaudeSubscriptionProvider {
         } else {
             body_json
         };
-        let body_size_mib = body_json.len() / 1_048_576;
+        let body_length = body_json.len();
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
         let betas = self.compute_betas(!tools.is_empty());
@@ -695,11 +672,14 @@ impl Provider for ClaudeSubscriptionProvider {
         );
 
         let response = request.body(body_json).send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "HTTP request failed (body {} MiB): {}",
-                body_size_mib,
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error(
+                &format!(
+                    "HTTP request failed (body {} MiB)",
+                    shared::body_size_mib(body_length)
+                ),
+                &error,
+                None,
+            )
         })?;
 
         remember_request_id(response.headers());
@@ -732,21 +712,23 @@ impl Provider for ClaudeSubscriptionProvider {
             Some("oauth-2025-04-20"),
         );
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "usage request failed: {}",
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error("usage request failed", &error, None)
         })?;
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read usage response: {}", error))
+            crate::error::provider_transport_error(
+                "failed to read usage response",
+                &error,
+                retry_after,
+            )
         })?;
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Auxiliary,
             ));
         }
         let parsed: OAuthUsageResponse = serde_json::from_str(&response_text)
@@ -768,21 +750,23 @@ impl Provider for ClaudeSubscriptionProvider {
                 Some("oauth-2025-04-20"),
             );
             let response = request.send().await.map_err(|error| {
-                MekaError::Provider(format!(
-                    "profile request failed: {}",
-                    crate::error::format_reqwest_error(&error),
-                ))
+                crate::error::provider_transport_error("profile request failed", &error, None)
             })?;
             let status = response.status();
             let retry_after = crate::error::parse_retry_after(response.headers());
             let text = response.text().await.map_err(|error| {
-                MekaError::Provider(format!("failed to read profile response: {}", error))
+                crate::error::provider_transport_error(
+                    "failed to read profile response",
+                    &error,
+                    retry_after,
+                )
             })?;
             if !status.is_success() {
                 return Err(crate::error::provider_http_error(
                     status,
                     &text,
                     retry_after,
+                    crate::error::ProviderRequest::Auxiliary,
                 ));
             }
             text
@@ -829,21 +813,23 @@ impl Provider for ClaudeSubscriptionProvider {
             Some("oauth-2025-04-20"),
         );
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "history request failed: {}",
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error("history request failed", &error, None)
         })?;
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
         let text = response.text().await.map_err(|error| {
-            MekaError::Provider(format!("failed to read history response: {}", error))
+            crate::error::provider_transport_error(
+                "failed to read history response",
+                &error,
+                retry_after,
+            )
         })?;
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &text,
                 retry_after,
+                crate::error::ProviderRequest::Auxiliary,
             ));
         }
         #[derive(Deserialize)]
@@ -1039,10 +1025,117 @@ mod tests {
     }
 
     fn test_provider() -> ClaudeSubscriptionProvider {
+        provider_with_base(None)
+    }
+
+    fn provider_with_base(base_url: Option<&str>) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            base_url.map(str::to_string),
             None,
+            None,
+            None,
+            "test".to_string(),
+            ThinkingMode::Off,
+            10000,
+            "a".repeat(64),
+            Some("high".to_string()),
+            false,
+            None,
+            None,
+        )
+        .expect("build test provider")
+    }
+
+    /// A stream that never started is retryable on the backend a real session lost a turn to.
+    ///
+    /// This is the exact site of the incident: an HTTP/2 stream reset while uploading a 2 MiB body
+    /// was reported as a bare `MekaError::Provider`, which the agent loop discards, so the turn
+    /// ended on the first attempt.
+    ///
+    /// An OAuth token rather than the API key the other tests use, because this backend refuses an
+    /// API key outright and would never reach the send. Its expiry is a day out so
+    /// `ensure_valid_credential` takes no refresh round trip of its own first.
+    #[tokio::test]
+    async fn a_stream_that_could_not_start_reports_a_retryable_failure() {
+        let provider = provider_on_a_dead_port();
+        let (sender, _receiver) = mpsc::channel(8);
+        let error = provider
+            .stream(
+                "you are a test",
+                &[Message::user("hello")],
+                &[],
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "a stream that never started must be retryable, got: {error}"
+        );
+    }
+
+    /// The account probes classify a dead endpoint the same way the turn path does.
+    ///
+    /// Three functions in one test because they are one property: each has its own `.send()` and
+    /// response-read, and each is a place the shared classifier could be bypassed.
+    ///
+    /// Nothing retries these -- their callers are `meka account usage` / `whoami` / `stats` and the
+    /// REPL's `/usage`, none inside a retry loop -- so classifying them changes only how the
+    /// failure reads. Still worth pinning: it is the same classifier the turn path depends on, and
+    /// a probe that stops calling it is a probe that has grown its own private rules.
+    #[tokio::test]
+    async fn the_account_probes_report_a_dead_endpoint_as_retryable() {
+        let provider = provider_on_a_dead_port();
+
+        let usage = provider.fetch_usage().await.expect_err("nothing is there");
+        assert!(
+            matches!(usage, MekaError::RetryableProvider { .. }),
+            "{usage}"
+        );
+
+        let identity = provider
+            .fetch_identity()
+            .await
+            .expect_err("nothing is there");
+        assert!(
+            matches!(identity, MekaError::RetryableProvider { .. }),
+            "{identity}"
+        );
+
+        let history = provider
+            .fetch_history()
+            .await
+            .expect_err("nothing is there");
+        assert!(
+            matches!(history, MekaError::RetryableProvider { .. }),
+            "{history}"
+        );
+    }
+
+    /// A provider pointed at a port nothing is listening on, with a credential that needs no
+    /// refresh round trip of its own first.
+    ///
+    /// An OAuth token rather than the API key the other tests use, because this backend refuses an
+    /// API key outright and would never reach a send. The port is bound and dropped, so connecting
+    /// is refused rather than answered or left hanging.
+    fn provider_on_a_dead_port() -> ClaudeSubscriptionProvider {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        ClaudeSubscriptionProvider::new(
+            AuthCredential::OAuthToken {
+                access_token: "access-test".to_string(),
+                refresh_token: Some("refresh-test".to_string()),
+                expires_at: Some(crate::provider::now_epoch_millis() + 86_400_000),
+                account_id: Some("workspace-test".to_string()),
+            },
+            "claude-sonnet-4-20250514".to_string(),
+            Some(format!("http://127.0.0.1:{port}")),
             None,
             None,
             None,
@@ -3633,6 +3726,145 @@ mod tests {
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.shutdown().await;
             });
+        }
+    }
+
+    /// Answer every refresh with one fixed status and body, so a test can pin what the classifier
+    /// is handed. `truncate` overstates `Content-Length`, which is how a *successful* exchange
+    /// whose body never arrives is reproduced.
+    async fn run_mock_refusing_refresh_endpoint(
+        listener: tokio::net::TcpListener,
+        status_line: &'static str,
+        body: &'static str,
+        truncate: bool,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = Vec::with_capacity(2048);
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = match socket.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => return,
+                };
+                buf.extend_from_slice(&chunk[..read]);
+                let Some(end) = find_crlf_crlf(&buf) else {
+                    continue;
+                };
+                if buf.len() >= end + 4 + parse_content_length(&buf[..end]).unwrap_or(0) {
+                    break;
+                }
+            }
+
+            let declared = if truncate {
+                body.len() + 64
+            } else {
+                body.len()
+            };
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                status_line, declared, body
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                tracing::debug!("mock refresh endpoint could not shut its socket down cleanly");
+            }
+        }
+    }
+
+    /// What the token endpoint answered decides the classification, at the site rather than only in
+    /// the classifier.
+    ///
+    /// The wiring rather than the rule: `crate::error::oauth_refresh_error` has its own tests, and
+    /// this asserts that the refresh path calls it. Every answer used to become a bare
+    /// `MekaError::Provider`, which the agent loop drops, so a 503 from the token endpoint ended
+    /// the turn while a 503 from the messages endpoint two lines later was retried; and since
+    /// `ensure_valid_credential` runs inside `complete` and `stream`, that was a live turn lost to
+    /// an outage with nothing to do with the conversation. The 400 is the opposite failure: it must
+    /// *not* be retried, and it has to name the profile, because two accounts of one backend can
+    /// coexist and "log in again" alone does not say where.
+    #[tokio::test]
+    async fn what_the_token_endpoint_answered_decides_whether_a_refresh_is_retried() {
+        for (status_line, body, truncate, retryable) in [
+            (
+                "503 Service Unavailable",
+                r#"{"error":"temporarily_unavailable"}"#,
+                false,
+                true,
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"invalid_grant"}"#,
+                false,
+                false,
+            ),
+            // A success meka cannot read back: the grant is spent and only a login recovers it.
+            ("200 OK", r#"{"access_token":"#, true, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock OAuth endpoint");
+            let local = listener.local_addr().expect("local addr");
+            tokio::spawn(run_mock_refusing_refresh_endpoint(
+                listener,
+                status_line,
+                body,
+                truncate,
+            ));
+
+            let credential = AuthCredential::OAuthToken {
+                access_token: "stale".to_string(),
+                refresh_token: Some("rt".to_string()),
+                expires_at: Some(crate::provider::now_epoch_millis()),
+                account_id: None,
+            };
+            let provider = ClaudeSubscriptionProvider::new(
+                credential,
+                "claude-sonnet-4-20250514".to_string(),
+                None,
+                None,
+                Some(format!("http://{}/", local)),
+                None,
+                "work".to_string(),
+                ThinkingMode::Off,
+                10000,
+                "a".repeat(64),
+                None,
+                false,
+                None,
+                None,
+            )
+            .expect("build test provider");
+
+            let error = provider
+                .ensure_valid_credential()
+                .await
+                .expect_err("the endpoint did not hand back a usable token");
+
+            // The prefix is asserted as well as the variant because the two backends now compose
+            // their messages from one shared exchange: a reworded `context` would change what a
+            // user greps for in both at once, silently.
+            match error {
+                MekaError::RetryableProvider { message, .. } if retryable => assert!(
+                    message.starts_with("OAuth token refresh failed ("),
+                    "{status_line}: {message}"
+                ),
+                MekaError::Provider(message) if !retryable => {
+                    assert!(
+                        message.starts_with("OAuth token refresh"),
+                        "{status_line}: {message}"
+                    );
+                    assert!(
+                        message.contains("meka provider login work"),
+                        "{status_line} should name the profile to log in to: {message}"
+                    );
+                }
+                other => panic!("{status_line} was classified wrongly: {other}"),
+            }
         }
     }
 

@@ -184,31 +184,34 @@ impl Provider for AnthropicMessagesProvider {
                         MekaError::Provider(format!("failed to serialize body: {}", error))
                     })
             })?;
-        let body_size_mib = body_json.len() / 1_048_576;
+        let body_length = body_json.len();
         let request = self
             .apply_headers(self.client.post(format!("{}/v1/messages", self.base_url)))
             .body(body_json);
 
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "HTTP request failed (body {} MiB): {}",
-                body_size_mib,
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error(
+                &format!(
+                    "HTTP request failed (body {} MiB)",
+                    shared::body_size_mib(body_length)
+                ),
+                &error,
+                None,
+            )
         })?;
 
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response
-            .text()
-            .await
-            .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
+        let response_text = response.text().await.map_err(|error| {
+            crate::error::provider_transport_error("failed to read response", &error, retry_after)
+        })?;
 
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
                 status,
                 &response_text,
                 retry_after,
+                crate::error::ProviderRequest::Completion,
             ));
         }
 
@@ -244,7 +247,7 @@ impl Provider for AnthropicMessagesProvider {
         {
             tracing::debug!("failed to forward redaction notice into stream: {}", error);
         }
-        let body_size_mib = body_json.len() / 1_048_576;
+        let body_length = body_json.len();
         let request = self
             .apply_headers(
                 self.client
@@ -254,11 +257,14 @@ impl Provider for AnthropicMessagesProvider {
             .body(body_json);
 
         let response = request.send().await.map_err(|error| {
-            MekaError::Provider(format!(
-                "HTTP request failed (body {} MiB): {}",
-                body_size_mib,
-                crate::error::format_reqwest_error(&error),
-            ))
+            crate::error::provider_transport_error(
+                &format!(
+                    "HTTP request failed (body {} MiB)",
+                    shared::body_size_mib(body_length)
+                ),
+                &error,
+                None,
+            )
         })?;
 
         drive_claude_sse_stream(response, event_sender, cancellation).await
@@ -306,6 +312,174 @@ mod tests {
             None,
         )
         .expect("build test provider")
+    }
+
+    /// A backend that could not reach its endpoint reports a failure the agent loop will retry.
+    ///
+    /// This is the wiring rather than the rule: [`crate::error::provider_transport_error`] has its
+    /// own tests, and what this one asserts is that a real `.send()` site actually calls it. Every
+    /// such site in every backend was hand-rolling a bare `MekaError::Provider`, which the retry
+    /// loop discards, so a site that quietly goes back to doing that is the regression worth
+    /// catching. One backend stands for the pattern; the classifier they all share is what makes
+    /// that enough.
+    #[tokio::test]
+    async fn a_backend_that_could_not_reach_its_endpoint_reports_a_retryable_failure() {
+        // Bound and dropped, so the port is refused rather than answered or hung.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        let provider = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let error = provider
+            .complete("", &[Message::user("hello")], &[])
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "a call that never reached the provider must be retryable, got: {error}"
+        );
+    }
+
+    /// The same, for the streaming path, which is the one an interactive turn actually takes.
+    ///
+    /// Worth its own test rather than trusting the sibling above: `complete` and `stream` build and
+    /// send their requests separately, so they are two wirings, and it was the streaming one that
+    /// ended a real session by reporting a connection reset as terminal.
+    #[tokio::test]
+    async fn a_backend_whose_stream_could_not_start_reports_a_retryable_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        let provider = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let (sender, _receiver) = mpsc::channel(8);
+        let error = provider
+            .stream(
+                "",
+                &[Message::user("hello")],
+                &[],
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "a stream that never started must be retryable, got: {error}"
+        );
+    }
+
+    /// A read that fails after the headers arrived keeps the hint those headers carried.
+    ///
+    /// Parsing `Retry-After` and passing it on are separate acts, and an earlier version did only
+    /// the first: every read site parsed the header into a local and then handed
+    /// [`crate::error::provider_transport_error`] a `None`, so a provider that had just said "wait
+    /// 60 seconds" was retried on plain 1s/2s backoff. The classifier's own tests cannot catch
+    /// that, because they supply the argument themselves; this one makes a real site parse a real
+    /// header. Asserting the message as well as the hint is what pins it to the read site: a 429
+    /// whose body *did* arrive is also retryable and also carries the hint, but says so in
+    /// `provider_http_error`'s words.
+    #[tokio::test]
+    async fn a_truncated_body_keeps_the_rate_limit_hint() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Read the request out in full before answering. A response written while the client is
+            // still uploading can be lost to the reset that closing an unread socket sends.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = match socket.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => return,
+                };
+                request.extend_from_slice(&chunk[..read]);
+                let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let length: usize = String::from_utf8_lossy(&request[..head_end])
+                    .split("\r\n")
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    break;
+                }
+            }
+
+            // A `Content-Length` the body then stops short of, so the read ends at EOF with the
+            // status and headers already delivered.
+            let head = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\
+                        Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n";
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.write_all(b"{\"error\":").await.is_err() {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                tracing::debug!("mock endpoint could not shut its socket down cleanly");
+            }
+        });
+
+        let provider = provider_with_base(
+            "claude-sonnet-4-20250514",
+            None,
+            Some(&format!("http://127.0.0.1:{port}")),
+        );
+        let error = provider
+            .complete("", &[Message::user("hello")], &[])
+            .await
+            .expect_err("the body stops short of its declared length");
+
+        match error {
+            MekaError::RetryableProvider {
+                message,
+                retry_after,
+            } => {
+                assert!(
+                    message.starts_with("failed to read response"),
+                    "expected the read site rather than the status classifier: {message}"
+                );
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(60)));
+            }
+            other => panic!("expected a retryable failure carrying the hint, got: {other}"),
+        }
+    }
+
+    /// The size in a failed send's message is reported to one decimal.
+    ///
+    /// Nothing else reads this string, so nothing else would notice it going wrong, and it went
+    /// wrong once already: integer division reported every body from 2.0 to just under 3.0 MiB as
+    /// "2 MiB". It is the figure a user quotes when asking why a request was refused, so being out
+    /// by up to a megabyte sends the answer in the wrong direction.
+    #[test]
+    fn a_body_size_is_reported_to_one_decimal() {
+        assert_eq!(shared::body_size_mib(0), "0.0");
+        assert_eq!(shared::body_size_mib(1_048_576), "1.0");
+        // The case truncation got wrong: two and a half megabytes is not "2 MiB".
+        assert_eq!(shared::body_size_mib(2_621_440), "2.5");
+        assert_eq!(shared::body_size_mib(3_145_727), "3.0");
     }
 
     #[test]

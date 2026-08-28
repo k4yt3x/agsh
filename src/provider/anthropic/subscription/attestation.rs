@@ -466,6 +466,16 @@ fn stainless_os() -> &'static str {
 /// (`http::HeaderName` normalises, and HTTP/2 requires it anyway, so this is invisible on the real
 /// wire), and `reqwest` places `Accept-Encoding` first because its decompression layer installs it
 /// before any per-request header.
+///
+/// **`Connection: keep-alive` is deliberately absent, though the capture shows it.** It is one of
+/// the connection-specific header fields HTTP/2 forbids (RFC 9113 §8.2.2), and a peer that receives
+/// one must treat the message as malformed and reset the stream with `PROTOCOL_ERROR`. Setting it
+/// here achieved nothing either way: hyper strips it on the h2 path, so it never went on the wire.
+/// It does so silently in this build -- the `warn!` beside the strip is behind hyper's `tracing`
+/// feature, which nothing here enables and which needs a `--cfg hyper_unstable_tracing` besides --
+/// so nothing would have said so. Whatever made the capture show it is a property of how the
+/// capture was taken rather than of what this endpoint receives, so do not re-add it by diffing
+/// against that capture.
 pub(super) fn apply_headers(
     request: reqwest::RequestBuilder,
     auth_header_name: &str,
@@ -501,7 +511,6 @@ pub(super) fn apply_headers(
         .header("x-app", "cli")
         // Per-request, not from an SDK helper.
         .header("x-client-request-id", Uuid::new_v4().to_string())
-        .header("Connection", "keep-alive")
         .header("Accept-Encoding", "gzip, deflate, br, zstd")
 }
 

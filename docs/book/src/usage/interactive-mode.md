@@ -200,6 +200,18 @@ Providers validate the whole conversation on every request, so one piece of cont
 
 A mislabelled image already committed to the session is repaired when you resume it, without a provider round trip. For anything further back, use `/rewind`.
 
+### Recovering from a call that got no answer
+
+A refusal is one thing the provider says; a request that never got a usable reply at all is another. A connection that fails or is reset while the request is going out is retried with backoff (up to twice, waiting 1s then 2s), and so is a response body that could not be read back. The turn continues as if the failed attempt had not happened, and nothing about it enters the conversation. Only when the retries run out does the turn report the error.
+
+Worth knowing what a retry can cost. When the failure was a body that could not be read, the provider had already generated the response and billed you for it, so the retry pays a second time. meka does it anyway, because the alternative is losing the turn for content you have already been charged for once, but it is not free.
+
+Two failures are not retried, because the next attempt is known not to be worth making: a request meka could not build, and a URL that redirects in a loop. A redirect loop points at a misconfigured `base_url`; a request that could not be built points at whatever went into it, most often a `base_url` that is not a URL or a stored credential carrying a character that cannot go in a header.
+
+Retrying is bounded by time as well as by count, and the time bound is the one that usually decides. A failure that takes the full read timeout to arrive costs five minutes, which spends the whole budget, so a call that hung is reported rather than tried again: retrying is for a failure that was cheap, and a provider that went silent for five minutes has already taken more of your turn than a second silence is worth. Without the bound at all, three slow failures would be fifteen minutes of waiting on a turn that fails anyway.
+
+The bound stops a *new* attempt starting rather than capping the total, so the worst case is a failure arriving just under the five minutes and permitting one more full-length attempt after it, for about ten in total.
+
 ### `/fork`
 
 `/fork` copies the current session and switches you into the copy, printing its ID. Your conversation carries over untouched, so the branch happens exactly where you are; the original stops there and keeps everything up to that point.

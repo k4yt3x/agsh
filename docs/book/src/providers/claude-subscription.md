@@ -89,7 +89,7 @@ The OAuth client ID defaults to Claude Code's client ID but can be overridden pe
 2. The token bundle is stored in the database, keyed by the profile name.
 3. On subsequent launches the token is loaded from the database.
 4. meka refreshes the access token automatically when it's within 5 minutes of expiry; the new token is written back to the database under the same profile.
-5. If the refresh token dies, run `meka provider login <name>` to re-authenticate.
+5. If the refresh token dies, run `meka provider login <name>` to re-authenticate. meka says so itself: a refresh the authorisation server *rejects* ends the turn with that command in the error, naming the profile. A refresh that fails because the token endpoint is rate-limited or down is retried with backoff instead, since neither answer means the grant is bad.
 
 **Token refresh URL:** defaults to `https://api.anthropic.com/v1/oauth/token`. Configurable via `oauth_token_url` in the profile.
 

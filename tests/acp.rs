@@ -4499,16 +4499,14 @@ fn acp_session_prompt_retries_transient_provider_error_then_succeeds() {
 /// the failure to the client as a normal JSON-RPC error, exactly like a non-retryable failure does.
 #[test]
 fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
-    // MAX_PROVIDER_RETRIES (3) retries + the initial attempt = 4 total attempts, all failing.
+    // MAX_PROVIDER_RETRIES (2) retries + the initial attempt = 3 total attempts, all failing.
     let script = serde_json::json!([
         [{ "kind": "fail_retryable", "message": "overloaded 1", "retry_after_secs": null }],
         [{ "kind": "fail_retryable", "message": "overloaded 2", "retry_after_secs": null }],
         [{ "kind": "fail_retryable", "message": "overloaded 3", "retry_after_secs": null }],
-        [{ "kind": "fail_retryable", "message": "overloaded 4", "retry_after_secs": null }],
     ]);
-    // The default backoff (1s + 2s + 4s = 7s of sleeping) plus process overhead is comfortably
-    // under 15s, but give this one extra headroom since it's the slowest test in the suite by
-    // design.
+    // The default backoff (1s + 2s = 3s of sleeping) plus process overhead is comfortably under
+    // 15s, but give this one extra headroom since it's the slowest test in the suite by design.
     let mut harness = AcpTestHarness::builder()
         .config(ACP_INVALID_PARAMS_CONFIG)
         .script(script)
@@ -4528,7 +4526,7 @@ fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
         .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
     // The last attempt's message is what propagates.
     assert!(
-        data.contains("overloaded 4"),
+        data.contains("overloaded 3"),
         "error.data should carry the final attempt's message; got: {}",
         data,
     );

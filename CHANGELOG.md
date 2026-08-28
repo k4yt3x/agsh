@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A failing provider call is attempted three times rather than four, with 1s then 2s of backoff.
+- A provider's `Retry-After` is honoured up to 60 seconds, where it was previously capped at 15.
+- A 502 from `meka serve` relays the upstream's `Retry-After` when it gave one, capped at an hour.
+- Both subscription backends share one OAuth refresh exchange, so their handling cannot drift.
+- `claude-subscription` stops setting `Connection: keep-alive`, which HTTP/2 forbids and never sent.
 - **Breaking:** a pre-migration backup supersedes the previous one; the copy 0.43 left is deleted.
 - **Breaking:** `schedule_create` drops `isolated`; every job fires in the session that created it.
 - **Breaking:** `POST /v1/sessions/{id}/schedule` rejects `isolated`; job views and webhooks drop it.
@@ -49,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A provider call that got no usable response is retried with backoff instead of ending the turn.
+- A retry sequence starts no new attempt after five minutes, so a call that hung is not tried again.
+- `meka serve` answers 502 rather than 500 for a retryable, mid-stream or context-overflow failure.
+- A context overflow answers `/errors/context-overflow`, so a client stops retrying what cannot fit.
+- A 400 from a usage or history probe no longer classifies as a malformed *turn*.
+- A 429 or 5xx from an OAuth token endpoint is retried instead of killing the turn in progress.
+- A rejected OAuth refresh names the profile to run `meka provider login` on.
+- `meka serve` answers 503 `/errors/mcp-unavailable`, not 500, when a required MCP server is down.
+- A `Retry-After` the provider gave is no longer discarded when reading its response body fails.
+- A failed send reports the body size to one decimal; integer division rounded 2.9 MiB down to 2.
 - A scheduled job can always cancel itself from the turn it wakes; an isolated fire could not.
 - `meka provider add` destroyed every profile when `providers` was written as an inline table.
 - `meka provider remove` on the same config reported the opposite of what it did.

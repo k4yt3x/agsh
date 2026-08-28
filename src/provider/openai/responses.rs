@@ -25,7 +25,7 @@ use super::responses_wire::{
     aggregate_stream, build_request_body, drive_responses_sse_stream, drop_replayed_reasoning,
 };
 use crate::{
-    error::{MekaError, Result},
+    error::Result,
     provider::{Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
 };
 
@@ -151,10 +151,11 @@ impl Provider for OpenAiResponsesProvider {
             .send()
             .await
             .map_err(|error| {
-                MekaError::Provider(format!(
-                    "Responses HTTP request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ))
+                crate::error::provider_transport_error(
+                    "Responses HTTP request failed",
+                    &error,
+                    None,
+                )
             })?;
 
         drive_responses_sse_stream(response, event_sender, cancellation).await
@@ -182,6 +183,38 @@ mod tests {
             None,
         )
         .expect("build test provider")
+    }
+
+    /// A stream that never started is retryable here too.
+    ///
+    /// The sibling of the pair in `provider::anthropic::messages`, and here for the same reason:
+    /// this backend has its own `.send()` site, so it is its own wiring into
+    /// [`crate::error::provider_transport_error`] and its own chance to go back to a bare
+    /// `MekaError::Provider` that the agent loop discards.
+    #[tokio::test]
+    async fn a_stream_that_could_not_start_reports_a_retryable_failure() {
+        // Bound and dropped, so the port is refused rather than answered or hung.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+
+        let provider = provider(None, Some(&format!("http://127.0.0.1:{port}/v1")));
+        let (sender, _receiver) = mpsc::channel(8);
+        let error = provider
+            .stream(
+                "",
+                &[Message::user("hello")],
+                &[],
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing is listening there");
+
+        assert!(
+            matches!(error, crate::error::MekaError::RetryableProvider { .. }),
+            "a stream that never started must be retryable, got: {error}"
+        );
     }
 
     /// The endpoint is composed the same way Chat Completions composes its own.
