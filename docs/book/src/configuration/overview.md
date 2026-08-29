@@ -33,24 +33,45 @@ credential, meka prints an error pointing at `meka provider add` / `meka provide
 | Profile for an existing session | The session's own row | `--provider <name>`, which **repins** the row |
 | Profile for a new session | `default_provider` in config, or the sole profile | `--provider <name>` |
 | Backend (`type`) | `[providers.<name>].type` | -- |
-| Model | The session's `model_override`, else `[providers.<name>].model` | `-m`, `--model`, recorded on the session |
+| Model | `[providers.<name>].model` | -- |
+| Every other model-tied setting | `[providers.<name>].*` | -- |
 | Credential (API key / OAuth) | Database, via `meka provider add` / `login` | -- |
+
+## A profile is indivisible
+
+A profile is a named bundle: the backend, the endpoint, the credential keyed to it, the model, and
+every model-tied setting (`context_window`, `vision`, `max_output_tokens`, `effort`, `thinking`,
+`thinking_budget`, `redact_thinking`). A session selects one by name and records that name.
+**Nothing overrides a field inside one.**
+
+There is deliberately no `--model`, `--base-url`, `--thinking` or `--thinking-budget`. A flag that
+moved one field of the bundle left the rest behind, so a session could run a 200K model while
+gauging its context against the 1M window its profile still stated, and never auto-compact.
+
+To change a setting, edit the profile:
+
+```bash
+meka provider set work model claude-opus-5
+```
+
+To run something different, make a second profile and select it:
+
+```bash
+meka provider add fast --type anthropic-messages --model claude-haiku-4-5 --context-window 200000
+meka --provider fast "quick question"
+```
 
 ## Override Layers
 
 Provider configuration is layered as follows; higher-priority layers override lower ones:
 
-1. **The session's own row**: the profile it was created with, and any model or endpoint override
-   recorded on it. A session that exists runs on what its row says, whatever `default_provider`
-   later becomes.
-2. **CLI flags**: `--provider`, `--model` and `--base-url`. On a new session these choose what the
-   row records. On a resume they **rewrite** it, so the change holds for every later turn and from
-   every surface. See [what a resume restores](../usage/sessions.md#what-a-resume-restores).
+1. **The session's own row**: the profile it was created with. A session that exists runs on what
+   its row says, whatever `default_provider` later becomes.
+2. **`--provider <name>`**: on a new session this chooses what the row records; on a resume it
+   **rewrites** the row, so the change holds for every later turn and from every surface. See
+   [what a resume restores](../usage/sessions.md#what-a-resume-restores).
 3. **Config file**: persistent profiles in `~/.config/meka/config.toml`.
 4. **Built-in defaults**: permission defaults to `read`, streaming defaults to on.
-
-`--thinking` is the exception: it applies to the run and is not recorded, because the thinking
-encoding is a property of the profile rather than of the conversation.
 
 There is **no environment-variable tier** for provider configuration; an ambient `OPENAI_API_KEY` or
 `MEKA_PROVIDER` has no effect (see [Environment Variables](./environment-variables.md)).

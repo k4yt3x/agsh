@@ -51,7 +51,7 @@ Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, m
 
 ### `thinking`
 
-`adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens), which pre-4.6 models require; `off` sends no thinking field. `temperature` follows whether thinking is on at all, not which encoding it uses. The betas do not: they are gated on the model alone.
+`adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from the profile's `thinking_budget` (falling back to [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens)), which pre-4.6 models require; `off` sends no thinking field. `temperature` follows whether thinking is on at all, not which encoding it uses. The betas do not: they are gated on the model alone.
 
 ### `redact_thinking`
 

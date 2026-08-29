@@ -11,9 +11,13 @@
 //! compatibility grows with every reader times every shape it has to tolerate and never goes away;
 //! a migration converts once and leaves exactly one shape in the world.
 //!
-//! **A migration is frozen when it ships, and so are its dependencies.** It may not call meka's own
-//! code. It reads and writes raw rows, and inlines whatever the logic meant at the time it was
-//! written. [`gates_become_kind_and_spec`] builds its JSON by hand rather than through
+//! **A migration is frozen once any store has run it, and so are its dependencies.** Once, not
+//! "once it ships": `user_version` is a positional index into this list, so removing an entry
+//! renumbers every entry after it, and a store stamped between the hole and the new head skips a
+//! step it never ran and then stamps itself current. A development store is a store. It may not
+//! call meka's own code either. It reads and writes raw rows, and inlines whatever the logic meant
+//! at the time it was written. [`gates_become_kind_and_spec`] builds its JSON by hand rather than
+//! through
 //! `Gate::spec`, because a migration that borrowed that function would quietly start doing
 //! something else the day the gate types are refactored, years after the users it ran for stopped
 //! being able to notice.
@@ -129,8 +133,8 @@ impl Context {
 
 /// Every migration, in order. **Append only, and never edit a shipped entry**: users who already
 /// ran it will not run it again, so an edit changes what new stores get and nothing else, which is
-/// a divergence no test downstream of it can see. `the_released_prefix_is_frozen` fails the build
-/// on any change to an entry that has shipped.
+/// a divergence no test downstream of it can see. `the_ledger_is_append_only` fails the build on
+/// any change to an entry any store has already run.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "baseline_0_42",
@@ -155,6 +159,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "scheduled_jobs_forget_isolation",
         step: Step::Rust(scheduled_jobs_forget_isolation),
+    },
+    Migration {
+        name: "sessions_forget_their_model_overrides",
+        step: Step::Rust(sessions_forget_their_model_overrides),
+    },
+    Migration {
+        name: "mcp_credentials_exist_on_every_store",
+        step: Step::Rust(mcp_credentials_exist_on_every_store),
     },
 ];
 
@@ -897,30 +909,6 @@ fn sessions_name_their_provider(
     Ok(())
 }
 
-/// Add the two columns that hold a session's per-session model and endpoint.
-///
-/// Nullable with no backfill, and that is the correct value rather than a shortcut: absent means
-/// "whatever the profile says", which is exactly what every session written before these columns
-/// existed did. There is nothing to convert.
-fn sessions_record_their_model_overrides(
-    transaction: &rusqlite::Transaction<'_>,
-) -> rusqlite::Result<()> {
-    let columns = {
-        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
-        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<String>>>()?
-    };
-    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
-    // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
-    if !columns.iter().any(|column| column == "model_override") {
-        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT")?;
-    }
-    if !columns.iter().any(|column| column == "base_url_override") {
-        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN base_url_override TEXT")?;
-    }
-    Ok(())
-}
-
 /// One table for every MCP secret, not only the OAuth ones.
 ///
 /// `mcp_oauth_credentials` was named for the only kind it could hold. A server's static bearer and
@@ -943,6 +931,13 @@ fn sessions_record_their_model_overrides(
 ///
 /// Every row that already exists came from the authorization-code flow, which is the only one that
 /// ever persisted anything, so they all copy over as `oauth` and there is nothing to work out.
+///
+/// [`mcp_credentials_exist_on_every_store`] repeats this conversion verbatim, and the duplication
+/// is the point rather than an oversight: that step reaches stores this one was renumbered past,
+/// and each entry is frozen on its own, so neither may borrow the other's body. The visible cost is
+/// that `cargo mutants` reports replacing *this* function with `Ok(())` as a surviving mutant,
+/// because the later step puts the table back. Belt and braces, deliberately, on the one table
+/// whose absence took down every MCP connection.
 fn mcp_credentials_hold_every_kind(
     transaction: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<()> {
@@ -974,6 +969,122 @@ fn mcp_credentials_hold_every_kind(
     // `classify_by_shape` has already ruled out for anything this reaches. Guarded anyway, because
     // a step that assumes its predecessor's output is the assumption the replay rule exists to
     // break.
+    if table_exists("mcp_oauth_credentials")? {
+        transaction.execute_batch(
+            "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at)
+             SELECT server_name, 'oauth', credentials_json, updated_at FROM mcp_oauth_credentials",
+        )?;
+        transaction.execute_batch("DROP TABLE mcp_oauth_credentials")?;
+    }
+    Ok(())
+}
+
+/// Add the two columns that hold a session's per-session model and endpoint.
+///
+/// Nullable with no backfill, and that is the correct value rather than a shortcut: absent means
+/// "whatever the profile says", which is exactly what every session written before these columns
+/// existed did. There is nothing to convert.
+///
+/// **Superseded by [`sessions_forget_their_model_overrides`], and kept anyway.** The columns lasted
+/// one unreleased cycle before a profile became indivisible, so nothing shipped with them and the
+/// obvious move was to delete this entry outright. That is wrong, and the reason is the whole point
+/// of a positional ledger: `user_version` is an *index*, so removing an entry renumbers every entry
+/// after it, and a store stamped anywhere between the hole and the new head silently skips a step
+/// it never ran while claiming to be current. A development store sitting at 4 lost
+/// `mcp_credentials_hold_every_kind` exactly that way, then stamped itself finished so nothing
+/// would ever revisit it. An entry is frozen once *any* store has run it, which is not the same
+/// thing as having shipped; append a reversal instead.
+///
+/// A consequence worth stating, because it looks like a coverage hole and is not: this body is now
+/// net-inert on every path, since step 6 drops exactly what it adds. `cargo mutants` therefore
+/// reports replacing it with `Ok(())` as a surviving mutant, and no test can kill it. The entry
+/// still has to be here, holding index 3 so nothing after it moves.
+fn sessions_record_their_model_overrides(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
+    // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
+    if !columns.iter().any(|column| column == "model_override") {
+        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN model_override TEXT")?;
+    }
+    if !columns.iter().any(|column| column == "base_url_override") {
+        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN base_url_override TEXT")?;
+    }
+    Ok(())
+}
+
+/// 0.44: a session records the profile it runs on and nothing else.
+///
+/// A provider profile is an indivisible bundle, so a session names one rather than carrying a
+/// rewritten copy of part of it. The two columns held the copy; they are dropped rather than left
+/// inert for the reason [`scheduled_jobs_forget_isolation`] gives about `isolated`.
+///
+/// Nothing is converted. A row that pinned a model was pinning it *at its profile's own endpoint*,
+/// so the profile still describes where that conversation was had; what is lost is a model
+/// override, which was only ever expressible for one unreleased cycle.
+fn sessions_forget_their_model_overrides(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns: Vec<String> = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    // Guarded on each column independently, so a store that lost its `user_version` and replays
+    // this step does not fail on `no such column` and refuse to open ever afterwards.
+    if columns.iter().any(|column| column == "model_override") {
+        transaction.execute_batch("ALTER TABLE sessions DROP COLUMN model_override")?;
+    }
+    if columns.iter().any(|column| column == "base_url_override") {
+        transaction.execute_batch("ALTER TABLE sessions DROP COLUMN base_url_override")?;
+    }
+    Ok(())
+}
+
+/// Repair a store that a 0.44 development build renumbered past `mcp_credentials_hold_every_kind`.
+///
+/// That build deleted an entry from the middle of the ledger, which shifted this table's step down
+/// one. A store stamped at the old index 4 was therefore judged to have already run it, skipped it,
+/// and stamped itself current -- so every MCP connection failed with `no such table:
+/// mcp_credentials` while the migration reported success.
+///
+/// Restoring the ledger's numbering fixes the *cause*, but not those stores: they are now stamped
+/// past the step they missed, so nothing replays it. Appending is the only thing that reaches them,
+/// which is the same reason the reversal above is appended rather than the entry being edited.
+///
+/// A no-op on every store that is not in that state, which is all of them but the ones that ran
+/// that build. Deliberately self-contained rather than calling
+/// [`mcp_credentials_hold_every_kind`]: each entry is frozen on its own, and a step that borrows
+/// another's body would start meaning whatever that one meant later.
+fn mcp_credentials_exist_on_every_store(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    };
+
+    if table_exists("mcp_credentials")? {
+        return Ok(());
+    }
+    transaction.execute_batch(
+        "CREATE TABLE mcp_credentials (
+            server_name TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            secret      TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (server_name, kind)
+        )",
+    )?;
     if table_exists("mcp_oauth_credentials")? {
         transaction.execute_batch(
             "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at)
@@ -1171,8 +1282,8 @@ mod tests {
     /// It does **not** catch a column added to `BASELINE_0_42` instead of appended as a new
     /// migration, because the 0.42 fixture below is built from that same constant, so an edit lands
     /// in both paths and they agree. Verified by making that exact edit: this test passed and
-    /// `the_released_prefix_is_frozen` failed. That one is the guard for edits; this one is the
-    /// guard for divergence.
+    /// `the_ledger_is_append_only` failed. That one is the guard for edits; this one is the guard
+    /// for divergence.
     #[test]
     fn a_fresh_store_and_an_upgraded_one_have_the_same_schema() {
         let mut built_from_scratch = fresh();
@@ -1191,6 +1302,121 @@ mod tests {
         );
     }
 
+    /// Every stopping point in the ledger resumes to the shape a fresh store gets.
+    ///
+    /// What it does catch: a step that fails or converts differently depending on whether the
+    /// objects it touches were made a moment ago by an earlier step or were already there. Every
+    /// guarded step is a candidate, and the guards are why this file has so many of them.
+    ///
+    /// **What it cannot catch is renumbering, and the wording here used to claim otherwise.** The
+    /// intermediate store is built by running `MIGRATIONS[..stopped_at]` -- the *current* list --
+    /// so "a store at version N" means whatever this build says N is. Delete an entry and the
+    /// yardstick moves with the ledger: prefix and suffix still compose to the whole list, the
+    /// fingerprints still match, and this test passes. Verified by re-introducing the exact
+    /// deletion that caused the outage; this test was green and only
+    /// [`the_ledger_is_append_only`] failed.
+    ///
+    /// That is the general shape of every test in this file bar one: the "before" state is built
+    /// from the code under test, so no test here can see a defect that depends on what a *previous*
+    /// binary left behind. The single guard against renumbering is the hand-written name list in
+    /// [`the_ledger_is_append_only`], and it is hand-written for exactly that reason.
+    #[test]
+    fn every_reachable_version_converges_on_the_fresh_shape() {
+        let head = MIGRATIONS.len() as u32;
+
+        let mut reference = store_as_0_42_left_it();
+        let reference_plan = plan(&reference).expect("classified");
+        apply(
+            &mut reference,
+            reference_plan,
+            &Context::adopting(Some("p")),
+        )
+        .expect("migrated");
+        let expected = fingerprint(&reference);
+
+        for stopped_at in 0..=head {
+            // A store as a binary carrying only the first `stopped_at` steps would have left it.
+            let mut store = store_as_0_42_left_it();
+            {
+                let transaction = store.transaction().expect("transaction");
+                for migration in MIGRATIONS.iter().take(stopped_at as usize) {
+                    match &migration.step {
+                        Step::Sql(sql) => transaction.execute_batch(sql),
+                        Step::Rust(run) => run(&transaction),
+                        Step::Contextual(run) => run(&transaction, &Context::adopting(Some("p"))),
+                    }
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "building a store at {stopped_at} failed on {}: {error}",
+                            migration.name
+                        )
+                    });
+                }
+                transaction.commit().expect("commit");
+            }
+            store
+                .execute_batch(&format!("PRAGMA user_version = {stopped_at};"))
+                .expect("stamp the version that binary would have written");
+
+            // A store at 0 or 1 is classified by shape rather than believed; both are covered by
+            // their own tests. What matters here is that the migration completes and converges.
+            let step_plan = plan(&store).expect("a store at any reachable version is planned");
+            apply(&mut store, step_plan, &Context::adopting(Some("p")))
+                .unwrap_or_else(|error| panic!("a store at {stopped_at} must migrate: {error}"));
+
+            assert_eq!(
+                fingerprint(&store),
+                expected,
+                "a store stamped {stopped_at} did not converge on the fresh shape"
+            );
+            assert_eq!(
+                user_version(&store).expect("read the version back"),
+                head,
+                "a store stamped {stopped_at} did not end up at head"
+            );
+        }
+    }
+
+    /// A store stamped above head is refused, not migrated.
+    ///
+    /// This fires for a store a *newer* meka wrote, and that is the only thing it is for. 0.44
+    /// briefly relied on it for something else: `sessions_record_their_model_overrides` was deleted
+    /// rather than reversed, on the reasoning that an unreleased entry belongs to nobody, and this
+    /// refusal was supposed to catch the development stores that shortening the list left stranded
+    /// above head. It caught nothing, because the stores that mattered were stamped *below* the new
+    /// head, not above it: they skipped the step the hole renumbered past and reported success. The
+    /// entry was restored and reversed by an appended step, so the list only ever grows and this
+    /// test is back to guarding one thing.
+    ///
+    /// The refusal has to name the version and change nothing, because the remedy is the user's to
+    /// choose: recreate the store, restore the pre-upgrade backup, or converge it by hand.
+    #[test]
+    fn a_store_stamped_above_head_is_refused_rather_than_migrated() {
+        let connection = store_as_0_42_left_it();
+        let head = MIGRATIONS.len() as u32;
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {};", head + 1))
+            .expect("stamp it as a newer meka would");
+
+        let error = plan(&connection).expect_err("a store from the future must not be migrated");
+        let message = error.to_string();
+        assert!(
+            message.contains(&(head + 1).to_string()) && message.contains(&head.to_string()),
+            "the refusal names both versions so the user can tell which way to go: {message}"
+        );
+        assert!(
+            message.contains("Nothing has been changed"),
+            "and says it did not touch the store: {message}"
+        );
+
+        let still_there = user_version(&connection).expect("read the version back");
+        assert_eq!(
+            still_there,
+            head + 1,
+            "a refused plan leaves the version exactly as it found it"
+        );
+    }
+
     /// Editing a migration that has already shipped changes what new stores get and nothing else,
     /// because the users who ran it will never run it again. Reordering or renaming one does the
     /// same. None of that is visible downstream, so it is checked here rather than hoped for.
@@ -1203,7 +1429,7 @@ mod tests {
     /// edited step and therefore agree. The conversion tests below pin the gate JSON, not the
     /// DDL. Treat a `Rust` step's body as guarded by review alone.
     #[test]
-    fn the_released_prefix_is_frozen() {
+    fn the_ledger_is_append_only() {
         // FNV-1a, written out rather than taken from `DefaultHasher`, whose output Rust explicitly
         // does not promise to keep stable across releases. A test that changes its own expectation
         // when the toolchain moves is not a guard.
@@ -1215,13 +1441,41 @@ mod tests {
             }
             hash
         }
-        /// What has shipped, and only that. A **prefix**, deliberately: appending a migration is
-        /// the supported thing to do and must not fail this test, or the repair ritual becomes
-        /// "paste the new vector from the failure", which silently re-freezes an edited entry
-        /// alongside the appended one and launders exactly what this guards.
+        /// Every entry, in order, because **an entry is frozen once any store has run it** -- which
+        /// is not the same as having shipped.
+        ///
+        /// This used to pin the released prefix only, on the reasoning that an unreleased entry
+        /// belongs to nobody. It does not: a development store has run it, and `user_version` is a
+        /// positional index, so removing an entry renumbers every entry after it and a store
+        /// stamped between the hole and the new head skips a step it never ran while reporting a
+        /// clean migration. That happened. `sessions_record_their_model_overrides` was deleted as
+        /// "unreleased, therefore free", and a store at 4 silently lost
+        /// `mcp_credentials_hold_every_kind`, then stamped itself current so nothing would revisit
+        /// it. Every MCP connection failed with `no such table: mcp_credentials`.
+        ///
+        /// Still a **prefix** check, so appending stays legal and is the only legal move. Adding a
+        /// migration means adding a line here, which is the point: it is a deliberate, reviewable
+        /// act rather than a silent renumbering. If this fires for any other reason, append; never
+        /// paste the new vector out of the failure, which re-freezes the edit alongside whatever
+        /// was legitimately added and launders exactly what this guards.
         const SHIPPED: &[(&str, u64)] = &[
             ("baseline_0_42", 9890918125805624612_u64),
             ("gates_become_kind_and_spec", 16184223490636562176_u64),
+            ("sessions_name_their_provider", 7824110043179268911_u64),
+            (
+                "sessions_record_their_model_overrides",
+                4279137114388985815_u64,
+            ),
+            ("mcp_credentials_hold_every_kind", 18066399338065045505_u64),
+            ("scheduled_jobs_forget_isolation", 13446154123810759904_u64),
+            (
+                "sessions_forget_their_model_overrides",
+                17272656124316757495_u64,
+            ),
+            (
+                "mcp_credentials_exist_on_every_store",
+                6893219499647049540_u64,
+            ),
         ];
         let current: Vec<(&str, u64)> = MIGRATIONS
             .iter()
@@ -1506,6 +1760,113 @@ mod tests {
         );
     }
 
+    /// The store the broken build actually left, rebuilt by hand rather than by this ledger.
+    ///
+    /// Every other test here derives its "before" from the code under test, which is why none of
+    /// them could see the renumbering and why none of them reaches
+    /// [`mcp_credentials_exist_on_every_store`]'s body: by the time index 7 runs, index 4 has
+    /// always just created the table. This one writes the damaged shape out in SQL -- stamped past
+    /// the step, `mcp_credentials` absent, `mcp_oauth_credentials` still holding a bundle -- so the
+    /// repair has something to repair. Without it the `CREATE TABLE`, the `INSERT … SELECT` and the
+    /// `DROP TABLE` are all dead under test, and a wrong column name or a mistyped `kind` would
+    /// lose every user's OAuth bundle with the suite green.
+    #[test]
+    fn the_repair_rebuilds_a_table_the_renumbered_ledger_skipped() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                // What that build had done by the time it stamped 5: named the provider, and
+                // skipped the table. Written out rather than run, because a store built from
+                // today's list cannot be missing a step today's list contains.
+                "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+                 INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at) \
+                 VALUES ('docs', '{\"access_token\":\"at1\"}', '2026-01-01T00:00:00Z');
+                 PRAGMA user_version = 5;",
+            )
+            .expect("the shape the renumbered ledger left");
+
+        let planned = plan(&connection).expect("classified");
+        assert_eq!(planned.from, 5, "taken at its word, as a version is");
+        apply(&mut connection, planned, &Context::adopting(Some("p"))).expect("repaired");
+
+        let carried: Vec<(String, String, String)> = connection
+            .prepare("SELECT server_name, kind, secret FROM mcp_credentials")
+            .expect("the table the broken build never created")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(
+            carried,
+            vec![(
+                "docs".to_string(),
+                "oauth".to_string(),
+                "{\"access_token\":\"at1\"}".to_string()
+            )],
+            "the bundle is carried across under the kind the reader looks for, not dropped"
+        );
+        let old: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = \
+                 'mcp_oauth_credentials'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count the superseded table");
+        assert_eq!(
+            old, 0,
+            "and the table it came from is gone, as on any other path"
+        );
+        assert_eq!(
+            user_version(&connection).expect("read the version back"),
+            MIGRATIONS.len() as u32,
+            "a repaired store is at head like any other"
+        );
+    }
+
+    /// Rule 3 for [`sessions_forget_their_model_overrides`], on the store that makes it bite.
+    ///
+    /// A fresh install on the broken build never ran the step that *added* the override columns,
+    /// yet is stamped past the step that drops them. Replaying the drop over that store is the only
+    /// way its guard is ever consulted: on every path built from the current ledger, index 3 has
+    /// added the columns before index 6 removes them. Drop the guard and this is the one test that
+    /// notices, while such a store would be refused on every start with `no such column`.
+    #[test]
+    fn dropping_the_override_columns_replays_over_a_store_that_never_had_them() {
+        let mut connection = store_as_0_42_left_it();
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE mcp_credentials (
+                     server_name TEXT NOT NULL,
+                     kind        TEXT NOT NULL,
+                     secret      TEXT NOT NULL,
+                     updated_at  TEXT NOT NULL,
+                     PRIMARY KEY (server_name, kind)
+                 );
+                 DROP TABLE mcp_oauth_credentials;
+                 PRAGMA user_version = 5;",
+            )
+            .expect("a fresh store as the broken build built one");
+
+        let planned = plan(&connection).expect("classified");
+        apply(&mut connection, planned, &Context::adopting(Some("p")))
+            .expect("the drop must skip a column that was never added, not fail on it");
+
+        let columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('sessions')")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert!(
+            !columns.iter().any(|column| column == "model_override")
+                && !columns.iter().any(|column| column == "base_url_override"),
+            "and leaves the table without them either way: {columns:?}"
+        );
+    }
+
     /// Every job survives losing the column, keeps its schedule, and is still readable afterwards.
     ///
     /// The column sat at index 9 of a positionally-decoded row, so dropping it moves four fields
@@ -1597,47 +1958,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scheduled_jobs", [], |row| row.get(0))
             .expect("query");
         assert_eq!(surviving, 1, "and the job is still there");
-    }
-
-    /// The override columns replay for the same reason the provider column does, and the failure
-    /// mode is worse: a bare `ADD COLUMN` would refuse the store on every start, permanently.
-    #[test]
-    fn a_replay_neither_fails_nor_clears_a_chosen_model() {
-        let mut connection = store_as_0_42_left_it();
-        plant_session(&connection, "carried");
-        let first = plan(&connection).expect("classified");
-        apply(&mut connection, first, &Context::adopting(Some("first"))).expect("migrated");
-
-        connection
-            .execute(
-                "UPDATE sessions SET model_override = 'pinned' WHERE id = 'carried'",
-                [],
-            )
-            .expect("the user pins a model");
-        connection
-            .execute_batch("PRAGMA user_version = 0;")
-            .expect("the round trip that drops the version");
-
-        let replayed = plan(&connection).expect("classified by shape");
-        apply(
-            &mut connection,
-            replayed,
-            &Context::adopting(Some("second")),
-        )
-        .expect("the replay must not fail");
-
-        let model: Option<String> = connection
-            .query_row(
-                "SELECT model_override FROM sessions WHERE id = 'carried'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("read back");
-        assert_eq!(
-            model.as_deref(),
-            Some("pinned"),
-            "a replay adds the columns and converts nothing"
-        );
     }
 
     /// The step speaks exactly when it has something to say, and says which profile it chose.

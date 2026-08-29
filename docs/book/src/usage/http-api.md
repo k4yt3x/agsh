@@ -28,7 +28,7 @@ scopes = ["sessions:r", "sessions:w"]
 
 On startup the server logs the bind address and begins accepting requests. All endpoints (except health probes and OpenAPI docs) require a valid `Authorization: Bearer <token>` header.
 
-Four flags are refused rather than ignored: `-c`, `-r`, `--model` and `--base-url`. All four name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own provider profile. Set `model` and `base_url` on the profile in `config.toml` instead, or pass `provider` on the create request. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
+Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own provider profile. Pass `provider` on the create request instead. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
 
 > **TLS**: `meka serve` speaks plain HTTP. For production, front it with a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel).
 
@@ -139,11 +139,9 @@ longer sees the reasoning recorded under the old provider. Like the other `PATCH
 swap makes the swap wait for that turn rather than fail, so the request can take as long as the turn
 does. The row has already moved by then, and the agent follows when the turn ends.)
 
-A `PATCH` naming a provider **restates the session's whole binding**, so it clears any `model` or
-`base_url` override the session was carrying. That is deliberate: an override belonging to the
-profile you are leaving has no business following you onto one that may not have that model. It
-applies even when the body names the profile the session is already on, which is how you clear a
-stale override without moving profile.
+A `PATCH` naming a provider moves the session to that profile, and the profile is the whole story:
+the model, the endpoint and every model-tied setting come from it, so there is nothing else on the
+row to reconcile.
 
 If you run more than one `meka` on the same store, send the `PATCH` to whichever process has the
 session. A body naming only a provider is the one `PATCH` that works on a session this server has
@@ -201,18 +199,16 @@ back to its source. See [Forking a Session](./sessions.md#forking-a-session) for
 #### Importing an archive
 
 `POST /v1/sessions/import` recreates a session tree from a `meka session export` archive under fresh
-ids. Two rules differ from the CLI's `meka session import`, both because the archive arrives as
-request data rather than from the operator's own disk:
+ids, on the same terms as the CLI's `meka session import`. An archive naming no provider profile
+takes the server's default, the same one `POST /v1/sessions` applies to a body with no `provider`; a
+long-lived host always has one, since it refuses to start without it.
 
-- **A pinned endpoint is refused.** An archive whose session carries a `base_url_override` gets a
-  `422` naming the session. Honouring it would let anyone holding `sessions:w` point a session at a
-  URL of their choosing, and the profile's stored credential would be sent there on the next turn.
-  Import such an archive with `meka session import`, where the archive and the config are both
-  yours.
-- **A profile is adopted, not carried blindly.** An archive naming no provider profile takes the
-  server's default, the same one `POST /v1/sessions` applies to a body with no `provider`. If the
-  server has no default to give, the import is refused rather than creating a session that cannot
-  run.
+One limit is the server's alone: an archive holding more than **1000** sessions is refused with a
+`422` whose detail names the count and the cap, and points at `meka session import`. The whole tree
+is written in one transaction on the process's single database connection, so a larger one would
+hold every other in-flight request behind it. A one-shot `meka session import` restoring its own
+backup has nothing to contend with and so carries no cap; it is the way to restore a tree this
+large.
 
 Everything else about the archive is honoured as the CLI honours it; see
 [Exporting a Session](./sessions.md#exporting-a-session).

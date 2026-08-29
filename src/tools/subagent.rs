@@ -624,7 +624,14 @@ impl Tool for AgentSpawnTool {
         let (sub_session_id, sub_session_lock) = self
             .tool_builder_params
             .session_manager
-            .create_child_session(parent_sid, Some(sub_cwd_snapshot.clone()), Some(spec_json))
+            .create_child_session(
+                parent_sid,
+                Some(sub_cwd_snapshot.clone()),
+                Some(spec_json),
+                // The same cell `build_subagent` reads a moment later, so the row this writes and
+                // the provider the worker is built on cannot come apart.
+                self.tool_builder_params.live_binding.current().binding,
+            )
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_spawn".to_string(),
@@ -2447,9 +2454,15 @@ mod tests {
     }
 
     fn binding_on(provider: Arc<dyn Provider>) -> crate::agent::PublishedBinding {
+        binding_named(provider, "test-profile")
+    }
+
+    /// The same, with the profile *name* chosen, for a test that needs the parent's live binding to
+    /// differ from what its row records.
+    fn binding_named(provider: Arc<dyn Provider>, profile: &str) -> crate::agent::PublishedBinding {
         crate::agent::PublishedBinding::detached(&crate::agent::ResolvedBinding {
             provider,
-            binding: crate::session::SessionProvider::from("test-profile".to_string()),
+            binding: profile.to_string(),
             context_window: 200_000,
             vision: true,
         })
@@ -2680,6 +2693,7 @@ mod tests {
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("serialize the spec")),
+                "test-profile".to_string(),
             )
             .await
             .expect("child");
@@ -2762,6 +2776,7 @@ mod tests {
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("encode")),
+                "test-profile".to_string(),
             )
             .await
             .expect("child")
@@ -2848,6 +2863,7 @@ mod tests {
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("encode")),
+                "test-profile".to_string(),
             )
             .await
             .expect("child")
@@ -2961,6 +2977,80 @@ mod tests {
             .await?
             .expect("a spawned worker has a spec");
         Ok(serde_json::from_str(&json).expect("spec decodes"))
+    }
+
+    /// A worker's row records the profile its parent is *running on*, not the one its parent's row
+    /// says.
+    ///
+    /// The sibling of [`a_worker_gauges_against_the_window_its_parent_runs_on_now`], and the same
+    /// defect a third time: provider, window and now the recorded profile all have to come off the
+    /// one live cell. This one was taken by SQL, `SELECT … provider FROM sessions`, which is the
+    /// parent's *row*.
+    ///
+    /// The two come apart for as long as a repin that could not take the runtime lock. ACP's
+    /// `session/set_config_option` moves the row mid-turn and `try_lock`s the runtime; when a turn
+    /// is in flight that fails, and the agent stays where it was until the next turn. A worker
+    /// spawned in that window ran on the old profile and billed the old account, while its row
+    /// claimed the new one -- so a later `agent_followup` on that child resolved a different
+    /// account from the one that had done the work.
+    ///
+    /// The row here is deliberately left on `stale-row-profile` while the live binding says
+    /// `live-profile`, because a test where the two agree cannot tell the fix from the bug.
+    #[tokio::test]
+    async fn a_spawned_worker_records_the_profile_its_parent_runs_on_now() {
+        let session_manager = test_session_manager().await;
+        let parent_sid = session_manager
+            .create_session(None, "stale-row-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = test_params(
+            session_manager.clone(),
+            Arc::new(RwLock::new(Some(parent_sid))),
+        );
+        params.live_binding = binding_named(
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("done"),
+            ])),
+            "live-profile",
+        );
+
+        let spawn = AgentSpawnTool {
+            parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            tool_builder_params: params,
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let output = spawn
+            .execute(
+                serde_json::json!({"prompt": "do a thing", "permission": "read"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("spawn");
+        let text = super::super::tests::text_content(&output);
+        let agent_id: Uuid = text
+            .lines()
+            .find_map(|line| line.strip_prefix("agent: "))
+            .and_then(|id| Uuid::parse_str(id.trim()).ok())
+            .unwrap_or_else(|| panic!("no agent id in: {text}"));
+
+        assert_eq!(
+            session_manager
+                .recorded_provider(agent_id)
+                .await
+                .expect("read the child's row"),
+            Some("live-profile".to_string()),
+            "the worker's row must name what it was built on, not what the parent's row still says"
+        );
+        assert_eq!(
+            session_manager
+                .recorded_provider(parent_sid)
+                .await
+                .expect("read the parent's row"),
+            Some("stale-row-profile".to_string()),
+            "and spawning must not rewrite the parent's own row on the way past"
+        );
     }
 
     /// A worker starts with nothing it was not given. Both grants default to the restrictive end,
@@ -3460,6 +3550,7 @@ mod tests {
                 parent_sid,
                 None,
                 Some(r#"{"permission":"read"}"#.to_string()),
+                "test-profile".to_string(),
             )
             .await
             .expect("child")
@@ -3526,6 +3617,7 @@ mod tests {
                 parent_sid,
                 None,
                 Some(r#"{"permission":"read"}"#.to_string()),
+                "test-profile".to_string(),
             )
             .await
             .expect("child")
@@ -3749,7 +3841,12 @@ mod tests {
             .await
             .expect("stranger");
         let child = session_manager
-            .create_child_session(owner, None, Some("{\"permission\":\"read\"}".to_string()))
+            .create_child_session(
+                owner,
+                None,
+                Some("{\"permission\":\"read\"}".to_string()),
+                "test-profile".to_string(),
+            )
             .await
             .expect("child")
             .0;
@@ -3815,7 +3912,7 @@ mod tests {
             .await
             .expect("parent");
         let child = session_manager
-            .create_child_session(parent_sid, None, None)
+            .create_child_session(parent_sid, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;

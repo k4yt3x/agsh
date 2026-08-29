@@ -80,7 +80,7 @@ pub struct SessionMetaRow {
     pub subagent_spec_json: Option<String>,
     /// What the session runs on, so an export carries it and an import can restore it rather than
     /// landing every imported session on the empty profile no configuration can name.
-    pub provider: SessionProvider,
+    pub provider: String,
 }
 
 /// Per-surface overrides applied to the copy produced by [`SessionManager::fork_session`]. Each
@@ -117,7 +117,7 @@ pub struct ImportSessionRecord {
     /// What the imported session runs on. The caller settles this: an archive that carries a
     /// profile keeps it, and one written before the field existed adopts the importing
     /// installation's default, which is the only thing that can be known about it here.
-    pub provider: SessionProvider,
+    pub provider: String,
     pub stats: crate::stats::SessionStatsSnapshot,
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub events: Vec<(String, crate::conversation::Event)>,
@@ -144,9 +144,9 @@ pub struct SessionSummary {
     /// API persists this so `POST /v1/sessions` with an explicit `permission` field survives
     /// GC-eviction + re-attach.
     pub permission: Option<String>,
-    /// What this session runs on: the profile that resolved when the row was written, plus
-    /// whatever it overrides of that profile's model and endpoint.
-    pub provider: SessionProvider,
+    /// The name of the provider profile this session runs on, and nothing else: a profile is an
+    /// indivisible bundle, so the name is the whole binding.
+    pub provider: String,
     /// Per-session capability flags, as a serialized
     /// [`crate::server::http_frontend::SessionCapabilities`]. Deliberately not enumerated here:
     /// the flag set has grown twice, and each restatement went stale silently. NULL on the
@@ -164,44 +164,6 @@ pub struct SessionSummary {
     /// receiving a flat list in which a worker is indistinguishable from the agent that dispatched
     /// it.
     pub parent_id: Option<Uuid>,
-}
-
-/// What a session runs on: the profile it names, plus any per-session override of that profile's
-/// model or endpoint.
-///
-/// The two overrides are `Option` because absence is honest rather than missing: every session has
-/// a profile, and a session with no override follows whatever `config.toml` currently says for that
-/// profile, so editing the profile moves the session with it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionProvider {
-    pub profile: String,
-    pub model_override: Option<String>,
-    pub base_url_override: Option<String>,
-}
-
-impl SessionProvider {
-    /// The override half, in the shape [`crate::provider::ProviderRegistry`] takes.
-    ///
-    /// `thinking` is deliberately absent: it is a per-profile encoding the user states because
-    /// neither meka nor the provider can determine it, not something a session pins.
-    pub fn overrides(&self) -> crate::config::ProfileOverrides {
-        crate::config::ProfileOverrides {
-            model: self.model_override.clone(),
-            base_url: self.base_url_override.clone(),
-            thinking: None,
-        }
-    }
-}
-
-impl From<String> for SessionProvider {
-    /// A profile with no overrides, which is what every caller that only names one wants.
-    fn from(profile: String) -> Self {
-        Self {
-            profile,
-            model_override: None,
-            base_url_override: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1128,7 +1090,7 @@ impl SessionManager {
     pub async fn create_session(
         &self,
         cwd: Option<std::path::PathBuf>,
-        provider: impl Into<SessionProvider>,
+        provider: impl Into<String>,
     ) -> Result<Uuid> {
         self.create_session_with_metadata(cwd, None, None, None, provider)
             .await
@@ -1149,7 +1111,7 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
-        provider: impl Into<SessionProvider>,
+        provider: impl Into<String>,
     ) -> Result<CreatedSession> {
         self.insert_session_row(
             Uuid::new_v4(),
@@ -1191,7 +1153,7 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
-        provider: impl Into<SessionProvider>,
+        provider: impl Into<String>,
     ) -> Result<(CreatedSession, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
         let lock = self.claim_a_fresh_id(session_id);
@@ -1242,22 +1204,15 @@ impl SessionManager {
     /// reachable, on a carried-forward row the migration could resolve no profile for, and needs no
     /// branch here: like a name that has since left `config.toml`, it is refused by
     /// [`crate::provider::ProviderRegistry::settings`], by name.
-    pub async fn recorded_provider(&self, session_id: Uuid) -> Result<Option<SessionProvider>> {
+    pub async fn recorded_provider(&self, session_id: Uuid) -> Result<Option<String>> {
         let id = session_id.to_string();
         self.connection
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT provider, model_override, base_url_override FROM sessions \
-                         WHERE id = ?1",
+                        "SELECT provider FROM sessions WHERE id = ?1",
                         [&id],
-                        |row| {
-                            Ok(SessionProvider {
-                                profile: row.get(0)?,
-                                model_override: row.get(1)?,
-                                base_url_override: row.get(2)?,
-                            })
-                        },
+                        |row| row.get::<_, String>(0),
                     )
                     .optional()
             })
@@ -1267,38 +1222,23 @@ impl SessionManager {
             })
     }
 
-    /// Move a session onto another provider binding, permanently.
+    /// Move a session onto another provider profile, permanently.
     ///
     /// The CLI's `/provider` and `--provider` repin and ACP's `session/set_config_option` land
-    /// here; the HTTP surfaces move the same three columns through
-    /// [`Self::update_session_metadata_atomic`], which writes them in one statement with permission
-    /// and cwd. Either door leaves the row stating what the session actually runs with, rather than
-    /// the drift the columns exist to remove: overriding for one run and leaving the row saying
+    /// here; the HTTP surfaces move the same column through
+    /// [`Self::update_session_metadata_atomic`], which writes it in one statement with permission
+    /// and cwd. Either door leaves the row stating what the session actually runs on, rather than
+    /// the drift the column exists to remove: overriding for one run and leaving the row saying
     /// something else.
-    ///
-    /// All three columns are written together because they describe one thing. A caller that means
-    /// to keep an override has to say so, which is what stops a repin from silently carrying one
-    /// profile's model onto another.
-    pub async fn set_recorded_provider(
-        &self,
-        session_id: Uuid,
-        provider: &SessionProvider,
-    ) -> Result<bool> {
+    pub async fn set_recorded_provider(&self, session_id: Uuid, profile: &str) -> Result<bool> {
         let id = session_id.to_string();
-        let provider = provider.clone();
+        let profile = profile.to_string();
         let changed = self
             .connection
             .call(move |connection| {
                 connection.execute(
-                    "UPDATE sessions SET provider = ?2, model_override = ?3, \
-                     base_url_override = ?4, updated_at = ?5 WHERE id = ?1",
-                    rusqlite::params![
-                        id,
-                        provider.profile,
-                        provider.model_override,
-                        provider.base_url_override,
-                        chrono::Utc::now().to_rfc3339()
-                    ],
+                    "UPDATE sessions SET provider = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, profile, chrono::Utc::now().to_rfc3339()],
                 )
             })
             .await
@@ -1340,7 +1280,7 @@ impl SessionManager {
         permission: Option<String>,
         capabilities_json: Option<String>,
         token_id: Option<String>,
-        provider: SessionProvider,
+        provider: String,
     ) -> Result<CreatedSession> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
@@ -1350,8 +1290,8 @@ impl SessionManager {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "INSERT INTO sessions (id, created_at, updated_at, cwd, permission, \
-                     capabilities_json, token_id, provider, model_override, base_url_override)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     capabilities_json, token_id, provider)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
                         session_id.to_string(),
                         created_at_for_db,
@@ -1360,9 +1300,7 @@ impl SessionManager {
                         permission,
                         capabilities_json,
                         token_id,
-                        provider.profile,
-                        provider.model_override,
-                        provider.base_url_override,
+                        provider,
                     ],
                 )?;
                 Ok(())
@@ -1390,6 +1328,15 @@ impl SessionManager {
         parent: Uuid,
         cwd: Option<std::path::PathBuf>,
         subagent_spec_json: Option<String>,
+        // The profile the worker will actually be built on, which is the parent *agent's* live
+        // binding and not necessarily the parent *row's*. The two differ for exactly as long as a
+        // repin that could not take the runtime lock: ACP's `session/set_config_option` moves the
+        // row mid-turn, `try_lock` fails, and the agent stays where it was until the next turn.
+        // Selecting the column here recorded the profile the worker was not running on, so a later
+        // `agent_followup` on that child resolved a different account from the one that did the
+        // work. Passed in for the same reason the window is: everything about a worker's binding
+        // comes off one cell.
+        provider: String,
     ) -> Result<(Uuid, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
         // Locked before the row, like every other door that mints one -- and the exposure here is
@@ -1406,13 +1353,13 @@ impl SessionManager {
             .connection
             .call(move |connection| -> rusqlite::Result<bool> {
                 let rows = connection.execute(
-                    // The whole binding is selected from the parent rather than passed in: a
-                    // sub-agent runs the parent's conversation onward, so the two must not be able
-                    // to disagree about what that runs on.
+                    // Still `SELECT … FROM sessions WHERE id = ?4` rather than a plain `VALUES`,
+                    // because a parent that is gone must select no row and insert nothing. Only
+                    // the provider stopped being read off that row; see the parameter's note.
                     "INSERT INTO sessions
                          (id, created_at, updated_at, parent_session_id, cwd, subagent_spec_json,
-                          provider, model_override, base_url_override)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, provider, model_override, base_url_override
+                          provider)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
                      FROM sessions WHERE id = ?4",
                     rusqlite::params![
                         session_id.to_string(),
@@ -1421,6 +1368,7 @@ impl SessionManager {
                         parent.to_string(),
                         cwd_string,
                         subagent_spec_json,
+                        provider,
                     ],
                 )?;
                 Ok(rows > 0)
@@ -1577,7 +1525,7 @@ impl SessionManager {
                     "INSERT INTO sessions (
                          id, created_at, updated_at, parent_session_id, cwd, permission,
                          capabilities_json, token_id, additional_roots_json, provider,
-                         model_override, base_url_override, stat_turns,
+                         stat_turns,
                          stat_input_tokens, stat_output_tokens,
                          stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                          stat_redactions, stat_redacted_images, stat_redacted_bytes
@@ -1585,7 +1533,6 @@ impl SessionManager {
                      SELECT ?1, ?2, ?2, NULL, COALESCE(?3, cwd), permission,
                             capabilities_json, ?4,
                             CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, provider,
-                            model_override, base_url_override,
                             stat_turns,
                             stat_input_tokens, stat_output_tokens,
                             stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
@@ -1874,7 +1821,7 @@ impl SessionManager {
             capabilities_json: Option<String>,
             additional_roots_json: Option<String>,
             subagent_spec_json: Option<String>,
-            provider: SessionProvider,
+            provider: String,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String)>,
             tool_outputs: Vec<(String, String)>,
@@ -1912,11 +1859,11 @@ impl SessionManager {
                         "INSERT INTO sessions (
                              id, created_at, updated_at, parent_session_id, cwd, permission,
                              capabilities_json, additional_roots_json, subagent_spec_json,
-                             provider, model_override, base_url_override,
+                             provider,
                              stat_turns, stat_input_tokens, stat_output_tokens,
                              stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                              stat_redactions, stat_redacted_images, stat_redacted_bytes
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                         rusqlite::params![
                             session.id,
                             session.created_at,
@@ -1927,9 +1874,7 @@ impl SessionManager {
                             session.capabilities_json,
                             session.additional_roots_json,
                             session.subagent_spec_json,
-                            session.provider.profile,
-                            session.provider.model_override,
-                            session.provider.base_url_override,
+                            session.provider,
                             session.stats.turns as i64,
                             session.stats.input_tokens as i64,
                             session.stats.output_tokens as i64,
@@ -2047,8 +1992,7 @@ impl SessionManager {
                      )
                      SELECT s.id, s.parent_session_id, s.created_at, s.updated_at,
                             s.cwd, s.permission, s.capabilities_json, s.additional_roots_json,
-                            s.subagent_spec_json, s.provider, s.model_override,
-                            s.base_url_override
+                            s.subagent_spec_json, s.provider
                      FROM sessions s JOIN tree ON s.id = tree.id
                      ORDER BY tree.depth ASC, s.created_at ASC, s.id ASC",
                 )?;
@@ -2074,11 +2018,7 @@ impl SessionManager {
                             row.get::<_, Option<String>>(7)?.as_deref(),
                         ),
                         subagent_spec_json: row.get(8)?,
-                        provider: SessionProvider {
-                            profile: row.get(9)?,
-                            model_override: row.get(10)?,
-                            base_url_override: row.get(11)?,
-                        },
+                        provider: row.get(9)?,
                     })
                 })?;
                 let mut out = Vec::new();
@@ -2382,7 +2322,7 @@ impl SessionManager {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider, s.model_override, s.base_url_override,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -2420,12 +2360,8 @@ impl SessionManager {
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
                     let parent_id: Option<String> = row.get(8)?;
-                    let provider = SessionProvider {
-                        profile: row.get(9)?,
-                        model_override: row.get(10)?,
-                        base_url_override: row.get(11)?,
-                    };
-                    let preview: String = row.get(12)?;
+                    let provider: String = row.get(9)?;
+                    let preview: String = row.get(10)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2497,7 +2433,7 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider, s.model_override, s.base_url_override,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.provider,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -2517,12 +2453,8 @@ impl SessionManager {
                     let additional_roots_json: Option<String> = row.get(6)?;
                     let token_id: Option<String> = row.get(7)?;
                     let parent_id: Option<String> = row.get(8)?;
-                    let provider = SessionProvider {
-                        profile: row.get(9)?,
-                        model_override: row.get(10)?,
-                        base_url_override: row.get(11)?,
-                    };
-                    let preview: String = row.get(12)?;
+                    let provider: String = row.get(9)?;
+                    let preview: String = row.get(10)?;
                     Ok((
                         id_str,
                         created_at,
@@ -2796,10 +2728,10 @@ impl SessionManager {
         session_id: Uuid,
         new_permission: Option<String>,
         new_cwd: Option<std::path::PathBuf>,
-        // The whole binding, never just its profile. Writing `provider` alone would leave the
-        // overrides of the profile being left behind on the row, so the next process to resume the
-        // session would send it to an endpoint this one never used.
-        new_provider: Option<SessionProvider>,
+        // A profile name, which is the whole binding: nothing else about a provider is recorded on
+        // a session, so there is no second field that could be left behind pointing somewhere
+        // else.
+        new_provider: Option<String>,
     ) -> Result<()> {
         if new_permission.is_none() && new_cwd.is_none() && new_provider.is_none() {
             return Ok(());
@@ -2824,15 +2756,8 @@ impl SessionManager {
                 }
                 if let Some(ref provider) = new_provider {
                     txn.execute(
-                        "UPDATE sessions SET provider = ?1, model_override = ?2, \
-                         base_url_override = ?3, updated_at = ?4 WHERE id = ?5",
-                        rusqlite::params![
-                            provider.profile,
-                            provider.model_override,
-                            provider.base_url_override,
-                            now,
-                            id_string
-                        ],
+                        "UPDATE sessions SET provider = ?1, updated_at = ?2 WHERE id = ?3",
+                        rusqlite::params![provider, now, id_string],
                     )?;
                 }
                 txn.commit()?;
@@ -3980,7 +3905,7 @@ mod tests {
 
         assert_eq!(
             manager.recorded_provider(id).await.expect("read"),
-            Some(SessionProvider::from("openaiprof".to_string()))
+            Some("openaiprof".to_string())
         );
     }
 
@@ -3995,14 +3920,14 @@ mod tests {
 
         assert!(
             manager
-                .set_recorded_provider(id, &SessionProvider::from("claudeprof".to_string()))
+                .set_recorded_provider(id, "claudeprof")
                 .await
                 .expect("repin"),
             "the row was there to update"
         );
         assert_eq!(
             manager.recorded_provider(id).await.expect("read"),
-            Some(SessionProvider::from("claudeprof".to_string()))
+            Some("claudeprof".to_string())
         );
     }
 
@@ -4020,80 +3945,45 @@ mod tests {
         );
         assert!(
             !manager
-                .set_recorded_provider(
-                    Uuid::new_v4(),
-                    &SessionProvider::from("anything".to_string())
-                )
+                .set_recorded_provider(Uuid::new_v4(), "anything")
                 .await
                 .expect("update"),
             "a repin that matched no row says so rather than reporting success"
         );
     }
 
-    /// The sibling of the provider drift: `meka -m <model> -c` then plain `meka -c` used to fall
-    /// back to whatever the profile says, so the session quietly changed model.
+    /// A child records the profile it was given, not the one on its parent's row.
+    ///
+    /// The two are the same on every ordinary path, and this used to be a `SELECT … provider FROM
+    /// sessions` that made them the same by construction. They come apart for exactly as long as a
+    /// repin that could not take the runtime lock, which is what ACP's `session/set_config_option`
+    /// does mid-turn: the row moves, the agent does not, and a worker spawned in that window ran on
+    /// one account while its row claimed the other. Whoever calls this owes it the profile the
+    /// worker is actually built on; `agent_spawn` reads both from the same cell.
+    ///
+    /// Asserted with the two deliberately different, because passing the parent's own profile
+    /// cannot tell the new behaviour from the old.
     #[tokio::test]
-    async fn a_session_keeps_the_model_it_was_pinned_to() {
-        let manager = test_manager().await;
-        let pinned = SessionProvider {
-            profile: "openaiprof".to_string(),
-            model_override: Some("gpt-5".to_string()),
-            base_url_override: Some("https://example.invalid/v1".to_string()),
-        };
-        let id = manager
-            .create_session(None, pinned.clone())
-            .await
-            .expect("create");
-
-        assert_eq!(
-            manager.recorded_provider(id).await.expect("read"),
-            Some(pinned)
-        );
-    }
-
-    /// Every write door states the whole binding, so repinning the profile through one of them
-    /// cannot leave another profile's model attached to it.
-    #[tokio::test]
-    async fn repinning_the_profile_states_the_whole_binding() {
-        let manager = test_manager().await;
-        let id = manager
-            .create_session(None, SessionProvider {
-                profile: "openaiprof".to_string(),
-                model_override: Some("gpt-5".to_string()),
-                base_url_override: None,
-            })
-            .await
-            .expect("create");
-
-        manager
-            .set_recorded_provider(id, &SessionProvider::from("claudeprof".to_string()))
-            .await
-            .expect("repin");
-
-        assert_eq!(
-            manager.recorded_provider(id).await.expect("read"),
-            Some(SessionProvider::from("claudeprof".to_string())),
-            "the model that belonged to the old profile does not ride along"
-        );
-    }
-
-    /// A sub-agent runs the parent's work onward, so it must bill the parent's account.
-    #[tokio::test]
-    async fn a_child_session_inherits_its_parents_provider() {
+    async fn a_child_session_records_the_profile_it_was_given_not_its_parents_row() {
         let manager = test_manager().await;
         let parent = manager
             .create_session(None, "openaiprof".to_string())
             .await
             .expect("parent");
         let (child, _lock) = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "repinned-midturn".to_string())
             .await
             .expect("child");
 
         assert_eq!(
             manager.recorded_provider(child).await.expect("read"),
-            Some(SessionProvider::from("openaiprof".to_string())),
-            "inherited rather than defaulted"
+            Some("repinned-midturn".to_string()),
+            "the caller's profile, which is the one the worker runs on"
+        );
+        assert_eq!(
+            manager.recorded_provider(parent).await.expect("read"),
+            Some("openaiprof".to_string()),
+            "and the parent's own row is left alone"
         );
     }
 
@@ -4288,7 +4178,7 @@ mod tests {
         // must be used. Nothing here needs the child's lock: `fork_session` and `load_session_tree`
         // take none.
         let _child = manager
-            .create_child_session(source, None, None)
+            .create_child_session(source, None, None, "test-profile".to_string())
             .await
             .expect("child");
 
@@ -4546,25 +4436,23 @@ mod tests {
             "stat_redactions",
             "stat_redacted_images",
             "stat_redacted_bytes",
-            // These three are last, and in ledger order, because migrations appended them and the
-            // fresh path replays those same steps rather than creating the columns inline, so both
+            // Last, and after the stats, because a migration appended it and the fresh path
+            // replays that same step rather than creating the column inline, so both
             // orders agree.
             //
-            // All copied by a fork: a fork continues the same conversation and so has to keep
-            // running on the same thing. Resetting any of them would make forking one more door
-            // that switches provider without saying so.
+            // Copied by a fork: a fork continues the same conversation and so has to keep running
+            // on the same thing. Resetting it would make forking one more door that switches
+            // provider without saying so.
             "provider",
-            "model_override",
-            "base_url_override",
         ]);
     }
 
     /// The sibling of `fork_copies_every_session_column`, for the door that had no such guard and
-    /// was therefore the one that forgot: `import_sessions` wrote neither the profile nor its two
-    /// overrides, so every imported session landed on the empty profile no configuration can name,
-    /// and the resume hint the command printed named a session that could not resume.
+    /// was therefore the one that forgot: `import_sessions` wrote no profile at all, so every
+    /// imported session landed on the empty profile no configuration can name, and the resume hint
+    /// the command printed named a session that could not resume.
     #[tokio::test]
-    async fn import_writes_the_whole_binding() {
+    async fn import_writes_the_sessions_profile() {
         let manager = test_manager().await;
         let id = Uuid::new_v4();
         manager
@@ -4577,11 +4465,7 @@ mod tests {
                 capabilities_json: None,
                 additional_roots: Vec::new(),
                 subagent_spec_json: None,
-                provider: SessionProvider {
-                    profile: "work".to_string(),
-                    model_override: Some("gpt-5".to_string()),
-                    base_url_override: Some("https://example.invalid/v1".to_string()),
-                },
+                provider: "work".to_string(),
                 stats: crate::stats::SessionStatsSnapshot::default(),
                 events: Vec::new(),
                 tool_outputs: Vec::new(),
@@ -4591,43 +4475,29 @@ mod tests {
 
         assert_eq!(
             manager.recorded_provider(id).await.expect("read"),
-            Some(SessionProvider {
-                profile: "work".to_string(),
-                model_override: Some("gpt-5".to_string()),
-                base_url_override: Some("https://example.invalid/v1".to_string()),
-            })
+            Some("work".to_string())
         );
     }
 
-    /// A `PATCH /v1/sessions/{id}` naming a provider restates the whole binding, so the overrides
-    /// of the profile it is leaving must not survive on the row. They did: the handler passed only
-    /// the profile name, so the row said one endpoint and the live agent used another, and which
-    /// one a turn reached depended on whether the server or the CLI happened to be running it.
+    /// A `PATCH /v1/sessions/{id}` naming a provider moves the row, in the same statement that
+    /// carries permission and cwd, so a client that changed all three cannot end up with a session
+    /// that took some of them.
     #[tokio::test]
-    async fn moving_a_session_atomically_clears_the_old_profile_s_overrides() {
+    async fn moving_a_session_atomically_rewrites_its_profile() {
         let manager = test_manager().await;
         let created = manager
-            .create_session(None, SessionProvider {
-                profile: "alpha".to_string(),
-                model_override: Some("pinned".to_string()),
-                base_url_override: Some("https://alpha.invalid".to_string()),
-            })
+            .create_session(None, "alpha".to_string())
             .await
             .expect("create");
 
         manager
-            .update_session_metadata_atomic(
-                created,
-                None,
-                None,
-                Some(SessionProvider::from("beta".to_string())),
-            )
+            .update_session_metadata_atomic(created, None, None, Some("beta".to_string()))
             .await
             .expect("move the session");
 
         assert_eq!(
             manager.recorded_provider(created).await.expect("read"),
-            Some(SessionProvider::from("beta".to_string()))
+            Some("beta".to_string())
         );
     }
 
@@ -4668,7 +4538,7 @@ mod tests {
             .expect("create parent");
         for _ in 0..3 {
             let (_id, lock) = manager
-                .create_child_session(parent, None, None)
+                .create_child_session(parent, None, None, "test-profile".to_string())
                 .await
                 .expect("spawn a worker");
             lock.expect("claim the worker's lock");
@@ -4685,16 +4555,17 @@ mod tests {
 
     /// A spawn against a parent that is gone must fail, not hand back an id with no row behind it.
     ///
-    /// The statement is an `INSERT … SELECT` so the child copies the parent's binding rather than
-    /// being told it, and that form selects nothing and succeeds where the `VALUES` it replaced was
-    /// refused by `parent_session_id`'s foreign key. Unchecked, the model is told about a worker
+    /// The statement is an `INSERT … SELECT` even though the child is now *told* its provider
+    /// rather than copying it, and this is why: that form selects nothing and succeeds where the
+    /// `VALUES` it replaced was refused by `parent_session_id`'s foreign key. Unchecked, the model
+    /// is told about a worker
     /// that does not exist, a lock file is held for it, and the failure resurfaces as a raw
     /// constraint violation on the worker's first saved message.
     #[tokio::test]
     async fn spawning_from_a_session_that_is_gone_is_refused() {
         let manager = test_manager().await;
         let Err(error) = manager
-            .create_child_session(Uuid::new_v4(), None, None)
+            .create_child_session(Uuid::new_v4(), None, None, "test-profile".to_string())
             .await
         else {
             panic!("a missing parent must refuse the spawn");
@@ -5811,7 +5682,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("create child")
             .0;
@@ -6478,7 +6349,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("create child")
             .0;
@@ -6501,7 +6372,7 @@ mod tests {
             .await
             .expect("create parent");
         let _child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("create child")
             .0;
@@ -6662,7 +6533,7 @@ mod tests {
             .await
             .expect("create parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("create child")
             .0;

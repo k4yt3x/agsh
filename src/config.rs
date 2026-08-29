@@ -712,6 +712,11 @@ impl ResolvedSubagentsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ThinkingConfig {
     /// Budget for [`crate::provider::ThinkingMode::Budgeted`]; ignored under the other modes.
+    ///
+    /// The installation-wide fallback, which `[providers.<name>].thinking_budget` takes precedence
+    /// over. Kept rather than retired when the budget became a profile field, because it shipped
+    /// in 0.43 and `deny_unknown_fields` would turn a leftover into a parse error on a config
+    /// that never did anything wrong.
     pub budget_tokens: Option<u64>,
     pub show_content: Option<bool>,
 }
@@ -1069,7 +1074,7 @@ pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x
 /// Max conversation messages kept in the per-turn API window by default.
 const DEFAULT_CONTEXT_MESSAGES: usize = 200;
 /// Default extended-thinking token budget.
-const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
+pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 
@@ -1217,23 +1222,21 @@ pub struct ProviderProfile {
     /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
     /// later changes `model` is the user's to keep correct.
     pub thinking: Option<crate::provider::ThinkingMode>,
+    /// How many tokens `thinking = "budgeted"` asks the model to spend reasoning. Falls back to
+    /// `[thinking].budget_tokens`, then to [`DEFAULT_THINKING_BUDGET_TOKENS`]. Ignored by the
+    /// other two modes, which send no budget at all.
+    ///
+    /// Per profile because it is a parameter of `thinking`, and `thinking` is per profile. It was
+    /// one value for the whole process until 0.44, which meant [`validate_max_output_tokens`] took
+    /// four arguments stated per profile and a fifth that was not: a profile could be refused over
+    /// a number it did not state, and the refusal told the user to lower a global that every
+    /// other profile was also budgeting against.
+    pub thinking_budget: Option<u64>,
     /// `claude-subscription` only: when true, meka sends the `redact-thinking-2026-02-12` beta
     /// header so the server returns `redacted_thinking` blocks instead of full thinking
     /// summaries (saves bandwidth, but the redacted payloads can't be replayed back to the
     /// server in multi-turn conversations). Defaults to true.
     pub redact_thinking: Option<bool>,
-}
-
-/// The values that override a profile's own for one run or one session.
-///
-/// Separate from [`ProviderProfile`] because they arrive from somewhere else and outlive nothing:
-/// `--model` and `--base-url` are typed per invocation, and a session records its own. Passing them
-/// in rather than reading a global is what lets one process resolve two profiles differently.
-#[derive(Debug, Default, Clone)]
-pub struct ProfileOverrides {
-    pub model: Option<String>,
-    pub base_url: Option<String>,
-    pub thinking: Option<crate::provider::ThinkingMode>,
 }
 
 /// One profile resolved into everything needed to build a provider for it.
@@ -1257,6 +1260,11 @@ pub struct ProfileSettings {
     pub device_id: String,
     pub redact_thinking: bool,
     pub thinking: crate::provider::ThinkingMode,
+    /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
+    /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
+    /// window is what [`crate::binding_context_window`] reports rather than dividing by a figure
+    /// meka has no reason to believe.
+    pub thinking_budget: u64,
     pub effort: Option<String>,
     pub context_window: Option<u64>,
     pub vision: bool,
@@ -1296,15 +1304,18 @@ pub fn default_profile_on_disk(requested: Option<&str>) -> crate::error::Result<
     Ok(active)
 }
 
-/// Resolve one named profile, applying the overrides and the `[session]`-level fallbacks.
+/// Resolve one named profile, applying the process-level fallbacks for the two settings that have
+/// them. Nothing overrides a field inside a profile, so there is nothing else to apply.
 ///
-/// `session_context_window` is `[session].context_window`, which a profile's own value takes
-/// precedence over; the call sites in `main.rs` apply [`crate::provider::DEFAULT_CONTEXT_WINDOW`]
-/// when both are unset.
+/// `session_context_window` is `[session].context_window` and `default_thinking_budget` is
+/// `[thinking].budget_tokens`; a profile's own value takes precedence over either. The two are
+/// spelled differently on the way out because they are consumed differently: the call sites in
+/// `main.rs` apply [`crate::provider::DEFAULT_CONTEXT_WINDOW`] when the window is still unset,
+/// while the budget is defaulted here because every consumer needs a number.
 pub fn resolve_profile(
     profile: &ProviderProfile,
-    overrides: &ProfileOverrides,
     session_context_window: Option<u64>,
+    default_thinking_budget: Option<u64>,
     // Received rather than resolved here, because resolving it is not a pure function: for a
     // `claude-subscription` profile that states none, [`resolve_device_id`] mints one and rewrites
     // the user's `config.toml` under the config lock. This runs per request now (every
@@ -1315,18 +1326,19 @@ pub fn resolve_profile(
 ) -> ProfileSettings {
     ProfileSettings {
         backend: profile.backend.clone(),
-        model: overrides.model.clone().or_else(|| profile.model.clone()),
-        base_url: overrides
-            .base_url
-            .clone()
-            .or_else(|| profile.base_url.clone()),
+        model: profile.model.clone(),
+        base_url: profile.base_url.clone(),
         client_id: profile.client_id.clone(),
         oauth_token_url: profile.oauth_token_url.clone(),
         device_id,
         // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
         // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
         redact_thinking: profile.redact_thinking.unwrap_or(true),
-        thinking: overrides.thinking.or(profile.thinking).unwrap_or_default(),
+        thinking: profile.thinking.unwrap_or_default(),
+        thinking_budget: profile
+            .thinking_budget
+            .or(default_thinking_budget)
+            .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
         // Pure passthrough for every backend: whatever the profile sets goes to the provider
         // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
         // the provider applies its own default. An invalid value is the user's to own.
@@ -1409,21 +1421,6 @@ pub struct ResolvedConfig {
     /// anyone asked for it. Resuming needs the two apart: a session runs at the level it recorded,
     /// and only an explicit request overrides that.
     pub requested_permission: Option<Permission>,
-    /// The model and endpoint the user named on the command line with `--model` / `--base-url`.
-    ///
-    /// Recorded on the session rather than applied for one run, for the same reason
-    /// [`Self::requested_profile`] is: a per-run override leaves the row describing a session that
-    /// no longer exists, and the next resume drifts back to the profile's model without saying so.
-    pub requested_model: Option<String>,
-    pub requested_base_url: Option<String>,
-    /// `--thinking` for this run, applied to whichever profile a session resolves to.
-    ///
-    /// Held raw rather than folded into [`Self::thinking`], which is the *default profile's*
-    /// resolved mode and so is the wrong value to hand a session on another profile. The flag
-    /// stopped reaching the provider entirely when profiles became per-session: the only overrides
-    /// that survived were a session's own model and base URL, and `thinking` is not one a session
-    /// pins.
-    pub requested_thinking: Option<crate::provider::ThinkingMode>,
     /// The profile the user named on the command line with `--provider`, if any.
     ///
     /// Distinct from [`Self::active_profile`], which is the *resolved* default and is set whether
@@ -1490,7 +1487,11 @@ pub struct ResolvedConfig {
     /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
     pub retention_days: Option<u64>,
     pub thinking: crate::provider::ThinkingMode,
-    pub thinking_budget_tokens: u64,
+    /// The active profile's resolved thinking budget, the sibling of [`Self::thinking`] and
+    /// [`Self::max_output_tokens`]. Answers "what would a brand-new session get", which is exactly
+    /// what [`ResolvedConfig::validate_default_profile`] needs to check the pair against each
+    /// other. Not the seed: that is [`Self::default_thinking_budget`].
+    pub thinking_budget: u64,
     pub thinking_show_content: bool,
     pub auto_compact: bool,
     pub compact_checkpoint: bool,
@@ -1503,6 +1504,11 @@ pub struct ResolvedConfig {
     /// gauge itself against the big cloud default and never compact, and the reverse pairing would
     /// compact every turn. Resolving it here and again per profile is the same mistake twice.
     pub session_context_window: Option<u64>,
+    /// `[thinking].budget_tokens` verbatim, unresolved for the reason
+    /// [`Self::session_context_window`] gives at length: it is the seed every profile falls back
+    /// to, so a value already resolved through the *active* profile would become that
+    /// profile's budget for every profile stating none.
+    pub default_thinking_budget: Option<u64>,
     /// Maximum sub-agent recursion depth. `1` lets the root agent spawn but denies its sub-agents
     /// the same; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s depth
     /// budget in `main.rs`.
@@ -2893,28 +2899,25 @@ impl ResolvedConfig {
             .collect();
 
         // Provider config comes from the active profile (no env tier); the credential is loaded
-        // from the DB in main.rs by `active_profile`. CLI `--model` / `--base-url` override the
-        // profile's values for this run.
+        // from the DB in main.rs by `active_profile`. Nothing on the command line rewrites a field
+        // inside the profile: `--provider` selects which one, and `meka provider set` is how a
+        // field changes.
         //
         // Resolved through the same [`resolve_profile`] any other profile goes through, so the
         // process default is not a second, subtly different derivation of the same twelve fields.
         // The flat fields below are this profile's; a session naming a different one resolves it
         // again by name.
-        let active_overrides = ProfileOverrides {
-            model: cli.model.clone(),
-            base_url: cli.base_url.clone(),
-            thinking: cli.thinking,
-        };
         // The profile's `device_id` verbatim, never a freshly seeded one. Seeding writes
         // `config.toml`, and the flat fields below are read only to answer "what would a brand-new
         // session get"; the provider a session actually runs on is built by
         // [`crate::provider::ProviderRegistry`], which is where the seed belongs and where it
         // happens once.
+        let default_thinking_budget = file_thinking.budget_tokens;
         let active_settings = active.map(|profile| {
             resolve_profile(
                 profile,
-                &active_overrides,
                 file_session.context_window,
+                default_thinking_budget,
                 profile.device_id.clone().unwrap_or_default(),
             )
         });
@@ -2985,9 +2988,6 @@ impl ResolvedConfig {
             active_profile,
             configured_default_profile,
             requested_permission,
-            requested_model: cli.model.clone(),
-            requested_base_url: cli.base_url.clone(),
-            requested_thinking: cli.thinking,
             requested_profile: cli.provider.clone(),
             providers,
             provider_error,
@@ -3031,13 +3031,12 @@ impl ResolvedConfig {
             thinking: active_settings
                 .as_ref()
                 .map(|settings| settings.thinking)
-                .or(cli.thinking)
                 .unwrap_or_default(),
-            thinking_budget_tokens: cli.thinking_budget.unwrap_or_else(|| {
-                file_thinking
-                    .budget_tokens
-                    .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
-            }),
+            thinking_budget: active_settings
+                .as_ref()
+                .map(|settings| settings.thinking_budget)
+                .or(default_thinking_budget)
+                .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
             auto_compact: file_session.auto_compact.unwrap_or(true),
             compact_checkpoint: file_session.compact_checkpoint.unwrap_or(true),
@@ -3045,6 +3044,9 @@ impl ResolvedConfig {
             // applied once, per profile, in `resolve_profile`, and the call sites in `main.rs`
             // apply `DEFAULT_CONTEXT_WINDOW` when both are unset.
             session_context_window: file_session.context_window,
+            // Unresolved for the same reason, and by the same rule: every profile that states no
+            // budget of its own falls back to this one.
+            default_thinking_budget,
             subagent_max_depth: file_session
                 .subagent_max_depth
                 .unwrap_or(DEFAULT_SUBAGENT_MAX_DEPTH),
@@ -3241,8 +3243,8 @@ impl ResolvedConfig {
         }
         if self.model.is_none() {
             return Err(crate::error::MekaError::Config(format!(
-                "no model configured for profile '{}'. Set `model` in its [providers.<name>] \
-                 table, or pass --model.",
+                "no model configured for profile '{0}'. Run `meka provider set {0} model \
+                 <model>`, or set `model` under [providers.{0}] in config.toml.",
                 self.active_profile.as_deref().unwrap_or("?"),
             )));
         }
@@ -3251,7 +3253,7 @@ impl ResolvedConfig {
             self.provider_name.as_deref(),
             self.max_output_tokens,
             self.thinking,
-            self.thinking_budget_tokens,
+            self.thinking_budget,
         )?;
         Ok(())
     }
@@ -3268,12 +3270,17 @@ impl ResolvedConfig {
 /// that session's own pairing must still be checked. [`ResolvedConfig::validate_default_profile`]
 /// asks it of the process default; [`crate::provider::ProviderRegistry::build`] asks it of
 /// whichever profile a session actually names.
+///
+/// That claim was only four-fifths true until 0.44, when `thinking_budget` was one value for the
+/// whole process. A profile could be refused over a number stated nowhere in it, and the refusal
+/// named a global whose every other reader would move with it. Both arguments now come from the
+/// same [`ProfileSettings`].
 pub(crate) fn validate_max_output_tokens(
     profile: &str,
     provider_name: Option<&str>,
     max_output_tokens: Option<u64>,
     thinking: crate::provider::ThinkingMode,
-    thinking_budget_tokens: u64,
+    thinking_budget: u64,
 ) -> crate::error::Result<()> {
     let Some(max_output) = max_output_tokens else {
         return Ok(());
@@ -3284,12 +3291,15 @@ pub(crate) fn validate_max_output_tokens(
     // until a real request is rejected mid-turn, which is what this check exists to pre-empt.
     let speaks_messages = provider_name.is_some_and(crate::provider::backend_takes_thinking);
     let budgeted = matches!(thinking, crate::provider::ThinkingMode::Budgeted);
-    if speaks_messages && budgeted && max_output <= thinking_budget_tokens {
+    if speaks_messages && budgeted && max_output <= thinking_budget {
+        // The remedy names this profile's own keys, never the `[thinking].budget_tokens` the budget
+        // may have been inherited from. Both fix the refusal; only one of them leaves every other
+        // profile budgeting against what it did before.
         return Err(crate::error::MekaError::Config(format!(
             "profile '{}': max_output_tokens ({}) must exceed the thinking budget ({}) for an \
-             Anthropic Messages profile with thinking = \"budgeted\"; raise max_output_tokens or \
-             lower [thinking].budget_tokens.",
-            profile, max_output, thinking_budget_tokens,
+             Anthropic Messages profile with thinking = \"budgeted\"; under [providers.{}], raise \
+             max_output_tokens or set a lower thinking_budget.",
+            profile, max_output, thinking_budget, profile,
         )));
     }
     Ok(())
@@ -4009,38 +4019,6 @@ type = "claude-subscription"
 
     /// An override beats the profile, and an absent one leaves the profile's value alone.
     ///
-    /// Both directions matter: `--model` has to reach the request, and a profile that states a
-    /// model must not be blanked by the flag being unset.
-    #[test]
-    fn an_override_wins_and_absence_keeps_the_profile_value() {
-        let profile = ProviderProfile {
-            backend: "anthropic-messages".to_string(),
-            model: Some("from-profile".to_string()),
-            base_url: Some("https://profile.example".to_string()),
-            ..Default::default()
-        };
-
-        let overridden = resolve_profile(
-            &profile,
-            &ProfileOverrides {
-                model: Some("from-flag".to_string()),
-                ..Default::default()
-            },
-            None,
-            String::new(),
-        );
-        assert_eq!(overridden.model.as_deref(), Some("from-flag"));
-        assert_eq!(
-            overridden.base_url.as_deref(),
-            Some("https://profile.example"),
-            "an unset override leaves the profile's own value"
-        );
-
-        let untouched =
-            resolve_profile(&profile, &ProfileOverrides::default(), None, String::new());
-        assert_eq!(untouched.model.as_deref(), Some("from-profile"));
-    }
-
     /// The two fields that default *on*, and the one that falls back to `[session]`.
     ///
     /// A profile saying nothing must resolve the way a profile-less run did, or switching a session
@@ -4051,12 +4029,7 @@ type = "claude-subscription"
             backend: "openai-chat-completions".to_string(),
             ..Default::default()
         };
-        let settings = resolve_profile(
-            &bare,
-            &ProfileOverrides::default(),
-            Some(200_000),
-            String::new(),
-        );
+        let settings = resolve_profile(&bare, Some(200_000), None, String::new());
 
         assert!(settings.vision, "vision defaults on");
         assert!(settings.redact_thinking, "redact_thinking defaults on");
@@ -4077,13 +4050,100 @@ type = "claude-subscription"
             context_window: Some(32_000),
             ..Default::default()
         };
-        let settings = resolve_profile(
-            &profile,
-            &ProfileOverrides::default(),
-            Some(1_000_000),
-            String::new(),
-        );
+        let settings = resolve_profile(&profile, Some(1_000_000), None, String::new());
         assert_eq!(settings.context_window, Some(32_000));
+    }
+
+    /// The budget resolves like the window: profile first, then the installation-wide fallback,
+    /// then the built-in default.
+    ///
+    /// The middle rung is the one worth pinning. Dropping it silently sends every profile the
+    /// built-in 16000 and ignores a `[thinking].budget_tokens` that shipped in 0.43 and is still
+    /// the only budget most configs state, which no request would refuse and no other test would
+    /// notice.
+    #[test]
+    fn a_profiles_thinking_budget_beats_the_installation_fallback() {
+        let budgeted = |thinking_budget| ProviderProfile {
+            backend: "anthropic-messages".to_string(),
+            thinking_budget,
+            ..Default::default()
+        };
+        let resolve = |profile: &ProviderProfile, fallback| {
+            resolve_profile(profile, None, fallback, String::new()).thinking_budget
+        };
+
+        assert_eq!(
+            resolve(&budgeted(Some(8_000)), Some(64_000)),
+            8_000,
+            "the profile's own budget wins over `[thinking].budget_tokens`"
+        );
+        assert_eq!(
+            resolve(&budgeted(None), Some(64_000)),
+            64_000,
+            "a profile stating none falls back to `[thinking].budget_tokens`"
+        );
+        assert_eq!(
+            resolve(&budgeted(None), None),
+            DEFAULT_THINKING_BUDGET_TOKENS,
+            "with neither stated, the documented default"
+        );
+    }
+
+    /// Two profiles resolve two budgets from one registry.
+    ///
+    /// The whole point of the move: while the budget was one value for the process, this could not
+    /// be expressed, and [`validate_max_output_tokens`] judged both profiles against whichever
+    /// number the process happened to hold.
+    #[test]
+    fn two_profiles_can_hold_different_thinking_budgets() {
+        let big = ProviderProfile {
+            backend: "anthropic-messages".to_string(),
+            thinking_budget: Some(60_000),
+            ..Default::default()
+        };
+        let small = ProviderProfile {
+            backend: "anthropic-messages".to_string(),
+            thinking_budget: Some(2_048),
+            ..Default::default()
+        };
+        let resolve = |profile: &ProviderProfile| {
+            resolve_profile(profile, None, Some(16_000), String::new()).thinking_budget
+        };
+        assert_eq!(resolve(&big), 60_000);
+        assert_eq!(resolve(&small), 2_048);
+    }
+
+    /// A profile is judged against its own budget, not the installation's.
+    ///
+    /// `max_output_tokens = 8000` is fine beside a 2048 budget and impossible beside a 64000 one.
+    /// Before the budget was a profile field the second profile's number decided the first
+    /// profile's fate, which is the defect this pins shut.
+    #[test]
+    fn max_output_tokens_is_checked_against_the_profiles_own_budget() {
+        let check = |thinking_budget| {
+            validate_max_output_tokens(
+                "work",
+                Some("anthropic-messages"),
+                Some(8_000),
+                crate::provider::ThinkingMode::Budgeted,
+                thinking_budget,
+            )
+        };
+        assert!(
+            check(2_048).is_ok(),
+            "8000 output over a 2048 budget is fine"
+        );
+        let error = check(64_000).expect_err("8000 output cannot carry a 64000 budget");
+        let message = error.to_string();
+        assert!(
+            message.contains("[providers.work]"),
+            "the remedy names the profile's own table, not a global: {message}"
+        );
+        assert!(
+            !message.contains("[thinking].budget_tokens"),
+            "fixing one profile must not be described as editing every profile's fallback: \
+             {message}"
+        );
     }
 
     #[test]
@@ -5609,8 +5669,8 @@ model = "small-model"
                 .get("small")
                 .map(|profile| resolve_profile(
                     profile,
-                    &ProfileOverrides::default(),
                     profile_only.session_context_window,
+                    profile_only.default_thinking_budget,
                     String::new(),
                 ))
                 .and_then(|settings| settings.context_window),
@@ -5667,9 +5727,6 @@ thinking = "budgeted"
         }
         use clap::Parser;
         let from_profile = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
-        // A CLI flag still wins over the profile.
-        let from_flag =
-            ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka", "--thinking", "off"]));
         // SAFETY: same as above; the guard is held for the full set→read→clear cycle.
         unsafe {
             std::env::remove_var("MEKA_CONFIG_DIR");
@@ -5677,9 +5734,9 @@ thinking = "budgeted"
 
         assert_eq!(
             from_profile.thinking,
-            crate::provider::ThinkingMode::Budgeted
+            crate::provider::ThinkingMode::Budgeted,
+            "the profile's thinking mode is the only thing that decides this now"
         );
-        assert_eq!(from_flag.thinking, crate::provider::ThinkingMode::Off);
     }
 
     /// End-to-end check that `MEKA_INSTRUCTIONS` reaches `user_instructions` when

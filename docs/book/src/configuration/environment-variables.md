@@ -4,7 +4,7 @@ The [config file](./config-file.md) is the recommended way to configure meka. En
 
 These operational variables override config file values but are overridden by CLI flags.
 
-> **Provider configuration is not configurable via the environment.** Provider selection, model, and base URL come from the [config file](./config-file.md) (with per-run `--provider` / `--model` / `--base-url` flags); secrets come from the database via [`meka provider`](./config-file.md#meka-provider-cli). There are no provider env vars. This is deliberate: an ambient `OPENAI_API_KEY` or `MEKA_PROVIDER` left in the environment must never silently rebind which account a named profile bills.
+> **Provider configuration is not configurable via the environment.** Provider selection comes from the [config file](./config-file.md) and `--provider`; the model, base URL and every other model-tied setting come from the selected profile; secrets come from the database via [`meka provider`](./config-file.md#meka-provider-cli). There are no provider env vars. This is deliberate: an ambient `OPENAI_API_KEY` or `MEKA_PROVIDER` left in the environment must never silently rebind which account a named profile bills.
 
 ## meka-Specific Variables
 

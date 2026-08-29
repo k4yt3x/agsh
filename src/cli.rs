@@ -99,13 +99,6 @@ pub enum SessionAction {
         /// Hidden by default, so the view stays on conversations you started.
         #[arg(long)]
         include_children: bool,
-        /// Show each session's model and endpoint overrides
-        ///
-        /// A session pins its provider profile, and may pin a model or base URL
-        /// on top of it. The short listing shows only the profile, so an
-        /// override is invisible; this adds the two columns that carry it.
-        #[arg(short = 'l', long)]
-        long: bool,
     },
     /// Export a session as Markdown or JSON
     Export {
@@ -238,6 +231,42 @@ pub enum ProviderAction {
         /// applies its own default.
         #[arg(long)]
         effort: Option<String>,
+        /// Thinking budget in tokens, for thinking = budgeted
+        ///
+        /// Ignored by the other two modes, which send no budget. Defaults to
+        /// `[thinking].budget_tokens`, then to 16000.
+        #[arg(long = "thinking-budget")]
+        thinking_budget: Option<u64>,
+        /// Accept image input: true or false (default: true)
+        ///
+        /// Set false for a text-only model, so the ACP frontend stops offering
+        /// images it cannot use.
+        #[arg(long, hide_possible_values = true)]
+        vision: Option<bool>,
+        /// Per-request output token cap
+        ///
+        /// Unset leaves the backend's own default. On Claude with thinking =
+        /// budgeted this must exceed the thinking budget.
+        #[arg(long = "max-output-tokens")]
+        max_output_tokens: Option<u64>,
+        /// Redact thinking blocks: true or false (default: true)
+        ///
+        /// claude-subscription only. Saves bandwidth, but redacted payloads
+        /// cannot be replayed to the server across turns.
+        #[arg(long = "redact-thinking", hide_possible_values = true)]
+        redact_thinking: Option<bool>,
+        /// OAuth token endpoint override (advanced)
+        ///
+        /// For a self-hosted or proxied authorisation server. The backend's own
+        /// endpoint is used when this is unset.
+        #[arg(long = "oauth-token-url")]
+        oauth_token_url: Option<String>,
+        /// OAuth client ID override (advanced)
+        ///
+        /// Subscription backends only, for the same self-hosted case as
+        /// --oauth-token-url.
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
         /// Read the API key from stdin
         ///
         /// Non-interactive alternative to the key prompt. API backends only.
@@ -246,6 +275,38 @@ pub enum ProviderAction {
     },
     /// List configured provider profiles
     List,
+    /// Change one setting on a provider profile
+    ///
+    /// Writes the key in place, leaving every other setting and any comments
+    /// around it alone. This is how a profile's model changes; there is no
+    /// per-run flag for it, because a profile is an indivisible bundle and a
+    /// session records which one it runs on, not a rewritten copy.
+    ///
+    /// Keys: model, base_url, context_window, vision, max_output_tokens,
+    /// effort, thinking, thinking_budget, redact_thinking, oauth_token_url,
+    /// client_id. `type` is not settable, because the stored credential was
+    /// acquired for the current backend.
+    ///
+    /// Examples:
+    ///   meka provider set work model claude-opus-5
+    ///   meka provider set work context_window 200000
+    ///   meka provider set work effort --unset
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// Profile name to change.
+        name: String,
+        /// Setting to write.
+        key: String,
+        /// New value. Omit it and pass --unset to remove the setting instead.
+        value: Option<String>,
+        /// Remove the setting, so the profile falls back to the default
+        ///
+        /// The inverse of setting a value, and not the same as setting an
+        /// empty one: an absent key follows whatever meka's default becomes,
+        /// which is what an unstated setting has always meant.
+        #[arg(long, conflicts_with = "value")]
+        unset: bool,
+    },
     /// Set the default provider profile
     Use {
         /// Profile name to make the default.
@@ -731,16 +792,12 @@ pub struct Cli {
     pub writable_root: Vec<std::path::PathBuf>,
 
     /// Provider profile for this session; on a resume, repins it
+    ///
+    /// The only provider flag on a run. A profile is an indivisible bundle of a backend, an
+    /// endpoint, a credential and every model-tied setting, so this selects one rather than
+    /// rewriting part of one. Change a field with `meka provider set`.
     #[arg(short = 'p', long = "provider")]
     pub provider: Option<String>,
-
-    /// Model for this session, overriding its profile's
-    #[arg(short = 'm', long = "model")]
-    pub model: Option<String>,
-
-    /// Endpoint for this session, overriding its profile's
-    #[arg(long = "base-url")]
-    pub base_url: Option<String>,
 
     /// Linux sandbox backend: landlock or bubblewrap
     #[arg(long = "sandbox-backend", value_parser = parse_sandbox_backend)]
@@ -753,19 +810,6 @@ pub struct Cli {
     /// Markdown render mode: termimad (default), syntect, raw, or silent
     #[arg(long = "render-mode", value_parser = parse_render_mode)]
     pub render_mode: Option<crate::render::RenderMode>,
-
-    /// Extended thinking mode: adaptive, budgeted, or off
-    ///
-    /// Anthropic Messages backends only; the rest ignore it. adaptive lets the model size its own
-    /// budget and suits Claude 4.6 and newer; budgeted sends the fixed --thinking-budget that
-    /// older Claude and most third-party servers require; off asks for none. Overrides the active
-    /// profile's thinking setting for this run.
-    #[arg(long = "thinking", value_enum, hide_possible_values = true)]
-    pub thinking: Option<crate::provider::ThinkingMode>,
-
-    /// Thinking token budget (Anthropic Messages, thinking = budgeted)
-    #[arg(long = "thinking-budget")]
-    pub thinking_budget: Option<u64>,
 
     /// Standing instructions for this run, replacing the discovered ones
     #[arg(long = "instructions", value_name = "STRING")]
@@ -813,8 +857,6 @@ mod tests {
         assert!(cli.resume.is_none());
         assert!(cli.permission.is_none());
         assert!(cli.provider.is_none());
-        assert!(cli.model.is_none());
-        assert!(cli.base_url.is_none());
         assert!(!cli.no_stream);
         assert!(cli.render_mode.is_none());
         assert!(cli.skill.is_none());
@@ -909,14 +951,11 @@ mod tests {
             "meka",
             "--provider",
             "openai-chat-completions",
-            "--model",
-            "gpt-4o",
             "--no-stream",
             "-c",
             "-vv",
         ]);
         assert_eq!(cli.provider.as_deref(), Some("openai-chat-completions"));
-        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.no_stream);
         assert!(cli.continue_last);
         assert_eq!(cli.verbosity, 2);
@@ -1001,7 +1040,6 @@ mod tests {
                     SessionAction::List {
                         limit,
                         include_children,
-                        long: _,
                     },
             }) => {
                 assert_eq!(limit, 20);

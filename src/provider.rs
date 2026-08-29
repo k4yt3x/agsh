@@ -713,9 +713,10 @@ pub enum ThinkingMode {
     /// The model sets its own budget. Claude 4.6 and newer.
     ///
     /// Sends the adaptive thinking block, and is the default because it is what the current models
-    /// want. `--thinking` hides its possible-values list to keep `meka -h` to one line, so these
-    /// variant docs no longer reach a terminal and that flag's own help summarises the three modes;
-    /// the wire shapes each mode produces live in `anthropic::shared::insert_thinking_fields`.
+    /// want. `provider add --thinking` hides its possible-values list to keep that command's `-h`
+    /// within 80 columns, so these variant docs no longer reach a terminal and that flag's own help
+    /// summarises the three modes; the wire shapes each mode produces live in
+    /// `anthropic::shared::insert_thinking_fields`.
     #[default]
     Adaptive,
     /// A fixed budget, from the thinking budget_tokens setting. Required by pre-4.6 Claude.
@@ -1612,9 +1613,11 @@ fn look_up_profile<'a>(
 
 /// What distinguishes one built provider from another.
 ///
-/// The profile name alone is not enough: a session may override the model or the endpoint, and two
-/// sessions on one profile with different overrides are talking to different things. Everything
-/// else a profile states is fixed for that name, so it needs no place here.
+/// The profile name determines the rest: nothing can rewrite a field inside a profile, so two
+/// providers built from one name are built from the same twelve values. The three fields beside it
+/// are therefore redundant rather than load-bearing, and kept for one reason: they make the memo
+/// key state what a provider is actually built from, so a future field that is *not* a function of
+/// the name cannot be added without someone noticing this struct.
 ///
 /// The credential is deliberately *not* part of this, even though the provider is built from one.
 /// See [`CachedProvider`].
@@ -1689,14 +1692,10 @@ pub struct ProviderRegistry {
     profiles: std::collections::BTreeMap<String, crate::config::ProviderProfile>,
     /// `[session].context_window`, which a profile's own value takes precedence over.
     session_context_window: Option<u64>,
-    /// `[thinking].budget_tokens`. A profile states the thinking *mode*; the budget is one setting
-    /// for the process, so it is held here rather than resolved per profile.
-    thinking_budget_tokens: u64,
-    /// `--thinking` for this run, which outranks whatever profile a session resolves to. Held
-    /// beside the budget because both are properties of the run rather than of a profile, and it
-    /// has to be applied here: a session's own overrides carry a model and an endpoint, and the
-    /// flag is neither.
-    requested_thinking: Option<ThinkingMode>,
+    /// `[thinking].budget_tokens`, the seed a profile stating no `thinking_budget` of its own
+    /// falls back to. Held unresolved for the reason [`Self::session_context_window`] is:
+    /// resolving it through any one profile would make that profile's budget everyone else's.
+    default_thinking_budget: Option<u64>,
     /// Device ids, resolved at most once per profile.
     ///
     /// `claude-subscription` mints one and writes it into `config.toml` when the profile states
@@ -1727,8 +1726,7 @@ impl ProviderRegistry {
         Self {
             profiles: config.providers.clone(),
             session_context_window: config.session_context_window,
-            thinking_budget_tokens: config.thinking_budget_tokens,
-            requested_thinking: config.requested_thinking,
+            default_thinking_budget: config.default_thinking_budget,
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             session_stats,
@@ -1743,23 +1741,12 @@ impl ProviderRegistry {
     /// Refuses by name rather than falling back to the default. A recorded profile that is no
     /// longer configured is the user's to fix, and quietly running the conversation somewhere else
     /// is the failure this whole arrangement exists to prevent.
-    pub fn settings(
-        &self,
-        profile: &str,
-        overrides: &crate::config::ProfileOverrides,
-    ) -> Result<crate::config::ProfileSettings> {
+    pub fn settings(&self, profile: &str) -> Result<crate::config::ProfileSettings> {
         let configured = look_up_profile(&self.profiles, profile)?;
         Ok(crate::config::resolve_profile(
             configured,
-            // `--thinking` folded in here rather than carried on the session's own overrides: it
-            // describes this run, and applying it where the profile's value is read is what keeps
-            // `ProviderKey.thinking` the mode the built provider actually uses.
-            &crate::config::ProfileOverrides {
-                model: overrides.model.clone(),
-                base_url: overrides.base_url.clone(),
-                thinking: self.requested_thinking.or(overrides.thinking),
-            },
             self.session_context_window,
+            self.default_thinking_budget,
             self.device_id_for(profile, configured),
         ))
     }
@@ -1788,16 +1775,15 @@ impl ProviderRegistry {
     /// The provider for one profile, built on first ask and reused after, with the settings it was
     /// built from.
     ///
-    /// Both, because the caller wants both and resolving is not free: it reads the profile, applies
-    /// the run's overrides and looks up a device id. Returning only the provider meant
-    /// [`crate::resolved_binding`] resolved a second time to learn the window and the vision flag
-    /// that this call had just computed and thrown away.
+    /// Both, because the caller wants both and resolving is not free: it reads the profile and
+    /// looks up a device id. Returning only the provider meant [`crate::resolved_binding`]
+    /// resolved a second time to learn the window and the vision flag that this call had just
+    /// computed and thrown away.
     pub async fn build(
         &self,
         profile: &str,
-        overrides: &crate::config::ProfileOverrides,
     ) -> Result<(Arc<dyn Provider>, crate::config::ProfileSettings)> {
-        let settings = self.settings(profile, overrides)?;
+        let settings = self.settings(profile)?;
 
         #[cfg(debug_assertions)]
         if let Ok(scripted) = self.scripted.lock()
@@ -1814,7 +1800,7 @@ impl ProviderRegistry {
             Some(&settings.backend),
             settings.max_output_tokens,
             settings.thinking,
-            self.thinking_budget_tokens,
+            settings.thinking_budget,
         )?;
         let key = ProviderKey {
             profile: profile.to_string(),
@@ -1852,7 +1838,7 @@ impl ProviderRegistry {
             .credential_key(Some(profile.to_string()))
             .oauth_token_url(settings.oauth_token_url.clone())
             .token_store(needs_token_store.then(|| Arc::clone(&self.token_store)))
-            .thinking(settings.thinking, self.thinking_budget_tokens)
+            .thinking(settings.thinking, settings.thinking_budget)
             .device_id(settings.device_id.clone())
             .effort(settings.effort.clone())
             .redact_thinking(settings.redact_thinking)
@@ -1932,60 +1918,23 @@ mod tests {
             .get_mut("stated")
             .expect("seeded above")
             .context_window = Some(32_000);
-        let registry = test_registry(profiles, None).await;
+        let registry = test_registry(profiles).await;
 
         assert_eq!(
-            crate::binding_context_window(
-                &registry,
-                &crate::session::SessionProvider::from("stated".to_string())
-            ),
+            crate::binding_context_window(&registry, "stated"),
             Some(32_000),
             "a profile that states a window reports it"
         );
         assert_eq!(
-            crate::binding_context_window(
-                &registry,
-                &crate::session::SessionProvider::from("silent".to_string())
-            ),
+            crate::binding_context_window(&registry, "silent"),
             Some(DEFAULT_CONTEXT_WINDOW),
             "one that states none reports the documented default, not its neighbour's value"
         );
         assert_eq!(
-            crate::binding_context_window(
-                &registry,
-                &crate::session::SessionProvider::from("departed".to_string())
-            ),
+            crate::binding_context_window(&registry, "departed"),
             None,
             "a profile that has left config.toml reports nothing, so no client divides by a guess"
         );
-    }
-
-    /// A session's recorded model and endpoint must survive the trip into a provider build.
-    ///
-    /// `overrides()` could return `Default::default()` -- dropping both -- with nothing failing,
-    /// which would silently run a session recorded against one model on its profile's default
-    /// instead. It feeds `ProviderKey`, so it also decides whether two sessions share a provider.
-    #[test]
-    fn a_recorded_binding_carries_its_overrides_into_the_registry() {
-        let binding = crate::session::SessionProvider {
-            profile: "work".to_string(),
-            model_override: Some("claude-opus-5".to_string()),
-            base_url_override: Some("https://example.invalid/v1".to_string()),
-        };
-        let overrides = binding.overrides();
-        assert_eq!(overrides.model.as_deref(), Some("claude-opus-5"));
-        assert_eq!(
-            overrides.base_url.as_deref(),
-            Some("https://example.invalid/v1")
-        );
-        assert_eq!(
-            overrides.thinking, None,
-            "thinking is a per-profile encoding the user states, never something a session pins"
-        );
-
-        let bare = crate::session::SessionProvider::from("work".to_string());
-        assert_eq!(bare.overrides().model, None);
-        assert_eq!(bare.overrides().base_url, None);
     }
 
     fn profiles(
@@ -2005,7 +1954,6 @@ mod tests {
     /// A registry over `profiles`, with everything a resolution needs and nothing it does not.
     async fn test_registry(
         profiles: std::collections::BTreeMap<String, crate::config::ProviderProfile>,
-        requested_thinking: Option<ThinkingMode>,
     ) -> ProviderRegistry {
         let manager = crate::session::SessionManager::open(
             Some(std::path::Path::new(":memory:")),
@@ -2016,8 +1964,7 @@ mod tests {
         ProviderRegistry {
             profiles,
             session_context_window: None,
-            thinking_budget_tokens: 4_096,
-            requested_thinking,
+            default_thinking_budget: Some(4_096),
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(manager.token_store()),
             session_stats: Arc::new(crate::stats::SessionStats::default()),
@@ -2027,32 +1974,30 @@ mod tests {
         }
     }
 
-    /// `--thinking` is a property of the run, and a session's own overrides carry a model and an
-    /// endpoint, neither of which is a thinking mode. Once a session resolved its own profile the
-    /// flag reached nothing: it parsed, it was documented as an override, and it was discarded.
+    /// Each profile resolves its own thinking mode, and nothing at the run level can outrank it.
+    ///
+    /// There used to be a `--thinking` on the registry that did, which is exactly the shape this
+    /// pins shut: a flag applied where a profile's value is read makes one profile's mode every
+    /// profile's, and a session that resolved a different profile got a mode its own never stated.
     #[tokio::test]
-    async fn the_runs_thinking_flag_outranks_the_profile_a_session_resolves_to() {
-        let mut profiles = profiles(&["work"]);
-        if let Some(profile) = profiles.get_mut("work") {
+    async fn each_profile_resolves_its_own_thinking_mode() {
+        let mut profiles = profiles(&["adaptive", "off"]);
+        if let Some(profile) = profiles.get_mut("adaptive") {
             profile.thinking = Some(ThinkingMode::Adaptive);
         }
-        let overrides = crate::config::ProfileOverrides::default();
+        if let Some(profile) = profiles.get_mut("off") {
+            profile.thinking = Some(ThinkingMode::Off);
+        }
+        let registry = test_registry(profiles).await;
 
-        let without = test_registry(profiles.clone(), None).await;
         assert_eq!(
-            without
-                .settings("work", &overrides)
-                .expect("resolve")
-                .thinking,
-            ThinkingMode::Adaptive,
-            "with no flag the profile's own mode stands"
+            registry.settings("adaptive").expect("resolve").thinking,
+            ThinkingMode::Adaptive
         );
-
-        let with = test_registry(profiles, Some(ThinkingMode::Off)).await;
         assert_eq!(
-            with.settings("work", &overrides).expect("resolve").thinking,
+            registry.settings("off").expect("resolve").thinking,
             ThinkingMode::Off,
-            "the flag must reach the settings the provider is built from"
+            "one registry, two profiles, two modes"
         );
     }
 
@@ -2073,9 +2018,7 @@ mod tests {
         if let Some(profile) = profiles.get_mut("sub") {
             profile.backend = "claude-subscription".to_string();
         }
-        let registry = test_registry(profiles, None).await;
-        let overrides = crate::config::ProfileOverrides::default();
-
+        let registry = test_registry(profiles).await;
         let config_dir = tempfile::tempdir().expect("tempdir");
         // Seeded with the profile, so `persist` takes its write path rather than the bail it used
         // to take by accident against the real file.
@@ -2090,14 +2033,8 @@ mod tests {
         let _env = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", config_dir.path()) };
 
-        let first = registry
-            .settings("sub", &overrides)
-            .expect("resolve")
-            .device_id;
-        let second = registry
-            .settings("sub", &overrides)
-            .expect("resolve")
-            .device_id;
+        let first = registry.settings("sub").expect("resolve").device_id;
+        let second = registry.settings("sub").expect("resolve").device_id;
 
         let persisted = std::fs::read_to_string(config_dir.path().join("config.toml"))
             .expect("read config.toml back");
@@ -2125,19 +2062,15 @@ mod tests {
         if let Some(profile) = profiles.get_mut("work") {
             profile.model = Some("claude-opus-5".to_string());
         }
-        let registry = test_registry(profiles, None).await;
-        let overrides = crate::config::ProfileOverrides::default();
+        let registry = test_registry(profiles).await;
         registry
             .token_store
             .save_provider_credential("work", &AuthCredential::ApiKey("first".to_string()))
             .await
             .expect("store a credential");
 
-        let (first, _) = registry.build("work", &overrides).await.expect("build");
-        let (again, _) = registry
-            .build("work", &overrides)
-            .await
-            .expect("build again");
+        let (first, _) = registry.build("work").await.expect("build");
+        let (again, _) = registry.build("work").await.expect("build again");
         assert!(
             Arc::ptr_eq(&first, &again),
             "an unmoved credential must still be served from the memo -- keeping the connection \
@@ -2151,7 +2084,7 @@ mod tests {
             .expect("rotate the credential");
 
         let (after, _) = registry
-            .build("work", &overrides)
+            .build("work")
             .await
             .expect("build after the rotation");
         assert!(

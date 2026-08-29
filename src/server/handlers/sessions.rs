@@ -168,15 +168,6 @@ pub struct SessionResponse {
     pub permission: String,
     /// The provider profile this session runs on.
     pub provider: String,
-    /// The model this session runs, when it overrides its profile's. Absent means the profile's
-    /// own, so a client reading it back sees the same thing `meka session list --long` prints
-    /// rather than having to infer that `provider` tells the whole story -- which it does not for
-    /// a session created with `--model` or `--base-url`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
-    /// The endpoint this session runs against, when it overrides its profile's.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url_override: Option<String>,
     pub title: String,
     /// Per-session capability flags declared at create time (or re-attach), echoed back so clients
     /// can confirm the settings their session actually ended up with.
@@ -509,10 +500,6 @@ pub async fn create_session(
             cwd: Some(cwd_path),
             permission: permission.to_string(),
             provider: profile,
-            // `POST /v1/sessions` names a profile and nothing else, so a session created here
-            // never has one.
-            model_override: None,
-            base_url_override: None,
             title,
             capabilities,
             turn_in_flight: false,
@@ -661,18 +648,8 @@ pub async fn fork_session(
     // fork's row is what the next turn on it will resolve, so the response should quote that.
     let forked_provider = forked_info
         .as_ref()
-        .map(|info| info.provider.profile.clone())
+        .map(|info| info.provider.clone())
         .unwrap_or_default();
-    let forked_overrides = forked_info
-        .as_ref()
-        .map(|info| {
-            (
-                info.provider.model_override.clone(),
-                info.provider.base_url_override.clone(),
-            )
-        })
-        .unwrap_or_default();
-
     Ok((
         StatusCode::CREATED,
         Json(SessionResponse {
@@ -683,8 +660,6 @@ pub async fn fork_session(
             cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
             provider: forked_provider,
-            model_override: forked_overrides.0,
-            base_url_override: forked_overrides.1,
             title,
             capabilities: entry.capabilities,
             turn_in_flight: false,
@@ -772,9 +747,7 @@ pub async fn list_sessions(
                 last_turn_at,
                 cwd: row.cwd,
                 permission,
-                provider: row.provider.profile,
-                model_override: row.provider.model_override,
-                base_url_override: row.provider.base_url_override,
+                provider: row.provider,
                 title: row.preview,
                 capabilities,
                 turn_in_flight,
@@ -833,16 +806,7 @@ pub async fn get_session(
             .unwrap_or_default();
         let provider = info
             .as_ref()
-            .map(|info| info.provider.profile.clone())
-            .unwrap_or_default();
-        let overrides = info
-            .as_ref()
-            .map(|info| {
-                (
-                    info.provider.model_override.clone(),
-                    info.provider.base_url_override.clone(),
-                )
-            })
+            .map(|info| info.provider.clone())
             .unwrap_or_default();
         let last_turn_at = entry
             .last_turn_at_wall
@@ -857,8 +821,6 @@ pub async fn get_session(
             cwd: Some(crate::workspace::cwd_snapshot(&entry.cwd)),
             permission: entry.permission.get().to_string(),
             provider,
-            model_override: overrides.0,
-            base_url_override: overrides.1,
             title,
             capabilities: entry.capabilities,
             turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,
@@ -888,9 +850,7 @@ pub async fn get_session(
         last_turn_at: None,
         cwd: summary.cwd,
         permission: summary.permission.unwrap_or_default(),
-        provider: summary.provider.profile,
-        model_override: summary.provider.model_override,
-        base_url_override: summary.provider.base_url_override,
+        provider: summary.provider,
         title: summary.preview,
         capabilities,
         turn_in_flight: false,
@@ -956,7 +916,7 @@ async fn repin_dormant_session(
     require_configured_profile(state, profile)?;
     let resolved = crate::resolved_binding(
         &state.shared.providers,
-        crate::session::SessionProvider::from(profile.to_string()),
+        profile.to_string(),
     )
     .await
     // Discriminated, not a blanket 422; see the sibling site in `patch_session`.
@@ -977,7 +937,8 @@ async fn repin_dormant_session(
             ProblemDetail::internal_sanitized("failed to read session provider", error)
         })?;
     // Skipped when nothing changes, so a no-op PATCH does not advance `updated_at` that clients
-    // watch for changes. The whole binding, for the reason the resident path gives.
+    // watch for changes. Nothing to reconcile beyond the name: a dormant session has no live agent
+    // to put back in step, which is what the resident path has to do unconditionally.
     if current.as_ref() != Some(&resolved.binding) {
         state
             .shared
@@ -1015,9 +976,7 @@ async fn repin_dormant_session(
         last_turn_at: None,
         cwd: summary.cwd,
         permission: summary.permission.unwrap_or_default(),
-        provider: summary.provider.profile,
-        model_override: summary.provider.model_override,
-        base_url_override: summary.provider.base_url_override,
+        provider: summary.provider,
         title: summary.preview,
         capabilities: capabilities_from_row(summary.capabilities_json.as_deref()),
         // Not resident, and nothing could have made it so while the reconstruction lock was held.
@@ -1137,13 +1096,12 @@ pub async fn patch_session(
     let new_provider = match body.provider.as_deref() {
         Some(name) => {
             require_configured_profile(&state, name)?;
-            // The profile as configured, with no overrides: a `PATCH` naming a provider is the
-            // client restating the whole binding, so a model override left over from another
-            // profile does not ride along onto one that may not have that model.
+            // The profile as configured. A `PATCH` naming a provider moves the session to that
+            // bundle entire, which is the only thing naming a profile can mean.
             Some(
                 crate::resolved_binding(
                     &state.shared.providers,
-                    crate::session::SessionProvider::from(name.to_string()),
+                    name.to_string(),
                 )
                 .await
                 // Not a blanket 422: `resolved_binding` reaches `provider_credential_version` and
@@ -1170,7 +1128,13 @@ pub async fn patch_session(
         new_permission.filter(|parsed| entry.permission.get() != *parsed);
     let cwd_change: Option<std::path::PathBuf> =
         new_cwd.filter(|path| crate::workspace::cwd_snapshot(&entry.cwd) != *path);
-    let provider_change = match new_provider {
+    // Only whether the *row* already says this, because that is all this decides. The live agent
+    // is moved further down regardless, so a `PATCH` naming the profile the row already records is
+    // how a session whose agent and row have come apart is put back together. Gating the swap on
+    // this too made that the one state no request could repair: the retry after a failed `PATCH`
+    // found the row already correct, wrote nothing, swapped nothing, and left every turn running
+    // on the profile the client had just been told it was off.
+    let provider_row_write = match new_provider.as_ref() {
         Some(resolved) => {
             let current = state
                 .shared
@@ -1180,14 +1144,11 @@ pub async fn patch_session(
                 .map_err(|error| {
                     ProblemDetail::internal_sanitized("failed to read session provider", error)
                 })?;
-            // The whole binding, not just the profile name. A `PATCH` naming a provider restates
-            // the binding entire, so one that names the profile the session already runs on is
-            // still how a stale model or endpoint override is cleared.
-            (current.as_ref() != Some(&resolved.binding)).then_some(resolved)
+            current.as_ref() != Some(&resolved.binding)
         }
-        None => None,
+        None => false,
     };
-    let mutated = permission_change.is_some() || cwd_change.is_some() || provider_change.is_some();
+    let mutated = permission_change.is_some() || cwd_change.is_some() || provider_row_write;
     if mutated {
         state
             .shared
@@ -1196,9 +1157,13 @@ pub async fn patch_session(
                 id,
                 permission_change.map(|perm| perm.to_string()),
                 cwd_change.clone(),
-                provider_change
-                    .as_ref()
-                    .map(|resolved| resolved.binding.clone()),
+                provider_row_write
+                    .then(|| {
+                        new_provider
+                            .as_ref()
+                            .map(|resolved| resolved.binding.clone())
+                    })
+                    .flatten(),
             )
             .await
             .map_err(|error| {
@@ -1225,15 +1190,20 @@ pub async fn patch_session(
         if let Some(path) = cwd_change {
             *crate::server::poisoned::write(&entry.cwd, "patch_session::cwd") = path;
         }
-        // The live agent moves last, and only after the row it must agree with. An `await` and not
-        // a `try_lock`: the row has already moved, and a resident session's next turn runs on the
-        // agent rather than re-reading the row, so refusing to swap would leave the two
-        // disagreeing until eviction. See the in-flight note at the top of the handler.
-        if let Some(resolved) = provider_change {
-            // One call, not three. The window and the vision flag the entry reports both come off
-            // the cell `set_provider` publishes into, so moving the agent moves them.
-            entry.runtime.lock().await.agent.set_provider(resolved);
-        }
+    }
+
+    // The live agent moves last, and only after the row it must agree with. An `await` and not a
+    // `try_lock`: the row has already moved, and a resident session's next turn runs on the agent
+    // rather than re-reading the row, so refusing to swap would leave the two disagreeing until
+    // eviction. See the in-flight note at the top of the handler.
+    //
+    // Outside the `mutated` block, because "the row already says this" is exactly when a repair is
+    // wanted and never a reason to skip one. Re-publishing the profile the agent already runs on
+    // costs one lock and changes nothing.
+    if let Some(resolved) = new_provider {
+        // One call, not three. The window and the vision flag the entry reports both come off the
+        // cell `set_provider` publishes into, so moving the agent moves them.
+        entry.runtime.lock().await.agent.set_provider(resolved);
     }
 
     // Bump `updated_at` only on actual changes; leave `last_turn_at` alone so the GC
@@ -1273,14 +1243,8 @@ pub async fn patch_session(
         permission: entry.permission.get().to_string(),
         provider: info
             .as_ref()
-            .map(|info| info.provider.profile.clone())
+            .map(|info| info.provider.clone())
             .unwrap_or_default(),
-        model_override: info
-            .as_ref()
-            .and_then(|info| info.provider.model_override.clone()),
-        base_url_override: info
-            .as_ref()
-            .and_then(|info| info.provider.base_url_override.clone()),
         title,
         capabilities: entry.capabilities,
         turn_in_flight: entry.in_flight.load(std::sync::atomic::Ordering::Acquire) > 0,

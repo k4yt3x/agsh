@@ -37,8 +37,8 @@ meka --oneshot "search the web for the latest Rust release"
 All configuration flags work in one-shot mode:
 
 ```bash
-# Use a specific provider and model
-meka --oneshot --provider work -m claude-opus-5 "explain this codebase"
+# Use a specific provider profile
+meka --oneshot --provider work "explain this codebase"
 
 # With workspace permission
 meka --oneshot --permission workspace "run 'cargo test' and summarize the results"

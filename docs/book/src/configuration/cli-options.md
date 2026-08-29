@@ -15,6 +15,7 @@ Manage provider profiles (add, list, switch, login, remove). `meka provider add`
 ```bash
 meka provider add work --type claude-subscription --model claude-opus-5
 meka provider list
+meka provider set work model claude-opus-5
 meka provider use work
 meka provider login work
 meka provider remove work
@@ -162,28 +163,11 @@ A new session records the profile it runs on, so `meka -c` later comes back on i
 rewritten and it keeps that profile from then on. See
 [what a resume restores](../usage/sessions.md#what-a-resume-restores).
 
-### `-m`, `--model <MODEL>`
-
-Override the active profile's model.
-
-```bash
-meka -m gpt-5.6-sol
-```
-
-Recorded on the session like `--provider`, so a resume keeps it. A session that was never given one
-follows whatever its profile says, which means editing the profile in `config.toml` moves it.
-
-The three flags are one statement together: a resume that names any of them states the session's
-whole binding, so `meka -c --provider work` clears a model override that belonged to the previous
-profile, and `meka -c --model gpt-5.6-sol` keeps the profile and replaces the model.
-
-### `--base-url <URL>`
-
-Override the active profile's API base URL. Recorded on the session in the same way as `--model`.
-
-```bash
-meka --base-url http://localhost:11434/v1
-```
+> **There is no `--model`, `--base-url`, `--thinking` or `--thinking-budget`.** A profile is an
+> indivisible bundle of a backend, an endpoint, a credential and every model-tied setting, and a
+> session records which one it runs on rather than a rewritten copy. To change a setting, edit the
+> profile with [`meka provider set`](./config-file.md#meka-provider-cli); to run something different,
+> make a second profile and select it with `--provider`.
 
 ### `--no-stream`
 
@@ -208,26 +192,6 @@ meka --render-mode raw
 ```
 
 Can also be set permanently via `display.render_mode` in the config file.
-
-### `--thinking <MODE>`
-
-Extended thinking mode for this run (`anthropic-messages` and `claude-subscription` providers): `adaptive`,
-`budgeted`, or `off`. Overrides the profile's
-[`thinking`](./config-file.md#thinking) key, which defaults to `adaptive`.
-
-```bash
-meka --thinking off
-```
-
-### `--thinking-budget <TOKENS>`
-
-Set the extended thinking token budget. Read only under `--thinking budgeted` (and the profile's
-`thinking = "budgeted"`), since the adaptive encoding lets the model set its own budget and `off`
-sends none at all.
-
-```bash
-meka --thinking-budget 20000
-```
 
 ### `--instructions <STRING>`
 

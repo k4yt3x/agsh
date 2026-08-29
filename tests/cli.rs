@@ -752,23 +752,20 @@ fn an_unresolvable_writable_root_warns_without_failing_the_run() {
     );
 }
 
-/// `--continue`, `--resume`, `--model` and `--base-url` name *this run's session*, and neither
-/// long-lived host has one: each creates a session per `session/new` or `POST /v1/sessions`. They
-/// used to parse and do nothing, which was worse than it sounds. `GET /v1/info` went on reporting a
-/// `--model` no session ever used, and `-c` / `-r` set `session_resume`, which switches off the
-/// default-profile check a host with no configured default needs most: `meka -c acp` then wrote a
-/// session row naming the empty profile and failed its first turn complaining about a session it
+/// `--continue` and `--resume` name *this run's session*, and neither long-lived host has one:
+/// each creates a session per `session/new` or `POST /v1/sessions`. They used to parse and do
+/// nothing, which was worse than it sounds: `-c` / `-r` set `session_resume`, which switches off
+/// the default-profile check a host with no configured default needs most, so `meka -c acp` wrote
+/// a session row naming the empty profile and failed its first turn complaining about a session it
 /// had created moments earlier.
+///
+/// The list was longer before 0.44, when `--model` and `--base-url` were refused here for the same
+/// reason. Those flags are gone entirely, so nothing about them needs refusing.
 #[test]
 fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     for host in ["acp", "serve"] {
-        for flag in [
-            vec!["--continue"],
-            vec!["--resume", "0e5f"],
-            vec!["--model", "some-model"],
-            vec!["--base-url", "https://example.invalid"],
-        ] {
+        for flag in [vec!["--continue"], vec!["--resume", "0e5f"]] {
             // Isolated, like every other CLI test. A regression in the guard would otherwise reach
             // the host's real startup, and `meka serve` would bind the port in the *developer's*
             // `config.toml` and run until the harness gave up -- a hang rather than a failure.
@@ -1061,43 +1058,107 @@ fn a_resume_with_an_unconfigured_provider_is_refused_by_name() {
     );
 }
 
-/// `--model` on its own repins the model, without `--base-url` beside it.
+/// `meka provider set` is the successor to the retired `--model`: it writes the key, leaves the
+/// rest of the file alone, and leaves behind a config the next process can still start on.
 ///
-/// The condition is `model.is_some() || base_url.is_some()`; as `&&` it needs both, so `--model`
-/// alone silently applied to nothing and the row kept whatever it had.
+/// End to end rather than at `set_profile_field`, because the unit test cannot see the last of
+/// those: a write that parses in isolation can still produce a file that fails at startup.
 #[test]
-fn a_resume_with_model_alone_repins_the_model() {
+fn provider_set_writes_the_key_and_leaves_a_config_the_next_run_can_start_on() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_provider_config(dir.path(), "alpha", &["alpha"]);
-    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
-    assert!(created.status.success());
-    let id = only_session(dir.path());
 
-    let moved = run_scripted(dir.path(), &[
-        "-r",
-        &id,
-        "--model",
-        "pinned-model",
-        "--oneshot",
-        "hi",
+    // A comment beside the key, which is exactly what a whole-table rewrite would eat.
+    let config_path = dir.path().join("meka").join("config.toml");
+    let annotated = std::fs::read_to_string(&config_path)
+        .expect("read config")
+        .replace(
+            "model = \"alpha-model\"",
+            "model = \"alpha-model\" # the model, annotated",
+        );
+    std::fs::write(&config_path, annotated).expect("write config");
+
+    let set = run_isolated(dir.path(), &[
+        "provider",
+        "set",
+        "alpha",
+        "model",
+        "swapped-model",
     ]);
     assert!(
-        moved.status.success(),
-        "the resume should run: {}",
-        String::from_utf8_lossy(&moved.stderr)
+        set.status.success(),
+        "set should succeed: {}",
+        String::from_utf8_lossy(&set.stderr)
     );
-    let recorded: Option<String> = store(dir.path())
-        .query_row(
-            "SELECT model_override FROM sessions WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .expect("the session row");
-    assert_eq!(
-        recorded.as_deref(),
-        Some("pinned-model"),
-        "`--model` alone must reach the row"
+
+    let written = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        written.contains("model = \"swapped-model\""),
+        "the new model is written: {written}"
     );
+    assert!(
+        written.contains("# the model, annotated"),
+        "the comment beside the changed key survives: {written}"
+    );
+    assert!(
+        written.contains("base_url = \"http://127.0.0.1:9/\""),
+        "the profile's other keys survive: {written}"
+    );
+
+    // The edited file still starts a process and runs a turn, which is what a whole class of
+    // botched writes would break. Deliberately *not* a claim that the new model reached the wire:
+    // `run_scripted`'s reply is fixed text, so nothing here can observe which model was built, and
+    // saying otherwise would describe a guard this does not have.
+    let turn = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(
+        turn.status.success(),
+        "the turn should run: {}",
+        String::from_utf8_lossy(&turn.stderr)
+    );
+
+    // And `--unset` returns the profile to stating nothing, which a later run then refuses by name
+    // rather than inventing a model for.
+    let unset = run_isolated(dir.path(), &[
+        "provider", "set", "alpha", "model", "--unset",
+    ]);
+    assert!(unset.status.success(), "unset should succeed");
+    let cleared = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        !cleared.contains("swapped-model"),
+        "the key is gone, not emptied: {cleared}"
+    );
+}
+
+/// The retired per-profile override flags are gone from the parser, not merely ignored.
+///
+/// A flag that parses and does nothing is worse than one that does not parse: a script pinning a
+/// model would keep exiting 0 while every turn ran on the profile's own. clap's unknown-argument
+/// error is the honest answer, and it is what tells the user to look for the new door.
+#[test]
+fn the_retired_profile_override_flags_no_longer_parse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    for flag in [
+        vec!["--model", "pinned-model"],
+        vec!["--base-url", "https://example.invalid"],
+        vec!["--thinking", "off"],
+        vec!["--thinking-budget", "2048"],
+    ] {
+        let mut args = flag.clone();
+        args.extend(["--oneshot", "hi"]);
+        let output = run_isolated(dir.path(), &args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "meka {} must not run: {stderr}",
+            flag.join(" ")
+        );
+        assert!(
+            stderr.contains("unexpected argument") && stderr.contains(flag[0]),
+            "meka {} must be refused by name: {stderr}",
+            flag.join(" ")
+        );
+    }
 }
 
 /// A setup failure that is *not* a missing profile must not offer to repin the session.

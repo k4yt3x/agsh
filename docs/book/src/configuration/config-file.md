@@ -95,7 +95,7 @@ The model identifier to send to the provider, forwarded verbatim. meka does not 
 
 `meka provider add` suggests `claude-opus-5` for a Claude profile and `gpt-5.6-sol` for an OpenAI one. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
 
-Override per-run with `--model`.
+Change it with `meka provider set <name> model <value>`.
 
 ### `base_url`
 
@@ -111,7 +111,7 @@ If not set, defaults to:
 - `https://chatgpt.com` for the `chatgpt-subscription` backend (request path is `/backend-api/codex/responses`)
 - `https://api.anthropic.com` for the `anthropic-messages` and `claude-subscription` backends
 
-Override per-run with `--base-url`.
+Change it with `meka provider set <name> base_url <value>`.
 
 **The two API families end their base URL in different places, and that is not meka's choice.** An
 OpenAI-compatible base includes the version segment, which is why every provider documents one
@@ -188,7 +188,7 @@ Claude-only. How the request encodes extended thinking, and whether it asks for 
 | Value | Wire shape |
 |-------|-----------|
 | `adaptive` (default) | `thinking: {"type": "adaptive"}` - the model sets its own budget. Claude 4.6+ |
-| `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}` from [`[thinking].budget_tokens`](#thinkingbudget_tokens). Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement |
+| `budgeted` | `thinking: {"type": "enabled", "budget_tokens": N}`, with N from [`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000. Required by pre-4.6 Claude, and the form most third-party Anthropic-compatible servers implement |
 | `off` | No `thinking` field |
 
 One knob rather than two: it replaces both the old on/off switch and the encoding meka used to infer from the model name. The right value depends on the model *and* on what the endpoint implements, which meka can't determine, so the profile states it - and a profile whose `model` later changes is yours to keep correct.
@@ -197,6 +197,19 @@ One knob rather than two: it replaces both the old on/off switch and the encodin
 [providers.local]
 type     = "anthropic-messages"
 thinking = "budgeted"
+```
+
+### `thinking_budget`
+
+Tokens the model may spend thinking. Read only under [`thinking = "budgeted"`](#thinking); the other two modes send no budget at all. A profile that states none falls back to [`[thinking].budget_tokens`](#thinkingbudget_tokens), and then to **16000**.
+
+Per profile because it is a parameter of `thinking`, and `thinking` is per profile. It was one installation-wide value until 0.44, which meant a profile could be refused over a number stated nowhere in it, and told to fix it by lowering a global every other profile was also budgeting against. Under `thinking = "budgeted"` this profile's [`max_output_tokens`](#max_output_tokens) must exceed the resolved budget, and the remedy now names this profile's own keys.
+
+```toml
+[providers.work]
+type            = "anthropic-messages"
+thinking        = "budgeted"
+thinking_budget = 20000
 ```
 
 ### `vision`
@@ -214,7 +227,7 @@ vision = false
 
 ### `max_output_tokens`
 
-Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed `[thinking].budget_tokens` (validated at startup).
+Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000). `meka provider add` and `meka provider set` both refuse a profile that fails this, and it is validated again at startup.
 
 ```toml
 [providers.work]
@@ -248,8 +261,9 @@ config file.
 
 | Command | Action |
 |---|---|
-| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--type` and `--model` as flags too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. Becomes `default_provider` whenever none is set. |
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--type` and `--model` as flags too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. Becomes `default_provider` whenever none is set. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--thinking`, `--context-window`, `--effort`, `--thinking-budget`, `--vision`, `--max-output-tokens`, `--redact-thinking`, `--oauth-token-url` and `--client-id`, so one non-interactive command can create a profile of any shape. The optional advanced prompt covers only thinking, context window and effort, plus the thinking budget if you answer `budgeted`; the rest are flag-only, and an unflagged setting is left out of the profile so its documented default applies. `device_id` has no flag, because meka resolves and persists it itself. |
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
+| `meka provider set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
 | `meka provider login <name> [--api-key-stdin]` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every other setting on the profile is kept, which `remove` + `add` would not do. |
 | `meka provider remove <name>` | Delete the stored credential from the database and remove the `[providers.<name>]` entry from the config file. Works on a name with only one of the two, so it can clean up after a hand-edit. Warns if it clears a `default_provider` that other profiles are still competing for, and if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --provider <name>`). |
@@ -259,6 +273,67 @@ config file.
 ```console
 $ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-chat-completions --model gpt-5.6-sol --api-key-stdin
 ```
+
+### Changing one setting
+
+`meka provider set <name> <key> <value>` writes one key into `[providers.<name>]` and touches
+nothing else: every other setting keeps its value, its position in the file, and any comment you
+wrote above or beside it. This is how a profile's model changes, since there is no per-run flag for
+it.
+
+```console
+$ meka provider set work model claude-opus-5
+$ meka provider set work context_window 200000
+$ meka provider set work effort --unset
+```
+
+`--unset` removes the key so the profile falls back to meka's default for it. That is not the same
+as writing an empty value: an absent key follows whatever the documented default later becomes,
+which is what an unstated setting has always meant.
+
+Eleven keys are settable, each named after the [profile field](#profile-fields) it writes:
+
+| Key | Value |
+|---|---|
+| `model` | Any string, forwarded to the provider verbatim |
+| `base_url` | Any string |
+| `context_window` | A whole number of tokens |
+| `vision` | `true` or `false` |
+| `max_output_tokens` | A whole number of tokens |
+| `effort` | Any string |
+| `thinking` | `adaptive`, `budgeted`, or `off` |
+| `thinking_budget` | A whole number of tokens |
+| `redact_thinking` | `true` or `false` |
+| `oauth_token_url` | Any string |
+| `client_id` | Any string |
+
+A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
+anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing
+else, so `yes` and `1` are refused rather than read as true. A key that is not on the list, and a
+profile name that is not configured, are both refused by name with the valid ones listed.
+
+`type` and `device_id` are on the profile but deliberately not settable, and the refusal says why
+rather than leaving them silently off the list:
+
+- **`type`** would leave the profile's stored credential, acquired for the current backend and
+  different in kind between backends, unable to serve it. Use `meka provider remove` and then
+  `meka provider add` instead.
+- **`device_id`** is meka's own, resolved and persisted per profile (see
+  [`device_id`](#device_id)).
+
+Two more rules are enforced on `meka provider add` and `meka provider set` alike, so neither door can
+leave behind a profile the other would have declined:
+
+- **`thinking`, `thinking_budget` and `redact_thinking` on a backend that never sends them.** All
+  three are Anthropic Messages request fields, so only `anthropic-messages` and
+  `claude-subscription` profiles carry them. `set` refuses the key and writes nothing, whether it
+  was given a value or `--unset`; `add` drops the flag with a warning and creates the profile
+  without it. Same outcome either way: the key never lands where it would read plausibly and do
+  nothing.
+- **A [`max_output_tokens`](#max_output_tokens) that does not exceed the thinking budget**, under
+  `thinking = "budgeted"` on one of those two backends. The budget is drawn from the output cap, so
+  such a profile cannot produce a valid request; both commands check the file they are about to
+  write and refuse before writing it.
 
 ### Leftover credentials
 
@@ -789,7 +864,7 @@ When the block ends the line stays on screen as a record that the phase happened
 
 ### `thinking.budget_tokens`
 
-Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap.
+Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap. A per-profile [`[providers.<name>].thinking_budget`](#thinking_budget) takes precedence over this.
 
 Default: `16000`
 

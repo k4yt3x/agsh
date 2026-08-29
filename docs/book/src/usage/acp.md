@@ -20,7 +20,7 @@ A few flags are worth knowing:
 | `-vv` | `debug` (per-request JSON-RPC diagnostics). |
 | `RUST_LOG=meka=trace` | Trace level. |
 
-Four flags are refused rather than ignored: `-c`, `-r`, `--model` and `--base-url`. All four name one run's session, and this host creates one per `session/new`, each naming its own provider profile. Set `model` and `base_url` on the profile in `config.toml` instead, or have the client name a `provider` per session. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
+Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and this host creates one per `session/new`, each naming its own provider profile. Have the client name a `provider` per session instead. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
 
 On startup, after the client's `initialize` arrives, meka logs `ACP client connected: <name> <version>` so you can confirm the client identity in `-v` mode.
 

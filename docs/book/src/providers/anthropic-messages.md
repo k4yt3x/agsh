@@ -42,7 +42,7 @@ meka sends the reasoning-effort control as `output_config.effort` in the request
 
 ### `thinking`
 
-`adaptive` (the default) sends `thinking: {"type": "adaptive"}` and lets the model set its own budget; `budgeted` sends the older `{"type": "enabled", "budget_tokens": N}` form, taking N from [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens); `off` sends no thinking field. Pre-4.6 Claude models require `budgeted`.
+`adaptive` (the default) sends `thinking: {"type": "adaptive"}` and lets the model set its own budget; `budgeted` sends the older `{"type": "enabled", "budget_tokens": N}` form, taking N from the profile's `thinking_budget` and falling back to [`[thinking].budget_tokens`](../configuration/config-file.md#thinkingbudget_tokens); `off` sends no thinking field. Pre-4.6 Claude models require `budgeted`.
 
 ## Supported Models
 
@@ -53,7 +53,7 @@ Any model available through the Claude Messages API; meka forwards the model str
 To use a Claude-API-compatible proxy or gateway:
 
 ```bash
-meka --provider work --model claude-opus-5 --base-url https://my-proxy.example.com
+meka --provider work
 ```
 
 A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.

@@ -75,7 +75,7 @@ pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 #[derive(Clone)]
 pub struct ResolvedBinding {
     pub provider: Arc<dyn Provider>,
-    pub binding: crate::session::SessionProvider,
+    pub binding: String,
     /// What the context gauge and the auto-compaction threshold read.
     pub context_window: u64,
     /// Whether this profile's model accepts image input. The agent does not read it: admitting an
@@ -396,14 +396,15 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     /// What [`Self::provider`] was built from, recorded on any session this agent creates.
     ///
-    /// The whole binding rather than the profile name alone, because the name alone is not enough
-    /// to rebuild this provider: a run given `--model` builds one the profile does not describe,
-    /// and a row recording only the profile would send the next resume to a different model.
+    /// The profile name is the whole of it, and that is the point: a profile is an indivisible
+    /// bundle, so the name determines the model, the endpoint and every model-tied knob. Nothing
+    /// can rewrite one of those for a run, which is what makes a name sufficient to rebuild this
+    /// provider on the next resume.
     ///
     /// Carried alongside the provider rather than derived from it: a built provider knows its
     /// backend and model but not which named profile asked for them, and the name is what a
     /// session records and later resolves by.
-    provider_binding: crate::session::SessionProvider,
+    provider_binding: String,
     /// Where [`Self::set_provider`] republishes the binding for collaborators that hold a handle.
     ///
     /// Always present, including for a sub-agent, which gets a [`PublishedBinding::detached`] cell
@@ -971,7 +972,7 @@ impl Agent {
     ///
     /// The session's own binding, which is not the process default once a resume or a switch has
     /// happened, and the only thing a status display may read if it is to agree with the turn.
-    pub fn provider_binding(&self) -> &crate::session::SessionProvider {
+    pub fn provider_binding(&self) -> &String {
         &self.provider_binding
     }
 
@@ -4198,28 +4199,28 @@ mod tests {
         // The agent's own cell, which is what `agent_spawn` and `context_check` hold.
         agent.set_provider(ResolvedBinding {
             provider: Arc::clone(&first),
-            binding: crate::session::SessionProvider::from("alpha".to_string()),
+            binding: "alpha".to_string(),
             context_window: 32_000,
             vision: true,
         });
         let published = agent.published_binding();
         let gauge = published.window();
-        assert_eq!(published.current().binding.profile, "alpha");
+        assert_eq!(published.current().binding, "alpha");
         assert_eq!(gauge.load(std::sync::atomic::Ordering::Acquire), 32_000);
 
         let second: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
         agent.set_provider(ResolvedBinding {
             provider: Arc::clone(&second),
-            binding: crate::session::SessionProvider::from("beta".to_string()),
+            binding: "beta".to_string(),
             context_window: 500_000,
             vision: false,
         });
 
-        assert_eq!(published.current().binding.profile, "beta");
+        assert_eq!(published.current().binding, "beta");
         assert!(Arc::ptr_eq(&published.current().provider, &second));
         assert_eq!(gauge.load(std::sync::atomic::Ordering::Acquire), 500_000);
-        assert_eq!(agent.provider_binding().profile, "beta");
+        assert_eq!(agent.provider_binding(), "beta");
         assert_eq!(agent.context_window(), 500_000);
     }
 
@@ -4563,7 +4564,7 @@ mod tests {
         let agent = Agent::new(
             PublishedBinding::detached(&ResolvedBinding {
                 provider,
-                binding: crate::session::SessionProvider::from("test-profile".to_string()),
+                binding: "test-profile".to_string(),
                 context_window: 0,
                 vision: true,
             }),

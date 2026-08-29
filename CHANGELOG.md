@@ -9,20 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A session records the provider profile, model and base URL it runs on, and a resume restores them.
+- A session records the provider profile it runs on, and a resume restores it.
 - A session's context window, vision flag and `max_output_tokens` come from its own profile.
 - `/provider [name]` in the REPL shows or changes the profile the session runs on.
 - `POST /v1/sessions` takes `provider`; `PATCH /v1/sessions/{id}` moves a session, loaded or not.
 - ACP advertises `configOptions` (permission and provider) and handles `session/set_config_option`.
-- `meka session list` gains a Provider column; `--long` adds the model and endpoint overrides.
-- Every HTTP session body reports `provider`, and `model_override` / `base_url_override` when set.
-- `meka session export` / `import` carry the provider profile and its overrides.
+- `meka session list` gains a Provider column.
+- Every HTTP session body reports the `provider` profile the session runs on.
+- `meka session export` / `import` carry the provider profile.
 - `meka provider login --api-key-stdin` rotates an API key without prompting or losing the profile.
 - `meka mcp login --auth-token-stdin` / `--client-secret-stdin` set or rotate a server's secret.
 - `meka mcp get` reports which kinds of credential a server has stored, without printing them.
+- `meka provider set <name> <key> <value>` changes one profile setting, keeping the rest intact.
+- `provider add` gains six flags for the remaining profile fields, so any profile is one command.
 
 ### Changed
 
+- **Breaking:** `--model`, `--base-url`, `--thinking` and `--thinking-budget` are removed.
+- **Breaking:** `meka session list --long` is removed along with the columns it showed.
+- The thinking budget is per profile (`thinking_budget`), falling back to `[thinking].budget_tokens`.
+- `provider add` refuses a profile that would fail at startup, as `provider set` already did.
+- `provider set` refuses a thinking setting on a backend that never sends one, as `add` drops it.
 - A failing provider call is attempted three times rather than four, with 1s then 2s of backoff.
 - A provider's `Retry-After` is honoured up to 60 seconds, where it was previously capped at 15.
 - A 502 from `meka serve` relays the upstream's `Retry-After` when it gave one, capped at an hour.
@@ -38,10 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A stored bearer and an `[auth]` block are mutually exclusive; where both exist, the block wins.
 - `meka mcp add` refuses a name that still holds a credential, rather than silently reusing it.
 - **Breaking:** `GET /v1/info` drops `provider` and `model`; `GET /v1/providers` reports both.
-- **Breaking:** `meka acp` / `meka serve` refuse `-c`, `-r`, `--model` and `--base-url`.
+- **Breaking:** `meka acp` / `meka serve` refuse `-c` and `-r`, which name one run's session.
 - **Breaking:** the REPL and `--oneshot` resume at the recorded permission level, not the default.
 - Existing sessions adopt `default_provider` when the store is brought forward.
-- `--provider`, `--model`, `--base-url` and `--permission` on a resume repin the session.
+- `--provider` and `--permission` on a resume repin the session.
 - A session whose recorded profile is not configured is refused by name, never silently redirected.
 - A profile's credential is checked when a session first needs it, not when a host starts up.
 - A resume is no longer blocked by an ambiguous `default_provider` it does not use.
@@ -54,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A store a 0.44 dev build renumbered past `mcp_credentials` has the table restored on next open.
+- `provider add` wrote a negative integer for a setting above `i64::MAX`, leaving config unreadable.
+- `provider set` deleted the comment and blank line above the key it changed.
+- `provider add --thinking-budget` wrote the key onto backends that never send a thinking field.
+- The interactive thinking-budget prompt offered the built-in default over `[thinking].budget_tokens`.
+- `PATCH /v1/sessions/{id}` naming the recorded profile now re-syncs a diverged live agent.
+- A sub-agent spawned during an ACP mid-turn repin recorded a profile it was not running on.
+- The refusal for a profile with no model named the removed `--model` instead of `provider set`.
 - A provider call that got no usable response is retried with backoff instead of ending the turn.
 - A retry sequence starts no new attempt after five minutes, so a call that hung is not tried again.
 - `meka serve` answers 502 rather than 500 for a retryable, mid-stream or context-overflow failure.

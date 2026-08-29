@@ -64,7 +64,7 @@ model = "llama3"
 base_url = "http://localhost:11434/v1"
 ```
 
-`--base-url` is also available as a per-run flag to override the profile's value for one invocation.
+Change it later with `meka provider set <name> base_url <url>`.
 
 ## API Details
 

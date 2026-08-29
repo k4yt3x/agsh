@@ -1770,7 +1770,6 @@ async fn build_config_options(
                 );
                 None
             })
-            .map(|recorded| recorded.profile)
             .unwrap_or_default(),
         None => String::new(),
     };
@@ -1844,7 +1843,7 @@ async fn apply_recorded_binding(
     if &recorded == runtime.agent.provider_binding() {
         return Ok(());
     }
-    let profile = recorded.profile.clone();
+    let profile = recorded.clone();
     let resolved = crate::resolved_binding(&state.shared.providers, recorded).await?;
     runtime.agent.set_provider(resolved);
     tracing::info!(
@@ -1930,9 +1929,7 @@ fn build_status_text(runtime: &SessionRuntime, shared: &crate::SharedDeps) -> St
     // This session's profile, not the process default's: two ACP sessions on one connection may sit
     // on different profiles, and the effort and context lines below already come from this one.
     let binding = runtime.agent.provider_binding();
-    if let Ok(settings) = shared
-        .providers
-        .settings(&binding.profile, &binding.overrides())
+    if let Ok(settings) = shared.providers.settings(binding)
         && let Some(model) = settings.model.as_deref()
     {
         let _ = writeln!(out, "  Model:    {model}");
@@ -4085,23 +4082,19 @@ async fn handle_set_session_config_option(
                         .join(", ")
                 )));
             }
-            // The profile as configured, with no overrides: setting the provider through a picker
-            // is the client restating the whole binding, and a model override left over from
-            // another profile has no business riding along onto one that may not have that model.
-            let resolved = match crate::resolved_binding(
-                &state.shared.providers,
-                crate::session::SessionProvider::from(value.clone()),
-            )
-            .await
-            {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    return responder.respond_with_error(invalid_params_error(format!(
-                        "cannot use provider profile `{}`: {}",
-                        value, error
-                    )));
-                }
-            };
+            // The profile as configured. Picking one through the picker moves the session to that
+            // bundle entire, which is the only thing a provider selection can mean now that a
+            // profile is indivisible.
+            let resolved =
+                match crate::resolved_binding(&state.shared.providers, value.clone()).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return responder.respond_with_error(invalid_params_error(format!(
+                            "cannot use provider profile `{}`: {}",
+                            value, error
+                        )));
+                    }
+                };
             // Setting the option to what it already is writes nothing. A picker re-sends its
             // current value readily -- a client rebuilding its UI, a user reselecting the
             // highlighted row -- and each write bumps `updated_at`, which is what the GC scanner's

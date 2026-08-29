@@ -47,20 +47,17 @@ A session records what it runs on, and a resume brings all of it back:
   provider that produced it and is not replayed to a different one, so resuming across providers
   would silently discard the reasoning the conversation recorded, and a different account would be
   billed.
-- **`--model` and `--base-url`**, when the run that created the session gave them. A session with
-  neither follows whatever the profile currently says, so editing the profile in `config.toml` moves
-  it.
 - **The permission level.** A session created at `unrestricted` resumes there without the flag.
 
-Everything the profile itself states comes with it: the context window the gauge and auto-compaction
-measure against, and whether images may be attached. Two sessions on one `meka serve` can sit on
-profiles with different windows and each is measured against its own.
+Everything the profile itself states comes with it: the model, the endpoint, the context window the
+gauge and auto-compaction measure against, and whether images may be attached. A session records the
+profile's *name*, not a copy of its settings, so editing the profile with
+[`meka provider set`](../configuration/config-file.md#meka-provider-cli) moves every session on it.
+Two sessions on one `meka serve` can sit on profiles with different windows and each is measured
+against its own.
 
-Naming any of `--provider`, `--model` or `--base-url` on a resume **repins the session**: the row is
-rewritten, so it keeps that from then on rather than for one run. The three are one statement
-together, so `meka -c --provider work` moves the profile and clears a model override that belonged
-to the previous one; `meka -c --model gpt-5.6` keeps the profile and replaces the model.
-`--permission` repins the same way.
+Naming `--provider` on a resume **repins the session**: the row is rewritten, so it keeps that
+profile from then on rather than for one run. `--permission` repins the same way.
 
 You can also change the provider mid-session: `/provider <name>` in the REPL,
 `PATCH /v1/sessions/{id}` with `{"provider": "..."}` over HTTP, or the Provider picker in an ACP
@@ -154,8 +151,6 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
 | `stat_*` | INTEGER | Eight cumulative counters behind `/status` |
 | `provider` | TEXT | Provider profile the session runs on. Never NULL |
-| `model_override` | TEXT | Model this session runs, or NULL for the profile's |
-| `base_url_override` | TEXT | Endpoint this session runs against, or NULL for the profile's |
 
 Locks are OS file locks under the data directory, not a column: a row cannot record a crashed
 process's PID and lock a session forever.
@@ -344,19 +339,9 @@ Sub-agent transcripts are hidden by default, so the listing stays the conversati
 meka session list --include-children
 ```
 
-The Provider column names the profile, which is the whole binding for most sessions. A session
-created or resumed with `--model` or `--base-url` also pins one of its own, and those do not show
-here. `--long` adds them, with `-` where the session simply follows its profile:
-
-```bash
-meka session list --long
-```
-
-```
-ID                                    Updated              Provider  Model       Base URL                   Preview
-550e8400-e29b-41d4-a716-446655440000  2026-03-14 12:00:00  work      -           -                          How do I implement a binary search tree?
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  2026-03-13 09:30:00  personal  gpt-5-mini  https://proxy.internal/v1  Fix the login page CSS
-```
+The Provider column names the profile, which is the whole story: a session records a profile name
+and nothing else, so the model and endpoint it runs on are whatever that profile currently says.
+`meka provider list` shows them.
 
 ## Exporting a Session
 
@@ -410,7 +395,7 @@ Read from stdin with `-`:
 cat session.json | meka session import -
 ```
 
-The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, and the provider profile the session ran on (plus any model or base-URL override). An archive that names no profile adopts this installation's default instead; repin it with `--provider` if it ran somewhere else. If nothing can supply one, because no `default_provider` is set and several profiles are configured, the import is refused rather than restoring a session that cannot run: set a default with `meka provider use <name>`, or name one for the import with `meka --provider <name> session import`.
+The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, and the name of the provider profile the session ran on. That name is all an archive carries about the provider: the settings themselves come from whatever `[providers.<name>]` says on the installation importing it. An archive that names no profile adopts this installation's default instead; repin it with `--provider` if it ran somewhere else. If nothing can supply one, because no `default_provider` is set and several profiles are configured, the import is refused rather than restoring a session that cannot run: set a default with `meka provider use <name>`, or name one for the import with `meka --provider <name> session import`.
 
 `updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than a configured `retention_days` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
 

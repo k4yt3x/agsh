@@ -975,41 +975,6 @@ fn a_second_process_resumes_on_the_provider_the_first_one_used() {
     );
 }
 
-/// `--model` is recorded the same way `--provider` is, so the model does not drift back either.
-///
-/// The sibling defect: a session pinned its profile but the run's model override was dropped on the
-/// floor, so the next process ran the profile's model instead of the one the user asked for.
-#[test]
-fn a_second_process_resumes_on_the_model_the_first_one_was_given() {
-    let cluster = cluster_with_two_unreachable_profiles();
-
-    turn_reaches(&cluster, &[
-        "--oneshot",
-        "-p",
-        "beta",
-        "-m",
-        "pinned-model",
-        "--permission",
-        "read",
-        "hello",
-    ]);
-
-    let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
-    let recorded: (String, Option<String>) = connection
-        .query_row(
-            "SELECT provider, model_override FROM sessions LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read the row");
-    assert_eq!(recorded.0, "beta");
-    assert_eq!(
-        recorded.1.as_deref(),
-        Some("pinned-model"),
-        "the run's `--model` belongs on the row, not just on the provider it built"
-    );
-}
-
 /// A profile deleted from `config.toml` is refused by name rather than silently replaced.
 ///
 /// The failure this guards is the quiet one: falling back to the default would run the conversation

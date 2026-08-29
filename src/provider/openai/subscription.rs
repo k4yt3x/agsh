@@ -147,8 +147,8 @@ impl ChatGptSubscriptionProvider {
 
     /// Returns the URL the request POSTs to. Codex's own client appends `/backend-api`
     /// automatically when the base URL is one of the chatgpt.com domains, but we keep the path
-    /// explicit so users pointing `--base-url` at a custom proxy don't need to know the rewrite
-    /// rule.
+    /// explicit so a profile whose `base_url` names a custom proxy doesn't need its author to know
+    /// the rewrite rule.
     fn responses_url(&self) -> String {
         let base = &self.base_url;
         if base.contains("/backend-api") || base.contains("/codex") {

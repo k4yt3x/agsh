@@ -6,8 +6,9 @@ Most upgrades are a binary swap: replace the old executable with the new one and
 
 A binary swap, and the store migrates itself as promised below, **unless you authenticate an MCP
 server with `auth_token` or `client_secret`**, which are no longer config keys. Read the next
-section first if you do; meka will refuse to start otherwise. Then two behaviour changes worth
-knowing before you resume an existing session, and two more if you run `meka serve` or `meka acp`.
+section first if you do; meka will refuse to start otherwise. Then the behaviour changes below,
+worth reading before you resume an existing session or run a scripted `meka`, several of which apply
+only if you run `meka serve` or `meka acp`.
 
 **MCP secrets moved out of `config.toml`.** `auth_token` on a server, and `client_secret` in a
 `[mcp.servers.auth]` block, are gone. Both were secrets sitting in a plaintext file people commit
@@ -128,14 +129,52 @@ default profile's *backend* under the name `provider`, while `provider` on `POST
 a *profile*, so a client that read one and posted it to the other got a 422. They were duplicates of
 the `active` row besides.
 
-**`meka acp` and `meka serve` refuse `-c`, `-r`, `--model` and `--base-url`.** All four name one
-run's session, and a long-lived host has no such thing: it creates one per `session/new` or per
-`POST /v1/sessions`, each naming its own profile. They used to be accepted and quietly misapplied,
-which was worse than it sounds: `GET /v1/info` went on reporting a `--model` no session ever used,
-and `-c` / `-r` switched off the default-profile check a host with no default needs most. Set
-`model` and `base_url` on the profile in `config.toml`, or name a `provider` per session. `--provider`
-is still accepted, because it selects which configured profile the host defaults to, which is a
-property of the host rather than of one session.
+**If you ran a 0.44 development build, your store repairs itself on the next run.** One such build
+removed a migration from the middle of the ledger instead of appending its reversal. `user_version`
+is a positional index, so that renumbered every later step, and a store sitting between the hole and
+the new head skipped a step it had never run while stamping itself current. The symptom was every
+MCP connection failing with `no such table: mcp_credentials` after a migration that reported
+success.
+
+Nothing is needed from you: an appended step recreates the table and carries the old MCP credentials
+into it, because a store already stamped past the missed step is only reachable by appending.
+Released 0.43 stores were never affected; they sit at the baseline and migrate straight through.
+
+**`--model`, `--base-url`, `--thinking` and `--thinking-budget` are gone.** A provider profile is an
+indivisible bundle: the backend, the endpoint, the credential keyed to it, the model, and every
+model-tied setting. A session selects one by name and records that name. A flag that moved one field
+of the bundle left the rest behind, so `--model` against a profile stating `context_window = 1000000`
+ran a 200K model while gauging its context against a 1M window, and never auto-compacted.
+
+Change a setting on the profile:
+
+```bash
+meka provider set work model claude-opus-5
+meka provider set work effort --unset
+```
+
+Or make a second profile and select it with `--provider`, which is now the only provider flag on a
+run. `meka provider add` has a flag for every profile field except `device_id`, which meka resolves
+and persists itself, so one command creates a whole profile:
+
+```bash
+printf '%s' "$ANTHROPIC_API_KEY" | meka provider add fast \
+    --type anthropic-messages --model claude-haiku-4-5 \
+    --context-window 200000 --api-key-stdin
+```
+
+**The thinking budget is per profile.** `[providers.<name>].thinking_budget` takes precedence over
+`[thinking].budget_tokens`, which stays as the installation-wide fallback and needs no edit. The
+global was previously cross-checked against a *per-profile* `max_output_tokens`, so a profile could
+be refused over a number stated nowhere in it, and told to fix it by lowering a value every other
+profile also read.
+
+**`meka acp` and `meka serve` refuse `-c` and `-r`.** Both name one run's session, and a long-lived
+host has no such thing: it creates one per `session/new` or per `POST /v1/sessions`, each naming its
+own profile. They used to be accepted and quietly misapplied: `-c` / `-r` switched off the
+default-profile check a host with no default needs most. Name a `provider` per session instead.
+`--provider` is still accepted, because it selects which configured profile the host defaults to,
+which is a property of the host rather than of one session.
 
 Also on the HTTP side, and not a break: `PATCH /v1/sessions/{id}` with a body naming only a provider
 now works on a session that is not loaded, which is how you move one whose profile has left

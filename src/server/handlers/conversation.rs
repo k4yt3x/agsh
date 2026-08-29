@@ -732,18 +732,16 @@ pub async fn import(
     // envelope is the caller's, so a rejection is a statement about their input.
     // An archive that names no profile adopts this server's default, which is the same profile
     // `POST /v1/sessions` gives a body that names none.
-    let (records, root_new_id) = crate::session::cli::plan_import(
-        export,
-        Some(&state.shared.default_profile),
-        crate::session::cli::EndpointOverride::Refused,
-    )
-    .map_err(|error| {
-        ProblemDetail::new(
-            ErrorKind::InvalidBody,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            error.to_string(),
-        )
-    })?;
+    let (records, root_new_id) =
+        crate::session::cli::plan_import(export, Some(&state.shared.default_profile)).map_err(
+            |error| {
+                ProblemDetail::new(
+                    ErrorKind::InvalidBody,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    error.to_string(),
+                )
+            },
+        )?;
     let count = records.len();
     state
         .shared

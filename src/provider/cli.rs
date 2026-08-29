@@ -48,6 +48,12 @@ pub async fn run(
             thinking,
             context_window,
             effort,
+            thinking_budget,
+            vision,
+            max_output_tokens,
+            redact_thinking,
+            oauth_token_url,
+            client_id,
             api_key_stdin,
         } => {
             run_add(
@@ -59,6 +65,12 @@ pub async fn run(
                     thinking: *thinking,
                     context_window: *context_window,
                     effort: effort.clone(),
+                    thinking_budget: *thinking_budget,
+                    vision: *vision,
+                    max_output_tokens: *max_output_tokens,
+                    redact_thinking: *redact_thinking,
+                    oauth_token_url: oauth_token_url.clone(),
+                    client_id: client_id.clone(),
                 },
                 *api_key_stdin,
                 token_store,
@@ -66,6 +78,12 @@ pub async fn run(
             .await
         }
         ProviderAction::List => run_list(token_store).await,
+        ProviderAction::Set {
+            name,
+            key,
+            value,
+            unset,
+        } => run_set(name, key, value.as_deref(), *unset),
         ProviderAction::Use { name } => run_use(name),
         ProviderAction::Remove { name } => run_remove(name, token_store, session_manager).await,
         ProviderAction::Login {
@@ -78,11 +96,23 @@ pub async fn run(
 /// The settings `provider add` can write beyond the four it always asks for. Each is `None` when
 /// the flag was absent and the user declined (or skipped) the advanced prompt, which leaves the key
 /// out of the profile entirely so the documented default applies.
+///
+/// Only the first three are ever *prompted* for. The rest are flag-only, so a profile of any shape
+/// can be created in one non-interactive command without making the interactive path a nine-step
+/// wizard for settings most users never state. [`resolve_tuning`] says the same thing from the
+/// other side: its short-circuit tests those three and no others, because a rare flag must not
+/// silently skip the prompt for the common ones.
 #[derive(Default)]
 struct ProfileTuning {
     thinking: Option<crate::provider::ThinkingMode>,
     context_window: Option<u64>,
     effort: Option<String>,
+    thinking_budget: Option<u64>,
+    vision: Option<bool>,
+    max_output_tokens: Option<u64>,
+    redact_thinking: Option<bool>,
+    oauth_token_url: Option<String>,
+    client_id: Option<String>,
 }
 
 async fn run_add(
@@ -201,6 +231,10 @@ async fn run_add(
             .session
             .as_ref()
             .and_then(|session| session.context_window),
+        existing
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens),
         api_key_stdin,
     )?;
 
@@ -372,6 +406,260 @@ async fn run_remove(
             "cleared the stored credential for '{}'; no profile was configured",
             name
         );
+    }
+    Ok(())
+}
+
+/// The settings `meka provider set` will write, in the order `provider add` prompts for them and
+/// `config.toml` documents them.
+///
+/// `type` is deliberately absent. The stored credential was acquired *for* the current backend and
+/// differs in kind between them (an API key against an OAuth bundle), so rewriting it in place
+/// leaves a profile whose credential cannot serve it: a state no other door can produce, and the
+/// one thing this command must not be able to do. `device_id` is absent for the opposite reason -
+/// meka resolves and persists it itself ([`crate::config::resolve_device_id`]), so offering it
+/// invites a user to overwrite bookkeeping they do not own.
+const SETTABLE_PROFILE_KEYS: &[&str] = &[
+    "model",
+    "base_url",
+    "context_window",
+    "vision",
+    "max_output_tokens",
+    "effort",
+    "thinking",
+    "thinking_budget",
+    "redact_thinking",
+    "oauth_token_url",
+    "client_id",
+];
+
+/// Parse one `key`/`value` pair into the TOML value the profile should carry.
+///
+/// Split from the write so the whole vocabulary is testable without a filesystem, and so a value
+/// that cannot be parsed is refused before the config lock is taken rather than after.
+///
+/// Each key parses the way the matching `provider add` flag does, `thinking` through the same
+/// `ValueEnum` for the reason [`resolve_tuning`]'s prompt gives: a second hand-written match would
+/// be a second thing to keep in step with the enum.
+fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Value> {
+    let integer = |what: &str| -> anyhow::Result<toml_edit::Value> {
+        let parsed: u64 = value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{} must be a whole number, got '{}'", what, value))?;
+        Ok(toml_edit::Value::from(toml_integer(what, parsed)?))
+    };
+    let boolean = |what: &str| -> anyhow::Result<toml_edit::Value> {
+        match value {
+            "true" => Ok(toml_edit::Value::from(true)),
+            "false" => Ok(toml_edit::Value::from(false)),
+            other => anyhow::bail!("{} must be true or false, got '{}'", what, other),
+        }
+    };
+    match key {
+        "model" | "base_url" | "effort" | "oauth_token_url" | "client_id" => {
+            Ok(toml_edit::Value::from(value))
+        }
+        "context_window" => integer("context_window"),
+        "max_output_tokens" => integer("max_output_tokens"),
+        "thinking_budget" => integer("thinking_budget"),
+        "vision" => boolean("vision"),
+        "redact_thinking" => boolean("redact_thinking"),
+        "thinking" => {
+            let mode = <crate::provider::ThinkingMode as clap::ValueEnum>::from_str(value, true)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "'{}' is not a thinking mode. Expected adaptive, budgeted, or off.",
+                        value
+                    )
+                })?;
+            Ok(toml_edit::Value::from(mode.as_str()))
+        }
+        other => anyhow::bail!(
+            "'{}' is not a profile setting. Settable: {}.{}",
+            other,
+            SETTABLE_PROFILE_KEYS.join(", "),
+            unsettable_key_hint(other)
+        ),
+    }
+}
+
+/// Why a key that exists on the profile still cannot be written here.
+///
+/// An empty string for anything else, so the refusal above reads the same either way. Worth saying
+/// rather than leaving to the list: a user who typed `type` did not typo, and "settable: model,
+/// base_url, ..." alone would read as though meka had simply forgotten it.
+fn unsettable_key_hint(key: &str) -> String {
+    match key {
+        "type" => {
+            " Changing `type` would leave the profile's stored credential, which was acquired \
+                   for the current backend, unable to serve it; use `meka provider remove` and \
+                   `meka provider add` instead."
+                .to_string()
+        }
+        "device_id" => {
+            " `device_id` is meka's own, resolved and persisted per profile.".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Write one key into `[providers.<name>]`, or remove it when `value` is `None`.
+///
+/// Answers whether the profile was there to change, which the caller turns into the refusal: a
+/// silent no-op on a mistyped profile name is exactly the failure `meka provider remove` was
+/// carrying before it started reporting the same thing.
+///
+/// A field-level edit rather than [`upsert_profile_document`]'s whole-table replace, so `toml_edit`
+/// keeps every other key, its ordering, and any comment the user wrote beside it. Replacing the
+/// table would silently eat all three on every `set`.
+fn set_profile_field(
+    document: &mut toml_edit::DocumentMut,
+    name: &str,
+    key: &str,
+    value: Option<toml_edit::Value>,
+) -> bool {
+    let Some(profile) = document
+        .get_mut("providers")
+        .and_then(|item| item.as_table_like_mut())
+        .and_then(|providers| providers.get_mut(name))
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return false;
+    };
+    match value {
+        Some(mut value) => {
+            // A key's surroundings live in two places, and `insert` clears both. The *value*'s
+            // decor holds what follows it on the line, so losing it deleted the trailing `# note`
+            // beside the model being changed. The *key*'s leaf decor holds everything before it,
+            // which is where `toml_edit` puts whole-line comments and blank lines above the key --
+            // so losing that deleted the paragraph a user had written to explain the setting, and
+            // the blank line separating it from the one above. Both are captured before the insert
+            // and put back after, because `insert` is what clears them.
+            if let Some(existing) = profile.get(key).and_then(|item| item.as_value()) {
+                *value.decor_mut() = existing.decor().clone();
+            }
+            let key_decor = profile.key(key).map(|key| key.leaf_decor().clone());
+            profile.insert(key, toml_edit::Item::Value(value));
+            if let (Some(decor), Some(mut written)) = (key_decor, profile.key_mut(key)) {
+                *written.leaf_decor_mut() = decor;
+            }
+        }
+        None => {
+            profile.remove(key);
+        }
+    }
+    true
+}
+
+/// Every profile key that only means something to the Anthropic Messages request shape.
+const THINKING_ONLY_PROFILE_KEYS: &[&str] = &["thinking", "thinking_budget", "redact_thinking"];
+
+/// Refuse one of those keys on a profile whose backend will never send it.
+///
+/// [`resolve_tuning`] drops such a flag on `provider add` with a warning, on the grounds that
+/// writing it "would produce a setting that reads plausibly and does nothing". `set` reaches the
+/// same outcome by refusing rather than dropping, and the difference is deliberate: `add` is
+/// building a bundle out of many flags, where ignoring one inapplicable knob and saying so is
+/// proportionate, whereas `set` exists to write exactly one key, so dropping it would mean
+/// reporting success for a command that did nothing at all.
+///
+/// Read from the document being written rather than from a parameter, because `set type` is refused
+/// and so the backend cannot be the thing this command is changing. Asked only of a write:
+/// `run_set` skips it for `--unset`, which can only be removing such a key.
+fn refuse_an_inert_thinking_key(
+    document: &toml_edit::DocumentMut,
+    name: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    if !THINKING_ONLY_PROFILE_KEYS.contains(&key) {
+        return Ok(());
+    }
+    let backend = document
+        .get("providers")
+        .and_then(|item| item.as_table_like())
+        .and_then(|providers| providers.get(name))
+        .and_then(|item| item.as_table_like())
+        .and_then(|profile| profile.get("type"))
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    // An unrecognised backend is left alone: `validate_backend` is the door that reports that, and
+    // guessing here would refuse a key over a typo in a different one.
+    if backend.is_empty()
+        || !crate::provider::SUPPORTED_PROVIDERS.contains(&backend)
+        || crate::provider::backend_takes_thinking(backend)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "'{}' is an Anthropic Messages request field, and profile '{}' has backend '{}', which \
+         never sends one. Nothing was written.",
+        key,
+        name,
+        backend
+    )
+}
+
+/// Refuse a key this command will not write, naming the ones it will.
+///
+/// Asked before the value is looked at, so `--unset modle` is refused for the same reason and in
+/// the same words as `set modle x`. Checking it inside the value branch instead left `--unset` to
+/// accept any spelling and report success, having changed nothing.
+fn ensure_settable_key(key: &str) -> anyhow::Result<()> {
+    if SETTABLE_PROFILE_KEYS.contains(&key) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "'{}' is not a profile setting. Settable: {}.{}",
+        key,
+        SETTABLE_PROFILE_KEYS.join(", "),
+        unsettable_key_hint(key)
+    )
+}
+
+/// `meka provider set <name> <key> <value>`, or `--unset` to drop the key.
+fn run_set(name: &str, key: &str, value: Option<&str>, unset: bool) -> anyhow::Result<()> {
+    ensure_settable_key(key)?;
+    // Clap's `conflicts_with` rules out "both"; this is the other half, which it cannot express.
+    let parsed = match (value, unset) {
+        (Some(value), _) => Some(parse_profile_value(key, value)?),
+        (None, true) => None,
+        (None, false) => anyhow::bail!(
+            "`meka provider set {} {}` needs a value, or `--unset` to remove the setting",
+            name,
+            key
+        ),
+    };
+
+    // `_lock` is held to the end of the function, so the read, the validation and the write are one
+    // critical section.
+    let (_lock, path, mut document) = open_document()?;
+    let before = document.to_string();
+    if !set_profile_field(&mut document, name, key, parsed) {
+        let config_file = config::load_config_file_or_err()?;
+        anyhow::bail!(
+            "no provider profile named '{}' (configured: {})",
+            name,
+            join_profile_names(&config_file)
+        );
+    }
+    // Only a write is refused. `--unset` on such a key moves the profile *towards* the state this
+    // guards, and a hand-edited file is the one place an inert key can already be sitting, so
+    // refusing to remove it would leave no door that could.
+    if value.is_some() {
+        refuse_an_inert_thinking_key(&document, name, key)?;
+    }
+
+    // Asked of the document this command is about to write, not of the one on disk, so neither
+    // write door can leave behind a profile the other would have refused. Checked here rather than
+    // at the next run because a config that fails to start is a worse answer than a command that
+    // declines, and the value that broke it is in front of the user right now.
+    let after = document.to_string();
+    refuse_a_profile_that_cannot_run(&before, &after, name)?;
+
+    config::write_file_atomic(&path, &after)?;
+    match value {
+        Some(value) => tracing::info!("set {} = {} on profile '{}'", key, value, name),
+        None => tracing::info!("cleared {} on profile '{}'", key, name),
     }
     Ok(())
 }
@@ -663,6 +951,25 @@ fn ensure_providers_table(
 /// `as_table_like` rather than `as_table` because an inline `providers = { … }` deserializes and so
 /// is a config meka runs on; a probe that could not see it reported profiles as absent while they
 /// were in the file.
+/// Narrow a profile's `u64` setting to the `i64` a TOML integer actually is.
+///
+/// TOML has one integer type and it is signed 64-bit, so a `u64` past `i64::MAX` has no
+/// representation at all. `as i64` wrapped it silently: `provider add x --context-window
+/// 18446744073709551615` wrote `context_window = -1` and exited 0, after which every meka command
+/// refused the file with `invalid value: integer -1, expected u64` -- including the `provider set`
+/// that would have repaired it, leaving `provider remove` or a hand-edit as the only way out.
+/// Refused here, before anything is written.
+fn toml_integer(field: &str, value: u64) -> anyhow::Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        anyhow::anyhow!(
+            "{} must be at most {}, the largest integer TOML can represent; got {}.",
+            field,
+            i64::MAX,
+            value
+        )
+    })
+}
+
 fn profile_names(document: &toml_edit::DocumentMut) -> Vec<String> {
     document
         .get("providers")
@@ -693,10 +1000,37 @@ fn upsert_profile_document(
         profile.insert("thinking", toml_edit::value(mode.as_str()));
     }
     if let Some(window) = tuning.context_window {
-        profile.insert("context_window", toml_edit::value(window as i64));
+        profile.insert(
+            "context_window",
+            toml_edit::value(toml_integer("context_window", window)?),
+        );
     }
     if let Some(effort) = tuning.effort.as_deref() {
         profile.insert("effort", toml_edit::value(effort));
+    }
+    if let Some(budget) = tuning.thinking_budget {
+        profile.insert(
+            "thinking_budget",
+            toml_edit::value(toml_integer("thinking_budget", budget)?),
+        );
+    }
+    if let Some(vision) = tuning.vision {
+        profile.insert("vision", toml_edit::value(vision));
+    }
+    if let Some(cap) = tuning.max_output_tokens {
+        profile.insert(
+            "max_output_tokens",
+            toml_edit::value(toml_integer("max_output_tokens", cap)?),
+        );
+    }
+    if let Some(redact) = tuning.redact_thinking {
+        profile.insert("redact_thinking", toml_edit::value(redact));
+    }
+    if let Some(url) = tuning.oauth_token_url.as_deref() {
+        profile.insert("oauth_token_url", toml_edit::value(url));
+    }
+    if let Some(client_id) = tuning.client_id.as_deref() {
+        profile.insert("client_id", toml_edit::value(client_id));
     }
     ensure_providers_table(document)?.insert(name, toml_edit::Item::Table(profile));
 
@@ -742,8 +1076,51 @@ fn write_profile(
     // `_lock` is held to the end of the function, so the read above and the write below are
     // one critical section.
     let (_lock, path, mut document) = open_document()?;
+    let before = document.to_string();
     upsert_profile_document(&mut document, name, backend, model, base_url, tuning)?;
-    config::write_file_atomic(&path, &document.to_string())?;
+    let after = document.to_string();
+    refuse_a_profile_that_cannot_run(&before, &after, name)?;
+    config::write_file_atomic(&path, &after)?;
+    Ok(())
+}
+
+/// Refuse a write that would leave `name` unusable, before the file is touched.
+///
+/// Both write doors ask this, and that is the point of it being one function. `set` asked it and
+/// `add` did not, so `provider add work --thinking budgeted --thinking-budget 32000
+/// --max-output-tokens 8000` exited 0 and wrote a profile that failed at *startup* on every later
+/// run -- and was then a trap, because the `provider set` sent to repair it re-derived the same
+/// refusal from the two keys already on disk and declined an unrelated edit.
+///
+/// `before` is what the file said when the lock was taken. The reparse below covers the whole
+/// document, so an unrelated defect anywhere in it would otherwise be reported as something this
+/// command did; asking whether it already failed is the difference between naming the line the user
+/// must fix and blaming an edit that had nothing to do with it. It stays a refusal either way,
+/// because writing on top of a file meka cannot read would strand the rest of its contents.
+fn refuse_a_profile_that_cannot_run(before: &str, after: &str, name: &str) -> anyhow::Result<()> {
+    let candidate: config::ConfigFile = toml::from_str(after).map_err(|error| {
+        if toml::from_str::<config::ConfigFile>(before).is_err() {
+            anyhow::anyhow!(
+                "config.toml could not be read before this change either, so this is not what \
+                 broke it. Fix the file first: {}",
+                error
+            )
+        } else {
+            anyhow::anyhow!("that change makes config.toml unreadable: {}", error)
+        }
+    })?;
+    if let Some(profile) = candidate.providers.get(name) {
+        crate::config::validate_max_output_tokens(
+            name,
+            Some(&profile.backend),
+            profile.max_output_tokens,
+            profile.thinking.unwrap_or_default(),
+            profile
+                .thinking_budget
+                .or(candidate.thinking.as_ref().and_then(|it| it.budget_tokens))
+                .unwrap_or(crate::config::DEFAULT_THINKING_BUDGET_TOKENS),
+        )?;
+    }
     Ok(())
 }
 
@@ -786,6 +1163,21 @@ fn unset_defaults_summary(
     (!defaults.is_empty()).then(|| defaults.join(", "))
 }
 
+/// Whether the advanced step should ask for a thinking budget.
+///
+/// The one flag-only setting that is also prompted for, and only in the case that creates it. A
+/// budget means nothing under `adaptive` (the default) or `off`, which send no `budget_tokens` at
+/// all, so asking unconditionally would put a fourth question in front of every user to serve the
+/// one who just answered "budgeted" -- and that user needs it now, because this is where the
+/// `max_output_tokens` pairing starts to matter.
+///
+/// Split out from the prompt for the reason [`unset_defaults_summary`] is: the prompt itself is the
+/// one part of [`resolve_tuning`] a test cannot drive, so the condition deciding whether it fires
+/// has to be reachable on its own or it is guarded by nothing.
+fn budget_is_worth_asking_about(thinking: Option<crate::provider::ThinkingMode>) -> bool {
+    thinking == Some(crate::provider::ThinkingMode::Budgeted)
+}
+
 /// Fill in whatever the flags didn't set, offering one opt-in prompt rather than three
 /// unconditional ones. Declining leaves every unset knob out of the profile, and says which
 /// defaults that implies, because these are the settings meka stopped inferring: nothing else will
@@ -799,24 +1191,44 @@ fn resolve_tuning(
     backend: &str,
     profile_name: &str,
     session_window: Option<u64>,
+    global_budget: Option<u64>,
     stdin_is_the_key: bool,
 ) -> anyhow::Result<ProfileTuning> {
     // What an unset profile would actually budget against: `[session].context_window` if the user
     // already set one, else the built-in default. Showing the constant unconditionally would state
     // a window the run is not going to use.
     let effective_window = session_window.unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW);
+    // The same question one field over, and it was got wrong once: the budget prompt showed the
+    // built-in constant while the profile would actually fall back to `[thinking].budget_tokens`,
+    // so pressing Enter to "accept the default" produced a different number from typing the one on
+    // screen.
+    let effective_budget = global_budget.unwrap_or(crate::config::DEFAULT_THINKING_BUDGET_TOKENS);
     // `thinking` is an Anthropic Messages request field, so an OpenAI profile is neither asked
     // about it nor told what it defaults to: writing the key there would produce a setting that
     // reads plausibly and does nothing.
     let takes_thinking = crate::provider::backend_takes_thinking(backend);
     let mut flags = flags;
-    // The flag is dropped, not just left unprompted. Guarding only the prompt produced a run that
-    // printed "using defaults:" without thinking *and* wrote `thinking` into the profile.
-    if !takes_thinking && flags.thinking.take().is_some() {
-        tracing::warn!(
-            "ignoring --thinking for a '{}' profile: thinking is an Anthropic Messages request field",
-            backend
-        );
+    // The flags are dropped, not just left unprompted. Guarding only the prompt produced a run that
+    // printed "using defaults:" without thinking *and* wrote `thinking` into the profile. All three
+    // of them, because they are one request field between them: guarding `thinking` alone let
+    // `--thinking-budget 2048` write `thinking_budget` into an OpenAI profile, which is the same
+    // inert key one field over.
+    if !takes_thinking {
+        let dropped: Vec<&str> = [
+            flags.thinking.take().map(|_| "--thinking"),
+            flags.thinking_budget.take().map(|_| "--thinking-budget"),
+            flags.redact_thinking.take().map(|_| "--redact-thinking"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "ignoring {} for a '{}' profile: thinking is an Anthropic Messages request field",
+                dropped.join(", "),
+                backend
+            );
+        }
     }
     let complete = flags.context_window.is_some()
         && flags.effort.is_some()
@@ -880,10 +1292,35 @@ fn resolve_tuning(
         }
     };
 
+    let thinking_budget = match flags.thinking_budget {
+        Some(budget) => Some(budget),
+        None if budget_is_worth_asking_about(thinking) => {
+            let input = prompt_line(&format!(
+                "  Thinking budget in tokens [{}]: ",
+                effective_budget
+            ))?;
+            match input.as_str() {
+                "" => None,
+                other => Some(other.parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!("'{}' is not a whole number of tokens.", other)
+                })?),
+            }
+        }
+        None => None,
+    };
+
     Ok(ProfileTuning {
         thinking,
         context_window,
         effort,
+        thinking_budget,
+        // Flag-only, so they pass through whatever the caller set. Prompting for them would make
+        // the advanced step twice as long for settings that are stated far less often.
+        vision: flags.vision,
+        max_output_tokens: flags.max_output_tokens,
+        redact_thinking: flags.redact_thinking,
+        oauth_token_url: flags.oauth_token_url,
+        client_id: flags.client_id,
     })
 }
 
@@ -2297,35 +2734,56 @@ mod tests {
         assert_eq!(credential_kind("not-a-backend"), None);
     }
 
-    /// `--thinking` must be *dropped* on a backend whose requests have no thinking field, not
-    /// merely left unprompted.
+    /// Every thinking flag must be *dropped* on a backend whose requests have no thinking field,
+    /// not merely left unprompted.
     ///
     /// Guarding only the prompt is the bug this closes: the run then printed a "using defaults:"
     /// line with no thinking in it *and* wrote `thinking` into the profile anyway, so the file
     /// disagreed with what the user had just been told, and the key sat there reading plausibly
     /// while doing nothing. Both halves are asserted, because either one alone passes the wrong
     /// implementation.
+    ///
+    /// All three flags, because the fix was originally applied to `thinking` alone and
+    /// `--thinking-budget` then walked straight through the hole it left: the three are one request
+    /// field between them, so a guard that names one of them is a guard for none of them.
     #[test]
     fn a_thinking_flag_aimed_at_a_backend_without_thinking_is_dropped() {
         let flags = || ProfileTuning {
             thinking: Some(crate::provider::ThinkingMode::Budgeted),
+            thinking_budget: Some(2_048),
+            redact_thinking: Some(true),
             context_window: Some(1_024),
             effort: Some("low".to_string()),
+            ..Default::default()
         };
         // Every setting is pinned, so this returns before any prompt: no stdin involved.
-        let openai = resolve_tuning(flags(), "openai-chat-completions", "oai", None, false)
+        let openai = resolve_tuning(flags(), "openai-chat-completions", "oai", None, None, false)
             .expect("resolve");
         assert_eq!(openai.thinking, None, "written into an OpenAI profile");
+        assert_eq!(
+            openai.thinking_budget, None,
+            "the budget is the same request field, one key over"
+        );
+        assert_eq!(
+            openai.redact_thinking, None,
+            "and so is the redaction of what it produces"
+        );
         assert_eq!(openai.context_window, Some(1_024));
         assert_eq!(openai.effort.as_deref(), Some("low"));
 
-        let claude =
-            resolve_tuning(flags(), "anthropic-messages", "work", None, false).expect("resolve");
+        let claude = resolve_tuning(flags(), "anthropic-messages", "work", None, None, false)
+            .expect("resolve");
         assert_eq!(
             claude.thinking,
             Some(crate::provider::ThinkingMode::Budgeted),
             "the same flag must still reach a Claude profile"
         );
+        assert_eq!(
+            claude.thinking_budget,
+            Some(2_048),
+            "and so must the budget"
+        );
+        assert_eq!(claude.redact_thinking, Some(true), "and the redaction flag");
     }
 
     /// The defaults line names what is still unset, and nothing else.
@@ -2358,6 +2816,7 @@ mod tests {
             thinking: Some(crate::provider::ThinkingMode::Off),
             context_window: Some(8_192),
             effort: None,
+            ..Default::default()
         };
         let partial = unset_defaults_summary(&pinned, true, 1_000_000).expect("effort is unset");
         assert!(!partial.contains("thinking"), "{partial}");
@@ -2371,12 +2830,474 @@ mod tests {
                     thinking: Some(crate::provider::ThinkingMode::Off),
                     context_window: Some(8_192),
                     effort: Some("low".to_string()),
+                    ..Default::default()
                 },
                 true,
                 1_000_000,
             ),
             None
         );
+    }
+
+    /// `set` edits one key and leaves the rest of the file exactly as the user wrote it.
+    ///
+    /// The whole reason this is not [`upsert_profile_document`]: replacing the table would rewrite
+    /// every key in meka's order and drop the comments beside them, so a user who ran `set` once
+    /// would find their annotated config quietly reformatted and their notes gone. Nothing else
+    /// would fail, which is why the guard is here.
+    ///
+    /// A key's surroundings live in two decors and `insert` clears both, so this asserts on both.
+    /// The first version of the fix carried the *value*'s decor only, which saved the trailing
+    /// `# note` and still deleted the whole-line comment and blank line above the key, since those
+    /// belong to the key's leaf decor. Half a fix passes an assertion on either half alone.
+    #[test]
+    fn set_edits_one_key_and_preserves_everything_around_it() {
+        let mut document = r#"default_provider = "work"
+
+# Why this profile exists.
+[providers.work]
+type = "anthropic-messages"
+
+# The 1M-window model; keep context_window in step with it.
+model = "old-model"       # the model, annotated
+context_window = 200000
+
+[providers.other]
+type = "openai-responses"
+model = "untouched"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse");
+
+        assert!(set_profile_field(
+            &mut document,
+            "work",
+            "model",
+            Some(toml_edit::Value::from("new-model"))
+        ));
+
+        let rendered = document.to_string();
+        assert!(rendered.contains("model = \"new-model\""), "{rendered}");
+        assert!(
+            rendered.contains("# Why this profile exists."),
+            "the comment above the table survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("# the model, annotated"),
+            "the comment beside the edited key survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("# The 1M-window model; keep context_window in step with it."),
+            "and so does the one above it, which lives in the key's decor rather than the \
+             value's: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n\n# The 1M-window model"),
+            "including the blank line that separated it from the key before: {rendered}"
+        );
+        assert!(
+            rendered.contains("context_window = 200000"),
+            "the profile's other keys survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("model = \"untouched\""),
+            "another profile is not touched: {rendered}"
+        );
+        assert!(
+            rendered.find("type").unwrap() < rendered.find("context_window").unwrap(),
+            "key order is the user's, not meka's: {rendered}"
+        );
+    }
+
+    /// A profile setting past `i64::MAX` is refused rather than wrapped into the file.
+    ///
+    /// TOML has one integer type and it is signed, so `as i64` turned `u64::MAX` into `-1` and
+    /// wrote it. `provider add brick --context-window 18446744073709551615` then exited 0 having
+    /// bricked the config: every later command, including the `provider set` that would have
+    /// repaired it, refused the file with `invalid value: integer -1, expected u64`.
+    #[test]
+    fn an_integer_too_large_for_toml_is_refused_rather_than_wrapped() {
+        for field in ["context_window", "thinking_budget", "max_output_tokens"] {
+            let error = toml_integer(field, u64::MAX).expect_err("u64::MAX has no TOML form");
+            let message = error.to_string();
+            assert!(
+                message.contains(field) && message.contains(&i64::MAX.to_string()),
+                "the refusal names the setting and the ceiling: {message}"
+            );
+        }
+        assert_eq!(
+            toml_integer("context_window", 1_000_000).expect("an ordinary window fits"),
+            1_000_000
+        );
+        // The boundary itself, so the refusal is `>` and not `>=`.
+        assert_eq!(
+            toml_integer("context_window", i64::MAX as u64).expect("the largest legal value fits"),
+            i64::MAX
+        );
+
+        // And through the door `set` actually uses, since that is where a user meets it.
+        let error = parse_profile_value("context_window", &u64::MAX.to_string())
+            .expect_err("`set` refuses it too");
+        assert!(
+            error.to_string().contains("context_window"),
+            "{}",
+            error.to_string()
+        );
+    }
+
+    /// The shared refusal both write doors ask, checked directly.
+    ///
+    /// Reached only through `write_profile` and `run_set`, which both touch the real config path,
+    /// so nothing exercised it: `cargo mutants` replaced the whole function with `Ok(())` and the
+    /// suite stayed green. It is a pure function of the two documents and a name, so it does not
+    /// need the filesystem to be tested -- only to be called.
+    ///
+    /// The pairing is what `provider add` used to let through. `run_set`'s comment claimed parity
+    /// with `add` while `add` refused nothing, so the flags below wrote a profile that exited 0 and
+    /// then failed at startup on every later run.
+    #[test]
+    fn a_profile_that_could_not_start_is_refused_by_both_write_doors() {
+        let good = r#"[providers.work]
+type = "anthropic-messages"
+thinking = "budgeted"
+thinking_budget = 8000
+max_output_tokens = 32000
+"#;
+        let cap_below_budget = r#"[providers.work]
+type = "anthropic-messages"
+thinking = "budgeted"
+thinking_budget = 32000
+max_output_tokens = 8000
+"#;
+        refuse_a_profile_that_cannot_run(good, good, "work").expect("a workable pairing passes");
+        let error = refuse_a_profile_that_cannot_run(good, cap_below_budget, "work")
+            .expect_err("a cap at or below the budget cannot produce a valid request");
+        let message = error.to_string();
+        assert!(
+            message.contains("work") && message.contains("32000"),
+            "the refusal names the profile and the budget it must exceed: {message}"
+        );
+
+        // The budget falls back to the global when the profile states none, so the same pairing is
+        // refused even though neither number is written beside the other.
+        let global_budget = r#"[thinking]
+budget_tokens = 64000
+
+[providers.work]
+type = "anthropic-messages"
+thinking = "budgeted"
+max_output_tokens = 16000
+"#;
+        refuse_a_profile_that_cannot_run(good, global_budget, "work")
+            .expect_err("the fallback budget is checked too, not skipped for being absent");
+
+        // A profile the edit did not touch is not this call's business.
+        refuse_a_profile_that_cannot_run(good, cap_below_budget, "other")
+            .expect("only the named profile is judged");
+    }
+
+    /// A file that was already unreadable is not blamed on the edit that found it.
+    ///
+    /// The reparse covers the whole document, so any unrelated defect anywhere in it blocks the
+    /// write. Reporting that as "that change makes config.toml unreadable" sent the user looking at
+    /// the key they had just set, which was not the problem. Still a refusal either way; only the
+    /// sentence changes, and the sentence is the whole value.
+    #[test]
+    fn a_pre_existing_config_error_is_not_blamed_on_this_edit() {
+        let already_broken = "[typo_section]\nfoo = 1\n";
+        let error = refuse_a_profile_that_cannot_run(already_broken, already_broken, "work")
+            .expect_err("an unreadable file is refused");
+        assert!(
+            error.to_string().contains("before this change either"),
+            "the message must say the edit is not what broke it: {error}"
+        );
+
+        let fine = "[providers.work]\ntype = \"anthropic-messages\"\n";
+        let error = refuse_a_profile_that_cannot_run(fine, already_broken, "work")
+            .expect_err("an edit that breaks parsing is refused");
+        assert!(
+            error.to_string().contains("makes config.toml unreadable"),
+            "and when the edit *is* what broke it, it says so: {error}"
+        );
+    }
+
+    /// A thinking key is refused on a profile whose backend never sends one.
+    ///
+    /// `provider add` drops such a flag with a warning; `set` refuses, because a command whose
+    /// entire job is one key cannot report success having written nothing. Both doors reach the
+    /// same place: the key does not end up in a profile that ignores it.
+    #[test]
+    fn setting_a_thinking_key_on_a_backend_without_thinking_is_refused() {
+        let document = r#"[providers.oai]
+type = "openai-responses"
+model = "gpt-5.6"
+
+[providers.work]
+type = "anthropic-messages"
+model = "claude-opus-5"
+
+[providers.typo]
+type = "not-a-backend"
+model = "m"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse");
+
+        for key in THINKING_ONLY_PROFILE_KEYS {
+            let error = refuse_an_inert_thinking_key(&document, "oai", key)
+                .expect_err("inert on a Responses profile");
+            let message = error.to_string();
+            assert!(
+                message.contains(key) && message.contains("openai-responses"),
+                "the refusal names the key and the backend: {message}"
+            );
+            refuse_an_inert_thinking_key(&document, "work", key)
+                .expect("the same key is live on a Messages profile");
+            // An unrecognised `type` is `validate_backend`'s to report. Refusing here would
+            // answer a typo in one key with a complaint about a different one.
+            refuse_an_inert_thinking_key(&document, "typo", key)
+                .expect("an unknown backend is not this function's to judge");
+        }
+        refuse_an_inert_thinking_key(&document, "oai", "model")
+            .expect("a key that is not thinking-only passes on any backend");
+    }
+
+    /// `--unset` removes the key rather than writing an empty value.
+    ///
+    /// The two are not the same: an absent key follows whatever meka's default becomes, which is
+    /// the documented meaning of an unstated setting, while `model = ""` is a model named the empty
+    /// string and would be sent as one.
+    #[test]
+    fn unsetting_removes_the_key_rather_than_emptying_it() {
+        let mut document = r#"[providers.work]
+type = "anthropic-messages"
+effort = "high"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse");
+
+        assert!(set_profile_field(&mut document, "work", "effort", None));
+        let rendered = document.to_string();
+        assert!(!rendered.contains("effort"), "the key is gone: {rendered}");
+        assert!(rendered.contains("type ="), "the rest stays: {rendered}");
+    }
+
+    /// A profile that is not there is reported, never silently created.
+    ///
+    /// Answering `true` here would have `set` write a `[providers.<typo>]` table with one key in
+    /// it, report success, and leave the user's real profile unchanged with no indication why.
+    #[test]
+    fn setting_a_key_on_an_absent_profile_says_so() {
+        let mut document = r#"[providers.work]
+type = "anthropic-messages"
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse");
+
+        assert!(!set_profile_field(
+            &mut document,
+            "ghost",
+            "model",
+            Some(toml_edit::Value::from("x"))
+        ));
+        assert!(
+            !document.to_string().contains("ghost"),
+            "a refused set writes nothing at all"
+        );
+    }
+
+    /// Every settable key parses its own value type, and refuses what it cannot mean.
+    #[test]
+    fn each_profile_key_parses_the_way_its_add_flag_does() {
+        assert!(parse_profile_value("model", "claude-opus-5").is_ok());
+        assert!(parse_profile_value("context_window", "200000").is_ok());
+        assert!(parse_profile_value("context_window", "lots").is_err());
+        assert!(parse_profile_value("vision", "false").is_ok());
+        assert!(parse_profile_value("vision", "no").is_err());
+        assert!(parse_profile_value("thinking", "budgeted").is_ok());
+        assert!(parse_profile_value("thinking", "sideways").is_err());
+        assert!(parse_profile_value("thinking_budget", "2048").is_ok());
+
+        // Every key in the advertised list has an arm. A key listed but unhandled would fall to the
+        // catch-all and be refused as unknown, which reads as meka having forgotten its own field.
+        for key in SETTABLE_PROFILE_KEYS {
+            let sample = match *key {
+                "context_window" | "max_output_tokens" | "thinking_budget" => "1000",
+                "vision" | "redact_thinking" => "true",
+                "thinking" => "adaptive",
+                _ => "value",
+            };
+            assert!(
+                parse_profile_value(key, sample).is_ok(),
+                "'{key}' is advertised as settable but does not parse"
+            );
+        }
+    }
+
+    /// An unknown key is refused whichever way it arrived, including behind `--unset`.
+    ///
+    /// The refusal used to live inside the value branch, so `--unset modle` skipped it entirely:
+    /// the command exited 0, removed nothing, and told the user nothing. Nothing else would notice,
+    /// because the write it did not do is indistinguishable from a key that was already absent.
+    #[test]
+    fn an_unknown_key_is_refused_whether_or_not_a_value_came_with_it() {
+        let error = ensure_settable_key("modle").expect_err("a typo is not a setting");
+        assert!(
+            error.to_string().contains("is not a profile setting"),
+            "{}",
+            error
+        );
+        for key in SETTABLE_PROFILE_KEYS {
+            assert!(
+                ensure_settable_key(key).is_ok(),
+                "'{key}' is advertised as settable but the door refuses it"
+            );
+        }
+        assert!(
+            ensure_settable_key("type").is_err() && ensure_settable_key("device_id").is_err(),
+            "the two deliberate exclusions are refused by the same door"
+        );
+    }
+
+    /// The advanced step asks for a budget exactly when one will be sent, and never otherwise.
+    ///
+    /// `adaptive` and `off` send no `budget_tokens` at all, so a budget collected under them is a
+    /// question asked for nothing and a key written into the profile that does nothing. Inverting
+    /// this, or pinning it to `true`, is invisible to every other test: the prompt is the one part
+    /// of `resolve_tuning` a test cannot drive.
+    #[test]
+    fn the_budget_is_asked_for_under_budgeted_and_nothing_else() {
+        use crate::provider::ThinkingMode;
+        assert!(budget_is_worth_asking_about(Some(ThinkingMode::Budgeted)));
+        assert!(!budget_is_worth_asking_about(Some(ThinkingMode::Adaptive)));
+        assert!(!budget_is_worth_asking_about(Some(ThinkingMode::Off)));
+        assert!(
+            !budget_is_worth_asking_about(None),
+            "an unstated mode takes the default, which is adaptive and sends no budget"
+        );
+    }
+
+    /// `type` is refused with the reason, not merely omitted from the list.
+    ///
+    /// A user who typed it did not typo, so "settable: model, base_url, …" on its own would read as
+    /// an oversight rather than a decision, and the obvious next move would be to hand-edit the key
+    /// that meka is declining to change for them.
+    #[test]
+    fn changing_a_profiles_backend_is_refused_with_its_reason() {
+        let error = parse_profile_value("type", "openai-responses")
+            .expect_err("the backend is not settable in place");
+        let message = error.to_string();
+        assert!(
+            message.contains("credential") && message.contains("meka provider add"),
+            "the refusal must say why and where to go: {message}"
+        );
+
+        let device = parse_profile_value("device_id", "abc")
+            .expect_err("meka's own bookkeeping is not settable");
+        assert!(
+            device.to_string().contains("meka's own"),
+            "{}",
+            device.to_string()
+        );
+    }
+
+    /// Every flag-only setting reaches the profile, and none is written when its flag was absent.
+    ///
+    /// These six never pass through a prompt, so the writer is the only thing standing between the
+    /// flag and the file: a missing `insert` would make `--vision false` exit 0 and change nothing,
+    /// and the profile would keep advertising images the model cannot take. The absent half matters
+    /// for the reason the sibling test gives -- an unstated key follows the documented default, and
+    /// writing it eagerly would freeze today's default into every profile.
+    #[test]
+    fn the_flag_only_settings_reach_the_profile_and_only_when_given() {
+        let mut bare = toml_edit::DocumentMut::new();
+        upsert_profile_document(
+            &mut bare,
+            "local",
+            "anthropic-messages",
+            "some-local-model",
+            None,
+            &ProfileTuning::default(),
+        )
+        .expect("upsert");
+        let rendered = bare.to_string();
+        for key in [
+            "thinking_budget",
+            "vision",
+            "max_output_tokens",
+            "redact_thinking",
+            "oauth_token_url",
+            "client_id",
+        ] {
+            assert!(!rendered.contains(key), "{key} written unasked: {rendered}");
+        }
+
+        let mut tuned = toml_edit::DocumentMut::new();
+        upsert_profile_document(
+            &mut tuned,
+            "local",
+            "anthropic-messages",
+            "some-local-model",
+            None,
+            &ProfileTuning {
+                thinking_budget: Some(4_096),
+                vision: Some(false),
+                max_output_tokens: Some(32_000),
+                redact_thinking: Some(false),
+                oauth_token_url: Some("https://auth.invalid/token".to_string()),
+                client_id: Some("my-client".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("upsert");
+
+        // Read back through the real parser, so a key written under the wrong name or type is
+        // caught here rather than by `deny_unknown_fields` on the user's next run.
+        let parsed: config::ConfigFile = toml::from_str(&tuned.to_string()).expect("parses");
+        let profile = parsed.providers.get("local").expect("the profile");
+        assert_eq!(profile.thinking_budget, Some(4_096));
+        assert_eq!(profile.vision, Some(false));
+        assert_eq!(profile.max_output_tokens, Some(32_000));
+        assert_eq!(profile.redact_thinking, Some(false));
+        assert_eq!(
+            profile.oauth_token_url.as_deref(),
+            Some("https://auth.invalid/token")
+        );
+        assert_eq!(profile.client_id.as_deref(), Some("my-client"));
+    }
+
+    /// The advanced prompt covers exactly the three settings it has always covered.
+    ///
+    /// `complete` is what decides whether the prompt fires at all. Widening it to the flag-only
+    /// settings would mean `--client-id x` silently skips the thinking / window / effort questions,
+    /// so a user who set one advanced thing would never be asked about the three that matter most,
+    /// and would get their defaults without being told. Nothing else would fail.
+    #[test]
+    fn a_flag_only_setting_does_not_suppress_the_advanced_prompt() {
+        let all_three = ProfileTuning {
+            thinking: Some(crate::provider::ThinkingMode::Off),
+            context_window: Some(1_000),
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            unset_defaults_summary(&all_three, true, 1_000).is_none(),
+            "with the prompted three set there is no default left to report"
+        );
+
+        let only_flag_only = ProfileTuning {
+            client_id: Some("my-client".to_string()),
+            vision: Some(false),
+            ..Default::default()
+        };
+        let summary = unset_defaults_summary(&only_flag_only, true, 1_000)
+            .expect("the prompted three are still unset, so their defaults are still worth naming");
+        for expected in ["thinking", "context window", "reasoning effort"] {
+            assert!(
+                summary.contains(expected),
+                "'{expected}' missing from: {summary}"
+            );
+        }
     }
 
     #[test]
@@ -2410,6 +3331,7 @@ mod tests {
                 thinking: Some(crate::provider::ThinkingMode::Budgeted),
                 context_window: Some(262_144),
                 effort: Some("medium".to_string()),
+                ..Default::default()
             },
         )
         .expect("upsert");

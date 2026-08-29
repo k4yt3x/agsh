@@ -241,11 +241,10 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
-    // Refused rather than ignored. These four name *this run's session*, and a long-lived host has
-    // no such thing: it creates a session per `session/new` or `POST /v1/sessions`, each naming its
-    // own profile. Accepting them silently was worse than it sounds, because `GET /v1/info` went on
-    // reporting a `--model` no session ever used, and `-c` / `-r` set `session_resume`, which
-    // switches off the default-profile check a host with no default needs most.
+    // Refused rather than ignored. Both name *this run's session*, and a long-lived host has no
+    // such thing: it creates a session per `session/new` or `POST /v1/sessions`. Accepting them
+    // silently was worse than it sounds, because `-c` / `-r` set `session_resume`, which switches
+    // off the default-profile check a host with no default needs most.
     //
     // `--provider` is deliberately not in this list: it selects which configured profile the host
     // defaults to, which is a property of the host rather than of one session.
@@ -254,8 +253,6 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         let offending = [
             (cli.continue_last, "--continue"),
             (cli.resume.is_some(), "--resume"),
-            (cli.model.is_some(), "--model"),
-            (cli.base_url.is_some(), "--base-url"),
         ]
         .into_iter()
         .filter_map(|(given, flag)| given.then_some(flag))
@@ -263,8 +260,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         if !offending.is_empty() {
             anyhow::bail!(
                 "`meka {}` does not take {}: they name one run's session, and this host creates \
-                 one per request. Set `model` / `base_url` on the profile, or name a `provider` \
-                 per session.",
+                 one per request. Name a `provider` per session instead.",
                 host,
                 offending.join(", ")
             );
@@ -535,21 +531,20 @@ fn warn_on_stale_tool_config(
     );
 }
 
-/// What a session runs on: its profile, and any per-session override of that profile's model or
-/// endpoint.
+/// The provider profile a session runs on.
 ///
 /// One door, so every place that runs a turn answers the question the same way. A session that
-/// exists names its binding on its row and that is what it gets; anything else would move the
+/// exists names its profile on its row and that is what it gets; anything else would move the
 /// conversation to a provider it was not having, drop the reasoning it recorded (a thinking block
 /// is not replayed across providers) and bill a different account.
 ///
-/// `None` is a session that does not exist yet, which takes the configured default and this run's
-/// `--model` / `--base-url`, and records all three the moment its row is written.
+/// `None` is a session that does not exist yet, which takes the configured default and records it
+/// the moment its row is written.
 ///
-/// Takes the three values it decides between rather than the whole [`ResolvedConfig`], so the
-/// decision can be exercised on its own. Which of a recorded binding and the process default wins
-/// is the entire question here, and a door that could only be reached through a fully resolved
-/// config could not be asked it directly.
+/// Takes the value it decides between rather than the whole [`ResolvedConfig`], so the decision can
+/// be exercised on its own. Which of a recorded profile and the process default wins is the entire
+/// question here, and a door that could only be reached through a fully resolved config could not
+/// be asked it directly.
 pub async fn resolve_session_provider(
     session_manager: &SessionManager,
     // The process default, or the reason there is not one. A reason rather than a bare absence
@@ -558,22 +553,16 @@ pub async fn resolve_session_provider(
     // `meka provider use <name>`" is. `validate()` no longer raises it for a resume, so this is
     // where it surfaces.
     default_profile: std::result::Result<&str, &str>,
-    requested_model: Option<&str>,
-    requested_base_url: Option<&str>,
     session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<crate::session::SessionProvider> {
+) -> anyhow::Result<String> {
     if let Some(session_id) = session_id
         && let Some(recorded) = session_manager.recorded_provider(session_id).await?
     {
         return Ok(recorded);
     }
-    Ok(crate::session::SessionProvider {
-        profile: default_profile
-            .map_err(|reason| anyhow::anyhow!("{}", reason))?
-            .to_string(),
-        model_override: requested_model.map(str::to_string),
-        base_url_override: requested_base_url.map(str::to_string),
-    })
+    Ok(default_profile
+        .map_err(|reason| anyhow::anyhow!("{}", reason))?
+        .to_string())
 }
 
 /// [`resolve_session_provider`] for a caller that has a whole [`ResolvedConfig`] to hand.
@@ -581,7 +570,7 @@ pub async fn provider_for_config(
     session_manager: &SessionManager,
     config: &ResolvedConfig,
     session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<crate::session::SessionProvider> {
+) -> anyhow::Result<String> {
     resolve_session_provider(
         session_manager,
         // Exactly one of the two is set; see `select_active_profile`. The fallback text is for a
@@ -592,8 +581,6 @@ pub async fn provider_for_config(
                 .as_deref()
                 .unwrap_or("no provider profile is configured; run `meka provider add`")
         }),
-        config.requested_model.as_deref(),
-        config.requested_base_url.as_deref(),
         session_id,
     )
     .await
@@ -622,7 +609,7 @@ async fn recorded_profile_is_gone(
     session_id: uuid::Uuid,
 ) -> bool {
     match session_manager.recorded_provider(session_id).await {
-        Ok(Some(binding)) => !config.providers.contains_key(&binding.profile),
+        Ok(Some(binding)) => !config.providers.contains_key(&binding),
         Ok(None) => false,
         Err(error) => {
             tracing::debug!(
@@ -644,11 +631,9 @@ async fn recorded_profile_is_gone(
 /// provider rejected the turn instead.
 pub async fn resolved_binding(
     providers: &provider::ProviderRegistry,
-    binding: crate::session::SessionProvider,
+    binding: String,
 ) -> anyhow::Result<agent::ResolvedBinding> {
-    let (provider, settings) = providers
-        .build(&binding.profile, &binding.overrides())
-        .await?;
+    let (provider, settings) = providers.build(&binding).await?;
     Ok(agent::ResolvedBinding {
         provider,
         // The documented default, not a guess at the model: meka does not infer a window from a
@@ -669,12 +654,9 @@ pub async fn resolved_binding(
 ///
 /// Reads the same `ProfileSettings` [`resolved_binding`] does, so the answer a host caches cannot
 /// drift from the one the agent was built with.
-pub fn binding_accepts_images(
-    providers: &provider::ProviderRegistry,
-    binding: &crate::session::SessionProvider,
-) -> bool {
+pub fn binding_accepts_images(providers: &provider::ProviderRegistry, binding: &str) -> bool {
     providers
-        .settings(&binding.profile, &binding.overrides())
+        .settings(binding)
         .map(|settings| settings.vision)
         .unwrap_or(false)
 }
@@ -689,16 +671,13 @@ pub fn binding_accepts_images(
 /// invites a client to divide by a number meka has no reason to believe.
 pub fn binding_context_window(
     providers: &provider::ProviderRegistry,
-    binding: &crate::session::SessionProvider,
+    binding: &str,
 ) -> Option<u64> {
-    providers
-        .settings(&binding.profile, &binding.overrides())
-        .ok()
-        .map(|settings| {
-            settings
-                .context_window
-                .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW)
-        })
+    providers.settings(binding).ok().map(|settings| {
+        settings
+            .context_window
+            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW)
+    })
 }
 
 /// The provider registry for the two CLI hosts (the REPL and `--oneshot`), built the way
@@ -735,7 +714,7 @@ fn cli_provider_registry(
 pub async fn provider_for_session(
     shared: &SharedDeps,
     session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<crate::session::SessionProvider> {
+) -> anyhow::Result<String> {
     provider_for_config(&shared.session_manager, &shared.config, session_id).await
 }
 
@@ -1840,10 +1819,9 @@ async fn run_interactive(
     let current_provider = Arc::new(std::sync::RwLock::new(match &repin {
         // The repin has not been committed yet (it waits for the registry, below), but it is what
         // the row will say by the time anything reads this cell.
-        Some(binding) => binding.profile.clone(),
+        Some(binding) => binding.clone(),
         None => provider_for_config(&session_manager, &config, session_id)
             .await
-            .map(|binding| binding.profile)
             .unwrap_or_default(),
     }));
     let repl_current_provider = Arc::clone(&current_provider);
@@ -2081,15 +2059,9 @@ async fn run_interactive(
                         ));
                         break 'switch;
                     }
-                    // The profile as configured, with no overrides: `/provider` is the user
-                    // restating the whole binding, so a model override left over from another
-                    // profile does not ride along onto one that may not have that model.
-                    let resolved = match resolved_binding(
-                        &providers,
-                        crate::session::SessionProvider::from(name.clone()),
-                    )
-                    .await
-                    {
+                    // The profile as configured. `/provider` moves the session to that bundle
+                    // entire, which is the only thing naming a profile can mean.
+                    let resolved = match resolved_binding(&providers, name.clone()).await {
                         Ok(resolved) => resolved,
                         Err(error) => {
                             render::render_error(&error);
@@ -2768,7 +2740,7 @@ async fn run_interactive(
                         // effort that came from the session's, so `/status` and `/provider`
                         // contradicted each other on any resume onto a non-default profile.
                         let binding = agent.provider_binding().clone();
-                        let settings = providers.settings(&binding.profile, &binding.overrides());
+                        let settings = providers.settings(&binding);
                         render::render_session_status(
                             &snap,
                             &render::ModelStatus {
@@ -2776,7 +2748,7 @@ async fn run_interactive(
                                     .as_ref()
                                     .ok()
                                     .and_then(|settings| settings.model.as_deref()),
-                                profile: Some(binding.profile.as_str()),
+                                profile: Some(binding.as_str()),
                                 backend: settings
                                     .as_ref()
                                     .ok()
@@ -3461,10 +3433,10 @@ struct ResumedSession {
     /// The level this run starts at: the session's recorded one, unless `--permission` asked for
     /// something else, and the configured default for a run that resumed nothing.
     permission: crate::permission::Permission,
-    /// The binding `--provider` / `--model` / `--base-url` asked this session to move to, still
-    /// uncommitted. Carried out rather than written here because the row must not move until the
-    /// binding is known to produce a provider, and that needs a registry this runs before.
-    repin: Option<crate::session::SessionProvider>,
+    /// The profile `--provider` asked this session to move to, still uncommitted. Carried out
+    /// rather than written here because the row must not move until the profile is known to
+    /// produce a provider, and that needs a registry this runs before.
+    repin: Option<String>,
 }
 
 async fn resolve_session_resume(
@@ -3509,24 +3481,7 @@ async fn resolve_session_resume(
                 requested
             );
         }
-        Some(crate::session::SessionProvider {
-            profile: requested.clone(),
-            model_override: config.requested_model.clone(),
-            base_url_override: config.requested_base_url.clone(),
-        })
-    } else if config.requested_model.is_some() || config.requested_base_url.is_some() {
-        // `--model` / `--base-url` without `--provider` moves those two on the profile the session
-        // already names. Naming any of the three states the whole binding, so a run that gives only
-        // `--model` also clears a stale endpoint override; that is what makes the flags a way to
-        // undo as well as to set.
-        let Some(recorded) = session_manager.recorded_provider(id).await? else {
-            anyhow::bail!("session not found: {}", id);
-        };
-        Some(crate::session::SessionProvider {
-            profile: recorded.profile,
-            model_override: config.requested_model.clone(),
-            base_url_override: config.requested_base_url.clone(),
-        })
+        Some(requested.clone())
     } else {
         None
     };
@@ -3598,8 +3553,7 @@ async fn resolve_session_resume(
     })
 }
 
-/// Commit a `--provider` / `--model` / `--base-url` repin, once the binding it names is known to
-/// produce a provider.
+/// Commit a `--provider` repin, once the profile it names is known to produce a provider.
 ///
 /// The row moves last, deliberately. Writing it first and only then discovering that the profile
 /// has no stored credential leaves the session pinned to something that cannot run, and the binding
@@ -3610,7 +3564,7 @@ async fn apply_session_repin(
     session_manager: &SessionManager,
     providers: &provider::ProviderRegistry,
     session_id: uuid::Uuid,
-    binding: crate::session::SessionProvider,
+    binding: String,
 ) -> anyhow::Result<()> {
     let resolved = resolved_binding(providers, binding).await?;
     if !session_manager
@@ -3622,7 +3576,7 @@ async fn apply_session_repin(
     tracing::info!(
         "repinned session {} to provider profile `{}`",
         session_id,
-        resolved.binding.profile
+        resolved.binding
     );
     Ok(())
 }
@@ -3742,44 +3696,27 @@ mod tests {
     async fn a_recorded_binding_beats_the_process_default() {
         let manager = store().await;
         let id = manager
-            .create_session(None, crate::session::SessionProvider {
-                profile: "openaiprof".to_string(),
-                model_override: Some("gpt-5".to_string()),
-                base_url_override: None,
-            })
+            .create_session(None, "openaiprof".to_string())
             .await
             .expect("create");
 
-        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), None, None, Some(id))
+        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), Some(id))
             .await
             .expect("resolves");
 
-        assert_eq!(resolved.profile, "openaiprof");
-        assert_eq!(resolved.model_override.as_deref(), Some("gpt-5"));
+        assert_eq!(resolved, "openaiprof");
     }
 
-    /// A session that does not exist yet is the only case the configured default answers, and this
-    /// run's `--model` / `--base-url` ride along so the row records them at creation.
+    /// A session that does not exist yet is the only case the configured default answers.
     #[tokio::test]
-    async fn a_session_that_does_not_exist_yet_takes_the_default_and_this_runs_overrides() {
+    async fn a_session_that_does_not_exist_yet_takes_the_default() {
         let manager = store().await;
 
-        let resolved = resolve_session_provider(
-            &manager,
-            Ok("claudeprof"),
-            Some("claude-opus-5"),
-            Some("https://example.invalid/v1"),
-            None,
-        )
-        .await
-        .expect("resolves");
+        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), None)
+            .await
+            .expect("resolves");
 
-        assert_eq!(resolved.profile, "claudeprof");
-        assert_eq!(resolved.model_override.as_deref(), Some("claude-opus-5"));
-        assert_eq!(
-            resolved.base_url_override.as_deref(),
-            Some("https://example.invalid/v1")
-        );
+        assert_eq!(resolved, "claudeprof");
     }
 
     /// With nothing configured there is no profile to fall back to, and inventing one would be the
@@ -3791,8 +3728,6 @@ mod tests {
         let error = resolve_session_provider(
             &manager,
             Err("no provider profiles configured. Run `meka provider add <name>`."),
-            None,
-            None,
             None,
         )
         .await
@@ -3814,7 +3749,7 @@ mod tests {
                          `meka provider use <name>` to pick a default, or pass `--provider <name>`.";
 
         // `None` session id: `-c` on a store with nothing to resume lands here.
-        let error = resolve_session_provider(&manager, Err(ambiguous), None, None, None)
+        let error = resolve_session_provider(&manager, Err(ambiguous), None)
             .await
             .expect_err("no default to fall back to");
 

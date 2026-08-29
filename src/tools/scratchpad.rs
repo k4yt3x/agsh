@@ -2166,7 +2166,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2203,7 +2203,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2243,7 +2243,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2279,7 +2279,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2334,7 +2334,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2369,7 +2369,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2422,7 +2422,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2467,7 +2467,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2506,7 +2506,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -2549,7 +2549,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3034,7 +3034,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3200,7 +3200,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3388,7 +3388,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3428,7 +3428,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3565,7 +3565,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
@@ -3603,7 +3603,7 @@ mod tests {
             .await
             .expect("parent");
         let child = manager
-            .create_child_session(parent, None, None)
+            .create_child_session(parent, None, None, "test-profile".to_string())
             .await
             .expect("child")
             .0;
