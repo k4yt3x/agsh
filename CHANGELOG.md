@@ -76,6 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A 400 from a usage or history probe no longer classifies as a malformed *turn*.
 - A 429 or 5xx from an OAuth token endpoint is retried instead of killing the turn in progress.
 - A rejected OAuth refresh names the profile to run `meka provider login` on.
+- `provider add --client-id` minted the grant as the default OAuth client, so refresh always failed.
+- The OpenAI API-key backends took an OAuth token they could never refresh, failing at its expiry.
 - `meka serve` answers 503 `/errors/mcp-unavailable`, not 500, when a required MCP server is down.
 - A `Retry-After` the provider gave is no longer discarded when reading its response body fails.
 - A failed send reports the body size to one decimal; integer division rounded 2.9 MiB down to 2.

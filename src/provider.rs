@@ -1469,7 +1469,14 @@ impl ProviderBuilder {
                 // protocol, not by how they authenticate.
                 let api_key = match self.credential {
                     AuthCredential::ApiKey(key) => key,
-                    AuthCredential::OAuthToken { access_token, .. } => access_token,
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "provider 'openai-responses' requires an API key, not an OAuth token. \
+                             Use 'chatgpt-subscription' to bill a ChatGPT subscription over the \
+                             same protocol."
+                                .to_string(),
+                        ));
+                    }
                 };
                 Ok(Arc::new(OpenAiResponsesProvider::new(
                     api_key,
@@ -1482,7 +1489,14 @@ impl ProviderBuilder {
             "openai-chat-completions" => {
                 let api_key = match self.credential {
                     AuthCredential::ApiKey(key) => key,
-                    AuthCredential::OAuthToken { access_token, .. } => access_token,
+                    AuthCredential::OAuthToken { .. } => {
+                        return Err(MekaError::Config(
+                            "provider 'openai-chat-completions' requires an API key, not an OAuth \
+                             token. Use 'chatgpt-subscription' to bill a ChatGPT subscription; it \
+                             speaks Responses rather than Chat Completions."
+                                .to_string(),
+                        ));
+                    }
                 };
                 Ok(Arc::new(OpenAiChatCompletionsProvider::new(
                     api_key,
@@ -2846,7 +2860,7 @@ mod tests {
     fn every_supported_backend_builds() {
         for backend in SUPPORTED_PROVIDERS {
             // Hand each backend the credential shape it accepts; the mismatch cases are asserted
-            // separately by the `_rejects_` tests.
+            // by `every_supported_backend_refuses_the_credential_kind_it_does_not_take`.
             let credential = if backend.ends_with("-subscription") {
                 AuthCredential::OAuthToken {
                     access_token: "token".to_string(),
@@ -2864,6 +2878,55 @@ mod tests {
                 built.is_ok(),
                 "{backend} is supported but does not build: {:?}",
                 built.err()
+            );
+        }
+    }
+
+    /// Every backend refuses the credential kind it cannot serve, and names one that can.
+    ///
+    /// The inverse of [`every_supported_backend_builds`], and iterating the list for the same
+    /// reason: a sixth backend is covered the day it is added.
+    ///
+    /// Written after `openai-responses` and `openai-chat-completions` were found silently
+    /// *accepting* an OAuth bundle: they matched it, kept the bearer, discarded `refresh_token` and
+    /// `expires_at`, and were constructed with no `token_store`, so the credential could never
+    /// refresh and the profile stopped working at expiry with nothing naming why. Their three
+    /// siblings had refused the mismatch since they were written. Only these two had no test, and
+    /// only these two were wrong, which is the whole argument for asserting this over the list
+    /// rather than one backend at a time.
+    #[test]
+    fn every_supported_backend_refuses_the_credential_kind_it_does_not_take() {
+        for backend in SUPPORTED_PROVIDERS {
+            // The same rule `every_supported_backend_builds` pairs by, read the other way round.
+            let takes_oauth = backend.ends_with("-subscription");
+            let mismatched = if takes_oauth {
+                AuthCredential::ApiKey("key".to_string())
+            } else {
+                AuthCredential::OAuthToken {
+                    access_token: "token".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    expires_at: None,
+                    account_id: None,
+                }
+            };
+            let Err(error) = ProviderBuilder::new(*backend, mismatched, "some-model")
+                .device_id("a".repeat(64))
+                .build()
+            else {
+                panic!("{backend} accepted the credential kind it cannot serve");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(*backend),
+                "{backend}'s refusal does not name it: {message}"
+            );
+            // Naming a backend that *does* take this credential is what makes the refusal
+            // actionable: without it the user is told what is wrong and not what to switch to.
+            assert!(
+                SUPPORTED_PROVIDERS
+                    .iter()
+                    .any(|other| other != backend && message.contains(*other)),
+                "{backend}'s refusal names no backend to switch to: {message}"
             );
         }
     }

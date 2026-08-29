@@ -241,7 +241,14 @@ async fn run_add(
     // Acquire the credential last: the Codex OAuth login races a pasted-callback-URL reader against
     // the loopback callback, and if the callback wins it can leave a stdin read parked. Keeping the
     // interactive prompts above (which read stdin) before this ensures nothing reads stdin after.
-    let credential = acquire_credential(&backend, api_key_stdin, None).await?;
+    //
+    // The grant has to be minted under the same `client_id` the profile is about to record, because
+    // that recorded value is what every later refresh presents (`run_login` passes the profile's
+    // for the same reason). Passing `None` here while `write_profile` wrote `--client-id` below
+    // issued the grant to the default client and then claimed a custom one: the profile
+    // authenticated once and died at its first refresh, naming a mismatch nothing had announced.
+    let credential =
+        acquire_credential(&backend, api_key_stdin, tuning.client_id.as_deref()).await?;
 
     // The profile before the secret, so the half that lands first is the visible half. A config
     // write can fail for ordinary reasons -- a read-only directory, a full disk -- and doing it
