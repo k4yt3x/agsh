@@ -1540,21 +1540,26 @@ async fn run_oneshot(
             tool_params: config.tool_params,
             agent_event_sender: noninteractive_sender,
         }));
-    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
-        std::env::current_dir().unwrap_or_else(|error| {
-            tracing::warn!("could not read process cwd at startup: {}", error);
-            std::path::PathBuf::from(".")
-        }),
-    ));
+    let launch_cwd = std::env::current_dir().unwrap_or_else(|error| {
+        tracing::warn!("could not read process cwd at startup: {}", error);
+        std::path::PathBuf::from(".")
+    });
     // Resolved before the agent is built, not after: which session this is decides which provider
-    // profile the agent runs on and which level it runs at, and the agent carries both.
+    // profile the agent runs on, which level it runs at and which directory it opens in, and the
+    // agent carries all three.
     let ResumedSession {
         mut session_id,
         mut messages,
         lock: _session_lock,
         permission: start_permission,
         repin,
+        cwd: recorded_cwd,
     } = resolve_session_resume(&session_manager, &config).await?;
+    // A resumed session reopens where it was, not where this shell is. See
+    // `resume_working_directory`.
+    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
+        resume_working_directory(recorded_cwd, &launch_cwd, session_id),
+    ));
 
     let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions);
     if start_permission == crate::permission::Permission::Read {
@@ -1683,26 +1688,33 @@ async fn run_interactive(
     initial_prompt: Option<String>,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
-    // Per-session working directory, initialised from process cwd at startup. Shared by reference
-    // between the REPL (prompt + `/cd`) and the agent (file/shell/find/grep tools +
-    // environment-context block). Process cwd is no longer mutated.
-    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
-        std::env::current_dir().unwrap_or_else(|error| {
-            tracing::warn!("could not read process cwd at startup: {}", error);
-            std::path::PathBuf::from(".")
-        }),
-    ));
+    // Where the shell was. Kept separate from the per-session `cwd` below rather than folded into
+    // it, because the two part company the moment a resumed session opens somewhere else, and a
+    // bare `/cd` returns here.
+    let launch_cwd = std::env::current_dir().unwrap_or_else(|error| {
+        tracing::warn!("could not read process cwd at startup: {}", error);
+        std::path::PathBuf::from(".")
+    });
 
     // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
-    // before the first prompt, and before the permission cell exists because a resumed session
-    // brings its own level.
+    // before the first prompt, and before the permission and cwd cells exist because a resumed
+    // session brings both.
     let ResumedSession {
         mut session_id,
         mut messages,
         lock: resumed_lock,
         permission: start_permission,
         repin,
+        cwd: recorded_cwd,
     } = resolve_session_resume(&session_manager, &config).await?;
+
+    // Per-session working directory, shared by reference between the REPL (prompt + `/cd`) and the
+    // agent (file/shell/find/grep tools + environment-context block). Process cwd is never mutated.
+    // A resumed session opens where it recorded rather than where this shell is; see
+    // `resume_working_directory`.
+    let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
+        resume_working_directory(recorded_cwd, &launch_cwd, session_id),
+    ));
 
     let shared_permission = SharedPermission::new(start_permission, config.enabled_permissions);
     if start_permission == crate::permission::Permission::Read {
@@ -1925,6 +1937,7 @@ async fn run_interactive(
             input_sender,
             agent_event_receiver,
             repl_cwd,
+            launch_cwd,
             repl_mcp_server_names,
             repl_skill_roots,
             repl_history_db_path,
@@ -2037,6 +2050,14 @@ async fn run_interactive(
                         error
                     );
                 }
+            }
+            // Recorded for the same reasons the level above is, and it lands here rather than in
+            // the REPL thread because that thread is not async and holds no `SessionManager`. The
+            // row is where the *next* resume opens the session, and it is the directory a scheduled
+            // tool-gate is re-checked in; a `/cd` that stopped at the in-memory cell left both
+            // answering with the directory the session was created in.
+            ReplEvent::CwdChanged(path) => {
+                record_session_cwd(&session_manager, session_id, &path).await;
             }
             // The row moves first. If recording the change failed but the agent had already
             // switched, the next `meka -c` would silently go back to the old profile, which is the
@@ -3457,6 +3478,19 @@ struct ResumedSession {
     /// rather than written here because the row must not move until the profile is known to
     /// produce a provider, and that needs a registry this runs before.
     repin: Option<String>,
+    /// The directory the session recorded, which is where it reopens.
+    ///
+    /// Carried out rather than applied here because the caller owns the
+    /// [`crate::workspace::SharedCwd`] and the fallback: `None` here means the row carried no
+    /// directory (an imported archive may omit it) and the launch directory decides.
+    ///
+    /// **A resume never writes this column back.** The recorded directory is the session's, and at
+    /// `workspace` it is also the writable boundary; correcting it to whatever shell happened to
+    /// start the process would silently widen that boundary to, say, `$HOME`, and would let an
+    /// unattended `--oneshot -c` from a unit at `/` repoint a session and every gate it holds.
+    /// `meka serve` already reads the column this way ([`crate::server::reattach`]); ACP is the
+    /// deliberate exception, because its client passes an authoritative project root per request.
+    cwd: Option<std::path::PathBuf>,
 }
 
 async fn resolve_session_resume(
@@ -3471,6 +3505,8 @@ async fn resolve_session_resume(
         // A run that resumed nothing has no row to repin: the flags become this session's binding
         // when `resolve_session_provider` builds it, and are recorded when the row is created.
         repin: None,
+        // Nor a directory to reopen: a fresh session starts where the shell is, and records that.
+        cwd: None,
     };
     let resolved = match &config.session_resume {
         None => return Ok(fresh()),
@@ -3570,7 +3606,76 @@ async fn resolve_session_resume(
         lock: Some(lock),
         permission: permission.unwrap_or(config.permission),
         repin,
+        // Read off the row already loaded above, not fetched again.
+        cwd: recorded.and_then(|info| info.cwd),
     })
+}
+
+/// Record where `/cd` moved the session, so the row keeps saying where the session is.
+///
+/// A free function rather than a block inside the REPL's event loop because the loop is not
+/// reachable from a test: reedline needs a terminal, and a piped stdin fails the read outright, so
+/// everything inline there is verified only by running meka by hand.
+///
+/// Never returns an error. The directory has already moved in this process, so failing the REPL
+/// over a bookkeeping write would be worse than the stale row; the `warn!` is loud because the
+/// consequence is real -- this session's next resume, and any scheduled gate it holds, still read
+/// the old directory.
+async fn record_session_cwd(
+    session_manager: &SessionManager,
+    session_id: Option<uuid::Uuid>,
+    path: &std::path::Path,
+) {
+    // No row yet: the directory the first turn creates the session with is read from the same cell
+    // `/cd` has already written, so there is nothing to correct.
+    let Some(id) = session_id else {
+        return;
+    };
+    if let Err(error) = session_manager.update_session_cwd(id, path).await {
+        tracing::warn!(
+            "could not record working directory `{}` on session {}: {}. A resume and any scheduled \
+             gate will still use this session's previous directory",
+            path.display(),
+            id,
+            error
+        );
+    }
+}
+
+/// The directory a run opens in: the one its session recorded, or where meka was launched.
+///
+/// A session's directory is its own, so a resume reopens it rather than adopting whatever shell
+/// started the process. At `workspace` that directory is also the writable boundary, and taking the
+/// shell's instead would silently widen it -- resume a project session from `$HOME` and the whole
+/// home directory becomes writable, with a scheduled job able to fire before the user can react.
+/// `meka serve` already reads the column this way (`crate::server::reattach`); the REPL and
+/// `--oneshot` were the two that did not.
+///
+/// The launch directory is the fallback for two cases, both of which have to keep the run going:
+/// a row that carries no directory (`meka session import` stores an archive's value verbatim, and
+/// an archive may omit it) and one naming a directory that has since been removed.
+fn resume_working_directory(
+    recorded: Option<std::path::PathBuf>,
+    launch_cwd: &std::path::Path,
+    session_id: Option<uuid::Uuid>,
+) -> std::path::PathBuf {
+    let Some(recorded) = recorded else {
+        return launch_cwd.to_path_buf();
+    };
+    if recorded.is_dir() {
+        return recorded;
+    }
+    // Warn rather than fail: the conversation is still worth resuming, and the alternative is
+    // refusing to open a session because a directory moved. Matches how a scheduled gate reports
+    // the same loss (`crate::schedule`'s `run_shell_probe`).
+    tracing::warn!(
+        "session {} records working directory '{}', which no longer exists; opening in '{}' \
+         instead",
+        session_id.map_or_else(|| "?".to_string(), |id| id.to_string()),
+        recorded.display(),
+        launch_cwd.display()
+    );
+    launch_cwd.to_path_buf()
 }
 
 /// Commit a `--provider` repin, once the profile it names is known to produce a provider.
@@ -3708,6 +3813,101 @@ mod tests {
         )
         .await
         .expect("an in-memory store opens")
+    }
+
+    /// `/cd` reaches the row, which is what makes the recorded directory mean "where the session
+    /// is" rather than "where it was created". Nothing else covers this: the REPL loop that sends
+    /// the event needs a terminal, so a test cannot drive `/cd` itself.
+    #[tokio::test]
+    async fn a_cd_records_the_directory_on_the_session_row() {
+        let manager = store().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let moved = crate::workspace::canonical_for_test(temp.path());
+        let id = manager
+            .create_session(
+                Some(std::path::PathBuf::from("/somewhere/else")),
+                "p".to_string(),
+            )
+            .await
+            .expect("create");
+
+        record_session_cwd(&manager, Some(id), &moved).await;
+
+        let recorded = manager
+            .session_info(id)
+            .await
+            .expect("read the row")
+            .and_then(|info| info.cwd);
+        assert_eq!(
+            recorded,
+            Some(moved),
+            "the row must say where `/cd` moved the session",
+        );
+    }
+
+    /// Before the first turn there is no row to correct: the directory the creation snapshot reads
+    /// is the cell `/cd` has already written. So this is a no-op, and in particular it must not
+    /// reach for some other session's row -- a REPL sharing a store with a `meka serve` has plenty
+    /// to choose from.
+    #[tokio::test]
+    async fn a_cd_before_the_first_turn_writes_nobody_elses_row() {
+        let manager = store().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bystander = manager
+            .create_session(
+                Some(std::path::PathBuf::from("/its/own/place")),
+                "p".to_string(),
+            )
+            .await
+            .expect("create");
+
+        record_session_cwd(&manager, None, temp.path()).await;
+
+        let untouched = manager
+            .session_info(bystander)
+            .await
+            .expect("read the row")
+            .and_then(|info| info.cwd);
+        assert_eq!(
+            untouched,
+            Some(std::path::PathBuf::from("/its/own/place")),
+            "a `/cd` with no session of its own must leave every other row alone",
+        );
+    }
+
+    /// A resumed session opens where it was recorded. At `workspace` that directory is also the
+    /// writable boundary, so adopting the shell's would widen it behind the user's back.
+    #[test]
+    fn a_resume_prefers_the_recorded_directory_over_the_launch_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let recorded = temp.path().join("project");
+        let launch = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&recorded).expect("recorded dir");
+        std::fs::create_dir_all(&launch).expect("launch dir");
+
+        assert_eq!(
+            resume_working_directory(Some(recorded.clone()), &launch, None),
+            recorded,
+        );
+    }
+
+    /// The two cases that have to keep the run going: a row carrying no directory (an imported
+    /// archive may omit it) and one naming a directory that has since been removed.
+    #[test]
+    fn a_resume_falls_back_to_the_launch_directory_when_the_recording_cannot_serve() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&launch).expect("launch dir");
+
+        assert_eq!(resume_working_directory(None, &launch, None), launch);
+        assert_eq!(
+            resume_working_directory(Some(temp.path().join("gone")), &launch, None),
+            launch,
+        );
+        // A file is not a directory to open in either, and `is_dir` is what separates them.
+        let file = temp.path().join("a-file");
+        std::fs::write(&file, b"x").expect("write file");
+        assert_eq!(resume_working_directory(Some(file), &launch, None), launch);
     }
 
     /// The regression the whole feature exists for, at the one door every turn-running site goes

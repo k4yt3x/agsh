@@ -75,6 +75,8 @@ longer sees the reasoning recorded under the old provider, for the reason above.
 `--writable-root` is not restored, because it belongs to the process rather than the session; pass
 it again. See [permissions](./permissions.md) for why recording it would be wrong.
 
+**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it — resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
+
 A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
 
 - **Which files have been read.** meka tracks reads in memory so `edit_file` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `read_file` first.
@@ -143,7 +145,7 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `created_at` | TEXT (RFC 3339) | When the session was created |
 | `updated_at` | TEXT (RFC 3339) | When the session was last updated |
 | `parent_session_id` | TEXT (UUID) | The session that spawned this sub-agent, or NULL |
-| `cwd` | TEXT | Working directory the session was last used in |
+| `cwd` | TEXT | Working directory the session is in; moved only by `/cd`, ACP, or `PATCH` |
 | `permission` | TEXT | Permission mode a re-attached session resumes with |
 | `capabilities_json` | TEXT | Per-session capability flags, for HTTP re-attach |
 | `token_id` | TEXT | Bearer token that created the session, for HTTP |

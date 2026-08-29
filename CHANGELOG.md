@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The thinking budget is per profile (`thinking_budget`), falling back to `[thinking].budget_tokens`.
 - Profile keys have one canonical order, provider-scoped first, shared by the file, `-h` and docs.
 - Every writer normalises a profile's key order; `provider set` no longer preserves key positions.
+- **Breaking:** `/cd` with no argument returns to meka's launch directory, not `$HOME`; `~` still does.
 - `provider add` refuses a profile that would fail at startup, as `provider set` already did.
 - `provider set` refuses a thinking setting on a backend that never sends one, as `add` drops it.
 - A failing provider call is attempted three times rather than four, with 1s then 2s of backoff.
@@ -83,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka serve` answers 503 `/errors/mcp-unavailable`, not 500, when a required MCP server is down.
 - A `Retry-After` the provider gave is no longer discarded when reading its response body fails.
 - `meka tools list` shows the `agent_*` family as rows, replacing a note that named the wrong keys.
+- `/cd` records the working directory on the session row, as `/provider` already did.
+- A resumed session reopens in its recorded directory, so `workspace` no longer widens to `$HOME`.
 - A failed send reports the body size to one decimal; integer division rounded 2.9 MiB down to 2.
 - A scheduled job can always cancel itself from the turn it wakes; an isolated fire could not.
 - `meka provider add` destroyed every profile when `providers` was written as an inline table.

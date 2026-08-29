@@ -413,7 +413,10 @@ fn complete_cd_path(
     let scan_dir = if parent_portion.is_empty() {
         crate::workspace::cwd_snapshot(cwd)
     } else {
-        let Some(expanded) = expand_cd_target(parent_portion) else {
+        // `expand_user_path` rather than `expand_cd_target`: this branch only runs for a non-empty
+        // portion, so the bare-`/cd` default has nothing to say about it, and reaching for the
+        // `/cd`-specific door would mean handing the completer a launch directory it never uses.
+        let Some(expanded) = crate::config::expand_user_path(parent_portion) else {
             return Vec::new();
         };
         crate::workspace::resolve_against_cwd(cwd, expanded)
@@ -795,6 +798,17 @@ pub enum ReplEvent {
     /// not async and holds neither the session manager nor the provider registry. The agent side
     /// resolves the name, rebuilds the provider and records it on the row.
     ProviderChange(String),
+    /// The user moved this session's working directory.
+    ///
+    /// Sent for the same reason as `PermissionChanged`, and it matters for the same reason: the
+    /// recorded directory is where the *next* resume opens, and it is where a scheduled tool-gate
+    /// is re-checked. A `/cd` that never reached the row left both answering with the directory the
+    /// session was created in, so a gate stopped matching the command the model had just watched
+    /// succeed.
+    ///
+    /// Carries the canonical path [`handle_cd`] stored rather than a signal to re-read the cell,
+    /// so what lands on the row is exactly what the user was shown.
+    CwdChanged(PathBuf),
     Exit,
 }
 
@@ -1087,6 +1101,10 @@ pub fn run_repl(
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
     cwd: crate::workspace::SharedCwd,
+    // Where meka was started, which is what a bare `/cd` returns to. Distinct from `cwd`'s initial
+    // value because a resumed session opens in the directory it recorded, so the two differ from
+    // the first prompt whenever `meka -c` is run from somewhere else.
+    launch_cwd: PathBuf,
     mcp_server_names: Vec<String>,
     // Every root `[skills] extra_paths` resolves to, so `/skill ` completes an external skill as
     // well as a native one. Execution already honours them, so without this the completer is the
@@ -1348,12 +1366,23 @@ pub fn run_repl(
                             continue;
                         }
                         Some(SlashCommand::Cd(argument)) => {
-                            if let Some(message) =
-                                handle_cd(&cwd, argument.as_deref().unwrap_or(""))
-                            {
-                                spacing.after_prompt();
-                                eprintln!("{}", message);
-                                spacing.before_prompt();
+                            match handle_cd(&cwd, &launch_cwd, argument.as_deref().unwrap_or("")) {
+                                // Not waited on, unlike `/provider`: the move has already happened
+                                // in this process and the prompt itself is the confirmation, so
+                                // holding the line for a bookkeeping write would make the one
+                                // command that prints nothing feel like the slowest.
+                                Ok(moved) => {
+                                    if input_sender.send(ReplEvent::CwdChanged(moved)).is_err() {
+                                        tracing::debug!(
+                                            "agent loop is gone; working directory not persisted"
+                                        );
+                                    }
+                                }
+                                Err(message) => {
+                                    spacing.after_prompt();
+                                    eprintln!("{}", message);
+                                    spacing.before_prompt();
+                                }
                             }
                             continue;
                         }
@@ -1997,21 +2026,37 @@ fn shorten_path_with_tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// Expand a `/cd` target's leading tilde to the home directory. Shared by `handle_cd` and the path
-/// completer so both apply identical `~` / `~/` rules. Returns `None` only when a tilde needs the
-/// home directory but it cannot be determined.
-fn expand_cd_target(target: &str) -> Option<PathBuf> {
+/// Resolve what a `/cd` argument names: the launch directory when it is empty, otherwise whatever
+/// [`crate::config::expand_user_path`] makes of it. Returns `None` only when a tilde needs the home
+/// directory and it cannot be determined.
+///
+/// `handle_cd`'s alone. The path completer calls `expand_user_path` directly, because it only ever
+/// sees a non-empty portion and so has no use for the empty-argument default.
+fn expand_cd_target(launch_cwd: &std::path::Path, target: &str) -> Option<PathBuf> {
+    // A bare `/cd` returns to the directory meka was started in, where a shell's `cd` would go
+    // home. The two differ because a resumed session opens in the directory it recorded, not the
+    // one the shell is in, so "take me back to my shell" is the move a user actually wants here --
+    // and at `workspace` the working directory *is* the writable boundary, which makes `$HOME` the
+    // widest possible default. `~` still spells home.
+    if target.is_empty() {
+        return Some(launch_cwd.to_path_buf());
+    }
     crate::config::expand_user_path(target)
 }
 
-/// Move the session's working directory, returning the failure to report and `None` on success.
+/// Move the session's working directory, returning where it landed or the failure to report.
 ///
 /// The message is returned rather than printed because the caller owns the `[display]` spacing: a
 /// `cd` that works says nothing (the prompt already shows where you are), and blank lines wrapped
-/// around no output are a gap with nothing in it.
-fn handle_cd(cwd: &crate::workspace::SharedCwd, target: &str) -> Option<String> {
-    let Some(raw) = expand_cd_target(target) else {
-        return Some("cd: could not determine home directory".to_string());
+/// around no output are a gap with nothing in it. The path comes back so the caller can record it
+/// on the session row without re-reading the cell it just wrote.
+fn handle_cd(
+    cwd: &crate::workspace::SharedCwd,
+    launch_cwd: &std::path::Path,
+    target: &str,
+) -> std::result::Result<PathBuf, String> {
+    let Some(raw) = expand_cd_target(launch_cwd, target) else {
+        return Err("cd: could not determine home directory".to_string());
     };
 
     // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
@@ -2024,16 +2069,16 @@ fn handle_cd(cwd: &crate::workspace::SharedCwd, target: &str) -> Option<String> 
     // column stops matching an ACP `session/list` filter spelling the same directory normally.
     let canonical = match std::fs::canonicalize(&resolved) {
         Ok(canonical) => crate::workspace::strip_verbatim(canonical),
-        Err(error) => return Some(format!("cd: {}: {}", raw.display(), error)),
+        Err(error) => return Err(format!("cd: {}: {}", raw.display(), error)),
     };
     if !canonical.is_dir() {
-        return Some(format!("cd: {}: not a directory", canonical.display()));
+        return Err(format!("cd: {}: not a directory", canonical.display()));
     }
     match cwd.write() {
-        Ok(mut guard) => *guard = canonical,
-        Err(poisoned) => *poisoned.into_inner() = canonical,
+        Ok(mut guard) => guard.clone_from(&canonical),
+        Err(poisoned) => poisoned.into_inner().clone_from(&canonical),
     }
-    None
+    Ok(canonical)
 }
 
 /// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
@@ -3222,12 +3267,17 @@ mod tests {
         let cwd: crate::workspace::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
             std::path::PathBuf::from("/this/path/does/not/exist"),
         ));
-        let complaint = handle_cd(&cwd, target.to_str().expect("utf-8 tempdir"));
+        let landed = handle_cd(
+            &cwd,
+            &process_cwd_before,
+            target.to_str().expect("utf-8 tempdir"),
+        );
 
         assert_eq!(
-            complaint, None,
-            "a `cd` that worked has nothing to say, and the caller keys the `[display]` blank \
-             lines off exactly that",
+            landed.as_deref(),
+            Ok(target.as_path()),
+            "a `cd` that worked reports where it landed and has nothing to print, which is what \
+             the caller keys the `[display]` blank lines off",
         );
         let stored = cwd.read().expect("cwd lock").clone();
         assert_eq!(stored, target, "shared cwd must point at the new directory");
@@ -3248,15 +3298,15 @@ mod tests {
         let cwd: crate::workspace::SharedCwd =
             std::sync::Arc::new(std::sync::RwLock::new(start.clone()));
 
-        let missing = handle_cd(&cwd, "/this/path/does/not/exist");
+        let missing = handle_cd(&cwd, &start, "/this/path/does/not/exist");
         assert!(
-            missing.is_some_and(|message| message.starts_with("cd: ")),
+            missing.is_err_and(|message| message.starts_with("cd: ")),
             "a target that cannot be resolved must produce a message to print",
         );
 
-        let not_a_directory = handle_cd(&cwd, file.to_str().expect("utf-8 path"));
+        let not_a_directory = handle_cd(&cwd, &start, file.to_str().expect("utf-8 path"));
         assert!(
-            not_a_directory.is_some_and(|message| message.contains("not a directory")),
+            not_a_directory.is_err_and(|message| message.contains("not a directory")),
             "an existing non-directory must be refused, not silently accepted",
         );
 
@@ -3264,6 +3314,60 @@ mod tests {
             *cwd.read().expect("cwd lock"),
             start,
             "a failed `cd` must leave the session where it was",
+        );
+    }
+
+    /// A bare `/cd` returns to the launch directory, where a shell's `cd` goes home.
+    ///
+    /// The two differ deliberately: a resumed session opens in the directory it recorded, so
+    /// "take me back to my shell" is the move this actually serves, and at `workspace` the working
+    /// directory is the writable boundary -- which makes `$HOME` the worst available default.
+    #[test]
+    fn a_bare_cd_returns_to_the_launch_directory_rather_than_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = crate::workspace::canonical_for_test(temp.path());
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("create elsewhere");
+        let elsewhere = crate::workspace::canonical_for_test(&elsewhere);
+
+        let cwd: crate::workspace::SharedCwd =
+            std::sync::Arc::new(std::sync::RwLock::new(elsewhere.clone()));
+
+        assert_eq!(
+            handle_cd(&cwd, &launch, "").as_deref(),
+            Ok(launch.as_path()),
+            "`/cd` with no argument goes back to where meka was started",
+        );
+
+        // And `~` still spells home, so nothing is taken away -- only the default moved.
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let home = crate::workspace::canonical_for_test(&home);
+        assert_eq!(
+            handle_cd(&cwd, &launch, "~").as_deref(),
+            Ok(home.as_path()),
+            "`/cd ~` must still reach the home directory",
+        );
+    }
+
+    /// A relative target still resolves against where the session is now, not the launch directory.
+    /// Threading a second path in is exactly the sort of change that quietly re-bases this.
+    #[test]
+    fn a_relative_cd_still_resolves_against_the_session_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = crate::workspace::canonical_for_test(temp.path());
+        let nested = temp.path().join("outer");
+        std::fs::create_dir_all(nested.join("inner")).expect("create nested dirs");
+        let outer = crate::workspace::canonical_for_test(&nested);
+
+        let cwd: crate::workspace::SharedCwd =
+            std::sync::Arc::new(std::sync::RwLock::new(outer.clone()));
+
+        assert_eq!(
+            handle_cd(&cwd, &launch, "inner").as_deref(),
+            Ok(outer.join("inner").as_path()),
+            "a relative `/cd` lands inside the directory the session is in",
         );
     }
 

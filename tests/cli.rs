@@ -1037,6 +1037,180 @@ fn only_session(dir: &std::path::Path) -> String {
         .expect("exactly one session")
 }
 
+/// The working directory the one session recorded.
+fn only_session_cwd(dir: &std::path::Path) -> Option<String> {
+    store(dir)
+        .query_row("SELECT cwd FROM sessions", [], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .expect("exactly one session")
+}
+
+/// [`run_scripted`] with the process started somewhere specific and running a script the caller
+/// wrote, which is what the working-directory tests below need: the whole question is what the
+/// session does when the shell is *not* where the session is.
+fn run_scripted_from(
+    dir: &std::path::Path,
+    working_directory: &std::path::Path,
+    script_json: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let script = dir.join("script.json");
+    std::fs::write(&script, script_json).expect("write the provider script");
+    meka()
+        .args(args)
+        .current_dir(working_directory)
+        .env("MEKA_CONFIG_DIR", dir.join("meka"))
+        .env("MEKA_DATA_DIR", dir.join("data").join("meka"))
+        .env("XDG_CONFIG_HOME", dir)
+        .env("HOME", dir)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("MEKA_MOCK_PROVIDER", "1")
+        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to spawn meka {:?}: {}", args, error))
+}
+
+/// A scripted turn that writes `marker.txt` with a *relative* path, so where the file lands is
+/// where the session's working directory actually was. More direct than reading the rendering:
+/// `write_file` resolves against the same `SharedCwd` every other tool does.
+const WRITE_A_MARKER: &str = r#"[
+  [{"kind":"tool_use_start","id":"call-1","name":"write_file"},
+   {"kind":"tool_use_end","input":{"path":"marker.txt","content":"here"}},
+   {"kind":"message_end","stop_reason":"tool_use"}],
+  [{"kind":"text","text":"done"},{"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+
+/// A config that lets `write_file` run, since the marker above is the whole measurement.
+fn write_capable_config(dir: &std::path::Path) {
+    let config_dir = dir.join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "default_provider = \"mock\"\n\n[providers.mock]\ntype = \"anthropic-messages\"\nmodel = \
+         \"claude-sonnet-4-5\"\n\n[permissions]\ndefault = \"workspace\"\nenabled = [\"read\", \
+         \"workspace\"]\n",
+    )
+    .expect("write config.toml");
+}
+
+/// A resumed session reopens where it was recorded, not where this shell happens to be.
+///
+/// At `workspace` the working directory *is* the writable boundary, so taking the shell's would
+/// silently widen it: resume a project session from `$HOME` and the whole home directory becomes
+/// writable, with a scheduled job able to fire before the user can react.
+#[test]
+fn a_resumed_session_opens_in_the_directory_it_recorded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_capable_config(dir.path());
+    let project = dir.path().join("project");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+
+    let created = run_scripted_from(
+        dir.path(),
+        &project,
+        r#"[[{"kind":"text","text":"ok"},{"kind":"message_end","stop_reason":"end_turn"}]]"#,
+        &["--oneshot", "start here"],
+    );
+    assert!(
+        created.status.success(),
+        "first run failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let resumed = run_scripted_from(dir.path(), &elsewhere, WRITE_A_MARKER, &[
+        "--oneshot",
+        "-c",
+        "write the marker",
+    ]);
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+
+    assert!(
+        project.join("marker.txt").exists(),
+        "the resumed turn must run in the session's own directory; stderr:\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        !elsewhere.join("marker.txt").exists(),
+        "the resumed turn must not run in the directory the shell happened to be in",
+    );
+}
+
+/// ...and resuming does not rewrite the column either. An unattended `--oneshot -c` from cron or a
+/// unit at `/` would otherwise repoint a long-lived session, taking every scheduled tool-gate --
+/// which is re-checked in this directory -- with it.
+#[test]
+fn a_resumed_session_does_not_rewrite_its_recorded_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_capable_config(dir.path());
+    let project = dir.path().join("project");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+
+    let simple =
+        r#"[[{"kind":"text","text":"ok"},{"kind":"message_end","stop_reason":"end_turn"}]]"#;
+    run_scripted_from(dir.path(), &project, simple, &["--oneshot", "start here"]);
+    let before = only_session_cwd(dir.path()).expect("the first run records a directory");
+
+    run_scripted_from(dir.path(), &elsewhere, simple, &[
+        "--oneshot",
+        "-c",
+        "again",
+    ]);
+    assert_eq!(
+        only_session_cwd(dir.path()),
+        Some(before),
+        "a resume reads the recorded directory and leaves it alone",
+    );
+}
+
+/// A recorded directory that has since been removed must not stop the session opening: warn, fall
+/// back to where the process is, and carry on.
+#[test]
+fn a_resumed_session_falls_back_when_its_recorded_directory_is_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_capable_config(dir.path());
+    let project = dir.path().join("project");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+
+    let simple =
+        r#"[[{"kind":"text","text":"ok"},{"kind":"message_end","stop_reason":"end_turn"}]]"#;
+    run_scripted_from(dir.path(), &project, simple, &["--oneshot", "start here"]);
+    std::fs::remove_dir_all(&project).expect("remove the recorded directory");
+
+    let resumed = run_scripted_from(dir.path(), &elsewhere, WRITE_A_MARKER, &[
+        "-v",
+        "--oneshot",
+        "-c",
+        "write the marker",
+    ]);
+    assert!(
+        resumed.status.success(),
+        "a missing directory must not stop the session opening: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        elsewhere.join("marker.txt").exists(),
+        "the fallback must be where the process is; stderr:\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("no longer exists"),
+        "the fallback must say so rather than silently relocating the session: {}",
+        stderr
+    );
+}
+
 /// Resuming a session whose recorded profile has left `config.toml` must fail the process, not just
 /// print about it.
 ///

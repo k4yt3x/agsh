@@ -114,7 +114,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/rewind [N]` | Drop the last `N` turns (default 1) from the conversation the model sees |
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
 | `/export` | Write the session to `session-<id>.md` and print where it landed |
-| `/cd [path]` | Change working directory |
+| `/cd [path]` | Change working directory; with no path, return to where meka was started (`~` still goes home) |
 | `/schedule` | List this session's scheduled jobs |
 | `/schedule cancel <id>` | Cancel a scheduled job by id or unique prefix |
 | `/tasks` | List this session's [background tasks](./background.md) |

@@ -46,6 +46,15 @@ moved would refuse writes to the place you are plainly now working in. The agent
 directory, so it cannot relocate its own boundary. You can, with `/cd`; and under `meka serve` a
 client holding `sessions:w` can, with `PATCH /v1/sessions/{id}`.
 
+Because the boundary follows the directory, the directory is recorded on the session row and a
+[resume reopens it](./sessions.md) rather than adopting your shell's. Resuming a `workspace` session
+from `$HOME` would otherwise make your whole home directory writable without you asking.
+
+One consequence worth knowing: a *relative* `--writable-root` resolves against your shell, not
+against the session. `meka -c --writable-root build` run from `~` grants `~/build`, while the
+session itself may reopen in `~/project`. That follows from the flag belonging to the process rather
+than to the session; pass an absolute path when you mean a directory inside the session's.
+
 `--writable-root` belongs to the process and reaches the REPL, a one-shot run, and an ACP session.
 It does **not** reach a session created through `POST /v1/sessions`: the HTTP API is single-root, so a session there is confined to its own
 `cwd` and nothing else. Extra roots supplied by an ACP client apply to that client's session only,
