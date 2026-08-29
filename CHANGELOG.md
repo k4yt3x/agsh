@@ -82,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The OpenAI API-key backends took an OAuth token they could never refresh, failing at its expiry.
 - `meka serve` answers 503 `/errors/mcp-unavailable`, not 500, when a required MCP server is down.
 - A `Retry-After` the provider gave is no longer discarded when reading its response body fails.
+- `meka tools list` shows the `agent_*` family as rows, replacing a note that named the wrong keys.
 - A failed send reports the body size to one decimal; integer division rounded 2.9 MiB down to 2.
 - A scheduled job can always cancel itself from the turn it wakes; an isolated fire could not.
 - `meka provider add` destroyed every profile when `providers` was written as an inline table.

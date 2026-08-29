@@ -190,6 +190,8 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's workers.
 
+**All four go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the three lifecycle tools too: an agent that cannot delegate has no workers for them to act on, and leaving them behind would let it drive the ones a previous run left in the database. `meka tools list` reports all four as `disabled` in either case. Denying only `agent_list` removes just that one.
+
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a worker at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a worker you deliberately restricted.
 
 Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn.

@@ -254,125 +254,131 @@ pub struct AgentSpawnTool {
     pub absolute_depth: usize,
 }
 
+/// `agent_spawn`'s schema, as a free function so a caller holding no tool can still name it.
+/// See [`agent_tool_catalogue`] for why that matters.
+pub fn agent_spawn_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "agent_spawn".to_string(),
+        description: "Spawn a sub-agent to perform a research, analysis, or delegated task. \
+                      The sub-agent inherits the parent's permission level, has its own \
+                      private todo list and scratchpad, and returns a single text report. \
+                      Multiple agent_spawn calls in one turn run in parallel. Pass `skill` \
+                      to run an installed skill in the sub-agent. The skill's instructions \
+                      become the sub-agent's task; supply at least one of `prompt` or \
+                      `skill`. Use `inherit_scratchpad` to grant read-only access to \
+                      specific parent scratchpad entries by name so the sub-agent can \
+                      consume large captured output via `scratchpad_read` without you \
+                      re-inlining it in the prompt. Tip: when you expect to hand output to a \
+                      sub-agent later, set the `scratchpad` parameter on the originating \
+                      tool call (e.g. `execute_command({command: \"...\", scratchpad: \
+                      \"build_log\"})`) so the entry has a semantic name you can pass \
+                      through `inherit_scratchpad`. Sub-agents may themselves spawn further \
+                      sub-agents up to a configured depth; tune a subtree's depth with \
+                      `max_depth`. Pass `permission` to run the sub-agent at a more \
+                      restricted level than your own (you can restrict but never escalate), \
+                      and `deny_servers` / `deny_tools` to withhold MCP servers or individual \
+                      tools it would otherwise inherit. Restrictions only ever accumulate: \
+                      these add to whatever the installation already denies sub-agents, and \
+                      there is no way to grant back."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The task description for the sub-agent. Optional when \
+                                    `skill` is given; otherwise required."
+                },
+                "skill": {
+                    "type": "string",
+                    "description": "Name of an installed skill to run in the sub-agent. The \
+                                    skill's instructions become the sub-agent's task; \
+                                    `prompt`, if also given, is prepended as extra direction."
+                },
+                "scratchpad": {
+                    "type": "string",
+                    "description": "If provided, save the sub-agent's final report to the \
+                                    parent's scratchpad under this name instead of returning \
+                                    it inline."
+                },
+                "inherit_scratchpad": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Names of the parent's scratchpad entries the sub-agent \
+                                    is allowed to read. The sub-agent's `scratchpad_read` \
+                                    falls back to the parent for these names; \
+                                    `scratchpad_list` shows them with origin `inherited`. \
+                                    Read-only: `scratchpad_write` / `_edit` / `_delete` \
+                                    targeting an inherited name return an error so the \
+                                    sub-agent can't silently shadow your copy. Names that \
+                                    don't exist in the parent are silently skipped."
+                },
+                "permission": {
+                    "type": "string",
+                    "enum": ["none", "read", "workspace", "ask", "unrestricted"],
+                    "description": "Permission level for the sub-agent, never above your \
+                                    own. Defaults to your current level; use a lower one \
+                                    (e.g. \"read\") to sandbox risky work. \"workspace\" and \
+                                    \"ask\" do not contain each other, so asking for one from \
+                                    the other yields \"read\"."
+                },
+                "memory": {
+                    "type": "string",
+                    "enum": ["none", "read"],
+                    "description": "Grant the sub-agent read access to your memory store. \
+                                    Defaults to \"none\": a worker starts with a clean slate, \
+                                    since memories from unrelated work are context it pays for \
+                                    and reasons from. Grant \"read\" when the task genuinely \
+                                    depends on what you have recorded. Sub-agents can never \
+                                    write to the store; record anything worth keeping \
+                                    yourself, from the worker's report."
+                },
+                "instructions": {
+                    "type": "string",
+                    "enum": ["none", "inherit"],
+                    "description": "Give the sub-agent the installation's instructions file. \
+                                    Defaults to \"none\", because those instructions describe \
+                                    you -- your persona, how to address the user -- and a \
+                                    worker is not you. Pass \"inherit\" when the task needs \
+                                    the project's standing rules verbatim and quoting the \
+                                    relevant ones into `prompt` would be lossy or expensive."
+                },
+                "deny_servers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "MCP server names the sub-agent must not see. Removes \
+                                    everything the server offers: its tools, its resources, \
+                                    and its prompts. Use this when a server exists to act on \
+                                    your behalf or to talk to the user, so a worker cannot \
+                                    speak as you."
+                },
+                "deny_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Individual tool names the sub-agent must not see, as they \
+                                    appear in your own tool list (e.g. \"write_file\", \
+                                    \"mcp__notion__create_page\"). For a whole server, prefer \
+                                    `deny_servers`."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Override how many further levels of sub-agents this \
+                                    sub-agent may itself spawn. Defaults to one less than your \
+                                    own remaining budget. 0 forbids it from spawning further; \
+                                    larger values are still bounded by a built-in absolute \
+                                    recursion cap."
+                }
+            }
+        }),
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Tool for AgentSpawnTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "agent_spawn".to_string(),
-            description: "Spawn a sub-agent to perform a research, analysis, or delegated task. \
-                          The sub-agent inherits the parent's permission level, has its own \
-                          private todo list and scratchpad, and returns a single text report. \
-                          Multiple agent_spawn calls in one turn run in parallel. Pass `skill` \
-                          to run an installed skill in the sub-agent. The skill's instructions \
-                          become the sub-agent's task; supply at least one of `prompt` or \
-                          `skill`. Use `inherit_scratchpad` to grant read-only access to \
-                          specific parent scratchpad entries by name so the sub-agent can \
-                          consume large captured output via `scratchpad_read` without you \
-                          re-inlining it in the prompt. Tip: when you expect to hand output to a \
-                          sub-agent later, set the `scratchpad` parameter on the originating \
-                          tool call (e.g. `execute_command({command: \"...\", scratchpad: \
-                          \"build_log\"})`) so the entry has a semantic name you can pass \
-                          through `inherit_scratchpad`. Sub-agents may themselves spawn further \
-                          sub-agents up to a configured depth; tune a subtree's depth with \
-                          `max_depth`. Pass `permission` to run the sub-agent at a more \
-                          restricted level than your own (you can restrict but never escalate), \
-                          and `deny_servers` / `deny_tools` to withhold MCP servers or individual \
-                          tools it would otherwise inherit. Restrictions only ever accumulate: \
-                          these add to whatever the installation already denies sub-agents, and \
-                          there is no way to grant back."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The task description for the sub-agent. Optional when \
-                                        `skill` is given; otherwise required."
-                    },
-                    "skill": {
-                        "type": "string",
-                        "description": "Name of an installed skill to run in the sub-agent. The \
-                                        skill's instructions become the sub-agent's task; \
-                                        `prompt`, if also given, is prepended as extra direction."
-                    },
-                    "scratchpad": {
-                        "type": "string",
-                        "description": "If provided, save the sub-agent's final report to the \
-                                        parent's scratchpad under this name instead of returning \
-                                        it inline."
-                    },
-                    "inherit_scratchpad": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Names of the parent's scratchpad entries the sub-agent \
-                                        is allowed to read. The sub-agent's `scratchpad_read` \
-                                        falls back to the parent for these names; \
-                                        `scratchpad_list` shows them with origin `inherited`. \
-                                        Read-only: `scratchpad_write` / `_edit` / `_delete` \
-                                        targeting an inherited name return an error so the \
-                                        sub-agent can't silently shadow your copy. Names that \
-                                        don't exist in the parent are silently skipped."
-                    },
-                    "permission": {
-                        "type": "string",
-                        "enum": ["none", "read", "workspace", "ask", "unrestricted"],
-                        "description": "Permission level for the sub-agent, never above your \
-                                        own. Defaults to your current level; use a lower one \
-                                        (e.g. \"read\") to sandbox risky work. \"workspace\" and \
-                                        \"ask\" do not contain each other, so asking for one from \
-                                        the other yields \"read\"."
-                    },
-                    "memory": {
-                        "type": "string",
-                        "enum": ["none", "read"],
-                        "description": "Grant the sub-agent read access to your memory store. \
-                                        Defaults to \"none\": a worker starts with a clean slate, \
-                                        since memories from unrelated work are context it pays for \
-                                        and reasons from. Grant \"read\" when the task genuinely \
-                                        depends on what you have recorded. Sub-agents can never \
-                                        write to the store; record anything worth keeping \
-                                        yourself, from the worker's report."
-                    },
-                    "instructions": {
-                        "type": "string",
-                        "enum": ["none", "inherit"],
-                        "description": "Give the sub-agent the installation's instructions file. \
-                                        Defaults to \"none\", because those instructions describe \
-                                        you -- your persona, how to address the user -- and a \
-                                        worker is not you. Pass \"inherit\" when the task needs \
-                                        the project's standing rules verbatim and quoting the \
-                                        relevant ones into `prompt` would be lossy or expensive."
-                    },
-                    "deny_servers": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "MCP server names the sub-agent must not see. Removes \
-                                        everything the server offers: its tools, its resources, \
-                                        and its prompts. Use this when a server exists to act on \
-                                        your behalf or to talk to the user, so a worker cannot \
-                                        speak as you."
-                    },
-                    "deny_tools": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Individual tool names the sub-agent must not see, as they \
-                                        appear in your own tool list (e.g. \"write_file\", \
-                                        \"mcp__notion__create_page\"). For a whole server, prefer \
-                                        `deny_servers`."
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Override how many further levels of sub-agents this \
-                                        sub-agent may itself spawn. Defaults to one less than your \
-                                        own remaining budget. 0 forbids it from spawning further; \
-                                        larger values are still bounded by a built-in absolute \
-                                        recursion cap."
-                    }
-                }
-            }),
-            ..Default::default()
-        }
+        agent_spawn_definition()
     }
 
     fn required_permission(&self) -> Permission {
@@ -812,6 +818,37 @@ pub fn register_subagent_tools(registry: &ToolRegistry, spawn: AgentSpawnTool) -
     Ok(())
 }
 
+/// Whether a session assembled with these settings gets the `agent_*` family at all.
+///
+/// The two all-or-nothing conditions [`register_subagent_tools`] and `assemble_agent` between them
+/// impose, named once so `meka tools list` can answer the question without assembling a session.
+/// Per-tool `[tools]` entries are *not* here: denying `agent_list` alone removes only that one, and
+/// the caller applies [`BuiltinToolFilter::admits`] per name on top of this.
+///
+/// Takes the filter rather than a [`ToolRegistry`] because the listing builds its reference
+/// registry unfiltered on purpose, to read every tool's hardcoded permission level; asking that
+/// registry would answer "yes" no matter what the user configured.
+pub fn agent_tools_registered(filter: &BuiltinToolFilter, subagent_max_depth: usize) -> bool {
+    subagent_max_depth >= 1 && filter.admits("agent_spawn")
+}
+
+/// The name, schema and required level of each tool [`register_subagent_tools`] installs.
+///
+/// `meka tools list` prints a catalogue rather than running a session, and cannot build these
+/// tools: [`ToolBuilderParams::live_binding`] carries an `Arc<dyn Provider>`, so holding the
+/// objects would mean resolving a profile's credential before the command could name meka's own
+/// tools. Every value here is a constant, so the listing reads them directly. A test pins this
+/// against what a real registry ends up with, since the cost of a second door is that the two can
+/// disagree.
+pub fn agent_tool_catalogue() -> Vec<(ToolDefinition, Permission)> {
+    vec![
+        (agent_spawn_definition(), Permission::Read),
+        (agent_list_definition(), Permission::Read),
+        (agent_followup_definition(), Permission::Read),
+        (agent_delete_definition(), Permission::Read),
+    ]
+}
+
 /// Parse the `agent` argument, without checking ownership.
 ///
 /// Split out so a caller can claim the per-worker guard *before* verifying ownership: verifying
@@ -880,19 +917,24 @@ pub struct AgentListTool {
     pub tool_builder_params: ToolBuilderParams,
 }
 
+/// `agent_list`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
+pub fn agent_list_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "agent_list".to_string(),
+        description: "List the sub-agents you have spawned in this session, with each one's \
+                      id, working directory, turn count, and last activity. Pass an id to \
+                      `agent_followup` to ask it another question, or to `agent_delete` to \
+                      discard it and free what it held."
+            .to_string(),
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Tool for AgentListTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "agent_list".to_string(),
-            description: "List the sub-agents you have spawned in this session, with each one's \
-                          id, working directory, turn count, and last activity. Pass an id to \
-                          `agent_followup` to ask it another question, or to `agent_delete` to \
-                          discard it and free what it held."
-                .to_string(),
-            parameters: serde_json::json!({ "type": "object", "properties": {} }),
-            ..Default::default()
-        }
+        agent_list_definition()
     }
 
     fn required_permission(&self) -> Permission {
@@ -1043,40 +1085,45 @@ fn combined_for_followup(
     }
 }
 
+/// `agent_followup`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
+pub fn agent_followup_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "agent_followup".to_string(),
+        description: "Ask a sub-agent you already spawned another question. It keeps its own \
+                      conversation, so it still remembers what it found and can build on it \
+                      rather than starting over from a summary. Returns its new report. The \
+                      sub-agent runs under the terms it was spawned with (same permission \
+                      level, same restrictions), which your current settings cannot widen. \
+                      Get ids from `agent_spawn`'s result or from `agent_list`."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "The sub-agent's id, as returned by `agent_spawn` or \
+                                    `agent_list`."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The follow-up question or task."
+                },
+                "scratchpad": {
+                    "type": "string",
+                    "description": "If provided, save the sub-agent's new report to your \
+                                    scratchpad under this name instead of returning it inline."
+                }
+            },
+            "required": ["agent", "prompt"]
+        }),
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Tool for AgentFollowupTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "agent_followup".to_string(),
-            description: "Ask a sub-agent you already spawned another question. It keeps its own \
-                          conversation, so it still remembers what it found and can build on it \
-                          rather than starting over from a summary. Returns its new report. The \
-                          sub-agent runs under the terms it was spawned with (same permission \
-                          level, same restrictions), which your current settings cannot widen. \
-                          Get ids from `agent_spawn`'s result or from `agent_list`."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "agent": {
-                        "type": "string",
-                        "description": "The sub-agent's id, as returned by `agent_spawn` or \
-                                        `agent_list`."
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "The follow-up question or task."
-                    },
-                    "scratchpad": {
-                        "type": "string",
-                        "description": "If provided, save the sub-agent's new report to your \
-                                        scratchpad under this name instead of returning it inline."
-                    }
-                },
-                "required": ["agent", "prompt"]
-            }),
-            ..Default::default()
-        }
+        agent_followup_definition()
     }
 
     fn required_permission(&self) -> Permission {
@@ -1253,31 +1300,36 @@ pub struct AgentDeleteTool {
     pub in_flight: InFlightFollowups,
 }
 
+/// `agent_delete`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
+pub fn agent_delete_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "agent_delete".to_string(),
+        description: "Delete a sub-agent you spawned, discarding its conversation, its \
+                      scratchpad entries, and any sub-agents it spawned in turn. Use this once \
+                      you have what you needed from a worker, so a long session doesn't carry \
+                      every worker it ever ran. This removes only meka's own record of that \
+                      sub-agent and its descendants: files it wrote to disk, and your own \
+                      conversation and scratchpad, are untouched."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "The sub-agent's id, as returned by `agent_spawn` or \
+                                    `agent_list`."
+                }
+            },
+            "required": ["agent"]
+        }),
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Tool for AgentDeleteTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "agent_delete".to_string(),
-            description: "Delete a sub-agent you spawned, discarding its conversation, its \
-                          scratchpad entries, and any sub-agents it spawned in turn. Use this once \
-                          you have what you needed from a worker, so a long session doesn't carry \
-                          every worker it ever ran. This removes only meka's own record of that \
-                          sub-agent and its descendants: files it wrote to disk, and your own \
-                          conversation and scratchpad, are untouched."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "agent": {
-                        "type": "string",
-                        "description": "The sub-agent's id, as returned by `agent_spawn` or \
-                                        `agent_list`."
-                    }
-                },
-                "required": ["agent"]
-            }),
-            ..Default::default()
-        }
+        agent_delete_definition()
     }
 
     fn required_permission(&self) -> Permission {
@@ -3532,6 +3584,132 @@ mod tests {
                 "'{name}' must go with agent_spawn"
             );
         }
+    }
+
+    /// The two doors that describe this family must describe it identically. `meka tools list`
+    /// reads [`agent_tool_catalogue`] because it cannot build these tools, so a definition edited
+    /// on one side only would reach the model and the table differently, and nothing else in the
+    /// tree would notice.
+    #[tokio::test]
+    async fn the_agent_tool_catalogue_says_what_registration_produces() {
+        let session_manager = test_session_manager().await;
+        let parent_sid = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
+        let registry = ToolRegistry::new();
+        register_subagent_tools(&registry, AgentSpawnTool {
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
+            tool_builder_params: params.on_provider(Arc::new(
+                crate::provider::mock::MockProvider::from_rounds(Vec::new()),
+            )),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        })
+        .expect("register");
+
+        // Serialised rather than compared field by field: `ToolDefinition` has no `PartialEq`, and
+        // going through JSON covers the parameter schema too, which the catalogue's callers read
+        // but `ToolRegistry::tool_catalogue` drops.
+        let as_json = |definition: &ToolDefinition| {
+            serde_json::to_value(definition).expect("definitions serialise")
+        };
+        let declared = agent_tool_catalogue();
+        for (definition, required) in &declared {
+            let registered = registry
+                .get(&definition.name)
+                .unwrap_or_else(|| panic!("'{}' must be registered", definition.name));
+            assert_eq!(as_json(&registered.definition()), as_json(definition));
+            assert_eq!(registered.required_permission(), *required);
+        }
+        // The other direction: a fifth tool added to `register_subagent_tools` and not to the
+        // catalogue would vanish from `meka tools list` exactly as the whole family used to.
+        let registered_names: Vec<String> = registry
+            .tool_catalogue()
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect();
+        let declared_names: Vec<String> = declared
+            .iter()
+            .map(|(definition, _)| definition.name.clone())
+            .collect();
+        assert_eq!(registered_names.len(), declared_names.len());
+        for name in &registered_names {
+            assert!(declared_names.contains(name), "'{name}' is not catalogued");
+        }
+    }
+
+    /// Each entry has to actually describe itself. The test above only proves the two doors agree,
+    /// and they agree by reading one function, so a definition that lost its description or its
+    /// schema would still match itself while telling the model and `meka tools list` nothing.
+    #[test]
+    fn every_agent_tool_describes_itself_and_the_arguments_it_requires() {
+        for (definition, _) in agent_tool_catalogue() {
+            let name = &definition.name;
+            assert!(name.starts_with("agent_"), "'{name}' is not in the family");
+            // A floor rather than an exact length: the point is that a sentence survived, and the
+            // shortest of the four runs to several hundred characters.
+            assert!(
+                definition.description.len() > 40,
+                "'{name}' has no usable description"
+            );
+            assert_eq!(
+                definition.parameters["type"], "object",
+                "'{name}' must declare an object schema"
+            );
+            let properties = definition.parameters["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("'{name}' must declare properties"));
+            // `agent_list` takes nothing, so an empty set is legal; a required name that no
+            // property defines is not, and would reach the model as an unfillable argument.
+            for required in definition.parameters["required"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                let required = required.as_str().unwrap_or_default();
+                assert!(
+                    properties.contains_key(required),
+                    "'{name}' requires '{required}' but declares no such property"
+                );
+            }
+        }
+    }
+
+    /// The listing reproduces the registration rule, so the rule has to answer for both halves of
+    /// "all four or none" and leave the per-name case to its caller.
+    #[test]
+    fn the_agent_family_needs_a_depth_budget_and_an_admitted_agent_spawn() {
+        let filter = |disabled: Vec<String>| {
+            BuiltinToolFilter::from_config(None, disabled, std::collections::HashMap::new())
+        };
+        assert!(agent_tools_registered(&BuiltinToolFilter::default(), 1));
+        // The documented way to turn delegation off entirely.
+        assert!(!agent_tools_registered(&BuiltinToolFilter::default(), 0));
+        assert!(!agent_tools_registered(
+            &filter(vec!["agent_spawn".to_string()]),
+            3
+        ));
+        // Denying a lifecycle tool alone removes that one and leaves the family, so the predicate
+        // has to say yes here and let the caller filter the name.
+        assert!(agent_tools_registered(
+            &filter(vec!["agent_list".to_string()]),
+            3
+        ));
+        // An exhaustive `allowed_tools` that omits `agent_spawn` takes the family with it.
+        assert!(!agent_tools_registered(
+            &BuiltinToolFilter::from_config(
+                Some(vec!["read_file".to_string()]),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            ),
+            3
+        ));
     }
 
     /// `agent_delete` shares the follow-up guard, so the two cannot run on one worker at once.

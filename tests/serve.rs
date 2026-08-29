@@ -6327,6 +6327,93 @@ fn session_tools_endpoint_lists_the_catalogue_with_permissions() {
     );
 }
 
+/// The tool names a live session's registry ends up holding, which is what `assemble_agent`
+/// actually built rather than what a test assembled by hand.
+fn session_tool_names(harness: &ServeTestHarness, id: &str) -> Vec<String> {
+    let response = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tools", id))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    body["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+const AGENT_FAMILY: [&str; 4] = [
+    "agent_spawn",
+    "agent_list",
+    "agent_followup",
+    "agent_delete",
+];
+
+/// `assemble_agent` gates the family on `agent_tools_registered`, and every other test of that rule
+/// calls `register_subagent_tools` directly on a registry it built itself. This is the only door
+/// that walks the live path, so a predicate that answered wrongly for a real session would show up
+/// nowhere else -- including in `meka tools list`, which reproduces the rule rather than observing
+/// it.
+#[test]
+fn a_session_registers_the_whole_agent_family_by_default() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = session_with_one_turn(&harness);
+    let names = session_tool_names(&harness, &id);
+    for name in AGENT_FAMILY {
+        assert!(
+            names.contains(&name.to_string()),
+            "'{name}' must be registered, got: {names:?}"
+        );
+    }
+}
+
+/// Denying `agent_spawn` takes the three lifecycle tools with it, on a real session and not just in
+/// the listing's reproduction of the rule.
+#[test]
+fn a_session_denied_agent_spawn_registers_none_of_the_family() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "[tools]\ndisabled_tools = [\"agent_spawn\"]\n",
+        "",
+        mock_simple_turn(),
+    );
+    let id = session_with_one_turn(&harness);
+    let names = session_tool_names(&harness, &id);
+    for name in AGENT_FAMILY {
+        assert!(
+            !names.contains(&name.to_string()),
+            "'{name}' goes with agent_spawn, got: {names:?}"
+        );
+    }
+    assert!(
+        names.contains(&"read_file".to_string()),
+        "only the family is denied, got: {names:?}"
+    );
+}
+
+/// The other half of the rule, which the listing used not to mention at all.
+#[test]
+fn a_session_at_depth_zero_registers_none_of_the_family() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "[session]\nsubagent_max_depth = 0\n",
+        "",
+        mock_simple_turn(),
+    );
+    let id = session_with_one_turn(&harness);
+    let names = session_tool_names(&harness, &id);
+    for name in AGENT_FAMILY {
+        assert!(
+            !names.contains(&name.to_string()),
+            "'{name}' needs a depth budget, got: {names:?}"
+        );
+    }
+    assert!(
+        names.contains(&"read_file".to_string()),
+        "only the family is denied, got: {names:?}"
+    );
+}
+
 #[test]
 fn instructions_endpoint_reports_absence_rather_than_failing() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());

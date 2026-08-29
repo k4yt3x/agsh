@@ -199,6 +199,111 @@ fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
     );
 }
 
+/// The `agent_*` family used to be a sentence on stderr instead of four rows, because the listing
+/// builds a real registry and those tools carry an `Arc<dyn Provider>` it has no credential for.
+/// They are read from `agent_tool_catalogue` now, so they belong on stdout with everything else --
+/// this is the wiring the unit tests in `src/tools/subagent.rs` cannot see.
+#[test]
+fn tools_list_puts_the_agent_family_in_the_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run_isolated(dir.path(), &["tools", "list"]);
+    assert!(
+        output.status.success(),
+        "meka tools list exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in [
+        "agent_spawn",
+        "agent_list",
+        "agent_followup",
+        "agent_delete",
+    ] {
+        let row = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("'{name}' must have a row, got:\n{stdout}"));
+        assert!(
+            row.contains("enabled"),
+            "'{name}' must read as enabled by default, got: {row}"
+        );
+    }
+    // Sorted with the rest rather than appended, so the family arrives as one block at the top.
+    let names: Vec<&str> = stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "the table must stay sorted by name");
+}
+
+/// Denying `agent_spawn` takes the three lifecycle tools with it, so all four have to read as
+/// disabled. Listing `agent_list` as enabled here would describe a session nobody can have.
+#[test]
+fn tools_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_dir = dir.path().join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[tools]\ndisabled_tools = [\"agent_spawn\"]\n",
+    )
+    .expect("write config.toml");
+    let output = run_isolated(dir.path(), &["tools", "list"]);
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in [
+        "agent_spawn",
+        "agent_list",
+        "agent_followup",
+        "agent_delete",
+    ] {
+        let row = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("'{name}' must have a row, got:\n{stdout}"));
+        assert!(
+            row.contains("disabled"),
+            "'{name}' goes with agent_spawn, got: {row}"
+        );
+    }
+}
+
+/// `session.subagent_max_depth = 0` is the documented way to turn delegation off, and the listing
+/// missed it entirely while the family was described in prose.
+#[test]
+fn tools_list_reports_the_agent_family_as_denied_at_depth_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_dir = dir.path().join("meka");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[session]\nsubagent_max_depth = 0\n",
+    )
+    .expect("write config.toml");
+    let output = run_isolated(dir.path(), &["tools", "list"]);
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in [
+        "agent_spawn",
+        "agent_list",
+        "agent_followup",
+        "agent_delete",
+    ] {
+        let row = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("'{name}' must have a row, got:\n{stdout}"));
+        assert!(
+            row.contains("disabled"),
+            "'{name}' needs a depth budget, got: {row}"
+        );
+    }
+}
+
 #[test]
 fn mcp_add_http_positional_url_persists_server() {
     // Notion-style happy path: positional URL, transport auto-detected from the URL scheme, no

@@ -930,8 +930,13 @@ async fn assemble_agent(
         agent::PublishedBinding::new(&bundle.resolved, Arc::clone(&bundle.context_window));
 
     // `subagent_max_depth == 0` disables sub-agents entirely (root gets no `agent_spawn`); `>= 1`
-    // seeds the root's soft recursion budget. The `absolute_depth` starts at 0 for the root.
-    if bundle.subagent_max_depth >= 1 {
+    // seeds the root's soft recursion budget, and `absolute_depth` starts at 0 for the root. The
+    // predicate folds in the `[tools]` half too, and is named rather than written inline because
+    // `meka tools list` has to reach the same answer with no provider to assemble a session with.
+    if crate::tools::subagent::agent_tools_registered(
+        &bundle.builtin_filter,
+        bundle.subagent_max_depth,
+    ) {
         crate::tools::subagent::register_subagent_tools(
             &tool_registry,
             crate::tools::subagent::AgentSpawnTool {
@@ -3149,7 +3154,28 @@ async fn run_tools_subcommand(
                 std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             );
 
-            let catalogue = reference.tool_catalogue();
+            let mut catalogue = reference.tool_catalogue();
+            // The one family the registry above cannot hold: its tools carry an `Arc<dyn
+            // Provider>`, so building them would make naming meka's own tools require a resolved
+            // credential. Their definitions are constants, so the listing reads those instead of
+            // describing the family in prose the table has no way to keep honest.
+            let agent_family = crate::tools::subagent::agent_tool_catalogue();
+            let agent_family_names: std::collections::HashSet<String> = agent_family
+                .iter()
+                .map(|(definition, _)| definition.name.clone())
+                .collect();
+            // Both conditions that remove the whole family, asked the way `assemble_agent` asks
+            // them. A per-name `[tools]` entry is a separate question, applied below alongside
+            // every other tool's.
+            let agent_family_registered =
+                crate::tools::subagent::agent_tools_registered(&filter, config.subagent_max_depth);
+            catalogue.extend(agent_family.into_iter().map(|(definition, required)| {
+                // Never deferred: `register_subagent_tools` registers all four eagerly and calls
+                // no `mark_deferred`.
+                (definition.name, definition.description, required, false)
+            }));
+            catalogue.sort_by(|left, right| left.0.cmp(&right.0));
+
             // `format_columns`, like every other listing meka prints. The fixed `{:<20}` this used
             // to hand-roll silently ran its columns together for any name longer than the width,
             // and a namespaced MCP tool (`mcp__mekabridge__send_file`) is 26
@@ -3159,6 +3185,8 @@ async fn run_tools_subcommand(
                 .map(|(name, description, required, is_deferred)| {
                     let override_entry = filter.permission_overrides.get(name);
                     let effective = override_entry.copied().unwrap_or(*required);
+                    let admitted = filter.admits(name)
+                        && (agent_family_registered || !agent_family_names.contains(name));
                     vec![
                         name.clone(),
                         effective.to_string(),
@@ -3167,7 +3195,7 @@ async fn run_tools_subcommand(
                         } else {
                             "builtin".to_string()
                         },
-                        if filter.admits(name) {
+                        if admitted {
                             if *is_deferred { "deferred" } else { "enabled" }
                         } else {
                             "disabled"
@@ -3189,14 +3217,6 @@ async fn run_tools_subcommand(
                     &["Name", "Required", "Source", "Visibility", "Description"],
                     &rows
                 )
-            );
-            // The one family this listing cannot build. `agent_spawn` carries a live provider, and
-            // constructing one would make listing tool names require a working credential. Named
-            // rather than silently absent: this listing is what the docs point people at.
-            eprintln!(
-                "\nThe agent_* family (agent_spawn, agent_list, agent_followup, agent_delete) is \
-                 registered per session and needs a provider, so it is not shown here. It is \
-                 available at every permission level unless [subagents] or [tools] denies it."
             );
         }
     }
