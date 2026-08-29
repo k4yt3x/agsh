@@ -89,14 +89,6 @@ The backend the profile uses (required).
 
 A backend names the wire protocol it speaks, not a vendor. See [Providers Overview](../providers/overview.md) for why, and which servers implement which protocol.
 
-### `model`
-
-The model identifier to send to the provider, forwarded verbatim. meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
-
-`meka provider add` suggests `claude-opus-5` for a Claude profile and `gpt-5.6-sol` for an OpenAI one. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
-
-Change it with `meka provider set <name> model <value>`.
-
 ### `base_url`
 
 Custom API base URL. Useful for:
@@ -140,6 +132,57 @@ Custom OAuth token refresh endpoint. Defaults:
 - `https://api.anthropic.com/v1/oauth/token` for `claude-subscription`
 - `https://auth.openai.com/oauth/token` for `chatgpt-subscription`
 
+### `client_id`
+
+OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use meka's built-in default client IDs.
+
+### `device_id`
+
+`claude-subscription` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
+
+If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the profile under `[providers.<name>].device_id`. This file write only happens for the `claude-subscription` backend; other backends don't need a device ID.
+
+You can supply your own value if you want to control attribution explicitly:
+
+```toml
+[providers.work]
+type      = "claude-subscription"
+device_id = "your-stable-id-here"
+```
+
+### `model`
+
+The model identifier to send to the provider, forwarded verbatim. meka does not gate which strings are valid, so an OpenAI-compatible endpoint accepts whatever that server exposes.
+
+`meka provider add` suggests `claude-opus-5` for a Claude profile and `gpt-5.6-sol` for an OpenAI one. For the current line-ups, see [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview) and [OpenAI's models overview](https://platform.openai.com/docs/models); naming them here would go stale on someone else's schedule.
+
+Change it with `meka provider set <name> model <value>`.
+
+### `context_window`
+
+The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, meka assumes **1000000**.
+
+meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request - but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
+
+The window belongs to the session, not to the process: each session is measured against the profile it recorded, so two sessions in one `meka serve` can sit on profiles with different windows.
+
+```toml
+[providers.work]
+type           = "openai-chat-completions"
+model          = "my-128k-model"
+context_window = 131072
+```
+
+### `max_output_tokens`
+
+Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000). `meka provider add` and `meka provider set` both refuse a profile that fails this, and it is validated again at startup.
+
+```toml
+[providers.work]
+type              = "anthropic-messages"
+max_output_tokens = 16000
+```
+
 ### `effort`
 
 One knob for reasoning effort across every backend: Claude sends it as `output_config.effort` (`claude-subscription` under the `effort-2025-11-24` beta, `anthropic-messages` directly), OpenAI as `reasoning.effort` (with `max_completion_tokens` in place of `max_tokens`).
@@ -156,29 +199,17 @@ type   = "claude-subscription"
 effort = "xhigh"
 ```
 
-### `redact_thinking`
+### `vision`
 
-`claude-subscription` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
+Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so attachments are refused rather than sent to a model that cannot read them.
 
-```toml
-[providers.work]
-type            = "claude-subscription"
-redact_thinking = false
-```
-
-### `context_window`
-
-The model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over [`[session].context_window`](#sessioncontext_window); when neither is set, meka assumes **1000000**.
-
-meka never infers this from the model name and never asks the provider for it, so this is where a model smaller than the default gets stated. It is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request - but leaving it at 1M for a smaller model means planned compaction never fires, and every compaction instead happens after the provider rejects the request as too large, costing a wasted round trip each time.
-
-The window belongs to the session, not to the process: each session is measured against the profile it recorded, so two sessions in one `meka serve` can sit on profiles with different windows.
+Refusal is per session, from the profile that session recorded, on both ACP and `POST /v1/sessions/{id}/turn`. What ACP *advertises* in `promptCapabilities.image` is necessarily per connection: `initialize` is answered before any session exists, so it reports the default profile's flag. A client on a vision-capable connection can still have its attachment refused by a session pinned to a text-only profile. See [ACP](../usage/acp.md).
 
 ```toml
-[providers.work]
-type           = "openai-chat-completions"
-model          = "my-128k-model"
-context_window = 131072
+[providers.local]
+type   = "openai-chat-completions"
+model  = "llama-3-8b"
+vision = false
 ```
 
 ### `thinking`
@@ -212,45 +243,14 @@ thinking        = "budgeted"
 thinking_budget = 20000
 ```
 
-### `vision`
+### `redact_thinking`
 
-Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so attachments are refused rather than sent to a model that cannot read them.
-
-Refusal is per session, from the profile that session recorded, on both ACP and `POST /v1/sessions/{id}/turn`. What ACP *advertises* in `promptCapabilities.image` is necessarily per connection: `initialize` is answered before any session exists, so it reports the default profile's flag. A client on a vision-capable connection can still have its attachment refused by a session pinned to a text-only profile. See [ACP](../usage/acp.md).
-
-```toml
-[providers.local]
-type   = "openai-chat-completions"
-model  = "llama-3-8b"
-vision = false
-```
-
-### `max_output_tokens`
-
-Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000). `meka provider add` and `meka provider set` both refuse a profile that fails this, and it is validated again at startup.
+`claude-subscription` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
 
 ```toml
 [providers.work]
-type              = "anthropic-messages"
-max_output_tokens = 16000
-```
-
-### `client_id`
-
-OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription` only). Leave unset to use meka's built-in default client IDs.
-
-### `device_id`
-
-`claude-subscription` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
-
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the profile under `[providers.<name>].device_id`. This file write only happens for the `claude-subscription` backend; other backends don't need a device ID.
-
-You can supply your own value if you want to control attribution explicitly:
-
-```toml
-[providers.work]
-type      = "claude-subscription"
-device_id = "your-stable-id-here"
+type            = "claude-subscription"
+redact_thinking = false
 ```
 
 ## `meka provider` CLI
@@ -261,7 +261,7 @@ config file.
 
 | Command | Action |
 |---|---|
-| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--type` and `--model` as flags too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. Becomes `default_provider` whenever none is set. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--thinking`, `--context-window`, `--effort`, `--thinking-budget`, `--vision`, `--max-output-tokens`, `--redact-thinking`, `--oauth-token-url` and `--client-id`, so one non-interactive command can create a profile of any shape. The optional advanced prompt covers only thinking, context window and effort, plus the thinking budget if you answer `budgeted`; the rest are flag-only, and an unflagged setting is left out of the profile so its documented default applies. `device_id` has no flag, because meka resolves and persists it itself. |
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-5` for Claude, `gpt-5.6-sol` for OpenAI), then acquires the secret (OAuth login for `claude-subscription` / `chatgpt-subscription`, API-key prompt for `anthropic-messages` / `openai-chat-completions` / `openai-responses`). `--api-key-stdin` reads the key from stdin instead, and then needs `--type` and `--model` as flags too, since a prompt would consume the piped key; it is refused for the two subscription backends, which have no key to read. Becomes `default_provider` whenever none is set. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--oauth-token-url`, `--client-id`, `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget` and `--redact-thinking`, so one non-interactive command can create a profile of any shape. The optional advanced prompt covers only thinking, context window and effort, plus the thinking budget if you answer `budgeted`; the rest are flag-only, and an unflagged setting is left out of the profile so its documented default applies. `device_id` has no flag, because meka resolves and persists it itself. |
 | `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. Also names any stored credential that no profile claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka provider set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka provider use <name>` | Set `default_provider` to this profile. |
@@ -276,10 +276,15 @@ $ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-chat-com
 
 ### Changing one setting
 
-`meka provider set <name> <key> <value>` writes one key into `[providers.<name>]` and touches
-nothing else: every other setting keeps its value, its position in the file, and any comment you
-wrote above or beside it. This is how a profile's model changes, since there is no per-run flag for
-it.
+`meka provider set <name> <key> <value>` writes one key into `[providers.<name>]`: every other
+setting keeps its value, and every comment you wrote above or beside a key stays attached to that
+key. This is how a profile's model changes, since there is no per-run flag for it.
+
+Keys are left in the order [Profile fields](#profile-fields) documents, so a profile meka has
+written to is in that order whatever order it was in before. That is deliberate rather than
+incidental: every writer normalises, so the file does not depend on which command last touched it,
+and there is one shape to read rather than one per history. Comments move with their keys, so an
+annotated profile stays annotated.
 
 ```console
 $ meka provider set work model claude-opus-5
@@ -295,17 +300,17 @@ Eleven keys are settable, each named after the [profile field](#profile-fields) 
 
 | Key | Value |
 |---|---|
-| `model` | Any string, forwarded to the provider verbatim |
 | `base_url` | Any string |
+| `oauth_token_url` | Any string |
+| `client_id` | Any string |
+| `model` | Any string, forwarded to the provider verbatim |
 | `context_window` | A whole number of tokens |
-| `vision` | `true` or `false` |
 | `max_output_tokens` | A whole number of tokens |
 | `effort` | Any string |
+| `vision` | `true` or `false` |
 | `thinking` | `adaptive`, `budgeted`, or `off` |
 | `thinking_budget` | A whole number of tokens |
 | `redact_thinking` | `true` or `false` |
-| `oauth_token_url` | Any string |
-| `client_id` | Any string |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
 anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing

@@ -102,17 +102,20 @@ pub async fn run(
 /// wizard for settings most users never state. [`resolve_tuning`] says the same thing from the
 /// other side: its short-circuit tests those three and no others, because a rare flag must not
 /// silently skip the prompt for the common ones.
+/// Ordered as [`crate::config::ProviderProfile`] is, minus the three `provider add` takes as its
+/// own arguments (`type`, `base_url`, `model`) and `device_id`, which meka resolves rather than
+/// accepting.
 #[derive(Default)]
 struct ProfileTuning {
-    thinking: Option<crate::provider::ThinkingMode>,
-    context_window: Option<u64>,
-    effort: Option<String>,
-    thinking_budget: Option<u64>,
-    vision: Option<bool>,
-    max_output_tokens: Option<u64>,
-    redact_thinking: Option<bool>,
     oauth_token_url: Option<String>,
     client_id: Option<String>,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    effort: Option<String>,
+    vision: Option<bool>,
+    thinking: Option<crate::provider::ThinkingMode>,
+    thinking_budget: Option<u64>,
+    redact_thinking: Option<bool>,
 }
 
 async fn run_add(
@@ -417,28 +420,52 @@ async fn run_remove(
     Ok(())
 }
 
-/// The settings `meka provider set` will write, in the order `provider add` prompts for them and
-/// `config.toml` documents them.
+/// The settings `meka provider set` will write, in [`crate::config::ProviderProfile`]'s canonical
+/// order minus the two keys below.
 ///
-/// `type` is deliberately absent. The stored credential was acquired *for* the current backend and
-/// differs in kind between them (an API key against an OAuth bundle), so rewriting it in place
-/// leaves a profile whose credential cannot serve it: a state no other door can produce, and the
-/// one thing this command must not be able to do. `device_id` is absent for the opposite reason -
-/// meka resolves and persists it itself ([`crate::config::resolve_device_id`]), so offering it
-/// invites a user to overwrite bookkeeping they do not own.
+/// Deliberately *not* the order `provider add` prompts in, which is backend, then model, then base
+/// URL: a prompt asks for the required thing before the one with a working default, which is right
+/// for a prompt and wrong for a file. This list is read as a file is, so it follows the file.
+///
+/// `type` is absent. The stored credential was acquired *for* the current backend and differs in
+/// kind between them (an API key against an OAuth bundle), so rewriting it in place leaves a
+/// profile whose credential cannot serve it: a state no other door can produce, and the one thing
+/// this command must not be able to do. `device_id` is absent for the opposite reason - meka
+/// resolves and persists it itself ([`crate::config::resolve_device_id`]), so offering it invites a
+/// user to overwrite bookkeeping they do not own.
 const SETTABLE_PROFILE_KEYS: &[&str] = &[
-    "model",
     "base_url",
+    "oauth_token_url",
+    "client_id",
+    "model",
     "context_window",
-    "vision",
     "max_output_tokens",
     "effort",
+    "vision",
     "thinking",
     "thinking_budget",
     "redact_thinking",
-    "oauth_token_url",
-    "client_id",
 ];
+
+#[cfg(test)]
+mod canonical_order_tests {
+    use super::SETTABLE_PROFILE_KEYS;
+
+    /// The two key lists cannot drift, because one is now stated as a function of the other.
+    ///
+    /// They were separate lists in separate files for a while, and they diverged: this one had
+    /// `context_window` before `effort` while the writer had it after, under a doc comment claiming
+    /// the two matched.
+    #[test]
+    fn the_settable_keys_are_the_canonical_order_minus_what_set_refuses() {
+        let expected: Vec<&str> = crate::config::PROFILE_KEY_ORDER
+            .iter()
+            .copied()
+            .filter(|key| !matches!(*key, "type" | "device_id"))
+            .collect();
+        assert_eq!(SETTABLE_PROFILE_KEYS, expected.as_slice());
+    }
+}
 
 /// Parse one `key`/`value` pair into the TOML value the profile should carry.
 ///
@@ -463,13 +490,13 @@ fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Valu
         }
     };
     match key {
-        "model" | "base_url" | "effort" | "oauth_token_url" | "client_id" => {
+        "base_url" | "oauth_token_url" | "client_id" | "model" | "effort" => {
             Ok(toml_edit::Value::from(value))
         }
         "context_window" => integer("context_window"),
         "max_output_tokens" => integer("max_output_tokens"),
-        "thinking_budget" => integer("thinking_budget"),
         "vision" => boolean("vision"),
+        "thinking_budget" => integer("thinking_budget"),
         "redact_thinking" => boolean("redact_thinking"),
         "thinking" => {
             let mode = <crate::provider::ThinkingMode as clap::ValueEnum>::from_str(value, true)
@@ -525,12 +552,14 @@ fn set_profile_field(
     key: &str,
     value: Option<toml_edit::Value>,
 ) -> bool {
-    let Some(profile) = document
+    let Some(item) = document
         .get_mut("providers")
         .and_then(|item| item.as_table_like_mut())
         .and_then(|providers| providers.get_mut(name))
-        .and_then(|item| item.as_table_like_mut())
     else {
+        return false;
+    };
+    let Some(profile) = item.as_table_like_mut() else {
         return false;
     };
     match value {
@@ -555,6 +584,11 @@ fn set_profile_field(
             profile.remove(key);
         }
     }
+    // A key `set` adds was appended, so it would otherwise sit wherever it landed. Sorting here
+    // rather than only on the added key is what makes the order an invariant instead of a habit: a
+    // profile written by hand, or by a meka that ordered its keys differently, is normalised the
+    // first time this command touches it.
+    crate::config::sort_profile_keys(item);
     true
 }
 
@@ -996,42 +1030,15 @@ fn upsert_profile_document(
     tuning: &ProfileTuning,
 ) -> anyhow::Result<()> {
     let mut profile = toml_edit::Table::new();
-    profile.insert("type", toml_edit::value(backend));
-    profile.insert("model", toml_edit::value(model));
-    if let Some(url) = base_url {
-        profile.insert("base_url", toml_edit::value(url));
-    }
+    // Written in [`crate::config::ProviderProfile`]'s canonical order, so a profile meka authors
+    // reads the way the reference documents it: the provider block first (where the request goes
+    // and who meka is when it arrives), then the profile block (what it asks for, and how).
+    //
     // An unset knob is left out rather than written at its default, so the profile records only
     // what the user actually chose and a later change to a default reaches existing profiles.
-    if let Some(mode) = tuning.thinking {
-        profile.insert("thinking", toml_edit::value(mode.as_str()));
-    }
-    if let Some(window) = tuning.context_window {
-        profile.insert(
-            "context_window",
-            toml_edit::value(toml_integer("context_window", window)?),
-        );
-    }
-    if let Some(effort) = tuning.effort.as_deref() {
-        profile.insert("effort", toml_edit::value(effort));
-    }
-    if let Some(budget) = tuning.thinking_budget {
-        profile.insert(
-            "thinking_budget",
-            toml_edit::value(toml_integer("thinking_budget", budget)?),
-        );
-    }
-    if let Some(vision) = tuning.vision {
-        profile.insert("vision", toml_edit::value(vision));
-    }
-    if let Some(cap) = tuning.max_output_tokens {
-        profile.insert(
-            "max_output_tokens",
-            toml_edit::value(toml_integer("max_output_tokens", cap)?),
-        );
-    }
-    if let Some(redact) = tuning.redact_thinking {
-        profile.insert("redact_thinking", toml_edit::value(redact));
+    profile.insert("type", toml_edit::value(backend));
+    if let Some(url) = base_url {
+        profile.insert("base_url", toml_edit::value(url));
     }
     if let Some(url) = tuning.oauth_token_url.as_deref() {
         profile.insert("oauth_token_url", toml_edit::value(url));
@@ -1039,7 +1046,43 @@ fn upsert_profile_document(
     if let Some(client_id) = tuning.client_id.as_deref() {
         profile.insert("client_id", toml_edit::value(client_id));
     }
-    ensure_providers_table(document)?.insert(name, toml_edit::Item::Table(profile));
+    profile.insert("model", toml_edit::value(model));
+    if let Some(window) = tuning.context_window {
+        profile.insert(
+            "context_window",
+            toml_edit::value(toml_integer("context_window", window)?),
+        );
+    }
+    if let Some(cap) = tuning.max_output_tokens {
+        profile.insert(
+            "max_output_tokens",
+            toml_edit::value(toml_integer("max_output_tokens", cap)?),
+        );
+    }
+    if let Some(effort) = tuning.effort.as_deref() {
+        profile.insert("effort", toml_edit::value(effort));
+    }
+    if let Some(vision) = tuning.vision {
+        profile.insert("vision", toml_edit::value(vision));
+    }
+    if let Some(mode) = tuning.thinking {
+        profile.insert("thinking", toml_edit::value(mode.as_str()));
+    }
+    if let Some(budget) = tuning.thinking_budget {
+        profile.insert(
+            "thinking_budget",
+            toml_edit::value(toml_integer("thinking_budget", budget)?),
+        );
+    }
+    if let Some(redact) = tuning.redact_thinking {
+        profile.insert("redact_thinking", toml_edit::value(redact));
+    }
+    // Redundant here, since the inserts above already run in order, and deliberately kept: it is
+    // the one line that makes "every writer leaves the canonical order" true of this writer too,
+    // rather than true only for as long as nobody adds an insert in the wrong place.
+    let mut profile = toml_edit::Item::Table(profile);
+    crate::config::sort_profile_keys(&mut profile);
+    ensure_providers_table(document)?.insert(name, profile);
 
     // Make the first profile the default so a single-profile setup needs no extra step.
     if document.get("default_provider").is_none() {

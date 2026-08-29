@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `--model`, `--base-url`, `--thinking` and `--thinking-budget` are removed.
 - **Breaking:** `meka session list --long` is removed along with the columns it showed.
 - The thinking budget is per profile (`thinking_budget`), falling back to `[thinking].budget_tokens`.
+- Profile keys have one canonical order, provider-scoped first, shared by the file, `-h` and docs.
+- Every writer normalises a profile's key order; `provider set` no longer preserves key positions.
 - `provider add` refuses a profile that would fail at startup, as `provider set` already did.
 - `provider set` refuses a thinking setting on a backend that never sends one, as `add` drops it.
 - A failing provider call is attempted three times rather than four, with 1s then 2s of backoff.

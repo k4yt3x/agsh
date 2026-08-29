@@ -205,56 +205,11 @@ pub enum ProviderAction {
         /// claude-subscription, openai-chat-completions, openai-responses.
         #[arg(long = "type")]
         r#type: Option<String>,
-        /// Model name.
-        #[arg(long)]
-        model: Option<String>,
         /// API base URL
         ///
         /// Any endpoint serving the chosen protocol.
         #[arg(long = "base-url")]
         base_url: Option<String>,
-        /// Thinking mode: adaptive, budgeted, off
-        ///
-        /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
-        /// ignore it. Defaults to adaptive.
-        #[arg(long, value_enum, hide_possible_values = true)]
-        thinking: Option<crate::provider::ThinkingMode>,
-        /// Context window in tokens
-        ///
-        /// Skips the advanced prompt for this setting. Defaults to 1000000. Set the model's real
-        /// window so compaction fires at the right point; meka never infers or probes for it.
-        #[arg(long = "context-window")]
-        context_window: Option<u64>,
-        /// Reasoning effort (e.g. low, high)
-        ///
-        /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
-        /// applies its own default.
-        #[arg(long)]
-        effort: Option<String>,
-        /// Thinking budget in tokens, for thinking = budgeted
-        ///
-        /// Ignored by the other two modes, which send no budget. Defaults to
-        /// `[thinking].budget_tokens`, then to 16000.
-        #[arg(long = "thinking-budget")]
-        thinking_budget: Option<u64>,
-        /// Accept image input: true or false (default: true)
-        ///
-        /// Set false for a text-only model, so the ACP frontend stops offering
-        /// images it cannot use.
-        #[arg(long, hide_possible_values = true)]
-        vision: Option<bool>,
-        /// Per-request output token cap
-        ///
-        /// Unset leaves the backend's own default. On Claude with thinking =
-        /// budgeted this must exceed the thinking budget.
-        #[arg(long = "max-output-tokens")]
-        max_output_tokens: Option<u64>,
-        /// Redact thinking blocks: true or false (default: true)
-        ///
-        /// claude-subscription only. Saves bandwidth, but redacted payloads
-        /// cannot be replayed to the server across turns.
-        #[arg(long = "redact-thinking", hide_possible_values = true)]
-        redact_thinking: Option<bool>,
         /// OAuth token endpoint override (advanced)
         ///
         /// For a self-hosted or proxied authorisation server. The backend's own
@@ -267,6 +222,51 @@ pub enum ProviderAction {
         /// --oauth-token-url.
         #[arg(long = "client-id")]
         client_id: Option<String>,
+        /// Model name.
+        #[arg(long)]
+        model: Option<String>,
+        /// Context window in tokens
+        ///
+        /// Skips the advanced prompt for this setting. Defaults to 1000000. Set the model's real
+        /// window so compaction fires at the right point; meka never infers or probes for it.
+        #[arg(long = "context-window")]
+        context_window: Option<u64>,
+        /// Per-request output token cap
+        ///
+        /// Unset leaves the backend's own default. On Claude with thinking =
+        /// budgeted this must exceed the thinking budget.
+        #[arg(long = "max-output-tokens")]
+        max_output_tokens: Option<u64>,
+        /// Reasoning effort (e.g. low, high)
+        ///
+        /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
+        /// applies its own default.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Accept image input: true or false (default: true)
+        ///
+        /// Set false for a text-only model, so the ACP frontend stops offering
+        /// images it cannot use.
+        #[arg(long, hide_possible_values = true)]
+        vision: Option<bool>,
+        /// Thinking mode: adaptive, budgeted, off
+        ///
+        /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
+        /// ignore it. Defaults to adaptive.
+        #[arg(long, value_enum, hide_possible_values = true)]
+        thinking: Option<crate::provider::ThinkingMode>,
+        /// Thinking budget in tokens, for thinking = budgeted
+        ///
+        /// Ignored by the other two modes, which send no budget. Defaults to
+        /// `[thinking].budget_tokens`, then to 16000.
+        #[arg(long = "thinking-budget")]
+        thinking_budget: Option<u64>,
+        /// Redact thinking blocks: true or false (default: true)
+        ///
+        /// claude-subscription only. Saves bandwidth, but redacted payloads
+        /// cannot be replayed to the server across turns.
+        #[arg(long = "redact-thinking", hide_possible_values = true)]
+        redact_thinking: Option<bool>,
         /// Read the API key from stdin
         ///
         /// Non-interactive alternative to the key prompt. API backends only.
@@ -277,15 +277,15 @@ pub enum ProviderAction {
     List,
     /// Change one setting on a provider profile
     ///
-    /// Writes the key in place, leaving every other setting and any comments
-    /// around it alone. This is how a profile's model changes; there is no
-    /// per-run flag for it, because a profile is an indivisible bundle and a
-    /// session records which one it runs on, not a rewritten copy.
+    /// Keeps every other setting and every comment, and leaves the profile's
+    /// keys in meka's documented order. This is how a profile's model changes;
+    /// there is no per-run flag for it, because a profile is an indivisible
+    /// bundle and a session records which one it runs on, not a rewritten copy.
     ///
-    /// Keys: model, base_url, context_window, vision, max_output_tokens,
-    /// effort, thinking, thinking_budget, redact_thinking, oauth_token_url,
-    /// client_id. `type` is not settable, because the stored credential was
-    /// acquired for the current backend.
+    /// Keys: base_url, oauth_token_url, client_id, model, context_window,
+    /// max_output_tokens, effort, vision, thinking, thinking_budget,
+    /// redact_thinking. `type` is not settable, because the stored credential
+    /// was acquired for the current backend.
     ///
     /// Examples:
     ///   meka provider set work model claude-opus-5

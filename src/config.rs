@@ -1189,34 +1189,52 @@ pub struct SessionConfig {
 /// One named provider profile from `[providers.<name>]`. Holds only non-secret settings; the
 /// credential (API key or OAuth bundle) is stored in the DB keyed by the profile name and is
 /// acquired via `meka provider add` / `login`.
+///
+/// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
+/// it: [`ProfileSettings`], `resolve_profile`, `ProfileTuning`, `upsert_profile_document`,
+/// `SETTABLE_PROFILE_KEYS`, the `provider add` flags, and the `config.toml` reference. It ran the
+/// other way for a while - six lists, no two agreeing, one of them documented as matching another
+/// it never had.
+///
+/// Two blocks, in this order, because they answer to different owners. First the **provider**:
+/// where a request goes and who meka is when it arrives (`type`, `base_url`, and the OAuth
+/// settings a login needs). Then the **profile**: what meka asks that endpoint for, and how
+/// (`model` and every model-tied knob). Within each block, widest reach first, ending with the
+/// narrowest - so `type` leads, `device_id` closes the first block as the one key meka writes
+/// rather than the user, and `redact_thinking` closes the second as the only `claude-subscription`
+/// setting.
+///
+/// The division is the one "Whose fact is it" draws, which is why a new field has an obvious home:
+/// would two models on one account state it differently? Then it belongs in the second block.
+/// Would two accounts on one endpoint? The first.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderProfile {
     /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
     #[serde(rename = "type")]
     pub backend: String,
-    pub model: Option<String>,
     pub base_url: Option<String>,
+    pub oauth_token_url: Option<String>,
+    /// OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription`).
+    pub client_id: Option<String>,
+    pub device_id: Option<String>,
+    pub model: Option<String>,
     /// The model's context window (total tokens it can hold), used for the context gauge and
     /// auto-compaction. Falls back to `[session].context_window`, then to
     /// [`crate::provider::DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
     /// asks the provider for it, so this is where a model smaller than the default gets stated.
     pub context_window: Option<u64>,
-    /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
-    /// the ACP frontend from advertising / accepting images for a text-only model.
-    pub vision: Option<bool>,
     /// Override the per-request output (completion) token cap. When unset, each backend keeps its
     /// built-in default. On Claude the value must exceed the thinking budget.
     pub max_output_tokens: Option<u64>,
-    pub oauth_token_url: Option<String>,
-    pub device_id: Option<String>,
-    /// OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription`).
-    pub client_id: Option<String>,
     /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
     /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
     /// is omitted entirely, which is how meka asks for the provider's own default. meka picks no
     /// tier of its own - see [`crate::provider::resolve_effort_level`].
     pub effort: Option<String>,
+    /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
+    /// the ACP frontend from advertising / accepting images for a text-only model.
+    pub vision: Option<bool>,
     /// Claude-only: how this profile encodes extended thinking - `adaptive`, `budgeted`, or `off`.
     /// Defaults to `adaptive`. The right value depends on the model *and* on what the endpoint
     /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
@@ -1239,6 +1257,60 @@ pub struct ProviderProfile {
     pub redact_thinking: Option<bool>,
 }
 
+/// [`ProviderProfile`]'s field order, as the key names a `config.toml` profile table carries.
+///
+/// The list exists because the order is now *enforced* rather than merely produced: every writer
+/// runs [`sort_profile_keys`] before saving, so a profile meka has touched is in this order however
+/// it got there - written whole by `provider add`, edited one key at a time by `provider set`, or
+/// hand-arranged and then appended to by `device_id`'s writer.
+pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
+    "type",
+    "base_url",
+    "oauth_token_url",
+    "client_id",
+    "device_id",
+    "model",
+    "context_window",
+    "max_output_tokens",
+    "effort",
+    "vision",
+    "thinking",
+    "thinking_budget",
+    "redact_thinking",
+];
+
+/// Put one profile table's keys into [`PROFILE_KEY_ORDER`].
+///
+/// Comments ride along, because `toml_edit` hangs them off the key they belong to: whole-line
+/// comments and blank lines above a key live in its `leaf_decor`, and a trailing `# note` lives in
+/// the value's decor. Moving the entry moves both, which is what makes sorting safe on a file a
+/// user has annotated.
+///
+/// A key the current build does not model sorts last, alphabetically among its peers, rather than
+/// wherever the sort happened to leave it. `deny_unknown_fields` means such a key cannot survive a
+/// load, so this only decides what an unreachable case looks like - but "unreachable" and
+/// "arbitrary" are different, and the second one produces a diff that changes between runs.
+///
+/// Takes a [`toml_edit::Item`] rather than a `TableLike`, which is the shape every caller has,
+/// because only the concrete types carry a comparator-taking sort and their comparators differ
+/// (`Table` compares `Item`s, `InlineTable` compares `Value`s). Both are reachable: a profile is
+/// ordinarily its own table, but `providers` written as one inline table is a shape meka has had to
+/// handle before.
+pub(crate) fn sort_profile_keys(profile: &mut toml_edit::Item) {
+    fn rank(key: &str) -> (usize, &str) {
+        let position = PROFILE_KEY_ORDER
+            .iter()
+            .position(|known| *known == key)
+            .unwrap_or(PROFILE_KEY_ORDER.len());
+        (position, key)
+    }
+    if let Some(table) = profile.as_table_mut() {
+        table.sort_values_by(|left, _, right, _| rank(left.get()).cmp(&rank(right.get())));
+    } else if let Some(inline) = profile.as_inline_table_mut() {
+        inline.sort_values_by(|left, _, right, _| rank(left.get()).cmp(&rank(right.get())));
+    }
+}
+
 /// One profile resolved into everything needed to build a provider for it.
 ///
 /// This exists because a provider is no longer a property of the process. A session names the
@@ -1253,22 +1325,22 @@ pub struct ProviderProfile {
 pub struct ProfileSettings {
     /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
     pub backend: String,
-    pub model: Option<String>,
     pub base_url: Option<String>,
-    pub client_id: Option<String>,
     pub oauth_token_url: Option<String>,
+    pub client_id: Option<String>,
     pub device_id: String,
-    pub redact_thinking: bool,
+    pub model: Option<String>,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub effort: Option<String>,
+    pub vision: bool,
     pub thinking: crate::provider::ThinkingMode,
     /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
     /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
     /// window is what [`crate::binding_context_window`] reports rather than dividing by a figure
     /// meka has no reason to believe.
     pub thinking_budget: u64,
-    pub effort: Option<String>,
-    pub context_window: Option<u64>,
-    pub vision: bool,
-    pub max_output_tokens: Option<u64>,
+    pub redact_thinking: bool,
 }
 
 /// The active profile's name, read straight off disk without resolving anything else.
@@ -1326,26 +1398,26 @@ pub fn resolve_profile(
 ) -> ProfileSettings {
     ProfileSettings {
         backend: profile.backend.clone(),
-        model: profile.model.clone(),
         base_url: profile.base_url.clone(),
-        client_id: profile.client_id.clone(),
         oauth_token_url: profile.oauth_token_url.clone(),
+        client_id: profile.client_id.clone(),
         device_id,
-        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
-        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
-        redact_thinking: profile.redact_thinking.unwrap_or(true),
+        model: profile.model.clone(),
+        context_window: profile.context_window.or(session_context_window),
+        max_output_tokens: profile.max_output_tokens,
+        // Pure passthrough for every backend: whatever the profile sets goes to the provider
+        // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
+        // the provider applies its own default. An invalid value is the user's to own.
+        effort: profile.effort.clone(),
+        vision: profile.vision.unwrap_or(true),
         thinking: profile.thinking.unwrap_or_default(),
         thinking_budget: profile
             .thinking_budget
             .or(default_thinking_budget)
             .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
-        // Pure passthrough for every backend: whatever the profile sets goes to the provider
-        // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
-        // the provider applies its own default. An invalid value is the user's to own.
-        effort: profile.effort.clone(),
-        context_window: profile.context_window.or(session_context_window),
-        vision: profile.vision.unwrap_or(true),
-        max_output_tokens: profile.max_output_tokens,
+        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
+        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
+        redact_thinking: profile.redact_thinking.unwrap_or(true),
     }
 }
 
@@ -3397,14 +3469,20 @@ mod device_id {
         // The active profile's table already exists (it's how the profile was selected); update its
         // `device_id` in place. Bail quietly rather than synthesize a malformed inline table if the
         // structure isn't what we expect.
-        let Some(table) = doc
+        let Some(item) = doc
             .get_mut("providers")
-            .and_then(|item| item.get_mut(profile))
-            .and_then(|item| item.as_table_mut())
+            .and_then(|providers| providers.get_mut(profile))
         else {
             return Ok(());
         };
+        let Some(table) = item.as_table_like_mut() else {
+            return Ok(());
+        };
         table.insert("device_id", toml_edit::value(id));
+        // `insert` appends, so without this the one key meka writes for itself would trail whatever
+        // the table already held. Sorting is cheap and leaves the file in the order the reference
+        // documents, which is the same thing every other writer now guarantees.
+        super::sort_profile_keys(item);
 
         write_file_atomic(path, &doc.to_string())
     }
@@ -4243,6 +4321,129 @@ type = "claude-subscription"
             device_id::resolve(Some("claude-subscription"), Some("work"), Some(&id)),
             id,
             "configured value must be used verbatim for claude-subscription"
+        );
+    }
+
+    /// Every key in [`PROFILE_KEY_ORDER`] is one [`ProviderProfile`] actually models, in order.
+    ///
+    /// `deny_unknown_fields` does the proving: a list naming a key the struct has since renamed or
+    /// dropped stops this fixture parsing. Without that, the sorter would quietly treat the real
+    /// key as unmodelled and file it last - a drift that surfaces as a diff nobody asked for rather
+    /// than as an error, which is the hardest kind to trace back.
+    ///
+    /// The fixture is also the order, written out, so the list has one readable statement of itself
+    /// that a person can check against the reference without running anything.
+    #[test]
+    fn every_canonical_key_is_one_the_profile_models() {
+        let fixture = concat!(
+            "[providers.work]\n",
+            "type = \"claude-subscription\"\n",
+            "base_url = \"https://api.anthropic.com\"\n",
+            "oauth_token_url = \"https://example.invalid/token\"\n",
+            "client_id = \"a-client\"\n",
+            "device_id = \"a-device\"\n",
+            "model = \"claude-opus-5\"\n",
+            "context_window = 200000\n",
+            "max_output_tokens = 64000\n",
+            "effort = \"high\"\n",
+            "vision = true\n",
+            "thinking = \"budgeted\"\n",
+            "thinking_budget = 32000\n",
+            "redact_thinking = true\n",
+        );
+
+        let parsed: ConfigFile =
+            toml::from_str(fixture).expect("every canonical key must be one the profile models");
+        assert!(parsed.providers.contains_key("work"));
+
+        let document: toml_edit::DocumentMut = fixture.parse().expect("parse");
+        let keys: Vec<&str> = document["providers"]["work"]
+            .as_table()
+            .expect("the profile table")
+            .iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            keys, PROFILE_KEY_ORDER,
+            "the fixture must cover the canonical list exactly, in order"
+        );
+    }
+
+    /// A scrambled profile comes back in [`PROFILE_KEY_ORDER`], with its annotations intact.
+    ///
+    /// The comments are the point, not decoration. Sorting moves whole entries, and `toml_edit`
+    /// hangs a whole-line comment off the *following* key's `leaf_decor` and a trailing one off the
+    /// value - so if either were held somewhere else, sorting would silently re-attach a user's
+    /// explanation to a different setting. That is a worse failure than the disorder it fixes,
+    /// because the file still parses and still reads as if it meant something.
+    #[test]
+    fn sorting_a_profile_orders_its_keys_and_carries_the_comments_with_them() {
+        let mut document: toml_edit::DocumentMut = concat!(
+            "[providers.work]\n",
+            "redact_thinking = false\n",
+            "\n",
+            "# the window this model really has\n",
+            "context_window = 200000\n",
+            "model = \"claude-opus-5\" # pinned deliberately\n",
+            "type = \"claude-subscription\"\n",
+        )
+        .parse()
+        .expect("parse");
+
+        let profile = document
+            .get_mut("providers")
+            .and_then(|providers| providers.get_mut("work"))
+            .expect("the profile table");
+        sort_profile_keys(profile);
+
+        let rendered = document.to_string();
+        let keys: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(key, _)| key.trim())
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "model", "context_window", "redact_thinking"],
+            "keys should follow PROFILE_KEY_ORDER: {rendered}"
+        );
+        assert!(
+            rendered.contains("# the window this model really has\ncontext_window = 200000"),
+            "the comment should still sit above the key it explains: {rendered}"
+        );
+        assert!(
+            rendered.contains("model = \"claude-opus-5\" # pinned deliberately"),
+            "a trailing comment should still sit beside its value: {rendered}"
+        );
+    }
+
+    /// A key this build does not model sorts last rather than wherever the sort left it.
+    ///
+    /// `deny_unknown_fields` means it cannot survive a load, so this pins what an unreachable case
+    /// looks like. Worth pinning anyway: the alternative is a write whose output depends on the
+    /// sort's internals, which is the kind of thing that produces a diff on a file nobody edited.
+    #[test]
+    fn an_unmodelled_profile_key_sorts_last() {
+        let mut document: toml_edit::DocumentMut =
+            "[providers.work]\nzzz_future = 1\nmodel = \"m\"\naaa_future = 2\ntype = \"t\"\n"
+                .parse()
+                .expect("parse");
+        let profile = document
+            .get_mut("providers")
+            .and_then(|providers| providers.get_mut("work"))
+            .expect("the profile table");
+        sort_profile_keys(profile);
+
+        let rendered = document.to_string();
+        let keys: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(key, _)| key.trim())
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "model", "aaa_future", "zzz_future"],
+            "{rendered}"
         );
     }
 
