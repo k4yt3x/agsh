@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `/provider` lists one profile per line with its backend, under a heading, not a comma-joined run.
+- `/status` orders its resolved-profile lines the way `[providers.<name>]` declares them.
+- Ctrl+C and the background-task notices read as annotations: `(interrupted)`, in yellow.
 - **Breaking:** `--model`, `--base-url`, `--thinking` and `--thinking-budget` are removed.
 - **Breaking:** `meka session list --long` is removed along with the columns it showed.
 - The thinking budget is per profile (`thinking_budget`), falling back to `[thinking].budget_tokens`.
@@ -64,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `[display]` blank lines now bracket everything between two prompts, including failures.
+- `newline_after_prompt = false` is no longer ignored from the second turn onward.
+- A failed turn's partial answer prints in its own turn, not under the next prompt.
+- `/skill` and `/mcp <server>:<prompt>` are spaced even when they answer without a turn.
+- An MCP progress line no longer swallows the blank line before the prompt.
+- A scheduled wake with nothing left to run no longer leaves a duplicate prompt on screen.
+- The interrupt notice no longer prints a stray blank line, or none of its blank lines at all.
 - A store a 0.44 dev build renumbered past `mcp_credentials` has the table restored on next open.
 - `provider add` wrote a negative integer for a setting above `i64::MAX`, leaving config unreadable.
 - `provider set` deleted the comment and blank line above the key it changed.

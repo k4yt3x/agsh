@@ -146,19 +146,24 @@ Print the session's resolved model parameters followed by its cumulative counter
 
 ```
 Session status
-  Model:           claude-opus-4-8
   Provider:        claude-max (claude-subscription)
+  Model:           claude-opus-4-8
+  Context:         128.4k / 1.0M (13% used, 871.6k left)
   Effort:          xhigh
   Thinking:        adaptive
   Turns:           23
-  Context:         128.4k / 1.0M (13% used, 871.6k left)
   Input tokens:    234.5k  (cache hit: 92%)
   Output tokens:   12.1k
   Redactions:      2 (12 images, ~38 MiB freed)
   Messages:        47
 ```
 
-The top block reports what the session actually resolved to: the model, the active profile and its backend, the reasoning `Effort` sent on the wire (omitted when nothing is sent, so the provider applies its own default; `claude-subscription` sends `high` when the profile sets none), and the `Thinking` mode. The rest are cumulative counters for the session.
+The top block reports what the session actually resolved to, in the order
+[`[providers.<name>]`](../configuration/config-file.md#providers) declares the same fields,
+so the two can be read side by side: the active profile and its backend (`type`), the `Model`, the
+`Context` window, the reasoning `Effort` sent on the wire (omitted when nothing is sent, so the
+provider applies its own default; `claude-subscription` sends `high` when the profile sets none),
+and the `Thinking` mode. The rest are cumulative counters for the session.
 
 `Context` is the live context-window occupancy: the total tokens of the most recent exchange (all input tiers plus output, i.e. what the next request re-sends minus your new prompt), against the active model's context window, with the percent used and tokens remaining. Use it to decide whether to `/compact` before continuing; after `/compact` it drops to the compacted size immediately. It reflects this session only; sub-agents spawned via `agent_spawn` have their own context and are not counted (a sub-agent's returned result is counted only once it lands in this session as a tool result). It is shown from the start, at `0 / <window>` before the first turn, since the window is your `context_window` setting (or the documented default) and this is where you confirm it took effect; it is omitted only when the window is unknown. Set [`display.show_context_in_prompt`](../configuration/config-file.md#displayshow_context_in_prompt) to show the same gauge in the prompt itself.
 

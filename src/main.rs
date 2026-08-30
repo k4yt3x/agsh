@@ -17,6 +17,7 @@ mod agent;
 mod background;
 mod cli;
 mod config;
+mod console;
 mod context;
 mod conversation;
 mod error;
@@ -1439,12 +1440,16 @@ fn install_interrupt_handler(agent: &Agent) {
                     }
                     let signalled = tasks.cancel_all().await;
                     if signalled > 0 {
-                        eprintln!("\nStopping {} background task(s).", signalled);
+                        render::render_annotation(&format!(
+                            "stopping {} background task{}",
+                            signalled,
+                            if signalled == 1 { "" } else { "s" }
+                        ));
                     }
                 }
                 // Leave -- but let what was already cancelled finish unwinding first.
                 _ => {
-                    eprintln!("\nInterrupted.");
+                    render::render_annotation("interrupted");
                     if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
                         .await
                         .is_err()
@@ -1529,11 +1534,24 @@ async fn run_oneshot(
     // will fail, and the agent surfaces a `cancelled` tool result, same end behavior as the
     // pre-refactor `None` approval sender.
     let (noninteractive_sender, _) = std::sync::mpsc::channel::<repl::AgentToReplEvent>();
+    // One episode for the whole run. Oneshot draws no prompt, so there is no line above to space
+    // away from and no prompt below to space towards: both blanks are configured off here rather
+    // than left to a bracket that would have nothing to bracket against. What the console still
+    // buys is the rest of it -- one owner for the streaming renderer, and the row-settling that
+    // keeps a turn's last paragraph off an MCP progress line.
+    let console = Arc::new(std::sync::Mutex::new(console::Console::new(
+        console::Spacing {
+            newline_before_prompt: false,
+            newline_after_prompt: false,
+        },
+        config.render_mode,
+    )));
+    with_console(&console, |console| {
+        console.open_episode(console::RowState::Empty)
+    });
     let oneshot_frontend: Arc<dyn frontend::Frontend> =
         Arc::new(repl::ReplFrontend::new(repl::ReplFrontendConfig {
-            render_mode: config.render_mode,
-            newline_before_prompt: config.newline_before_prompt,
-            newline_after_prompt: config.newline_after_prompt,
+            console: Arc::clone(&console),
             show_session_id_on_create: config.show_session_id_on_create,
             show_token_usage: config.show_token_usage,
             thinking_show_content: config.thinking_show_content,
@@ -1554,7 +1572,7 @@ async fn run_oneshot(
         permission: start_permission,
         repin,
         cwd: recorded_cwd,
-    } = resolve_session_resume(&session_manager, &config).await?;
+    } = resolve_session_resume(&session_manager, &config, &console).await?;
     // A resumed session reopens where it was, not where this shell is. See
     // `resume_working_directory`.
     let cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
@@ -1615,10 +1633,16 @@ async fn run_oneshot(
     {
         Ok(()) => {}
         Err(error::MekaError::Interrupted) => {
-            eprintln!("\nInterrupted.");
+            with_console(&console, |console| console.annotation("interrupted"));
         }
-        Err(error) => return Err(error.into()),
+        // Closed before returning, so a turn that streamed a partial answer and then failed still
+        // shows what it streamed. `TurnFinished` closes the happy path; nothing closed this one.
+        Err(error) => {
+            close_console_episode(&console);
+            return Err(error.into());
+        }
     }
+    close_console_episode(&console);
 
     // A one-shot run exits with the turn, so there is no later turn to deliver an outcome into.
     // Waiting here degrades a background call into a slow synchronous one, which is a worse deal
@@ -1644,7 +1668,9 @@ async fn run_oneshot(
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
                 _ = INTERRUPT_RELAY.pressed.notified() => {
-                    eprintln!("\nStopped waiting for background tasks.");
+                    with_console(&console, |console| {
+                        console.annotation("stopped waiting for background tasks")
+                    });
                 }
             }
         }
@@ -1699,6 +1725,26 @@ async fn run_interactive(
     // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
     // before the first prompt, and before the permission and cwd cells exist because a resumed
     // session brings both.
+    // Everything printed between two prompts, wherever it came from. One instance, shared by the
+    // agent's frontend, the blocking REPL thread and this loop, because the blank lines that
+    // bracket an episode follow from what the episode did rather than from which of the three
+    // happened to answer it.
+    //
+    // Built before the session is resolved because the resume banner, the replayed history and any
+    // prompt queued on the command line all belong to the episode that ends at the *first* prompt.
+    // Opening it here is what gives that episode the same brackets every later one gets.
+    let console = Arc::new(std::sync::Mutex::new(console::Console::new(
+        console::Spacing {
+            newline_before_prompt: config.newline_before_prompt,
+            newline_after_prompt: config.newline_after_prompt,
+        },
+        config.render_mode,
+    )));
+    with_console(&console, |console| {
+        console.open_episode(console::RowState::Empty)
+    });
+    let repl_console = Arc::clone(&console);
+
     let ResumedSession {
         mut session_id,
         mut messages,
@@ -1706,7 +1752,7 @@ async fn run_interactive(
         permission: start_permission,
         repin,
         cwd: recorded_cwd,
-    } = resolve_session_resume(&session_manager, &config).await?;
+    } = resolve_session_resume(&session_manager, &config, &console).await?;
 
     // Per-session working directory, shared by reference between the REPL (prompt + `/cd`) and the
     // agent (file/shell/find/grep tools + environment-context block). Process cwd is never mutated.
@@ -1727,19 +1773,22 @@ async fn run_interactive(
     if !messages.is_empty() {
         match config.resume_show_recent {
             Some(n) if n > 0 => {
-                let rendered = render::render_message_history(
+                // The replay is part of the episode that ends at the first prompt, so its blank
+                // line is that episode's closing bracket rather than a rule of its own. Announcing
+                // only when something rendered keeps the empty case (a tail of tool calls with no
+                // text) unbracketed.
+                if render::render_message_history(
                     render::last_n_turns(messages.as_slice(), n),
                     &history_render_options(&config),
-                );
-                // Match the live-turn-end convention: blank line between the rendered content and
-                // the first REPL prompt. `reprint_last_message` does the same. Skipped when the
-                // replay came to nothing (a tail of tool calls with no text), since then there is
-                // no rendered content for it to sit below.
-                if rendered && config.newline_before_prompt {
-                    eprintln!();
+                ) {
+                    with_console(&console, |console| console.announce_foreign_output());
                 }
             }
-            _ => reprint_last_message(messages.as_slice(), config.render_mode),
+            _ => {
+                if reprint_last_message(messages.as_slice(), config.render_mode) {
+                    with_console(&console, |console| console.announce_foreign_output());
+                }
+            }
         }
     }
 
@@ -1765,9 +1814,7 @@ async fn run_interactive(
     // reads from for `Done` / MCP elicitation / MCP progress events.
     let repl_frontend: Arc<dyn frontend::Frontend> =
         Arc::new(repl::ReplFrontend::new(repl::ReplFrontendConfig {
-            render_mode: config.render_mode,
-            newline_before_prompt: config.newline_before_prompt,
-            newline_after_prompt: config.newline_after_prompt,
+            console: Arc::clone(&console),
             show_session_id_on_create: config.show_session_id_on_create,
             show_token_usage: config.show_token_usage,
             thinking_show_content: config.thinking_show_content,
@@ -1842,7 +1889,13 @@ async fn run_interactive(
             .unwrap_or_default(),
     }));
     let repl_current_provider = Arc::clone(&current_provider);
-    let repl_configured_providers: Vec<String> = config.providers.keys().cloned().collect();
+    // Name and backend, so `/provider` can say what each profile *is* rather than only what it is
+    // called. `providers` is a `BTreeMap`, so this is already in name order.
+    let repl_configured_providers: Vec<(String, String)> = config
+        .providers
+        .iter()
+        .map(|(name, profile)| (name.clone(), profile.backend.clone()))
+        .collect();
 
     // A resumed session continues its lifetime `/status` totals; a fresh session (or a load
     // failure) starts empty.
@@ -1865,7 +1918,7 @@ async fn run_interactive(
         match cli_provider_registry(&config, token_store.clone(), Arc::clone(&session_stats)) {
             Ok(providers) => providers,
             Err(error) => {
-                render::render_error(&error);
+                with_console(&console, |console| console.error(&error));
                 return Err(AlreadyReported.into());
             }
         };
@@ -1874,7 +1927,7 @@ async fn run_interactive(
     if let (Some(id), Some(binding)) = (session_id, repin)
         && let Err(error) = apply_session_repin(&session_manager, &providers, id, binding).await
     {
-        render::render_error(&error);
+        with_console(&console, |console| console.error(&error));
         return Err(AlreadyReported.into());
     }
     let mut agent = match create_agent_from_config(
@@ -1896,7 +1949,7 @@ async fn run_interactive(
     {
         Ok(agent) => agent,
         Err(error) => {
-            render::render_error(&error);
+            with_console(&console, |console| console.error(&error));
             let gone = match session_id {
                 Some(id) => recorded_profile_is_gone(&session_manager, &config, id).await,
                 None => false,
@@ -1944,10 +1997,7 @@ async fn run_interactive(
             repl_wake,
             repl_current_provider,
             repl_configured_providers,
-            repl::CommandSpacing {
-                newline_after_prompt: config.newline_after_prompt,
-                newline_before_prompt: config.newline_before_prompt,
-            },
+            repl_console,
         );
     });
 
@@ -1972,6 +2022,9 @@ async fn run_interactive(
         let poll_interval = config.schedule.poll_interval;
         let schedule_enabled = config.schedule.enabled;
         let background_enabled = config.background.enabled;
+        // The watcher asks whether a wake would produce work, and part of that answer is the
+        // session's live permission resolved against this installation's enabled set.
+        let watcher_schedule_config = config.schedule.clone();
         tokio::spawn(async move {
             if !schedule_enabled && !background_enabled {
                 return;
@@ -1988,15 +2041,21 @@ async fn run_interactive(
                     continue;
                 };
                 if schedule_enabled {
-                    match session_manager
-                        .schedule_store()
-                        .list_due_scheduled_jobs(chrono::Utc::now())
-                        .await
+                    // The same question the fire door asks, as far as it can be answered without
+                    // running a gate probe. Asking the weaker "is a row due" here is what let a
+                    // parked job interrupt the prompt every `poll_interval` to run nothing.
+                    match crate::schedule::wake_would_produce_work(
+                        &session_manager,
+                        &watcher_schedule_config,
+                        current,
+                        chrono::Utc::now(),
+                    )
+                    .await
                     {
-                        Ok(due) if due.iter().any(|job| job.session_id == current) => {
+                        Ok(true) => {
                             schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(_) => {}
+                        Ok(false) => {}
                         Err(error) => tracing::warn!("scheduler watcher failed: {}", error),
                     }
                 }
@@ -2073,16 +2132,18 @@ async fn run_interactive(
                     // rather than `look_up_profile`'s, which is written for a session whose
                     // recorded profile went missing and speaks about restoring `config.toml`.
                     if !config.providers.contains_key(&name) {
-                        render::render_error(&format!(
-                            "no provider profile named '{}' (configured: {})",
-                            name,
-                            config
-                                .providers
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ));
+                        with_console(&console, |console| {
+                            console.error(&format!(
+                                "no provider profile named '{}' (configured: {})",
+                                name,
+                                config
+                                    .providers
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))
+                        });
                         break 'switch;
                     }
                     // The profile as configured. `/provider` moves the session to that bundle
@@ -2090,7 +2151,7 @@ async fn run_interactive(
                     let resolved = match resolved_binding(&providers, name.clone()).await {
                         Ok(resolved) => resolved,
                         Err(error) => {
-                            render::render_error(&error);
+                            with_console(&console, |console| console.error(&error));
                             break 'switch;
                         }
                     };
@@ -2102,12 +2163,14 @@ async fn run_interactive(
                             // No row: the session was deleted from under this process, so there is
                             // nothing to switch and the next turn will fail on its own terms.
                             Ok(false) => {
-                                render::render_error(&format!("session {} no longer exists", id));
+                                with_console(&console, |console| {
+                                    console.error(&format!("session {} no longer exists", id))
+                                });
                                 break 'switch;
                             }
                             Ok(true) => {}
                             Err(error) => {
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                                 break 'switch;
                             }
                         }
@@ -2118,7 +2181,9 @@ async fn run_interactive(
                         Ok(mut guard) => *guard = name.clone(),
                         Err(poisoned) => *poisoned.into_inner() = name.clone(),
                     }
-                    eprintln!("Provider profile set to: {}", name);
+                    with_console(&console, |console| {
+                        console.line(&format!("Provider profile set to: {}", name))
+                    });
                 }
                 if agent_event_sender
                     .send(repl::AgentToReplEvent::Done)
@@ -2180,7 +2245,7 @@ async fn run_interactive(
                     )
                     .await
                 {
-                    render::render_error(&error);
+                    with_console(&console, |console| console.error(&error));
                 }
                 let fired = fired
                     .into_inner()
@@ -2203,9 +2268,6 @@ async fn run_interactive(
                 } else {
                     Vec::new()
                 };
-                if !fired.is_empty() || !outcomes.is_empty() {
-                    eprintln!();
-                }
                 if !outcomes.is_empty() {
                     let prompt = crate::background::render_outcomes(&outcomes);
                     match run_turn_interruptible(
@@ -2219,17 +2281,11 @@ async fn run_interactive(
                     {
                         Ok(()) => {}
                         Err(error::MekaError::Interrupted) => {
-                            eprintln!("\nInterrupted.");
+                            with_console(&console, |console| console.annotation("interrupted"));
                             report_background_survivors(&agent).await;
-                            if config.newline_before_prompt {
-                                eprintln!();
-                            }
                         }
                         Err(error) => {
-                            render::render_error(&error);
-                            if config.newline_before_prompt {
-                                eprintln!();
-                            }
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                 }
@@ -2246,17 +2302,11 @@ async fn run_interactive(
                     {
                         Ok(()) => {}
                         Err(error::MekaError::Interrupted) => {
-                            eprintln!("\nInterrupted.");
+                            with_console(&console, |console| console.annotation("interrupted"));
                             report_background_survivors(&agent).await;
-                            if config.newline_before_prompt {
-                                eprintln!();
-                            }
                         }
                         Err(error) => {
-                            render::render_error(&error);
-                            if config.newline_before_prompt {
-                                eprintln!();
-                            }
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                 }
@@ -2279,17 +2329,11 @@ async fn run_interactive(
                 {
                     Ok(()) => {}
                     Err(error::MekaError::Interrupted) => {
-                        eprintln!("\nInterrupted.");
+                        with_console(&console, |console| console.annotation("interrupted"));
                         report_background_survivors(&agent).await;
-                        if config.newline_before_prompt {
-                            eprintln!();
-                        }
                     }
                     Err(error) => {
-                        render::render_error(&error);
-                        if config.newline_before_prompt {
-                            eprintln!();
-                        }
+                        with_console(&console, |console| console.error(&error));
                     }
                 }
 
@@ -2301,18 +2345,22 @@ async fn run_interactive(
                 }
             }
             ReplEvent::Command(command) => {
-                // Bracket a command's output with the same blank lines the REPL puts around a
-                // turn, so `[display]` spacing means one thing whether the line the user typed was
-                // a prompt or a slash command. `/history` used to do this for itself; everything
-                // else printed flush against the prompt above and the prompt below. The commands
-                // this thread does not handle are bracketed in `repl::run_repl` instead.
-                let spaced_by_its_turn = command.answers_by_running_a_turn();
-                if !spaced_by_its_turn && config.newline_after_prompt {
-                    eprintln!();
-                }
+                // Every command answered here says something, even if only that a list is empty,
+                // and much of it prints through the `cli` modules the console cannot see. One
+                // announcement covers all of them.
+                //
+                // There is deliberately no "does this one answer by running a turn" exception any
+                // more. Announcing is idempotent within an episode -- the opening blank is spent
+                // once, by whichever writer gets there first -- so a command that runs a turn is
+                // spaced identically whether the turn happens or it bails first. The predicate
+                // that used to make that distinction is what left `/skill nosuchskill` printing
+                // its error flush against both the line above and the prompt below.
+                with_console(&console, |console| console.announce_foreign_output());
                 match command {
                     repl::SlashCommand::Session => match &session_id {
-                        Some(id) => render::render_session_id("Current session", &id.to_string()),
+                        Some(id) => with_console(&console, |console| {
+                            console.session_id("Current session", &id.to_string())
+                        }),
                         None => eprintln!("No active session yet."),
                     },
                     repl::SlashCommand::Compact(instructions) => {
@@ -2329,10 +2377,12 @@ async fn run_interactive(
                             .await
                         {
                             Ok(outcome) => {
-                                render::render_hint(&render::compaction_summary(&outcome));
+                                with_console(&console, |console| {
+                                    console.hint(&render::compaction_summary(&outcome))
+                                });
                             }
                             Err(error) => {
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                             }
                         }
                     }
@@ -2353,21 +2403,25 @@ async fn run_interactive(
                                     // disagreeing, which would resurrect them on the next resume
                                     // and make the rewind look like it silently un-did itself.
                                     messages.pop_repair();
-                                    render::render_error(&error);
+                                    with_console(&console, |console| console.error(&error));
                                 } else {
                                     agent.reset_conversation_markers().await;
-                                    render::render_hint(&format!(
-                                        "Rewound {} turn(s). The model no longer sees them; \
+                                    with_console(&console, |console| {
+                                        console.hint(&format!(
+                                            "Rewound {} turn(s). The model no longer sees them; \
                                          `meka session export` still does.",
-                                        turns,
-                                    ));
+                                            turns,
+                                        ))
+                                    });
                                 }
                             }
                             // No session means nothing was ever persisted, so the in-memory rewind
                             // (which did happen) is the whole story.
                             (None, Some(_)) => {
                                 agent.reset_conversation_markers().await;
-                                render::render_hint(&format!("Rewound {} turn(s).", turns));
+                                with_console(&console, |console| {
+                                    console.hint(&format!("Rewound {} turn(s).", turns))
+                                });
                             }
                             (_, None) if turns == 0 => {
                                 eprintln!(
@@ -2406,7 +2460,9 @@ async fn run_interactive(
                                     eprintln!("Exported session to {}", shown.display());
                                 }
                                 Ok(None) => {}
-                                Err(error) => render::render_error(&error),
+                                Err(error) => {
+                                    with_console(&console, |console| console.error(&error))
+                                }
                             }
                         }
                         None => eprintln!("No active session to export."),
@@ -2423,14 +2479,18 @@ async fn run_interactive(
                                 session_id = Some(id);
                                 // `messages` is deliberately untouched, so the branch happens at
                                 // the current head and the next turn continues in the copy.
-                                render::render_session_id("Forked session", &id.to_string());
+                                with_console(&console, |console| {
+                                    console.session_id("Forked session", &id.to_string())
+                                });
                             }
                             Ok(crate::session::cli::ForkHandoff::LockFailed { id, error }) => {
-                                render::render_error(&error);
-                                render::render_hint(&format!(
-                                    "Staying in the original. The copy exists: {}",
-                                    id
-                                ));
+                                with_console(&console, |console| console.error(&error));
+                                with_console(&console, |console| {
+                                    console.hint(&format!(
+                                        "Staying in the original. The copy exists: {}",
+                                        id
+                                    ))
+                                });
                             }
                             Ok(crate::session::cli::ForkHandoff::SourceGone) => {
                                 eprintln!("Session no longer exists: {}", id);
@@ -2447,7 +2507,7 @@ async fn run_interactive(
                         )
                         .await
                         {
-                            render::render_error(&error);
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                     // These three report success at `info!` and print nothing, which is right for
@@ -2463,21 +2523,21 @@ async fn run_interactive(
                             // "Connected", not "Reconnected": this is a smoke test on a throwaway
                             // client, and the session's own connection to that server is untouched.
                             Ok(()) => eprintln!("Connected to '{}'.", server),
-                            Err(error) => render::render_error(&error),
+                            Err(error) => with_console(&console, |console| console.error(&error)),
                         }
                     }
                     repl::SlashCommand::McpLogin { server } => {
                         match mcp::cli::run_login(&config.mcp_servers, &token_store, &server).await
                         {
                             Ok(()) => eprintln!("Authorized '{}'.", server),
-                            Err(error) => render::render_error(&error),
+                            Err(error) => with_console(&console, |console| console.error(&error)),
                         }
                     }
                     repl::SlashCommand::McpLogout { server } => {
                         match mcp::cli::run_logout(&config.mcp_servers, &token_store, &server).await
                         {
                             Ok(()) => eprintln!("Cleared credentials for '{}'.", server),
-                            Err(error) => render::render_error(&error),
+                            Err(error) => with_console(&console, |console| console.error(&error)),
                         }
                     }
                     repl::SlashCommand::McpPrompt {
@@ -2519,7 +2579,7 @@ async fn run_interactive(
                             Err(error) => {
                                 // The `McpConnection` error already names the server and the
                                 // operation, so wrapping it here would say both twice.
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                                 Vec::new()
                             }
                         };
@@ -2581,14 +2641,18 @@ async fn run_interactive(
                                     {
                                         Ok(()) => {}
                                         Err(error::MekaError::Interrupted) => {
-                                            eprintln!("\nInterrupted.");
+                                            with_console(&console, |console| {
+                                                console.annotation("interrupted")
+                                            });
                                         }
-                                        Err(error) => render::render_error(&error),
+                                        Err(error) => {
+                                            with_console(&console, |console| console.error(&error))
+                                        }
                                     }
                                 }
                             }
                             Err(error) => {
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                             }
                         }
                     }
@@ -2599,14 +2663,14 @@ async fn run_interactive(
                         )
                         .await
                         {
-                            render::render_error(&error);
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                     repl::SlashCommand::MemoryShow { name } => {
                         if let Err(error) =
                             memory::cli::run_show(&session_manager.memory_store(true), &name).await
                         {
-                            render::render_error(&error);
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                     // Scoped to the session in the REPL, unlike `meka schedule list`, which has no
@@ -2620,7 +2684,7 @@ async fn run_interactive(
                             )
                             .await
                             {
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                             }
                         }
                         None => eprintln!("No active session yet."),
@@ -2641,7 +2705,9 @@ async fn run_interactive(
                                 Ok(None) => {
                                     eprintln!("No scheduled job matching '{}'.", id);
                                 }
-                                Err(error) => render::render_error(&error),
+                                Err(error) => {
+                                    with_console(&console, |console| console.error(&error))
+                                }
                             }
                         }
                         None => eprintln!("No active session yet."),
@@ -2652,7 +2718,7 @@ async fn run_interactive(
                                 crate::background::cli::run_list_for_session(&session_manager, id)
                                     .await
                             {
-                                render::render_error(&error);
+                                with_console(&console, |console| console.error(&error));
                             }
                         }
                         None => eprintln!("No active session yet."),
@@ -2678,7 +2744,9 @@ async fn run_interactive(
                                     }
                                     eprintln!("Cancelling {} background task(s).", cancelled.len());
                                 }
-                                Err(error) => render::render_error(&error),
+                                Err(error) => {
+                                    with_console(&console, |console| console.error(&error))
+                                }
                             }
                         }
                         None => eprintln!("No active session yet."),
@@ -2687,7 +2755,7 @@ async fn run_interactive(
                         if let Err(error) =
                             skills::cli::run_list(&config.skill_roots(), false).await
                         {
-                            render::render_error(&error);
+                            with_console(&console, |console| console.error(&error));
                         }
                     }
                     repl::SlashCommand::SkillInvoke { name, extra } => 'invoke: {
@@ -2719,16 +2787,18 @@ async fn run_interactive(
                                         .join(", ")
                                 ),
                             };
-                            render::render_error(&message);
+                            with_console(&console, |console| console.error(&message));
                             break 'invoke;
                         };
                         let body = match skills::load_skill_body(skill).await {
                             Ok(body) => body,
                             Err(error) => {
-                                render::render_error(&format!(
-                                    "failed to load skill '{}': {}",
-                                    name, error
-                                ));
+                                with_console(&console, |console| {
+                                    console.error(&format!(
+                                        "failed to load skill '{}': {}",
+                                        name, error
+                                    ))
+                                });
                                 break 'invoke;
                             }
                         };
@@ -2752,9 +2822,9 @@ async fn run_interactive(
                         {
                             Ok(()) => {}
                             Err(error::MekaError::Interrupted) => {
-                                eprintln!("\nInterrupted.");
+                                with_console(&console, |console| console.annotation("interrupted"));
                             }
-                            Err(error) => render::render_error(&error),
+                            Err(error) => with_console(&console, |console| console.error(&error)),
                         }
                     }
                     repl::SlashCommand::Status => {
@@ -2792,10 +2862,10 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Usage => match agent.fetch_usage().await {
                         Ok(Some(usage)) => render::render_account_usage(&usage),
-                        Ok(None) => {
-                            render::render_hint("Account usage isn't available for this provider.")
-                        }
-                        Err(error) => render::render_error(&error),
+                        Ok(None) => with_console(&console, |console| {
+                            console.hint("Account usage isn't available for this provider.")
+                        }),
+                        Err(error) => with_console(&console, |console| console.error(&error)),
                     },
                     repl::SlashCommand::History(limit) => {
                         let materialised = messages.as_slice();
@@ -2819,9 +2889,6 @@ async fn run_interactive(
                         }
                     }
                     _ => {}
-                }
-                if !spaced_by_its_turn && config.newline_before_prompt {
-                    eprintln!();
                 }
 
                 if agent_event_sender
@@ -2850,8 +2917,13 @@ async fn run_interactive(
     if let Some(id) = session_id
         && config.show_session_id_on_exit
     {
-        render::render_session_id("Leaving session", &id.to_string());
+        with_console(&console, |console| {
+            console.session_id("Leaving session", &id.to_string())
+        });
     }
+    // The last episode has no prompt after it, but closing it is still what settles the row and
+    // flushes anything a turn left open. Nothing else runs after this.
+    close_console_episode(&console);
     // Emptied after the "Leaving session" message so the lock is held until the very end; the OS
     // releases the underlying flock when the FD closes. Emptied rather than dropped: the slot is
     // shared with the agent, which is still alive here, so letting this handle fall out of scope
@@ -2869,7 +2941,16 @@ async fn run_interactive(
     // what this makes true.
     let stopped = agent.background_tasks().cancel_all().await;
     if stopped > 0 {
-        eprintln!("Stopping {} background task(s)...", stopped);
+        with_console(&console, |console| {
+            console.annotation(&format!(
+                "stopping {} background task{}",
+                stopped,
+                if stopped == 1 { "" } else { "s" }
+            ))
+        });
+        // The shutdown notice is the last thing the terminal sees, so it gets the same closing
+        // treatment as everything else. Closing twice is free.
+        close_console_episode(&console);
         // Waited for, not just signalled. `run_on_runtime` returns into `shutdown_background`
         // immediately after this, which drops every task where it stands: a task parked at an
         // await is never polled again, so it runs neither `kill_child_tree` nor
@@ -3416,16 +3497,16 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
     }
 }
 
-fn reprint_last_message(messages: &[provider::Message], render_mode: render::RenderMode) {
+fn reprint_last_message(messages: &[provider::Message], render_mode: render::RenderMode) -> bool {
     let Some(last) = messages.last() else {
-        return;
+        return false;
     };
 
     let text = match last.role {
         provider::Role::Assistant => {
             let text = last.text_content();
             if text.is_empty() {
-                return;
+                return false;
             }
             text
         }
@@ -3433,7 +3514,7 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
             let raw = last.text_content();
             let stripped = session::strip_context_tags(&raw);
             if stripped.is_empty() {
-                return;
+                return false;
             }
             stripped.to_string()
         }
@@ -3446,7 +3527,27 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
     if let Err(error) = renderer.finish() {
         tracing::debug!("failed to finish rendering last message: {}", error);
     }
-    eprintln!();
+    true
+}
+
+/// Borrow the shared console for one synchronous run of writes.
+///
+/// A poisoned lock is recovered from rather than propagated: the console holds the terminal's
+/// layout, and losing that is a worse outcome than continuing from a state one panicking writer may
+/// have left mid-transition. No `.await` may appear inside `act` -- `clippy::await_holding_lock` is
+/// deny-level and would catch it, but the reason is that the agent's frontend writes through the
+/// same lock.
+fn with_console<T>(
+    console: &std::sync::Mutex<console::Console>,
+    act: impl FnOnce(&mut console::Console) -> T,
+) -> T {
+    act(&mut console
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
+fn close_console_episode(console: &std::sync::Mutex<console::Console>) {
+    with_console(console, |console| console.close_episode());
 }
 
 /// Move a lock into the slot the agent and its host share, replacing whatever was there.
@@ -3496,6 +3597,7 @@ struct ResumedSession {
 async fn resolve_session_resume(
     session_manager: &SessionManager,
     config: &ResolvedConfig,
+    console: &std::sync::Mutex<console::Console>,
 ) -> anyhow::Result<ResumedSession> {
     let fresh = || ResumedSession {
         session_id: None,
@@ -3595,10 +3697,9 @@ async fn resolve_session_resume(
         );
     }
 
-    render::render_session_id("Continuing session", &id.to_string());
-    if config.newline_after_prompt {
-        eprintln!();
-    }
+    with_console(console, |console| {
+        console.session_id("Continuing session", &id.to_string())
+    });
     let messages = load_session_messages(session_manager, id).await?;
     Ok(ResumedSession {
         session_id: Some(id),

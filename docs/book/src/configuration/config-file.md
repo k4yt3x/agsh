@@ -615,16 +615,23 @@ Whether to add a blank line after the line you typed, before its output.
 
 Default: `true`
 
-Both apply to **anything printed between two prompts**, not only agent responses: a slash command's
-output (`/tasks`, `/memory`, `/help`, …) is bracketed the same way a turn is. A command that answers
-by running a turn, such as `/skill <name>`, is spaced once by the turn rather than twice.
+Both apply to **anything printed between two prompts**, not only agent responses. That span is the
+unit, whatever filled it: a turn, a slash command's output (`/tasks`, `/memory`, `/help`, …), an
+error, a scheduled job waking the shell to run several turns at once, or any combination. It is
+bracketed once, by whichever of those printed first and last — never once per turn inside it, and
+never twice because two things both thought they owned the spacing.
 
-The blank lines bracket output, so a command that prints nothing gets neither. In practice every
-slash command says something, even if only that a list is empty, so there is always something to
-bracket. Two exceptions: a successful `/cd` prints nothing at all, because the prompt itself is the
-confirmation, and gets no blank lines either; `!command` is always bracketed, because meka hands the
-terminal to the child process and never learns whether it wrote anything, so a silent `!touch file`
-still gets its blank lines.
+The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
+screen exactly as it found it. In practice every slash command says something, even if only that a
+list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,
+because the prompt itself is the confirmation; a successful `/clear`, because the cleared screen is;
+and a scheduled wake that finds nothing left to run. `!command` is the one exception in the other
+direction — it is always bracketed, because meka hands the terminal to the child process and never
+learns whether it wrote anything, so a silent `!touch file` still gets its blank lines.
+
+Turning a setting off removes that blank line and nothing else. The spacing *between* blocks of a
+single response — a tool indicator and the answer that follows it, or a thinking block and the text
+after it — is not controlled by either flag and does not change.
 
 ### `display.show_token_usage`
 

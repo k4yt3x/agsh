@@ -23,7 +23,7 @@ use crate::{
     frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
     permission::{EnabledPermissions, SharedPermission},
     relay::RELAY,
-    render::{self, OutputSpacing, RenderMode, StreamingRenderer},
+    render::{self},
 };
 
 /// A top-level REPL slash command, used to drive both `print_help` and the Tab completer so the
@@ -1036,54 +1036,32 @@ fn print_help() {
     eprintln!("  Ctrl+D        Exit the shell");
 }
 
-/// The `[display]` blank lines that bracket anything printed between two prompts.
+/// Borrow the shared console for one synchronous run of writes.
 ///
-/// Carried rather than read from a global because the REPL thread and the agent loop each answer a
-/// different half of the slash commands, and both have to space their output the same way for the
-/// setting to mean anything.
-///
-/// The blanks bracket *output*, so a command that prints nothing gets neither: two blank lines
-/// around an empty region is a gap the user has to work out the meaning of, and the meaning is
-/// "nothing happened". The rule that keeps this simple is that a REPL command always says
-/// something, even if only that a list is empty, so the brackets always have content. Two
-/// exceptions: a successful `/cd` says nothing because the prompt itself changes, and it is
-/// therefore not spaced; `!command` is spaced unconditionally because the child owns the terminal
-/// from the moment it starts and meka never learns whether it wrote anything.
-#[derive(Clone, Copy)]
-pub struct CommandSpacing {
-    pub newline_after_prompt: bool,
-    pub newline_before_prompt: bool,
+/// A poisoned lock is recovered from rather than propagated: the console holds spacing state, and
+/// losing the terminal's layout is a worse outcome than continuing from a state one panicking
+/// writer may have left mid-transition.
+fn with_console<T>(
+    console: &Mutex<crate::console::Console>,
+    act: impl FnOnce(&mut crate::console::Console) -> T,
+) -> T {
+    let mut guard = console
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    act(&mut guard)
 }
 
-impl SlashCommand {
-    /// Whether this command answers by running an agent turn.
-    ///
-    /// Such a command's output is already bracketed by `TurnStarted` / `TurnFinished` in the REPL
-    /// frontend, so the command dispatcher must not bracket it again or every blank line doubles.
-    /// Both can also bail before the turn starts (an unknown skill, a server that will not render
-    /// its prompt), in which case the error prints unspaced: terse enough not to be worth the
-    /// plumbing that telling the two cases apart would take.
-    pub fn answers_by_running_a_turn(&self) -> bool {
-        matches!(
-            self,
-            SlashCommand::McpPrompt { .. } | SlashCommand::SkillInvoke { .. }
-        )
-    }
-}
-
-impl CommandSpacing {
-    /// Blank line between the line the user typed and whatever the command prints.
-    fn after_prompt(self) {
-        if self.newline_after_prompt {
-            eprintln!();
-        }
-    }
-
-    /// Blank line between a command's output and the next prompt.
-    fn before_prompt(self) {
-        if self.newline_before_prompt {
-            eprintln!();
-        }
+/// What reedline left on the row it was drawing the prompt on.
+///
+/// It writes a CRLF on its way out of `read_line`, but only when it is genuinely exiting: the guard
+/// is `suspended_state.is_none()`, and the external-break path sets `suspended_state` precisely
+/// because the host is expected to print and come back. So a scheduler wake returns with the drawn
+/// prompt still on the row and the cursor at the end of it, and every other signal returns at
+/// column zero.
+fn row_after(signal: &Result<Signal, std::io::Error>) -> crate::console::RowState {
+    match signal {
+        Ok(Signal::ExternalBreak(_)) => crate::console::RowState::PromptParked,
+        _ => crate::console::RowState::Empty,
     }
 }
 
@@ -1119,12 +1097,14 @@ pub fn run_repl(
     // because the agent side changes it; the second is a snapshot because `config.toml` is
     // read once.
     current_provider: Arc<std::sync::RwLock<String>>,
-    configured_providers: Vec<String>,
-    // `[display]` blank-line spacing, for the commands this thread answers itself. The ones it
-    // forwards are bracketed by the agent loop, and a turn's own output by `TurnStarted` /
-    // `TurnFinished`; all three read the same two config values so the setting means one thing
-    // wherever the output came from.
-    spacing: CommandSpacing,
+    // Every configured profile as `(name, backend)`, in name order. The backend is what makes the
+    // listing worth reading once a user has more than a handful: the names are theirs and say
+    // nothing about which wire protocol each one speaks.
+    configured_providers: Vec<(String, String)>,
+    // Everything printed between two prompts, whichever side printed it. Shared with the agent's
+    // frontend rather than duplicated, because the blanks that bracket an episode are decided by
+    // what the *episode* did and not by which thread happened to answer.
+    console: Arc<Mutex<crate::console::Console>>,
 ) {
     // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
     // `read_line()`. From this point on, log lines (including async MCP-connect warnings that fire
@@ -1171,7 +1151,10 @@ pub fn run_repl(
     let completer = SlashCompleter {
         mcp_server_names,
         skill_names,
-        provider_names: configured_providers.clone(),
+        provider_names: configured_providers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect(),
         cwd: cwd.clone(),
     };
 
@@ -1203,7 +1186,7 @@ pub fn run_repl(
     // If the caller queued a synthetic first turn (e.g. `--skill` or a bare positional `[PROMPT]`
     // in interactive mode), drain agent events for that turn before drawing the first reedline
     // prompt. Otherwise the prompt indicator and the agent's stdout output collide on screen.
-    if initial_turn_pending && !wait_for_agent(&agent_event_receiver) {
+    if initial_turn_pending && !wait_for_agent(&agent_event_receiver, &console) {
         return;
     }
 
@@ -1216,9 +1199,13 @@ pub fn run_repl(
         // per prompt is the right cadence for the stat pass, and it happens while the user has not
         // started typing; the parse behind it only runs when the stats have moved.
         refresh_skill_names();
+        // The one place an episode can end, which is what makes the bracket impossible to skip: no
+        // `continue`, `break` or dispatch arm below reaches the next prompt without passing here.
+        with_console(&console, |console| console.close_episode());
         RELAY.set_at_prompt(true);
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
+        with_console(&console, |console| console.open_episode(row_after(&signal)));
         // Every exit lowers it, not just a submitted line: a Ctrl+C or a scheduler wake leaves the
         // buffer to be edited further, and it must go back to being edited plainly.
         submitted.store(false, Ordering::Relaxed);
@@ -1235,7 +1222,7 @@ pub fn run_repl(
                 if input_sender.send(ReplEvent::Wake).is_err() {
                     break;
                 }
-                if !wait_for_agent(&agent_event_receiver) {
+                if !wait_for_agent(&agent_event_receiver, &console) {
                     break;
                 }
                 // Nothing to restore: reedline hands back a *copy* of the line editor's contents
@@ -1260,9 +1247,7 @@ pub fn run_repl(
                             break;
                         }
                         Some(SlashCommand::Help) => {
-                            spacing.after_prompt();
-                            print_help();
-                            spacing.before_prompt();
+                            with_console(&console, |console| console.chrome(print_help));
                             continue;
                         }
                         Some(SlashCommand::Clear) => {
@@ -1273,25 +1258,50 @@ pub fn run_repl(
                             )
                             .is_err()
                             {
-                                eprintln!("Failed to clear terminal.");
+                                with_console(&console, |console| {
+                                    console.line("Failed to clear terminal.")
+                                });
                             }
                             continue;
                         }
                         Some(SlashCommand::Provider(argument)) => {
-                            spacing.after_prompt();
                             match argument {
                                 None => {
                                     let current = current_provider
                                         .read()
                                         .map(|guard| guard.clone())
                                         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-                                    eprintln!("Current provider profile: {}", current);
-                                    if !configured_providers.is_empty() {
-                                        eprintln!(
-                                            "Configured: {}",
-                                            configured_providers.join(", ")
-                                        );
-                                    }
+                                    // One profile per line rather than a comma-joined run of
+                                    // names. The list grows with every account and endpoint a
+                                    // user adds, and a single line stops fitting long before it
+                                    // stops being worth reading. The `name (backend)` shape is
+                                    // the one `/status` already uses for the same pair.
+                                    //
+                                    // The profile this session runs on first, then every profile
+                                    // there is. One per line rather than a comma-joined run of
+                                    // names: the list grows with every account and endpoint a user
+                                    // adds, and a single line stops fitting long before it stops
+                                    // being worth reading. Both the `name (backend)` shape and the
+                                    // heading are `/status`'s, so the two commands read alike.
+                                    //
+                                    // Deliberately not called "available". This is what
+                                    // `config.toml` holds, and says nothing about whether each
+                                    // profile has a credential to go with it; `meka provider list`
+                                    // answers that, and promising it here would list a profile
+                                    // that has never been logged into as ready to use.
+                                    with_console(&console, |console| {
+                                        console.line(&format!(
+                                            "Current provider profile: {}",
+                                            current
+                                        ));
+                                        if !configured_providers.is_empty() {
+                                            console.line("");
+                                            console.heading("Configured profiles");
+                                            for (name, backend) in &configured_providers {
+                                                console.line(&format!("- {} ({})", name, backend));
+                                            }
+                                        }
+                                    });
                                 }
                                 Some(name) => {
                                     let name = name.trim().to_string();
@@ -1305,34 +1315,39 @@ pub fn run_repl(
                                         // runs on is only moved on the agent's side, so a debug
                                         // log here left the user looking at a prompt that had
                                         // silently declined to do the one thing they asked for.
-                                        render::render_error(
-                                            &"the agent stopped; the provider was not changed",
-                                        );
+                                        with_console(&console, |console| {
+                                            console.error(
+                                                &"the agent stopped; the provider was not changed",
+                                            )
+                                        });
                                         break;
-                                    } else if !wait_for_agent(&agent_event_receiver) {
+                                    } else if !wait_for_agent(&agent_event_receiver, &console) {
                                         break;
                                     }
                                 }
                             }
-                            spacing.before_prompt();
                             continue;
                         }
                         Some(SlashCommand::Permission(argument)) => {
-                            spacing.after_prompt();
                             match argument {
                                 None => {
                                     let current = shared_permission.get();
-                                    eprintln!("Current permission level: {}", current);
+                                    with_console(&console, |console| {
+                                        console
+                                            .line(&format!("Current permission level: {}", current))
+                                    });
                                 }
                                 Some(level) => {
                                     match level.parse::<crate::permission::Permission>() {
                                         Ok(permission) => {
                                             match shared_permission.try_set(permission) {
                                                 Ok(()) => {
-                                                    eprintln!(
-                                                        "Permission level set to: {}",
-                                                        permission
-                                                    );
+                                                    with_console(&console, |console| {
+                                                        console.line(&format!(
+                                                            "Permission level set to: {}",
+                                                            permission
+                                                        ))
+                                                    });
                                                     // Persisted for the same reason as the
                                                     // Shift+Tab path above.
                                                     if input_sender
@@ -1348,21 +1363,25 @@ pub fn run_repl(
                                                     }
                                                 }
                                                 Err(_) => {
-                                                    render::render_error(&format!(
-                                                        "'{}' is disabled in this config (enabled: {})",
-                                                        permission,
-                                                        format_enabled(shared_permission.enabled()),
-                                                    ));
+                                                    with_console(&console, |console| {
+                                                        console.error(&format!(
+                                                            "'{}' is disabled in this config \
+                                                             (enabled: {})",
+                                                            permission,
+                                                            format_enabled(
+                                                                shared_permission.enabled()
+                                                            ),
+                                                        ))
+                                                    });
                                                 }
                                             }
                                         }
                                         Err(error) => {
-                                            render::render_error(&error);
+                                            with_console(&console, |console| console.error(&error));
                                         }
                                     }
                                 }
                             }
-                            spacing.before_prompt();
                             continue;
                         }
                         Some(SlashCommand::Cd(argument)) => {
@@ -1379,9 +1398,7 @@ pub fn run_repl(
                                     }
                                 }
                                 Err(message) => {
-                                    spacing.after_prompt();
-                                    eprintln!("{}", message);
-                                    spacing.before_prompt();
+                                    with_console(&console, |console| console.line(&message));
                                 }
                             }
                             continue;
@@ -1412,18 +1429,18 @@ pub fn run_repl(
                             if input_sender.send(ReplEvent::Command(command)).is_err() {
                                 break;
                             }
-                            if !wait_for_agent(&agent_event_receiver) {
+                            if !wait_for_agent(&agent_event_receiver, &console) {
                                 break;
                             }
                             continue;
                         }
                         None => {
-                            spacing.after_prompt();
-                            eprintln!(
-                                "Unknown command: {}. Type /help for available commands.",
-                                trimmed
-                            );
-                            spacing.before_prompt();
+                            with_console(&console, |console| {
+                                console.line(&format!(
+                                    "Unknown command: {}. Type /help for available commands.",
+                                    trimmed
+                                ))
+                            });
                             continue;
                         }
                     }
@@ -1446,7 +1463,7 @@ pub fn run_repl(
                     // from here and meka never learns whether it wrote anything: a silent
                     // `!touch foo` gets brackets around nothing, and the alternative is capturing
                     // the child's output, which would break every interactive `!` command.
-                    spacing.after_prompt();
+                    with_console(&console, |console| console.announce_foreign_output());
                     // Run in the session's working directory so `!` commands track `/cd`. `/cd`
                     // updates the `SharedCwd` (not the process cwd), so without this `!pwd` would
                     // report the original launch directory.
@@ -1469,14 +1486,17 @@ pub fn run_repl(
                             if !exit_status.success()
                                 && let Some(code) = exit_status.code()
                             {
-                                eprintln!("Command exited with status {}", code);
+                                with_console(&console, |console| {
+                                    console.line(&format!("Command exited with status {}", code))
+                                });
                             }
                         }
                         Err(error) => {
-                            eprintln!("Failed to execute command: {}", error);
+                            with_console(&console, |console| {
+                                console.line(&format!("Failed to execute command: {}", error))
+                            });
                         }
                     }
-                    spacing.before_prompt();
                     continue;
                 }
 
@@ -1487,7 +1507,7 @@ pub fn run_repl(
                     break;
                 }
 
-                if !wait_for_agent(&agent_event_receiver) {
+                if !wait_for_agent(&agent_event_receiver, &console) {
                     break;
                 }
             }
@@ -1536,21 +1556,26 @@ pub fn run_repl(
 /// `/provider` and `/session` and answers neither: everything those commands do happens on the
 /// agent's side of this channel, so without a word here the user is left typing into something that
 /// ignores them.
-fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>) -> bool {
+fn wait_for_agent(
+    agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>,
+    console: &Mutex<crate::console::Console>,
+) -> bool {
     loop {
         match agent_event_receiver.recv() {
             Ok(AgentToReplEvent::Done) => return true,
             Ok(AgentToReplEvent::ApprovalRequest(request)) => {
-                handle_approval_request(request);
+                handle_approval_request(request, console);
             }
             Ok(AgentToReplEvent::McpElicitation { prompt, responder }) => {
-                handle_elicitation_prompt(prompt, responder);
+                handle_elicitation_prompt(prompt, responder, console);
             }
             Ok(AgentToReplEvent::McpProgress(update)) => {
-                render_progress_update(&update);
+                render_progress_update(&update, console);
             }
             Err(_) => {
-                render::render_error(&"the agent stopped; leaving the shell");
+                with_console(console, |console| {
+                    console.error(&"the agent stopped; leaving the shell")
+                });
                 return false;
             }
         }
@@ -1558,11 +1583,30 @@ fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEv
 }
 
 /// One-line status overwrite on stderr for a running MCP tool.
-fn render_progress_update(update: &crate::mcp::progress::ProgressUpdate) {
+///
+/// Drawn through the console as a transient row, because it is: the line carries no newline and the
+/// text is the server's, so the next thing meka prints has to replace it rather than continue it.
+/// Before the console tracked that, whatever printed next spent its own blank line terminating this
+/// row -- most visibly the blank before the prompt, at the end of a turn whose last act was an MCP
+/// call.
+fn render_progress_update(
+    update: &crate::mcp::progress::ProgressUpdate,
+    console: &Mutex<crate::console::Console>,
+) {
     let line = format_progress_update(update);
-    eprint!("{}", line);
-    use std::io::Write;
-    let _ = std::io::stderr().flush();
+    with_console(console, |console| {
+        console.transient(|| {
+            eprint!("{}", line);
+            use std::io::Write;
+            match std::io::stderr().flush() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!("failed to flush the MCP progress line: {}", error);
+                    false
+                }
+            }
+        })
+    });
 }
 
 /// Format a progress line. Sanitises server-controlled strings so an MCP server can't inject ANSI
@@ -1612,7 +1656,13 @@ fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> Stri
 fn handle_elicitation_prompt(
     prompt: crate::mcp::elicitation::ElicitationPrompt,
     responder: tokio::sync::oneshot::Sender<crate::mcp::elicitation::ElicitationResponse>,
+    console: &Mutex<crate::console::Console>,
 ) {
+    // Announced like the approval prompt, so the row a server's progress line parked the cursor on
+    // is settled before meka's own chrome starts. Without it the form's first line continued that
+    // row, which is the forgery `render::begin_own_line` exists to prevent, and the elicitation
+    // prompt was the one door that never called it.
+    with_console(console, |console| console.announce_foreign_output());
     // Same reason the approval prompt drains: `read_line` reads a buffer the tty has been filling
     // throughout the turn, so a line the user typed in answer to something else -- or to a prompt a
     // server forged -- would be consumed the instant this one is drawn. The approval prompt got
@@ -1961,7 +2011,7 @@ fn drain_pending_stdin() {
 #[cfg(not(any(unix, windows)))]
 fn drain_pending_stdin() {}
 
-fn handle_approval_request(request: ToolApprovalRequest) {
+fn handle_approval_request(request: ToolApprovalRequest, console: &Mutex<crate::console::Console>) {
     use crossterm::style::Stylize;
 
     // Discard anything typed before the prompt was drawn. `read_line` below reads from a buffer the
@@ -1973,9 +2023,10 @@ fn handle_approval_request(request: ToolApprovalRequest) {
     drain_pending_stdin();
 
     // An MCP progress line parks the cursor mid-row with no newline, and its text comes from the
-    // server. Without this the prompt's first line continues that row, so `[ask] Shell` reads as
-    // the tail of a string meka does not control -- at the one prompt where that matters most.
-    crate::render::begin_own_line();
+    // server. Without settling the row first the prompt's first line continues it, so `[ask] Shell`
+    // reads as the tail of a string meka does not control -- at the one prompt where that matters
+    // most. The console owns that rule now, for every writer rather than the two that remembered.
+    with_console(console, |console| console.announce_foreign_output());
     for line in approval_prompt_lines(
         &request.tool_name,
         &request.input,
@@ -2084,9 +2135,10 @@ fn handle_cd(
 /// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
 /// `AgentOptions`; they are UI concerns and now belong to the frontend impl.
 pub struct ReplFrontendConfig {
-    pub render_mode: RenderMode,
-    pub newline_before_prompt: bool,
-    pub newline_after_prompt: bool,
+    /// Where everything printed between two prompts goes, shared with the REPL thread and the host
+    /// loop. The frontend decides *what* to say and the console decides how it is spaced, which is
+    /// what stops a turn's blank lines from being a different mechanism to a slash command's.
+    pub console: Arc<Mutex<crate::console::Console>>,
     pub show_session_id_on_create: bool,
     pub show_token_usage: bool,
     pub thinking_show_content: bool,
@@ -2096,9 +2148,12 @@ pub struct ReplFrontendConfig {
     pub agent_event_sender: std::sync::mpsc::Sender<AgentToReplEvent>,
 }
 
-/// REPL-side [`Frontend`] impl. Owns the [`StreamingRenderer`] and [`OutputSpacing`] state that
-/// used to be threaded through `Agent::run_turn` / `run_streaming`, and forwards approval requests
-/// over the existing mpsc to the blocking REPL thread.
+/// REPL-side [`Frontend`] impl: a translator from [`FrontendEvent`] to
+/// [`crate::console::Console`], plus the thinking indicator's own bookkeeping.
+///
+/// It decides *what* to say and nothing about spacing. The blank lines belong to the episode the
+/// turn happens inside, which is longer than the turn and outlives one that fails, so an owner that
+/// only exists while a turn is running cannot be the one that closes them.
 ///
 /// Lives in `crate::repl` (alongside the REPL thread it talks to) rather than in `crate::frontend`,
 /// so the trait module stays free of concrete UI types. See the module docs in `crate::frontend`.
@@ -2108,12 +2163,8 @@ pub struct ReplFrontend {
 }
 
 struct ReplFrontendState {
-    spacing: OutputSpacing,
-    /// Open across consecutive `AssistantTextDelta` events; closed by any non-text event (or
-    /// `TurnFinished`).
-    renderer: Option<StreamingRenderer>,
-    /// The thinking indicator currently drawn on the cursor's line, which has to be erased before
-    /// anything else prints. `None` when nothing is drawn.
+    /// The thinking indicator currently drawn on the cursor's line. `None` when nothing is drawn.
+    /// The row it occupies is the console's business; what the indicator *says* is this struct's.
     thinking_indicator: Option<ThinkingIndicator>,
 }
 
@@ -2177,8 +2228,6 @@ impl ReplFrontend {
         Self {
             config,
             state: Mutex::new(ReplFrontendState {
-                spacing: OutputSpacing::new(),
-                renderer: None,
                 thinking_indicator: None,
             }),
         }
@@ -2189,11 +2238,9 @@ impl ReplFrontend {
     /// Writes the newline the redraw loop deliberately withheld, so the last figure drawn becomes a
     /// permanent line. The reasoning phase is then legible after the fact -- the same way a visible
     /// thinking block stays on screen -- rather than vanishing the instant the answer starts.
-    fn commit_thinking_indicator(state: &mut ReplFrontendState) {
+    fn commit_thinking_indicator(&self, state: &mut ReplFrontendState) {
         if state.thinking_indicator.take().is_some() {
-            // The indicator is only ever `Some` when the draw succeeded, which requires a terminal,
-            // so there is nothing to guard here.
-            eprintln!();
+            with_console(&self.config.console, |console| console.commit_transient());
         }
     }
 
@@ -2202,21 +2249,9 @@ impl ReplFrontend {
     /// Only for the case where a thinking block with real text is about to render: that block opens
     /// with the same `Thinking...` prefix, so committing first would print the word twice for one
     /// phase of reasoning.
-    fn erase_thinking_indicator(state: &mut ReplFrontendState) {
+    fn erase_thinking_indicator(&self, state: &mut ReplFrontendState) {
         if state.thinking_indicator.take().is_some() {
-            render::clear_thinking_indicator();
-        }
-    }
-
-    /// Flush and drop any open streaming renderer. Called before any non-text event so block types
-    /// don't interleave on stderr.
-    fn close_text_run(state: &mut ReplFrontendState) {
-        if let Some(mut renderer) = state.renderer.take() {
-            // Rendering errors here are typically a broken stderr pipe; log and move on rather than
-            // panicking inside `emit`.
-            if let Err(error) = renderer.finish() {
-                tracing::debug!("frontend renderer finish failed: {}", error);
-            }
+            with_console(&self.config.console, |console| console.erase_transient());
         }
     }
 }
@@ -2239,48 +2274,30 @@ impl Frontend for ReplFrontend {
         // the one path nobody exercised.
         match indicator_action(&event) {
             IndicatorAction::Keep => {}
-            IndicatorAction::Erase => Self::erase_thinking_indicator(&mut state),
-            IndicatorAction::Commit => Self::commit_thinking_indicator(&mut state),
+            IndicatorAction::Erase => self.erase_thinking_indicator(&mut state),
+            IndicatorAction::Commit => self.commit_thinking_indicator(&mut state),
             IndicatorAction::Drop => state.thinking_indicator = None,
         }
 
         match event {
             FrontendEvent::SessionStarted { id } => {
                 if self.config.show_session_id_on_create {
-                    render::render_session_id("Creating new session", &id.to_string());
+                    with_console(&self.config.console, |console| {
+                        console.session_id("Creating new session", &id.to_string())
+                    });
                 }
             }
-            FrontendEvent::TurnStarted => {
-                // A text run left open here belongs to a previous turn that ended without
-                // `TurnFinished`, which the agent loop only emits when the turn succeeded: an
-                // interrupt or a provider error leaves the renderer holding whatever streamed
-                // before it. Flushing here keeps that text from being glued to the front of this
-                // turn's response. The ACP frontend sweeps its own per-turn state on `TurnStarted`
-                // for exactly this reason.
-                Self::close_text_run(&mut state);
-                if self.config.newline_after_prompt {
-                    eprintln!();
-                    state.spacing.after_prompt();
-                }
-            }
+            // Neither is a spacing signal any more. The blanks belong to the episode, which is
+            // longer than a turn and outlives one that fails: a turn is simply one of the things
+            // that can happen inside it.
+            FrontendEvent::TurnStarted => {}
+            // Closed here so a completed turn does not hold its last paragraph until the prompt,
+            // and closed again by the episode for a turn that died without reaching this.
             FrontendEvent::TurnFinished => {
-                Self::close_text_run(&mut state);
-                if self.config.newline_before_prompt {
-                    eprintln!();
-                }
+                with_console(&self.config.console, |console| console.close_text());
             }
             FrontendEvent::AssistantTextDelta(text) => {
-                if state.renderer.is_none() {
-                    if state.spacing.before_text() {
-                        eprintln!();
-                    }
-                    state.renderer = Some(StreamingRenderer::new(self.config.render_mode));
-                }
-                if let Some(renderer) = state.renderer.as_mut()
-                    && let Err(error) = renderer.push_delta(&text)
-                {
-                    tracing::debug!("frontend renderer push_delta failed: {}", error);
-                }
+                with_console(&self.config.console, |console| console.text_delta(&text));
             }
             FrontendEvent::ThinkingProgress { estimated_tokens } => {
                 // Redraw in place. The text run stays open deliberately: thinking can interleave
@@ -2293,18 +2310,7 @@ impl Frontend for ReplFrontend {
                 if !render::live_indicator_supported() {
                     return;
                 }
-                if state.thinking_indicator.is_none() {
-                    // Thinking can follow streamed text inside one turn, and the indicator is
-                    // drawn from column zero: with a text run still open it would overwrite the
-                    // tail of the last line, and now that the indicator is kept rather than erased
-                    // that damage would stay on screen.
-                    Self::close_text_run(&mut state);
-                    // Spaced like the thinking block it stands in for, so the committed line sits
-                    // apart from what preceded it.
-                    if state.spacing.before_thinking() {
-                        eprintln!();
-                    }
-                }
+                let opening = state.thinking_indicator.is_none();
                 let shown = peak_estimate(
                     state
                         .thinking_indicator
@@ -2312,20 +2318,21 @@ impl Frontend for ReplFrontend {
                         .and_then(|indicator| indicator.peak_estimate),
                     estimated_tokens,
                 );
-                state.thinking_indicator =
-                    render::render_thinking_indicator(shown).then_some(ThinkingIndicator {
-                        peak_estimate: shown,
-                    });
+                let drawn = with_console(&self.config.console, |console| {
+                    console.thinking_indicator(opening, shown)
+                });
+                state.thinking_indicator = drawn.then_some(ThinkingIndicator {
+                    peak_estimate: shown,
+                });
             }
             // The indicator was committed by the hook above, which is the whole point of the
             // event; there is no block text to render.
             FrontendEvent::ThinkingEnded => {}
             FrontendEvent::ThinkingBlock { content } => {
-                Self::close_text_run(&mut state);
-                if state.spacing.before_thinking() {
-                    eprintln!();
-                }
-                render::render_thinking_block(&content, self.config.thinking_show_content);
+                let show_content = self.config.thinking_show_content;
+                with_console(&self.config.console, |console| {
+                    console.thinking_block(&content, show_content)
+                });
             }
             // The indicator is drawn at `ToolCallStarted`, where the arguments exist to draw it
             // from. Announcing the bare name first would print every call twice, and the wait it
@@ -2337,16 +2344,10 @@ impl Frontend for ReplFrontend {
                 input,
                 display_summary,
             } => {
-                Self::close_text_run(&mut state);
-                if state.spacing.before_tool_indicator(self.config.tool_params) {
-                    eprintln!();
-                }
-                render::render_tool_indicator(
-                    &name,
-                    &input,
-                    display_summary.as_deref(),
-                    self.config.tool_params,
-                );
+                let params = self.config.tool_params;
+                with_console(&self.config.console, |console| {
+                    console.tool_indicator(&name, &input, display_summary.as_deref(), params)
+                });
             }
             // The REPL renders tool results inline through the agent's own message-history path
             // (the next assistant turn). No additional UI is needed at completion time; the
@@ -2359,26 +2360,19 @@ impl Frontend for ReplFrontend {
             // editor's tool-call view is the only place a command's output can appear.
             FrontendEvent::ToolCallOutputDelta { .. } => {}
             FrontendEvent::TodoListUpdated { title, items } => {
-                Self::close_text_run(&mut state);
-                // Only advance spacing when the list actually rendered. An empty list prints
-                // nothing; claiming a trailing blank would swallow the next text run's leading
-                // blank after a tool indicator.
-                if render::render_todo_list(title.as_deref(), &items) {
-                    state.spacing.after_todo_list();
-                }
+                with_console(&self.config.console, |console| {
+                    console.todo_list(title.as_deref(), &items)
+                });
             }
             FrontendEvent::TokenUsage(usage) => {
-                Self::close_text_run(&mut state);
                 if self.config.show_token_usage {
-                    render::render_token_usage(&usage);
+                    with_console(&self.config.console, |console| console.token_usage(&usage));
                 }
             }
             FrontendEvent::Notice(notice) => {
-                // Close any in-flight text run so the hint lands on its own line. Level is unused
-                // by `render_hint` today (it always paints DarkGrey); future styling can branch
-                // on `notice.level` when there's a need.
-                Self::close_text_run(&mut state);
-                render::render_hint(&notice.text);
+                // Level is unused by `render_hint` today (it always paints DarkGrey); future
+                // styling can branch on `notice.level` when there's a need.
+                with_console(&self.config.console, |console| console.hint(&notice.text));
             }
             // The REPL already prints the sub-agent's tool indicators as they happen, via the
             // parent's own renderer; a rolling rewrite of one tool call's content has no place in
@@ -2888,12 +2882,20 @@ mod frontend_tests {
     use super::*;
     use crate::frontend::{Frontend, FrontendEvent};
 
-    fn frontend() -> ReplFrontend {
+    fn console() -> Arc<Mutex<crate::console::Console>> {
+        Arc::new(Mutex::new(crate::console::Console::new(
+            crate::console::Spacing {
+                newline_before_prompt: true,
+                newline_after_prompt: true,
+            },
+            crate::render::RenderMode::Termimad,
+        )))
+    }
+
+    fn frontend_on(console: Arc<Mutex<crate::console::Console>>) -> ReplFrontend {
         let (sender, _receiver) = std::sync::mpsc::channel();
         ReplFrontend::new(ReplFrontendConfig {
-            render_mode: RenderMode::Termimad,
-            newline_before_prompt: false,
-            newline_after_prompt: false,
+            console,
             show_session_id_on_create: false,
             show_token_usage: false,
             thinking_show_content: false,
@@ -2902,38 +2904,35 @@ mod frontend_tests {
         })
     }
 
+    fn frontend() -> ReplFrontend {
+        frontend_on(console())
+    }
+
     /// `Agent::run_turn` emits `TurnFinished` only when the turn succeeded, so an interrupt or a
-    /// provider error leaves the streaming renderer holding whatever text arrived first. Starting
-    /// the next turn has to clear it; reusing the open renderer prepended the abandoned partial to
-    /// the next response.
+    /// provider error leaves the text block holding whatever arrived first. Ending the *episode* is
+    /// what flushes it, which is what puts it under the turn it belongs to. It used to be flushed
+    /// by the next turn's `TurnStarted`, which printed it under the following prompt as though the
+    /// model had said it in answer to something else.
     #[tokio::test]
-    async fn turn_started_closes_a_text_run_left_open_by_a_failed_turn() {
-        let frontend = frontend();
+    async fn a_failed_turn_flushes_its_partial_answer_when_the_episode_ends() {
+        let console = console();
+        let frontend = frontend_on(Arc::clone(&console));
         frontend
             .emit(FrontendEvent::AssistantTextDelta(
                 "abandoned partial".into(),
             ))
             .await;
         assert!(
-            frontend
-                .state
-                .lock()
-                .expect("frontend state")
-                .renderer
-                .is_some(),
-            "a text delta opens a renderer"
+            with_console(&console, |console| console.has_open_text()),
+            "a text delta opens a block"
         );
 
-        frontend.emit(FrontendEvent::TurnStarted).await;
+        // No `TurnFinished`: this is the failed turn. The episode still ends.
+        with_console(&console, |console| console.close_episode());
 
         assert!(
-            frontend
-                .state
-                .lock()
-                .expect("frontend state")
-                .renderer
-                .is_none(),
-            "the next turn must not inherit the previous turn's open renderer"
+            !with_console(&console, |console| console.has_open_text()),
+            "the episode must not hand an open block to the next one"
         );
     }
 
@@ -3066,68 +3065,20 @@ mod frontend_tests {
     /// The happy path still closes on `TurnFinished`, so a completed turn doesn't hold its last
     /// paragraph until the following prompt.
     #[tokio::test]
-    async fn turn_finished_closes_the_text_run() {
-        let frontend = frontend();
+    async fn turn_finished_closes_the_text_block() {
+        let console = console();
+        let frontend = frontend_on(Arc::clone(&console));
         frontend
             .emit(FrontendEvent::AssistantTextDelta("done".into()))
             .await;
         frontend.emit(FrontendEvent::TurnFinished).await;
 
-        assert!(
-            frontend
-                .state
-                .lock()
-                .expect("frontend state")
-                .renderer
-                .is_none()
-        );
+        assert!(!with_console(&console, |console| console.has_open_text()));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    /// Every command that prints its own output must be bracketed by the dispatcher, and every
-    /// command that answers by running a turn must not be, or its blank lines double.
-    #[test]
-    fn test_only_turn_running_commands_opt_out_of_command_spacing() {
-        assert!(
-            SlashCommand::SkillInvoke {
-                name: "s".to_string(),
-                extra: String::new(),
-            }
-            .answers_by_running_a_turn()
-        );
-        assert!(
-            SlashCommand::McpPrompt {
-                server: "fs".to_string(),
-                prompt: "p".to_string(),
-                args: Vec::new(),
-            }
-            .answers_by_running_a_turn()
-        );
-
-        // Everything that prints for itself. `/tasks` is the one that prompted this: its table
-        // rendered flush against the prompt above and the prompt below.
-        for command in [
-            SlashCommand::TaskList,
-            SlashCommand::TaskCancel { id: None },
-            SlashCommand::MemoryList,
-            SlashCommand::ScheduleList,
-            SlashCommand::SkillList,
-            SlashCommand::McpList,
-            SlashCommand::Status,
-            SlashCommand::Usage,
-            SlashCommand::History(None),
-            SlashCommand::Session,
-            SlashCommand::Export,
-        ] {
-            assert!(
-                !command.answers_by_running_a_turn(),
-                "a command that prints its own output must be spaced by the dispatcher",
-            );
-        }
-    }
-
     use super::*;
 
     /// Enumerates every `FrontendEvent` variant against the indicator decision.

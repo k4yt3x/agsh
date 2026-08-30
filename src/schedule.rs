@@ -2042,6 +2042,92 @@ static SCHEDULER_OWNER: std::sync::LazyLock<String> =
 
 /// Decide what to do with one due job: retire it, reschedule it quietly, or produce the [`Wakeup`]
 /// that spends a turn.
+/// What a session's permission is *now*, as opposed to what it was when a gate was authored.
+///
+/// `None` means the row carries no per-session level, so the host's own level is the live answer.
+/// That is now only an ACP session that has never been through `session/set_mode` (`session/new`
+/// writes no level) or an imported archive that carried none: `POST /v1/sessions` records it at
+/// insert, and `run_turn` records it for the REPL, one-shot and sub-agent rows it creates. A
+/// session row that exists but cannot be read also arrives here as `None` and the host level
+/// decides, which is why the lookup that feeds this warns rather than passing silently.
+///
+/// Filtered by the enabled set, like the other four readers of this column. A row records what a
+/// session was set to, not what this installation still permits, and the two diverge the moment an
+/// operator narrows `[permissions].enabled` and restarts: the session re-attaches clamped, while
+/// this read saw the unclamped row and kept firing the gate. That was verified end to end against a
+/// live `meka serve` -- and the creation door two files over returns 403 for the same authority, so
+/// the two doors disagreed about one job.
+///
+/// Shared with [`wake_would_produce_work`] rather than duplicated: the watcher that decides whether
+/// to interrupt a prompt has to reach the same answer as the door that decides whether to fire, or
+/// it wakes the shell for work that will not happen.
+fn live_permission(
+    session: Option<&crate::session::SessionSummary>,
+    config: &crate::config::ResolvedScheduleConfig,
+    session_id: uuid::Uuid,
+) -> crate::permission::Permission {
+    crate::permission::parse_recorded_permission(
+        session.and_then(|info| info.permission.as_deref()),
+        &format_args!("session {}", session_id),
+    )
+    .filter(|level| config.enabled_permissions.is_enabled(*level))
+    .unwrap_or(config.host_permission)
+}
+
+/// Whether waking this session's prompt would actually produce work.
+///
+/// The scheduler watcher used to raise its flag on `list_due_scheduled_jobs` alone, a pure SQL
+/// predicate, while [`prepare`] declines for several further reasons. Where the row deliberately
+/// does not move -- a job parked at [`MAX_CLAIM_ATTEMPTS`], or a session whose live level cannot do
+/// unattended work -- the job stayed due forever and the watcher re-raised the flag every poll,
+/// interrupting the prompt each time to run nothing.
+///
+/// This answers the subset of `prepare`'s question that costs a row read and nothing else. It is
+/// deliberately *conservative* rather than exact: a gated job still wakes the prompt, because the
+/// only way to know whether its gate passes is to run the probe, and running a side-effecting probe
+/// twice per poll to answer the same question would be worse than the interruption. The invariant
+/// is that anything this refuses, `prepare` would also have refused -- never the reverse.
+/// Whether any of `due` belongs to this session and is not parked.
+///
+/// Separated from the two database reads around it so the rule can be asserted directly: a job at
+/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancellable, reported as held), so
+/// "there is a due row" and "something will run" are different questions and the watcher has to ask
+/// the second one.
+fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
+    due.iter()
+        .any(|job| job.session_id == session_id && job.attempts < MAX_CLAIM_ATTEMPTS)
+}
+
+pub async fn wake_would_produce_work(
+    session_manager: &crate::session::SessionManager,
+    config: &crate::config::ResolvedScheduleConfig,
+    session_id: uuid::Uuid,
+    now: DateTime<Utc>,
+) -> crate::error::Result<bool> {
+    let due = session_manager
+        .schedule_store()
+        .list_due_scheduled_jobs(now)
+        .await?;
+    if !has_runnable_job(&due, session_id) {
+        return Ok(false);
+    }
+    // Read once for the session, not once per job: every job here shares it.
+    let session = match session_manager.session_info(session_id).await {
+        Ok(info) => info,
+        // Fail closed on a lookup that could not confirm the level, the same way `prepare` does:
+        // a session whose row cannot be read is not one to wake a prompt for.
+        Err(error) => {
+            tracing::warn!(
+                "could not read session {} while checking for due work: {}",
+                session_id,
+                error
+            );
+            None
+        }
+    };
+    Ok(live_permission(session.as_ref(), config, session_id).allows_unattended_work())
+}
+
 async fn prepare(
     session_manager: &crate::session::SessionManager,
     config: &crate::config::ResolvedScheduleConfig,
@@ -2121,12 +2207,7 @@ async fn prepare(
     // while this read saw the unclamped row and kept firing the gate. That was verified end to end
     // against a live `meka serve` -- and the creation door two files over returns 403 for the same
     // authority, so the two doors disagreed about one job.
-    let live_permission = crate::permission::parse_recorded_permission(
-        session.as_ref().and_then(|info| info.permission.as_deref()),
-        &format_args!("session {}", job.session_id),
-    )
-    .filter(|level| config.enabled_permissions.is_enabled(*level))
-    .unwrap_or(config.host_permission);
+    let live_permission = live_permission(session.as_ref(), config, job.session_id);
 
     let coalesced = occurrences_between(&job.schedule, job.next_fire_at, now);
     // `Some` only for a job that lives on. A one-shot's moment is spent, and a cron pattern with
@@ -4033,6 +4114,45 @@ mod tests {
 
     /// A gate runs in its session's directory, not the host process's.
     ///
+    /// A parked job stays in the table on purpose, so "a row is due" and "something will run" are
+    /// different questions. Asking the first one is what let a job at `MAX_CLAIM_ATTEMPTS`
+    /// interrupt the prompt every poll interval, forever, to run nothing.
+    #[test]
+    fn a_wake_is_only_worth_it_for_a_job_that_can_still_run() {
+        let mine = uuid::Uuid::new_v4();
+        let theirs = uuid::Uuid::new_v4();
+        let job = |session_id, attempts| ScheduledJob {
+            id: "j".to_string(),
+            session_id,
+            schedule: Schedule::At(Utc::now()),
+            prompt: "p".to_string(),
+            gate: None,
+            created_at: Utc::now(),
+            last_fired_at: None,
+            next_fire_at: Utc::now(),
+            attempts,
+        };
+
+        assert!(has_runnable_job(&[job(mine, 0)], mine));
+        assert!(
+            has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS - 1)], mine),
+            "one attempt short of parked is still runnable",
+        );
+        assert!(
+            !has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS)], mine),
+            "a parked job must not wake the prompt",
+        );
+        assert!(
+            !has_runnable_job(&[job(theirs, 0)], mine),
+            "another session's job is not this prompt's business",
+        );
+        assert!(!has_runnable_job(&[], mine));
+        assert!(
+            has_runnable_job(&[job(mine, MAX_CLAIM_ATTEMPTS), job(mine, 0)], mine),
+            "one runnable job among parked ones is enough",
+        );
+    }
+
     /// The model almost always authors a gate right after verifying the same command through
     /// `execute_command`, which runs in the session cwd. Under a `meka serve` unit the host process
     /// sits somewhere else entirely (`/`, or wherever systemd put it), so a gate that ignores the

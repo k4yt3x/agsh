@@ -22,6 +22,7 @@ use termimad::{Alignment, MadSkin};
 /// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended` (MIT).
 const MONOKAI_EXTENDED_TMTHEME: &[u8] = include_bytes!("../assets/themes/Monokai Extended.tmTheme");
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LastOutput {
     Nothing,
     Prompt,
@@ -32,6 +33,11 @@ enum LastOutput {
 }
 
 /// Tracks what was last printed to decide if a blank line is needed next.
+///
+/// `Copy` so [`crate::console`] can run a transition against a scratch copy and return both the
+/// blank line it implies and the state that follows, which is what lets the console's whole
+/// decision be a pure function a test can enumerate.
+#[derive(Clone, Copy)]
 pub struct OutputSpacing {
     last: LastOutput,
 }
@@ -2146,9 +2152,11 @@ pub fn format_session_status(
 
     let total_in = snap.total_input_tokens();
     let mut out = String::new();
-    if let Some(name) = model.model {
-        let _ = writeln!(out, "  Model:           {}", name);
-    }
+    // Ordered like the profile these lines are resolved from: the backend first, then the model,
+    // then the model-tied knobs in the order `[providers.<name>]` declares them (`context_window`,
+    // `effort`, `thinking`). Reading the block next to the config it came from is the whole point
+    // of this command, and the two disagreeing on order made that harder than it needed to be. The
+    // cumulative counters follow, and answer a different question.
     match (model.profile, model.backend) {
         (Some(profile), Some(backend)) => {
             let _ = writeln!(out, "  Provider:        {} ({})", profile, backend);
@@ -2158,19 +2166,9 @@ pub fn format_session_status(
         }
         _ => {}
     }
-    if let Some(effort) = model.effort {
-        let _ = writeln!(out, "  Effort:          {}", effort);
+    if let Some(name) = model.model {
+        let _ = writeln!(out, "  Model:           {}", name);
     }
-    // Anthropic-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
-    // status block should report what the request carries, and `thinking` is not a field an OpenAI
-    // request has. Naming an encoding there would read as a setting that is in force.
-    if model
-        .backend
-        .is_some_and(crate::provider::backend_takes_thinking)
-    {
-        let _ = writeln!(out, "  Thinking:        {}", model.thinking.as_str());
-    }
-    let _ = writeln!(out, "  Turns:           {}", snap.turns);
     // Live context occupancy: how full the window was on the last request. Distinct from the
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
     //
@@ -2192,6 +2190,19 @@ pub fn format_session_status(
             format_token_count(remaining),
         );
     }
+    if let Some(effort) = model.effort {
+        let _ = writeln!(out, "  Effort:          {}", effort);
+    }
+    // Anthropic-only, and omitted elsewhere for the same reason `Effort` is omitted when unset: a
+    // status block should report what the request carries, and `thinking` is not a field an OpenAI
+    // request has. Naming an encoding there would read as a setting that is in force.
+    if model
+        .backend
+        .is_some_and(crate::provider::backend_takes_thinking)
+    {
+        let _ = writeln!(out, "  Thinking:        {}", model.thinking.as_str());
+    }
+    let _ = writeln!(out, "  Turns:           {}", snap.turns);
     let _ = writeln!(
         out,
         "  Input tokens:    {}  (cache hit: {}%)",
@@ -2227,7 +2238,7 @@ pub fn render_session_status(
     context_tokens: u64,
     context_window: u64,
 ) {
-    eprintln!("{}", "Session status".with(Color::Cyan));
+    render_heading("Session status");
     eprint!(
         "{}",
         format_session_status(snap, model, message_count, context_tokens, context_window)
@@ -2370,6 +2381,33 @@ pub(crate) fn format_reset_time(epoch_seconds: i64) -> String {
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);
+}
+
+/// The heading above a block of command output, in the colour every other one uses.
+///
+/// Exists so the colour is decided once. `Session status` had it inline, and the second heading to
+/// want it would otherwise have copied the constant rather than the convention.
+pub fn render_heading(heading: &str) {
+    eprintln!("{}", heading.with(Color::Cyan));
+}
+
+/// A stage direction about the output rather than output of its own: `(interrupted)`.
+///
+/// Yellow, not red. None of these is a failure -- an interrupt is the user's own doing, and the
+/// background-task notices describe meka doing as it was asked. [`Color::Red`] belongs to
+/// [`render_error`] alone, and is worth keeping at one meaning. Yellow already carries "worth
+/// noticing, nothing went wrong" here: it is the `read` permission indicator and an in-progress
+/// todo. Not [`Color::DarkGrey`] either, which is the right *class* but is what thinking blocks
+/// use, and the mark saying an answer is incomplete should not recede as far as the model's
+/// musings -- spotting it in scrollback is the whole point, since at the time you already knew.
+///
+/// Parenthesised and lowercase because it annotates the transcript rather than speaking:
+/// `Interrupted.` reads as meka saying something, `(interrupted)` as a note on the answer that
+/// stopped, in the same register as `(truncated)`.
+///
+/// Every caller passes one of meka's own strings, so there is nothing here to sanitise.
+pub fn render_annotation(note: &str) {
+    eprintln!("{}", format!("({})", note).with(Color::Yellow));
 }
 
 /// A session whose recorded provider profile is not one the config has, and a profile it could be
@@ -2668,15 +2706,6 @@ pub fn render_thinking_indicator(estimated_tokens: Option<u64>) -> bool {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
     )
     .is_ok()
-}
-
-/// Erase the thinking indicator and return the cursor to column zero.
-///
-/// Only for the case where a thinking block with real content is about to render in its place --
-/// otherwise the indicator is committed rather than erased, so the time the model spent stays on
-/// screen.
-pub fn clear_thinking_indicator() {
-    begin_own_line();
 }
 
 /// Discard whatever an in-place status line left on the current row, so the caller starts at column
@@ -3401,6 +3430,54 @@ mod tests {
         // An unknown window (sub-agents, tests) still has nothing to report.
         let unknown = format_session_status(&snap, &model, 0, 0, 0);
         assert!(!unknown.contains("Context:"), "{unknown}");
+    }
+
+    /// The resolved-profile lines come in the order `[providers.<name>]` declares the same fields,
+    /// so the block and the config it was resolved from can be read side by side. Nothing enforced
+    /// that before, and the two had already drifted: `Model` sat above `Provider`, and `Context`
+    /// sat down among the cumulative counters rather than with the window it reports.
+    #[test]
+    fn the_status_block_follows_the_profile_field_order() {
+        use crate::provider::ThinkingMode;
+
+        let snap = crate::stats::SessionStats::default().snapshot();
+        let body = format_session_status(
+            &snap,
+            &ModelStatus {
+                model: Some("some-model"),
+                profile: Some("p"),
+                backend: Some("anthropic-messages"),
+                effort: Some("high"),
+                thinking: ThinkingMode::Adaptive,
+            },
+            7,
+            1_024,
+            262_144,
+        );
+
+        let labels: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.trim_start().split(':').next())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                // `type`, `model`, `context_window`, `effort`, `thinking` -- the profile's own
+                // order, for the fields that come from it.
+                "Provider",
+                "Model",
+                "Context",
+                "Effort",
+                "Thinking",
+                // Then what the session has spent, which no profile field describes.
+                "Turns",
+                "Input tokens",
+                "Output tokens",
+                "Redactions",
+                "Messages",
+            ],
+            "{body}"
+        );
     }
 
     /// `/status` reports what the request actually carries, not what meka happens to hold.
