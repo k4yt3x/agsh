@@ -65,6 +65,27 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 /// cancellation token.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 
+/// How long a turn waits, once its retry sequence is spent, before sending the *unmodified* request
+/// one last time rather than degrading its own content.
+///
+/// This is not another retry. It is the one attempt that can tell the two readings of a spent
+/// budget apart. A 5xx answering a completion means either "the provider cannot handle this body"
+/// or "the provider is having a moment", and the agent loop cannot see which; degrading answers the
+/// first, and answering the second that way destroys content on the strength of a coincidence,
+/// because the degraded retry then succeeds simply because the outage ended and
+/// `TurnRecovery::persist_vindicated_repair` writes the loss to the store as proven-good. The whole
+/// retry sequence is only [`MAX_PROVIDER_RETRIES`] attempts across three seconds of backoff, which
+/// a routine `529` burst outlasts easily, so without this the common case is the loss and the rare
+/// case is the recovery.
+///
+/// Cheap in the case that matters and free in the case that does not: it is paid only by a turn
+/// whose alternative was to start deleting things, and a payload that is genuinely broken costs one
+/// wait before the degrade proceeds exactly as before.
+///
+/// [`BACKOFF_CAP`] rather than a number of its own, because that is already this module's answer to
+/// "the longest a single wait is ever worth", and two constants would drift.
+pub(crate) const OUTAGE_REPRIEVE: Duration = BACKOFF_CAP;
+
 /// How long to wait before retry attempt number `attempt` (1-indexed: the first retry is
 /// `attempt == 1`). Honors the provider's `Retry-After` hint when present (capped); otherwise
 /// exponential backoff `1s, 2s, 4s, ...` capped at [`BACKOFF_CAP`], mirroring the shape of the

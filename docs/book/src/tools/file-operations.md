@@ -35,6 +35,18 @@ Recognized image extensions are returned as base64-encoded multimodal content:
 
 Images are rejected if the final payload exceeds 3.75 MB (~5 MB base64). Conversion can enlarge an image, so a small TIFF may produce a too-large PNG.
 
+Every image `read_file` returns is decoded before it is sent, including the pass-through formats, and one that does not decode is a tool error naming the failure. The same door covers `fetch_url`, `render_image`, and an image a client attaches over ACP or the HTTP API. The decode is not about the extension: a truncated or corrupt PNG keeps a valid signature, so nothing short of decoding it tells the two apart. It matters because a broken image is not refused where it is read but inside the provider, by which time it sits in a tool result the session has already saved and every later turn re-sends.
+
+The check is strict, including PNG chunk checksums, so a damaged file that some viewers still render is refused here. That is deliberate: meka cannot know which decoder is on the other end, and being wrong the other way puts an image the provider rejects into the session permanently. The error names what failed, so a file reported as corrupt is worth re-exporting.
+
+JPEG is decoded through a separate strict path rather than the shared one. The library meka uses for every other format hardcodes its JPEG decoder into a permissive mode with no way to switch it off, and that mode returns a picture for a stream truncated to a tenth of its bytes; the file is the one most likely to arrive truncated, so it gets a decoder configured to say so. Truncation at any depth, and a scan corrupted in place, are both refused.
+
+Three cases are *not* verified, and the last two are gaps rather than decisions:
+
+- **An image too big to decode**: one whose pixel count would cost more than 128 MiB, roughly 33 megapixels. The ceiling exists to stop a crafted file exhausting meka's own memory, and declining to decode achieves that; refusing as well would reject legitimate images, since a 6000x6000 screenshot compresses to a few hundred kilobytes and is inside Anthropic's 8000 px single-image cap. Such a file is passed through and the provider decides. Note that meka cannot downscale one either, so it also bypasses the 2000 px multi-image cap the Claude provider applies.
+- **Frames after the first of an animated GIF or WebP**: the decoder reads one frame, so damage confined to later frames is not seen.
+- **An image arriving from an [MCP server](../usage/mcp.md)**, which sniffs magic bytes only rather than decoding a payload meka did not produce, and **a conversation restored by `meka session import`**, whose message content is stored as supplied. A broken image through either door reaches the provider; the [degrade-and-retry](../usage/sessions.md#rewinding-a-session) is what recovers the session when it does.
+
 Only read image files when the current model supports vision input; text-only models will either error or silently drop the image block.
 
 ### Examples

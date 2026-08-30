@@ -49,6 +49,19 @@ pub enum MekaError {
     RetryableProvider {
         message: String,
         retry_after: Option<Duration>,
+        /// Whether a *completion* reached the provider and the provider then failed handling it,
+        /// which is exactly a 5xx from [`ProviderRequest::Completion`] and nothing else.
+        ///
+        /// Recorded because it is the only shape of this variant that the turn's own content could
+        /// explain, and the agent loop's degrade-and-retry keys on it. A transport failure never
+        /// delivered the body, so nothing judged it. A 429 is the provider declining to process
+        /// the request at all, which is a statement about rate and not about what was
+        /// sent. A token endpoint's 5xx concerns a request that carried no conversation.
+        /// Degrading on any of those would answer an outage by deleting the user's
+        /// content: the degraded retry can succeed simply because the network came back,
+        /// and `TurnRecovery::persist_vindicated_repair` would then write that loss to the
+        /// store as proven-good.
+        server_error_on_completion: bool,
     },
 
     #[error("tool execution error: {tool_name}: {message}")]
@@ -170,6 +183,8 @@ pub(crate) fn provider_http_error(
         MekaError::RetryableProvider {
             message,
             retry_after,
+            server_error_on_completion: request == ProviderRequest::Completion
+                && status.is_server_error(),
         }
     } else if request == ProviderRequest::Completion
         && (status == reqwest::StatusCode::BAD_REQUEST
@@ -251,6 +266,8 @@ pub(crate) fn provider_transport_error(
         MekaError::RetryableProvider {
             message,
             retry_after,
+            // No response arrived, so whatever was sent was never judged.
+            server_error_on_completion: false,
         }
     }
 }
@@ -303,6 +320,8 @@ pub(crate) fn oauth_refresh_error(
         MekaError::RetryableProvider {
             message,
             retry_after,
+            // A token exchange carries no conversation, so there is nothing to degrade.
+            server_error_on_completion: false,
         }
     } else {
         MekaError::Provider(format!(
@@ -415,6 +434,64 @@ mod tests {
             ),
             MekaError::ContextOverflow(_)
         ));
+    }
+
+    /// The one flag that decides whether the agent loop may answer a failure by deleting the
+    /// turn's content, pinned at the only place that can ever set it true.
+    ///
+    /// Nothing else covered this. `MockProvider` hard-codes `true`, so every agent-level test
+    /// asserts what the mock was told rather than what the classifier decides, and both halves of
+    /// this expression could be replaced by a constant with the whole suite still green. A `true`
+    /// here is not a cosmetic bug: it is the data-loss shape, where a rate limit or an auxiliary
+    /// call's outage licenses a degrade whose successful retry is then written to the store as
+    /// proven-good.
+    #[test]
+    fn test_only_a_server_error_answering_a_completion_may_blame_the_content() {
+        let flag = |status, request| match provider_http_error(
+            status,
+            "upstream said no",
+            None,
+            request,
+        ) {
+            MekaError::RetryableProvider {
+                server_error_on_completion,
+                ..
+            } => Some(server_error_on_completion),
+            _ => None,
+        };
+
+        assert_eq!(
+            flag(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                ProviderRequest::Completion
+            ),
+            Some(true),
+            "a 5xx answering a completion is the one shape the turn's own content could explain"
+        );
+        assert_eq!(
+            flag(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                ProviderRequest::Completion
+            ),
+            Some(true),
+            "and every 5xx status, not just 500"
+        );
+        assert_eq!(
+            flag(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                ProviderRequest::Completion
+            ),
+            Some(false),
+            "a rate limit is a statement about rate, not about what was sent"
+        );
+        assert_eq!(
+            flag(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                ProviderRequest::Auxiliary
+            ),
+            Some(false),
+            "an auxiliary call carried no conversation, so there is nothing in it to degrade"
+        );
     }
 
     #[test]
@@ -578,10 +655,18 @@ mod tests {
             MekaError::RetryableProvider {
                 message,
                 retry_after,
+                server_error_on_completion,
             } => {
                 assert_eq!(
                     retry_after, None,
                     "the hint is a response header, and the premise here is that no response came"
+                );
+                // The same premise decides this: nothing judged the body, so the agent loop's
+                // degrade-and-retry must not treat the failure as something the content explains.
+                // Otherwise a dropped connection answers itself by deleting the turn's work.
+                assert!(
+                    !server_error_on_completion,
+                    "a call that never reached the provider cannot blame what it carried"
                 );
                 assert!(
                     message.starts_with("HTTP request failed (body 2.0 MiB): "),

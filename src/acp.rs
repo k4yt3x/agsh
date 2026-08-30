@@ -708,6 +708,12 @@ impl Frontend for AcpFrontend {
                 // chunk with an `[meka]` prefix so editor transcripts record the side-effect and
                 // clients can filter or style by that prefix. `notice.level` is unused on the wire
                 // today; when ACP grows a typed notice variant, branch on it here.
+                //
+                // Deliberately not [`crate::conversation::HARNESS_NOTE`], despite the resemblance.
+                // That marker is longer because a *model* has to read it and should not have to
+                // recall what meka is; this one is read by a person looking at their own editor,
+                // where the product name needs no gloss, and by clients matching on the prefix,
+                // which a rename would break.
                 let text = format!("[meka] {}", notice.text);
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
                     agent_client_protocol::schema::v1::TextContent::new(text),
@@ -1256,8 +1262,18 @@ fn validate_additional_roots(roots: &[PathBuf]) -> Result<(), agent_client_proto
 
 /// Decode an ACP image content block into meka's internal [`crate::provider::ImageSource`] via the
 /// shared client-image pipeline, so ACP and the HTTP API enforce the same limits.
-fn decode_acp_image(image: &ImageContent) -> Result<crate::provider::ImageSource, String> {
-    crate::image::decode_base64_image(&image.data, &image.mime_type)
+///
+/// Off the runtime, for the reason `read_file` and `fetch_url` document at their own call sites:
+/// the pipeline base64-decodes and then decodes the image to verify it, which is tens of
+/// milliseconds of pure CPU on a multi-megapixel screenshot, and on the runtime it blocks every
+/// other task on that worker. The editor pasting one attachment must not stall an unrelated
+/// session's stream.
+async fn decode_acp_image(image: &ImageContent) -> Result<crate::provider::ImageSource, String> {
+    let data = image.data.clone();
+    let mime_type = image.mime_type.clone();
+    tokio::task::spawn_blocking(move || crate::image::decode_base64_image(&data, &mime_type))
+        .await
+        .map_err(|error| format!("image decode task failed: {}", error))?
 }
 
 /// Compute the `locations` entries for a tool call. For tools whose primary argument is a path,
@@ -2987,7 +3003,7 @@ async fn run_prompt_turn(
             // `Image` is accepted only when the active profile advertised the `image` capability
             // (vision on). Normalize the payload through the shared image pipeline so the size cap
             // and format conversion match tool-result images.
-            ContentBlock::Image(image) if session_vision => match decode_acp_image(image) {
+            ContentBlock::Image(image) if session_vision => match decode_acp_image(image).await {
                 Ok(source) => images.push(source),
                 Err(message) => {
                     return responder.respond_with_error(invalid_params_error(format!(
@@ -4437,31 +4453,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_decode_acp_image_passes_through_within_cap() {
-        // The PassThrough path validates size only, so small arbitrary bytes labelled `image/png`
-        // round-trip into an `ImageSource` without needing a real PNG.
-        let raw = vec![0u8; 128];
-        let data = base64::engine::general_purpose::STANDARD.encode(&raw);
+    /// A real PNG, because the payload has to survive a decode: a client's attachment goes through
+    /// the same [`crate::image::prepare_image_source`] door a tool result does.
+    fn tiny_png() -> Vec<u8> {
+        let mut out = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode");
+        out
+    }
+
+    #[tokio::test]
+    async fn test_decode_acp_image_passes_through_within_cap() {
+        let data = base64::engine::general_purpose::STANDARD.encode(tiny_png());
         let image = ImageContent::new(data, "image/png".to_string());
-        let source = decode_acp_image(&image).expect("decode");
+        let source = decode_acp_image(&image).await.expect("decode");
         assert_eq!(source.source_type, "base64");
         assert_eq!(source.media_type, "image/png");
     }
 
-    #[test]
-    fn test_decode_acp_image_rejects_oversized() {
+    /// A client's attachment is refused for the same reason a `read_file` result is: forwarding
+    /// bytes that only look like a PNG lands the provider's rejection inside a committed message.
+    #[tokio::test]
+    async fn test_decode_acp_image_rejects_a_payload_that_does_not_decode() {
+        let mut truncated = tiny_png();
+        truncated.truncate(16);
+        let data = base64::engine::general_purpose::STANDARD.encode(&truncated);
+        let image = ImageContent::new(data, "image/png".to_string());
+        let error = decode_acp_image(&image)
+            .await
+            .expect_err("should reject undecodable bytes");
+        assert!(error.contains("decode"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_decode_acp_image_rejects_oversized() {
         let raw = vec![0u8; crate::image::MAX_IMAGE_RAW_BYTES + 1];
         let data = base64::engine::general_purpose::STANDARD.encode(&raw);
         let image = ImageContent::new(data, "image/png".to_string());
-        let error = decode_acp_image(&image).expect_err("should reject oversized");
+        let error = decode_acp_image(&image)
+            .await
+            .expect_err("should reject oversized");
         assert!(error.contains("too large"), "got: {error}");
     }
 
-    #[test]
-    fn test_decode_acp_image_rejects_bad_base64() {
+    #[tokio::test]
+    async fn test_decode_acp_image_rejects_bad_base64() {
         let image = ImageContent::new("not%%%valid".to_string(), "image/png".to_string());
-        assert!(decode_acp_image(&image).is_err());
+        assert!(decode_acp_image(&image).await.is_err());
     }
 
     #[test]

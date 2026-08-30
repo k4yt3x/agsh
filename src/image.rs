@@ -98,14 +98,123 @@ pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
 const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`].
+///
+/// The ceiling gets its own message. Hitting it says the image is *large*, not damaged, and the
+/// conversion path has no choice but to fail either way -- but telling somebody their file failed
+/// to decode when it is merely a 6400x6400 TIFF sends them to re-export a file that was never
+/// broken. The pass-through path treats the same condition as a pass (see
+/// [`refuse_if_undecodable`]), so the two only diverge on what they can *do*, never on what they
+/// claim.
 fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, String> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
-    reader
+    reader.decode().map_err(|error| match error {
+        image::ImageError::Limits(_) => format!(
+            "{:?} image is too large to convert: decoding it would need more than {} MiB, which is \
+             meka's per-image ceiling. Convert or downscale it first, or supply it in a format \
+             that needs no conversion (png, jpeg, gif, webp, bmp).",
+            format,
+            MAX_DECODE_ALLOC_BYTES / (1024 * 1024)
+        ),
+        error => format!("failed to decode {:?} image: {}", format, error),
+    })
+}
+
+/// Whether `bytes` really are a `format` image, for the pass-through path that forwards them
+/// unaltered.
+///
+/// `Err` means the payload is broken and must not be sent. `Ok` means one of two things, and they
+/// are deliberately the same answer: it decoded, or decoding it would have cost more than
+/// [`MAX_DECODE_ALLOC_BYTES`] and meka declined to find out.
+///
+/// Treating the limit as a pass is not a hole in the check. That ceiling exists to stop a crafted
+/// image exhausting *meka's* memory, and refusing to decode achieves that whether or not the bytes
+/// are then forwarded; the provider does its own decoding either way. Refusing outright would
+/// instead reject legitimate images, because the ceiling is a pixel count rather than a file size:
+/// a 6000x6000 screenshot compresses to a few hundred kilobytes and is well inside every provider's
+/// dimension cap, but decodes to 137 MB. The failures this function exists to catch -- truncation,
+/// a corrupt header, a wrong CRC -- all arrive as [`image::ImageError::Decoding`] and are refused.
+fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
+    if format == ImageFormat::Jpeg {
+        return refuse_undecodable_jpeg(bytes);
+    }
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    match reader.decode() {
+        Ok(_) => Ok(()),
+        // Checked against the declared dimensions before any buffer is reserved, so this costs
+        // nothing beyond parsing the header.
+        Err(image::ImageError::Limits(_)) => Ok(()),
+        Err(error) => Err(format!("failed to decode {:?} image: {}", format, error)),
+    }
+}
+
+/// The JPEG half of [`refuse_if_undecodable`], which cannot go through `image` at all.
+///
+/// `image`'s JPEG codec constructs `zune_core::options::DecoderOptions` with
+/// `set_strict_mode(false)` at every site and exposes no way to change it, so `ImageReader::decode`
+/// answers `Ok` for a JPEG truncated to a *tenth* of its bytes: the decoder fills the missing scan
+/// with what it has and returns a picture. A guard that passes that is not a guard, and JPEG is the
+/// format most likely to arrive truncated, so meka drives the same decoder itself with strict mode
+/// on. Measured: strict refuses truncation at every fraction from 10% to 99% and refuses a
+/// corrupted scan, while accepting 34 real JPEGs (baseline, progressive, optimised, 4:4:4,
+/// grayscale) unchanged.
+///
+/// The alternative considered and rejected was checking for a trailing `FF D9` end-of-image marker.
+/// It is worse in both directions: it misses corruption that leaves the marker intact, and it
+/// refuses the valid files that carry bytes after it.
+///
+/// The header is read first so this can honour [`MAX_DECODE_ALLOC_BYTES`] the way every other
+/// format does. Two things forced it, and taking the defaults got both wrong:
+///
+/// `DecoderOptions::default()` caps each axis at 16384 and enforces that in frame-header parsing,
+/// independently of strict mode. A 1080x20000 full-page mobile screenshot is a few hundred
+/// kilobytes, sniffs clean, decodes fine under `image`, and was refused here as "failed to decode"
+/// with a message telling the *user* to call `set_limits`. Raising the axis caps to JPEG's own
+/// format maximum removes a refusal that was never about the image being broken.
+///
+/// Those same caps then permit 16384x16384x3, about 805 MB, against a ceiling of 128 MiB.
+/// `output_buffer_size` is computed from the frame header and allocated in one go, so it is the
+/// exact analogue of a PNG's `IHDR` and is checked the same way: over the ceiling means meka
+/// declines to find out, which is a pass, not a refusal (see [`refuse_if_undecodable`]).
+fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
+    let options = zune_core::options::DecoderOptions::default()
+        .set_strict_mode(true)
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX));
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder
+        .decode_headers()
+        .map_err(|error| format!("failed to decode Jpeg image: {}", error))?;
+    // Unknown rather than large: nothing to weigh against the ceiling, so fall through and let the
+    // decode speak.
+    //
+    // A size that cannot be computed is treated as over the ceiling rather than fallen through,
+    // which is the fail-safe direction and also removes a panic: `output_buffer_size` returns
+    // `None` on overflow, and `decode` opens by unwrapping it. Unreachable on a 64-bit target,
+    // reachable on a 32-bit one now that the axis caps are raised.
+    //
+    // Strictly greater, matching `image::Limits`, which permits an allocation *equal* to
+    // `max_alloc` and fails only past it. The two paths have to agree at the boundary or the same
+    // 128 MiB image is judged by one and waved through by the other depending on its format. A
+    // mutation to `>=` survives the suite: killing it needs a JPEG whose decoded size is exactly
+    // the ceiling, which is constructible (grayscale 16384x8192) but costs 128 MiB in the test to
+    // assert a difference that is definitionally the wrong way round.
+    let within_ceiling = decoder
+        .output_buffer_size()
+        .and_then(|size| u64::try_from(size).ok())
+        .is_some_and(|size| size <= MAX_DECODE_ALLOC_BYTES);
+    if !within_ceiling {
+        return Ok(());
+    }
+    decoder
         .decode()
-        .map_err(|error| format!("failed to decode {:?} image: {}", format, error))
+        .map(|_| ())
+        .map_err(|error| format!("failed to decode Jpeg image: {}", error))
 }
 
 /// Decode arbitrary supported image bytes and re-encode as PNG.
@@ -164,9 +273,10 @@ pub(crate) fn downscale_to_dim_cap(
     Ok(out)
 }
 
-/// Run the classification pipeline end-to-end: pass-through native formats, convert others to PNG,
-/// enforce the byte cap. Provider-agnostic. Does NOT enforce per-axis pixel limits (Anthropic's
-/// 2000 px multi-image cap is enforced separately at the Claude provider layer in
+/// Run the classification pipeline end-to-end: reject what does not decode, pass through native
+/// formats, convert the rest to PNG, enforce the byte cap. Provider-agnostic. Does NOT enforce
+/// per-axis pixel limits (Anthropic's 2000 px multi-image cap is enforced separately at the Claude
+/// provider layer in
 /// `src/provider/anthropic/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
 /// bytes)`.
 ///
@@ -177,6 +287,13 @@ pub(crate) fn downscale_to_dim_cap(
 /// lands in a `tool_result` already committed to the session, where it fails every subsequent
 /// request. Deciding the media type from the bytes is what keeps a mislabel from becoming
 /// unrecoverable history.
+///
+/// The decode check answers that same question one step further in. A correctly labelled image
+/// whose payload is truncated or corrupt is refused for the same reason a mislabelled one is: it
+/// lands in a committed `tool_result` and fails every later request. Worse, the refusal need not
+/// arrive as a 400 -- a gateway that reports its decoder's exception as a 500 reads to
+/// [`crate::error::provider_http_error`] as transient, so the request is retried unchanged rather
+/// than repaired, and the session ends the turn unusable.
 pub(crate) fn prepare_image_payload(
     hint: ImageHandling,
     bytes: &[u8],
@@ -195,6 +312,12 @@ pub(crate) fn prepare_image_payload(
                     MAX_IMAGE_RAW_BYTES,
                 ));
             }
+            // Decoded and thrown away, purely to learn whether it decodes at all. A signature is
+            // not a decode: `guess_format` reads eight bytes, so a PNG truncated mid-IDAT and a PNG
+            // whose IHDR is zeroed both classify as clean pass-throughs and travel to the provider
+            // as `image/png`. `Convert` has always decoded, which meant a broken TIFF was caught
+            // and a broken PNG was not -- safety by accident of which formats need transcoding.
+            refuse_if_undecodable(bytes, format)?;
             Ok((format.to_mime_type(), bytes.to_vec()))
         }
         ImageHandling::Convert(format) => {
@@ -325,6 +448,37 @@ mod tests {
     /// JPEG has no alpha channel, so it needs an RGB source rather than the RGBA one above.
     fn synthesize_jpeg_bytes() -> Vec<u8> {
         let img = image::RgbImage::from_pixel(4, 4, image::Rgb([128, 64, 200]));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), ImageFormat::Jpeg)
+            .expect("encode");
+        out
+    }
+
+    /// A large JPEG that is cheap to build and cheap to encode: broad flat blocks, so the file
+    /// stays well inside the byte cap at dimensions whose *decoded* size is the point.
+    fn synthesize_flat_jpeg(width: u32, height: u32) -> Vec<u8> {
+        // A single fill rather than a per-pixel pattern: these two assertions are about declared
+        // dimensions, not content, and at ~45 megapixels the pattern was the dominant cost of the
+        // whole `image::` test module.
+        let img = image::RgbImage::from_pixel(width, height, image::Rgb([96, 128, 200]));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), ImageFormat::Jpeg)
+            .expect("encode");
+        out
+    }
+
+    /// A JPEG with enough detail to have a scan worth truncating. A flat fill compresses to a few
+    /// hundred bytes that are almost all header, so cutting it tests the marker parser rather than
+    /// the entropy-coded data every real photograph is mostly made of.
+    fn synthesize_detailed_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(width, height);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x.wrapping_mul(7) ^ y.wrapping_mul(13)) as u8,
+                (x.wrapping_mul(31) ^ y.wrapping_mul(3)) as u8,
+                (x ^ y) as u8,
+            ]);
+        }
         let mut out = Vec::new();
         img.write_to(&mut Cursor::new(&mut out), ImageFormat::Jpeg)
             .expect("encode");
@@ -488,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_prepare_pass_through_within_limit() {
-        let bytes = vec![0u8; 128];
+        let bytes = synthesize_image_bytes(ImageFormat::Png);
         let (media_type, payload) =
             prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &bytes)
                 .expect("ok");
@@ -496,6 +650,177 @@ mod tests {
         assert_eq!(payload, bytes);
     }
 
+    /// The defect this decode exists to catch, and the one a signature check cannot.
+    ///
+    /// `guess_format` reads eight bytes, so a PNG truncated mid-IDAT is still `PassThrough(Png)`
+    /// and was forwarded verbatim as `image/png`. It then failed in the provider's decoder, inside
+    /// a `tool_result` already committed to the session, where it failed every later request too.
+    #[test]
+    fn test_prepare_refuses_a_truncated_payload_that_sniffs_clean() {
+        let png = synthesize_image_bytes_sized(ImageFormat::Png, 64, 64);
+        let truncated = &png[..png.len() / 2];
+        assert_eq!(
+            classify_bytes(truncated),
+            ImageHandling::PassThrough(ImageFormat::Png),
+            "the fixture has to still sniff as a clean PNG, or it proves nothing"
+        );
+        let error = prepare_image_payload(ImageHandling::Unsupported, truncated)
+            .expect_err("a payload that does not decode must not be forwarded");
+        assert!(error.contains("decode"), "{error}");
+    }
+
+    /// The same defect in JPEG, which `image` cannot answer at all.
+    ///
+    /// Its JPEG codec hardcodes `set_strict_mode(false)`, so `ImageReader::decode` returns a
+    /// picture for a stream truncated to a tenth of its bytes. Every fraction is checked because
+    /// the interesting ones are the *late* truncations: a 99% JPEG is what an interrupted download
+    /// or a full disk actually produces, and it looked perfect to the check this replaces.
+    #[test]
+    fn test_prepare_refuses_a_truncated_jpeg_at_every_depth() {
+        let jpeg = synthesize_detailed_jpeg(400, 400);
+        for percent in [10usize, 25, 50, 75, 90, 99] {
+            let truncated = &jpeg[..jpeg.len() * percent / 100];
+            assert_eq!(
+                classify_bytes(truncated),
+                ImageHandling::PassThrough(ImageFormat::Jpeg),
+                "the fixture has to still sniff as a clean JPEG at {percent}%"
+            );
+            let error = prepare_image_payload(ImageHandling::Unsupported, truncated)
+                .expect_err("a truncated JPEG must not be forwarded");
+            assert!(error.contains("decode"), "{percent}%: {error}");
+        }
+    }
+
+    /// And a scan corrupted in place, which keeps the length and the trailing `FF D9` marker. This
+    /// is the case that rules out checking for that marker instead of decoding.
+    #[test]
+    fn test_prepare_refuses_a_jpeg_whose_scan_is_corrupt() {
+        let mut jpeg = synthesize_detailed_jpeg(400, 400);
+        let middle = jpeg.len() / 2;
+        for byte in &mut jpeg[middle..middle + 256] {
+            *byte ^= 0xFF;
+        }
+        assert_eq!(
+            jpeg[jpeg.len() - 2..],
+            [0xFF, 0xD9],
+            "the end-of-image marker has to survive, or this proves nothing"
+        );
+        let error = prepare_image_payload(ImageHandling::Unsupported, &jpeg)
+            .expect_err("a corrupt scan must not be forwarded");
+        assert!(error.contains("decode"), "{error}");
+    }
+
+    /// A tall JPEG is forwarded, not refused, and does not cost more than the ceiling to find out.
+    ///
+    /// `zune`'s default axis caps are 16384, enforced in frame-header parsing regardless of strict
+    /// mode, so a full-page mobile screenshot was refused as "failed to decode" and the user was
+    /// shown a message telling them to call `set_limits`. It is a few hundred kilobytes, sniffs
+    /// clean, and decodes fine under the permissive decoder: nothing about it is broken.
+    ///
+    /// The same defaults would otherwise allow 16384x16384x3 -- about 805 MB against a 128 MiB
+    /// ceiling -- so this also pins the other direction: an image whose declared frame exceeds the
+    /// ceiling is passed through *unverified*, exactly as the non-JPEG path treats
+    /// `ImageError::Limits`, rather than being decoded.
+    #[test]
+    fn test_prepare_forwards_a_jpeg_past_the_axis_and_alloc_ceilings() {
+        let tall = synthesize_flat_jpeg(1_080, 20_000);
+        assert!(
+            tall.len() < MAX_IMAGE_RAW_BYTES,
+            "the fixture has to pass the byte cap, or it is refused for the wrong reason"
+        );
+        assert_eq!(
+            classify_bytes(&tall),
+            ImageHandling::PassThrough(ImageFormat::Jpeg)
+        );
+        let (media_type, payload) = prepare_image_payload(ImageHandling::Unsupported, &tall)
+            .expect("forwarded, not judged");
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(payload, tall, "forwarded unaltered");
+
+        // Over the alloc ceiling (8000 x 6000 x 3 = 144 MB), so meka must decline to decode it at
+        // all. Truncated on purpose: a *valid* oversized JPEG passes whether or not the ceiling is
+        // honoured, so it cannot tell "declined" from "decoded anyway". This one is refused the
+        // moment anything actually decodes it, which makes the pass evidence that nothing did.
+        let huge = synthesize_flat_jpeg(8_000, 6_000);
+        assert!(
+            huge.len() < MAX_IMAGE_RAW_BYTES,
+            "still inside the byte cap"
+        );
+        let truncated = &huge[..huge.len() * 3 / 4];
+        assert_eq!(
+            classify_bytes(truncated),
+            ImageHandling::PassThrough(ImageFormat::Jpeg),
+            "the fixture still sniffs as a JPEG"
+        );
+        prepare_image_payload(ImageHandling::Unsupported, truncated)
+            .expect("declining to spend the memory is a pass, not a refusal");
+    }
+
+    /// Strict mode has to stay strict about damage and permissive about everything else. A JPEG
+    /// carrying bytes after its end-of-image marker is ordinary and must not be refused; so must a
+    /// tiny one, whose entire scan is shorter than the headers around it.
+    #[test]
+    fn test_prepare_accepts_ordinary_jpegs() {
+        let plain = synthesize_jpeg_bytes();
+        prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Jpeg), &plain)
+            .expect("a 4x4 JPEG is a JPEG");
+
+        let mut trailing = synthesize_detailed_jpeg(64, 64);
+        trailing.extend_from_slice(b"trailing bytes some encoders append");
+        prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Jpeg), &trailing)
+            .expect("bytes after the end-of-image marker are not damage");
+    }
+
+    /// An image too big to decode under the ceiling is forwarded, not refused.
+    ///
+    /// The check must separate "this is broken" from "I declined to spend the memory finding out".
+    /// A 6000x6000 screenshot is a few hundred kilobytes, is inside every provider's dimension cap,
+    /// and decodes to more than [`MAX_DECODE_ALLOC_BYTES`]; refusing it would break a working case
+    /// to defend meka's memory, which declining to decode already does.
+    #[test]
+    fn test_prepare_forwards_an_image_too_large_to_decode_under_the_ceiling() {
+        let huge = synthesize_image_bytes_sized(ImageFormat::Png, 6000, 6000);
+        assert!(
+            huge.len() < MAX_IMAGE_RAW_BYTES,
+            "the fixture has to pass the byte cap, or it is refused for the wrong reason"
+        );
+        // Also pins what the *conversion* path says about the same bytes. It has no choice but to
+        // fail, and it used to report a merely-large image as a corrupt one, which sends somebody
+        // to re-export a file that was never broken.
+        let ceiling = decode_with_limits(&huge, ImageFormat::Png)
+            .expect_err("has to exceed the decode ceiling, or it proves nothing");
+        assert!(
+            ceiling.contains("too large to convert"),
+            "a size refusal must not read as a corruption refusal: {ceiling}"
+        );
+        assert!(
+            !ceiling.contains("failed to decode"),
+            "and must not carry the corruption wording at all: {ceiling}"
+        );
+        let (media_type, payload) =
+            prepare_image_payload(ImageHandling::Unsupported, &huge).expect("forwarded unverified");
+        assert_eq!(media_type, "image/png");
+        assert_eq!(payload, huge, "forwarded unaltered");
+    }
+
+    /// The sibling shape: the signature is intact and the header behind it is not, so the failure
+    /// surfaces from the decoder rather than from a short read.
+    #[test]
+    fn test_prepare_refuses_a_corrupt_header_behind_a_valid_signature() {
+        let mut png = synthesize_image_bytes_sized(ImageFormat::Png, 64, 64);
+        png[8..16].fill(0);
+        assert_eq!(
+            classify_bytes(&png),
+            ImageHandling::PassThrough(ImageFormat::Png)
+        );
+        let error = prepare_image_payload(ImageHandling::Unsupported, &png)
+            .expect_err("a payload that does not decode must not be forwarded");
+        assert!(error.contains("decode"), "{error}");
+    }
+
+    /// Also pins the ordering: the cap is checked before the decode, so an oversized payload is
+    /// refused for its size rather than paying for a decode it was never going to survive. These
+    /// bytes are not a PNG, so a decode-first arm would report the wrong reason.
     #[test]
     fn test_prepare_pass_through_oversized_errors() {
         let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];

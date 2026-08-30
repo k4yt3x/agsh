@@ -63,6 +63,8 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zune-core = "0.5"
+zune-jpeg = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

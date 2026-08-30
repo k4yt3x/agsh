@@ -681,6 +681,38 @@ fn acp_first_turn_emits_session_info_update_title() {
     );
 }
 
+/// A provider advisory reaches the editor as an assistant-message chunk prefixed `[meka]`.
+///
+/// ACP has no notice primitive, so this chunk is the *only* way an advisory reaches a client, and
+/// the prefix is the only thing letting one filter or style it. The degrade-and-retry uses it to
+/// say that content was removed from the turn, which makes this the difference between an editor
+/// user being told and a tool result quietly changing under them.
+///
+/// Deleting the `FrontendEvent::Notice` arm that produces it left every suite green: it was the one
+/// mutant the sweep over this changeset missed.
+#[test]
+fn acp_forwards_a_provider_notice_as_a_prefixed_assistant_chunk() {
+    let script = serde_json::json!([[
+        { "kind": "notice", "message": "context is filling up" },
+        { "kind": "text", "text": "ok" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "hello");
+    let (updates, _response) = harness.collect_updates(&sid, id);
+
+    let chunks: Vec<&str> = updates
+        .iter()
+        .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|value| value["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(
+        chunks.contains(&"[meka] context is filling up"),
+        "the advisory must reach the client, prefixed: {chunks:?}"
+    );
+}
+
 /// `session/prompt` reports session-cumulative token usage on the response, alongside the
 /// per-turn `usage_update` notification that carries the context gauge.
 #[test]
@@ -4822,8 +4854,10 @@ fn acp_session_prompt_accepts_image_with_vision() {
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
     let sid = harness.new_session();
-    // A 1x1 transparent PNG, base64-encoded.
-    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    // A 1x1 transparent PNG, base64-encoded, and it has to be a real one: meka decodes every
+    // attachment before forwarding it. The fixture here used to be a hand-mangled PNG with a bad
+    // IDAT checksum and a truncated final chunk, which passed only because nothing ever decoded it.
+    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     let id = harness.send_request(
         "session/prompt",
         serde_json::json!({

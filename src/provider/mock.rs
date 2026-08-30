@@ -273,6 +273,10 @@ impl Provider for MockProvider {
                     return Err(crate::error::MekaError::RetryableProvider {
                         message,
                         retry_after: retry_after_secs.map(std::time::Duration::from_secs),
+                        // Models the shape the classifier gives a 5xx answering a completion,
+                        // which is the one the degrade-and-retry keys on. A test wanting the
+                        // other shape drives `error::provider_transport_error` directly.
+                        server_error_on_completion: true,
                     });
                 }
                 MockEvent::FailInvalidRequest { message } => {
@@ -388,6 +392,10 @@ impl Provider for MockProvider {
                     return Err(crate::error::MekaError::RetryableProvider {
                         message,
                         retry_after: retry_after_secs.map(std::time::Duration::from_secs),
+                        // Models the shape the classifier gives a 5xx answering a completion,
+                        // which is the one the degrade-and-retry keys on. A test wanting the
+                        // other shape drives `error::provider_transport_error` directly.
+                        server_error_on_completion: true,
                     });
                 }
                 MockEvent::FailInvalidRequest { message } => {
@@ -588,6 +596,7 @@ mod tests {
             crate::error::MekaError::RetryableProvider {
                 message,
                 retry_after,
+                ..
             } => {
                 assert_eq!(message, "overloaded");
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(3)));

@@ -35,13 +35,16 @@ use uuid::Uuid;
 type DeferredSet = Arc<std::sync::RwLock<HashSet<String>>>;
 
 /// Name of the meta-tool that loads a deferred tool's schema. Calls to this tool are scanned out of
-/// the conversation to compute the per-turn active tool set; see [`extract_loaded_tool_names`].
+/// the conversation to compute the per-turn active tool set; see
+/// [`crate::conversation::extract_loaded_tool_names_from_events`].
 pub const LOAD_TOOL_NAME: &str = "load_tool";
 
+#[cfg(test)]
+use crate::provider::{ContentBlock, Message};
 use crate::{
     error::Result,
     permission::Permission,
-    provider::{ContentBlock, Message, ToolDefinition, ToolResultContent},
+    provider::{ToolDefinition, ToolResultContent},
     session::SessionManager,
 };
 
@@ -343,7 +346,11 @@ pub fn schema_disagreement(
             tool_name,
         ));
     }
-    Some(format!("\n\n[meka] {}", lines.join("\n")))
+    Some(format!(
+        "\n\n{} {}",
+        crate::conversation::HARNESS_NOTE,
+        lines.join("\n")
+    ))
 }
 
 /// `" Did you mean `a` or `b`?"` for a tool name that isn't registered, or `""` when nothing is
@@ -487,7 +494,7 @@ pub const MAX_LOAD_TOOL_BATCH: usize = 10;
 /// [`MAX_LOAD_TOOL_BATCH`].
 ///
 /// Accepts a bare string or an array of strings: a task needing three tools off one server should
-/// cost one round trip, not three. Shared with [`extract_loaded_tool_names`] so the active set is
+/// cost one round trip, not three. Shared with the scanners that recover the active set, so it is
 /// derived from exactly the names the tool acted on, cap included. A name dropped by the cap must
 /// not become active, since its schema was never rendered.
 pub fn load_tool_names(input: &serde_json::Value) -> Vec<String> {
@@ -519,13 +526,20 @@ pub fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
 /// `tool_result` whose `tool_use_id` matches; this excludes errored loads (unknown name, malformed
 /// args) and orphan `tool_use` blocks awaiting their result.
 ///
-/// The active set is a pure function of the message slice, so the tools array sent to the Claude
-/// API is deterministic given the conversation state. Resumed sessions reconstruct the exact active
-/// set their suspend time had, with no out-of-band state.
-///
 /// A batch that resolved some names and not others returns a non-error result, so every name it
 /// carried is recorded here. Harmless: a name with no registry entry matches nothing when the
 /// active set is assembled (see [`ToolRegistry::definitions_active_with_loaded`]).
+///
+/// **Test-only, and compiled out otherwise, because the answer it gives is not the one production
+/// wants.** A materialized slice shows only the `load_tool` exchanges still standing in the current
+/// view, and two ordinary things take them out of it: a compaction replaces everything before its
+/// boundary with a summary that names nothing, and `DegradeTier::ToolExchanges` empties a refused
+/// call in place. Both leave a load that really happened invisible here.
+/// [`crate::conversation::extract_loaded_tool_names_from_events`] reads the log instead and so
+/// survives both, which is why every production caller uses it. Keeping this one available to tests
+/// that hold a plain `Vec<Message>` is fine; `#[cfg(test)]` is what stops it drifting back into a
+/// live path, which is how the compaction snapshot came to be built from it.
+#[cfg(test)]
 pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
     let mut pending: HashMap<String, Vec<String>> = HashMap::new();
     let mut loaded: HashSet<String> = HashSet::new();
@@ -1414,8 +1428,8 @@ impl ToolRegistry {
     /// Returns every active tool definition regardless of the caller's current permission. The
     /// active set is the union of non-deferred tools and deferred tools whose schema has been
     /// loaded via the `load_tool` meta-tool. `loaded` is computed by the caller (via
-    /// [`crate::conversation::extract_loaded_tool_names_from_events`] for the agent loop,
-    /// [`extract_loaded_tool_names`] for tests).
+    /// [`crate::conversation::extract_loaded_tool_names_from_events`], which is the only door for
+    /// that question outside tests).
     ///
     /// Blocked calls are rejected at dispatch; keeping the tools array permission-independent is
     /// what preserves the prompt cache prefix across `/permission` toggles (breakpoint 3 in the

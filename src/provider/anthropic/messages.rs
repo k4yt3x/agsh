@@ -456,6 +456,7 @@ mod tests {
             MekaError::RetryableProvider {
                 message,
                 retry_after,
+                ..
             } => {
                 assert!(
                     message.starts_with("failed to read response"),
@@ -556,6 +557,39 @@ mod tests {
         );
         // Thinking off on a 1M-capable model → no betas at all.
         assert!(provider("claude-opus-4-8", None).compute_betas().is_none());
+    }
+
+    /// A repaired `tool_use` reaches the wire with the arguments the repair put on it, unexamined.
+    ///
+    /// `DegradeTier::ToolExchanges` empties a refused call in place, which leaves its `input` no
+    /// longer matching the tool's declared schema. That is only safe because a replayed `tool_use`
+    /// is a record of what happened rather than a request to validate, so nothing on the way out
+    /// should be checking it. This pins meka's half of that: whatever the repair wrote is what gets
+    /// sent. The other half, that the provider accepts it, is the provider's and cannot be asserted
+    /// here.
+    #[test]
+    fn test_a_repaired_tool_use_reaches_the_wire_with_its_arguments_unexamined() {
+        let provider = test_provider();
+        let messages = vec![Message::user("read my notes"), Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![crate::provider::ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                // What the repair leaves behind: nothing the tool's schema declares.
+                input: serde_json::json!({"[meka harness]": "arguments removed"}),
+            }],
+        }];
+        let body = provider.build_request_body("be nice", &messages, &[], false);
+
+        let serialized = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            serialized.contains("[meka harness]"),
+            "the repaired input must survive to the wire verbatim: {serialized}"
+        );
+        assert!(
+            serialized.contains("read_file") && serialized.contains("call_1"),
+            "and the call keeps its identity, so its result is not orphaned: {serialized}"
+        );
     }
 
     #[test]

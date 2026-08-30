@@ -2241,8 +2241,46 @@ fn turn_with_neither_message_nor_images_returns_422() {
     assert_eq!(response.status(), 422);
 }
 
+/// A payload that is valid base64 *and* sniffs as a PNG, but does not decode.
+///
+/// This is the one the decode guard exists for, and the door meka does not control: a client can
+/// post anything. The sibling below stops at base64, which fails a line earlier and never reaches
+/// the decode, so before this the whole HTTP layer could lose that guard and stay green.
 #[test]
-fn turn_with_undecodable_image_returns_422() {
+fn turn_with_truncated_image_returns_422() {
+    use base64::Engine as _;
+
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(TINY_PNG_BASE64)
+        .expect("the fixture is valid base64");
+    let truncated = base64::engine::general_purpose::STANDARD.encode(&png[..png.len() * 2 / 3]);
+
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({
+            "message": "look",
+            "images": [{"media_type": "image/png", "data": truncated}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 422);
+    let detail = response.json::<serde_json::Value>().expect("parse")["detail"]
+        .as_str()
+        .expect("detail")
+        .to_string();
+    assert!(detail.contains("images[0]"), "{detail}");
+    assert!(
+        detail.contains("decode"),
+        "the refusal has to name the decode, not the base64: {detail}"
+    );
+}
+
+/// The sibling: not base64 at all, refused one step earlier. Named for what it actually feeds.
+#[test]
+fn turn_with_unparseable_image_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness

@@ -709,6 +709,9 @@ pub(super) fn process_event(
                 MekaError::RetryableProvider {
                     message,
                     retry_after: None,
+                    // As in the Claude backend: a mid-stream error event cannot be told apart from
+                    // an overload, so it does not license deleting content.
+                    server_error_on_completion: false,
                 }
             } else {
                 MekaError::Provider(message)

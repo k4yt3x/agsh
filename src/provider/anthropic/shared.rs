@@ -957,6 +957,11 @@ pub(super) async fn drive_claude_sse_stream(
                                     MekaError::RetryableProvider {
                                         message,
                                         retry_after: None,
+                                        // False even though a completion was in flight: this
+                                        // arrives as an SSE event and the stream layer cannot tell
+                                        // an overload from a failure to handle the body, so it
+                                        // does not license deleting content.
+                                        server_error_on_completion: false,
                                     }
                                 } else {
                                     MekaError::Provider(message)

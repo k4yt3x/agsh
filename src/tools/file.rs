@@ -2546,6 +2546,49 @@ mod tests {
         assert!(text_content(&result).contains("line3"));
     }
 
+    /// The regression the whole image path exists to prevent, at the door it comes through.
+    ///
+    /// A truncated PNG keeps a perfect 8-byte signature, so it sniffed as a clean pass-through and
+    /// was base64'd into the conversation. It then failed inside the provider's decoder, in a
+    /// `tool_result` already committed to the session, which failed every later turn as well; the
+    /// gateway reported that as `500`, so meka re-sent it twice and kept it. An error here costs
+    /// the model one tool call and nothing else.
+    #[tokio::test]
+    async fn test_read_file_refuses_an_image_that_does_not_decode() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let file_path = temp_dir.path().join("truncated.png");
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode");
+        png.truncate(png.len() / 2);
+        std::fs::write(&file_path, &png).expect("failed to write");
+
+        let tool = ReadFileTool {
+            read_tracker: test_tracker(),
+            cwd: crate::workspace::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"path": file_path.to_str().expect("path")}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a broken image is a tool error, not a failed turn");
+
+        assert!(result.is_error, "{:?}", result.content);
+        let text = text_content(&result);
+        assert!(text.contains("decode"), "says why: {text}");
+        assert!(
+            !result
+                .content
+                .iter()
+                .any(|item| matches!(item, ToolResultContent::Image { .. })),
+            "and forwards nothing the provider would choke on"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_file_falls_back_when_client_cannot_serve_path() {
         // Regression: a delegate failure used to abort the read. Editors serve `fs/read_text_file`

@@ -1,6 +1,7 @@
 //! `load_tool` meta-tool: makes a deferred tool's full schema visible to the model on subsequent
 //! turns. The active tool set is derived by scanning the conversation for successful `load_tool`
-//! calls ([`super::extract_loaded_tool_names`]); this tool's `execute` only renders the description
+//! calls ([`crate::conversation::extract_loaded_tool_names_from_events`]); this tool's `execute`
+//! only renders the description
 //! and schema as `tool_result` text. It never mutates the registry.
 
 use std::{

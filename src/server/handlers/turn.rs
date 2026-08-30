@@ -331,7 +331,7 @@ pub async fn submit_turn(
     // attachment is admissible is a fact about *this session's* profile, and the session is not
     // resolved until now. A refusal drops `turn_guard` on the way out, so a rejected attachment
     // still leaves the session idle rather than reporting a turn in flight.
-    let images = decode_turn_images(&body.images, entry.binding.current().vision)?;
+    let images = decode_turn_images(&body.images, entry.binding.current().vision).await?;
 
     if body.stream {
         // SSE responses are streamed live and aren't a single envelope we can cache.
@@ -471,10 +471,16 @@ async fn commit_idempotency(
 ///
 /// Every failure is a 422: these are all malformed input, not server faults.
 ///
+/// Off the runtime, for the reason `read_file` and `fetch_url` document at their own call sites:
+/// the pipeline base64-decodes and then decodes each image to verify it, which is tens of
+/// milliseconds of pure CPU on a multi-megapixel attachment, and on the runtime it blocks every
+/// other task on that worker. One client posting a screenshot must not stall an unrelated
+/// session's stream.
+///
 /// The `allow` matches the rest of this module's validation helpers: `ProblemDetail` is a large
 /// struct by design (RFC 9457 members plus an extensions map) and boxing it here alone would make
 /// the error type inconsistent with every other handler.
-fn decode_turn_images(
+async fn decode_turn_images(
     images: &[ImageInput],
     vision: bool,
 ) -> Result<Vec<crate::provider::ImageSource>, ProblemDetail> {
@@ -489,19 +495,33 @@ fn decode_turn_images(
              true` under `[providers.<name>]` or omit `images`",
         ));
     }
-    images
+    let owned: Vec<(String, String)> = images
         .iter()
-        .enumerate()
-        .map(|(index, image)| {
-            crate::image::decode_base64_image(&image.data, &image.media_type).map_err(|message| {
-                ProblemDetail::new(
-                    ErrorKind::InvalidBody,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("`images[{}]` is invalid: {}", index, message),
-                )
+        .map(|image| (image.data.clone(), image.media_type.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        owned
+            .iter()
+            .enumerate()
+            .map(|(index, (data, media_type))| {
+                crate::image::decode_base64_image(data, media_type).map_err(|message| {
+                    ProblemDetail::new(
+                        ErrorKind::InvalidBody,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("`images[{}]` is invalid: {}", index, message),
+                    )
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
+    .await
+    .map_err(|error| {
+        ProblemDetail::new(
+            ErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("image decode task failed: {}", error),
+        )
+    })?
 }
 
 /// Extract the `Idempotency-Key` header, validating that it isn't empty and stays within
@@ -1605,54 +1625,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_turn_images_accepts_a_png() {
-        let decoded = decode_turn_images(&[png_input()], true).expect("should decode");
+    #[tokio::test]
+    async fn decode_turn_images_accepts_a_png() {
+        let decoded = decode_turn_images(&[png_input()], true)
+            .await
+            .expect("should decode");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].media_type, "image/png");
         assert_eq!(decoded[0].source_type, "base64");
         assert!(!decoded[0].data.is_empty());
     }
 
-    #[test]
-    fn decode_turn_images_is_a_noop_without_attachments() {
+    #[tokio::test]
+    async fn decode_turn_images_is_a_noop_without_attachments() {
         // The vision flag is irrelevant when nothing is attached: a text-only profile must still
         // be able to take ordinary turns.
         assert!(
             decode_turn_images(&[], false)
+                .await
                 .expect("no images")
                 .is_empty()
         );
     }
 
-    #[test]
-    fn decode_turn_images_rejects_attachments_when_vision_is_off() {
-        let problem = decode_turn_images(&[png_input()], false).expect_err("should reject");
+    #[tokio::test]
+    async fn decode_turn_images_rejects_attachments_when_vision_is_off() {
+        let problem = decode_turn_images(&[png_input()], false)
+            .await
+            .expect_err("should reject");
         assert_eq!(problem.status, 422);
         assert!(problem.detail.unwrap_or_default().contains("vision"));
     }
 
-    #[test]
-    fn decode_turn_images_rejects_invalid_base64() {
+    #[tokio::test]
+    async fn decode_turn_images_rejects_invalid_base64() {
         let bad = ImageInput {
             media_type: "image/png".to_string(),
             data: "!!!not-base64!!!".to_string(),
         };
-        let problem = decode_turn_images(&[bad], true).expect_err("should reject");
+        let problem = decode_turn_images(&[bad], true)
+            .await
+            .expect_err("should reject");
         assert_eq!(problem.status, 422);
         assert!(problem.detail.unwrap_or_default().contains("images[0]"));
     }
 
     /// The offending index is named so a client sending several attachments knows which one to
     /// fix, rather than being told only that "an image" was bad.
-    #[test]
-    fn decode_turn_images_names_the_failing_index() {
+    #[tokio::test]
+    async fn decode_turn_images_names_the_failing_index() {
         use base64::Engine as _;
         let garbage = ImageInput {
             media_type: "application/octet-stream".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(b"not an image"),
         };
-        let problem = decode_turn_images(&[png_input(), garbage], true).expect_err("should reject");
+        let problem = decode_turn_images(&[png_input(), garbage], true)
+            .await
+            .expect_err("should reject");
         assert_eq!(problem.status, 422);
         let detail = problem.detail.unwrap_or_default();
         assert!(detail.contains("images[1]"), "{}", detail);
@@ -1660,23 +1689,27 @@ mod tests {
 
     /// A declared MIME type that names no supported format still decodes when the payload's magic
     /// bytes do, so a client that labels its upload `application/octet-stream` isn't stuck.
-    #[test]
-    fn decode_turn_images_falls_back_to_magic_bytes() {
+    #[tokio::test]
+    async fn decode_turn_images_falls_back_to_magic_bytes() {
         let mut input = png_input();
         input.media_type = "application/octet-stream".to_string();
-        let decoded = decode_turn_images(&[input], true).expect("should decode via magic bytes");
+        let decoded = decode_turn_images(&[input], true)
+            .await
+            .expect("should decode via magic bytes");
         assert_eq!(decoded[0].media_type, "image/png");
     }
 
-    #[test]
-    fn decode_turn_images_rejects_oversized_payloads() {
+    #[tokio::test]
+    async fn decode_turn_images_rejects_oversized_payloads() {
         use base64::Engine as _;
         let raw = vec![0u8; crate::image::MAX_IMAGE_RAW_BYTES + 1];
         let oversized = ImageInput {
             media_type: "image/png".to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&raw),
         };
-        let problem = decode_turn_images(&[oversized], true).expect_err("should reject");
+        let problem = decode_turn_images(&[oversized], true)
+            .await
+            .expect_err("should reject");
         assert_eq!(problem.status, 422);
     }
 }

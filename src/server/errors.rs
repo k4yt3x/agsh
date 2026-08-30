@@ -338,6 +338,7 @@ impl From<&MekaError> for ProblemDetail {
             MekaError::RetryableProvider {
                 message,
                 retry_after,
+                ..
             } => {
                 tracing::warn!("provider error: {}", message);
                 let problem = ProblemDetail::new(
@@ -474,6 +475,7 @@ mod tests {
             MekaError::RetryableProvider {
                 message: leaky.to_string(),
                 retry_after: None,
+                server_error_on_completion: false,
             },
             MekaError::StreamError(leaky.to_string()),
         ] {
@@ -528,6 +530,7 @@ mod tests {
             MekaError::RetryableProvider {
                 message: "529 overloaded, four attempts".into(),
                 retry_after: None,
+                server_error_on_completion: false,
             },
             MekaError::StreamError("connection closed mid-stream".into()),
         ] {
@@ -589,6 +592,7 @@ mod tests {
         let problem = ProblemDetail::from(&MekaError::RetryableProvider {
             message: "429 rate limited".into(),
             retry_after: Some(std::time::Duration::from_secs(30)),
+            server_error_on_completion: false,
         });
         assert_eq!(problem.retry_after_seconds, Some(30));
         assert_eq!(
@@ -599,6 +603,7 @@ mod tests {
         let absurd = ProblemDetail::from(&MekaError::RetryableProvider {
             message: "529 overloaded".into(),
             retry_after: Some(std::time::Duration::from_secs(31_536_000)),
+            server_error_on_completion: false,
         });
         assert_eq!(
             absurd.retry_after_seconds,
@@ -609,6 +614,7 @@ mod tests {
         let silent = ProblemDetail::from(&MekaError::RetryableProvider {
             message: "connection reset".into(),
             retry_after: None,
+            server_error_on_completion: false,
         });
         assert_eq!(
             silent.retry_after_seconds, None,

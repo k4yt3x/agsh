@@ -22,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka mcp get` reports which kinds of credential a server has stored, without printing them.
 - `meka provider set <name> <key> <value>` changes one profile setting, keeping the rest intact.
 - `provider add` gains six flags for the remaining profile fields, so any profile is one command.
+- A turn whose repair did not help points at `/rewind` before it fails.
 
 ### Changed
 
+- Notes meka writes into a conversation are prefixed `[meka harness]`, not `[meka]`.
 - An MCP meta-tool's indicator names the resource or prompt it acts on, not the server holding it.
 - `/provider` lists one profile per line with its backend, under a heading, not a comma-joined run.
 - `/status` orders its resolved-profile lines the way `[providers.<name>]` declares them.
@@ -68,6 +70,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An image whose bytes do not decode is refused when read, not sent for the provider to choke on.
+- A truncated or corrupt JPEG is refused; the shared decoder accepted one cut to a tenth.
+- A JPEG taller or wider than 16384 px is forwarded, not refused as corrupt by the new check.
+- A JPEG over the decode ceiling is no longer decoded; it bypassed the limit every format honours.
+- A 5xx on a completion that outlives every retry degrades the turn's content, not just a 400.
+- A 5xx waits 8s and re-sends unchanged before degrading, so a passing outage costs no content.
+- A request the provider accepts restores the turn's reprieve and tier budget for later rounds.
+- The degrade notice names `meka session export --format json`, which still holds what it removed.
+- A refused text-only tool exchange is emptied in place; it used to break every later turn.
+- A turn that compacted on the way in can still degrade; the suspect window was left empty.
+- A failed emergency compaction restores the degraded content instead of stranding it in memory.
+- A repair the provider accepted no longer counts against the turn's next, cheaper repair.
+- A compaction keeps deferred tools loaded before an earlier compaction or a repaired call.
+- A too-large image says so when converting, rather than reporting itself as corrupt.
 - `/history` replays a built-in's argument; nineteen of them replayed as a bare tool name.
 - `context_compact`'s indicator shows its instructions, where it showed no argument anywhere.
 - `[display]` blank lines now bracket everything between two prompts, including failures.

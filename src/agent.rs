@@ -2,11 +2,16 @@
 //! messages to the session store. Also handles mid-conversation auto-compaction when the
 //! input-token budget is exceeded.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::conversation::HARNESS_NOTE;
 
 /// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
 /// protocol (e.g. the ACP `session/prompt` response) use this to map to a protocol-level stop
@@ -186,10 +191,74 @@ pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
 /// overflows, looping won't help.
 const MAX_OVERFLOW_RETRIES: u32 = 1;
 
-/// How many times a single turn may degrade-and-retry after the provider rejects the request as
-/// malformed. One pass strips every non-text block meka added since the last accepted request, so a
-/// second pass would have nothing left to remove.
-const MAX_REQUEST_REPAIRS: u32 = 1;
+/// What a turn is willing to destroy of its own content in order to get a request accepted, least
+/// damaging first. A tier that failed is undone before the next is tried, and running off the end
+/// fails the turn.
+///
+/// The walk is bounded *per stretch of consecutive failure*, not per turn:
+/// [`TurnRecovery::note_request_accepted`] clears it on every request the provider takes, and a
+/// compaction clears it too, having replaced the conversation the tiers were measured against. So a
+/// turn making progress through many tool rounds can spend the list once per round.
+///
+/// One such round costs at most four request *sequences* -- the refusal itself, the outage
+/// reprieve's unchanged re-send, then one per tier -- each of them
+/// [`crate::provider::retry::MAX_PROVIDER_RETRIES`] + 1 attempts, plus the reprieve's one
+/// deliberate wait. Lengthening this list adds a sequence to that figure, and the figure is per
+/// round rather than per turn.
+///
+/// Ordered, because the tiers are not alternatives. [`DegradeTier::Attachments`] leaves every tool
+/// call and result standing and removes only what a text-only conversation never had, which is the
+/// right first guess and usually the whole fix. [`DegradeTier::ToolExchanges`] destroys the turn's
+/// actual work product and is worth reaching for only once the cheap answer has been proven wrong.
+///
+/// **The list is short because each entry is a whole retry sequence, not one request.** A tier's
+/// attempt goes back through `run_streaming`, which starts its own `MAX_PROVIDER_RETRIES` and its
+/// own [`crate::provider::retry::RETRY_BUDGET`], so a provider failing every time costs one such
+/// sequence per tier before the turn gives up. That is the price of not stranding a session on a
+/// refusal a 5xx never explained, and it is only ever paid by a turn that was going to fail.
+/// Lengthening this list multiplies it.
+const DEGRADE_TIERS: [DegradeTier; 2] = [DegradeTier::Attachments, DegradeTier::ToolExchanges];
+
+/// What [`TurnRecovery::suspect_floor`] becomes once a compaction has rewritten the conversation:
+/// the whole of it is suspect.
+///
+/// A compaction replaces the conversation wholesale and stamps [`LAST_ACCEPTED_UNKNOWN`], which
+/// says exactly this -- no length recorded against the old shape addresses anything in the new one,
+/// so nothing in it is known-accepted. The floor has to say the same, and zero is the only value
+/// that does.
+///
+/// It used to be set to the post-compaction `messages.len()`, which is the opposite claim: that
+/// everything present is known-good. The clamp in `repair_rejected_content` then read the two as an
+/// *empty* suspect window, both tiers found nothing, and the degrade-and-retry became silently
+/// inert for the rest of the turn -- in exactly the large-conversation case that triggers a
+/// compaction and is likeliest to be carrying a refused attachment. It failed quietly: with no tier
+/// spent, even the `/rewind` hint stayed suppressed.
+///
+/// The cost is reach. Index 0 is the summary, plain text no tier touches, but the verbatim tail
+/// after it came from earlier turns, so a degrade here can empty a tool exchange this turn did not
+/// create. That is the same reach the cross-turn `last_accepted_len` already has, it happens only
+/// after the cheaper tier has been refused, and it is undone unless the retry carrying it succeeds.
+const SUSPECT_FLOOR_AFTER_REWRITE: usize = 0;
+
+/// How far [`degrade_rejected_content`] goes when rewriting the content a request was refused for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradeTier {
+    /// Replace non-text content -- a tool result's images, a message's own attachments -- with a
+    /// note, leaving the surrounding `tool_use` / `tool_result` structure untouched.
+    Attachments,
+    /// Empty the turn's tool exchanges where they stand: the call keeps its name and identity and
+    /// loses its arguments, which move into the result that reports it. Everything
+    /// [`Self::Attachments`] removes goes too, since a turn arrives here by having that tier
+    /// undone.
+    ///
+    /// Reaches content [`Self::Attachments`] cannot. A tool result is usually text, and a provider
+    /// that refuses one -- a body it cannot encode, a filter, sheer size -- leaves nothing for the
+    /// first tier to remove, so the turn used to die with the refused text still committed and
+    /// every later turn re-sent it. This also reaches the *arguments*, which no tier that
+    /// preserves the call can: a `tool_use` the provider objects to is repaired only by ceasing
+    /// to be one.
+    ToolExchanges,
+}
 
 /// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from the
 /// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
@@ -572,6 +641,10 @@ struct TurnRecovery {
     /// message (which may carry attached images) is inside the window a rejection can blame.
     /// Distinct from [`Self::turn_start_len`], which marks the start of the *loop's* additions
     /// and so excludes it.
+    ///
+    /// Reset to [`SUSPECT_FLOOR_AFTER_REWRITE`] by every compaction, because a number counted
+    /// against the conversation the compaction replaced does not address any message in the one it
+    /// produced.
     suspect_floor: usize,
     /// The log's length with this turn's prompt on the end and nothing after it. A withdrawal is
     /// only safe while it still reads this, so it is captured up front rather than reconstructed
@@ -584,8 +657,12 @@ struct TurnRecovery {
     /// Bounds the emergency compact-and-retry on a [`MekaError::ContextOverflow`] so a request
     /// that stays too large after one compaction fails cleanly instead of looping.
     overflow_retries: u32,
-    /// Bounds the degrade-and-retry on a [`MekaError::InvalidRequest`], in the same spirit.
-    repairs_used: u32,
+    /// How many entries of [`DEGRADE_TIERS`] this turn has already spent, so a tier that failed is
+    /// not tried again and the turn runs out of ideas after the last one. Bounds the
+    /// degrade-and-retry the way [`Self::overflow_retries`] bounds the compact-and-retry, but
+    /// counts positions in an ordered list rather than attempts, because which tier is next is the
+    /// whole state a repair needs to carry.
+    tiers_tried: usize,
     /// A repair applied to the in-memory conversation but not yet proven good by a 2xx, so not yet
     /// persisted. Dropped back into the log on success, undone on a second rejection.
     pending_repair: Option<crate::conversation::Event>,
@@ -596,6 +673,11 @@ struct TurnRecovery {
     /// Set once the model has been nudged for a user-visible response this turn, so the recovery
     /// fires at most once and can't loop (see [`should_nudge_thinking_only`]).
     thinking_only_nudged: bool,
+    /// Whether this turn has already spent its [`crate::provider::retry::OUTAGE_REPRIEVE`]: the
+    /// one wait-and-re-send-unchanged that separates a provider having a moment from a
+    /// provider that cannot handle this body. Once per turn, on the first refusal that could
+    /// be either, because a second would only re-measure what the first already answered.
+    outage_reprieve_used: bool,
 }
 
 impl TurnRecovery {
@@ -604,13 +686,26 @@ impl TurnRecovery {
     ///
     /// The compacted conversation already holds this turn's tool results, so the retry rebuilds the
     /// request base from it and re-sends. Everything reset here is a position measured against a
-    /// conversation that compaction has just rewritten, which is also why the pending repair goes:
-    /// [`crate::conversation::Event::Repair`] is position-relative, so one parked here would be
-    /// persisted *after* the new `CompactBoundary` and, on the next load, truncate the wrong
-    /// messages -- deleting the compaction summary outright when the split kept no tail, leaving
-    /// memory and disk permanently disagreeing for that session. A secondary effect was just as
-    /// bad: a later `InvalidRequest` in the same turn took the "already repaired" arm, found no
-    /// `Repair` at the tail, and killed the turn without ever attempting a fresh degrade.
+    /// conversation that compaction has just rewritten, which is also why any pending repair is
+    /// *undone* first: [`crate::conversation::Event::Repair`] is position-relative, so one left in
+    /// place would be persisted after the new `CompactBoundary` and, on the next load, truncate the
+    /// wrong messages -- deleting the compaction summary outright when the split kept no tail,
+    /// leaving memory and disk permanently disagreeing for that session.
+    ///
+    /// Undone rather than merely dropped, and before the compaction rather than after, for two
+    /// reasons the earlier "drop it" left open. A `ContextOverflow` says the request was too big;
+    /// it says nothing about whether the degraded content was the problem, so an unvindicated
+    /// repair kept here would be summarised into the boundary and become permanent on the
+    /// strength of a verdict that was never about it. And [`Self::compact_session`] can fail --
+    /// its summariser is a provider call, made against the provider that has just been
+    /// misbehaving -- in which case this returns before any reset runs, and a repair still
+    /// applied would be stranded in memory with nothing on disk for the rest of the process's
+    /// life.
+    ///
+    /// [`Self::tiers_tried`] resets for the same reason the positions do. A tier that found nothing
+    /// (or was refused) in the old conversation has said nothing about the new one.
+    ///
+    /// [`Self::compact_session`]: Agent::compact_session
     ///
     /// Returns the overflow the turn should fail with when the compaction itself failed, since
     /// re-sending the same request would be refused identically.
@@ -627,6 +722,10 @@ impl TurnRecovery {
             "provider reported context overflow; compacting and retrying ({})",
             reason
         );
+        // The rebuild this does is recomputed below from the compacted conversation, so it is
+        // redundant here rather than wrong. Kept because the alternative is a second entry point
+        // that undoes *without* restoring the request base, which is the shape the bug had.
+        self.undo_rejected_repair(agent, messages);
         if let Err(compact_error) = agent
             .compact_session(
                 session_id,
@@ -644,28 +743,38 @@ impl TurnRecovery {
             agent.options.context_messages,
         ));
         self.turn_start_len = messages.len();
-        self.suspect_floor = messages.len();
-        self.pending_repair = None;
+        self.suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
+        self.tiers_tried = 0;
         Ok(())
     }
 
-    /// Strip the non-text content appended since the last accepted request and retry once, after
-    /// the provider refused the request as malformed.
+    /// Degrade the content appended since the last accepted request and retry, after the provider
+    /// refused the request in a way the content could explain.
     ///
-    /// Retrying it unchanged is pointless (a 400 is deterministic on the body), and failing
-    /// outright is worse than it looks: the content is already committed to the session, so
-    /// every later request carries it and dies the same way, leaving the session unusable. The
-    /// model is told what happened through the tool result it is already equipped to read.
+    /// Retrying it unchanged is pointless (a rejection earned by the body is deterministic on the
+    /// body), and failing outright is worse than it looks: the content is already committed to the
+    /// session, so every later request carries it and dies the same way, leaving the session
+    /// unusable until somebody rewinds it by hand. The model is told what happened through the tool
+    /// result it is already equipped to read.
     ///
-    /// Returns the rejection the turn should fail with when there was nothing to strip, which means
-    /// the complaint was never about content: a `max_tokens` over the model's ceiling, an unknown
-    /// header, a bad `tool_choice`.
+    /// Walks [`DEGRADE_TIERS`] from wherever the turn left off, taking the first tier that finds
+    /// something to change. Skipping rather than failing on a tier with nothing to do matters:
+    /// a turn whose refused content is all text has no attachments to strip, and spending a round
+    /// trip to discover that would just delay the tier that can actually help.
+    ///
+    /// Returns `rejection` verbatim when no tier finds anything, which means the complaint was
+    /// never about content: a `max_tokens` over the model's ceiling, an unknown header, a bad
+    /// `tool_choice`. Verbatim rather than reclassified, because the turn's failure is still the
+    /// provider's -- relabelling a 500 as [`MekaError::InvalidRequest`] would have the HTTP surface
+    /// answer 4xx for an upstream fault.
     async fn repair_rejected_content(
         &mut self,
         agent: &Agent,
         messages: &mut Conversation,
-        reason: String,
+        rejection: MekaError,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        let reason = rejection.to_string();
         let suspect_start = match agent
             .last_accepted_len
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -679,29 +788,81 @@ impl TurnRecovery {
             LAST_ACCEPTED_UNKNOWN => self.suspect_floor.min(messages.len()),
             accepted => accepted.min(messages.len()),
         };
-        let Some(degraded) =
-            degrade_rejected_content(&messages.as_slice()[suspect_start..], &reason)
+        let suspect = &messages.as_slice()[suspect_start..];
+        let Some((tier_index, tier, degraded)) = DEGRADE_TIERS
+            .iter()
+            .enumerate()
+            .skip(self.tiers_tried)
+            .find_map(|(index, tier)| {
+                degrade_rejected_content(suspect, &reason, *tier)
+                    .map(|degraded| (index, *tier, degraded))
+            })
         else {
-            return Err(MekaError::InvalidRequest(reason));
+            // Only once a tier has actually been spent, which is what makes this a report rather
+            // than a guess: the turn degraded real content, was refused anyway, and has just put
+            // that content back where every later turn will re-send it. With no tier spent the
+            // window held nothing either tier could name, so the complaint was about the request
+            // and not its contents -- a `max_tokens` over the ceiling, an unknown header -- and
+            // pointing at `/rewind` would send the user to delete a turn that is not the problem.
+            if self.tiers_tried > 0 {
+                agent
+                    .frontend
+                    .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
+                        "the content this turn added is back in the session; if the next turn \
+                         fails the same way, shorten the session (`/rewind` in the REPL, \
+                         `meka session rewind`, or POST /rewind)"
+                            .to_string(),
+                    )))
+                    .await;
+            }
+            return Err(rejection);
         };
-        self.repairs_used += 1;
+        // A tier has found something to destroy. *Now* spend the one wait that can tell a provider
+        // having a moment from a provider that will not take this body, since this is the first
+        // point at which the answer costs anything: a turn with nothing to degrade would fail
+        // either way, and making it wait first would buy the user eight seconds of nothing.
+        //
+        // Returning `Ok` without touching `tiers_tried` or the conversation sends the caller back
+        // round the loop, which re-sends the request exactly as it stood.
+        if self
+            .take_outage_reprieve(agent, &rejection, cancellation)
+            .await
+        {
+            return Ok(());
+        }
+        self.tiers_tried = tier_index + 1;
         let replaced_count = messages.len() - suspect_start;
         tracing::warn!(
             "provider rejected the request; degrading {} message(s) appended since the last \
-             accepted one and retrying ({})",
+             accepted one ({:?}) and retrying ({})",
             replaced_count,
+            tier,
             reason,
         );
         agent
             .frontend
             .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
-                // No provider body here. `reason` is the verbatim rejection text from
+                // Says what meka did, not why the provider did what it did. On the 5xx path the
+                // provider judged nothing and rejected nothing -- it failed, repeatedly, and this
+                // is the turn's last guess at the cause -- so the older wording ("provider rejected
+                // content in this turn") asserted something meka does not know and, on an overload,
+                // was simply false.
+                //
+                // No provider body here either. `reason` is the verbatim rejection text from
                 // `error::provider_http_error`, and the HTTP error path was fixed to stop relaying
                 // it because it has carried an account identifier and a fragment of the request;
                 // under `serve` this notice rides the same response and reinstated exactly that.
                 // The full text is on the `warn!` immediately above, at default verbosity.
-                "provider rejected content in this turn; retrying without it (its response is in \
-                 the log)"
+                // Names the way back, and names the *right* one. What a degrade removes is gone
+                // from the conversation, not from the session: the log is append-only, so the
+                // superseded rows are still on disk. But `--format json` is the only export that
+                // returns them, because the markdown writer renders a user message as its text and
+                // drops `ContentBlock::Image` outright -- which is precisely the content
+                // `DegradeTier::Attachments` takes. Pointing at the default format would send
+                // somebody to a file their screenshot is not in.
+                "the provider would not take this turn's content; retrying without some of it. Its \
+                 response is in the log, and `meka session export --format json` still has the \
+                 original."
                     .to_string(),
             )))
             .await;
@@ -714,18 +875,122 @@ impl TurnRecovery {
         Ok(())
     }
 
+    /// Wait once, then re-send the request unchanged, for a refusal that might be an outage rather
+    /// than a verdict on the content. Returns whether the caller should do that instead of
+    /// degrading.
+    ///
+    /// Granted only for the [`MekaError::RetryableProvider`] shape, and once per stretch of
+    /// consecutive failure: a request the provider accepts makes it available again, because the
+    /// next refusal is then about content the first wait never weighed. A
+    /// [`MekaError::InvalidRequest`] is the provider stating that it read the body and would not
+    /// take it, which no amount of waiting changes, so that path degrades immediately as before.
+    ///
+    /// The point is that a spent retry budget has two readings and the loop cannot see which it
+    /// has. `refusal_may_blame_content` admits a 5xx on a completion because a gateway reports its
+    /// own decoder's exception that way -- but so does a gateway that is merely overloaded, and the
+    /// retry sequence is two attempts across three seconds of backoff, which an ordinary burst
+    /// outlasts. Degrading on the wrong reading is not a wasted round trip: the degraded retry
+    /// succeeds because the outage ended, and [`Self::persist_vindicated_repair`] writes the
+    /// content loss to the store as proven-good. One wait, one unmodified attempt, and the
+    /// ambiguity is gone -- for the price of a delay paid only by a turn that was otherwise about
+    /// to start deleting things.
+    ///
+    /// The sleep races the turn's cancellation token, and a cancelled wait still returns `true`:
+    /// the loop head is where interruption is answered, and sending control back there is how this
+    /// stays out of that decision.
+    async fn take_outage_reprieve(
+        &mut self,
+        agent: &Agent,
+        error: &MekaError,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let outage_shaped = matches!(error, MekaError::RetryableProvider {
+            server_error_on_completion: true,
+            ..
+        });
+        if !outage_shaped || self.outage_reprieve_used {
+            return false;
+        }
+        self.outage_reprieve_used = true;
+        let delay = crate::provider::retry::OUTAGE_REPRIEVE;
+        tracing::warn!(
+            "provider failed every retry ({}); waiting {:?} and re-sending unchanged before \
+             degrading this turn's content",
+            error,
+            delay
+        );
+        agent
+            .frontend
+            .emit(FrontendEvent::Notice(crate::provider::Notice::warn(
+                format!(
+                    "the provider failed every retry; waiting {}s and trying the same request once \
+                 more before removing anything from this turn",
+                    delay.as_secs()
+                ),
+            )))
+            .await;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = cancellation.cancelled() => {}
+        }
+        true
+    }
+
     /// Put back what [`Self::repair_rejected_content`] degraded, after the retry carrying it was
     /// refused too.
     ///
-    /// The repair was therefore not the fix, and the conversation is left byte-identical to before
+    /// The tier was therefore not the fix, and the conversation is left byte-identical to before
     /// the attempt: the cost of guessing wrong has to be one round trip, never a destroyed tool
-    /// result.
-    fn undo_rejected_repair(&self, messages: &mut Conversation) {
-        if messages.pop_repair() {
+    /// result. [`Self::tiers_tried`] deliberately survives, so the next attempt measures the *next*
+    /// tier against the conversation this one restored rather than re-running the one just
+    /// disproved.
+    ///
+    /// Called on every failing exit from the round, not only the ones another tier can answer.
+    /// A repair the turn then dies on was never vindicated, and leaving it applied in memory while
+    /// [`Self::persist_vindicated_repair`] never runs would leave that session's conversation
+    /// disagreeing with its own store until the process ends.
+    fn undo_rejected_repair(&mut self, agent: &Agent, messages: &mut Conversation) {
+        if self.pending_repair.take().is_some() && messages.pop_repair() {
+            // Putting the conversation back is only half of it. `repair_rejected_content` also
+            // rebuilt `base_messages` from the degraded conversation, and that is the slice the
+            // request is actually assembled from -- both tiers preserve message *count*, so
+            // `messages.len() == turn_start_len` still holds and the next round takes the branch
+            // that sends `base_messages` verbatim. Restoring one without the other left the next
+            // request carrying content the conversation no longer had, which is how an "unchanged
+            // re-send" came to send the degraded body.
+            self.base_messages = Arc::from(truncate_messages_for_context(
+                messages.as_slice(),
+                agent.options.context_messages,
+            ));
+            self.turn_start_len = messages.len();
             tracing::warn!(
                 "degrading this turn's content did not satisfy the provider; restored it unchanged"
             );
         }
+    }
+
+    /// Forget what this turn has already tried, because the provider just accepted a request.
+    ///
+    /// Both counters exist to stop a turn re-running a recovery that has already been disproved,
+    /// and a 2xx is what disproves the disproof: whatever the next refusal is about, it is not the
+    /// exchange that just succeeded. Keying on acceptance rather than on a vindicated *repair* is
+    /// the whole point. The obvious place for this is `persist_vindicated_repair`, and putting it
+    /// there was wrong in the one case that matters most: when the outage reprieve does its job --
+    /// the wait passes, the unchanged re-send returns 2xx -- no repair was ever applied, so there
+    /// is nothing to vindicate and the reset never ran. The reprieve stayed spent for the rest of
+    /// the turn, and a second, unrelated 5xx thirty rounds later would degrade on the spot: exactly
+    /// the silent content loss [`crate::provider::retry::OUTAGE_REPRIEVE`] exists to prevent.
+    ///
+    /// It also covers a case the repair-keyed version could not express at all. A tier applied,
+    /// undone, and then followed by a *successful* unchanged re-send has been shown to have been
+    /// unnecessary; leaving it counted would have the next refusal skip straight past the cheap
+    /// tier it never needed to spend.
+    ///
+    /// This cannot loop. Every reset costs a round trip the provider accepted, so it happens only
+    /// as often as the turn makes real progress, which the tool loop already bounds.
+    fn note_request_accepted(&mut self) {
+        self.tiers_tried = 0;
+        self.outage_reprieve_used = false;
     }
 
     /// Persist the repair a 2xx has just vindicated.
@@ -736,6 +1001,16 @@ impl TurnRecovery {
     /// instead. A failed write still leaves the in-memory conversation repaired, so the turn
     /// completes; the cost is that a resume re-reads the rejected content and pays one more
     /// round trip to heal it again.
+    ///
+    /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was *right*.
+    /// Leaving it counted made the next refusal in the same turn skip it: a turn whose prompt
+    /// attachment `Attachments` had just removed successfully would answer a second refusal --
+    /// over an image a later `read_file` returned, which that same tier reaches -- by jumping
+    /// straight to `ToolExchanges` and destroying the tool result whole. It also made the
+    /// `/rewind` hint in [`Self::repair_rejected_content`] fire on a turn that had restored
+    /// nothing, telling the user content was back in the session when it had been removed for
+    /// good. The bound the counter exists for is unaffected: a reset costs a 2xx, so it can only
+    /// happen as often as the turn makes real progress.
     async fn persist_vindicated_repair(&mut self, agent: &Agent, session_id: Uuid) {
         if let Some(event) = self.pending_repair.take()
             && let Err(error) = agent.session_manager.save_event(session_id, &event).await
@@ -1579,8 +1854,9 @@ impl Agent {
         let user_message = Message::user_with_images(augmented_input, images);
         // Captured around the append rather than in the `TurnRecovery` literal below, which is
         // built after a proactive compaction may have moved the conversation under both. See their
-        // field documentation for what each one is measured against.
-        let suspect_floor = messages.len();
+        // field documentation for what each one is measured against. The compaction, if it runs,
+        // then replaces this with `SUSPECT_FLOOR_AFTER_REWRITE`.
+        let mut suspect_floor = messages.len();
         messages.append(user_message.clone());
         let prompt_only_events = messages.events_len();
         // Persist the user message eagerly, before the first provider call.  A crash
@@ -1626,7 +1902,7 @@ impl Agent {
                     AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.context_window()
                 );
-                if let Err(error) = self
+                match self
                     .compact_session(
                         session_id,
                         messages,
@@ -1635,7 +1911,12 @@ impl Agent {
                     )
                     .await
                 {
-                    tracing::warn!("proactive compaction failed: {}", error);
+                    // The floor captured above counts messages that no longer exist. Left as it
+                    // was, it lands past the end of the collapsed conversation, clamps to the
+                    // length, and leaves the degrade-and-retry nothing to look at for the whole
+                    // turn. See `SUSPECT_FLOOR_AFTER_REWRITE`.
+                    Ok(_) => suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE,
+                    Err(error) => tracing::warn!("proactive compaction failed: {}", error),
                 }
             }
         }
@@ -1649,10 +1930,11 @@ impl Agent {
             suspect_floor,
             prompt_only_events,
             overflow_retries: 0,
-            repairs_used: 0,
+            tiers_tried: 0,
             pending_repair: None,
             user_saved: user_eagerly_saved,
             thinking_only_nudged: false,
+            outage_reprieve_used: false,
         };
 
         // Accumulate token usage across every provider call within this turn so the per-turn
@@ -1662,13 +1944,24 @@ impl Agent {
 
         let result: Result<TurnOutcome> = 'turn: {
             loop {
+                // Both exits undo an unvindicated repair first. A degrade that has been applied but
+                // not yet retried is parked in memory with no `Event::Repair` on disk, and these
+                // are the two ways out of the round that skip the error arm entirely: a repair
+                // fires, `continue` returns here, and the turn ends before the provider ever judged
+                // it. Leaving it applied would have the model reasoning from a conversation the
+                // store has never heard of, while `GET /messages` still serves the original with
+                // its revision unmoved. Under ACP `client_disconnected` becomes true precisely
+                // while a turn is stalled on a failing provider, which is when a repair is most
+                // likely to be in flight.
                 if cancellation.is_cancelled() {
+                    recovery.undo_rejected_repair(self, messages);
                     break 'turn Err(MekaError::Interrupted);
                 }
                 // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
                 // disconnect). No point burning more provider tokens for an audience that won't see
                 // the output. REPL frontends report `false` here, so this is a no-op for them.
                 if self.frontend.client_disconnected() {
+                    recovery.undo_rejected_repair(self, messages);
                     break 'turn Err(MekaError::Interrupted);
                 }
 
@@ -1747,6 +2040,7 @@ impl Agent {
                 // blocking provider call surfaces notices in its return tuple (no event channel);
                 // we forward them to the frontend here so the user sees the same advisories the
                 // streaming path emits inline via `StreamEvent::Notice`.
+                let mut content_started = false;
                 let call_result: Result<(Message, StopReason, crate::provider::TokenUsage)> =
                     if self.options.streaming {
                         self.run_streaming(
@@ -1754,6 +2048,7 @@ impl Agent {
                             api_messages,
                             tools,
                             cancellation.clone(),
+                            &mut content_started,
                         )
                         .await
                     } else {
@@ -1824,30 +2119,31 @@ impl Agent {
                         }
                         continue;
                     }
-                    Err(MekaError::InvalidRequest(message))
-                        if recovery.pending_repair.is_some() =>
-                    {
-                        recovery.undo_rejected_repair(messages);
-                        break 'turn Err(MekaError::InvalidRequest(message));
-                    }
-                    Err(MekaError::InvalidRequest(message))
-                        if recovery.repairs_used < MAX_REQUEST_REPAIRS =>
-                    {
+                    Err(error) => {
+                        // Unconditionally, before deciding anything else. A repair still applied
+                        // here is one the provider has just refused a second time, so it was not
+                        // the fix whatever happens next: another tier measures itself against the
+                        // conversation as it really is, and a turn that gives up leaves memory and
+                        // store agreeing.
+                        recovery.undo_rejected_repair(self, messages);
+                        if !refusal_may_blame_content(&error, content_started) {
+                            break 'turn Err(error);
+                        }
                         if let Err(error) = recovery
-                            .repair_rejected_content(self, messages, message)
+                            .repair_rejected_content(self, messages, error, &cancellation)
                             .await
                         {
                             break 'turn Err(error);
                         }
                         continue;
                     }
-                    Err(error) => break 'turn Err(error),
                 };
 
                 // The provider accepted this body, so everything in it is known-good and only what
                 // comes after can be blamed for a later rejection.
                 self.last_accepted_len
                     .store(sent_len, std::sync::atomic::Ordering::Relaxed);
+                recovery.note_request_accepted();
 
                 // Total of all tiers including output = everything in context as of this exchange,
                 // which is what the next request re-sends (minus the new user prompt). Summing the
@@ -1874,6 +2170,14 @@ impl Agent {
                     .saturating_add(usage.cache_read_input_tokens);
 
                 if let Err(error) = recovery.ensure_prompt_saved(self, sid, &user_message).await {
+                    // The one exit between a 2xx and the persist below, so the repair the 2xx just
+                    // vindicated has to be put back rather than left applied: persisting it on top
+                    // of a store whose opening message is missing is exactly what the failure above
+                    // forbids. Undoing also restores the trailing `Event::Append` that the
+                    // post-loop `pop_unsaved` looks for, which a trailing
+                    // `Event::Repair` would have made it silently skip,
+                    // stranding the prompt in memory too.
+                    recovery.undo_rejected_repair(self, messages);
                     break 'turn Err(error);
                 }
 
@@ -2189,25 +2493,29 @@ impl Agent {
         messages: Arc<[Message]>,
         tools: Arc<[ToolDefinition]>,
         cancellation: CancellationToken,
+        content_started: &mut bool,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         let mut retries = 0u32;
         let started = std::time::Instant::now();
         loop {
-            let mut content_started = false;
+            // Reported back out as well as read here, because `run_turn` needs the same fact for
+            // the same reason: whatever it does with a failure, it must not re-send a request whose
+            // output the user has already seen.
+            *content_started = false;
             match self
                 .run_streaming_attempt(
                     Arc::clone(&system_prompt),
                     Arc::clone(&messages),
                     Arc::clone(&tools),
                     cancellation.clone(),
-                    &mut content_started,
+                    content_started,
                 )
                 .await
             {
                 Ok(value) => return Ok(value),
                 Err(error) => match should_retry_provider_error(
                     &error,
-                    content_started,
+                    *content_started,
                     retries,
                     started.elapsed(),
                 ) {
@@ -3172,7 +3480,21 @@ impl Agent {
         // Snapshot the deferred-tool active set BEFORE compaction so the `CompactBoundary` event
         // carries it forward; otherwise tools the model loaded pre-compaction would silently drop
         // out of the active set on the next turn.
-        let loaded_tools_snapshot = crate::tools::extract_loaded_tool_names(messages.as_slice());
+        //
+        // Read from the events, like the per-turn active set, and not from the materialized slice.
+        // A slice scan can only see `load_tool` exchanges still standing in the current view, and
+        // two things routinely take them out of it. `DegradeTier::ToolExchanges` empties a refused
+        // call in place, so its `input` no longer names anything and its result is marked
+        // `is_error`; a *previous* compaction replaced everything before it with a summary, which
+        // names nothing at all. Either way the snapshot came out short, `prune_compacted_events`
+        // then dropped the events that could have corrected it, and a tool the model had loaded
+        // disappeared from its array mid-session -- while a resume, reading the full log off disk,
+        // brought it back. `ToolRegistry::definitions_active` says this in its own doc comment; the
+        // one production caller was not doing it.
+        let loaded_tools_snapshot: std::collections::HashSet<String> =
+            crate::conversation::extract_loaded_tool_names_from_events(messages.events())
+                .into_iter()
+                .collect();
 
         let summary_user_message = Message::user(&context_message);
         messages.replace_for_compaction(
@@ -3790,9 +4112,48 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
 /// echoing the request body back can't flood the window.
 const REJECTION_REASON_LIMIT: usize = 600;
 
-/// Rewrite `messages` so nothing the provider can refuse on content grounds survives, replacing
-/// every non-text block with a note carrying `reason`. Returns `None` when there was nothing to
-/// rewrite, which the caller treats as "this rejection isn't about content, don't retry".
+/// How much of a neutralised `tool_use`'s arguments are quoted in its result. They are there so
+/// the model can see what it sent, which a short prefix answers; carrying them whole would re-send
+/// the very bytes the provider may have objected to.
+const QUOTED_ARGUMENTS_LIMIT: usize = 400;
+
+/// Rewrite `messages` so nothing the provider can refuse on content grounds survives, to the depth
+/// `tier` allows, replacing what it removes with a note carrying `reason`. Returns `None` when this
+/// tier found nothing to rewrite, which the caller reads as "try the next tier, and if there isn't
+/// one this rejection isn't about content".
+///
+/// The tiers differ in how much of the turn's own content they destroy, not in what they are
+/// willing to break: **neither changes the shape of the conversation**, and every `tool_use` /
+/// `tool_result` pair survives both of them intact. `Attachments` removes only non-text blocks,
+/// which leaves a text-only tool result and a call's arguments untouched; `ToolExchanges` exists
+/// because those are refusable too.
+///
+/// Neither tier ever touches a message's plain text outside a tool exchange. That is the user's own
+/// prompt, and a turn that answers a refusal by deleting what the user typed is not a recovery.
+fn degrade_rejected_content(
+    messages: &[Message],
+    reason: &str,
+    tier: DegradeTier,
+) -> Option<Vec<Message>> {
+    let reason = elide(reason, REJECTION_REASON_LIMIT);
+    match tier {
+        DegradeTier::Attachments => strip_non_text_content(messages, &reason),
+        DegradeTier::ToolExchanges => {
+            // Declines unless there is an exchange to empty, which is the only thing this tier
+            // adds. Falling back to what the tier before it does would re-send the body that tier
+            // just had refused, spending the turn's last attempt to change nothing.
+            let emptied = neutralise_tool_exchanges(messages, &reason)?;
+            // And having fired, it subsumes: a turn only reaches here by having `Attachments`
+            // undone, so anything that tier had removed is back in `messages` and must go again.
+            // Second, over the emptied messages, since a tool result whose content this tier has
+            // already replaced has nothing left to strip.
+            Some(strip_non_text_content(&emptied, &reason).unwrap_or(emptied))
+        }
+    }
+}
+
+/// [`DegradeTier::Attachments`]: replace non-text blocks, leaving every `tool_use` and `tool_result`
+/// where it is.
 ///
 /// Structure is preserved rather than pruned. A `tool_use` whose result is dropped would be an
 /// orphan the provider rejects in a *new* way, and dropping the `tool_use` itself is worse still:
@@ -3800,8 +4161,7 @@ const REJECTION_REASON_LIMIT: usize = 600;
 /// it again. Instead the `tool_result` keeps its `tool_use_id` and is marked `is_error`, which is
 /// exactly the shape meka already uses for a tool that failed outright, so the model needs no new
 /// concept to understand it and no frontend needs new rendering.
-fn degrade_rejected_content(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
-    let reason = elide_reason(reason);
+fn strip_non_text_content(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
     let mut changed = false;
     let degraded: Vec<Message> = messages
         .iter()
@@ -3826,9 +4186,9 @@ fn degrade_rejected_content(messages: &[Message], reason: &str) -> Option<Vec<Me
                             .collect();
                         kept.push(ToolResultContent::Text {
                             text: format!(
-                                "[meka] The provider refused this tool result, so its non-text \
-                                 content was removed to keep the conversation usable: {}. Do not \
-                                 repeat this call unchanged.",
+                                "{HARNESS_NOTE} The provider refused this tool result, so its \
+                                 non-text content was removed to keep the conversation usable: \
+                                 {}. Do not repeat this call unchanged.",
                                 reason
                             ),
                         });
@@ -3842,8 +4202,8 @@ fn degrade_rejected_content(messages: &[Message], reason: &str) -> Option<Vec<Me
                         changed = true;
                         ContentBlock::Text {
                             text: format!(
-                                "[meka] An image attached to this message was removed because the \
-                                 provider refused it: {}.",
+                                "{HARNESS_NOTE} An image attached to this message was removed \
+                                 because the provider refused it: {}.",
                                 reason
                             ),
                         }
@@ -3861,12 +4221,160 @@ fn degrade_rejected_content(messages: &[Message], reason: &str) -> Option<Vec<Me
     changed.then_some(degraded)
 }
 
-fn elide_reason(reason: &str) -> String {
-    if reason.chars().count() <= REJECTION_REASON_LIMIT {
-        return reason.to_string();
+/// What a neutralised `tool_use` carries in place of the arguments it was refused with.
+///
+/// A breadcrumb rather than `{}`, because an empty object is a false record: it reads as a call the
+/// model made with no arguments at all, rather than one whose arguments meka took.
+fn neutralised_arguments() -> serde_json::Value {
+    serde_json::json!({
+        crate::conversation::HARNESS_NOTE: "arguments removed; they are quoted in this call's \
+                                            result",
+    })
+}
+
+/// [`DegradeTier::ToolExchanges`]: empty the tool exchanges in `messages` where they stand, moving
+/// what the call carried into the result that reports it.
+///
+/// **Nothing here changes the shape of the conversation.** A `tool_use` stays a `tool_use` and a
+/// `tool_result` stays a `tool_result`, so the one invariant both APIs enforce on replay -- that
+/// the two are matched -- cannot be broken by the repair. That is the whole design. An earlier
+/// version replaced the pair with plain text, which meant a `tool_result` whose call sat in
+/// already-accepted history had to be special-cased or it would be orphaned, and every provider
+/// refuses an orphan outright: a rejection this function exists to recover from would have become a
+/// permanent one it cannot. Keeping the shape deletes that hazard rather than handling it.
+///
+/// Two more things fall out of the same choice. The turn still ends in a `tool_use`, so the
+/// reasoning the provider issued for it stays valid and is left alone. And the result keeps
+/// `is_error` with a text body, which is byte-identical in shape to any ordinary tool failure
+/// ([`Agent::resolve_and_execute_tool`] produces exactly this for a denied permission or an unknown
+/// name), so the model needs no new concept and no frontend needs new rendering.
+///
+/// The arguments move into the result rather than staying on the call. Size is the way a
+/// `tool_use` earns a refusal -- the model can emit a very large one -- so leaving it in place
+/// would leave the tier unable to reach the thing that may have caused the failure. They are
+/// quoted, truncated, in the result, which puts what was sent and why it failed in one block,
+/// which is where the model already looks to find out what happened to a call.
+fn neutralise_tool_exchanges(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
+    // Quoted here rather than looked up per result, because a result reports a call that appears
+    // earlier in the window and the rewrite below visits blocks in order.
+    //
+    // A result whose call is *outside* the window has no entry, and gets a note without the
+    // arguments. The reverse cannot happen: a call precedes its result, so a call inside the
+    // window always has its result inside it too.
+    let quoted_arguments: HashMap<&str, String> = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some((
+                id.as_str(),
+                format!(
+                    "`{}` with {}",
+                    name,
+                    elide(&input.to_string(), QUOTED_ARGUMENTS_LIMIT)
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let mut changed = false;
+    let degraded: Vec<Message> = messages
+        .iter()
+        .map(|message| {
+            let content = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::ToolUse { id, name, .. } => {
+                        changed = true;
+                        ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: neutralised_arguments(),
+                        }
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        changed = true;
+                        let call = match quoted_arguments.get(tool_use_id.as_str()) {
+                            Some(quoted) => format!(" The call was {}.", quoted),
+                            None => String::new(),
+                        };
+                        ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: vec![ToolResultContent::Text {
+                                text: format!(
+                                    "{HARNESS_NOTE} The provider refused the request carrying this \
+                                     call, so its arguments and result were removed to keep the \
+                                     conversation usable.{} The provider said: {}. Do not repeat \
+                                     this call unchanged.",
+                                    call, reason
+                                ),
+                            }],
+                            is_error: true,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Message {
+                role: message.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    changed.then_some(degraded)
+}
+
+fn elide(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
     }
-    let kept: String = reason.chars().take(REJECTION_REASON_LIMIT).collect();
+    let kept: String = text.chars().take(limit).collect();
     format!("{}…", kept)
+}
+
+/// Whether a failed provider call is one the turn may answer by degrading its own content.
+///
+/// [`MekaError::InvalidRequest`] is the designed signal and needs no argument: the classifier
+/// produces it only for a completion, and it already means "degrade what this turn appended".
+///
+/// [`MekaError::RetryableProvider`] qualifies only in the one shape its
+/// `server_error_on_completion` records: a 5xx answering a completion. It means the provider said
+/// retry, which is honoured first, so this is reached once the retries are spent (or the budget
+/// is, which can happen on the first attempt) and the alternative is not "wait longer" but failing
+/// the turn with content already committed that every later turn re-sends. That is how a 5xx bricks
+/// a session, and it is not hypothetical: a gateway that reports its own image decoder's exception
+/// as `500 Internal Server Error` reads as transient here however deterministic it is.
+///
+/// **Every other way that variant arises is excluded, and the reason is that degrading is not free
+/// when the guess is wrong.** The restore only covers the branch where the degraded retry *also*
+/// fails; if it succeeds because the outage merely ended, `TurnRecovery::persist_vindicated_repair`
+/// writes that content loss to the store as proven-good. So a dropped connection (which never
+/// delivered the body for anything to judge), a 429 (a statement about rate, not about what was
+/// sent), and a token endpoint's 5xx (a request carrying no conversation) must not reach here: a
+/// ten-second Wi-Fi drop would otherwise answer itself by deleting a file the model had read.
+///
+/// `content_started` is the other exclusion, and it applies to both. A failure can arrive after
+/// text has reached the frontend, and retrying with degraded content would re-emit what the user
+/// has already seen. That is the same reason [`should_retry_provider_error`] refuses an ordinary
+/// retry there. It gates [`MekaError::InvalidRequest`] as well even though today's classifier can
+/// only raise that from a response status, which for a streaming call arrives before any body: the
+/// argument is about what the user has seen and not about which variant carried the news, and a
+/// backend that mapped a mid-stream `event: error` to a 400 would otherwise print the answer twice
+/// with nothing to catch it.
+fn refusal_may_blame_content(error: &MekaError, content_started: bool) -> bool {
+    if content_started {
+        return false;
+    }
+    match error {
+        MekaError::InvalidRequest(_) => true,
+        MekaError::RetryableProvider {
+            server_error_on_completion,
+            ..
+        } => *server_error_on_completion,
+        _ => false,
+    }
 }
 
 /// Whether a failed provider call should be retried, and if so, after how long. Pure and
@@ -4285,7 +4793,7 @@ mod tests {
         );
     }
 
-    /// An emergency compaction must drop a pending repair rather than carry it across.
+    /// An emergency compaction must *undo* a pending repair, not carry it or merely forget it.
     ///
     /// `Event::Repair` is *position-relative*: it records how many trailing entries it replaces,
     /// and its own doc comment states the producer invariant that those entries must still be
@@ -4294,8 +4802,13 @@ mod tests {
     /// shape it was taken from, and would replace the wrong messages. Deleting the clearing
     /// line left every suite green: the one test that reaches this arm asserts on the turn's
     /// outcome and never looks at the recovery state.
+    ///
+    /// Clearing the field was not enough on its own, which is what this now also pins. The degraded
+    /// messages stayed in the conversation, so the summariser read them and the boundary made the
+    /// loss permanent -- on the strength of a `ContextOverflow`, which says the request was too big
+    /// and nothing whatever about whether the degraded content was the problem.
     #[tokio::test]
-    async fn an_emergency_compaction_drops_a_pending_repair() {
+    async fn an_emergency_compaction_undoes_a_pending_repair() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
 
         // The compaction runs a checkpoint turn and then a summary, so it needs more than the one
@@ -4331,19 +4844,27 @@ mod tests {
         messages.append(Message::user("a task whose request overflowed"));
         messages.append(Message::assistant_text("a reply"));
 
+        // Applied for real, so the undo has something to put back and the assertions below are
+        // about the conversation rather than about a field.
+        let pending_repair =
+            Some(messages.replace_tail(1, vec![Message::user("the degraded replacement")]));
+        assert_eq!(
+            messages.as_slice()[1].text_content(),
+            "the degraded replacement",
+            "precondition: the degrade is applied"
+        );
+
         let mut recovery = TurnRecovery {
             base_messages: Arc::from(messages.as_slice().to_vec()),
             turn_start_len: messages.len(),
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
-            repairs_used: 1,
-            pending_repair: Some(crate::conversation::Event::Repair {
-                replaced_count: 1,
-                messages: vec![Message::user("the degraded replacement")],
-            }),
+            tiers_tried: 1,
+            pending_repair,
             user_saved: false,
             thinking_only_nudged: false,
+            outage_reprieve_used: false,
         };
 
         recovery
@@ -4360,6 +4881,86 @@ mod tests {
         assert!(
             recovery.pending_repair.is_none(),
             "a position-relative repair survived the compaction that moved everything it points at"
+        );
+        assert!(
+            !messages
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::conversation::Event::Repair { .. })),
+            "the repair has to be gone from the log, not just from the field: {:?}",
+            messages.events()
+        );
+        assert_eq!(
+            recovery.suspect_floor, SUSPECT_FLOOR_AFTER_REWRITE,
+            "a floor counted against the pre-compaction conversation addresses nothing in this one"
+        );
+        assert_eq!(
+            recovery.tiers_tried, 0,
+            "a tier measured against the old conversation has said nothing about the new one"
+        );
+    }
+
+    /// The branch the undo above was moved *before*: compaction can fail, and its summariser is a
+    /// provider call made against the provider that has just been misbehaving.
+    ///
+    /// With the reset happening only after a successful compaction, this path returned with the
+    /// degrade still applied and no `Event::Repair` anywhere on disk -- so the model reasoned from
+    /// a conversation the store had never heard of for the rest of the process's life, while
+    /// `GET /messages` served the original with its revision unmoved.
+    #[tokio::test]
+    async fn a_failed_emergency_compaction_still_restores_the_degraded_content() {
+        use crate::provider::mock::MockProvider;
+
+        // No rounds at all: the checkpoint turn and the summariser both find the script empty, so
+        // the compaction cannot produce a summary and fails.
+        let provider = Arc::new(MockProvider::from_rounds(Vec::new()));
+        let (agent, session_manager) =
+            test_agent_that_compacts(provider as Arc<dyn Provider>).await;
+        let created = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let mut session_id = Some(created);
+
+        let mut messages = Conversation::new();
+        messages.append(Message::user("a task whose request overflowed"));
+        messages.append(Message::assistant_text("a reply"));
+        let pending_repair =
+            Some(messages.replace_tail(1, vec![Message::user("the degraded replacement")]));
+
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(messages.as_slice().to_vec()),
+            turn_start_len: messages.len(),
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            overflow_retries: 0,
+            tiers_tried: 1,
+            pending_repair,
+            user_saved: false,
+            thinking_only_nudged: false,
+            outage_reprieve_used: false,
+        };
+
+        let error = recovery
+            .recover_from_context_overflow(
+                &agent,
+                &mut session_id,
+                &mut messages,
+                &CancellationToken::new(),
+                "prompt is too long".to_string(),
+            )
+            .await
+            .expect_err("the compaction had nothing to summarise with");
+        assert!(matches!(error, MekaError::ContextOverflow(_)), "{error}");
+
+        assert!(
+            recovery.pending_repair.is_none(),
+            "the repair was never vindicated, so nothing may still be holding it"
+        );
+        assert_eq!(
+            messages.as_slice()[1].text_content(),
+            "a reply",
+            "and the content it degraded has to be back, byte for byte"
         );
     }
 
@@ -5240,6 +5841,702 @@ mod tests {
                 .flat_map(|message| message.content.iter())
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
             "the repair must be persisted, not just applied in memory"
+        );
+    }
+
+    /// One refused round, as the mock's script sees it: a `500` shaped like the incident.
+    ///
+    /// `retry_after_secs: Some(0)` is honoured verbatim by `backoff_delay`, so a test using this
+    /// spends no wall clock proving something about classification.
+    fn refused_with_a_five_hundred() -> Vec<crate::provider::mock::MockEvent> {
+        vec![crate::provider::mock::MockEvent::FailRetryable {
+            message: "API returned status 500 Internal Server Error: {\"error\":\"An exception \
+                      occurred while loading IMAGE data at index 21\"}"
+                .to_string(),
+            retry_after_secs: Some(0),
+        }]
+    }
+
+    /// Every request one `run_streaming` call makes before it gives up.
+    ///
+    /// Derived, not written out, so raising [`crate::provider::retry::MAX_PROVIDER_RETRIES`]
+    /// lengthens the scripts below rather than silently making them assert the ordinary retry path
+    /// instead.
+    fn one_spent_retry_sequence() -> Vec<Vec<crate::provider::mock::MockEvent>> {
+        (0..=crate::provider::retry::MAX_PROVIDER_RETRIES)
+            .map(|_| refused_with_a_five_hundred())
+            .collect()
+    }
+
+    /// The incident the [`MekaError::RetryableProvider`] arm exists for.
+    ///
+    /// A gateway that answers `500` because its own image decoder threw is indistinguishable, from
+    /// here, from one that is overloaded. So the retry is honoured first and in full, and then the
+    /// outage reprieve re-sends the body unchanged one more time; this is what happens once *that*
+    /// has been refused too. The alternative to degrading is not "wait longer", it is failing the
+    /// turn with that body committed, which fails every later turn in the session the same way.
+    ///
+    /// Paused time, because the reprieve is eight seconds of deliberate waiting and this test is
+    /// about what happens after it, not about how long it is.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_five_hundred_outliving_its_retries_degrades_rather_than_stranding_the_session()
+    {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        // Two sequences: the original request, then the reprieve's re-send of the same body. Only
+        // once both have failed does the turn conclude the content is the problem.
+        let mut rounds = one_spent_retry_sequence();
+        rounds.extend(one_spent_retry_sequence());
+        rounds.push(vec![
+            MockEvent::Text {
+                text: "I could not see that image.".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]);
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (agent, session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let outcome = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a spent retry budget degrades rather than ending the turn");
+        assert_eq!(outcome, TurnOutcome::EndTurn);
+
+        let user = &messages.as_slice()[0];
+        assert!(
+            user.content
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the content the provider kept refusing must not survive the turn"
+        );
+        assert!(
+            user.text_content().contains("500"),
+            "the model is told what the provider said: {}",
+            user.text_content()
+        );
+
+        let sid = session_id.expect("session created");
+        let reloaded =
+            Conversation::from_events(session_manager.load_events(sid).await.expect("load events"));
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "and on disk, or the next resume walks straight back into it"
+        );
+    }
+
+    /// The case the reprieve exists for: an outage that ends, and content that survives it.
+    ///
+    /// A `529` burst lasting a few seconds outlives the whole retry sequence, which is two attempts
+    /// across three seconds of backoff. Without the reprieve the turn read that as a verdict on its
+    /// own body, degraded, and the degraded retry then succeeded -- not because the degrade helped,
+    /// but because the burst had ended -- so `persist_vindicated_repair` wrote the loss to the
+    /// store as proven-good. The user's attachment was gone permanently, in exchange for
+    /// nothing.
+    ///
+    /// The script says exactly that: one spent sequence, then a success. If the reprieve fires, the
+    /// success answers the *unmodified* request and the image is still there.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_outage_that_ends_costs_a_wait_rather_than_the_turn_s_attachment() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let mut rounds = one_spent_retry_sequence();
+        rounds.push(vec![
+            MockEvent::Text {
+                text: "I can see the image.".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]);
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (agent, session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the re-sent request succeeded");
+
+        assert!(
+            messages.as_slice()[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "the attachment must survive an outage that merely ended: {:?}",
+            messages.as_slice()
+        );
+        let sid = session_id.expect("session created");
+        let reloaded =
+            Conversation::from_events(session_manager.load_events(sid).await.expect("load events"));
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "and no `Event::Repair` may have been written for a loss that never happened"
+        );
+    }
+
+    /// Undoing a repair has to restore the *request base*, not just the conversation.
+    ///
+    /// `repair_rejected_content` rebuilds `base_messages` from the degraded conversation, because
+    /// that is the slice a request is actually assembled from. The undo put the conversation back
+    /// and left `base_messages` degraded. Both tiers preserve message *count*, so
+    /// `messages.len() == turn_start_len` still held and the next round took the branch that sends
+    /// `base_messages` verbatim: the conversation said one thing and the wire said another.
+    ///
+    /// The reachable consequence was a bricked session. `take_outage_reprieve` is the one caller
+    /// that re-sends after an undo, and its whole promise is that the body is unchanged; instead it
+    /// re-sent the degraded one, and a success there stamped `last_accepted_len` against the
+    /// *restored* conversation, putting the content that earned the original refusal permanently
+    /// below every later suspect window.
+    ///
+    /// Stated as the inverse property rather than as that one path, because the property is what
+    /// every caller of the undo relies on.
+    #[tokio::test]
+    async fn test_undoing_a_repair_also_restores_the_request_base() {
+        use crate::provider::mock::MockProvider;
+
+        let (agent, _session_manager) =
+            test_agent(Arc::new(MockProvider::from_rounds(Vec::new()))).await;
+        let mut messages = Conversation::new();
+        messages.append(Message::user_with_images("look at this".to_string(), vec![
+            image_source(),
+        ]));
+        let original = messages.as_slice().to_vec();
+
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(original.clone()),
+            turn_start_len: messages.len(),
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            overflow_retries: 0,
+            tiers_tried: 0,
+            pending_repair: None,
+            user_saved: true,
+            thinking_only_nudged: false,
+            outage_reprieve_used: false,
+        };
+
+        recovery
+            .repair_rejected_content(
+                &agent,
+                &mut messages,
+                MekaError::InvalidRequest(REJECTION.to_string()),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the attachment tier had something to remove");
+        assert!(
+            recovery
+                .base_messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "precondition: the degrade rebuilt the request base without the attachment"
+        );
+
+        recovery.undo_rejected_repair(&agent, &mut messages);
+
+        // `Message` has no `PartialEq`, so compare the shape that matters here: whether the
+        // attachment is present, and in the same place.
+        let images = |slice: &[Message]| -> Vec<usize> {
+            slice
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| {
+                    message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Image { .. }))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        assert_eq!(
+            images(messages.as_slice()),
+            images(&original),
+            "the conversation is restored"
+        );
+        assert_eq!(
+            images(&recovery.base_messages),
+            images(&original),
+            "and so is the slice the next request is built from, or the two disagree on the wire"
+        );
+        assert_eq!(
+            recovery.turn_start_len,
+            messages.len(),
+            "and the marker that decides which of the two a round reads"
+        );
+    }
+
+    /// End to end: a reprieve that *worked* is available again later in the same turn.
+    ///
+    /// This is the wiring, and the wiring is where the bug was. The unit test above pins what
+    /// `note_request_accepted` does; nothing pinned *when it is called*, and calling it from
+    /// `persist_vindicated_repair` meant it never ran on the one path that matters. A successful
+    /// reprieve applies no repair, so there is nothing to vindicate, so the flag stayed spent and a
+    /// later unrelated 5xx degraded on the spot.
+    ///
+    /// Counted rather than inspected, because `TurnRecovery` is local to `run_turn`. Each reprieve
+    /// costs one extra *sequence* of unchanged re-sends, so the request tally separates the two
+    /// behaviours: eleven requests if the second reprieve fires, eight if it does not.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_reprieve_that_worked_is_available_again_later_in_the_turn() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        // A tool round first, so the outages that follow have a tool exchange to degrade. Without
+        // one, `repair_rejected_content` finds no tier and fails the turn before the reprieve is
+        // ever consulted.
+        let tool_round = |id: &str| {
+            vec![
+                MockEvent::ToolUseStart {
+                    id: id.to_string(),
+                    name: "no_such_tool".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"path": "notes.md"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ]
+        };
+
+        let mut rounds = vec![tool_round("call_1")];
+        // First outage: a spent sequence, then the reprieve's re-send, which succeeds and calls a
+        // tool again so the turn continues.
+        rounds.extend(one_spent_retry_sequence());
+        rounds.push(tool_round("call_2"));
+        // Second, unrelated outage. Its own spent sequence, then the *second* reprieve's re-send,
+        // failing too, so a tier finally applies.
+        rounds.extend(one_spent_retry_sequence());
+        rounds.extend(one_spent_retry_sequence());
+        rounds.push(vec![
+            MockEvent::Text {
+                text: "done".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]);
+
+        let mock = Arc::new(MockProvider::from_rounds(rounds));
+        let (agent, _session_manager) = test_agent(Arc::clone(&mock) as Arc<dyn Provider>).await;
+        agent
+            .run_turn(
+                &mut None,
+                &mut Conversation::new(),
+                "read my notes".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn recovers");
+
+        assert_eq!(
+            mock.streams().len(),
+            12,
+            "the second outage has to buy its own unchanged re-send; nine requests would mean the \
+             reprieve stayed spent after the first one succeeded"
+        );
+    }
+
+    /// The reprieve is spent once per stretch of consecutive failure, not once per refusal.
+    ///
+    /// It answers one question -- is this provider failing, or is it failing *on this body* -- and
+    /// a second wait against the same refusal re-asks what the first already answered while the
+    /// user watches. A turn refused twice more without an accepted request in between therefore
+    /// degrades on the spot; `note_request_accepted` is what makes it available again.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_outage_reprieve_is_spent_once_per_stretch_of_failure() {
+        use crate::provider::mock::MockProvider;
+
+        let provider = Arc::new(MockProvider::from_rounds(Vec::new()));
+        let (agent, _session_manager) = test_agent(provider).await;
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(Vec::new()),
+            turn_start_len: 0,
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            overflow_retries: 0,
+            tiers_tried: 0,
+            pending_repair: None,
+            user_saved: true,
+            thinking_only_nudged: false,
+            outage_reprieve_used: false,
+        };
+        let outage = MekaError::RetryableProvider {
+            message: "529 overloaded".to_string(),
+            retry_after: None,
+            server_error_on_completion: true,
+        };
+        let cancellation = CancellationToken::new();
+
+        assert!(
+            recovery
+                .take_outage_reprieve(&agent, &outage, &cancellation)
+                .await,
+            "the first refusal that could be either buys the wait"
+        );
+        assert!(
+            !recovery
+                .take_outage_reprieve(&agent, &outage, &cancellation)
+                .await,
+            "the second must degrade rather than wait again"
+        );
+
+        // And a refusal the provider issued *about the body* never buys it at all: waiting cannot
+        // change a verdict the provider has already reached on what it read.
+        let mut fresh = TurnRecovery {
+            outage_reprieve_used: false,
+            ..recovery
+        };
+        assert!(
+            !fresh
+                .take_outage_reprieve(
+                    &agent,
+                    &MekaError::InvalidRequest("400 bad request".to_string()),
+                    &cancellation
+                )
+                .await,
+            "a 400 is a verdict, not an outage"
+        );
+    }
+
+    /// A turn that compacted on the way in can still degrade.
+    ///
+    /// `suspect_floor` is captured before the prompt is appended, so it counts messages of the
+    /// conversation the compaction then replaces. Left alone it lands past the end of the collapsed
+    /// one, the clamp in `repair_rejected_content` reads the window as *empty*, both tiers find
+    /// nothing, and the turn dies with the refused attachment committed -- in precisely the
+    /// large-conversation case that triggers a compaction and is likeliest to be carrying one. The
+    /// failure was silent twice over: no tier was spent, so even the `/rewind` hint stayed quiet.
+    #[tokio::test]
+    async fn test_a_turn_that_compacted_on_the_way_in_can_still_degrade() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // The proactive compaction's summariser.
+            vec![
+                MockEvent::Text {
+                    text: "a summary of the work so far".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "I could not see that image.".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (mut agent, _session_manager) =
+            test_agent_that_compacts(provider as Arc<dyn Provider>).await;
+
+        // Two constraints pull against each other, so the numbers are deliberate. The window has to
+        // be small enough that the history below trips the pre-send projection (80% of it), which
+        // is what puts the compaction ahead of the turn's first request. It also has to be large
+        // enough that `compaction_tail_budget` (~10% of it) can hold this turn's prompt, or the
+        // split keeps no tail, the prompt is summarised away with its attachment, and the test
+        // passes for the wrong reason: nothing left to degrade.
+        agent.set_context_window_for_test(20_000);
+
+        let mut messages = Conversation::new();
+        for index in 0..40 {
+            messages.append(Message::user(format!(
+                "earlier request {index}: {}",
+                "x".repeat(1_000)
+            )));
+            messages.append(Message::assistant_text(format!(
+                "earlier reply {index}: {}",
+                "y".repeat(1_000)
+            )));
+        }
+        let before = messages.len();
+
+        let mut session_id = None;
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the degrade has to be reachable after the compaction");
+
+        assert!(
+            messages.len() < before,
+            "precondition: the proactive compaction ran, or this proves nothing"
+        );
+        assert!(
+            messages
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the refused attachment must not survive the turn: {:?}",
+            messages.as_slice()
+        );
+    }
+
+    /// The other half of the bargain: a turn that degrades and is refused anyway must leave the
+    /// conversation exactly as it found it, and must fail with the provider's own error rather than
+    /// one invented by the repair.
+    ///
+    /// The second matters at the HTTP surface, where [`MekaError::InvalidRequest`] answers 4xx.
+    /// Reclassifying an upstream 500 as a client error would blame the caller for a fault that was
+    /// never theirs.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_degrade_that_does_not_help_restores_the_content_and_keeps_the_error() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        // Three full sequences and no more: the original request, the reprieve's unchanged re-send,
+        // and the one carrying `Attachments`. The window here is a prompt with an attachment and no
+        // tool exchange, so `ToolExchanges` then declines without spending a round trip.
+        // Over-provisioning would not fail loudly if the count were wrong:
+        // `MockProvider::from_rounds` yields an empty round once the script runs out, and
+        // that folds into a successful empty turn.
+        let mut rounds = one_spent_retry_sequence();
+        rounds.extend(one_spent_retry_sequence());
+        rounds.extend(one_spent_retry_sequence());
+        rounds.push(vec![MockEvent::MessageEnd {
+            stop_reason: MockStopReason::EndTurn,
+        }]);
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (agent, _session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        let error = agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("nothing the turn tried satisfied the provider");
+        assert!(
+            matches!(error, MekaError::RetryableProvider { .. }),
+            "the turn fails with the provider's fault, not a reclassified one: {error}"
+        );
+        assert!(
+            messages.as_slice()[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "a guess that did not pay off costs a round trip, never the content"
+        );
+    }
+
+    /// A refused tool round with nothing but text in it recovers, on the first attempt.
+    ///
+    /// This is the shape the whole tier list exists for. `Attachments` has nothing to remove here,
+    /// and before the second tier that was the end of the turn: the refused body stayed
+    /// committed and every later turn in the session re-sent it, so the only way out was `/rewind`
+    /// or editing the store by hand. The single refusal in the script is the point -- finding
+    /// nothing must make a tier step aside, not spend a round trip proving it.
+    ///
+    /// Driven with a call to a tool that does not exist: the dispatcher answers an unknown name
+    /// with an error `tool_result` rather than an `Err`, which is a real `tool_use` / `tool_result`
+    /// pair without a fixture tool to register.
+    #[tokio::test]
+    async fn test_a_refused_text_only_tool_round_recovers_without_spending_a_tier_on_attachments() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call_1".to_string(),
+                    name: "no_such_tool".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"path": "notes.md"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, _session_manager) = test_agent(provider).await;
+
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut session_id,
+                &mut messages,
+                "read my notes".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the second tier gets the turn through");
+
+        let blocks: Vec<&ContentBlock> = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .collect();
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "no_such_tool")),
+            "the call stays a call, so nothing can be orphaned: {:?}",
+            messages.as_slice()
+        );
+        let results: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => match content.first() {
+                    Some(ToolResultContent::Text { text }) => Some(text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|text| text.contains("notes.md")),
+            "and its arguments moved into the result it reports: {results:?}"
+        );
+    }
+
+    /// The second tier subsumes the one before it.
+    ///
+    /// A turn reaches it only by having `Attachments` undone, so anything that tier removed is back
+    /// in the conversation. Emptying the exchange alone would hand the provider the very
+    /// attachment the first attempt had already been refused with.
+    ///
+    /// The attachment has to be one emptying the exchange does *not* reach, or the test passes on
+    /// the wrong mechanism: an image inside a tool result goes because the result is emptied. A
+    /// prompt's own attached image is the case that needs the second pass, and it shares the window
+    /// with a tool exchange whenever a compaction has reset the floor.
+    #[test]
+    fn test_the_second_tier_also_removes_what_the_attachment_tier_would_have() {
+        let degraded = degrade_rejected_content(
+            &[
+                Message::user_with_images("look at this".to_string(), vec![image_source()]),
+                tool_call("call_1", "read_file", serde_json::json!({"path": "a.png"})),
+                tool_result_text("call_1", "body"),
+            ],
+            "refused",
+            DegradeTier::ToolExchanges,
+        )
+        .expect("there is an exchange to empty");
+        assert!(
+            degraded
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .all(|block| !matches!(block, ContentBlock::Image { .. })),
+            "the attachment the first tier would have taken must go too: {degraded:?}"
+        );
+    }
+
+    /// And it declines when there is no exchange to empty, rather than repeating the tier before
+    /// it. Reaching here means `Attachments` has already been refused, so re-sending what it
+    /// produced would spend the turn's last attempt to change nothing.
+    #[test]
+    fn test_the_second_tier_declines_rather_than_repeating_the_attachment_tier() {
+        let attached = Message::user_with_images("look at this".to_string(), vec![image_source()]);
+        assert!(
+            degrade_rejected_content(
+                std::slice::from_ref(&attached),
+                "refused",
+                DegradeTier::Attachments
+            )
+            .is_some(),
+            "the first tier answers an attachment"
+        );
+        assert!(
+            degrade_rejected_content(&[attached], "refused", DegradeTier::ToolExchanges).is_none(),
+            "and the second must not answer it a second time"
+        );
+    }
+
+    /// The `/rewind` hint reports, so it must fire exactly when there is something to report.
+    ///
+    /// It is earned by having spent a tier: real content was degraded, refused anyway, and put
+    /// back where every later turn re-sends it. A turn that never found a tier to spend was
+    /// refused over the request rather than its contents, and sending that user to delete a turn
+    /// would be advice to destroy the wrong thing.
+    #[tokio::test]
+    async fn test_the_rewind_hint_is_earned_by_a_tier_that_did_not_help() {
+        use crate::provider::mock::{MockEvent, MockProvider};
+
+        async fn hinted(attachments: Vec<ImageSource>) -> bool {
+            let refused = || {
+                vec![MockEvent::FailInvalidRequest {
+                    message: REJECTION.to_string(),
+                }]
+            };
+            let provider = Arc::new(MockProvider::from_rounds(vec![
+                refused(),
+                refused(),
+                refused(),
+            ]));
+            let (agent, frontend) = test_agent_recording(provider).await;
+            agent
+                .run_turn(
+                    &mut None,
+                    &mut Conversation::new(),
+                    "look at this".to_string(),
+                    attachments,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("every attempt was refused");
+            frontend.events().iter().any(|event| {
+                matches!(event, FrontendEvent::Notice(notice) if notice.text.contains("/rewind"))
+            })
+        }
+
+        assert!(
+            hinted(vec![image_source()]).await,
+            "an attachment was degraded and restored, so the session is carrying it again"
+        );
+        assert!(
+            !hinted(Vec::new()).await,
+            "a prose-only turn offered no tier anything; the refusal was not about its contents"
         );
     }
 
@@ -6521,7 +7818,7 @@ mod tests {
 
         assert!(results.contains("Sent (message id 1)"), "{results}");
         assert!(
-            !results.contains("[meka]"),
+            !results.contains(crate::conversation::HARNESS_NOTE),
             "the schema was loaded; nothing to advise: {results}"
         );
     }
@@ -6567,6 +7864,7 @@ mod tests {
         MekaError::RetryableProvider {
             message: "overloaded".to_string(),
             retry_after: None,
+            server_error_on_completion: true,
         }
     }
 
@@ -6605,6 +7903,7 @@ mod tests {
         let degraded = degrade_rejected_content(
             &[assistant, tool_result_with_image("call_1")],
             "the image appears to be a image/jpeg image",
+            DegradeTier::Attachments,
         )
         .expect("there was non-text content to degrade");
 
@@ -6656,7 +7955,8 @@ mod tests {
             media_type: "image/png".to_string(),
             data: "QUJD".to_string(),
         }]);
-        let degraded = degrade_rejected_content(&[attached], "refused").expect("degraded");
+        let degraded = degrade_rejected_content(&[attached], "refused", DegradeTier::Attachments)
+            .expect("degraded");
         assert!(
             degraded[0]
                 .content
@@ -6667,31 +7967,478 @@ mod tests {
 
     /// The signal that a rejection is *not* about content, which is what stops the loop from
     /// spending a retry on a `max_tokens` or bad-header error.
+    ///
+    /// It has to hold for *every* tier, which is what makes the exhausted-tier path in
+    /// [`TurnRecovery::repair_rejected_content`] reachable at all. It is also the guard on the
+    /// user's own words: a conversation of plain prose offers `ToolExchanges` nothing to empty,
+    /// so no tier can answer a refusal by deleting what somebody typed.
     #[test]
     fn test_degrade_rejected_content_reports_nothing_to_do_for_text_only() {
         let messages = vec![
             Message::user("plain text"),
             Message::assistant_text("also plain"),
         ];
-        assert!(degrade_rejected_content(&messages, "refused").is_none());
-        assert!(degrade_rejected_content(&[], "refused").is_none());
+        for tier in DEGRADE_TIERS {
+            assert!(
+                degrade_rejected_content(&messages, "refused", tier).is_none(),
+                "{tier:?} must find nothing in a text-only conversation"
+            );
+            assert!(degrade_rejected_content(&[], "refused", tier).is_none());
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, input: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }],
+        }
+    }
+
+    fn tool_result_text(tool_use_id: &str, text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: text.to_string(),
+                }],
+                is_error: false,
+            }],
+        }
+    }
+
+    /// What the second tier is for. A tool result carrying only text offers `Attachments` nothing,
+    /// which used to end the turn with that text committed and every later turn re-sending it.
+    #[test]
+    fn test_a_text_only_tool_exchange_is_beyond_the_first_tier_and_reached_by_the_second() {
+        let messages = [
+            tool_call(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "notes.md"}),
+            ),
+            tool_result_text("call_1", "a body the provider would not encode"),
+        ];
+
+        assert!(
+            degrade_rejected_content(&messages, "refused", DegradeTier::Attachments).is_none(),
+            "there is no non-text content, so the cheap tier must pass rather than claim a fix"
+        );
+
+        let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
+            .expect("the second tier reaches it");
+        assert_eq!(degraded.len(), 2, "the message count must not change");
+
+        // The shape is untouched: still a call, still its result, still paired.
+        match (&degraded[0].content[0], &degraded[1].content[0]) {
+            (
+                ContentBlock::ToolUse { id, name, input },
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                },
+            ) => {
+                assert_eq!(id, tool_use_id, "the pairing must survive");
+                assert_eq!(name, "read_file", "the model can still see what it called");
+                assert!(
+                    !input.to_string().contains("notes.md"),
+                    "the arguments must not stay on the call: {input}"
+                );
+                // Not `{}`, which would be a false record: it reads as a call the model made with
+                // no arguments at all, rather than one whose arguments meka moved.
+                assert!(
+                    input
+                        .to_string()
+                        .contains(crate::conversation::HARNESS_NOTE),
+                    "the call says its arguments were taken and where they went: {input}"
+                );
+                assert!(is_error, "the model reads this as a failed call");
+
+                let text = ContentBlock::tool_result_text_content(content);
+                assert!(text.contains("read_file"), "names the call: {text}");
+                assert!(text.contains("notes.md"), "quotes the arguments: {text}");
+                assert!(text.contains("refused"), "carries the reason: {text}");
+                assert!(
+                    text.contains("Do not repeat this call unchanged"),
+                    "tells the model not to loop: {text}"
+                );
+                assert!(
+                    !text.contains("a body the provider would not encode"),
+                    "the refused body is what had to go: {text}"
+                );
+            }
+            other => panic!("the exchange must stay an exchange, got {other:?}"),
+        }
+    }
+
+    /// Reasoning is left alone, because the assistant turn still ends in a `tool_use`.
+    ///
+    /// This is the hazard the in-place design deletes rather than manages. Replacing the call with
+    /// text would end the turn on something else, leaving whatever the provider issued to carry
+    /// that reasoning forward describing a turn that no longer exists.
+    #[test]
+    fn test_neutralising_leaves_the_reasoning_that_describes_the_call() {
+        let mut call = tool_call("call_1", "read_file", serde_json::json!({}));
+        call.content.insert(0, ContentBlock::Thinking {
+            thinking: "I should read the file".to_string(),
+            opaque: None,
+        });
+        let degraded = degrade_rejected_content(
+            &[call, tool_result_text("call_1", "body")],
+            "refused",
+            DegradeTier::ToolExchanges,
+        )
+        .expect("degraded");
+
+        assert!(
+            matches!(&degraded[0].content[0], ContentBlock::Thinking { .. }),
+            "reasoning outlives a call that is still a call: {:?}",
+            degraded[0]
+        );
+    }
+
+    /// A result whose call sits in already-accepted history is emptied like any other, and simply
+    /// has no arguments to quote. Nothing is removed, so nothing can be orphaned -- which is the
+    /// property that made the special case this test used to cover unnecessary.
+    #[test]
+    fn test_a_result_whose_call_is_outside_the_window_is_emptied_without_quoting_it() {
+        let messages = [tool_result_text("call_from_before", "the refused body")];
+        let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
+            .expect("the body still has to go");
+
+        match &degraded[0].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call_from_before", "the pairing must survive");
+                assert!(is_error);
+                let text = ContentBlock::tool_result_text_content(content);
+                assert!(!text.contains("the refused body"), "emptied: {text}");
+                assert!(
+                    !text.contains("The call was"),
+                    "and claims nothing about a call it cannot see: {text}"
+                );
+            }
+            other => panic!("an unpaired result must stay a ToolResult, got {other:?}"),
+        }
+    }
+
+    /// The user's own words are not the turn's to destroy, at either tier. A prompt that opens a
+    /// turn sits inside the suspect window, so nothing but this keeps a refusal from being answered
+    /// by deleting what somebody typed.
+    #[test]
+    fn test_no_tier_rewrites_the_prompt_that_opened_the_turn() {
+        let prompt = Message::user("summarise the notes for me");
+        let messages = [
+            prompt,
+            tool_call("call_1", "read_file", serde_json::json!({})),
+            tool_result_text("call_1", "body"),
+        ];
+        let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
+            .expect("degraded");
+        assert_eq!(
+            degraded[0].text_content(),
+            "summarise the notes for me",
+            "the prompt must survive verbatim"
+        );
+    }
+
+    /// A compaction's `loaded_tools_snapshot` has to be built from the log, not from the view.
+    ///
+    /// This is the wiring the test below only describes. Two compactions in a row are enough on
+    /// their own: the first replaces the `load_tool` exchange with a summary that names nothing, so
+    /// a scan of the *materialized* conversation reports no loaded tools, the second boundary
+    /// records that emptiness, and `prune_compacted_events` drops the events that would have
+    /// corrected it. `DegradeTier::ToolExchanges` is the second way into the same hole -- it
+    /// empties a `load_tool` call in place -- and both close with the same one-line change.
+    ///
+    /// The divergence is what makes it nasty in the field: the live process loses the tool and a
+    /// resume, reading the full log off disk, gets it back.
+    #[tokio::test]
+    async fn test_a_second_compaction_keeps_the_tools_the_first_one_carried() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let round = || {
+            vec![
+                MockEvent::Text {
+                    text: "a summary".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![round(), round()]));
+        let (agent, session_manager) =
+            test_agent_that_compacts(provider as Arc<dyn Provider>).await;
+        let created = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let mut session_id = Some(created);
+
+        // Long enough that `compute_compaction_split` keeps a tail rather than summarising
+        // everything, so the second compaction has a real conversation to work on.
+        let body = "x".repeat(4_000);
+        let mut messages = Conversation::new();
+        messages.append(Message::user(format!("load the fetcher {body}")));
+        messages.append(tool_call(
+            "call_1",
+            crate::tools::LOAD_TOOL_NAME,
+            serde_json::json!({"name": ["fetch_url"]}),
+        ));
+        messages.append(tool_result_text("call_1", "loaded"));
+        for index in 0..5 {
+            messages.append(Message::user(format!("user {index} {body}")));
+            messages.append(Message::assistant_text(format!("assistant {index} {body}")));
+        }
+
+        for pass in 1..=2 {
+            agent
+                .compact_session(
+                    &mut session_id,
+                    &mut messages,
+                    CompactRequest::new(CompactOrigin::Manual),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("compaction {pass}: {error}"));
+        }
+
+        assert!(
+            crate::conversation::extract_loaded_tool_names_from_events(messages.events())
+                .iter()
+                .any(|name| name == "fetch_url"),
+            "a tool loaded before the first boundary must survive the second: {:?}",
+            messages.events()
+        );
+    }
+
+    /// Emptying a `load_tool` exchange must not un-load the tool it loaded.
+    ///
+    /// Both scanners are pinned, because they disagree and the disagreement is the defect. The
+    /// slice scan sees a call whose `input` names nothing and a result marked `is_error`, so it
+    /// reports the tool was never loaded; the event scan still has the `Append` rows that recorded
+    /// the load and keeps it. `compact_session` used the slice one to build
+    /// `Event::CompactBoundary::loaded_tools_snapshot`, and `prune_compacted_events` then dropped
+    /// the events that could have corrected it -- so a deferred tool disappeared from the model's
+    /// array mid-session, while a resume reading the full log off disk brought it back.
+    #[test]
+    fn test_a_degraded_load_tool_stays_loaded_in_the_events() {
+        let messages = [
+            tool_call(
+                "call_1",
+                crate::tools::LOAD_TOOL_NAME,
+                serde_json::json!({"name": ["fetch_url"]}),
+            ),
+            tool_result_text("call_1", "loaded"),
+        ];
+        assert!(
+            crate::tools::extract_loaded_tool_names(&messages).contains("fetch_url"),
+            "precondition: the undegraded exchange records the load"
+        );
+
+        let degraded = degrade_rejected_content(&messages, "refused", DegradeTier::ToolExchanges)
+            .expect("there is an exchange to empty");
+        assert!(
+            !crate::tools::extract_loaded_tool_names(&degraded).contains("fetch_url"),
+            "the slice scan cannot see through the emptied call -- which is why nothing production \
+             may use it"
+        );
+
+        let events = vec![
+            crate::conversation::Event::Append(messages[0].clone()),
+            crate::conversation::Event::Append(messages[1].clone()),
+            crate::conversation::Event::Repair {
+                replaced_count: 2,
+                messages: degraded,
+            },
+        ];
+        assert!(
+            crate::conversation::extract_loaded_tool_names_from_events(&events)
+                .iter()
+                .any(|name| name == "fetch_url"),
+            "the log still holds the rows that recorded the load, and a repair only ever adds"
+        );
+    }
+
+    /// Arguments travel so the model can recognise the call, not so the request can carry them
+    /// again: if the arguments were what the provider objected to, re-sending them whole would
+    /// spend the tier and change nothing.
+    #[test]
+    fn test_quoted_arguments_are_capped() {
+        let huge = "x".repeat(QUOTED_ARGUMENTS_LIMIT * 4);
+        let degraded = degrade_rejected_content(
+            &[
+                tool_call("call_1", "write_file", serde_json::json!({"body": huge})),
+                tool_result_text("call_1", "body"),
+            ],
+            "refused",
+            DegradeTier::ToolExchanges,
+        )
+        .expect("degraded");
+        let quoted = ContentBlock::tool_result_text_content(match &degraded[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected a ToolResult, got {other:?}"),
+        });
+        assert!(
+            quoted.chars().count() < QUOTED_ARGUMENTS_LIMIT * 2,
+            "the arguments are a hint, not a payload: {} chars",
+            quoted.chars().count()
+        );
+    }
+
+    /// The degrade notice has to name the way back to what it removed.
+    ///
+    /// A repair is not a deletion: the log is append-only, so the superseded rows stay on disk and
+    /// `format_session_as_markdown` renders them above the repair marker. That is only useful to
+    /// somebody who knows it, and `meka session export` is not a command a user would guess at the
+    /// moment their attachment disappears. The notice is the one place they are certainly looking.
+    #[tokio::test]
+    async fn test_the_degrade_notice_says_where_the_original_went() {
+        use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, frontend) = test_agent_recording(provider).await;
+        agent
+            .run_turn(
+                &mut None,
+                &mut Conversation::new(),
+                "look at this".to_string(),
+                vec![image_source()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the degrade got the turn through");
+
+        let notices: Vec<String> = frontend
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                FrontendEvent::Notice(notice) => Some(notice.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|text| text.contains("meka session export --format json")),
+            "a user whose content just vanished has to be told it is still recoverable: {notices:?}"
+        );
+    }
+
+    /// An accepted request clears what the turn has tried, and it is *acceptance* that does it.
+    ///
+    /// Keying this on a vindicated repair instead left the reprieve spent for the whole turn in the
+    /// one case that matters: when the reprieve works, the unchanged re-send succeeds and no repair
+    /// was ever applied, so there was nothing to vindicate. A second, unrelated 5xx later in the
+    /// same turn then degraded on the spot. Both counters are checked here because both had the
+    /// same bug and only one of them had a test.
+    #[test]
+    fn test_an_accepted_request_clears_what_the_turn_has_tried() {
+        let mut recovery = TurnRecovery {
+            base_messages: Arc::from(Vec::new()),
+            turn_start_len: 0,
+            suspect_floor: 0,
+            prompt_only_events: 0,
+            overflow_retries: 0,
+            tiers_tried: 1,
+            pending_repair: None,
+            user_saved: true,
+            thinking_only_nudged: false,
+            outage_reprieve_used: true,
+        };
+
+        // No pending repair, which is exactly the shape a successful reprieve leaves behind.
+        recovery.note_request_accepted();
+
+        assert_eq!(
+            recovery.tiers_tried, 0,
+            "a tier disproved before an accepted request says nothing about the next refusal"
+        );
+        assert!(
+            !recovery.outage_reprieve_used,
+            "and the wait that separates an outage from a verdict has to be available again"
+        );
+    }
+
+    /// The predicate that decides whether a turn is allowed to answer a failure by rewriting its
+    /// own content.
+    #[test]
+    fn test_refusal_may_blame_content_admits_a_spent_retry_budget_but_not_a_streamed_one() {
+        let retryable = |server_error_on_completion| MekaError::RetryableProvider {
+            message: "API returned status 500 Internal Server Error".to_string(),
+            retry_after: None,
+            server_error_on_completion,
+        };
+        assert!(refusal_may_blame_content(&retryable(true), false));
+        assert!(
+            !refusal_may_blame_content(&retryable(true), true),
+            "retrying after output has reached the user would print it twice"
+        );
+        // The exclusion this predicate exists for. A dropped connection is the same variant, and
+        // degrading on it answers an outage by deleting content: the retry can succeed simply
+        // because the network came back, and the loss is then persisted as proven-good.
+        assert!(
+            !refusal_may_blame_content(&retryable(false), false),
+            "only a 5xx that answered a completion may blame the content"
+        );
+        assert!(refusal_may_blame_content(
+            &MekaError::InvalidRequest("400".to_string()),
+            false
+        ));
+        // The same exclusion, on the variant whose classifier cannot reach it today. The rule is
+        // about what the user has already seen, not about which variant carried the news, so a
+        // backend that ever maps a mid-stream failure to a 400 inherits it rather than printing
+        // the answer twice.
+        assert!(
+            !refusal_may_blame_content(&MekaError::InvalidRequest("400".to_string()), true),
+            "no refusal may be answered by re-sending after output has reached the user"
+        );
+        assert!(
+            !refusal_may_blame_content(&MekaError::Provider("403 forbidden".to_string()), false),
+            "an auth or routing fault is not something the content can explain"
+        );
+        assert!(
+            !refusal_may_blame_content(&MekaError::Interrupted, false),
+            "a user's Ctrl+C is not a refusal to recover from"
+        );
     }
 
     #[test]
-    fn test_elide_reason_caps_a_provider_echoing_the_request_body() {
+    fn test_elide_caps_a_provider_echoing_the_request_body() {
         let long = "x".repeat(REJECTION_REASON_LIMIT * 2);
-        let elided = elide_reason(&long);
+        let elided = elide(&long, REJECTION_REASON_LIMIT);
         assert_eq!(elided.chars().count(), REJECTION_REASON_LIMIT + 1);
         assert!(elided.ends_with('…'));
-        assert_eq!(elide_reason("short"), "short");
+        assert_eq!(elide("short", REJECTION_REASON_LIMIT), "short");
     }
 
     /// Multi-byte input must not be sliced mid-character.
     #[test]
-    fn test_elide_reason_respects_char_boundaries() {
+    fn test_elide_respects_char_boundaries() {
         let long = "é".repeat(REJECTION_REASON_LIMIT + 10);
         assert_eq!(
-            elide_reason(&long).chars().count(),
+            elide(&long, REJECTION_REASON_LIMIT).chars().count(),
             REJECTION_REASON_LIMIT + 1
         );
     }
@@ -6827,6 +8574,7 @@ mod tests {
         let error = MekaError::RetryableProvider {
             message: "rate limited".to_string(),
             retry_after: Some(std::time::Duration::from_secs(5)),
+            server_error_on_completion: false,
         };
         assert_eq!(
             should_retry_provider_error(&error, false, 0, std::time::Duration::ZERO),

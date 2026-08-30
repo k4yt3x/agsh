@@ -151,8 +151,10 @@ impl Conversation {
         }
     }
 
-    /// Read-only borrow of the materialized view. Providers and the scanner
-    /// ([`crate::tools::extract_loaded_tool_names`]) consume this.
+    /// Read-only borrow of the materialized view: what the model is about to be shown, which is
+    /// what providers and the token scanner consume. Anything asking what *happened* reads
+    /// [`Self::events`] instead, because a compaction or a repair can take a record out of this
+    /// view while leaving it in the log.
     pub fn as_slice(&self) -> &[Message] {
         &self.materialized
     }
@@ -440,6 +442,20 @@ impl Conversation {
     }
 }
 
+/// Prefix on every note meka writes *into the conversation itself*, as opposed to onto the screen.
+///
+/// It answers one question the surrounding blocks cannot: who wrote this. A note replacing a tool
+/// result sits where the tool's own output would be, and one replacing an attachment sits in the
+/// user's message, so without a marker the model has to guess whether the tool said it, the user
+/// said it, or something between them did.
+///
+/// Names the harness in words rather than only by product, because a bare `[meka]` is legible only
+/// to a model that recalls what meka is from the system prompt and infers the rest. `[system]`
+/// would read better still and is the wrong choice: nothing strips markers out of a tool result, so
+/// a fetched page or an MCP server's output can contain any string this does, and a marker models
+/// already obey on sight is the worst one to make load-bearing.
+pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
+
 /// Replace every image whose bytes disagree with its declared `media_type` with a text note,
 /// returning how many were replaced.
 ///
@@ -466,8 +482,8 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
     };
     let note = |source: &crate::provider::ImageSource| {
         format!(
-            "[meka] An image here was removed: it is declared {} but the bytes are something else, \
-             which the provider refuses.",
+            "{HARNESS_NOTE} An image here was removed: it is declared {} but the bytes are \
+             something else, which the provider refuses.",
             source.media_type
         )
     };
@@ -585,8 +601,9 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
     orphan
 }
 
-/// Walk events and collect the names of tools loaded via successful `load_tool` calls. Same
-/// contract as [`crate::tools::extract_loaded_tool_names`] but events-aware so it can absorb
+/// Walk events and collect the names of tools loaded via successful `load_tool` calls. **The only
+/// door for this question**: a scan of the materialized slice cannot see a load whose exchange a
+/// compaction has summarised away or a repair has emptied, and this absorbs
 /// [`Event::CompactBoundary::loaded_tools_snapshot`] when it crosses a boundary. Pending uses
 /// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
 /// for those uses are still in the log on disk, but they're below the materialized view's "logical
