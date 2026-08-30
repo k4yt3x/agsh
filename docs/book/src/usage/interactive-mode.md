@@ -138,6 +138,8 @@ Replays prior messages in the current session so you can scroll back through con
 
 The renderer mimics the live REPL: assistant text flows through the same markdown highlighter, tool calls honour [`display.tool_params`](../configuration/config-file.md#displaytool_params) (by default a one-line `[tool ReadFile(...)]` indicator), and thinking blocks honour `[thinking].show_content`. User prompts are prefixed with a cyan `>` so they stand out from agent text.
 
+One difference: a call to a tool from an [MCP server](../configuration/config-file.md#mcpservers) replays as a bare `[tool name]`, without the argument it showed live. Which of a tool's arguments is the one worth showing comes from its JSON Schema, which the server publishes at connect time and the conversation does not store; meka knows its own tools' arguments from their names alone, so those replay in full.
+
 For users who always want extra context at resume time, set [`display.resume_show_recent`](../configuration/config-file.md#displayresume_show_recent); the resume code path then renders the last N turns through the same function.
 
 ### `/status`

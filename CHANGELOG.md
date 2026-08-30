@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An MCP meta-tool's indicator names the resource or prompt it acts on, not the server holding it.
 - `/provider` lists one profile per line with its backend, under a heading, not a comma-joined run.
 - `/status` orders its resolved-profile lines the way `[providers.<name>]` declares them.
 - Ctrl+C and the background-task notices read as annotations: `(interrupted)`, in yellow.
@@ -67,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `/history` replays a built-in's argument; nineteen of them replayed as a bare tool name.
+- `context_compact`'s indicator shows its instructions, where it showed no argument anywhere.
 - `[display]` blank lines now bracket everything between two prompts, including failures.
 - `newline_after_prompt = false` is no longer ignored from the second turn onward.
 - A failed turn's partial answer prints in its own turn, not under the next prompt.

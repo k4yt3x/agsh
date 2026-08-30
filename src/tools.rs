@@ -2539,32 +2539,42 @@ pub(crate) mod tests {
         Arc::new(RwLock::new(todo::TodoState::default()))
     }
 
-    /// Every tool that takes a meaningful argument must be able to show one in the tool-call
-    /// indicator.
+    /// Every built-in that takes a meaningful argument must be able to show one in the tool-call
+    /// indicator, and must still be able to when the tool's schema next changes.
     ///
-    /// `resolve_primary_param` tries the built-in map first and falls back to `required[0]`, so a
-    /// tool with arguments but no `required` array falls through both and renders as a bare name.
-    /// `task_cancel` shipped exactly that way: an id-or-`all` schema with nothing required, so a
-    /// cancellation displayed without saying what it cancelled.
+    /// Three failure modes, each of which has actually happened here:
+    ///
+    /// - **No rule at all.** `resolve_primary_param` consults the built-in map, then the tool's
+    ///   JSON Schema. Replayed history has no schema, so a built-in absent from the map renders
+    ///   bare in `/history` having rendered fully live: nineteen of them did, including
+    ///   `schedule_cancel`, which replayed without saying which job it cancelled.
+    /// - **No rule and no `required`.** Then even the live line has nothing to reach for.
+    ///   `task_cancel` shipped that way, and `context_compact` after it.
+    /// - **A rule that has gone stale.** The map is keyed by tool name and names a parameter by
+    ///   string, so renaming that parameter silently breaks it. Renaming `schedule_cancel`'s `id`
+    ///   to `job_id` fails the schedule tool's own two tests and nothing else, and updating those
+    ///   two - the obvious thing to do next - leaves the indicator quietly bare again. This is why
+    ///   the probe is built from each tool's declared properties rather than from a fixed list.
+    ///
+    /// The sweep is over the whole registry rather than `BUILTIN_TOOL_NAMES` so that each name
+    /// arrives with its real schema, and it asserts at the end that it saw every name, because a
+    /// family missing from the registry is exactly how the first two went unnoticed: the previous
+    /// version of this test could not build `context_*`, `agent_*` or the MCP meta-tools and
+    /// therefore never examined eleven of the tools it was written to protect.
     #[tokio::test]
     async fn test_every_tool_with_arguments_can_show_a_primary_param() {
         // meka's own universal parameters. A tool whose schema is only these takes no argument of
         // its own and has nothing to display.
         const UNIVERSAL: &[&str] = &[SCRATCHPAD_PARAMETER, BACKGROUND_PARAMETER];
 
-        let registry = test_registry().await;
-        registry.enable_background();
-        for tool in background::build(
-            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory db"),
-            Arc::new(RwLock::new(None)),
-            crate::background::BackgroundTasks::default(),
-        ) {
-            registry.register(tool).expect("register task tool");
-        }
+        let registry = registry_with_every_builtin().await;
+        // The MCP meta-tools are registered deferred, which is what keeps them out of an ordinary
+        // turn's tool list; naming them as loaded is how the sweep sees them.
+        let loaded: Vec<String> = MCP_META_TOOL_NAMES.iter().map(|n| n.to_string()).collect();
 
-        for definition in registry.definitions_active_with_loaded(&[]) {
+        let mut swept: HashSet<String> = HashSet::new();
+        for definition in registry.definitions_active_with_loaded(&loaded) {
+            swept.insert(definition.name.clone());
             let own_properties = definition
                 .parameters
                 .get("properties")
@@ -2576,23 +2586,155 @@ pub(crate) mod tests {
                         .count()
                 })
                 .unwrap_or(0);
+            assert_eq!(
+                own_properties == 0,
+                crate::render::BUILTINS_WITHOUT_ARGUMENTS.contains(&definition.name.as_str()),
+                "{} takes {} argument(s), so `BUILTINS_WITHOUT_ARGUMENTS` {} list it",
+                definition.name,
+                own_properties,
+                if own_properties == 0 {
+                    "should"
+                } else {
+                    "must not"
+                },
+            );
             if own_properties == 0 {
                 continue;
             }
-            let has_required = definition
-                .parameters
-                .get("required")
-                .and_then(|required| required.as_array())
-                .is_some_and(|required| !required.is_empty());
-            // Probe the built-in map with an empty object: a mapped tool answers for at least one
-            // shape of input, which is what distinguishes "has a rule" from "falls through".
-            let mapped = crate::render::has_primary_param_rule(&definition.name);
             assert!(
-                has_required || mapped,
-                "{} takes arguments but has no `required` and no built-in rule, so its tool-call \
-                 indicator would render with no argument",
+                crate::render::primary_param_answers_for_schema(
+                    &definition.name,
+                    &definition.parameters
+                ),
+                "{} takes arguments, but `builtin_primary_param` returns nothing for an input \
+                 built from its own schema: either it has no rule, or its rule names a parameter \
+                 the tool no longer declares. Its tool-call indicator renders with no argument, \
+                 live and in `/history`.",
                 definition.name,
             );
+        }
+
+        for name in BUILTIN_TOOL_NAMES {
+            assert!(
+                swept.contains(*name),
+                "{name} was never examined: `registry_with_every_builtin` does not register it, so \
+                 nothing above checked whether its indicator can show an argument",
+            );
+        }
+    }
+
+    /// A registry holding every name in [`BUILTIN_TOOL_NAMES`], for tests that must not silently
+    /// skip a family.
+    ///
+    /// `build_default` alone is not enough: `skill_write` / `skill_delete` need `agent_managed`,
+    /// the `task_*` and `context_*` families are registered by their own hosts, and the MCP
+    /// meta-tools appear only once a server is configured. None of them need to *work* here, only
+    /// to answer `definition()`, so the collaborators are the cheapest that construct: an in-memory
+    /// store, a zeroed gauge, and a server whose command does not exist (`prepare` validates config
+    /// and spawns nothing).
+    async fn registry_with_every_builtin() -> ToolRegistry {
+        let registry = build_test_registry_with(BuiltinToolFilter::default(), true).await;
+        let session_manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("in-memory db");
+
+        registry.enable_background();
+        for tool in background::build(
+            session_manager.clone(),
+            Arc::new(RwLock::new(None)),
+            crate::background::BackgroundTasks::default(),
+        ) {
+            registry.register(tool).expect("register task tool");
+        }
+
+        registry.register_context_tools(
+            context::ContextGauge {
+                used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                compact_at_percent: None,
+            },
+            context::PendingCompaction::default(),
+            false,
+            session_manager,
+            Arc::new(RwLock::new(None)),
+        );
+
+        for definition in [
+            subagent::agent_spawn_definition(),
+            subagent::agent_list_definition(),
+            subagent::agent_followup_definition(),
+            subagent::agent_delete_definition(),
+        ] {
+            registry
+                .register(Arc::new(SchemaOnlyTool { definition }))
+                .expect("register subagent schema");
+        }
+
+        let server = crate::config::McpServerConfig {
+            name: "fixture-srv".to_string(),
+            transport: crate::config::McpTransport::Stdio,
+            command: Some("/bin/false".to_string()),
+            args: None,
+            env: None,
+            url: None,
+            headers: None,
+            headers_helper: None,
+            auth: None,
+            permission: None,
+            allowed_tools: None,
+            disabled_tools: None,
+            eager_load_tools: None,
+            tool_permissions: None,
+            trust_read_only_hint: None,
+            disabled: false,
+            required: None,
+        };
+        let manager = crate::mcp::McpClientManager::prepare(
+            &[server],
+            None,
+            None,
+            crate::mcp::McpClientContext::new(),
+        )
+        .await
+        .expect("prepare with one configured server");
+        mcp_resources::register_all(&registry, manager);
+
+        registry
+    }
+
+    /// Stands in for a tool whose only interesting part here is its schema.
+    ///
+    /// The `agent_*` family's real tools carry a `ToolBuilderParams` that reaches most of the
+    /// process; their schemas are free-standing functions precisely so a caller can have the
+    /// declaration without the machinery, and this is such a caller.
+    struct SchemaOnlyTool {
+        definition: ToolDefinition,
+    }
+
+    #[async_trait]
+    impl Tool for SchemaOnlyTool {
+        fn definition(&self) -> ToolDefinition {
+            self.definition.clone()
+        }
+
+        fn required_permission(&self) -> Permission {
+            Permission::Read
+        }
+
+        /// An error rather than a panic, so a later test that reaches
+        /// [`registry_with_every_builtin`] for some other reason and dispatches one of these fails
+        /// on its own assertion instead of on this one's stack.
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolOutput> {
+            Err(crate::error::MekaError::ToolExecution {
+                tool_name: self.definition.name.clone(),
+                message: "registered for its schema only and cannot run".to_string(),
+            })
         }
     }
 

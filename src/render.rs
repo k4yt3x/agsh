@@ -3190,22 +3190,63 @@ pub(crate) mod log_capture {
     }
 }
 
-/// Whether [`builtin_primary_param`] has a rule for `name`.
+/// Whether [`builtin_primary_param`] answers for `name` given an input shaped like `parameters`.
 ///
-/// Exists so a test can assert the invariant that every tool taking arguments can display one,
-/// without having to synthesise a valid input for each. A tool with no `required` array relies
-/// entirely on having a rule here, since the schema fallback has no first entry to read.
+/// The probe is built from the tool's own declared properties, not from a fixed list of keys, and
+/// that is the whole point. A rule keyed to a parameter the tool does not declare - a typo, or a
+/// parameter renamed long afterwards - satisfies a hand-written probe happily while returning
+/// `None` for every real call, and the tool silently goes back to rendering bare. Renaming
+/// `schedule_cancel`'s `id` to `job_id` failed only that tool's own two behavioural tests; nothing
+/// anywhere said the indicator had lost its argument.
+///
+/// Drives `test_every_tool_with_arguments_can_show_a_primary_param`, which is in `crate::tools`
+/// because that is where the schemas are.
 #[cfg(test)]
-pub fn has_primary_param_rule(name: &str) -> bool {
-    // A probe input that satisfies whichever branch applies. `builtin_primary_param` returns `None`
-    // for a mapped tool given the wrong shape, so the probe carries every key any rule looks at.
-    let probe = serde_json::json!({
-        "from_scratchpad": "x", "id": "x", "command": "x", "path": "x", "pattern": "x",
-        "url": "x", "query": "x", "prompt": "x", "name": "x",
-    });
-    builtin_primary_param(name, &probe).is_some()
+pub fn primary_param_answers_for_schema(name: &str, parameters: &serde_json::Value) -> bool {
+    let mut probe = serde_json::Map::new();
+    if let Some(properties) = parameters.get("properties").and_then(|p| p.as_object()) {
+        for (key, property) in properties {
+            // Typed, because a rule may read a value rather than only its presence: `task_cancel`
+            // branches on `all` being `true`, and a string there would take the wrong arm.
+            let value = match property.get("type").and_then(|t| t.as_str()) {
+                Some("integer" | "number") => serde_json::json!(1),
+                Some("boolean") => serde_json::json!(true),
+                Some("array") => serde_json::json!(["x"]),
+                Some("object") => serde_json::json!({"x": "y"}),
+                _ => serde_json::json!("x"),
+            };
+            probe.insert(key.clone(), value);
+        }
+    }
+    builtin_primary_param(name, &serde_json::Value::Object(probe)).is_some()
 }
 
+/// The built-ins that take no argument of their own, and so need no rule below.
+///
+/// The complement of [`builtin_primary_param`]'s coverage over
+/// [`crate::tools::BUILTIN_TOOL_NAMES`]. Stated rather than derived because most of these are
+/// `list` tools that could grow a filter later, and a new property on one of them must be a
+/// decision to revisit the entry rather than a silent exemption;
+/// `test_every_tool_with_arguments_can_show_a_primary_param` checks every entry against the tool's
+/// real schema and fails either way round.
+#[cfg(test)]
+pub const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
+    "agent_list",
+    "context_check",
+    "mcp_resource_updates_list",
+    "schedule_list",
+    "scratchpad_list",
+    "task_list",
+];
+
+/// The argument a tool-call indicator shows next to the tool's name.
+///
+/// One rule per name in [`crate::tools::BUILTIN_TOOL_NAMES`] that takes an argument, the complement
+/// of `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is *for*, not a
+/// convenience: [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed
+/// history has none, so a built-in missing from here renders bare in `/history` having rendered
+/// fully live. `schedule_cancel` shipped that way, replaying as `[tool ScheduleCancel]` with no
+/// word of which job was cancelled.
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     // `render_image` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
@@ -3265,19 +3306,44 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         return input.get("id").and_then(|v| v.as_str()).map(str::to_string);
     }
 
+    // Sorted, like `tool_display_name` and `BUILTIN_TOOL_NAMES`, so the three can be read against
+    // each other. Mostly this agrees with the schema's own `required[0]`, which is what the live
+    // path would have fallen back to; where it does not, the schema's first required key names the
+    // server a call is addressed to rather than the thing it acts on, and the object is what a
+    // reader wants (`mcp_resource_read` shows the URI, not which server holds it).
     let key = match name {
-        "execute_command" => "command",
-        "read_file" | "write_file" | "edit_file" => "path",
-        "find_files" | "search_contents" => "pattern",
-        "fetch_url" => "url",
-        "search_web" => "query",
+        "agent_delete" | "agent_followup" => "agent",
         "agent_spawn" => "prompt",
-        "scratchpad_write" | "scratchpad_read" | "scratchpad_edit" | "scratchpad_delete" => "name",
-        "skill_read" | "skill_write" | "skill_delete" => "name",
+        "context_compact" => "instructions",
+        "conversation_read" => "start",
+        "conversation_search" => "query",
+        "edit_file" | "read_file" | "write_file" => "path",
+        "execute_command" => "command",
+        "fetch_url" => "url",
+        "find_files" | "search_contents" => "pattern",
+        "load_tool" => "name",
+        "mcp_prompt_get" => "name",
+        "mcp_prompt_list" | "mcp_resource_list" => "server",
+        "mcp_resource_read" | "mcp_resource_subscribe" | "mcp_resource_unsubscribe" => "uri",
+        "memory_delete" | "memory_read" | "memory_write" => "name",
+        "memory_search" => "queries",
+        "schedule_cancel" => "id",
+        "schedule_create" => "prompt",
+        "scratchpad_delete" | "scratchpad_edit" | "scratchpad_read" | "scratchpad_write" => "name",
+        "scratchpad_load_file" => "path",
+        "scratchpad_merge" => "sources",
+        "scratchpad_rename" => "old",
+        "scratchpad_save_file" => "name",
+        "search_web" => "query",
+        "skill_delete" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
         _ => return None,
     };
-    input.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    // Coerced rather than read as a string: `load_tool` takes a name or a list of them,
+    // `memory_search` takes a list of phrasings, and `conversation_read` takes a number. Reading
+    // only `as_str` returned `None` for all three, which sent the live path to the schema fallback
+    // -- where the same value went through this very function -- and left the replayed line bare.
+    input.get(key).and_then(coerce_display_value)
 }
 
 /// Fallback for tools not covered by the built-in map (MCP tools, dynamically-registered tools,
@@ -4088,6 +4154,38 @@ mod tests {
                 TEST_WIDTH,
             ),
             "[tool ReadFile(`/resolved/by/the/agent`)]"
+        );
+    }
+
+    /// The reported defect, pinned by name. `crate::tools`'
+    /// `test_every_tool_with_arguments_can_show_a_primary_param` is what generalises it to every
+    /// built-in; this is the case a reader recognises.
+    #[test]
+    fn test_a_replayed_cancellation_says_what_it_cancelled() {
+        assert_eq!(
+            tool_indicator_line(
+                "schedule_cancel",
+                &serde_json::json!({"id": "7f3a1c22"}),
+                None,
+                TEST_WIDTH,
+            ),
+            "[tool ScheduleCancel(`7f3a1c22`)]"
+        );
+    }
+
+    /// A list-valued primary parameter is joined, not dropped. Reading only `as_str` returned
+    /// `None` here, which cost the live line nothing (the schema fallback coerced the same value)
+    /// and cost the replayed one its argument.
+    #[test]
+    fn test_a_list_valued_primary_param_survives_replay() {
+        assert_eq!(
+            tool_indicator_line(
+                "memory_search",
+                &serde_json::json!({"queries": ["window size", "context window"]}),
+                None,
+                TEST_WIDTH,
+            ),
+            "[tool MemorySearch(`window size, context window`)]"
         );
     }
 
@@ -5408,6 +5506,69 @@ mod tests {
         );
         assert_eq!(
             builtin_primary_param("task_cancel", &serde_json::json!({})),
+            None
+        );
+    }
+
+    /// The four MCP meta-tools that address a server deliberately show the object rather than the
+    /// server, which is where the map departs from what `required[0]` would have picked.
+    ///
+    /// Written down because the departure looks like an oversight from the schema's side: reading
+    /// `mcp_resource_read`'s `"required": ["server", "uri"]` alone, `server` is the obvious answer.
+    /// It is also the useless one, identical across every call to a given server.
+    #[test]
+    fn test_builtin_primary_param_mcp_meta_tools_show_the_object() {
+        let addressed = serde_json::json!({"server": "ida", "uri": "file:///tmp/a.i64"});
+        for name in [
+            "mcp_resource_read",
+            "mcp_resource_subscribe",
+            "mcp_resource_unsubscribe",
+        ] {
+            assert_eq!(
+                builtin_primary_param(name, &addressed).as_deref(),
+                Some("file:///tmp/a.i64"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            builtin_primary_param(
+                "mcp_prompt_get",
+                &serde_json::json!({"server": "ida", "name": "explain"})
+            )
+            .as_deref(),
+            Some("explain")
+        );
+        // The two list tools take only `server`, and it is optional: listing every server is the
+        // documented default, and has nothing specific to show.
+        assert_eq!(
+            builtin_primary_param("mcp_resource_list", &serde_json::json!({"server": "ida"}))
+                .as_deref(),
+            Some("ida")
+        );
+        assert_eq!(
+            builtin_primary_param("mcp_prompt_list", &serde_json::json!({})),
+            None
+        );
+    }
+
+    /// `context_compact` declares no `required`, so like `task_cancel` before it the schema
+    /// fallback had nothing to reach for and the call rendered bare on every surface, not just
+    /// replay.
+    #[test]
+    fn test_builtin_primary_param_context_compact() {
+        assert_eq!(
+            builtin_primary_param(
+                "context_compact",
+                &serde_json::json!({"instructions": "keep the design decisions"})
+            )
+            .as_deref(),
+            Some("keep the design decisions")
+        );
+        assert_eq!(
+            builtin_primary_param(
+                "context_compact",
+                &serde_json::json!({"keep_recent": false})
+            ),
             None
         );
     }
