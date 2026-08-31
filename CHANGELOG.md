@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A store meka refuses to migrate is named by path, instead of an unlocatable "this store".
+
 ## [0.44.1] - 2026-08-31
 
 ### Removed

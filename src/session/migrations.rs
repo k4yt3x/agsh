@@ -184,10 +184,12 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
     // downgrade.
     if stored > head {
         return Err(MekaError::Database(format!(
-            "this store is at schema version {} and this meka only knows {}, so it was written by \
-             a newer release. Nothing has been changed. Upgrade meka, or point MEKA_DATA_DIR at a \
+            "{} is at schema version {} and this meka only knows {}, so it was written by a newer \
+             release. Nothing has been changed. Upgrade meka, or point MEKA_DATA_DIR at a \
              different store",
-            stored, head
+            store_name(connection),
+            stored,
+            head
         )));
     }
     let from = if stored <= RETIRED_INITIALISED_FLAG {
@@ -437,6 +439,24 @@ fn set_user_version(transaction: &rusqlite::Transaction<'_>, version: u32) -> Re
 /// last. Without the check such a store is stamped at head with a table still missing, which
 /// nothing will ever revisit; measured, `meka session list` succeeded and left it that way.
 /// Refusing names what is wrong instead.
+/// Name the file a refusal is about.
+///
+/// Every refusal here is a *stop*, and the reader's next move is to go look at the store. Saying
+/// "this store" leaves them to work out which file that is, and the answer is not obvious: meka
+/// creates one on any invocation while `config.toml` appears only once a provider is added, so a
+/// machine that ran an old meka once and was never configured has a store the user has no reason to
+/// believe in. Told "this store is in the 0.41 shape" there, the honest reading is that meka is
+/// wrong. Named, it is a file they can look at.
+///
+/// `Connection::path` is rusqlite's own, so this stays inside what a migration may call. An
+/// in-memory store reports an empty path rather than `None`, hence both arms.
+fn store_name(connection: &rusqlite::Connection) -> &str {
+    match connection.path() {
+        Some(path) if !path.is_empty() => path,
+        _ => "the session store",
+    }
+}
+
 fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     // Not a meka store: an empty file, or one carrying tables meka did not write. Nothing to carry
     // forward either way, so build the schema alongside whatever is already there, which is what
@@ -446,20 +466,20 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     }
     let columns = table_columns(connection, "scheduled_jobs")?;
     if columns.is_empty() {
-        return Err(MekaError::Database(
-            "this store has tables but no `scheduled_jobs`, so it predates 0.42 and this meka \
-             cannot bring it forward. Nothing has been changed. Run the 0.42 release against it \
-             once, then this one"
-                .to_string(),
-        ));
+        return Err(MekaError::Database(format!(
+            "{} has tables but no `scheduled_jobs`, so it predates 0.42 and this meka cannot bring \
+             it forward. Nothing has been changed. Run the 0.42 release against it once, then this \
+             one",
+            store_name(connection)
+        )));
     }
     if !columns.iter().any(|column| column == "gate_permission") {
-        return Err(MekaError::Database(
-            "this store is in the 0.41 shape, which this meka cannot bring forward. Nothing has \
-             been changed. Run `migrate-0.41-to-0.42.py`, attached to the 0.42 release, once; \
-             every upgrade after that is automatic"
-                .to_string(),
-        ));
+        return Err(MekaError::Database(format!(
+            "{} is in the 0.41 shape, which this meka cannot bring forward. Nothing has been \
+             changed. Run `migrate-0.41-to-0.42.py`, attached to the 0.42 release, once; every \
+             upgrade after that is automatic",
+            store_name(connection)
+        )));
     }
     let mut missing = Vec::new();
     for names in BASELINE_OBJECTS {
@@ -488,9 +508,10 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     }
     if !missing.is_empty() {
         return Err(MekaError::Database(format!(
-            "this store is missing {}, which every release from 0.42 creates, so it was probably \
-             left half-built by an interrupted first run. Nothing has been changed. Restore it \
-             from a backup, or move it aside and let meka build a new one",
+            "{} is missing {}, which every release from 0.42 creates, so it was probably left \
+             half-built by an interrupted first run. Nothing has been changed. Restore it from a \
+             backup, or move it aside and let meka build a new one",
+            store_name(connection),
             missing.join(", ")
         )));
     }
@@ -2395,6 +2416,81 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("migrate-0.41-to-0.42.py"), "{message}");
         assert!(message.contains("Nothing has been changed"), "{message}");
+    }
+
+    /// A refusal has to name the file it is about. meka creates a store on any invocation while
+    /// `config.toml` appears only once a provider is added, so a machine that ran an old meka once
+    /// and was never configured holds a store its owner has no reason to believe exists. Told only
+    /// that "this store" is in the 0.41 shape, the honest reading there is that meka is wrong about
+    /// a database that was never set up.
+    ///
+    /// Every refusal, not only the one that prompted this: each ends with the reader going to look
+    /// at a file, and a later one added without the path would be exactly as unlocatable.
+    ///
+    /// Matched on the file name rather than the whole path, because SQLite reports the path it
+    /// opened and that is not textually the one passed on every platform.
+    #[test]
+    fn every_refusal_names_the_store_it_is_about() {
+        // Each is the smallest shape that reaches one refusal, paired with a phrase unique to it so
+        // a case that starts landing on a *different* refusal fails rather than passing by luck.
+        let shapes: &[(&str, &str, &str)] = &[
+            (
+                "newer.db",
+                "PRAGMA user_version = 999;",
+                "is at schema version",
+            ),
+            (
+                "pre-042.db",
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY);",
+                "has tables but no `scheduled_jobs`",
+            ),
+            (
+                "shape-041.db",
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+                 CREATE TABLE scheduled_jobs (id TEXT PRIMARY KEY, gate_command TEXT);",
+                "is in the 0.41 shape",
+            ),
+            (
+                "half-built.db",
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+                 CREATE TABLE scheduled_jobs (id TEXT PRIMARY KEY, gate_permission TEXT);",
+                "is missing",
+            ),
+        ];
+
+        let directory = tempfile::tempdir().expect("a temp dir");
+        for (file, shape, phrase) in shapes {
+            let connection = rusqlite::Connection::open(directory.path().join(file))
+                .expect("a file-backed store");
+            connection.execute_batch(shape).expect("the planted shape");
+
+            let message = plan(&connection).expect_err("refused").to_string();
+            assert!(
+                message.contains(phrase),
+                "{file} hit another refusal: {message}"
+            );
+            assert!(message.contains(file), "{file} must be named: {message}");
+        }
+    }
+
+    /// The fallback arm, which every unit test above reaches. An in-memory store reports an empty
+    /// path rather than `None`, so a bare `unwrap_or` would put the refusal's subject at the front
+    /// of the sentence as nothing at all.
+    #[test]
+    fn a_store_with_no_path_is_still_given_a_subject() {
+        let connection = fresh();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+                 CREATE TABLE scheduled_jobs (id TEXT PRIMARY KEY, gate_command TEXT);",
+            )
+            .expect("a 0.41 shape");
+
+        let message = plan(&connection).expect_err("0.41 is refused").to_string();
+        assert!(
+            message.contains("the session store is in the 0.41 shape"),
+            "{message}"
+        );
     }
 
     /// The whole basis for distrusting a stored `1`, pinned so it cannot quietly stop being true.
