@@ -636,7 +636,7 @@ Default: `true`
 
 ### `display.newline_after_prompt`
 
-Whether to add a blank line after the line you typed, before its output.
+Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Continuing session:` banner takes its place, and this is the blank between that banner and the replayed history.
 
 Default: `true`
 
