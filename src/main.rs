@@ -226,20 +226,6 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
-    // `-c` used to take an optional session id, so `meka -c <uuid>` was the documented way to
-    // resume one. It is now a boolean, which would silently read that id as the prompt and continue
-    // the *most recent* session instead of the named one. Catch the old spelling rather than
-    // quietly doing the wrong thing.
-    if cli.continue_last
-        && let Some(prompt) = cli.prompt.as_deref()
-        && looks_like_session_id(prompt)
-    {
-        return Err(anyhow::anyhow!(
-            "`-c` no longer takes a session id; use `-r {prompt}` to resume that session, \
-             or `-c` alone to continue the most recent one"
-        ));
-    }
-
     // Refused rather than ignored. Both name *this run's session*, and a long-lived host has no
     // such thing: it creates a session per `session/new` or `POST /v1/sessions`. Accepting them
     // silently was worse than it sounds, because `-c` / `-r` set `session_resume`, which switches
@@ -3211,17 +3197,6 @@ async fn apply_session_repin(
     Ok(())
 }
 
-/// Whether a string is plausibly a session id rather than a prompt: hex digits and hyphens only,
-/// and long enough to be a useful UUID prefix.
-///
-/// Only used to catch the old `meka -c <uuid>` spelling and point at `-r`. Deliberately
-/// conservative: an English prompt of eight-plus characters with no spaces that happens to be pure
-/// hex (`deadbeef`) would be caught, but that is a far better trade than silently continuing the
-/// wrong session for someone following older docs.
-fn looks_like_session_id(value: &str) -> bool {
-    value.len() >= 8 && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 /// Resolve `meka -r <value>` to a single session UUID. Tries a
 /// full-UUID parse first; if that fails, falls back to a prefix lookup so users can type just the
 /// leading hex chars.
@@ -3792,23 +3767,6 @@ mod tests {
             crate::session::cli::parents_first_order(&nodes).expect("order"),
             vec![0]
         );
-    }
-
-    /// `meka -c <uuid>` was the documented way to resume a specific session before `-c` became a
-    /// boolean. It now parses as "continue the most recent session, with this id as the prompt",
-    /// which is silently the wrong session, so the old spelling has to be caught rather than run.
-    #[test]
-    fn test_looks_like_session_id_catches_the_old_spelling() {
-        assert!(looks_like_session_id(
-            "550e8400-e29b-41d4-a716-446655440000"
-        ));
-        assert!(looks_like_session_id("550e8400"));
-        // Real prompts are not mistaken for ids.
-        assert!(!looks_like_session_id("fix the bug"));
-        assert!(!looks_like_session_id("explain"));
-        assert!(!looks_like_session_id("why?"));
-        // Too short to be a useful prefix, so treated as a prompt.
-        assert!(!looks_like_session_id("550e"));
     }
 
     fn user_msg(text: &str) -> provider::Message {

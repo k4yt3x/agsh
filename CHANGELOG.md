@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The compat error for `meka -c <uuid>`, retired in 0.37.0; the id now reads as a prompt.
+
 ### Fixed
 
 - A thinking signature sent on `content_block_start` is kept, unbreaking tool calls via OpenRouter.
