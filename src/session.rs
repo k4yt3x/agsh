@@ -8633,7 +8633,13 @@ mod tests {
     /// there, with a name already picked and no copy written.
     ///
     /// Control flow is what enforces the ordering; this is what notices a rearrangement of it.
-    #[cfg(unix)]
+    ///
+    /// Linux, not `unix`: macOS validates filenames as UTF-8 in the kernel and answers `EILSEQ` to
+    /// a `create` for this name, so the store path this needs cannot be built there. The ordering
+    /// is still guarded on every platform by
+    /// [`a_failed_migration_keeps_the_copy_it_would_have_superseded`], which reaches the same
+    /// refusal through an unreadable config.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn nothing_is_pruned_when_no_fresh_copy_landed() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
