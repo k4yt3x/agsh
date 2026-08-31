@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.44.1"
+version = "0.44.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

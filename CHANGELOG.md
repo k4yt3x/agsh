@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.2] - 2026-08-31
+
 ### Fixed
 
 - A store meka refuses to migrate is named by path, instead of an unlocatable "this store".
+- `failed to open database` and `failed to initialize schema` name the store they are about.
 
 ## [0.44.1] - 2026-08-31
 
@@ -1757,7 +1760,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.2...HEAD
+[0.44.2]: https://github.com/k4yt3x/meka/compare/0.44.1...0.44.2
 [0.44.1]: https://github.com/k4yt3x/meka/compare/0.44.0...0.44.1
 [0.44.0]: https://github.com/k4yt3x/meka/compare/0.43.0...0.44.0
 [0.43.0]: https://github.com/k4yt3x/meka/compare/0.42.2...0.43.0

@@ -916,9 +916,13 @@ impl SessionManager {
                 })?;
         }
 
-        let connection = Connection::open(&database_path)
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to open database: {}", error)))?;
+        let connection = Connection::open(&database_path).await.map_err(|error| {
+            MekaError::Database(format!(
+                "failed to open database '{}': {}",
+                database_path.display(),
+                error
+            ))
+        })?;
 
         // Belt-and-braces: if the file pre-existed at a more permissive mode (manual setup,
         // restored backup, etc.), tighten it now. The pre-touch above is the primary protection for
@@ -1038,9 +1042,9 @@ impl SessionManager {
         // What the lock costs, and it is real: opening the store takes a write lock even when there
         // is nothing to do, so a long-running writer elsewhere fails commands that only read. An
         // external `BEGIN IMMEDIATE` held for eight seconds kills `meka --oneshot` at 5.1 seconds
-        // with `failed to initialize schema: database is locked`, and `meka session list` -- a pure
-        // read -- dies the same way. A rare, loud, retryable startup error is the accepted half of
-        // that trade.
+        // with `failed to initialize schema in '<path>': database is locked`, and
+        // `meka session list` -- a pure read -- dies the same way. A rare, loud, retryable startup
+        // error is the accepted half of that trade.
         let database_path = self.database_path.clone();
         let context = context.clone();
         let (plan, backup) = self
@@ -1082,7 +1086,11 @@ impl SessionManager {
             .await
             .map_err(|error| match error {
                 tokio_rusqlite::Error::Error(inner) => inner,
-                other => MekaError::Database(format!("failed to initialize schema: {}", other)),
+                other => MekaError::Database(format!(
+                    "failed to initialize schema in '{}': {}",
+                    self.database_path.display(),
+                    other
+                )),
             })?;
 
         if plan.has_work() {

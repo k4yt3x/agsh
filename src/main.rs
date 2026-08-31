@@ -1587,15 +1587,26 @@ async fn run_oneshot(
         if !outcomes.is_empty() {
             // Printed rather than delivered as a turn: the agent's answer has already been given
             // and the process is on its way out, so this is for the human reading the output.
-            eprintln!();
-            eprint!("{}", crate::background::render_outcomes(&outcomes));
+            //
+            // Through the console, which owns every row this run writes; spacing is off here, so
+            // the leading blank is this block's own. Nothing in a one-shot leaves a transient row
+            // to settle today (MCP progress is dropped for want of a REPL to draw it), so this is
+            // the module's one-owner rule rather than a fix for a reachable glitch.
+            with_console(&console, |console| {
+                console.chrome(|| {
+                    eprintln!();
+                    eprint!("{}", crate::background::render_outcomes(&outcomes));
+                })
+            });
         }
     }
 
     if let Some(id) = session_id
         && config.show_session_id_on_exit
     {
-        render::render_session_id("Leaving session", &id.to_string());
+        with_console(&console, |console| {
+            console.session_id("Leaving session", &id.to_string())
+        });
     }
 
     // Same pairing the REPL does: this path attached the registry to the manager when the agent was
