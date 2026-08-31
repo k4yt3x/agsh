@@ -10,20 +10,36 @@ A general-purpose AI agent harness.
 
 ![meka Screenshot](https://github.com/user-attachments/assets/2efa1688-1461-4d26-9743-a3e88203e522)
 
-## Overview
+## Features
 
-meka wraps a large language model with a tool set, durable memory, persistent sessions, and a permission model. Bring a provider and it becomes an agent that reads and edits files, runs commands, searches the web, calls MCP servers, and delegates to sub-agents.
+- **Scheduling**: the agent wakes itself on a cron, optionally gated on a command or tool call.
+- **Proactive context management**: the agent watches its own usage and compacts when it chooses.
+- **Memory**: notes the agent keeps, tagged, ranked, and searchable across sessions.
+- **Sandboxed shell**: write access confined by the operating system itself.
+- **Sub-agents**: resumable workers the parent seeds with a skill; several run in parallel.
+- **Background tasks**: detached tool calls that report back when they finish.
+- **Skills**: [Agent Skills](https://agentskills.io/specification) compliant, portable across clients.
+- **MCP**: any standard-compliant server, over streamable HTTP or stdio.
+- **Sessions**: resume, fork, rewind, export, or import.
 
-Supported providers:
+## Supported Providers
 
-- **Anthropic Messages**: your own API key; also reaches LiteLLM, Ollama and anything else speaking it.
-- **OpenAI Chat Completions**: your own API key, against any endpoint serving that format.
-- **OpenAI Responses**: OpenAI's newer protocol, likewise against any server that offers it.
-- **Claude subscription** / **ChatGPT subscription**: sign in with a subscription instead of a key.
+- **Anthropic Messages**: Anthropic's own API. Also served by Bedrock, LiteLLM, Ollama, and others.
+- **OpenAI Chat Completions**: the industry standard. Supported by almost every provider.
+- **OpenAI Responses**: OpenAI's agent-oriented interface, recommended for new projects.
+- **Claude subscription** / **ChatGPT subscription**: sign in with your subscription plan.
+
+## Interfaces
+
+The same agent core is available through several interfaces:
+
+- **CLI**: an interactive REPL, or one-shot commands for scripts.
+- **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
+- **HTTP API**: use meka to power your own apps and bots.
 
 ## Installation
 
-Download a pre-built binary from [GitHub Releases](https://github.com/k4yt3x/meka/releases/latest), or install with Cargo:
+meka runs on Linux, macOS, and Windows. Download a pre-built binary from [GitHub Releases](https://github.com/k4yt3x/meka/releases/latest), or install with Cargo:
 
 ```bash
 cargo install --locked --git https://github.com/k4yt3x/meka.git
@@ -61,27 +77,6 @@ meka [u] > install and start nginx
 
 See the [documentation](https://docs.meka.so) for the full usage guide.
 
-## Features
-
-- **Skills**: [Agent Skills](https://agentskills.io/specification) compliant, so skills work across clients.
-- **Memory**: notes the agent keeps for itself, carried into every later session.
-- **MCP**: add tools, resources, and prompts from any MCP server.
-- **Sub-agents**: delegate work to children that never exceed your permission level.
-- **Sandboxed shell**: read mode confines commands using the OS's own sandbox.
-- **Scheduling**: have the agent prompt itself later, once or on a cron.
-- **Background tasks**: long jobs run detached and report back when done.
-- **Sessions**: resume, fork, rewind, or export any past conversation.
-- **Context management**: compacts itself before the window fills.
-- **Standing instructions**: your own rules, applied to every session.
-
-## Interfaces
-
-The same agent core is available through several interfaces:
-
-- **CLI**: an interactive REPL, or one-shot commands for scripts.
-- **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
-- **HTTP API**: embed meka in your own apps and bots.
-
 ## Tools
 
 The agent has access to the following built-in tools:
@@ -99,13 +94,13 @@ The agent has access to the following built-in tools:
 - `context_check` / `context_compact`: read the remaining window, or compact on purpose
 - `agent_*`: delegate to a sub-agent, which never exceeds your permission level
 - `skill_*`: load, search, and optionally author skills
-- `schedule_*`: run a prompt later, once or on a cron
+- `schedule_*`: run a prompt later, once or repeatedly, optionally behind a gate
 - `task_list` / `task_cancel`: manage work the agent detached to the background
 - `render_image`: render an image into the conversation for vision models
 - `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
 - `load_tool`: fetch the full schema for a tool held back to keep the prompt small
 
-Run `meka tools list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it.
+Run `meka tools list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.so/tools/overview.html).
 
 ## Permissions
 
