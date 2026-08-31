@@ -1814,8 +1814,14 @@ async fn build_config_options(
 /// A session whose profile cannot resolve answers `false`; its next prompt fails on that same
 /// profile either way, and taking an attachment first would only add a second failure.
 async fn session_accepts_images(state: &ServerState, session_uuid: uuid::Uuid) -> bool {
-    match crate::provider_for_session(&state.shared, Some(session_uuid)).await {
-        Ok(binding) => crate::binding_accepts_images(&state.shared.providers, &binding),
+    match crate::provider::provider_for_config(
+        &state.shared.session_manager,
+        &state.shared.config,
+        Some(session_uuid),
+    )
+    .await
+    {
+        Ok(binding) => crate::provider::binding_accepts_images(&state.shared.providers, &binding),
         Err(error) => {
             tracing::warn!(
                 "could not resolve the provider for session {} to decide image support: {}",
@@ -1860,7 +1866,7 @@ async fn apply_recorded_binding(
         return Ok(());
     }
     let profile = recorded.clone();
-    let resolved = crate::resolved_binding(&state.shared.providers, recorded).await?;
+    let resolved = crate::provider::resolved_binding(&state.shared.providers, recorded).await?;
     runtime.agent.set_provider(resolved);
     tracing::info!(
         "session {} moved onto provider profile `{}`",
@@ -3291,6 +3297,28 @@ async fn handle_load_session(
         }
     };
 
+    // Before the lock, and before the three writes below. `build_session_runtime` refuses a
+    // sub-agent at the end of this handler, but by then it has taken the worker's file lock,
+    // rewritten its `cwd` and replaced its `additional_roots_json` -- durable writes to a session
+    // the caller may not drive, followed by an *internal* error for something the caller got wrong.
+    // `cwd` is the writable boundary at `workspace` and the directory a scheduled gate is
+    // re-checked in, so moving it is not cosmetic; the test below proves it moves without this.
+    //
+    // The `claim_session` call in between is *not* part of the harm, though it looks like it: its
+    // sweep is keyed on this id, and a worker has no `background_tasks` rows because
+    // `Agent::new_subagent` never enables them.
+    //
+    // Both load doors, not one. `session/resume` got this first and `session/load` did not, which
+    // left the guard on the method editors reach for least: every side effect above stayed
+    // reachable, and the changelog and upgrade guide both said otherwise. Through the shared
+    // predicate rather than `summary.parent_id`, so the doors cannot drift and an imported worker
+    // with no surviving parent is refused here too.
+    if let Err(error) =
+        crate::refuse_a_spawned_session(&state.shared.session_manager, Some(session_uuid)).await
+    {
+        return responder.respond_with_error(invalid_params_error(error.to_string()));
+    }
+
     // Take the on-disk lock now so a concurrent process can't write events while we replay history.
     let session_lock = match state.shared.session_manager.lock_session(session_uuid) {
         Ok(lock) => Arc::new(lock),
@@ -3542,6 +3570,21 @@ async fn handle_resume_session(
         }
     };
 
+    // Before the lock, and before any of the four writes below. `build_session_runtime` refuses a
+    // sub-agent at the end of this handler, but by then this has taken the worker's file lock,
+    // rewritten its `cwd`, retired the background work its parent left running, and replaced its
+    // `additional_roots_json` -- four side effects on a session the caller may not drive, followed
+    // by an *internal* error for something the caller got wrong. `session/fork` refuses up front
+    // for the same reason; this is its sibling.
+    //
+    // Through the shared predicate rather than `summary.parent_id`, so the two doors cannot drift
+    // and so an imported worker with no surviving parent is refused here too.
+    if let Err(error) =
+        crate::refuse_a_spawned_session(&state.shared.session_manager, Some(session_uuid)).await
+    {
+        return responder.respond_with_error(invalid_params_error(error.to_string()));
+    }
+
     let session_lock = match state.shared.session_manager.lock_session(session_uuid) {
         Ok(lock) => Arc::new(lock),
         Err(error) => {
@@ -3735,6 +3778,42 @@ async fn handle_fork_session(
     }
     if let Err(error) = validate_additional_roots(&req.additional_directories) {
         return responder.respond_with_error(error);
+    }
+
+    // Before the copy, for the reason `crate::server::handlers::sessions::fork_session` refuses
+    // there: a fork of a sub-agent is a sibling under the same parent, so the copy is a worker too
+    // and `build_session_runtime` below refuses to build it. That refusal is correct but arrives
+    // far too late to say anything useful -- it is reported as an *internal* error, for something
+    // the caller got wrong, and it names the copy's id, which the client has never seen and which
+    // `discard_failed_fork` has already deleted by the time it reads it.
+    //
+    // `spawn_terms` and not the parent link, so the same rows the builders refuse are refused
+    // here. Keyed on the link alone, an imported worker fell straight through this check into the
+    // failure it exists to prevent.
+    match state.shared.session_manager.spawn_terms(source_uuid).await {
+        Ok(Some(terms)) => {
+            return responder.respond_with_error(invalid_params_error(match terms.parent {
+                Some(parent) => format!(
+                    "session {source_uuid} was spawned by session {parent}, and a copy of it is a \
+                     sub-agent under that same parent rather than a session of its own, so there \
+                     is no session to hand back. Continue the conversation with `agent_followup` \
+                     from {parent}."
+                ),
+                None => format!(
+                    "session {source_uuid} carries the terms another session spawned it under, so \
+                     it is a sub-agent's conversation and a copy of it is another one. Its parent \
+                     is not in this store, so there is no session to hand back."
+                ),
+            }));
+        }
+        // Not this door's refusal to make: `fork_session_locked` answers an unknown id below, with
+        // the wording the rest of this handler uses.
+        Ok(None) => {}
+        Err(error) => {
+            return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                format!("failed to read session: {}", error),
+            ));
+        }
     }
 
     // Locked before the copy's row exists. Otherwise a sweep between the two takes the copy, this
@@ -4102,7 +4181,9 @@ async fn handle_set_session_config_option(
             // bundle entire, which is the only thing a provider selection can mean now that a
             // profile is indivisible.
             let resolved =
-                match crate::resolved_binding(&state.shared.providers, value.clone()).await {
+                match crate::provider::resolved_binding(&state.shared.providers, value.clone())
+                    .await
+                {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         return responder.respond_with_error(invalid_params_error(format!(

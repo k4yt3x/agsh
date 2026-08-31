@@ -165,6 +165,18 @@ pub enum ErrorKind {
     /// Distinct from [`Self::InvalidBody`]: the request is well-formed and the remedy is to pick
     /// another name or edit that file directly, not to fix the payload.
     StoreReadOnly,
+    /// The id names a sub-agent's conversation, which only its parent can continue.
+    ///
+    /// Distinct from [`Self::InvalidBody`] for the reason [`Self::StoreReadOnly`] is: the request
+    /// parsed and validated, and no edit to it will ever be accepted. A client routing on `type`
+    /// reads `invalid-body` as "my payload is malformed" and rewrites the payload forever, when the
+    /// remedy is to stop addressing this id and call `agent_followup` from the parent instead.
+    ///
+    /// Not [`Self::SessionPermission`], which is about the level a session runs at and is raised
+    /// with `PATCH /v1/sessions/{id}`; no permission makes a worker drivable from outside its
+    /// parent. Not [`Self::SessionNotFound`] either: the session exists and every read endpoint
+    /// still serves it.
+    SessionNotDrivable,
     InvalidBody,
     PayloadTooLarge,
     ConcurrencyLimit,
@@ -212,6 +224,7 @@ impl ErrorKind {
             Self::RequestNotFound => "https://meka.so/errors/request-not-found",
             Self::Idempotency => "https://meka.so/errors/idempotency",
             Self::StoreReadOnly => "https://meka.so/errors/store-read-only",
+            Self::SessionNotDrivable => "https://meka.so/errors/session-not-drivable",
             Self::InvalidBody => "https://meka.so/errors/invalid-body",
             Self::PayloadTooLarge => "https://meka.so/errors/payload-too-large",
             Self::ConcurrencyLimit => "https://meka.so/errors/concurrency-limit",
@@ -237,6 +250,7 @@ impl ErrorKind {
             Self::RequestNotFound => "Pending request not found",
             Self::Idempotency => "Idempotency-Key conflict",
             Self::StoreReadOnly => "Skill is in a read-only root",
+            Self::SessionNotDrivable => "Session is a sub-agent's conversation",
             Self::InvalidBody => "Invalid request body",
             Self::PayloadTooLarge => "Request body exceeds configured limit",
             Self::ConcurrencyLimit => "Process-wide concurrency limit reached",
@@ -281,8 +295,24 @@ impl IntoResponse for ProblemDetail {
 impl From<&MekaError> for ProblemDetail {
     fn from(error: &MekaError) -> Self {
         match error {
+            // Adjacent, and to the same shape [`crate::server::reattach::agent_build_problem`]
+            // gives them, because the two arrive the same way: a builder refusing something the
+            // caller can act on, in its own words. Every door that can raise `SessionNotDrivable`
+            // today goes through that function, so these arms are the belt to its braces. Falling
+            // through to `other` would answer "internal server error; consult server logs" to a
+            // client whose only problem is that it posted at a sub-agent's id, which is the failure
+            // that function exists to prevent.
+            //
+            // Same status, different `type`, because the remedies do not overlap: a `Config`
+            // refusal is about what the caller sent or how the installation is set up, while
+            // [`ErrorKind::SessionNotDrivable`] is a permanent property of the id itself.
             MekaError::Config(message) => ProblemDetail::new(
                 ErrorKind::InvalidBody,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                message.clone(),
+            ),
+            MekaError::SessionNotDrivable(message) => ProblemDetail::new(
+                ErrorKind::SessionNotDrivable,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 message.clone(),
             ),
@@ -292,9 +322,9 @@ impl From<&MekaError> for ProblemDetail {
             //
             // Not *because* the agent loop exhausted its retries first, which is only sometimes
             // true: `should_retry_provider_error` gives up immediately once any output has reached
-            // the frontend, and `compact_session`'s summariser calls `complete` with no retry loop
-            // at all. So one of these can arrive after four attempts or after one. The mapping does
-            // not depend on which, and saying it did would be inventing a guarantee.
+            // the frontend, and a cancelled turn abandons the sequence wherever it stands. So one
+            // of these can arrive after three attempts or after one. The mapping does not depend on
+            // which, and saying it did would be inventing a guarantee.
             //
             // `RetryableProvider`, `StreamError` and `ContextOverflow` belong here rather than
             // merely filling the match. All three used to fall through to the `other` arm, which

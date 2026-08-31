@@ -168,7 +168,7 @@ pub struct NoticeView {
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "Turn already in flight OR Idempotency-Key body mismatch", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or the id names a sub-agent's conversation. Read `type`: `/errors/invalid-body` is worth resending with a corrected payload, `/errors/session-not-drivable` never is", body = ProblemDetail),
         (status = 429, description = "Concurrency limit reached or idempotency-key cache full", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
         (status = 502, description = "The provider refused or failed this turn. Read `type`: `/errors/provider` is worth resending after a pause, `/errors/context-overflow` is not until the conversation is shortened", body = ProblemDetail),

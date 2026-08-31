@@ -327,6 +327,25 @@ const TWO_TURNS: &str = r#"[
   {"kind":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
+/// A thinking block, a transient failure, its retry, then a second turn.
+///
+/// The thinking delta is what puts the cursor on a `RowState::Transient` line -- the live
+/// indicator -- so the warning that follows lands on a row the console is about to erase. Without
+/// it the warning prints onto an empty row and survives whether or not the relay settles anything,
+/// which is a test that passes for the wrong reason.
+///
+/// A transient failure, its retry, then a second turn. The retry consumes a round of its own:
+/// `MockEvent::FailRetryable` returns from the stream the moment it is reached, so anything after
+/// it in the same round is never emitted.
+const RETRIES_MID_TURN: &str = r#"[
+ [{"kind":"thinking_delta","text":"weighing the options"},
+  {"kind":"fail_retryable","message":"529 overloaded","retry_after_secs":1}],
+ [{"kind":"text","text":"recovered answer"},
+  {"kind":"message_end","stop_reason":"end_turn"}],
+ [{"kind":"text","text":"second answer"},
+  {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+
 const FAILS_MID_ANSWER: &str = r#"[
  [{"kind":"text","text":"partial answer before the failure"},
   {"kind":"fail","message":"provider exploded"}],
@@ -680,5 +699,35 @@ fn an_interrupted_turn_is_annotated_and_bracketed() {
             .windows(2)
             .any(|pair| pair[0].is_empty() && pair[1].is_empty()),
         "and no stray blank from the notice's old leading newline: {body:#?}"
+    );
+}
+
+/// A warning printed mid-turn reaches the screen and stays there, beside the answer it explains.
+///
+/// The retry path warns at default verbosity, which is the moment a user most needs to know why
+/// nothing is happening, and nothing else covers that end to end: `tracing` goes straight to stderr
+/// off-prompt, outside every renderer this file otherwise exercises.
+///
+/// **What this does not cover.** It does not reproduce the erasure `relay::RelayWriter::write`
+/// settles the row to prevent -- neutering that call leaves this test green. The collision needs
+/// the warning to land while the row is still the thinking indicator's, and which of the frontend's
+/// draw and the agent's `warn!` wins that race is not something a script can pin. The settle itself
+/// is guarded in `relay`'s own tests, where the row can be forced; this guards the plainer property
+/// that the warning is not lost some *other* way, which is what a reader of the changelog entry
+/// would want to know.
+#[test]
+fn a_warning_raised_during_a_turn_is_not_erased_by_the_turn() {
+    let install = Install::new(true, true, "");
+    let rows = run_repl(&install, RETRIES_MID_TURN, &["boom", "again", "/exit"]);
+
+    let turn = between(&rows, "> boom", "> again");
+    assert!(
+        turn.iter().any(|row| row.contains("529 overloaded")),
+        "the retry warning has to still be on screen at the end of the turn that raised it: \
+         {turn:#?}"
+    );
+    assert!(
+        turn.iter().any(|row| row.contains("recovered answer")),
+        "and the answer it was waiting for has to follow it: {turn:#?}"
     );
 }

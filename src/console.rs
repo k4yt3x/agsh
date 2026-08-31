@@ -511,6 +511,32 @@ impl Console {
         self.renderer.is_some()
     }
 
+    /// Whether this episode has printed anything, for [`crate::relay`]'s tests.
+    ///
+    /// The one bit of console state a caller outside this module can observe without a terminal,
+    /// and enough to answer the question the relay's test asks: did a log line reach the console at
+    /// all, or did it go round it to stderr as it used to.
+    #[cfg(test)]
+    pub fn has_printed(&self) -> bool {
+        self.state.printed()
+    }
+
+    /// Put the row into a state a test cannot reach through the drawing API.
+    ///
+    /// `transient` and `thinking_indicator` both return early unless
+    /// `render::live_indicator_supported()`, which is false without a terminal, so the row a
+    /// mid-turn log line actually collides with is otherwise unreachable under `cargo test`.
+    #[cfg(test)]
+    pub fn force_row(&mut self, row: RowState) {
+        self.state.row = row;
+    }
+
+    /// What the cursor is sitting on, for the same tests.
+    #[cfg(test)]
+    pub fn row(&self) -> RowState {
+        self.state.row
+    }
+
     pub fn text_delta(&mut self, text: &str) {
         if self.renderer.is_none() {
             self.act(Action::Block(BlockKind::Text));

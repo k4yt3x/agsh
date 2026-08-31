@@ -30,26 +30,36 @@ use crate::{
 
 /// How a failed [`crate::build_session_agent`] reaches the caller.
 ///
-/// A configuration problem is the caller's to fix, not a server fault, and its message is meka's
-/// own rather than an upstream provider's, so it goes back verbatim. The two cases are a session
-/// pinned to a profile that has since left `config.toml`, and a profile that is configured but has
-/// no stored credential; both refusals name the profile and what to do about it, and sanitising
-/// them to "internal server error; consult server logs" left the one actionable sentence in a file
-/// the caller cannot read.
+/// Something the caller can fix is the caller's to fix, not a server fault, and its message is
+/// meka's own rather than an upstream provider's, so it goes back verbatim. Three cases: a session
+/// pinned to a profile that has since left `config.toml`, a profile that is configured but has no
+/// stored credential, and a session another one spawned, which only its parent can drive. All three
+/// name what to do about it, and sanitising them to "internal server error; consult server logs"
+/// left the one actionable sentence in a file the caller cannot read.
 ///
 /// Shared by re-attach and by session creation because they were not shared before, and creation
 /// was the half that got the 500 -- which is also the half a fresh `meka serve` hits first, since a
 /// profile's credential is now checked when a session first asks for it rather than at startup.
+///
+/// The two carry the same 422 and different `type` URIs, because a `Config` refusal is answered by
+/// changing the request or the installation and this one never is: no payload addressed at a
+/// worker's id is acceptable. Kept in step with [`ProblemDetail::from`], which classifies the same
+/// pair when one reaches a handler that does not build an agent.
 pub(crate) fn agent_build_problem(id: Uuid, context: &str, error: anyhow::Error) -> ProblemDetail {
-    match error.downcast_ref::<crate::error::MekaError>() {
+    let problem = match error.downcast_ref::<crate::error::MekaError>() {
         Some(crate::error::MekaError::Config(message)) => ProblemDetail::new(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
             message.clone(),
-        )
-        .with("session_id", id.to_string()),
-        _ => ProblemDetail::internal_sanitized(context, error).with("session_id", id.to_string()),
-    }
+        ),
+        Some(crate::error::MekaError::SessionNotDrivable(message)) => ProblemDetail::new(
+            ErrorKind::SessionNotDrivable,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            message.clone(),
+        ),
+        _ => ProblemDetail::internal_sanitized(context, error),
+    };
+    problem.with("session_id", id.to_string())
 }
 
 /// Assert a session exists, without building anything.
@@ -95,9 +105,10 @@ static RECONSTRUCTION_LOCKS: std::sync::LazyLock<
 /// owner is the map are dropped on the way past, so it stays bounded by concurrent reconstructions
 /// rather than by every session the process has ever loaded.
 ///
-/// Also taken by the dormant-repin path in `handlers::sessions`, which decides what to write on the
-/// strength of the session *not* being resident and must not have that stop being true while it
-/// writes.
+/// Also taken by the dormant fast paths in `handlers::sessions` and `handlers::conversation`, which
+/// decide what to write on the strength of the session *not* being resident and must not have that
+/// stop being true while they write. `assert_dormant_fast_path_is_serialised` below is the one
+/// statement of what such a path owes.
 pub(crate) async fn lock_session_reconstruction(id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
     let lock = {
         let mut registry = match RECONSTRUCTION_LOCKS.lock() {
@@ -114,6 +125,107 @@ pub(crate) async fn lock_session_reconstruction(id: Uuid) -> tokio::sync::OwnedM
         )
     };
     lock.lock_owned().await
+}
+
+/// Assert that a handler which writes to a session *without* loading it holds both locks that make
+/// the decision it wrote on still true at the moment it writes.
+///
+/// Two handlers bypass [`ensure_session_loaded`] when a session is not resident, and both repeat
+/// one shape: take the reconstruction lock, re-check residency under it and hand the caller back to
+/// the resident path if the answer moved, take the session's on-disk lock, and only then write.
+/// Stated once here rather than per handler, because what keeps happening is a new site rather than
+/// a changed rule: this was asserted at `repin_dormant_session`, and the rewind path, written
+/// afterwards, arrived with none of it. Deleting its `lock_session` entirely left all 3056 tests
+/// green.
+///
+/// A source-text assertion, because what it protects is unreachable from a single process. The
+/// reconstruction lock is per process by construction, and the session lock only conflicts across
+/// them, so reproducing either failure needs a second `meka serve` on one store. `signature` names
+/// the function, `body_sentinel` is a string near the end of it that proves the scanned region
+/// still covers the whole body, and `write` is the call the whole arrangement exists to protect.
+#[cfg(test)]
+pub(crate) fn assert_dormant_fast_path_is_serialised(
+    source: &str,
+    signature: &str,
+    body_sentinel: &str,
+    write: &str,
+) {
+    // Line endings normalised first, because the delimiter below is the one thing here that a CRLF
+    // checkout breaks *silently*. The repo has no `.gitattributes` and CI's `windows-latest` job
+    // checks out under Git for Windows' `core.autocrlf = true`, so `\r\n}\r\n` never matches and
+    // `split` yields the whole remainder instead: the region widens from one function to the rest
+    // of the file, `body_sentinel` matches trivially, and this assertion reads as coverage on two
+    // platforms while proving much less on the third.
+    let source = source.replace("\r\n", "\n");
+    // To the function's closing brace at column zero. Every brace inside the body is indented, so
+    // this is exact, where cutting at the next doc comment would drag in whatever follows.
+    let body = source
+        .split(signature)
+        .nth(1)
+        .expect("the function this assertion is about")
+        .split("\n}\n")
+        .next()
+        .expect("splitting always yields a first part");
+    assert!(
+        body.contains(body_sentinel),
+        "the scanned region no longer covers {signature}, so this assertion proves nothing"
+    );
+
+    let reconstruction = body.find("lock_session_reconstruction(id)").expect(
+        "a dormant write must hold the reconstruction lock, or the residency it decided on can \
+         stop being true while it writes",
+    );
+    let recheck = body
+        .find("state.sessions.read().await.contains_key(&id)")
+        .expect(
+            "and it must re-check residency under that lock, returning `Ok(None)` so the caller \
+             takes the resident path and the live agent moves with the row",
+        );
+    let write_at = body
+        .find(write)
+        .expect("the write this whole arrangement exists to protect is no longer in this function");
+    assert!(
+        reconstruction < recheck && recheck < write_at,
+        "the lock must be taken first, the residency re-checked under it, and only then the write \
+         issued; found reconstruction@{reconstruction} recheck@{recheck} write@{write_at}"
+    );
+    // The re-check has to *act*, not merely look. Replacing its `return Ok(None)` with a log line
+    // leaves all three positions intact and reinstates the race, which is how this read as coverage
+    // while proving nothing; verified green with exactly that edit.
+    assert!(
+        body.get(recheck..write_at)
+            .is_some_and(|arm| arm.contains("return Ok(None)")),
+        "the residency re-check must hand the caller back to the resident path, not just observe \
+         that the session came back"
+    );
+
+    // The reconstruction lock is per process, so it says nothing about a second `meka serve` on the
+    // same store. Reproduced over HTTP for the repin: server B answered `200` for a session server
+    // A was running, and A went on from its own in-memory copy while both reported the write.
+    let session = body
+        .find("lock_session(id)")
+        .expect("a dormant write must own the session it writes to, not just the process's map");
+    assert!(
+        session < write_at,
+        "the session lock must be held before the write; found session@{session} write@{write_at}"
+    );
+
+    // Presence is not enough: `let _ = lock_session_reconstruction(id).await` compiles, reads as a
+    // lock, and drops the guard at the end of that very statement, so every await after it runs
+    // unprotected. That one-character edit keeps this assertion green while reinstating the whole
+    // race, which is the only way these functions can regress silently.
+    for guard in ["_reconstruction", "_session"] {
+        assert!(
+            body.contains(&format!("let {guard} =")),
+            "the {guard} guard must be bound to a name, not `let _ =`, which drops it immediately \
+             and leaves every await below it unserialised"
+        );
+        assert!(
+            !body.contains(&format!("drop({guard}")),
+            "and {guard} must live to the end of the function; dropping it early is the same \
+             defect as never binding it"
+        );
+    }
 }
 
 /// Look up a session, reconstructing it from the persisted DB row if the in-memory entry has been
@@ -164,6 +276,37 @@ pub async fn ensure_session_loaded(
             )
             .with("session_id", id.to_string())
         })?;
+
+    // Before the lock, not merely before the build. `build_session_agent` refuses a worker at the
+    // end of this function, and what the intervening work costs is one wrong *answer*: a worker
+    // whose parent is currently running it has its lock held, so `lock_session` below fails first
+    // and the caller gets `409 session-locked` -- "another process has it, try again" -- for a
+    // condition no retry ever resolves. The 422 is the true answer and the guard is what makes it
+    // the one that arrives. Hydrating the event log for a session about to be refused is wasted
+    // besides.
+    //
+    // Deliberately *not* justified by the `claim_session` sweep below, which is what an earlier
+    // version of this comment claimed. That sweep is keyed on this id and a worker has no
+    // `background_tasks` rows to key: `Agent::enable_background` is reached only through
+    // `assemble_agent`, which is the host builders' path, and `Agent::new_subagent` never calls it.
+    // The UPDATE matches zero rows. Recording that here because the placement is right for the
+    // reason above and would otherwise keep being re-justified by a harm that cannot occur.
+    //
+    // Here rather than at each door, because every write-side session endpoint funnels through this
+    // function: `/turn`, `/compact`, `/rewind`, `/responses`, the fork's read-back and the
+    // scheduler fire. Placing it at the doors is what left `patch_session` needing its own copy
+    // for the one branch that never calls this.
+    //
+    // On the cold path only, which the two fast-path returns above skip. That is safe because a
+    // worker cannot become *resident*: the only code that inserts into `state.sessions` is
+    // `POST /v1/sessions` (a fresh row with no parent), the fork handler (which refuses a worker
+    // source before copying, so its copy is never one) and this function. The other two writers of
+    // that map only ever remove. Residency therefore implies the row already passed here. Moving
+    // the check above the fast path would buy nothing and put a store read on every request to a
+    // live session; a future inserter belongs behind this rule rather than in front of it.
+    crate::refuse_a_spawned_session(&state.shared.session_manager, Some(id))
+        .await
+        .map_err(|error| agent_build_problem(id, "failed to read session", error))?;
 
     // Resolve persisted permission. The row is the authority and this process's default is the
     // answer only when the row has none, which is an ACP session that has never been through
@@ -383,6 +526,37 @@ pub async fn ensure_session_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker's refusal reaches the client as its own words, not as "consult server logs".
+    ///
+    /// The refusal names the parent and `agent_followup`, and every sentence of that is meka's
+    /// own; sanitising it would leave a `sessions:w` holder with a 500 and no way to learn that
+    /// the id it used names a sub-agent. 422 rather than 403 for the reason [`agent_build_problem`]
+    /// gives generally: no token and no permission level lifts it, so routing it as an auth
+    /// failure would send a client to re-provision something that cannot help.
+    ///
+    /// Its own `type`, and not [`ErrorKind::InvalidBody`], for the same reason one step down: that
+    /// URI reads as "your payload is malformed", and a client acting on it rewrites the payload
+    /// forever against an id that will never accept one.
+    #[test]
+    fn a_worker_refusal_reaches_the_client_verbatim_as_422() {
+        let id = Uuid::from_u128(0xb0b);
+        let problem = agent_build_problem(
+            id,
+            "failed to rebuild session agent",
+            crate::error::MekaError::SessionNotDrivable(
+                "session A was spawned by session B; continue it with `agent_followup`".to_string(),
+            )
+            .into(),
+        );
+        assert_eq!(problem.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem.type_uri, ErrorKind::SessionNotDrivable.type_uri());
+        let detail = problem.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("agent_followup"),
+            "the one actionable sentence must survive the mapping: {detail}"
+        );
+    }
 
     /// Two requests for the same unloaded session must not reconstruct it concurrently.
     ///

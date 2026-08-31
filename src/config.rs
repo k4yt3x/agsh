@@ -1337,8 +1337,8 @@ pub struct ProfileSettings {
     pub thinking: crate::provider::ThinkingMode,
     /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
     /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
-    /// window is what [`crate::binding_context_window`] reports rather than dividing by a figure
-    /// meka has no reason to believe.
+    /// window is what [`crate::provider::binding_context_window`] reports rather than dividing by
+    /// a figure meka has no reason to believe.
     pub thinking_budget: u64,
     pub redact_thinking: bool,
 }

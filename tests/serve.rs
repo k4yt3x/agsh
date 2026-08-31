@@ -31,6 +31,10 @@ fn ephemeral_port() -> u16 {
 
 struct ServeTestHarness {
     _temp: tempfile::TempDir,
+    /// The server's `MEKA_DATA_DIR`. Exposed so a test can reach the session lock directory
+    /// underneath it, which is the only way to create the cross-process lock contention that
+    /// distinguishes a refusal placed before `lock_session` from one placed after.
+    data_dir: std::path::PathBuf,
     child: Child,
     base_url: String,
     token: String,
@@ -183,6 +187,7 @@ scopes = [{scopes_str}]
 
                 return Self {
                     _temp: temp,
+                    data_dir: data_dir.clone(),
                     child,
                     base_url: format!("http://{}", bind),
                     token: token.to_string(),
@@ -8930,5 +8935,321 @@ context_window = 32000
     assert_eq!(
         after["window"], 32000,
         "the live agent must gauge against the new profile's window, not the old one: {after}"
+    );
+}
+
+/// A sub-agent's transcript can be rewound over HTTP, the way `meka session rewind` always could.
+///
+/// Rewind is deliberately on the other side of the line from `/turn` and `/compact`: those drive a
+/// conversation only the worker's parent may drive, while this edits an event log the same caller
+/// can already read in full through `/export`. Leaving it refused made the HTTP surface disagree
+/// with the CLI about the same operation on the same row, which is a difference nobody chose.
+///
+/// Asserts the log actually shrank, not just the 200: a handler that answered without writing
+/// would satisfy the status alone.
+#[test]
+fn a_sub_agent_transcript_can_be_rewound_over_http() {
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "kind": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "kind": "text", "text": "worker done" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ],
+            [
+                { "kind": "text", "text": "dispatched" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let parent = session_with_one_turn(&harness);
+
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?include_children=true")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let worker = listing["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["parent_id"].as_str() == Some(parent.as_str()))
+        .map(|row| row["id"].as_str().expect("id").to_string())
+        .unwrap_or_else(|| panic!("the spawn should have left a worker under {parent}: {listing}"));
+
+    let rewound = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/rewind", worker),
+        )
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        rewound.status(),
+        200,
+        "a rewind edits a transcript rather than driving it, so a worker takes it"
+    );
+    let body: serde_json::Value = rewound.json().expect("parse");
+    let before = body["messages_before"].as_u64().unwrap_or_default();
+    let after = body["messages_after"].as_u64().unwrap_or_default();
+    assert!(
+        after < before,
+        "the rewind must actually remove turns, not merely answer 200: {body}"
+    );
+
+    // And driving it is still refused, which is the line this endpoint sits on the other side of.
+    let refused = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/compact", worker),
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "compaction runs the model, which is the parent's to do"
+    );
+}
+
+/// A worker whose lock is held answers 422, not 409.
+///
+/// The ordering test for the re-attach door, and the reason `ensure_session_loaded` refuses before
+/// `lock_session` rather than leaving it to `build_session_agent` at the end. Without the guard the
+/// lock is taken first, so a worker its parent is currently running answers `409 session-locked` --
+/// "another process has it, try again" -- for a condition no retry ever resolves. The 422 is the
+/// true answer and this pins that it is the one that arrives.
+///
+/// Contention is created by flocking the worker's lock file from the test process, which is a
+/// different open file description from the server's, so the conflict is real rather than
+/// simulated. Moving the refusal below `lock_session` turns this 422 into a 409; the plain
+/// refusal test above stays green under that move, which is why this one exists separately.
+#[test]
+fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "kind": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "kind": "text", "text": "worker done" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ],
+            [
+                { "kind": "text", "text": "dispatched" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let parent = session_with_one_turn(&harness);
+
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?include_children=true")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let worker = listing["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["parent_id"].as_str() == Some(parent.as_str()))
+        .map(|row| row["id"].as_str().expect("id").to_string())
+        .unwrap_or_else(|| panic!("the spawn should have left a worker under {parent}: {listing}"));
+
+    // Hold the worker's lock the way its parent would while running it.
+    let lock_path = harness
+        .data_dir
+        .join("locks")
+        .join(format!("{}.lock", worker));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    let mut held = fd_lock::RwLock::new(held);
+    let _guard = held
+        .try_write()
+        .expect("the worker's lock is free for this test to take");
+
+    let refused = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/turn", worker),
+        )
+        .json(&serde_json::json!({"message": "drive the worker while its lock is held"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "a held lock must not turn a permanent refusal into a retryable conflict"
+    );
+    let problem: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.so/errors/session-not-drivable"),
+        "and it says which kind it is, rather than `session-locked`: {problem}"
+    );
+}
+
+/// A worker session cannot be driven through the HTTP turn door.
+///
+/// The wiring, not the predicate: `refuse_a_spawned_session` has its own unit test, but that one
+/// passes with the call deleted from both builders, which is exactly how this shipped open. A
+/// worker's `[subagents]` denials, memory and instruction grants and permission ceiling live in
+/// `subagent_spec_json`, which `build_session_agent` never reads, so before the refusal a
+/// `sessions:w` holder could POST a turn at a worker id and drive that conversation with the full
+/// built-in set at the host's level.
+///
+/// The worker is spawned for real rather than fabricated, because the id has to come from the same
+/// place an attacker's would: `GET /v1/sessions?include_children=true`, which hands sub-agent ids
+/// to any `sessions:r` holder.
+#[test]
+fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
+    // Three rounds in one queue, drained in order: the parent's `agent_spawn` call, the worker's
+    // own (non-streaming) reply, then the parent's closing text.
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "kind": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "kind": "text", "text": "worker done" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ],
+            [
+                { "kind": "text", "text": "dispatched" },
+                { "kind": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let parent = session_with_one_turn(&harness);
+
+    let listing = harness
+        .request(reqwest::Method::GET, "/v1/sessions?include_children=true")
+        .send()
+        .expect("send");
+    assert_eq!(listing.status(), 200);
+    let body: serde_json::Value = listing.json().expect("parse");
+    let worker = body["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["parent_id"].as_str() == Some(parent.as_str()))
+        .map(|row| row["id"].as_str().expect("id").to_string())
+        .unwrap_or_else(|| panic!("the spawn should have left a worker under {parent}: {body}"));
+
+    let refused = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/turn", worker),
+        )
+        .json(&serde_json::json!({"message": "drive the worker directly"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "a worker must not take a turn from this door"
+    );
+    let problem: serde_json::Value = refused.json().expect("parse");
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("agent_followup") && detail.contains(&parent),
+        "the refusal must name the parent and the door that can drive it: {problem}"
+    );
+
+    // Reading it is untouched, which is the whole of what the refusal costs.
+    let messages = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", worker),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(
+        messages.status(),
+        200,
+        "a worker's transcript stays readable"
+    );
+
+    // And the copy door is not a way round the refusal. `fork_session` used to write a NULL
+    // parent, so this handed a `sessions:w` holder a drivable copy of the worker's whole
+    // conversation with no spawn terms and the host's permission -- the very escalation the
+    // refusal above exists to stop, one call to the side of it.
+    let forked = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/fork", worker),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(
+        forked.status(),
+        422,
+        "a copy of a worker is a worker, so this door has no live session to hand back"
+    );
+    let problem: serde_json::Value = forked.json().expect("parse");
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&worker) && detail.contains(&parent),
+        "and it names the id the caller sent, not the copy it did not make: {problem}"
+    );
+
+    // The refusal has to come before the copy, or it leaves a row behind.
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?include_children=true")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listing["sessions"]
+            .as_array()
+            .expect("a sessions array")
+            .iter()
+            .filter(|row| row["parent_id"].as_str() == Some(parent.as_str()))
+            .count(),
+        1,
+        "a refused fork writes no row: {listing}"
+    );
+
+    // And neither is the metadata door. A provider-only `PATCH` takes `repin_dormant_session`,
+    // the one branch of that handler which writes `sessions.provider` without building an agent --
+    // so the refusal in the builders could not answer for it, and a worker is exactly the session
+    // that branch always gets, since `build_subagent` runs one under its parent's runtime rather
+    // than registering it with the server. It answered 200 and moved the row.
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", worker))
+        .json(&serde_json::json!({"provider": "mock"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        patched.status(),
+        422,
+        "a worker's profile comes from the terms it was spawned with, not from this door"
+    );
+    let problem: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.so/errors/session-not-drivable"),
+        "and it says which kind of 422 it is, so a client stops rewriting its payload: {problem}"
     );
 }

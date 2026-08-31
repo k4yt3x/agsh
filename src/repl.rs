@@ -694,6 +694,8 @@ fn build_reedline_editor(
     editor
 }
 
+pub(crate) mod host_commands;
+
 pub enum SlashCommand {
     Exit,
     Help,
@@ -775,6 +777,61 @@ pub enum SlashCommand {
     /// work it triggered). Any non-numeric argument (e.g. `all`) falls back to the dump-everything
     /// path.
     History(Option<usize>),
+}
+
+/// Who answers a slash command.
+///
+/// The split is not arbitrary: a command needs the host loop exactly when it needs the live
+/// `Agent`, the conversation, or the session id that `/fork` moves. Everything else the REPL thread
+/// has to hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answerer {
+    /// Answered on the REPL thread, where it was parsed.
+    Repl,
+    /// Forwarded to the host loop; see [`host_commands::answer`].
+    Host,
+}
+
+impl SlashCommand {
+    /// Which side answers this command.
+    ///
+    /// Exhaustive, and that is the whole point. This used to be a hand-written list of variants in
+    /// the forwarding arm and a `match` in the host loop that ended in `_ => {}`; they agreed, but
+    /// nothing made them. A variant added to the forwarding list and forgotten in the host was
+    /// sent, silently did nothing, and still got its episode brackets -- a blank line either side
+    /// of no output. Both sides now read this, so a new variant fails to compile until both have
+    /// been considered.
+    pub fn answered_by(&self) -> Answerer {
+        match self {
+            SlashCommand::Cd { .. } => Answerer::Repl,
+            SlashCommand::Clear => Answerer::Repl,
+            SlashCommand::Exit => Answerer::Repl,
+            SlashCommand::Help => Answerer::Repl,
+            SlashCommand::Permission { .. } => Answerer::Repl,
+            SlashCommand::Provider { .. } => Answerer::Repl,
+            SlashCommand::Compact { .. } => Answerer::Host,
+            SlashCommand::Export => Answerer::Host,
+            SlashCommand::Fork => Answerer::Host,
+            SlashCommand::History { .. } => Answerer::Host,
+            SlashCommand::McpList => Answerer::Host,
+            SlashCommand::McpLogin { .. } => Answerer::Host,
+            SlashCommand::McpLogout { .. } => Answerer::Host,
+            SlashCommand::McpPrompt { .. } => Answerer::Host,
+            SlashCommand::McpReconnect { .. } => Answerer::Host,
+            SlashCommand::MemoryList => Answerer::Host,
+            SlashCommand::MemoryShow { .. } => Answerer::Host,
+            SlashCommand::Rewind { .. } => Answerer::Host,
+            SlashCommand::ScheduleCancel { .. } => Answerer::Host,
+            SlashCommand::ScheduleList => Answerer::Host,
+            SlashCommand::Session => Answerer::Host,
+            SlashCommand::SkillInvoke { .. } => Answerer::Host,
+            SlashCommand::SkillList => Answerer::Host,
+            SlashCommand::Status => Answerer::Host,
+            SlashCommand::TaskCancel { .. } => Answerer::Host,
+            SlashCommand::TaskList => Answerer::Host,
+            SlashCommand::Usage => Answerer::Host,
+        }
+    }
 }
 
 pub enum ReplEvent {
@@ -1403,29 +1460,19 @@ pub fn run_repl(
                             }
                             continue;
                         }
-                        Some(
-                            command @ (SlashCommand::Session
-                            | SlashCommand::Compact(_)
-                            | SlashCommand::Rewind(_)
-                            | SlashCommand::Export
-                            | SlashCommand::Fork
-                            | SlashCommand::McpPrompt { .. }
-                            | SlashCommand::McpList
-                            | SlashCommand::McpReconnect { .. }
-                            | SlashCommand::McpLogin { .. }
-                            | SlashCommand::McpLogout { .. }
-                            | SlashCommand::MemoryList
-                            | SlashCommand::MemoryShow { .. }
-                            | SlashCommand::ScheduleList
-                            | SlashCommand::ScheduleCancel { .. }
-                            | SlashCommand::TaskList
-                            | SlashCommand::TaskCancel { .. }
-                            | SlashCommand::SkillList
-                            | SlashCommand::SkillInvoke { .. }
-                            | SlashCommand::Status
-                            | SlashCommand::Usage
-                            | SlashCommand::History(_)),
-                        ) => {
+                        // Everything the arms above did not answer goes to the host. What makes
+                        // that safe is not this arm: it is that `answered_by` and the host's own
+                        // `match` are both exhaustive, so a new variant fails to compile until
+                        // someone has said which side owns it. The assertion catches the remaining
+                        // drift -- a variant `answered_by` calls ours that no arm above handles --
+                        // in the builds where a test would see it.
+                        Some(command) => {
+                            debug_assert_eq!(
+                                command.answered_by(),
+                                Answerer::Host,
+                                "the REPL thread answers this command, so an arm above should \
+                                 have; forwarding it sends the host something it will not match"
+                            );
                             if input_sender.send(ReplEvent::Command(command)).is_err() {
                                 break;
                             }

@@ -83,8 +83,41 @@ const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 /// wait before the degrade proceeds exactly as before.
 ///
 /// [`BACKOFF_CAP`] rather than a number of its own, because that is already this module's answer to
-/// "the longest a single wait is ever worth", and two constants would drift.
+/// "the longest a single wait is ever worth", and two constants would drift. It is a *floor*, not
+/// the whole answer: see [`outage_reprieve`].
 pub(crate) const OUTAGE_REPRIEVE: Duration = BACKOFF_CAP;
+
+// `Duration::clamp` panics on an inverted range, and the floor and the ceiling in
+// `outage_reprieve` are two independent constants that nothing else relates: `OUTAGE_REPRIEVE`
+// tracks `BACKOFF_CAP`, tuned for interactive latency, while `RETRY_AFTER_CAP` bounds what a
+// hostile upstream can ask for. Raising the first past the second is an ordinary-looking edit that
+// would turn every `Retry-After` on a 5xx into an abort. A `const` assertion so it fails at compile
+// time rather than on the one path a user reaches during an outage.
+//
+// A comment rather than a doc comment: this item is anonymous, so rustdoc renders nothing and a
+// `///` here would silently swallow the next item's documentation instead. It did, for a while.
+const _: () = assert!(OUTAGE_REPRIEVE.as_nanos() <= RETRY_AFTER_CAP.as_nanos());
+
+/// How long the reprieve waits, given whatever the failing response asked for.
+///
+/// The provider's own `Retry-After` decides, up to [`RETRY_AFTER_CAP`], with [`OUTAGE_REPRIEVE`] as
+/// the floor. Honouring it here rather than only in [`backoff_delay`] closes a gap that read badly
+/// once stated: a `503` carrying `Retry-After: 60` had both retries wait the full minute on the
+/// provider's instruction, and then the one wait that decides whether to *delete the user's
+/// content* was eight seconds. The hint is the only evidence anyone has about how long the outage
+/// lasts, and the wait it governs here is the most consequential of the three.
+///
+/// Still floored, because a provider that answers `Retry-After: 0` on a 5xx is not telling us the
+/// outage is over; it is telling us nothing, and re-sending instantly would spend the reprieve
+/// without giving the outage any time to end.
+///
+/// The `clamp` cannot panic: a `const` assertion above pins the floor at or below the ceiling.
+pub(crate) fn outage_reprieve(retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(hint) => hint.clamp(OUTAGE_REPRIEVE, RETRY_AFTER_CAP),
+        None => OUTAGE_REPRIEVE,
+    }
+}
 
 /// How long to wait before retry attempt number `attempt` (1-indexed: the first retry is
 /// `attempt == 1`). Honors the provider's `Retry-After` hint when present (capped); otherwise
@@ -165,6 +198,43 @@ mod tests {
         assert_eq!(
             backoff_delay(1, Some(Duration::from_secs(120))),
             RETRY_AFTER_CAP
+        );
+    }
+}
+
+#[cfg(test)]
+mod reprieve_tests {
+    use super::*;
+
+    /// The reprieve waits as long as the provider asked, within the same bounds as a retry.
+    ///
+    /// It used to sleep the constant and drop `retry_after` on the floor, which read badly once
+    /// stated: a `503` carrying `Retry-After: 60` had both retries wait the full minute on the
+    /// provider's own instruction, and then the wait that decides whether to *delete the user's
+    /// content* was eight seconds. All three bounds are asserted, because each exists for a
+    /// different reason and a single-value test would pin none of them.
+    #[test]
+    fn the_reprieve_honours_the_hint_between_its_floor_and_the_shared_cap() {
+        assert_eq!(
+            outage_reprieve(None),
+            OUTAGE_REPRIEVE,
+            "no hint is the case the constant was chosen for"
+        );
+        assert_eq!(
+            outage_reprieve(Some(Duration::from_secs(30))),
+            Duration::from_secs(30),
+            "a hint inside the bounds is the whole point"
+        );
+        assert_eq!(
+            outage_reprieve(Some(Duration::from_secs(3600))),
+            RETRY_AFTER_CAP,
+            "and it is bounded by the same cap a retry is, not by the provider's patience"
+        );
+        assert_eq!(
+            outage_reprieve(Some(Duration::ZERO)),
+            OUTAGE_REPRIEVE,
+            "`Retry-After: 0` on a 5xx says nothing; re-sending instantly would spend the \
+             reprieve without giving the outage any time to end"
         );
     }
 }

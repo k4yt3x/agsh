@@ -152,7 +152,7 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `additional_roots_json` | TEXT | Workspace roots beyond `cwd` |
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
 | `stat_*` | INTEGER | Eight cumulative counters behind `/status` |
-| `provider` | TEXT | Provider profile the session runs on. Never NULL |
+| `provider` | TEXT | Provider profile the session runs on. Never NULL, though a row carried forward from a store that predates the column can hold `''` |
 
 Locks are OS file locks under the data directory, not a column: a row cannot record a crashed
 process's PID and lock a session forever.
@@ -419,7 +419,10 @@ Use it to try a different direction from a known-good point, to run a throwaway 
 
 What the copy carries: the full event log, scratchpad entries, working directory, permission level, additional workspace roots, and cumulative stats. What it does **not**: sub-agent child transcripts (the sub-agent's result already sits in the parent conversation as a tool result, so the copy is complete without them), and the timestamps, which are stamped fresh.
 
-A fork records no link back to the session it came from; it is a top-level session like any other.
+A fork of an ordinary session records no link back to the one it came from; it is a top-level
+session like any other. A fork of a *sub-agent* is the exception: it keeps that worker's parent and
+spawn terms, so the copy is a sibling under the same parent rather than a promotion to a session of
+its own, and it is continued through `agent_followup` like any other worker.
 
 Forking copies what has been committed to the database, so forking a session with a turn in flight can capture that turn partially: the user message is persisted before the model is called, and each assistant round lands together with its tool results as it completes. The copy may therefore end mid-turn, with a user message that has no reply yet, or an assistant round that was not the last. Because each round and its tool results are written as one unit, the copy is never internally inconsistent, just short. Fork between turns if you want an exact copy.
 

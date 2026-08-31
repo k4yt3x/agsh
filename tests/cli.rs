@@ -1474,3 +1474,162 @@ fn recorded_profile(dir: &std::path::Path, id: &str) -> String {
         })
         .expect("the session row")
 }
+
+/// `meka -r <worker-id>` refuses, on the CLI door the HTTP test cannot reach.
+///
+/// The sibling of `tests/serve.rs`'s `a_worker_session_refuses_a_turn_posted_straight_at_it`, and
+/// not redundant with it: that one covers `build_session_agent`, while the REPL and `--oneshot` go
+/// through `create_agent_from_config`. Two call sites, and deleting the guard from *this* one left
+/// the whole suite green -- which is the untested-wiring shape the sub-agent refusal was added to
+/// close in the first place.
+///
+/// The worker is spawned for real, because the id has to come from where a user's would: a listing.
+/// Fabricating a row with a `parent_session_id` would test the predicate again rather than the
+/// wiring.
+#[test]
+fn a_worker_session_refuses_a_resume_from_the_command_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_capable_config(dir.path());
+
+    let spawned = run_scripted_from(
+        dir.path(),
+        dir.path(),
+        r#"[
+          [{"kind":"tool_use_start","id":"call-1","name":"agent_spawn"},
+           {"kind":"tool_use_end","input":{"prompt":"count the files","permission":"read"}},
+           {"kind":"message_end","stop_reason":"tool_use"}],
+          [{"kind":"text","text":"worker done"},{"kind":"message_end","stop_reason":"end_turn"}],
+          [{"kind":"text","text":"dispatched"},{"kind":"message_end","stop_reason":"end_turn"}]
+        ]"#,
+        &["--oneshot", "spawn one"],
+    );
+    assert!(
+        spawned.status.success(),
+        "the spawning turn has to succeed for there to be a worker: {}",
+        String::from_utf8_lossy(&spawned.stderr)
+    );
+
+    let worker: String = store(dir.path())
+        .query_row(
+            "SELECT id FROM sessions WHERE parent_session_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the spawn should have left exactly one worker row");
+
+    let refused = run_scripted(dir.path(), &[
+        "--oneshot",
+        "-r",
+        &worker,
+        "drive it directly",
+    ]);
+    assert!(
+        !refused.status.success(),
+        "a worker must not take a turn from this door"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("agent_followup"),
+        "the refusal must name the door that can drive it: {stderr}"
+    );
+
+    // The interactive host too, since the two order their startup independently.
+    //
+    // The `meka provider add` assertion below states an outcome, not a mechanism, and is weaker
+    // than it once was: `resolve_session_resume` now refuses before `run_interactive` reaches the
+    // builder at all, so the hint is unreachable rather than suppressed. It is kept because the
+    // outcome is still what a user must get -- a refusal naming `agent_followup` and no advice to
+    // configure a profile -- but it would stay green if the suppression it used to guard were
+    // deleted, and it no longer has anything to suppress.
+    let interactive = run_scripted(dir.path(), &["-r", &worker]);
+    let stderr = String::from_utf8_lossy(&interactive.stderr);
+    assert!(
+        stderr.contains("agent_followup"),
+        "the REPL host refuses a worker by the same rule: {stderr}"
+    );
+    assert!(
+        !stderr.contains("meka provider add"),
+        "and must not follow it with advice to configure a provider, which is not the \
+         problem: {stderr}"
+    );
+
+    // And the refusal comes before `--provider` repins the row, which is the whole reason it sits
+    // ahead of `apply_session_repin` in both hosts rather than merely inside the builders. A run
+    // that refuses to touch a session must not have already rewritten it on the way to saying so.
+    let config = dir.path().join("meka").join("config.toml");
+    let mut toml = std::fs::read_to_string(&config).expect("read config.toml");
+    toml.push_str("\n[providers.second]\ntype = \"anthropic-messages\"\nmodel = \"other-model\"\n");
+    std::fs::write(&config, toml).expect("write config.toml");
+
+    // Both columns a resume can rewrite, not just the provider: `--provider` is computed in
+    // `resolve_session_resume` and committed by `apply_session_repin` afterwards, while
+    // `--permission` is committed by `resolve_session_resume` itself, so a refusal placed between
+    // them covered one and missed the other. Reading only `provider` was how that stayed green.
+    let row = |id: &str| -> (Option<String>, Option<String>) {
+        store(dir.path())
+            .query_row(
+                "SELECT provider, permission FROM sessions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the worker row is readable")
+    };
+    let before = row(&worker);
+
+    let repinned = run_scripted(dir.path(), &[
+        "--oneshot",
+        "--provider",
+        "second",
+        "-r",
+        &worker,
+        "drive it on another profile",
+    ]);
+    assert!(
+        !repinned.status.success(),
+        "naming a profile does not make a worker drivable: {}",
+        String::from_utf8_lossy(&repinned.stderr)
+    );
+    assert_eq!(
+        before,
+        row(&worker),
+        "a refused run must leave the row alone, not rewrite it on the way to the refusal"
+    );
+
+    // Both hosts, because they order these two calls independently and the assertion above only
+    // reaches `run_oneshot`. Swapping them in `run_interactive` alone left this test green.
+    let repinned = run_scripted(dir.path(), &["--provider", "second", "-r", &worker]);
+    assert!(
+        !repinned.status.success(),
+        "the REPL host refuses it too: {}",
+        String::from_utf8_lossy(&repinned.stderr)
+    );
+    assert_eq!(
+        before,
+        row(&worker),
+        "and leaves the row alone by the same ordering"
+    );
+
+    // `--permission` is the sibling flag, and the one the ordering used to miss entirely: it is
+    // written a function earlier than the repin, so a refusal placed between the two let it
+    // through. The value it falsifies travels into `session list`, `GET /v1/sessions/{id}` and
+    // every archive made from this store.
+    let repermissioned = run_scripted(dir.path(), &[
+        "--oneshot",
+        "--permission",
+        "read",
+        "-r",
+        &worker,
+        "drive it at another level",
+    ]);
+    assert!(
+        !repermissioned.status.success(),
+        "naming a permission does not make a worker drivable: {}",
+        String::from_utf8_lossy(&repermissioned.stderr)
+    );
+    assert_eq!(
+        before,
+        row(&worker),
+        "and the refusal comes before the level is recorded, or the row claims the worker ran at \
+         a level it never ran at"
+    );
+}

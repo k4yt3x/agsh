@@ -71,7 +71,7 @@ forever is not patience.
 ## `default_provider`
 
 Top-level field naming the profile to use when `--provider` isn't passed. Set it with
-`meka provider use <name>`; `meka provider add` sets it automatically when adding the first profile.
+`meka provider use <name>`; `meka provider add` sets it automatically whenever it is absent, not only for the first profile.
 
 ## Profile fields
 
@@ -127,10 +127,21 @@ documentation shows.
 
 ### `oauth_token_url`
 
-Custom OAuth token refresh endpoint. Defaults:
+The OAuth token endpoint meka posts to, for the initial code exchange at `meka provider add` /
+`login` and for every refresh thereafter. Both, not just refreshes: it overrides a constant, so it
+overrides it everywhere that constant is used. Defaults:
 
 - `https://api.anthropic.com/v1/oauth/token` for `claude-subscription`
 - `https://auth.openai.com/oauth/token` for `chatgpt-subscription`
+
+It exists because that endpoint is the provider's fact, not meka's, and a value baked into the
+binary either goes stale or sits on the far side of a proxy your network makes you use. Set it with
+`client_id` when your route out needs both.
+
+There is deliberately no `authorize_url` to go with it, and the asymmetry is not an oversight: meka
+never *requests* the authorisation URL, it hands it to your browser, so an egress proxy is never in
+that path. The two legs meka makes itself are the code exchange and the refresh, and this covers
+both.
 
 ### `client_id`
 
@@ -329,12 +340,16 @@ rather than leaving them silently off the list:
 Two more rules are enforced on `meka provider add` and `meka provider set` alike, so neither door can
 leave behind a profile the other would have declined:
 
-- **`thinking`, `thinking_budget` and `redact_thinking` on a backend that never sends them.** All
-  three are Anthropic Messages request fields, so only `anthropic-messages` and
-  `claude-subscription` profiles carry them. `set` refuses the key and writes nothing, whether it
-  was given a value or `--unset`; `add` drops the flag with a warning and creates the profile
-  without it. Same outcome either way: the key never lands where it would read plausibly and do
-  nothing.
+- **`thinking`, `thinking_budget` and `redact_thinking` on a backend that never sends them.**
+  `thinking` and `thinking_budget` are Anthropic Messages request fields, so `anthropic-messages`
+  and `claude-subscription` profiles carry them and nothing else does.
+  [`redact_thinking`](#redact_thinking) is narrower still: it gates a beta header only
+  `claude-subscription` sends, so an `anthropic-messages` profile takes a thinking field and
+  declines the redaction flag beside it. `set` refuses the key and writes nothing; `add` drops the
+  flag with a warning and creates the profile without it. Same outcome either way: the key never
+  lands where it would read plausibly and do nothing. `set --unset` is allowed on all three,
+  because removing an inert key is the remedy rather than the offence, and a hand-edited file is
+  the one place one can already be sitting.
 - **A [`max_output_tokens`](#max_output_tokens) that does not exceed the thinking budget**, under
   `thinking = "budgeted"` on one of those two backends. The budget is drawn from the output cap, so
   such a profile cannot produce a valid request; both commands check the file they are about to
@@ -1135,7 +1150,7 @@ $ pass show acme-secret | meka mcp login acme --client-secret-stdin
 
 A confidential OAuth client holds two at once: the long-lived client secret it authenticates with, and the refreshable bundle it obtained. Store the secret first, then run `meka mcp login <name>` to complete the flow. Refreshing the bundle leaves the client secret alone.
 
-`meka mcp get <name>` lists which kinds a server has, without printing any of them. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
+`meka mcp get <name>` lists which kinds a server has, without printing any of them, and shows the origin an OAuth bundle was issued for as `issued for: <scheme>://<host>[:port]`. That flags the case a rotated `url` leaves behind: a bundle minted against the old host is still stored and still sent, so the line names a mismatch rather than letting the next call fail as a bare `401`. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
 
 #### `meka mcp add` flags
 

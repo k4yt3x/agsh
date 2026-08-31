@@ -6,11 +6,15 @@
 //! through `/compact`, `/rewind` and `/export`. None of them are new capability; they are the
 //! missing way to ask for it over the wire.
 //!
-//! Compaction and rewind mutate the *live* conversation, so both take the session runtime mutex
-//! and refuse while a turn is in flight. Reading the DB copy and writing it back would be wrong in
-//! a way that is silent: a resident session holds its own `Conversation` in memory and would
-//! overwrite the change on its next turn. `meka session rewind` guards the same hazard with an
-//! on-disk `lock_session` because it runs in a separate process (`src/main.rs`).
+//! Compaction and rewind rewrite the conversation rather than appending to it, so on a session this
+//! process holds they take its runtime mutex and refuse while a turn is in flight. Reading the DB
+//! copy and writing it back would be wrong in a way that is silent: a resident session holds its
+//! own `Conversation` in memory and would overwrite the change on its next turn.
+//!
+//! Rewind alone also has a path for a session that is *not* resident, which writes the store
+//! directly instead of reviving anything, and so guards that same hazard with the on-disk
+//! `lock_session` that `meka session rewind` has always used for it (`src/session/cli.rs`). That is
+//! what lets a rewind reach a sub-agent's transcript, which no other operation here can.
 
 use axum::{
     Extension, Json,
@@ -79,7 +83,7 @@ pub struct CompactResponse {
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "Turn in flight; cancel first", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body, or nothing to compact", body = ProblemDetail),
+        (status = 422, description = "Invalid body, nothing to compact, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
         (status = 502, description = "The provider refused or failed the summarising turn. `/errors/context-overflow` here means the conversation will not fit even to summarise it", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -387,7 +391,7 @@ pub async fn context(
             // Both answer "meka cannot say", which `window` already encodes; the server default
             // would be a number about a different profile.
             recorded.and_then(|binding| {
-                crate::binding_context_window(&state.shared.providers, &binding)
+                crate::provider::binding_context_window(&state.shared.providers, &binding)
             })
         }
     };
@@ -506,10 +510,18 @@ pub async fn rewind(
                 })?;
                 (entry, guard)
             }
-            // Not resident: `ensure_session_loaded` below re-attaches it, and a session that is
-            // not in the map cannot be racing a turn, so there is nothing to guard against yet.
+            // Not resident: rewound straight on the store, without reviving anything. A rewind is
+            // an edit to the event log, not a turn, so the agent this used to build was needed
+            // only to hold the result -- and a session with no runtime has nothing to hold. This
+            // is also what makes the endpoint symmetrical with `meka session rewind`, which has
+            // always been a store-only operation and therefore always worked on a sub-agent.
             None => {
                 drop(map);
+                if let Some(response) = rewind_dormant_session(&state, id, body.turns).await? {
+                    return Ok(response);
+                }
+                // It became resident while we looked; fall through so the rewind lands in the
+                // live conversation rather than under it.
                 let entry = ensure_session_loaded(&state, id).await?;
                 let guard = crate::server::state::InFlightGuard::acquire(&entry).map_err(|_| {
                     turn_in_flight_conflict(
@@ -586,6 +598,103 @@ pub async fn rewind(
         messages_before,
         messages_after,
     }))
+}
+
+/// Rewind a session this server has not loaded, without loading it.
+///
+/// `Ok(None)` means the session became resident while this was deciding, and the caller must take
+/// the resident path so the rewind lands in the live conversation rather than underneath it. The
+/// reconstruction lock is held for the whole body so that answer cannot go stale between the check
+/// and the write, exactly as `repin_dormant_session` holds it.
+///
+/// **The session lock is what makes this safe on a sub-agent.** A worker holds its own lock for as
+/// long as its parent is running it, so a rewind aimed at a live worker fails here with
+/// `session-locked` rather than truncating a log its parent is still appending to. A worker is
+/// never resident in this map -- `build_subagent` runs it under its parent's runtime -- so this is
+/// the only path a rewind on one can take, and it is the same one `meka session rewind` has always
+/// used.
+///
+/// Deliberately unlike `/compact`, which stays refused for a sub-agent: compaction runs the model,
+/// which is driving a conversation only the parent may drive. A rewind writes no request and reads
+/// no provider; it truncates an event log the caller can already read in full through `/export`.
+async fn rewind_dormant_session(
+    state: &ServerState,
+    id: Uuid,
+    turns: usize,
+) -> Result<Option<Json<RewindResponse>>, ProblemDetail> {
+    let _reconstruction = crate::server::reattach::lock_session_reconstruction(id).await;
+    if state.sessions.read().await.contains_key(&id) {
+        return Ok(None);
+    }
+    require_session_exists(state, id).await?;
+
+    // Held across the read-modify-write, for the reason the CLI holds it: another host with this
+    // session open has its own in-memory conversation and would write over the rewind on its next
+    // turn.
+    let _session = state
+        .shared
+        .session_manager
+        .lock_session(id)
+        .map_err(|error| {
+            ProblemDetail::new(
+                ErrorKind::SessionLocked,
+                StatusCode::CONFLICT,
+                format!(
+                    "another meka process is running this session, so its conversation cannot be \
+                     rewound from here: {}",
+                    error
+                ),
+            )
+            .with("session_id", id.to_string())
+        })?;
+
+    let events = state
+        .shared
+        .session_manager
+        .load_events(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to load session events", error)
+                .with("session_id", id.to_string())
+        })?;
+    let mut conversation = crate::conversation::Conversation::from_events(events);
+    let messages_before = conversation.len();
+    let Some(event) = conversation.rewind(turns) else {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "nothing to rewind: session has fewer than {} turn(s)",
+                turns
+            ),
+        )
+        .with("session_id", id.to_string()));
+    };
+    let messages_after = conversation.len();
+    state
+        .shared
+        .session_manager
+        .save_event(id, &event)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to persist rewind event", error)
+                .with("session_id", id.to_string())
+        })?;
+
+    tracing::info!(
+        "rewound {} turn(s) from dormant session {} via HTTP: {} -> {} messages",
+        turns,
+        id,
+        messages_before,
+        messages_after
+    );
+
+    Ok(Some(Json(RewindResponse {
+        session_id: id,
+        turns_removed: turns,
+        messages_before,
+        messages_after,
+    })))
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -762,4 +871,31 @@ pub async fn import(
             sessions_imported: count,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The dormant rewind must hold both locks; see
+    /// [`crate::server::reattach::assert_dormant_fast_path_is_serialised`] for why this is asserted
+    /// against the source.
+    ///
+    /// What it defends here is the whole reason a rewind may touch a sub-agent's transcript when
+    /// every other operation in this module refuses one. That permission rests entirely on
+    /// `lock_session`: a worker holds its own lock for as long as its parent is running it, so a
+    /// rewind aimed at a live one answers `session-locked` instead of truncating an event log the
+    /// parent is still appending to. Nothing else stops it, because a worker is never resident and
+    /// so never reaches the in-flight guard or the runtime mutex that protect a host's session.
+    ///
+    /// `tests/serve.rs`'s `a_sub_agent_transcript_can_be_rewound_over_http` covers what is
+    /// reachable, that the worker's log really shrinks. It does not cover this: deleting the
+    /// `lock_session` call outright left all 3056 tests green.
+    #[test]
+    fn the_dormant_rewind_serialises_against_reconstruction() {
+        crate::server::reattach::assert_dormant_fast_path_is_serialised(
+            include_str!("conversation.rs"),
+            "async fn rewind_dormant_session(",
+            "from dormant session",
+            "save_event(id, &event)",
+        );
+    }
 }

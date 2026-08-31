@@ -19,6 +19,73 @@ use crate::{
     session::TokenStore,
 };
 
+/// The server URL a stored OAuth bundle was issued for, if it records one.
+///
+/// rmcp writes `server_url` (older bundles: `issuer`) into the credential it hands the store, so
+/// the origin has always been on disk -- nothing surfaced it. Which matters because the row is
+/// keyed by `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at a
+/// different host and the token minted for the old one is presented to the new one, with no
+/// indication in `meka mcp get` that the two disagree.
+///
+/// Best-effort by design, and `None` in three different ways that all mean the same thing to a
+/// caller: no bundle, a bundle that is not JSON, or one from a version of rmcp that recorded
+/// neither key. This decorates a listing; it must not fail one.
+pub async fn stored_credential_origin(
+    token_store: &TokenStore,
+    server_name: &str,
+) -> Option<String> {
+    let json = match token_store
+        .load_mcp_credentials(server_name, crate::session::McpCredentialKind::OAuth)
+        .await
+    {
+        Ok(json) => json?,
+        // A store meka cannot read is not the same fact as a server with no stored grant, and this
+        // function's `None` says the second. Logged rather than propagated: the caller is a display
+        // line, and losing one row of `mcp get` is not worth failing the command over -- but a
+        // silent drop would present a locked store as "never logged in".
+        Err(error) => {
+            tracing::debug!(
+                "could not read the stored OAuth credential for {} to report its origin: {}",
+                server_name,
+                error
+            );
+            return None;
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
+    origin_of(&parsed).map(str::to_string)
+}
+
+/// Whether two URLs name the same server, for the purpose of "is this the grant for this host".
+///
+/// Scheme, host and port, which is the tuple that decides who receives the bearer token. Path is
+/// deliberately excluded: an MCP endpoint at `/mcp` and the issuer metadata at the site root are
+/// the same server, and comparing paths would report a mismatch on every correctly configured
+/// OAuth server. Both unparseable falls back to string equality, so a comparison meka cannot make
+/// says "the same" rather than crying wolf on a listing.
+pub(crate) fn same_origin(left: &str, right: &str) -> bool {
+    match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
+        (Ok(left), Ok(right)) => {
+            left.scheme() == right.scheme()
+                && left.host_str() == right.host_str()
+                && left.port_or_known_default() == right.port_or_known_default()
+        }
+        _ => left == right,
+    }
+}
+
+/// The issuer field out of a parsed bundle, in the order [`revoke_stored_token`] reads them.
+///
+/// Shared so the two cannot disagree about which key is authoritative: a bundle carrying both must
+/// revoke against the same host `mcp get` names, or the report is about a different endpoint than
+/// the one the token would be sent to.
+fn origin_of(parsed: &serde_json::Value) -> Option<&str> {
+    parsed
+        .get("server_url")
+        .and_then(|value| value.as_str())
+        .or_else(|| parsed.get("issuer").and_then(|value| value.as_str()))
+}
+
 /// Best-effort revoke of a stored OAuth access/refresh token for an MCP server. Looks up the stored
 /// credentials, discovers the provider's revocation endpoint via the OAuth authorization server
 /// metadata, and posts `token=…&token_type_hint=access_token` per RFC 7009. Errors are propagated
@@ -36,10 +103,7 @@ pub async fn revoke_stored_token(
     };
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .map_err(|error| format!("stored credentials are not valid JSON: {}", error))?;
-    let issuer = parsed
-        .get("server_url")
-        .and_then(|v| v.as_str())
-        .or_else(|| parsed.get("issuer").and_then(|v| v.as_str()))
+    let issuer = origin_of(&parsed)
         .ok_or_else(|| "stored credentials missing issuer/server_url".to_string())?;
     let access_token = parsed
         .get("tokens")
@@ -1258,6 +1322,104 @@ impl CredentialStore for SqliteCredentialStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The origin a stored bundle names, and what happens when it names none.
+    ///
+    /// rmcp has recorded `server_url` in the bundle since before meka stored it, so the fact was
+    /// always on disk; what was missing was any reader. `issuer` is the older key and still the
+    /// fallback, and the two must be read in the same order here as in `revoke_stored_token` --
+    /// otherwise `meka mcp get` reports one host while the revoke posts to another.
+    #[tokio::test]
+    async fn a_stored_bundle_reports_the_host_it_was_issued_for() {
+        let manager = crate::session::SessionManager::open(
+            Some(std::path::Path::new(":memory:")),
+            &Default::default(),
+        )
+        .await
+        .expect("memory store");
+        let token_store = manager.token_store();
+
+        assert_eq!(
+            stored_credential_origin(&token_store, "docs").await,
+            None,
+            "no bundle is not a mismatch; it is nothing to report"
+        );
+
+        token_store
+            .save_mcp_credentials(
+                "docs",
+                crate::session::McpCredentialKind::OAuth,
+                r#"{"server_url":"https://a.example/mcp","tokens":{"access_token":"x"}}"#,
+            )
+            .await
+            .expect("seed");
+        assert_eq!(
+            stored_credential_origin(&token_store, "docs")
+                .await
+                .as_deref(),
+            Some("https://a.example/mcp")
+        );
+
+        token_store
+            .save_mcp_credentials(
+                "older",
+                crate::session::McpCredentialKind::OAuth,
+                r#"{"issuer":"https://b.example","tokens":{"access_token":"x"}}"#,
+            )
+            .await
+            .expect("seed");
+        assert_eq!(
+            stored_credential_origin(&token_store, "older")
+                .await
+                .as_deref(),
+            Some("https://b.example"),
+            "the older key is still read, or every pre-existing bundle reports nothing"
+        );
+
+        token_store
+            .save_mcp_credentials(
+                "broken",
+                crate::session::McpCredentialKind::OAuth,
+                "not json at all",
+            )
+            .await
+            .expect("seed");
+        assert_eq!(
+            stored_credential_origin(&token_store, "broken").await,
+            None,
+            "this decorates a listing and must never fail one"
+        );
+    }
+
+    /// Two URLs are the same server when the bearer token would reach the same host.
+    #[test]
+    fn same_origin_compares_who_receives_the_token() {
+        assert!(
+            same_origin("https://a.example/mcp", "https://a.example/"),
+            "the issuer sits at the root and the endpoint under a path; comparing paths would \
+             report a mismatch on every correctly configured server"
+        );
+        assert!(same_origin(
+            "https://a.example",
+            "https://a.example:443/mcp"
+        ));
+        assert!(
+            !same_origin("https://a.example/mcp", "https://b.example/mcp"),
+            "a different host is the whole point of reporting this"
+        );
+        assert!(
+            !same_origin("https://a.example/mcp", "http://a.example/mcp"),
+            "and so is a downgraded scheme"
+        );
+        assert!(
+            !same_origin("https://a.example", "https://a.example:8443"),
+            "a different port is a different server"
+        );
+        assert!(
+            same_origin("not a url", "not a url"),
+            "a comparison meka cannot make says `the same` rather than crying wolf"
+        );
+    }
 
     /// Losing one compare-and-swap must not turn every later write into an unconditional one.
     ///

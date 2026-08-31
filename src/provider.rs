@@ -34,8 +34,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    config::ResolvedConfig,
     error::{MekaError, Result},
-    session::TokenStore,
+    session::{SessionManager, TokenStore},
 };
 
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
@@ -83,6 +84,26 @@ pub(crate) fn default_base_url(backend: &str) -> Option<&'static str> {
 /// and nothing about the failure is visible except a missing line.
 pub(crate) fn backend_takes_thinking(backend: &str) -> bool {
     matches!(backend, "anthropic-messages" | "claude-subscription")
+}
+
+/// Whether `backend` actually sends the profile key `key`.
+///
+/// [`backend_takes_thinking`] answers for the request *field*, which is the right question for
+/// `thinking` and `thinking_budget` and the wrong one for `redact_thinking`. That key gates the
+/// `redact-thinking-…` beta header, which only `claude-subscription` sends -- the string does not
+/// appear in `provider::anthropic::messages` at all, and `ProviderBuilder::redact_thinking` reaches
+/// only `ClaudeSubscriptionProvider::new`. So `provider set apikey redact_thinking false` reported
+/// success and did nothing, which is exactly what `refuse_an_inert_thinking_key` exists to stop one
+/// field over.
+///
+/// Every other key is read by every backend that has it, so the fallback is `true` rather than an
+/// enumeration that would need editing whenever a field is added.
+pub(crate) fn backend_reads_profile_key(backend: &str, key: &str) -> bool {
+    match key {
+        "redact_thinking" => backend == "claude-subscription",
+        "thinking" | "thinking_budget" => backend_takes_thinking(backend),
+        _ => true,
+    }
 }
 
 /// How long a provider stream may go without producing anything before it is treated as dead.
@@ -1393,19 +1414,19 @@ impl ProviderBuilder {
         self
     }
 
-    /// OAuth client ID. Only consumed by `claude-subscription`.
+    /// OAuth client ID. Consumed by both subscription backends.
     pub fn client_id(mut self, value: Option<String>) -> Self {
         self.client_id = value;
         self
     }
 
-    /// OAuth token endpoint. Only consumed by `claude-subscription`.
+    /// OAuth token endpoint. Consumed by both subscription backends.
     pub fn oauth_token_url(mut self, value: Option<String>) -> Self {
         self.oauth_token_url = value;
         self
     }
 
-    /// Sink for refreshed OAuth tokens. Only consumed by `claude-subscription`; when `None`,
+    /// Sink for refreshed OAuth tokens. Consumed by both subscription backends; when `None`,
     /// refreshed tokens are held in memory only.
     pub fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
@@ -1790,7 +1811,7 @@ impl ProviderRegistry {
     /// built from.
     ///
     /// Both, because the caller wants both and resolving is not free: it reads the profile and
-    /// looks up a device id. Returning only the provider meant [`crate::resolved_binding`]
+    /// looks up a device id. Returning only the provider meant [`resolved_binding`]
     /// resolved a second time to learn the window and the vision flag that this call had just
     /// computed and thrown away.
     pub async fn build(
@@ -1915,6 +1936,200 @@ impl ProviderRegistry {
     }
 }
 
+/// A session's provider binding, resolved into everything that follows from it.
+///
+/// One struct with one producer ([`resolved_binding`]) because these are not independent facts:
+/// they all come from the same `[providers.<name>]` block, and a caller that took the provider and
+/// left the window behind would gauge the new model against the old one's size. Building a session
+/// and switching one mid-conversation both go through it, so neither can derive a subset the other
+/// does not.
+#[derive(Clone)]
+pub struct ResolvedBinding {
+    pub provider: Arc<dyn Provider>,
+    pub binding: String,
+    /// What the context gauge and the auto-compaction threshold read.
+    pub context_window: u64,
+    /// Whether this profile's model accepts image input. The agent does not read it: admitting an
+    /// attachment is the host's decision, made before a turn exists.
+    ///
+    /// The two hosts that make it reach the answer differently, and neither keeps a per-session
+    /// copy any more. `serve` reads it off this struct through `SessionEntry::binding`, which is
+    /// the cell [`crate::agent::Agent::set_provider`] writes, so a `PATCH` moves the flag with the
+    /// agent. ACP reads the session row per prompt instead, because its
+    /// `session/set_config_option` must not block its dispatch loop on the runtime mutex and
+    /// so may leave the agent a turn behind the row; see `acp::session_accepts_images`. ACP
+    /// does keep one connection-wide copy, `ServerState::vision`, which is a different fact:
+    /// `initialize` answers the advertised `image` capability before any session exists.
+    pub vision: bool,
+}
+
+/// The provider profile a session runs on.
+///
+/// One door, so every place that runs a turn answers the question the same way. A session that
+/// exists names its profile on its row and that is what it gets; anything else would move the
+/// conversation to a provider it was not having, drop the reasoning it recorded (a thinking block
+/// is not replayed across providers) and bill a different account.
+///
+/// `None` is a session that does not exist yet, which takes the configured default and records it
+/// the moment its row is written.
+///
+/// Takes the value it decides between rather than the whole [`ResolvedConfig`], so the decision can
+/// be exercised on its own. Which of a recorded profile and the process default wins is the entire
+/// question here, and a door that could only be reached through a fully resolved config could not
+/// be asked it directly.
+pub async fn resolve_session_provider(
+    session_manager: &SessionManager,
+    // The process default, or the reason there is not one. A reason rather than a bare absence
+    // because it is the only useful thing to say when this falls through: "no profile could be
+    // picked" is not actionable, while "multiple profiles configured (work, side); run
+    // `meka provider use <name>`" is. `validate()` no longer raises it for a resume, so this is
+    // where it surfaces.
+    default_profile: std::result::Result<&str, &str>,
+    session_id: Option<Uuid>,
+) -> anyhow::Result<String> {
+    if let Some(session_id) = session_id
+        && let Some(recorded) = session_manager.recorded_provider(session_id).await?
+    {
+        return Ok(recorded);
+    }
+    Ok(default_profile
+        .map_err(|reason| anyhow::anyhow!("{}", reason))?
+        .to_string())
+}
+
+/// [`resolve_session_provider`] for a caller that has a whole [`ResolvedConfig`] to hand.
+pub async fn provider_for_config(
+    session_manager: &SessionManager,
+    config: &ResolvedConfig,
+    session_id: Option<Uuid>,
+) -> anyhow::Result<String> {
+    resolve_session_provider(
+        session_manager,
+        // Exactly one of the two is set; see `select_active_profile`. The fallback text is for a
+        // shape that pairing rules out rather than for a case anyone expects to hit.
+        config.active_profile.as_deref().ok_or_else(|| {
+            config
+                .provider_error
+                .as_deref()
+                .unwrap_or("no provider profile is configured; run `meka provider add`")
+        }),
+        session_id,
+    )
+    .await
+}
+
+/// The profile a session records, when `config.toml` no longer has it.
+///
+/// The one failure `--provider` is the fix for, and the only one worth naming a session in a hint
+/// about: a profile that is configured but unusable (no stored credential, an endpoint that
+/// refuses) is not moved by repinning the row.
+///
+/// The recorded name is compared against the configured set and nothing else, with no test for the
+/// empty one a migrated store can hold. `""` is a name that resolves to nothing, which is exactly
+/// what this asks, so it answers correctly without this function having to know where it came
+/// from.
+///
+/// The name itself is not returned, because nothing needs it: the refusal already printed names the
+/// profile, and the hint this gates adds only the repin command.
+///
+/// A read failure answers `false`: this runs only to decorate an error that has already been
+/// printed, and failing the process over the decoration would replace a useful message with a
+/// useless one.
+pub(crate) async fn recorded_profile_is_gone(
+    session_manager: &SessionManager,
+    config: &ResolvedConfig,
+    session_id: Uuid,
+) -> bool {
+    match session_manager.recorded_provider(session_id).await {
+        Ok(Some(binding)) => !config.providers.contains_key(&binding),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                "could not read session {}'s recorded profile for the setup hint: {}",
+                session_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Turn a session's binding into the provider it names and the per-profile facts that come with it.
+///
+/// The one producer of [`ResolvedBinding`], so building a session and moving one mid-conversation
+/// cannot disagree about what a profile means. Before this existed, the window and the vision flag
+/// were read once per process from the *default* profile: a session pinned to a 32k profile gauged
+/// itself against the default's window, so auto-compaction never fired and the provider rejected
+/// the turn instead.
+pub async fn resolved_binding(
+    providers: &ProviderRegistry,
+    binding: String,
+) -> anyhow::Result<ResolvedBinding> {
+    let (provider, settings) = providers.build(&binding).await?;
+    Ok(ResolvedBinding {
+        provider,
+        // The documented default, not a guess at the model: meka does not infer a window from a
+        // model name, so a profile that states none gets the one value the docs name.
+        context_window: settings.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        vision: settings.vision,
+        binding,
+    })
+}
+
+/// Whether a session's profile accepts image input, answered without building its provider.
+///
+/// For the hosts that must decide whether to admit an attachment before a turn exists. A profile
+/// that cannot resolve answers `false`: that session's next turn is going to fail on the same
+/// profile, and taking the attachment first would only add a second failure further in.
+///
+/// Reads the same `ProfileSettings` [`resolved_binding`] does, so the answer a host caches cannot
+/// drift from the one the agent was built with.
+pub fn binding_accepts_images(providers: &ProviderRegistry, binding: &str) -> bool {
+    providers
+        .settings(binding)
+        .map(|settings| settings.vision)
+        .unwrap_or(false)
+}
+
+/// A session's context window, answered without building its provider.
+///
+/// The sibling of [`binding_accepts_images`], for a host that reports occupancy without reaching
+/// through the runtime mutex an in-flight turn is holding. Same source, so the reported window is
+/// the one the agent gauges against.
+/// `None` for a binding that cannot resolve, which is not the same as the documented default: that
+/// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
+/// invites a client to divide by a number meka has no reason to believe.
+pub fn binding_context_window(providers: &ProviderRegistry, binding: &str) -> Option<u64> {
+    providers
+        .settings(binding)
+        .ok()
+        .map(|settings| settings.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW))
+}
+
+/// The provider registry for the two CLI hosts (the REPL and `--oneshot`), built the way
+/// `build_shared_deps` builds ACP's and `serve`'s so all four resolve a profile identically.
+pub(crate) fn cli_provider_registry(
+    config: &ResolvedConfig,
+    token_store: TokenStore,
+    session_stats: Arc<crate::stats::SessionStats>,
+) -> anyhow::Result<Arc<ProviderRegistry>> {
+    let providers = Arc::new(ProviderRegistry::new(config, token_store, session_stats));
+
+    // Debug-only, and the same install `run_acp` and `run_serve` make. It reaches the REPL and
+    // `--oneshot` because the questions two `meka` processes raise about each other -- who holds a
+    // session's lock while a first turn runs, whose background task the other sweeps -- are
+    // questions about the CLI entry point, and no harness could ask them while the only scriptable
+    // surfaces were ACP and HTTP.
+    #[cfg(debug_assertions)]
+    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
+        let rounds = mock::load_script_from_env()?.unwrap_or_default();
+        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
+        providers.install_scripted(Arc::new(mock::MockProvider::from_rounds(rounds)));
+    }
+
+    Ok(providers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1935,17 +2150,17 @@ mod tests {
         let registry = test_registry(profiles).await;
 
         assert_eq!(
-            crate::binding_context_window(&registry, "stated"),
+            binding_context_window(&registry, "stated"),
             Some(32_000),
             "a profile that states a window reports it"
         );
         assert_eq!(
-            crate::binding_context_window(&registry, "silent"),
+            binding_context_window(&registry, "silent"),
             Some(DEFAULT_CONTEXT_WINDOW),
             "one that states none reports the documented default, not its neighbour's value"
         );
         assert_eq!(
-            crate::binding_context_window(&registry, "departed"),
+            binding_context_window(&registry, "departed"),
             None,
             "a profile that has left config.toml reports nothing, so no client divides by a guess"
         );

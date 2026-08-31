@@ -20,7 +20,7 @@ A few flags are worth knowing:
 | `-vv` | `debug` (per-request JSON-RPC diagnostics). |
 | `RUST_LOG=meka=trace` | Trace level. |
 
-Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and this host creates one per `session/new`, each naming its own provider profile. Have the client name a `provider` per session instead. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
+Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and this host creates one per `session/new`, each naming its own provider profile. A new session starts on the host's default; move it with `session/set_config_option`, and `session/load` restores whichever profile a session already recorded. `--provider` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the connection rather than of one session.
 
 On startup, after the client's `initialize` arrives, meka logs `ACP client connected: <name> <version>` so you can confirm the client identity in `-v` mode.
 
@@ -89,9 +89,9 @@ One case can't honour that: a client advertising `fs.readTextFile` but not `fs.w
 meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessions can coexist in one `meka acp` process, each with its own cwd, permission level, conversation, cancellation token, and per-session runtime mutex. Prompts on different sessions run in parallel; a second `session/prompt` for a session that already has one in flight is rejected with `InvalidParams`. The session row is also locked on disk (the same lock the REPL uses), so two `meka` processes can't simultaneously write events for the same session id.
 
 - **`session/new { cwd, mcpServers }`**: mints a fresh persisted session, captures the cwd, takes the on-disk session lock, returns the session id and the current `SessionMode` state.
-- **`session/load { sessionId, cwd, mcpServers }`**: replays the persisted conversation as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins.
+- **`session/load { sessionId, cwd, mcpServers }`**: replays the persisted conversation as a stream of `session/update` notifications (`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`) before the response. Orphan tool calls (the persisted log stopped mid-tool) are closed out with a `failed` status so the client's UI doesn't render a stuck spinner. If the client's `cwd` differs from the persisted one, meka updates the persisted row to match; the client wins. A sub-agent's id is refused with `InvalidParams` before the session is locked or its `cwd` rewritten; continue that conversation with `agent_followup` from the parent instead.
 - **`session/list { cwd?, cursor? }`**: paginated index. Filtered to the requested cwd when present; sub-agent sessions are always hidden. `nextCursor` is opaque; round-trip it back to keep paging.
-- **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behaviour as `session/load`.
+- **`session/resume { sessionId, cwd, mcpServers }`**: adopts the session id without replaying. Use this when the client already has the history rendered. Same cwd-update behaviour as `session/load`. A sub-agent's id is refused on the same terms as `session/load`.
 - **`session/fork { sessionId, cwd, additionalDirectories, mcpServers }`**: copies the session's conversation into a new persisted session, adopts the copy as active, and returns its id. The source is left open and untouched. See [Forking](#forking).
 - **`session/close { sessionId }`**: cancels any in-flight prompt, releases the on-disk session lock, and removes the entry from the map.
 - **`session/cancel { sessionId }`**: interrupts the active `session/prompt`. The response carries `stopReason: "cancelled"`. If a cancel arrives between turns (after one prompt completed and before the next is installed), meka latches the signal and cancels the next prompt immediately on arrival.
@@ -244,7 +244,9 @@ The request is a session-*creation* request, not a row copy: it carries its own 
 
 There is no replay: unlike `session/load`, forking emits no `session/update` stream for the copied history, since a client that just forked already has the transcript rendered.
 
-Sub-agent child transcripts are not copied, and the fork records no link back to its source. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
+Sub-agent child transcripts are not copied, and a fork of an ordinary session records no link back
+to its source. `session/fork` answers `InvalidParams` for a sub-agent's own id: the copy would be a
+sibling under the same parent, so there is no session to hand back. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
 
 This method is marked **unstable** in the protocol: it is not part of the spec yet and may change or be removed. Zed does not currently call it.
 

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-08-31
+
 ### Added
 
 - A session records the provider profile it runs on, and a resume restores it.
@@ -20,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka provider login --api-key-stdin` rotates an API key without prompting or losing the profile.
 - `meka mcp login --auth-token-stdin` / `--client-secret-stdin` set or rotate a server's secret.
 - `meka mcp get` reports which kinds of credential a server has stored, without printing them.
+- `meka mcp get` names the host a stored OAuth grant was issued for, and flags a mismatch.
 - `meka provider set <name> <key> <value>` changes one profile setting, keeping the rest intact.
 - `provider add` gains six flags for the remaining profile fields, so any profile is one command.
 - A turn whose repair did not help points at `/rewind` before it fails.
+- Refusing a sub-agent's id carries `/errors/session-not-drivable`, which no payload makes acceptable.
 
 ### Changed
 
@@ -31,11 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/provider` lists one profile per line with its backend, under a heading, not a comma-joined run.
 - `/status` orders its resolved-profile lines the way `[providers.<name>]` declares them.
 - Ctrl+C and the background-task notices read as annotations: `(interrupted)`, in yellow.
-- **Breaking:** `--model`, `--base-url`, `--thinking` and `--thinking-budget` are removed.
-- **Breaking:** `meka session list --long` is removed along with the columns it showed.
 - The thinking budget is per profile (`thinking_budget`), falling back to `[thinking].budget_tokens`.
 - Profile keys have one canonical order, provider-scoped first, shared by the file, `-h` and docs.
-- Every writer normalises a profile's key order; `provider set` no longer preserves key positions.
+- Every writer normalises a profile's key order, so an edited profile comes back in canonical order.
 - **Breaking:** `/cd` with no argument returns to meka's launch directory, not `$HOME`; `~` still does.
 - `provider add` refuses a profile that would fail at startup, as `provider set` already did.
 - `provider set` refuses a thinking setting on a backend that never sends one, as `add` drops it.
@@ -67,15 +69,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka provider add` writes the profile before the credential, so a failed write strands neither.
 - `GET /v1/sessions/{id}/context` omits `window` for a profile it cannot resolve.
 - `GET /v1/health/ready` reports a provider as configured when any profile is, not just the default.
+- **Breaking:** a session another one spawned is driven only by `agent_followup`, never by a host.
+- **Breaking:** a fork of a sub-agent is a sibling under the same parent, not a new root.
+- **Breaking:** `POST /v1/sessions/{id}/fork` answers 422 for a sub-agent; the copy is not drivable.
+- **Breaking:** ACP `session/fork` answers `InvalidParams` for a sub-agent, before copying it.
+- **Breaking:** ACP `session/load` and `session/resume` refuse a sub-agent before locking or writing.
+- **Breaking:** a session carrying spawn terms is refused even when its parent did not survive.
+- **Breaking:** `PATCH /v1/sessions/{id}` answers 422 for a sub-agent, whose profile is its parent's.
+- `meka -c` and `meka session list` skip an imported worker, which no host can drive either.
+- `POST /v1/sessions/{id}/rewind` works on a sub-agent and on a dormant session, without loading it.
+- `meka -c` resumes the newest top-level session, skipping a sub-agent that ran more recently.
+- `provider set` refuses `redact_thinking` on `anthropic-messages`, which never sends the beta.
+
+### Removed
+
+- **Breaking:** `--model`, `--base-url`, `--thinking` and `--thinking-budget`.
+- **Breaking:** `meka session list --long`, along with the columns it showed.
 
 ### Fixed
 
 - An image whose bytes do not decode is refused when read, not sent for the provider to choke on.
 - A truncated or corrupt JPEG is refused; the shared decoder accepted one cut to a tenth.
-- A JPEG taller or wider than 16384 px is forwarded, not refused as corrupt by the new check.
-- A JPEG over the decode ceiling is no longer decoded; it bypassed the limit every format honours.
 - A 5xx on a completion that outlives every retry degrades the turn's content, not just a 400.
-- A 5xx waits 8s and re-sends unchanged before degrading, so a passing outage costs no content.
+- A 5xx waits its `Retry-After` and re-sends unchanged, so a passing outage costs no content.
 - A request the provider accepts restores the turn's reprieve and tier budget for later rounds.
 - The degrade notice names `meka session export --format json`, which still holds what it removed.
 - A refused text-only tool exchange is emptied in place; it used to break every later turn.
@@ -95,7 +111,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The interrupt notice no longer prints a stray blank line, or none of its blank lines at all.
 - A store a 0.44 dev build renumbered past `mcp_credentials` has the table restored on next open.
 - `provider add` wrote a negative integer for a setting above `i64::MAX`, leaving config unreadable.
-- `provider set` deleted the comment and blank line above the key it changed.
 - `provider add --thinking-budget` wrote the key onto backends that never send a thinking field.
 - The interactive thinking-budget prompt offered the built-in default over `[thinking].budget_tokens`.
 - `PATCH /v1/sessions/{id}` naming the recorded profile now re-syncs a diverged live agent.
@@ -128,6 +143,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The REPL's `/skill` completion follows skills the agent adds or deletes mid-session.
 - `--api-key-stdin` no longer lets the model or base-URL prompt consume the piped key.
 - `--api-key-stdin` is refused for the subscription backends instead of silently opening a browser.
+- A failed migration keeps the pre-migration copy it was about to supersede.
+- `agent_followup` records the profile its worker was built on, so its row stops naming another.
+- The OAuth mint posts to the profile's `oauth_token_url`; only refreshes honoured it before.
+- Compaction retries a transient provider failure instead of reporting it as a context overflow.
+- Ctrl+C ends a compaction waiting to retry, rather than sitting out the provider's `Retry-After`.
+- A provider's rejection text cannot forge `[meka harness]` inside the note that carries it.
+- A degraded tool result carries the flag the call reported, instead of always claiming success.
+- A 5xx whose body mentions the context window is retried, not treated as an overflow.
+- A second Ctrl+C prints through the console instead of onto the thinking indicator's row.
+- A mid-turn log line settles the thinking indicator's row instead of being erased with it.
+- `meka -r <sub-agent-id>` no longer follows its refusal with advice to configure a provider.
+- Row-settling survives a panic in a console method instead of stopping for the process's life.
+- A write aimed at a sub-agent is refused before its lock is taken, so it cannot answer 409 instead.
+- `session import` and `session fork` stop printing a `meka -r` that is refused when run.
+- `POST /v1/sessions/{id}/schedule` refuses an imported worker instead of failing on every fire.
+- A refused resume no longer records `--permission` on the row before declining to run it.
+- A 429 whose body mentions the context window is retried, not treated as an overflow.
+- `meka provider add -h` fits 80 columns again; six new flags had widened the flag column.
 
 ## [0.43.0] - 2026-08-26
 
@@ -1746,7 +1779,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.43.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.0...HEAD
+[0.44.0]: https://github.com/k4yt3x/meka/compare/0.43.0...0.44.0
 [0.43.0]: https://github.com/k4yt3x/meka/compare/0.42.2...0.43.0
 [0.42.2]: https://github.com/k4yt3x/meka/compare/0.42.1...0.42.2
 [0.42.1]: https://github.com/k4yt3x/meka/compare/0.42.0...0.42.1

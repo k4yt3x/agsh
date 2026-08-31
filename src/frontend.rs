@@ -224,11 +224,12 @@ impl std::error::Error for FrontendError {}
 pub enum FrontendEvent {
     /// A new session was created. Carries the session UUID.
     SessionStarted { id: Uuid },
-    /// The agent is about to start a turn. REPL uses this to emit the `newline_after_prompt` blank
-    /// line.
+    /// The agent is about to start a turn. Carries no spacing duty: the `[display]` blanks bracket
+    /// the *episode* between two prompts, which is `crate::console`'s to own, and a turn is only
+    /// one of the things an episode may contain.
     TurnStarted,
-    /// The agent finished a turn cleanly. REPL uses this to flush any open streaming renderer and
-    /// emit the `newline_before_prompt` blank line.
+    /// The agent finished a turn cleanly. The REPL closes any open streaming text block on this, as
+    /// a block boundary; the closing blank belongs to the episode, not to the turn.
     TurnFinished,
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.

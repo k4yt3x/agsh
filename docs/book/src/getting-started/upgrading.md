@@ -21,12 +21,27 @@ a key left behind is a parse error naming the key and the line rather than a val
 
 ```console
 $ meka mcp list
-Error: configuration error: failed to parse …/config.toml: TOML parse error at line 12, column 1
+Error: database error: schema migration 3 ('sessions_name_their_provider') failed: Invalid
+parameter name: cannot record a provider for 4 carried-forward session(s) while config.toml
+cannot be read; fix the file and start meka again. The store is unchanged
+```
+
+The parse error itself is a warning just above it, naming the key and the line:
+
+```console
+WARN meka: config.toml could not be read, so this run cannot say which profile anything should
+adopt: configuration error: failed to parse …/config.toml: TOML parse error at line 12, column 1
    |
 12 | auth_token = "…"
    | ^^^^^^^^^^
 unknown field `auth_token`, expected one of `name`, `transport`, …
 ```
+
+Two messages because two things are stuck: the file will not parse, and the migration that has to
+name a profile for your existing sessions cannot ask it which one. Fixing the file fixes both, and
+nothing has been written in the meantime -- "The store is unchanged" is literal, and the copy taken
+before the attempt is still beside your store. (On an installation with no sessions to carry
+forward, only the parse error appears.)
 
 For each server, delete the line and store the secret instead. Which command depends on which key
 you deleted, and the two are alternatives, not a sequence: a bearer belongs to a server with no
@@ -80,10 +95,65 @@ meka --oneshot --permission read --provider work "summarise today's alerts"
 Often a gate is the better answer: it means a frequent job takes no turn at all on the ticks where
 nothing happened, which saves more than skipping the history did.
 
+**A session another one spawned is driven only by its parent.** `POST /v1/sessions/{id}/turn`
+answers 422 for a sub-agent's id, `meka -r <worker-id>` refuses by name, and a scheduled fire aimed
+at one does the same. Both agent builders now check, rather than the scheduling door alone.
+
+What this closes is that a worker's restrictions live in its spawn record, which those builders
+never read: the `[subagents]` denials it was created under, its memory and instruction grants, and
+the permission ceiling its spawn call set. Driving one from a host therefore ran a conversation that
+was *deliberately given narrow tools* with the full built-in set at the host's level. `agent_followup`
+was and remains the door that reconstructs those terms, so nothing meka does for you changes.
+
+Reading a worker is untouched: `meka session export`, `GET /v1/sessions/{id}/messages` and
+`meka session list --include-children` all still serve it.
+
+**Forking one does not promote it**, and that is the other half of the change. A fork of a sub-agent
+now carries `parent_session_id` and the spawn terms, so the copy is a sibling under the same parent
+rather than a new root; without that, `POST /v1/sessions/{id}/fork` was a one-call way around the
+refusal above, handing back a live session over a worker's whole conversation with none of the terms
+it was spawned under. The two doors that have to hand back a *live* session therefore refuse a
+sub-agent's id up front: `POST /v1/sessions/{id}/fork` answers 422, and ACP's `session/fork` answers
+`InvalidParams`. `meka session fork` still makes the copy: it takes no runtime, and the copy is
+readable like any other worker. Forking an ordinary session is unchanged. If you want a worker's conversation as a top-level session of your own, copy
+the text out rather than expecting a command to promote it.
+
+**`meka session list --long` is gone**, along with the columns it showed. If a script parses that
+output, it needs updating; the default columns are unchanged.
+
+**`/cd` with no argument returns to the directory meka was launched from**, not `$HOME`. `/cd ~`
+still goes home. The old behaviour made a bare `/cd` a surprising way to leave the project you were
+working in.
+
+**`meka mcp logout <name>` clears every credential that server holds**, not only its OAuth tokens.
+If you were using it to drop a stale token from a server that also has a stored bearer or client
+secret, you will now need to store that again with `meka mcp login`.
+
 **A scheduled job is refused on a sub-agent session.** `POST /v1/sessions/{id}/schedule` answers 422
 if the session was spawned by another. Sub-agents never had the `schedule_*` tools, so no job meka
 created can be affected; what this closes is a client planting one directly, which would have woken
 the worker without the tool restrictions or memory grants it was spawned under.
+
+**ACP `session/load` and `session/resume` refuse a sub-agent's id.** Both used to take the session's
+lock, rewrite its `cwd`, retire its background work and replace its roots before failing with
+`Internal error`; both now decline with `InvalidParams` before touching anything, naming the parent
+to use `agent_followup` from. An editor that stored a worker's id from `session/list` gets a clear
+refusal instead of a mutated row and an opaque failure. Over HTTP the same holds for every write-side
+endpoint: `POST /v1/sessions/{id}/turn` and its neighbours refuse before taking the worker's lock or
+marking its background tasks interrupted.
+
+**A session that carries spawn terms is refused even when its parent is not in the store.** That
+shape has one source, and it is a pair of documented commands: `meka session export <worker>
+--format json` followed by `meka session import`. The archive's `parent_id` points outside it, so the
+import re-roots the row while copying the spawn terms faithfully. The result reads as a sub-agent's
+conversation to every door, so `meka -r` on it, and `POST /turn`, `/fork`, `/schedule` and `PATCH`
+against it over HTTP, all refuse. `meka -c` skips it and `meka session list` shows it only under
+`--include-children`, both so nothing offers you a session it will then decline. **If you were using
+export-then-import to promote a worker into a standalone session, that no longer works**; there is
+no supported replacement, because the tools and permission ceiling a worker ran under live in the
+terms its parent set and nothing outside that parent can reconstruct them. The conversation itself
+stays fully readable, and importing a *whole tree* -- the root and its workers together -- is
+unaffected, since each child keeps its parent.
 
 **This upgrade deletes the pre-migration copy 0.43 left, and keeps one from now on.** Before it
 migrates, meka copies the store aside; until now nothing removed those, so a full duplicate of your
@@ -172,7 +242,9 @@ profile also read.
 **`meka acp` and `meka serve` refuse `-c` and `-r`.** Both name one run's session, and a long-lived
 host has no such thing: it creates one per `session/new` or per `POST /v1/sessions`, each naming its
 own profile. They used to be accepted and quietly misapplied: `-c` / `-r` switched off the
-default-profile check a host with no default needs most. Name a `provider` per session instead.
+default-profile check a host with no default needs most. Over HTTP, name a `provider` on `POST
+/v1/sessions`; under ACP, `session/new` creates on the host's default and `session/set_config_option`
+moves it.
 `--provider` is still accepted, because it selects which configured profile the host defaults to,
 which is a property of the host rather than of one session.
 

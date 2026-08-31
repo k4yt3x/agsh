@@ -26,6 +26,19 @@ pub enum MekaError {
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
 
+    /// A session exists, but this door may not drive it. Carries the whole refusal, which names
+    /// both why and the door that can, so every surface can relay it verbatim.
+    ///
+    /// Its own variant rather than [`Self::Config`] because nothing about the installation is
+    /// wrong: `Config`'s `Display` opens with "configuration error", which is what a CLI user would
+    /// read, and it is the wrong diagnosis. Nor is it [`Self::InvalidRequest`], which means the
+    /// *provider* refused a body and arms the turn's degrade path.
+    ///
+    /// Raised by the two agent builders as a backstop, and by the doors that have to refuse before
+    /// they write anything. Mapped to 422 by [`crate::server::reattach::agent_build_problem`].
+    #[error("{0}")]
+    SessionNotDrivable(String),
+
     /// The provider rejected the request as malformed (HTTP 400 / 422 that isn't an overflow).
     /// Deterministic on the request body, so retrying it unchanged is pointless; distinct from
     /// [`Self::Provider`] so the agent loop can instead degrade the content it most recently
@@ -151,9 +164,10 @@ pub(crate) enum ProviderRequest {
 /// completions (400 / 422) to [`MekaError::InvalidRequest`] (so the agent loop can
 /// degrade-and-retry once), and everything else to [`MekaError::Provider`]. Anthropic returns HTTP
 /// 400 `invalid_request_error` with "prompt is too long"; OpenAI returns 400
-/// `context_length_exceeded` (or 413). The overflow check is matched on the body (a bare 400 is
-/// shared with many unrelated errors) and takes priority over the status code so it can't be
-/// shadowed by an unrelated retryable status.
+/// `context_length_exceeded` (or 413). The overflow check is matched on the body, because a bare
+/// 400 is shared with many unrelated errors -- but only on a status that could *be* an overflow:
+/// never a 5xx, never a 429, and unconditionally on a 413. See the comment on `overflow` below for
+/// why the status is the half worth trusting when the two disagree.
 ///
 /// The 400 / 422 bucket deliberately makes no attempt to tell a content problem from a parameter
 /// problem: a `max_tokens` above the model's ceiling, an unknown beta header and a mislabelled
@@ -170,12 +184,39 @@ pub(crate) fn provider_http_error(
     request: ProviderRequest,
 ) -> MekaError {
     let lower = body.to_ascii_lowercase();
+    // The body is only consulted on a 4xx. A 5xx is never a context overflow -- it is the server
+    // saying it failed, not that the request was too big -- and reading the body first meant any
+    // status could be reclassified by a substring. That is reachable without an adversary: this
+    // module's own callers record that a provider may echo the request back in an error, so a
+    // transient 500 answering a turn whose text discusses `context_length_exceeded` skipped both
+    // the retry and the reprieve and ran an emergency compaction, destroying context to answer a
+    // blip. `PAYLOAD_TOO_LARGE` stays unconditional: that is a status, not a guess.
+    //
+    // What this gives up, stated rather than left to be rediscovered: a gateway that re-wraps an
+    // upstream 400 as a 5xx turns a genuine overflow into a retry, then the outage reprieve, then
+    // the degrade tiers -- so the turn loses its attachments where it should have compacted. The
+    // trade is deliberate and goes this way because the two failures are not symmetric. Misreading
+    // a blip as an overflow destroys context on the *common* path, silently, and
+    // `persist_vindicated_repair` writes the loss down as proven-good; misreading a wrapped
+    // overflow costs a wait and a worse repair on a path that still ends in a legible error the
+    // user can answer with `/compact`. The status is the only thing in the response the provider
+    // is speaking in its own voice -- the body may be echoing meka's own request back -- so it is
+    // the half worth trusting. Every backend meka ships against sends a 400 here.
+    //
+    // `429` is excluded for the same reason as the 5xx, and was missed when they were: it is a
+    // rate limit, which is a statement about how often meka is asking rather than about how large
+    // the request is, so no `429` is ever a context overflow. Left in, it was the one remaining
+    // status at which an echoed request body could still route a transient failure into an
+    // emergency compaction -- and the *most* likely one, since a rate limit is what a busy session
+    // meets first.
     let overflow = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
-        || lower.contains("prompt is too long")
-        || lower.contains("context_length_exceeded")
-        || lower.contains("context length exceeded")
-        || lower.contains("maximum context length")
-        || lower.contains("exceeds the maximum context");
+        || (status.is_client_error()
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            && (lower.contains("prompt is too long")
+                || lower.contains("context_length_exceeded")
+                || lower.contains("context length exceeded")
+                || lower.contains("maximum context length")
+                || lower.contains("exceeds the maximum context")));
     let message = format!("API returned status {status}: {}", render_error_body(body));
     if overflow {
         MekaError::ContextOverflow(message)
@@ -964,19 +1005,87 @@ mod tests {
         }
     }
 
+    /// The overflow phrases are read on a 4xx and nowhere else.
+    ///
+    /// This test used to assert the opposite, and named it a priority rule: a 500 mentioning the
+    /// context window classified as overflow because the body was consulted before the status. The
+    /// body is not meka's to trust that far. A server that fails while echoing the request back --
+    /// which this module's own callers record as real behaviour -- turned a transient 500 into an
+    /// emergency compaction, so a turn whose text merely discussed `context_length_exceeded` had
+    /// its context destroyed to answer a blip, and skipped both the retry and the outage reprieve
+    /// on the way.
+    ///
+    /// Both arms, because a rule that stopped reading the body at all would silently break the
+    /// 400-shaped overflow every backend actually sends.
+    ///
+    /// `429` is asserted alongside the 5xx rather than left to the sibling test, because it is the
+    /// same rule and was fixed one release later than the 5xx was: a rate limit says how often meka
+    /// is asking, never how large the request is. It is also the likeliest status to carry an
+    /// echoed body, since a busy session meets it first. The existing `429` tests use bodies with
+    /// no overflow phrase in them, so they pass whichever way this goes and cover nothing here.
     #[test]
-    fn test_provider_http_error_overflow_takes_priority_over_retryable_status() {
-        // A 500 whose body happens to mention the context window should still classify as
-        // overflow, not retryable — the body check is checked first regardless of status.
-        assert!(matches!(
-            provider_http_error(
-                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                "context_length_exceeded",
-                None,
-                ProviderRequest::Completion,
+    fn the_overflow_phrases_are_read_on_a_4xx_and_not_on_a_5xx() {
+        assert!(
+            matches!(
+                provider_http_error(
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    "context_length_exceeded",
+                    None,
+                    ProviderRequest::Completion,
+                ),
+                MekaError::RetryableProvider {
+                    server_error_on_completion: true,
+                    ..
+                }
             ),
-            MekaError::ContextOverflow(_)
-        ));
+            "a 5xx is the server saying it failed, never that the request was too big"
+        );
+        assert!(
+            matches!(
+                provider_http_error(
+                    reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    "context_length_exceeded",
+                    None,
+                    ProviderRequest::Completion,
+                ),
+                MekaError::RetryableProvider { .. }
+            ),
+            "a 429 is a rate limit whatever its body says, so it waits rather than compacting"
+        );
+        // Every phrase, not one: they are an `||` chain, and a chain is the shape where one
+        // wrong operator still passes a single-value test while quietly requiring all of them.
+        for phrase in [
+            "prompt is too long",
+            "context_length_exceeded",
+            "context length exceeded",
+            "maximum context length",
+            "exceeds the maximum context",
+        ] {
+            assert!(
+                matches!(
+                    provider_http_error(
+                        reqwest::StatusCode::BAD_REQUEST,
+                        phrase,
+                        None,
+                        ProviderRequest::Completion,
+                    ),
+                    MekaError::ContextOverflow(_)
+                ),
+                "'{phrase}' is a shape a backend actually sends and has to be recognised alone"
+            );
+        }
+        assert!(
+            matches!(
+                provider_http_error(
+                    reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                    "no useful body",
+                    None,
+                    ProviderRequest::Completion,
+                ),
+                MekaError::ContextOverflow(_)
+            ),
+            "413 is a status rather than a guess, so it needs no phrase"
+        );
     }
 
     /// The body is the tail of the message, so whitespace on it is whitespace on the console line.

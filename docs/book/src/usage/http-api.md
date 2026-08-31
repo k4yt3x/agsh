@@ -193,8 +193,30 @@ The body is optional and inherits everything by default. The only field is `cwd`
 ```
 
 Permission, capabilities and the provider profile are inherited and remain changeable afterwards via
-`PATCH /v1/sessions/{id}`. Sub-agent child transcripts are not copied, and the fork records no link
-back to its source. See [Forking a Session](./sessions.md#forking-a-session) for the full semantics.
+`PATCH /v1/sessions/{id}`. Sub-agent child transcripts are not copied, and a fork of an ordinary
+session records no link back to its source.
+
+A sub-agent's own id is refused with `422`: the copy would keep that worker's parent and spawn terms,
+so it is a sibling under the same parent rather than a session this endpoint could hand back. See
+[Forking a Session](./sessions.md#forking-a-session) for the full semantics.
+
+#### Sub-agent sessions cannot be driven through this API
+
+`GET /v1/sessions?include_children=true` lists the sessions an `agent_spawn` created. Those ids are
+readable through every endpoint on this page -- `/messages`, `/context`, `/export` -- and
+drivable through none of them: `POST /v1/sessions/{id}/turn` answers `422` with
+`/errors/session-not-drivable`, as do `/compact`, `/responses/{request_id}`, `/fork`, `/schedule`,
+and `PATCH /v1/sessions/{id}`. A worker
+runs under the tools, permission ceiling and provider profile its spawn call set, which live in its
+spawn record and which only its parent can reconstruct, so the conversation is continued with the
+`agent_followup` tool from the parent rather than over HTTP.
+
+Two exceptions, both of which change a transcript without running anything on it. Teardown stays
+open: `DELETE /v1/sessions/{id}` discards a worker and `DELETE /v1/sessions/{id}/tasks/{task_id}`
+stops one of its background tasks, and the parent's own `agent_delete` does the same thing. So does
+`POST /v1/sessions/{id}/rewind`, which truncates the event log the same caller can already read in
+full through `/export`, and which `meka session rewind` has always allowed on a worker. The line is
+whether the model runs: `/compact` is refused because compaction is a turn.
 
 #### Importing an archive
 
@@ -653,6 +675,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-cancelled` | 409 | Turn was cancelled |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
+| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation. Reading it is unaffected; continuing it means `agent_followup` from the parent, whose id the message names. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
 | `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |
@@ -667,7 +690,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 
 Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the same error shape, then close the connection.
 
-> The two 502s are the ones worth branching on. `/errors/provider` says the upstream would not serve this turn, and is worth one backed-off resend; it does not say meka retried first, because on a turn it does and on `/compact` it does not, and a permanent failure looks the same from here. `/errors/context-overflow` says the request itself no longer fits, and will not fit next time either: retrying it unchanged loops until your client gives up. Shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
+> The two 502s are the ones worth branching on. `/errors/provider` says the upstream would not serve this turn, and is worth one backed-off resend; it does not say how many attempts meka made first, because it gives up as soon as any output has reached the stream and a cancelled turn abandons the sequence wherever it stands, so a permanent failure and an exhausted one look the same from here. `/errors/context-overflow` says the request itself no longer fits, and will not fit next time either: retrying it unchanged loops until your client gives up. Shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
 >
 > A `Retry-After` on a `/errors/provider` response is the upstream's own, relayed up to an hour; meka reads only the delta-seconds form, so an upstream that answers with an HTTP date sends none. Honour it in preference to your own backoff. `/errors/context-overflow` never carries one.
 

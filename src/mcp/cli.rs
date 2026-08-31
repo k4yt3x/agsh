@@ -224,6 +224,31 @@ pub async fn run_get(
             println!("credential:  {} (stored)", kind.label());
         }
     }
+    // The endpoint the stored grant was minted against, beside the one this config points at.
+    //
+    // A credential row is keyed by `(server_name, kind)` and by nothing else, so editing `url` in
+    // place -- a staging host promoted to production, a tenant moved -- leaves a token issued by
+    // one server being presented to another, with every other line of this report agreeing that
+    // the server is configured and authorised. Reporting only, because a mismatch is not
+    // necessarily wrong: an issuer legitimately differs from the resource server, and a host that
+    // moved behind the same issuer is a rename rather than a new grant. What it cannot be is
+    // invisible.
+    if let Some(origin) = super::auth::stored_credential_origin(token_store, name).await {
+        // A server with no `url` -- a stdio one that used to be HTTP, and still holds the bundle
+        // from then -- has nothing to disagree with, so it gets the origin and no verdict.
+        // Comparing against `""` reported every such server as a mismatch against an empty
+        // URL.
+        let mismatch = config
+            .url
+            .as_deref()
+            .filter(|configured| !super::auth::same_origin(&origin, configured));
+        match mismatch {
+            Some(configured) => {
+                println!("  issued for: {origin} (does not match url: {configured})")
+            }
+            None => println!("  issued for: {origin}"),
+        }
+    }
     if let Some(auth) = &config.auth {
         // The `type` value as written in config.toml, not `Debug` on a discriminant: that prints
         // an opaque `Discriminant(1)` and tells the reader nothing about which flow is configured.

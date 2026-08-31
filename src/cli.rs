@@ -208,19 +208,19 @@ pub enum ProviderAction {
         /// API base URL
         ///
         /// Any endpoint serving the chosen protocol.
-        #[arg(long = "base-url")]
+        #[arg(long = "base-url", value_name = "URL")]
         base_url: Option<String>,
         /// OAuth token endpoint override (advanced)
         ///
-        /// For a self-hosted or proxied authorisation server. The backend's own
-        /// endpoint is used when this is unset.
-        #[arg(long = "oauth-token-url")]
+        /// Used for the initial code exchange and every refresh. For a proxied
+        /// route out; the backend's own endpoint is used when this is unset.
+        #[arg(long = "oauth-token-url", value_name = "URL")]
         oauth_token_url: Option<String>,
         /// OAuth client ID override (advanced)
         ///
-        /// Subscription backends only, for the same self-hosted case as
-        /// --oauth-token-url.
-        #[arg(long = "client-id")]
+        /// Subscription backends only. Like --oauth-token-url, it replaces a
+        /// value meka has to hardcode but does not own.
+        #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
         /// Model name.
         #[arg(long)]
@@ -229,43 +229,47 @@ pub enum ProviderAction {
         ///
         /// Skips the advanced prompt for this setting. Defaults to 1000000. Set the model's real
         /// window so compaction fires at the right point; meka never infers or probes for it.
-        #[arg(long = "context-window")]
+        #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,
         /// Per-request output token cap
         ///
         /// Unset leaves the backend's own default. On Claude with thinking =
         /// budgeted this must exceed the thinking budget.
-        #[arg(long = "max-output-tokens")]
+        #[arg(long = "max-output-tokens", value_name = "TOKENS")]
         max_output_tokens: Option<u64>,
         /// Reasoning effort (e.g. low, high)
         ///
         /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
         /// applies its own default.
-        #[arg(long)]
+        #[arg(long, value_name = "LEVEL")]
         effort: Option<String>,
-        /// Accept image input: true or false (default: true)
+        /// Accept image input (default: true)
         ///
         /// Set false for a text-only model, so the ACP frontend stops offering
         /// images it cannot use.
-        #[arg(long, hide_possible_values = true)]
+        #[arg(long, hide_possible_values = true, value_name = "BOOL")]
         vision: Option<bool>,
         /// Thinking mode: adaptive, budgeted, off
         ///
         /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
         /// ignore it. Defaults to adaptive.
-        #[arg(long, value_enum, hide_possible_values = true)]
+        #[arg(long, value_enum, hide_possible_values = true, value_name = "MODE")]
         thinking: Option<crate::provider::ThinkingMode>,
-        /// Thinking budget in tokens, for thinking = budgeted
+        /// Token budget when thinking = budgeted
         ///
         /// Ignored by the other two modes, which send no budget. Defaults to
         /// `[thinking].budget_tokens`, then to 16000.
-        #[arg(long = "thinking-budget")]
+        #[arg(long = "thinking-budget", value_name = "TOKENS")]
         thinking_budget: Option<u64>,
-        /// Redact thinking blocks: true or false (default: true)
+        /// Redact thinking blocks (default: true)
         ///
         /// claude-subscription only. Saves bandwidth, but redacted payloads
         /// cannot be replayed to the server across turns.
-        #[arg(long = "redact-thinking", hide_possible_values = true)]
+        #[arg(
+            long = "redact-thinking",
+            hide_possible_values = true,
+            value_name = "BOOL"
+        )]
         redact_thinking: Option<bool>,
         /// Read the API key from stdin
         ///

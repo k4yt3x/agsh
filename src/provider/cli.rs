@@ -245,13 +245,20 @@ async fn run_add(
     // the loopback callback, and if the callback wins it can leave a stdin read parked. Keeping the
     // interactive prompts above (which read stdin) before this ensures nothing reads stdin after.
     //
-    // The grant has to be minted under the same `client_id` the profile is about to record, because
-    // that recorded value is what every later refresh presents (`run_login` passes the profile's
-    // for the same reason). Passing `None` here while `write_profile` wrote `--client-id` below
-    // issued the grant to the default client and then claimed a custom one: the profile
+    // The grant has to be minted under the same `client_id` *and* at the same `oauth_token_url`
+    // the profile is about to record, because those recorded values are what every later refresh
+    // presents and posts to (`run_login` passes the profile's for the same reason). Passing `None`
+    // for the client issued the grant to the default one and then claimed a custom one: the profile
     // authenticated once and died at its first refresh, naming a mismatch nothing had announced.
-    let credential =
-        acquire_credential(&backend, api_key_stdin, tuning.client_id.as_deref()).await?;
+    // The endpoint was the same defect one field over, and worse for the case it exists to serve:
+    // a profile pointed at a proxy because there is no direct route out could not mint at all.
+    let credential = acquire_credential(
+        &backend,
+        api_key_stdin,
+        tuning.client_id.as_deref(),
+        tuning.oauth_token_url.as_deref(),
+    )
+    .await?;
 
     // The profile before the secret, so the half that lands first is the visible half. A config
     // write can fail for ordinary reasons -- a read-only directory, a full disk -- and doing it
@@ -307,6 +314,7 @@ async fn run_login(
         &profile.backend,
         api_key_stdin,
         profile.client_id.as_deref(),
+        profile.oauth_token_url.as_deref(),
     )
     .await?;
     token_store
@@ -592,7 +600,12 @@ fn set_profile_field(
     true
 }
 
-/// Every profile key that only means something to the Anthropic Messages request shape.
+/// Every profile key that only means something to a backend that reasons in thinking blocks.
+///
+/// Not "the Anthropic Messages request shape", which is what this said and which `redact_thinking`
+/// is not: `refuse_an_inert_thinking_key` declines that key on `anthropic-messages` and admits it
+/// only for `claude-subscription`. The list is the union of what any thinking backend reads; the
+/// per-key narrowing is that function's job.
 const THINKING_ONLY_PROFILE_KEYS: &[&str] = &["thinking", "thinking_budget", "redact_thinking"];
 
 /// Refuse one of those keys on a profile whose backend will never send it.
@@ -627,16 +640,15 @@ fn refuse_an_inert_thinking_key(
     // guessing here would refuse a key over a typo in a different one.
     if backend.is_empty()
         || !crate::provider::SUPPORTED_PROVIDERS.contains(&backend)
-        || crate::provider::backend_takes_thinking(backend)
+        || crate::provider::backend_reads_profile_key(backend, key)
     {
         return Ok(());
     }
     anyhow::bail!(
-        "'{}' is an Anthropic Messages request field, and profile '{}' has backend '{}', which \
-         never sends one. Nothing was written.",
-        key,
+        "profile '{}' has backend '{}', which never sends '{}'. Nothing was written.",
         name,
-        backend
+        backend,
+        key
     )
 }
 
@@ -901,10 +913,14 @@ async fn acquire_credential(
     backend: &str,
     api_key_stdin: bool,
     client_id: Option<&str>,
+    // The profile's `oauth_token_url`, or `None` for the backend's own. Threaded for the same
+    // reason `client_id` is: a value that overrides a constant has to override it everywhere the
+    // constant appears, and the mint was the one place still reaching for the built-in.
+    oauth_token_url: Option<&str>,
 ) -> anyhow::Result<AuthCredential> {
     match credential_kind(backend) {
-        Some(CredentialKind::ClaudeLogin) => claude_login(client_id).await,
-        Some(CredentialKind::ChatGptLogin) => codex_login(client_id).await,
+        Some(CredentialKind::ClaudeLogin) => claude_login(client_id, oauth_token_url).await,
+        Some(CredentialKind::ChatGptLogin) => codex_login(client_id, oauth_token_url).await,
         Some(CredentialKind::ApiKey) => {
             let key = if api_key_stdin {
                 let mut buffer = String::new();
@@ -1263,10 +1279,21 @@ fn resolve_tuning(
     // of them, because they are one request field between them: guarding `thinking` alone let
     // `--thinking-budget 2048` write `thinking_budget` into an OpenAI profile, which is the same
     // inert key one field over.
-    if !takes_thinking {
+    // `redact_thinking` is dropped on a wider set than the other two, because it is read by a
+    // narrower one: see `backend_reads_profile_key`. `anthropic-messages` takes a thinking field
+    // and ignores the redaction beta entirely.
+    if !takes_thinking || !crate::provider::backend_reads_profile_key(backend, "redact_thinking") {
         let dropped: Vec<&str> = [
-            flags.thinking.take().map(|_| "--thinking"),
-            flags.thinking_budget.take().map(|_| "--thinking-budget"),
+            if takes_thinking {
+                None
+            } else {
+                flags.thinking.take().map(|_| "--thinking")
+            },
+            if takes_thinking {
+                None
+            } else {
+                flags.thinking_budget.take().map(|_| "--thinking-budget")
+            },
             flags.redact_thinking.take().map(|_| "--redact-thinking"),
         ]
         .into_iter()
@@ -1274,7 +1301,7 @@ fn resolve_tuning(
         .collect();
         if !dropped.is_empty() {
             tracing::warn!(
-                "ignoring {} for a '{}' profile: thinking is an Anthropic Messages request field",
+                "ignoring {} for a '{}' profile: that backend never sends the field",
                 dropped.join(", "),
                 backend
             );
@@ -1594,8 +1621,12 @@ fn build_authorize_url(
     Ok(url.to_string())
 }
 
-async fn claude_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> {
+async fn claude_login(
+    client_id: Option<&str>,
+    oauth_token_url: Option<&str>,
+) -> anyhow::Result<AuthCredential> {
     let client_id = client_id.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID);
+    let token_url = oauth_token_url.unwrap_or(TOKEN_URL);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
     let url = build_authorize_url(client_id, &code_challenge, &state)?;
@@ -1613,7 +1644,7 @@ async fn claude_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential>
     // The pasted value may include the state after a '#' delimiter (e.g. "code#state").
     let code = code_input.split('#').next().unwrap_or(&code_input);
 
-    exchange_claude_code(code, &code_verifier, client_id, &state).await
+    exchange_claude_code(code, &code_verifier, client_id, &state, token_url).await
 }
 
 #[derive(serde::Deserialize)]
@@ -1636,10 +1667,11 @@ async fn exchange_claude_code(
     code_verifier: &str,
     client_id: &str,
     state: &str,
+    token_url: &str,
 ) -> anyhow::Result<AuthCredential> {
     let client = reqwest::Client::new();
     let response = client
-        .post(TOKEN_URL)
+        .post(token_url)
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
             "code": code,
@@ -1684,8 +1716,12 @@ async fn exchange_claude_code(
 
 // ----- OpenAI Codex OAuth (localhost callback) ---------------------------------------------------
 
-async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> {
+async fn codex_login(
+    client_id: Option<&str>,
+    oauth_token_url: Option<&str>,
+) -> anyhow::Result<AuthCredential> {
     let client_id = client_id.unwrap_or(DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID);
+    let token_url = oauth_token_url.unwrap_or(CODEX_TOKEN_URL);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
     let redirect_uri = format!("http://localhost:{}/auth/callback", CODEX_REDIRECT_PORT);
@@ -1749,7 +1785,14 @@ async fn codex_login(client_id: Option<&str>) -> anyhow::Result<AuthCredential> 
     if received_state != state {
         anyhow::bail!("OAuth state mismatch, possible CSRF; aborting");
     }
-    exchange_codex_code(&received_code, &code_verifier, client_id, &redirect_uri).await
+    exchange_codex_code(
+        &received_code,
+        &code_verifier,
+        client_id,
+        &redirect_uri,
+        token_url,
+    )
+    .await
 }
 
 /// Read a manually pasted callback URL from stdin, the fallback for when the loopback callback
@@ -1971,6 +2014,7 @@ async fn exchange_codex_code(
     code_verifier: &str,
     client_id: &str,
     redirect_uri: &str,
+    token_url: &str,
 ) -> anyhow::Result<AuthCredential> {
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     let encode = |value: &str| utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
@@ -1984,7 +2028,7 @@ async fn exchange_codex_code(
 
     let client = reqwest::Client::new();
     let response = client
-        .post(CODEX_TOKEN_URL)
+        .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -2833,7 +2877,22 @@ mod tests {
             Some(2_048),
             "and so must the budget"
         );
-        assert_eq!(claude.redact_thinking, Some(true), "and the redaction flag");
+        // Not the redaction flag, which is a narrower question: `redact_thinking` gates a beta
+        // header only `claude-subscription` sends, so an `anthropic-messages` profile that stored
+        // it would carry a setting that reads plausibly and is never consulted. See
+        // `provider::backend_reads_profile_key`.
+        assert_eq!(
+            claude.redact_thinking, None,
+            "anthropic-messages takes a thinking field but never sends the redaction beta"
+        );
+        let subscription =
+            resolve_tuning(flags(), "claude-subscription", "work", None, None, false)
+                .expect("resolve");
+        assert_eq!(
+            subscription.redact_thinking,
+            Some(true),
+            "the one backend that does send it keeps the flag"
+        );
     }
 
     /// The defaults line names what is still unset, and nothing else.
@@ -3101,8 +3160,20 @@ model = "m"
                 message.contains(key) && message.contains("openai-responses"),
                 "the refusal names the key and the backend: {message}"
             );
-            refuse_an_inert_thinking_key(&document, "work", key)
-                .expect("the same key is live on a Messages profile");
+            // `anthropic-messages` sends a thinking field but not the redaction beta, so the two
+            // groups part company here rather than moving together.
+            let on_messages = refuse_an_inert_thinking_key(&document, "work", key);
+            if *key == "redact_thinking" {
+                let message = on_messages
+                    .expect_err("the redaction beta is claude-subscription's alone")
+                    .to_string();
+                assert!(
+                    message.contains(key) && message.contains("anthropic-messages"),
+                    "the refusal names the key and the backend: {message}"
+                );
+            } else {
+                on_messages.expect("the thinking field itself is live on a Messages profile");
+            }
             // An unrecognised `type` is `validate_backend`'s to report. Refusing here would
             // answer a typo in one key with a complaint about a different one.
             refuse_an_inert_thinking_key(&document, "typo", key)
@@ -3541,5 +3612,87 @@ type = "anthropic-messages"
         assert!(config.providers.contains_key("personal"));
         // `work` was the default; removing it must drop the dangling pointer rather than leave it.
         assert!(config.default_provider.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mint_endpoint_tests {
+    use super::*;
+
+    /// The code exchange goes to the profile's endpoint, not the built-in one.
+    ///
+    /// `48772c7` threaded the profile's `client_id` into the mint because a grant issued to the
+    /// default client then claimed a custom one, and the profile died at its first refresh. The
+    /// endpoint was the same defect one field over: refresh read `oauth_token_url` while the mint
+    /// posted to a constant, so the documented pair (`--client-id` with `--oauth-token-url`) could
+    /// not complete a login at all, and the case the field exists for -- no direct route out --
+    /// could not even reach Anthropic to be refused.
+    ///
+    /// A real socket rather than a URL assertion, because a helper that took the endpoint and
+    /// posted somewhere else would satisfy any signature check. The stub answers nothing useful and
+    /// the exchange fails afterwards; that the request *arrived* there is the whole claim.
+    ///
+    /// **What this does not cover, and what does.** The browser leg means no test can drive
+    /// `claude_login` end to end, so the link between the profile's field and this argument is held
+    /// by the compiler instead: dropping it makes `oauth_token_url` an unused parameter, which CI's
+    /// `-D warnings` turns into a build failure. Verified by reverting the call to the constant.
+    /// The same, for the other subscription backend.
+    ///
+    /// A sibling rather than a duplicate: `codex_login` reaches a *different* exchange helper with
+    /// a different body encoding and its own hardcoded constant, so the claude test above says
+    /// nothing about it. Threading the endpoint into one of two mints and not the other is exactly
+    /// the shape this release spent its time closing everywhere else.
+    #[tokio::test]
+    async fn the_codex_exchange_posts_to_the_profiles_token_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let received = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            String::from_utf8_lossy(&buffer[..read]).to_string()
+        });
+
+        let endpoint = format!("http://127.0.0.1:{port}/codex/own/token");
+        let _ = exchange_codex_code(
+            "code",
+            "verifier",
+            "a-client",
+            "http://localhost:1455/auth/callback",
+            &endpoint,
+        )
+        .await;
+
+        let request = received.join().expect("the stub thread");
+        assert!(
+            request.starts_with("POST /codex/own/token "),
+            "the exchange must post to the profile's endpoint, got: {}",
+            request.lines().next().unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_code_exchange_posts_to_the_profiles_token_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let received = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            String::from_utf8_lossy(&buffer[..read]).to_string()
+        });
+
+        let endpoint = format!("http://127.0.0.1:{port}/its/own/token");
+        // Fails once the stub hangs up; the assertion is about where it went.
+        let _ = exchange_claude_code("code", "verifier", "a-client", "state", &endpoint).await;
+
+        let request = received.join().expect("the stub thread");
+        assert!(
+            request.starts_with("POST /its/own/token "),
+            "the exchange must post to the profile's endpoint, got: {}",
+            request.lines().next().unwrap_or_default()
+        );
     }
 }

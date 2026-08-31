@@ -1228,6 +1228,44 @@ impl Tool for AgentFollowupTool {
         )
         .await?;
 
+        // The row has to follow the build, for the reason `agent_spawn` writes it from the same
+        // cell: `build_subagent` runs the worker on the parent's binding *now*, and a follow-up
+        // after a `/provider` switch therefore bills an account the worker's row does not name.
+        // Every reader disagrees with what ran until this lands -- `meka session list`, `GET
+        // /v1/sessions`, `session export`, and a later resume, which re-pins the worker to the
+        // profile it has not been running on.
+        //
+        // A write failure is a warning, not a refusal. The turn is about to happen either way, the
+        // worker is already built, and failing here would abandon work over a bookkeeping row. A
+        // write that matches no row is the same shape and gets the same treatment, but says
+        // something different, so it says it: the worker was deleted between the build and here.
+        //
+        // Read off the built agent rather than the live cell a second time. The cell is what
+        // `build_subagent` consulted, but a repin landing in the gap -- `/provider`, `PATCH
+        // /v1/sessions/{id}`, ACP's `session/set_config_option` -- would make the second read a
+        // different answer, and the row would name a profile this turn is not running on. That is
+        // the defect being fixed here, one race narrower.
+        let ran_on = sub_agent.provider_binding().clone();
+        match self
+            .tool_builder_params
+            .session_manager
+            .set_recorded_provider(agent_id, &ran_on)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "sub-agent {} is running on '{}' but has no row to record it on",
+                agent_id,
+                ran_on
+            ),
+            Err(error) => tracing::warn!(
+                "sub-agent {} is running on '{}' but its row could not be updated to say so: {}",
+                agent_id,
+                ran_on,
+                error
+            ),
+        }
+
         // Rehydrate the worker's own conversation: the same three calls the REPL's resume path
         // makes. `from_events` arms the resume notice, and it is left armed deliberately -- every
         // follow-up really is a fresh registry, a fresh read tracker and an empty todo list, so the
@@ -2512,7 +2550,7 @@ mod tests {
     /// The same, with the profile *name* chosen, for a test that needs the parent's live binding to
     /// differ from what its row records.
     fn binding_named(provider: Arc<dyn Provider>, profile: &str) -> crate::agent::PublishedBinding {
-        crate::agent::PublishedBinding::detached(&crate::agent::ResolvedBinding {
+        crate::agent::PublishedBinding::detached(&crate::provider::ResolvedBinding {
             provider,
             binding: profile.to_string(),
             context_window: 200_000,
@@ -3102,6 +3140,88 @@ mod tests {
                 .expect("read the parent's row"),
             Some("stale-row-profile".to_string()),
             "and spawning must not rewrite the parent's own row on the way past"
+        );
+    }
+
+    /// The sibling of the test above, on the door that was left open.
+    ///
+    /// `build_subagent` takes the parent's live binding for a follow-up exactly as it does for a
+    /// spawn, but only the spawn wrote it down, so a worker spawned on `first-profile` and
+    /// followed up after a `/provider` switch ran on and billed `second-profile` while its row
+    /// still said `first-profile`. That is the one thing this release otherwise forbids: a session
+    /// whose turns do not run on the profile its row names.
+    ///
+    /// The switch between the two calls is the whole point; a test where the binding never moves
+    /// passes with the write deleted.
+    #[tokio::test]
+    async fn a_followed_up_worker_records_the_profile_it_is_now_running_on() {
+        let session_manager = test_session_manager().await;
+        let parent_sid = session_manager
+            .create_session(None, "first-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = test_params(
+            session_manager.clone(),
+            Arc::new(RwLock::new(Some(parent_sid))),
+        );
+        params.live_binding = binding_named(
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("spawned"),
+                text_round("followed up"),
+            ])),
+            "first-profile",
+        );
+
+        let spawn = AgentSpawnTool {
+            parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            tool_builder_params: params.clone(),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        };
+        let output = spawn
+            .execute(
+                serde_json::json!({"prompt": "do a thing", "permission": "read"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("spawn");
+        let text = super::super::tests::text_content(&output);
+        let agent_id: Uuid = text
+            .lines()
+            .find_map(|line| line.strip_prefix("agent: "))
+            .and_then(|id| Uuid::parse_str(id.trim()).ok())
+            .unwrap_or_else(|| panic!("no agent id in: {text}"));
+
+        // What `/provider`, `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option` all
+        // leave behind: the cell `build_subagent` reads now names a different profile.
+        params.live_binding = binding_named(
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("followed up"),
+            ])),
+            "second-profile",
+        );
+
+        let followup = AgentFollowupTool {
+            parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            tool_builder_params: params,
+            in_flight: InFlightFollowups::default(),
+        };
+        followup
+            .execute(
+                serde_json::json!({"agent": agent_id.to_string(), "prompt": "again"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("follow up");
+
+        assert_eq!(
+            session_manager
+                .recorded_provider(agent_id)
+                .await
+                .expect("read the worker's row"),
+            Some("second-profile".to_string()),
+            "a follow-up runs the worker on the parent's binding now, so the row has to say so"
         );
     }
 

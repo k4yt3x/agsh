@@ -259,11 +259,23 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         .filter_map(|(given, flag)| given.then_some(flag))
         .collect::<Vec<_>>();
         if !offending.is_empty() {
+            // The remedy differs by host, and saying so beats one sentence that is right for
+            // neither. `POST /v1/sessions` genuinely takes a `provider`; ACP's `session/new` does
+            // not -- it creates on the host's default and a client moves it afterwards through
+            // `session/set_config_option`, which is what `configOptions` advertises it for.
+            let remedy = if acp_mode {
+                "Create the session with `session/new`, then move it with \
+                 `session/set_config_option` if it needs another profile; `session/load` restores \
+                 the one a session recorded"
+            } else {
+                "Name a `provider` on `POST /v1/sessions` instead"
+            };
             anyhow::bail!(
                 "`meka {}` does not take {}: they name one run's session, and this host creates \
-                 one per request. Name a `provider` per session instead.",
+                 one per request. {}.",
                 host,
-                offending.join(", ")
+                offending.join(", "),
+                remedy
             );
         }
     }
@@ -532,191 +544,64 @@ fn warn_on_stale_tool_config(
     );
 }
 
-/// The provider profile a session runs on.
+/// Refuse to build a plain agent for a session another one spawned.
 ///
-/// One door, so every place that runs a turn answers the question the same way. A session that
-/// exists names its profile on its row and that is what it gets; anything else would move the
-/// conversation to a provider it was not having, drop the reasoning it recorded (a thinking block
-/// is not replayed across providers) and bill a different account.
+/// A sub-agent's authority is not its host's. The `[subagents]` denials it was spawned under, its
+/// memory and instruction grants, and the permission ceiling its spawn call set all live in
+/// `sessions.subagent_spec_json`, and both builders below assemble from `config` alone. A worker
+/// built by either would run the conversation it was *given narrow tools for* with the full
+/// built-in set at the host's level, which is the escalation `[subagents]` exists to prevent.
 ///
-/// `None` is a session that does not exist yet, which takes the configured default and records it
-/// the moment its row is written.
+/// Called at the doors *and* kept in both builders. The doors are where a refusal has to land to
+/// come before the side effects each one performs -- a lock taken, a `cwd` rewritten, background
+/// work retired, a row repinned -- and the builders are the backstop that catches a door nobody
+/// thought of. A rule placed only in the builders arrives too late to prevent a write; a rule
+/// placed only at the doors is one the next door forgets, which is how this came to be enforced
+/// for scheduled jobs alone.
 ///
-/// Takes the value it decides between rather than the whole [`ResolvedConfig`], so the decision can
-/// be exercised on its own. Which of a recorded profile and the process default wins is the entire
-/// question here, and a door that could only be reached through a fully resolved config could not
-/// be asked it directly.
-pub async fn resolve_session_provider(
+/// Nothing about a previous release is encoded here: a worker session must not be driven this way
+/// on a store meka created a minute ago, and the check reads the same column either way.
+///
+/// [`crate::tools::subagent`]'s `agent_followup` is unaffected. It goes through `build_subagent`,
+/// which reads the spec and clamps the level against the parent's live one, and is the only thing
+/// that can reconstruct what the worker was spawned with.
+///
+/// Reading the session is the whole check, so an id with no row is not this function's business:
+/// `None` means there is nothing to refuse, and whatever follows answers for a session that is not
+/// there.
+async fn refuse_a_spawned_session(
     session_manager: &SessionManager,
-    // The process default, or the reason there is not one. A reason rather than a bare absence
-    // because it is the only useful thing to say when this falls through: "no profile could be
-    // picked" is not actionable, while "multiple profiles configured (work, side); run
-    // `meka provider use <name>`" is. `validate()` no longer raises it for a resume, so this is
-    // where it surfaces.
-    default_profile: std::result::Result<&str, &str>,
     session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<String> {
-    if let Some(session_id) = session_id
-        && let Some(recorded) = session_manager.recorded_provider(session_id).await?
-    {
-        return Ok(recorded);
-    }
-    Ok(default_profile
-        .map_err(|reason| anyhow::anyhow!("{}", reason))?
-        .to_string())
-}
-
-/// [`resolve_session_provider`] for a caller that has a whole [`ResolvedConfig`] to hand.
-pub async fn provider_for_config(
-    session_manager: &SessionManager,
-    config: &ResolvedConfig,
-    session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<String> {
-    resolve_session_provider(
-        session_manager,
-        // Exactly one of the two is set; see `select_active_profile`. The fallback text is for a
-        // shape that pairing rules out rather than for a case anyone expects to hit.
-        config.active_profile.as_deref().ok_or_else(|| {
-            config
-                .provider_error
-                .as_deref()
-                .unwrap_or("no provider profile is configured; run `meka provider add`")
-        }),
-        session_id,
-    )
-    .await
-}
-
-/// The profile a session records, when `config.toml` no longer has it.
-///
-/// The one failure `--provider` is the fix for, and the only one worth naming a session in a hint
-/// about: a profile that is configured but unusable (no stored credential, an endpoint that
-/// refuses) is not moved by repinning the row.
-///
-/// The recorded name is compared against the configured set and nothing else, with no test for the
-/// empty one a migrated store can hold. `""` is a name that resolves to nothing, which is exactly
-/// what this asks, so it answers correctly without this function having to know where it came
-/// from.
-///
-/// The name itself is not returned, because nothing needs it: the refusal already printed names the
-/// profile, and the hint this gates adds only the repin command.
-///
-/// A read failure answers `false`: this runs only to decorate an error that has already been
-/// printed, and failing the process over the decoration would replace a useful message with a
-/// useless one.
-async fn recorded_profile_is_gone(
-    session_manager: &SessionManager,
-    config: &ResolvedConfig,
-    session_id: uuid::Uuid,
-) -> bool {
-    match session_manager.recorded_provider(session_id).await {
-        Ok(Some(binding)) => !config.providers.contains_key(&binding),
-        Ok(None) => false,
-        Err(error) => {
-            tracing::debug!(
-                "could not read session {}'s recorded profile for the setup hint: {}",
-                session_id,
-                error
-            );
-            false
-        }
-    }
-}
-
-/// Turn a session's binding into the provider it names and the per-profile facts that come with it.
-///
-/// The one producer of [`agent::ResolvedBinding`], so building a session and moving one
-/// mid-conversation cannot disagree about what a profile means. Before this existed, the window and
-/// the vision flag were read once per process from the *default* profile: a session pinned to a
-/// 32k profile gauged itself against the default's window, so auto-compaction never fired and the
-/// provider rejected the turn instead.
-pub async fn resolved_binding(
-    providers: &provider::ProviderRegistry,
-    binding: String,
-) -> anyhow::Result<agent::ResolvedBinding> {
-    let (provider, settings) = providers.build(&binding).await?;
-    Ok(agent::ResolvedBinding {
-        provider,
-        // The documented default, not a guess at the model: meka does not infer a window from a
-        // model name, so a profile that states none gets the one value the docs name.
-        context_window: settings
-            .context_window
-            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW),
-        vision: settings.vision,
-        binding,
-    })
-}
-
-/// Whether a session's profile accepts image input, answered without building its provider.
-///
-/// For the hosts that must decide whether to admit an attachment before a turn exists. A profile
-/// that cannot resolve answers `false`: that session's next turn is going to fail on the same
-/// profile, and taking the attachment first would only add a second failure further in.
-///
-/// Reads the same `ProfileSettings` [`resolved_binding`] does, so the answer a host caches cannot
-/// drift from the one the agent was built with.
-pub fn binding_accepts_images(providers: &provider::ProviderRegistry, binding: &str) -> bool {
-    providers
-        .settings(binding)
-        .map(|settings| settings.vision)
-        .unwrap_or(false)
-}
-
-/// A session's context window, answered without building its provider.
-///
-/// The sibling of [`binding_accepts_images`], for a host that reports occupancy without reaching
-/// through the runtime mutex an in-flight turn is holding. Same source, so the reported window is
-/// the one the agent gauges against.
-/// `None` for a binding that cannot resolve, which is not the same as the documented default: that
-/// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
-/// invites a client to divide by a number meka has no reason to believe.
-pub fn binding_context_window(
-    providers: &provider::ProviderRegistry,
-    binding: &str,
-) -> Option<u64> {
-    providers.settings(binding).ok().map(|settings| {
-        settings
-            .context_window
-            .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW)
-    })
-}
-
-/// The provider registry for the two CLI hosts (the REPL and `--oneshot`), built the way
-/// [`build_shared_deps`] builds ACP's and `serve`'s so all four resolve a profile identically.
-fn cli_provider_registry(
-    config: &ResolvedConfig,
-    token_store: TokenStore,
-    session_stats: Arc<stats::SessionStats>,
-) -> anyhow::Result<Arc<provider::ProviderRegistry>> {
-    let providers = Arc::new(provider::ProviderRegistry::new(
-        config,
-        token_store,
-        session_stats,
-    ));
-
-    // Debug-only, and the same install `run_acp` and `run_serve` make. It reaches the REPL and
-    // `--oneshot` because the questions two `meka` processes raise about each other -- who holds a
-    // session's lock while a first turn runs, whose background task the other sweeps -- are
-    // questions about the CLI entry point, and no harness could ask them while the only scriptable
-    // surfaces were ACP and HTTP.
-    #[cfg(debug_assertions)]
-    if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
-        let rounds = crate::provider::mock::load_script_from_env()?.unwrap_or_default();
-        tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
-        providers.install_scripted(Arc::new(crate::provider::mock::MockProvider::from_rounds(
-            rounds,
-        )));
-    }
-
-    Ok(providers)
-}
-
-/// [`resolve_session_provider`] for the hosts that carry a [`SharedDeps`].
-pub async fn provider_for_session(
-    shared: &SharedDeps,
-    session_id: Option<uuid::Uuid>,
-) -> anyhow::Result<String> {
-    provider_for_config(&shared.session_manager, &shared.config, session_id).await
+) -> anyhow::Result<()> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    // Refused here rather than at the import, because import restoring a whole tree is a case it
+    // has to keep: a child whose parent *is* in the archive keeps its link and is caught by the
+    // parent check. What no legitimate door produces is spawn terms with no parent.
+    let Some(crate::session::SpawnTerms { parent }) =
+        session_manager.spawn_terms(session_id).await?
+    else {
+        return Ok(());
+    };
+    let door = match parent {
+        Some(parent) => format!(
+            "was spawned by session {parent} and runs under the terms it was spawned with, which \
+             only its parent can apply. Continue it with `agent_followup` from session {parent}"
+        ),
+        // An imported worker whose parent did not come with it. There is no session to point at, so
+        // say what it is rather than naming a door that is not there.
+        None => "carries the terms another session spawned it under, so it is a sub-agent's \
+                 conversation rather than a session of its own. Its parent is not in this store, \
+                 which is what importing a worker on its own leaves behind, and without it nothing \
+                 can reconstruct the tools and permission it ran with"
+            .to_string(),
+    };
+    Err(crate::error::MekaError::SessionNotDrivable(format!(
+        "session {session_id} {door}. Reading it is unaffected: `meka session export`, \
+         `meka session list --include-children` and the HTTP read endpoints all still serve it."
+    ))
+    .into())
 }
 
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
@@ -827,7 +712,7 @@ struct AgentAssembly<'a> {
     /// The whole binding rather than the provider and its profile separately, because
     /// [`assemble_agent`] has to publish it: the sub-agent and `context_*` tools hold a handle so
     /// a mid-session switch reaches them.
-    resolved: agent::ResolvedBinding,
+    resolved: provider::ResolvedBinding,
     mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
     skills: Arc<skills::SkillCache>,
     /// Whether this agent gets `skill_write` / `skill_delete`, from `[skills] agent_managed`.
@@ -1051,7 +936,7 @@ async fn assemble_agent(
 pub async fn build_session_agent(
     shared: &SharedDeps,
     // Which session this agent serves, or `None` for one that does not exist yet. It decides which
-    // provider profile the agent runs on: see `provider_for_session`.
+    // provider profile the agent runs on: see `provider::resolve_session_provider`.
     session_id: Option<uuid::Uuid>,
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
@@ -1067,9 +952,10 @@ pub async fn build_session_agent(
     // same one the agent gauges against rather than a copy it re-stores on every switch.
     context_window: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
-    let resolved = resolved_binding(
+    refuse_a_spawned_session(&shared.session_manager, session_id).await?;
+    let resolved = provider::resolved_binding(
         &shared.providers,
-        provider_for_session(shared, session_id).await?,
+        provider::provider_for_config(&shared.session_manager, &shared.config, session_id).await?,
     )
     .await?;
     let agent_options = shared.agent_options.clone();
@@ -1120,10 +1006,11 @@ async fn create_agent_from_config(
     context_window: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
+    refuse_a_spawned_session(&session_manager, session_id).await?;
 
-    let resolved = resolved_binding(
+    let resolved = provider::resolved_binding(
         providers,
-        provider_for_config(&session_manager, config, session_id).await?,
+        provider::provider_for_config(&session_manager, config, session_id).await?,
     )
     .await?;
 
@@ -1391,9 +1278,51 @@ impl InterruptRelay {
     }
 }
 
+/// What the nth Ctrl+C means.
+///
+/// Split from the handler because the handler cannot be tested: it is a `tokio::spawn` around
+/// `tokio::signal::ctrl_c()` whose last arm calls `std::process::exit`, so driving it needs real
+/// signals and survives none of them. The escalation itself is a decision about a number, and every
+/// mutation of it -- deleting the second arm, or moving its boundary -- is a real behaviour change:
+/// dropping [`Escalation::CancelBackgroundTasks`] makes the second press exit the process, which is
+/// the data-loss shape the three-press ladder exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escalation {
+    /// The shell's contract: the first SIGINT reaches the foreground job only. Background work
+    /// survives, because losing a twenty-minute build to a Ctrl+C aimed at the answer on screen is
+    /// unrecoverable and is not what the keystroke meant.
+    CancelTurn,
+    CancelBackgroundTasks,
+    /// Leave -- but let what was already cancelled finish unwinding first.
+    Leave,
+}
+
+fn escalation_for(press: usize) -> Escalation {
+    match press {
+        1 => Escalation::CancelTurn,
+        2 => Escalation::CancelBackgroundTasks,
+        _ => Escalation::Leave,
+    }
+}
+
+/// What to tell the user about the tasks a second Ctrl+C stopped, or `None` when it stopped none.
+///
+/// `None` rather than an empty string, because the difference is whether the console is written to
+/// at all: announcing "stopping 0 background tasks" would be both false and an episode's worth of
+/// spacing spent on nothing.
+fn background_cancellation_notice(signalled: usize) -> Option<String> {
+    (signalled > 0).then(|| {
+        format!(
+            "stopping {} background task{}",
+            signalled,
+            if signalled == 1 { "" } else { "s" }
+        )
+    })
+}
+
 /// Start the process's single SIGINT listener. Idempotent; every turn path calls it, and only the
 /// first call spawns.
-fn install_interrupt_handler(agent: &Agent) {
+fn install_interrupt_handler(agent: &Agent, console: Arc<std::sync::Mutex<console::Console>>) {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if INSTALLED.set(()).is_err() {
         return;
@@ -1412,16 +1341,13 @@ fn install_interrupt_handler(agent: &Agent) {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
 
-            match press {
-                // The shell's contract: the first SIGINT reaches the foreground job only.
-                // Background work survives, because losing a twenty-minute build to a Ctrl+C aimed
-                // at the answer on screen is unrecoverable and is not what the keystroke meant.
-                1 => {
+            match escalation_for(press) {
+                Escalation::CancelTurn => {
                     if let Some(token) = InterruptRelay::current() {
                         token.cancel();
                     }
                 }
-                2 => {
+                Escalation::CancelBackgroundTasks => {
                     // Recorded before signalling, so what the agent hears is "you stopped it"
                     // rather than the `failed` its own interruption would otherwise write.
                     for id in tasks.task_ids().await {
@@ -1439,17 +1365,12 @@ fn install_interrupt_handler(agent: &Agent) {
                         }
                     }
                     let signalled = tasks.cancel_all().await;
-                    if signalled > 0 {
-                        render::render_annotation(&format!(
-                            "stopping {} background task{}",
-                            signalled,
-                            if signalled == 1 { "" } else { "s" }
-                        ));
+                    if let Some(notice) = background_cancellation_notice(signalled) {
+                        with_console(&console, |console| console.annotation(&notice));
                     }
                 }
-                // Leave -- but let what was already cancelled finish unwinding first.
-                _ => {
-                    render::render_annotation("interrupted");
+                Escalation::Leave => {
+                    with_console(&console, |console| console.annotation("interrupted"));
                     if tokio::time::timeout(INTERRUPT_DRAIN_GRACE, tasks.wait_all())
                         .await
                         .is_err()
@@ -1476,7 +1397,6 @@ async fn compact_interruptible(
     request: crate::agent::CompactRequest,
 ) -> error::Result<crate::agent::CompactOutcome> {
     let cancellation = CancellationToken::new();
-    install_interrupt_handler(agent);
     InterruptRelay::publish(cancellation.clone());
     let result = agent
         .compact_session(session_id, messages, request, cancellation)
@@ -1497,7 +1417,6 @@ async fn run_turn_interruptible(
     retention: agent::PromptRetention,
 ) -> error::Result<()> {
     let cancellation = CancellationToken::new();
-    install_interrupt_handler(agent);
     InterruptRelay::publish(cancellation.clone());
     let result = agent
         .run_turn_retaining(
@@ -1546,6 +1465,10 @@ async fn run_oneshot(
         },
         config.render_mode,
     )));
+    // Before the first thing that logs. Off-prompt, `tracing` writes straight to stderr, and the
+    // row it lands on may be one the console intends to erase; giving the relay this handle is what
+    // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
+    relay::RELAY.install_console(&console);
     with_console(&console, |console| {
         console.open_episode(console::RowState::Empty)
     });
@@ -1600,7 +1523,8 @@ async fn run_oneshot(
         );
     }
 
-    let providers = cli_provider_registry(&config, token_store, Arc::clone(&session_stats))?;
+    let providers =
+        provider::cli_provider_registry(&config, token_store, Arc::clone(&session_stats))?;
     // Before the agent, because the agent resolves the row: a repin that has not landed yet would
     // build this run on the binding the session is leaving.
     if let (Some(id), Some(binding)) = (session_id, repin) {
@@ -1621,6 +1545,7 @@ async fn run_oneshot(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .await?;
+    install_interrupt_handler(&agent, Arc::clone(&console));
 
     match run_turn_interruptible(
         &agent,
@@ -1664,7 +1589,6 @@ async fn run_oneshot(
             // outstanding work" behaviour while leaving the user a way out; the outcomes collected
             // just below still report whatever did finish.
             let tasks = agent.background_tasks();
-            install_interrupt_handler(&agent);
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}
                 _ = INTERRUPT_RELAY.pressed.notified() => {
@@ -1740,6 +1664,10 @@ async fn run_interactive(
         },
         config.render_mode,
     )));
+    // Before the first thing that logs. Off-prompt, `tracing` writes straight to stderr, and the
+    // row it lands on may be one the console intends to erase; giving the relay this handle is what
+    // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
+    relay::RELAY.install_console(&console);
     with_console(&console, |console| {
         console.open_episode(console::RowState::Empty)
     });
@@ -1884,7 +1812,7 @@ async fn run_interactive(
         // The repin has not been committed yet (it waits for the registry, below), but it is what
         // the row will say by the time anything reads this cell.
         Some(binding) => binding.clone(),
-        None => provider_for_config(&session_manager, &config, session_id)
+        None => provider::provider_for_config(&session_manager, &config, session_id)
             .await
             .unwrap_or_default(),
     }));
@@ -1914,14 +1842,17 @@ async fn run_interactive(
     let scheduler_permission = shared_permission.clone();
     // Held past agent construction, unlike the other hosts', because `/provider` rebuilds one
     // mid-session and the cache is what makes the profile it left reusable when it comes back.
-    let providers =
-        match cli_provider_registry(&config, token_store.clone(), Arc::clone(&session_stats)) {
-            Ok(providers) => providers,
-            Err(error) => {
-                with_console(&console, |console| console.error(&error));
-                return Err(AlreadyReported.into());
-            }
-        };
+    let providers = match provider::cli_provider_registry(
+        &config,
+        token_store.clone(),
+        Arc::clone(&session_stats),
+    ) {
+        Ok(providers) => providers,
+        Err(error) => {
+            with_console(&console, |console| console.error(&error));
+            return Err(AlreadyReported.into());
+        }
+    };
     // Before the agent, because the agent resolves the row: a repin that has not landed yet would
     // build this run on the binding the session is leaving.
     if let (Some(id), Some(binding)) = (session_id, repin)
@@ -1950,8 +1881,13 @@ async fn run_interactive(
         Ok(agent) => agent,
         Err(error) => {
             with_console(&console, |console| console.error(&error));
+            // No `SessionNotDrivable` arm here. `session_id` reaches this builder only from
+            // `resolve_session_resume`, which refuses a worker before returning one, so the
+            // builder's own refusal is unreachable from this call site and an arm suppressing the
+            // provider advice below could never fire. The refusal the user actually sees is raised
+            // there, several steps before any of this runs.
             let gone = match session_id {
-                Some(id) => recorded_profile_is_gone(&session_manager, &config, id).await,
+                Some(id) => provider::recorded_profile_is_gone(&session_manager, &config, id).await,
                 None => false,
             };
             // The default when there is one, so the suggested move is the profile the rest of this
@@ -1973,6 +1909,13 @@ async fn run_interactive(
     // Point the agent's live context counter at the same atomic the REPL prompt holds, so the
     // prompt gauge tracks what the agent writes after each turn (and the resume seed above).
     agent.set_context_tokens(Arc::clone(&context_tokens));
+
+    // Installed by the host, once, rather than by each turn. It is `OnceLock`-guarded either way,
+    // so the per-turn calls were already no-ops after the first; what they could not supply is the
+    // console. Its escalation arms print, and a bare `eprintln!` from a spawned task lands wherever
+    // the cursor happens to be -- which, on a second Ctrl+C during a turn, is the middle of the
+    // thinking indicator's row.
+    install_interrupt_handler(&agent, Arc::clone(&console));
 
     // Spawned once there is an agent to answer it, which is what makes every refusal above final.
     // Started before the agent, the prompt outlived a failed construction: the loop below never
@@ -2148,7 +2091,8 @@ async fn run_interactive(
                     }
                     // The profile as configured. `/provider` moves the session to that bundle
                     // entire, which is the only thing naming a profile can mean.
-                    let resolved = match resolved_binding(&providers, name.clone()).await {
+                    let resolved = match provider::resolved_binding(&providers, name.clone()).await
+                    {
                         Ok(resolved) => resolved,
                         Err(error) => {
                             with_console(&console, |console| console.error(&error));
@@ -2250,17 +2194,6 @@ async fn run_interactive(
                 let fired = fired
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // Close the prompt line, once, and only if something is actually going to run.
-                //
-                // reedline moves the cursor below the input area on its way out of `read_line`
-                // (`move_cursor_to_end`), but only when it is genuinely exiting: the guard is
-                // `suspended_state.is_none()`, and the break path sets `suspended_state` precisely
-                // because the host is expected to print and come back. So unlike a submitted line,
-                // a scheduled wake leaves the cursor parked at the end of the prompt, and the
-                // turn's own `newline_after_prompt` blank gets spent terminating that line instead
-                // of producing a gap. Emitting the terminator here starts the turn at column zero
-                // of a fresh line, which is where a typed turn starts, so both `[display]` spacing
-                // settings mean the same thing either way.
                 // Outcomes are collected here, alongside the due jobs, so one wake delivers both
                 // rather than one of them and then another tick.
                 let outcomes = if config.background.enabled {
@@ -2345,556 +2278,25 @@ async fn run_interactive(
                 }
             }
             ReplEvent::Command(command) => {
-                // Every command answered here says something, even if only that a list is empty,
-                // and much of it prints through the `cli` modules the console cannot see. One
-                // announcement covers all of them.
-                //
-                // There is deliberately no "does this one answer by running a turn" exception any
-                // more. Announcing is idempotent within an episode -- the opening blank is spent
-                // once, by whichever writer gets there first -- so a command that runs a turn is
-                // spaced identically whether the turn happens or it bails first. The predicate
-                // that used to make that distinction is what left `/skill nosuchskill` printing
-                // its error flush against both the line above and the prompt below.
-                with_console(&console, |console| console.announce_foreign_output());
-                match command {
-                    repl::SlashCommand::Session => match &session_id {
-                        Some(id) => with_console(&console, |console| {
-                            console.session_id("Current session", &id.to_string())
-                        }),
-                        None => eprintln!("No active session yet."),
-                    },
-                    repl::SlashCommand::Compact(instructions) => {
-                        let request = crate::agent::CompactRequest {
-                            origin: crate::agent::CompactOrigin::Manual,
-                            instructions: instructions
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .map(str::to_string),
-                            keep_recent: None,
-                        };
-                        match compact_interruptible(&agent, &mut session_id, &mut messages, request)
-                            .await
-                        {
-                            Ok(outcome) => {
-                                with_console(&console, |console| {
-                                    console.hint(&render::compaction_summary(&outcome))
-                                });
-                            }
-                            Err(error) => {
-                                with_console(&console, |console| console.error(&error));
-                            }
-                        }
-                    }
-                    repl::SlashCommand::Rewind(turns) => {
-                        let turns = turns.unwrap_or(1);
-                        // `rewind(0)` returns `None` unconditionally, so without this the `None`
-                        // arm below would report "fewer than 0 turn(s)". The count is what's
-                        // wrong, not the conversation.
-                        let rewound = if turns == 0 {
-                            None
-                        } else {
-                            messages.rewind(turns)
-                        };
-                        match (session_id, rewound) {
-                            (Some(id), Some(event)) => {
-                                if let Err(error) = session_manager.save_event(id, &event).await {
-                                    // Put the turns back rather than leave memory and disk
-                                    // disagreeing, which would resurrect them on the next resume
-                                    // and make the rewind look like it silently un-did itself.
-                                    messages.pop_repair();
-                                    with_console(&console, |console| console.error(&error));
-                                } else {
-                                    agent.reset_conversation_markers().await;
-                                    with_console(&console, |console| {
-                                        console.hint(&format!(
-                                            "Rewound {} turn(s). The model no longer sees them; \
-                                         `meka session export` still does.",
-                                            turns,
-                                        ))
-                                    });
-                                }
-                            }
-                            // No session means nothing was ever persisted, so the in-memory rewind
-                            // (which did happen) is the whole story.
-                            (None, Some(_)) => {
-                                agent.reset_conversation_markers().await;
-                                with_console(&console, |console| {
-                                    console.hint(&format!("Rewound {} turn(s).", turns))
-                                });
-                            }
-                            (_, None) if turns == 0 => {
-                                eprintln!(
-                                    "Nothing to rewind: /rewind takes a turn count of 1 or more."
-                                );
-                            }
-                            (_, None) => {
-                                eprintln!(
-                                    "Nothing to rewind: the conversation has fewer than {} turn(s).",
-                                    turns
-                                );
-                            }
-                        }
-                    }
-                    repl::SlashCommand::Export => match &session_id {
-                        Some(id) => {
-                            match crate::session::cli::export_session(
-                                &session_manager,
-                                *id,
-                                None,
-                                cli::SessionExportFormat::Markdown,
-                            )
-                            .await
-                            {
-                                // The name is generated from the session id and the file lands in
-                                // the working directory, so a REPL user who is not told it has
-                                // nowhere to look. `meka session export` stays quiet: there the
-                                // shell is the one that knows.
-                                Ok(Some(path)) => {
-                                    // Shown absolute: `/cd` moves the session's directory while
-                                    // the export lands in the process's, so a bare filename would
-                                    // point at the wrong one.
-                                    let shown = std::env::current_dir()
-                                        .map(|dir| dir.join(&path))
-                                        .unwrap_or(path);
-                                    eprintln!("Exported session to {}", shown.display());
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    with_console(&console, |console| console.error(&error))
-                                }
-                            }
-                        }
-                        None => eprintln!("No active session to export."),
-                    },
-                    repl::SlashCommand::Fork => match session_id {
-                        Some(id) => match crate::session::cli::fork_and_lock(&session_manager, id)
-                            .await
-                        {
-                            Ok(crate::session::cli::ForkHandoff::Switched { id, lock }) => {
-                                // Replacing the slot's contents drops the original guard only now
-                                // that the new one is held; see
-                                // `crate::session::cli::fork_and_lock`.
-                                hold_session_lock(&session_lock, Some(lock));
-                                session_id = Some(id);
-                                // `messages` is deliberately untouched, so the branch happens at
-                                // the current head and the next turn continues in the copy.
-                                with_console(&console, |console| {
-                                    console.session_id("Forked session", &id.to_string())
-                                });
-                            }
-                            Ok(crate::session::cli::ForkHandoff::LockFailed { id, error }) => {
-                                with_console(&console, |console| console.error(&error));
-                                with_console(&console, |console| {
-                                    console.hint(&format!(
-                                        "Staying in the original. The copy exists: {}",
-                                        id
-                                    ))
-                                });
-                            }
-                            Ok(crate::session::cli::ForkHandoff::SourceGone) => {
-                                eprintln!("Session no longer exists: {}", id);
-                            }
-                            Err(error) => eprintln!("Failed to fork session: {}", error),
-                        },
-                        None => eprintln!("No active session to fork."),
-                    },
-                    repl::SlashCommand::McpList => {
-                        if let Err(error) = mcp::cli::run_list(
-                            &config.mcp_servers,
-                            mcp_manager.as_ref(),
-                            &session_manager.token_store(),
-                        )
-                        .await
-                        {
-                            with_console(&console, |console| console.error(&error));
-                        }
-                    }
-                    // These three report success at `info!` and print nothing, which is right for
-                    // the `meka mcp …` CLI (the exit code carries it) and wrong here: a REPL
-                    // command has no exit code, so silence is indistinguishable from the command
-                    // never having run, and it leaves the `[display]` blank lines wrapped around
-                    // an empty region. `/permission` sets the precedent for confirming a state
-                    // change the user asked for.
-                    repl::SlashCommand::McpReconnect { server } => {
-                        match mcp::cli::run_reconnect(&config.mcp_servers, &token_store, &server)
-                            .await
-                        {
-                            // "Connected", not "Reconnected": this is a smoke test on a throwaway
-                            // client, and the session's own connection to that server is untouched.
-                            Ok(()) => eprintln!("Connected to '{}'.", server),
-                            Err(error) => with_console(&console, |console| console.error(&error)),
-                        }
-                    }
-                    repl::SlashCommand::McpLogin { server } => {
-                        match mcp::cli::run_login(&config.mcp_servers, &token_store, &server).await
-                        {
-                            Ok(()) => eprintln!("Authorized '{}'.", server),
-                            Err(error) => with_console(&console, |console| console.error(&error)),
-                        }
-                    }
-                    repl::SlashCommand::McpLogout { server } => {
-                        match mcp::cli::run_logout(&config.mcp_servers, &token_store, &server).await
-                        {
-                            Ok(()) => eprintln!("Cleared credentials for '{}'.", server),
-                            Err(error) => with_console(&console, |console| console.error(&error)),
-                        }
-                    }
-                    repl::SlashCommand::McpPrompt {
-                        server,
-                        prompt: prompt_name,
-                        args,
-                    } => 'prompt: {
-                        let Some(manager) = mcp_manager.as_ref() else {
-                            eprintln!("No MCP servers configured.");
-                            break 'prompt;
-                        };
-                        let entry = manager.server_entry(&server);
-                        let Some(entry) = entry else {
-                            // Labelled break, not `continue`: `continue` targets the agent
-                            // loop, skipping the `AgentToReplEvent::Done` send below and
-                            // leaving the REPL thread parked in `wait_for_agent` with no
-                            // prompt, for good. Same reason as `SkillInvoke`'s `'invoke`.
-                            eprintln!(
-                                "Unknown MCP server '{}' (configured: {}).",
-                                server,
-                                manager.server_names().join(", ")
-                            );
-                            break 'prompt;
-                        };
-                        // Map positional args to declared prompt argument names (lookup via
-                        // prompts/list).
-                        let arg_names = match mcp::list_prompts(
-                            &entry,
-                            &tokio_util::sync::CancellationToken::new(),
-                        )
-                        .await
-                        {
-                            Ok(prompts) => prompts
-                                .into_iter()
-                                .find(|p| p.name == prompt_name)
-                                .and_then(|p| p.arguments)
-                                .map(|args| args.into_iter().map(|a| a.name).collect::<Vec<_>>())
-                                .unwrap_or_default(),
-                            Err(error) => {
-                                // The `McpConnection` error already names the server and the
-                                // operation, so wrapping it here would say both twice.
-                                with_console(&console, |console| console.error(&error));
-                                Vec::new()
-                            }
-                        };
-                        let mut arguments: Option<serde_json::Map<String, serde_json::Value>> =
-                            None;
-                        if !arg_names.is_empty() {
-                            let mut map = serde_json::Map::new();
-                            for (i, name) in arg_names.iter().enumerate() {
-                                if let Some(value) = args.get(i) {
-                                    map.insert(
-                                        name.clone(),
-                                        serde_json::Value::String(value.clone()),
-                                    );
-                                }
-                            }
-                            arguments = Some(map);
-                        }
-                        match mcp::get_prompt(
-                            &entry,
-                            prompt_name.clone(),
-                            arguments,
-                            &tokio_util::sync::CancellationToken::new(),
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                // Render the prompt messages as a single user turn, same shape
-                                // as the `mcp_prompt_get` tool output.
-                                let mut body = String::new();
-                                for message in &result.messages {
-                                    let role = match message.role {
-                                        rmcp::model::Role::User => "user",
-                                        rmcp::model::Role::Assistant => "assistant",
-                                    };
-                                    if let rmcp::model::ContentBlock::Text(text) = &message.content
-                                    {
-                                        body.push_str(&format!("{}: {}\n", role, text.text));
-                                    }
-                                }
-                                let user_input = body.trim().to_string();
-                                if user_input.is_empty() {
-                                    // Every other exit from this arm prints; a server whose
-                                    // prompt renders to nothing would otherwise return the user
-                                    // straight to a fresh prompt, which reads as "the command
-                                    // did nothing" rather than "the prompt was empty".
-                                    eprintln!(
-                                        "'{}:{}' rendered an empty prompt; nothing to send.",
-                                        server, prompt_name
-                                    );
-                                } else {
-                                    match run_turn_interruptible(
-                                        &agent,
-                                        &mut session_id,
-                                        &mut messages,
-                                        user_input,
-                                        agent::PromptRetention::Keep,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {}
-                                        Err(error::MekaError::Interrupted) => {
-                                            with_console(&console, |console| {
-                                                console.annotation("interrupted")
-                                            });
-                                        }
-                                        Err(error) => {
-                                            with_console(&console, |console| console.error(&error))
-                                        }
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                with_console(&console, |console| console.error(&error));
-                            }
-                        }
-                    }
-                    repl::SlashCommand::MemoryList => {
-                        if let Err(error) = memory::cli::run_list(
-                            &session_manager.memory_store(true),
-                            memory::cli::ListDetail::TableOnly,
-                        )
-                        .await
-                        {
-                            with_console(&console, |console| console.error(&error));
-                        }
-                    }
-                    repl::SlashCommand::MemoryShow { name } => {
-                        if let Err(error) =
-                            memory::cli::run_show(&session_manager.memory_store(true), &name).await
-                        {
-                            with_console(&console, |console| console.error(&error));
-                        }
-                    }
-                    // Scoped to the session in the REPL, unlike `meka schedule list`, which has no
-                    // conversation to be "this one" and so shows every session's jobs.
-                    repl::SlashCommand::ScheduleList => match session_id {
-                        Some(id) => {
-                            if let Err(error) = crate::schedule::cli::run_list_for_session(
-                                &session_manager,
-                                id,
-                                &config.schedule,
-                            )
-                            .await
-                            {
-                                with_console(&console, |console| console.error(&error));
-                            }
-                        }
-                        None => eprintln!("No active session yet."),
-                    },
-                    repl::SlashCommand::ScheduleCancel { id } => match session_id {
-                        Some(session) => {
-                            match session_manager
-                                .schedule_store()
-                                .cancel_scheduled_job(session, &id)
-                                .await
-                            {
-                                Ok(Some(cancelled)) => {
-                                    eprintln!(
-                                        "Cancelled job {}.",
-                                        &cancelled[..8.min(cancelled.len())]
-                                    );
-                                }
-                                Ok(None) => {
-                                    eprintln!("No scheduled job matching '{}'.", id);
-                                }
-                                Err(error) => {
-                                    with_console(&console, |console| console.error(&error))
-                                }
-                            }
-                        }
-                        None => eprintln!("No active session yet."),
-                    },
-                    repl::SlashCommand::TaskList => match session_id {
-                        Some(id) => {
-                            if let Err(error) =
-                                crate::background::cli::run_list_for_session(&session_manager, id)
-                                    .await
-                            {
-                                with_console(&console, |console| console.error(&error));
-                            }
-                        }
-                        None => eprintln!("No active session yet."),
-                    },
-                    repl::SlashCommand::TaskCancel { id } => match session_id {
-                        Some(session) => {
-                            // Recorded first, then signalled: `finish_background_task` only
-                            // overwrites a `running` row, so a task finishing in the same instant
-                            // cannot report success after the user was told it stopped.
-                            match crate::background::cli::cancel(
-                                &session_manager,
-                                session,
-                                id.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok(cancelled) if cancelled.is_empty() => {
-                                    eprintln!("No running background tasks.")
-                                }
-                                Ok(cancelled) => {
-                                    for task_id in &cancelled {
-                                        agent.background_tasks().cancel(task_id).await;
-                                    }
-                                    eprintln!("Cancelling {} background task(s).", cancelled.len());
-                                }
-                                Err(error) => {
-                                    with_console(&console, |console| console.error(&error))
-                                }
-                            }
-                        }
-                        None => eprintln!("No active session yet."),
-                    },
-                    repl::SlashCommand::SkillList => {
-                        if let Err(error) =
-                            skills::cli::run_list(&config.skill_roots(), false).await
-                        {
-                            with_console(&console, |console| console.error(&error));
-                        }
-                    }
-                    repl::SlashCommand::SkillInvoke { name, extra } => 'invoke: {
-                        // Labeled block so the early-exit error paths can `break 'invoke` out of
-                        // the arm body without skipping the `AgentToReplEvent::Done` send below;
-                        // `continue` would short-circuit the outer `while let`, leaving the REPL
-                        // stuck in `wait_for_agent` and never drawing the next prompt.
-                        let installed = agent.skills().current().await;
-                        let Some(skill) = installed.find(&name) else {
-                            // Prose, not `{:?}` on a `Vec<&str>`. This is user-facing output, and
-                            // the debug rendering printed `["a", "b"]` -- quotes, brackets and all
-                            // -- for a list a person is meant to read and pick from.
-                            let message = match installed.skip_reason(&name) {
-                                // The same distinction `skill_read` draws for the model, in the
-                                // same words: a file that is there and unreadable is not a missing
-                                // skill.
-                                Some(_) => installed.unavailable(&name),
-                                None if installed.skills.is_empty() => {
-                                    format!("unknown skill '{}'; no skills are installed", name)
-                                }
-                                None => format!(
-                                    "unknown skill '{}'; available: {}",
-                                    name,
-                                    installed
-                                        .skills
-                                        .iter()
-                                        .map(|s| s.name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ),
-                            };
-                            with_console(&console, |console| console.error(&message));
-                            break 'invoke;
-                        };
-                        let body = match skills::load_skill_body(skill).await {
-                            Ok(body) => body,
-                            Err(error) => {
-                                with_console(&console, |console| {
-                                    console.error(&format!(
-                                        "failed to load skill '{}': {}",
-                                        name, error
-                                    ))
-                                });
-                                break 'invoke;
-                            }
-                        };
-                        // Prepend the user's free-form directive to the skill body when present.
-                        // The blank-line separator gives the model a visual cue that the first
-                        // paragraph is the user's "do this skill, but with this twist" and the rest
-                        // is the skill's static body.
-                        let body = if extra.is_empty() {
-                            body
-                        } else {
-                            format!("{}\n\n{}", extra, body)
-                        };
-                        match run_turn_interruptible(
-                            &agent,
-                            &mut session_id,
-                            &mut messages,
-                            body,
-                            agent::PromptRetention::Keep,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(error::MekaError::Interrupted) => {
-                                with_console(&console, |console| console.annotation("interrupted"));
-                            }
-                            Err(error) => with_console(&console, |console| console.error(&error)),
-                        }
-                    }
-                    repl::SlashCommand::Status => {
-                        let snap = agent.session_stats_snapshot();
-                        let (context_tokens, context_window) = agent.context_usage();
-                        let effort = agent.resolved_effort();
-                        // This session's profile, not the process default's. Reading `config` here
-                        // reported the default profile's model and backend beside a window and an
-                        // effort that came from the session's, so `/status` and `/provider`
-                        // contradicted each other on any resume onto a non-default profile.
-                        let binding = agent.provider_binding().clone();
-                        let settings = providers.settings(&binding);
-                        render::render_session_status(
-                            &snap,
-                            &render::ModelStatus {
-                                model: settings
-                                    .as_ref()
-                                    .ok()
-                                    .and_then(|settings| settings.model.as_deref()),
-                                profile: Some(binding.as_str()),
-                                backend: settings
-                                    .as_ref()
-                                    .ok()
-                                    .map(|settings| settings.backend.as_str()),
-                                effort: effort.as_deref(),
-                                thinking: settings
-                                    .as_ref()
-                                    .map(|settings| settings.thinking)
-                                    .unwrap_or_default(),
-                            },
-                            messages.len(),
-                            context_tokens,
-                            context_window,
-                        );
-                    }
-                    repl::SlashCommand::Usage => match agent.fetch_usage().await {
-                        Ok(Some(usage)) => render::render_account_usage(&usage),
-                        Ok(None) => with_console(&console, |console| {
-                            console.hint("Account usage isn't available for this provider.")
-                        }),
-                        Err(error) => with_console(&console, |console| console.error(&error)),
-                    },
-                    repl::SlashCommand::History(limit) => {
-                        let materialised = messages.as_slice();
-                        let slice = match limit {
-                            Some(n) => render::last_n_turns(materialised, n),
-                            None => materialised,
-                        };
-                        // Say so rather than printing nothing, like every other list command
-                        // (`/tasks`, `/memory`, `/skill`). Silence here would be ambiguous between
-                        // "no history" and "the command did not run", and it would leave the
-                        // `[display]` blank lines bracketing an empty region. `/history 0` asks
-                        // for nothing and gets the neutral wording: there may well be a
-                        // conversation, it just wasn't what was asked for.
-                        if !render::render_message_history(slice, &history_render_options(&config))
-                        {
-                            if materialised.is_empty() {
-                                eprintln!("No conversation history yet.");
-                            } else {
-                                eprintln!("Nothing to show.");
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                if agent_event_sender
-                    .send(repl::AgentToReplEvent::Done)
-                    .is_err()
-                {
+                // The dispatcher moved to `repl::host_commands`, exhaustive over `SlashCommand`.
+                // It used to be 553 lines here ending in `_ => {}`, which is how a forwarded
+                // command could arrive, match nothing, and still get its episode brackets.
+                let after =
+                    repl::host_commands::answer(command, repl::host_commands::HostCommandContext {
+                        agent: &agent,
+                        agent_event_sender: &agent_event_sender,
+                        config: &config,
+                        console: &console,
+                        mcp_manager: &mcp_manager,
+                        messages: &mut messages,
+                        providers: &providers,
+                        session_id: &mut session_id,
+                        session_lock: &session_lock,
+                        session_manager: &session_manager,
+                        token_store: &token_store,
+                    })
+                    .await;
+                if matches!(after, repl::host_commands::AfterCommand::Leave) {
                     break;
                 }
             }
@@ -3623,6 +3025,15 @@ async fn resolve_session_resume(
         return Ok(fresh());
     };
 
+    // Before the lock, the repin and the permission write, which is the whole reason it is here
+    // rather than only at the two call sites below. Both hosts used to refuse *after* this
+    // function returned, which covered `--provider` -- computed here, committed there -- and
+    // missed `--permission`, which this function commits itself a few lines down. A run that
+    // declines to touch a session was rewriting its recorded level on the way to saying so, and
+    // that value is what `session list --include-children`, `GET /v1/sessions/{id}` and
+    // `session export` all report the worker as having run at.
+    refuse_a_spawned_session(session_manager, Some(id)).await?;
+
     let lock = session_manager.lock_session(id)?;
     // `--provider` on a resume repins the session rather than applying for this run alone. A
     // per-run override would leave the row disagreeing with the conversation it describes, and the
@@ -3792,7 +3203,7 @@ async fn apply_session_repin(
     session_id: uuid::Uuid,
     binding: String,
 ) -> anyhow::Result<()> {
-    let resolved = resolved_binding(providers, binding).await?;
+    let resolved = provider::resolved_binding(providers, binding).await?;
     if !session_manager
         .set_recorded_provider(session_id, &resolved.binding)
         .await?
@@ -3916,6 +3327,156 @@ mod tests {
         .expect("an in-memory store opens")
     }
 
+    /// The Ctrl+C ladder, which nothing else can reach.
+    ///
+    /// `install_interrupt_handler` is a spawned listener on `tokio::signal::ctrl_c()` ending in
+    /// `std::process::exit(130)`, so no test drives it; the four mutants that survived the sweep
+    /// all lived in these two decisions. Both are behaviour: collapsing the second press into the
+    /// third makes Ctrl+C Ctrl+C kill the process instead of the background tasks, which is the
+    /// unrecoverable outcome the ladder exists to put one more keystroke in front of.
+    #[test]
+    fn the_interrupt_ladder_escalates_one_press_at_a_time() {
+        assert_eq!(
+            escalation_for(1),
+            Escalation::CancelTurn,
+            "the first press is the shell's contract: the foreground job, and nothing else"
+        );
+        assert_eq!(
+            escalation_for(2),
+            Escalation::CancelBackgroundTasks,
+            "the second stops the background work, and is the rung whose absence would make the \
+             second press fatal"
+        );
+        for press in [3, 4, 99] {
+            assert_eq!(
+                escalation_for(press),
+                Escalation::Leave,
+                "press {press} is past the ladder and leaves"
+            );
+        }
+        // Zero is unreachable -- the counter is incremented before this is asked -- so what matters
+        // is that it does not land on a rung, not which one it picks.
+        assert_eq!(escalation_for(0), Escalation::Leave);
+    }
+
+    /// Nothing is announced when nothing was stopped, and the plural agrees with the count.
+    #[test]
+    fn the_background_cancellation_notice_counts_what_it_stopped() {
+        assert_eq!(
+            background_cancellation_notice(0),
+            None,
+            "a second press with nothing running must not claim to have stopped anything"
+        );
+        assert_eq!(
+            background_cancellation_notice(1).as_deref(),
+            Some("stopping 1 background task")
+        );
+        assert_eq!(
+            background_cancellation_notice(4).as_deref(),
+            Some("stopping 4 background tasks")
+        );
+    }
+
+    /// Both arms, against real rows rather than a fabricated `parent_id`.
+    ///
+    /// The refusal is what keeps a worker's spawn terms meaningful, so a predicate that answered
+    /// wrongly in either direction is serious in both directions: admitting a worker reopens the
+    /// escalation, and refusing a top-level session would break every host at once.
+    ///
+    /// `None` is asserted too, because that is what every fresh session passes and a check that
+    /// tried to read a row for it would refuse the case it exists to allow.
+    #[tokio::test]
+    async fn a_session_another_one_spawned_cannot_be_built_as_a_plain_agent() {
+        let manager = store().await;
+        let parent = manager
+            .create_session(None, "profile")
+            .await
+            .expect("a top-level session");
+        let (worker, _lock) = manager
+            .create_child_session(parent, None, None, "profile".to_string())
+            .await
+            .expect("a worker of that session");
+
+        refuse_a_spawned_session(&manager, None)
+            .await
+            .expect("a session that does not exist yet has nothing to refuse");
+        refuse_a_spawned_session(&manager, Some(parent))
+            .await
+            .expect("a top-level session is the ordinary case and must be admitted");
+
+        let error = refuse_a_spawned_session(&manager, Some(worker))
+            .await
+            .expect_err("a session with a parent cannot be built as a plain agent");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::error::MekaError>(),
+                Some(crate::error::MekaError::SessionNotDrivable(_))
+            ),
+            "the refusal has to be the variant the HTTP layer answers 422 for: {error}"
+        );
+        // Both ids and the way through, because a client handed a worker's id may not know what
+        // spawned it, and "no" without a remedy sends it looking for a bug in meka.
+        let text = error.to_string();
+        assert!(
+            text.contains(&worker.to_string())
+                && text.contains(&parent.to_string())
+                && text.contains("agent_followup"),
+            "the refusal must name the worker, its parent, and the door that can: {text}"
+        );
+    }
+
+    /// A worker whose parent did not survive an import is still a worker.
+    ///
+    /// `session export` on a worker alone writes a `parent_id` pointing outside the archive, and
+    /// `import_sessions` resolves an unknown parent to `NULL` while copying `subagent_spec_json`
+    /// verbatim. Keying the refusal on the parent alone therefore left export-then-import as a
+    /// two-command promotion of a worker into a drivable top-level session -- the same laundering
+    /// `fork_session` was fixed for, one door over, and reproducible with a real shell.
+    ///
+    /// The spec is the fact worth refusing on: a row holding the terms another session spawned it
+    /// under is a sub-agent's conversation whether or not the link survived.
+    #[tokio::test]
+    async fn spawn_terms_without_a_parent_are_still_a_sub_agent() {
+        let manager = store().await;
+        // Written through the real importer, because that is the only door that produces this
+        // shape: `plan_import` resolves a parent outside the archive to `None` and carries
+        // `subagent_spec_json` regardless.
+        let orphaned = uuid::Uuid::new_v4();
+        manager
+            .import_sessions(vec![crate::session::ImportSessionRecord {
+                new_id: orphaned,
+                new_parent_id: None,
+                created_at: "2026-08-31T00:00:00Z".to_string(),
+                cwd: None,
+                permission: None,
+                capabilities_json: None,
+                additional_roots: Vec::new(),
+                subagent_spec_json: Some("{\"tools\":[]}".to_string()),
+                provider: "profile".to_string(),
+                stats: Default::default(),
+                events: Vec::new(),
+                tool_outputs: Vec::new(),
+            }])
+            .await
+            .expect("the archive a lone worker exports to");
+
+        let error = refuse_a_spawned_session(&manager, Some(orphaned))
+            .await
+            .expect_err("spawn terms with no parent are what an imported worker looks like");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::error::MekaError>(),
+                Some(crate::error::MekaError::SessionNotDrivable(_))
+            ),
+            "the same refusal the parented case gets: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains(&orphaned.to_string()) && !text.contains("agent_followup"),
+            "there is no parent to point at, so it must not name a door that is not there: {text}"
+        );
+    }
+
     /// `/cd` reaches the row, which is what makes the recorded directory mean "where the session
     /// is" rather than "where it was created". Nothing else covers this: the REPL loop that sends
     /// the event needs a terminal, so a test cannot drive `/cd` itself.
@@ -4021,7 +3582,7 @@ mod tests {
             .await
             .expect("create");
 
-        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), Some(id))
+        let resolved = provider::resolve_session_provider(&manager, Ok("claudeprof"), Some(id))
             .await
             .expect("resolves");
 
@@ -4033,7 +3594,7 @@ mod tests {
     async fn a_session_that_does_not_exist_yet_takes_the_default() {
         let manager = store().await;
 
-        let resolved = resolve_session_provider(&manager, Ok("claudeprof"), None)
+        let resolved = provider::resolve_session_provider(&manager, Ok("claudeprof"), None)
             .await
             .expect("resolves");
 
@@ -4046,7 +3607,7 @@ mod tests {
     async fn no_configured_profile_is_an_error_rather_than_an_empty_one() {
         let manager = store().await;
 
-        let error = resolve_session_provider(
+        let error = provider::resolve_session_provider(
             &manager,
             Err("no provider profiles configured. Run `meka provider add <name>`."),
             None,
@@ -4070,7 +3631,7 @@ mod tests {
                          `meka provider use <name>` to pick a default, or pass `--provider <name>`.";
 
         // `None` session id: `-c` on a store with nothing to resume lands here.
-        let error = resolve_session_provider(&manager, Err(ambiguous), None)
+        let error = provider::resolve_session_provider(&manager, Err(ambiguous), None)
             .await
             .expect_err("no default to fall back to");
 

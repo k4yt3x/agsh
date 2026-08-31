@@ -541,7 +541,7 @@ pub struct ForkSessionBody {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or the source is a sub-agent's conversation, whose copy is another sub-agent and so has no live session to hand back (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -569,6 +569,50 @@ pub async fn fork_session(
     };
     if let Some(path) = body.cwd.as_deref() {
         validate_cwd(path)?;
+    }
+
+    // Before the copy, not after it. A fork of a sub-agent is a sibling under the same parent
+    // (`SessionManager::fork_session`), so the copy is a worker too and `ensure_session_loaded`
+    // below refuses to build it -- correctly, but far too late to say anything useful: the caller
+    // would get a refusal naming an id it has never seen, for a row this handler had already
+    // rolled back. Answering here names the id the caller actually sent.
+    //
+    // The store still copies the columns; what this door declines is the part of its own contract
+    // it cannot honour, which is handing back a live session. `meka session fork` takes no runtime
+    // and so still makes the copy.
+    if let Some(terms) = state
+        .shared
+        .session_manager
+        .spawn_terms(id)
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to read session", error))?
+    {
+        let detail = match terms.parent {
+            Some(parent) => format!(
+                "session '{id}' was spawned by session '{parent}', and a copy of it is a \
+                 sub-agent under that same parent rather than a session of its own, so this \
+                 endpoint has no live session to return. Read it with \
+                 `GET /v1/sessions/{id}/messages`, or continue the conversation with \
+                 `agent_followup` from '{parent}'."
+            ),
+            // `spawn_terms` rather than the parent link, so this names the id the caller sent even
+            // for an imported worker. Keyed on the link alone, that case fell through, the copy
+            // was made, `ensure_session_loaded` refused *it*, and the rollback ran -- so the
+            // caller got a 422 naming an id it had never seen, for a row that no longer existed.
+            // That is verbatim the failure this up-front guard exists to prevent.
+            None => format!(
+                "session '{id}' carries the terms another session spawned it under, so it is a \
+                 sub-agent's conversation and a copy of it is another one. Its parent is not in \
+                 this store, so there is nothing here that can drive either. Read it with \
+                 `GET /v1/sessions/{id}/messages`."
+            ),
+        };
+        return Err(ProblemDetail::new(
+            ErrorKind::SessionNotDrivable,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            detail,
+        )
+        .with("session_id", id.to_string()));
     }
 
     // Deliberately the *unlocked* fork, unlike the REPL's and ACP's. `ensure_session_loaded` below
@@ -664,7 +708,10 @@ pub async fn fork_session(
             capabilities: entry.capabilities,
             turn_in_flight: false,
             // Read back rather than assumed: forking a sub-agent session keeps it under the same
-            // parent, so the copy is a sibling of the original, not a new root.
+            // parent, so the copy is a sibling of the original, not a new root. That sentence was
+            // here before `fork_session` did it -- the copy took a NULL parent, so this reported
+            // one thing and the store held another, and the difference was a `sessions:w` holder's
+            // way around `crate::refuse_a_spawned_session`.
             parent_id: forked_info.and_then(|info| info.parent_id),
         }),
     ))
@@ -914,7 +961,7 @@ async fn repin_dormant_session(
             .with("session_id", id.to_string())
         })?;
     require_configured_profile(state, profile)?;
-    let resolved = crate::resolved_binding(
+    let resolved = crate::provider::resolved_binding(
         &state.shared.providers,
         profile.to_string(),
     )
@@ -1004,7 +1051,7 @@ async fn repin_dormant_session(
         (status = 404, description = "Session not found", body = ProblemDetail),
         (status = 409, description = "Turn in flight; cancel first", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or the id names a sub-agent's conversation, whose permission, cwd and profile come from the terms its parent spawned it with (`/errors/session-not-drivable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -1024,6 +1071,20 @@ pub async fn patch_session(
             "invalid session patch request body",
         )
     })?;
+
+    // Ahead of the dormant fast path below, which is the one branch of this handler that writes a
+    // session row without ever building an agent -- so it is the one branch
+    // `crate::refuse_a_spawned_session` cannot answer for from inside the builders. A worker is
+    // almost never resident (`build_subagent` runs it under its parent's runtime rather than
+    // registering it here), so that branch was where every `PATCH` aimed at a worker actually
+    // landed: it wrote `sessions.provider` on a sub-agent's row and answered `200`, while the same
+    // request against a *resident* session was refused. The write did not even survive -- the next
+    // `agent_followup` records the profile it really ran on, which is the parent's -- so what a
+    // `sessions:w` holder got was a row that disagreed with the worker until something quietly put
+    // it back.
+    crate::refuse_a_spawned_session(&state.shared.session_manager, Some(id))
+        .await
+        .map_err(|error| agent_build_problem(id, "failed to read session", error))?;
 
     // A body that names only a provider is the documented way to move a session whose recorded
     // profile has left `config.toml`, and reviving it to apply the change is the one thing that
@@ -1099,7 +1160,7 @@ pub async fn patch_session(
             // The profile as configured. A `PATCH` naming a provider moves the session to that
             // bundle entire, which is the only thing naming a profile can mean.
             Some(
-                crate::resolved_binding(
+                crate::provider::resolved_binding(
                     &state.shared.providers,
                     name.to_string(),
                 )
@@ -1409,101 +1470,27 @@ pub async fn delete_session(
 
 #[cfg(test)]
 mod tests {
-    /// The dormant repin must hold the reconstruction lock and re-check residency under it.
+    /// The dormant repin must hold both locks; see
+    /// [`crate::server::reattach::assert_dormant_fast_path_is_serialised`] for why this is asserted
+    /// against the source.
     ///
-    /// Asserted against the source rather than at runtime, for the same reason
-    /// `session::migrations`' own rules are: the invariant is not reachable from a test. Proving it
-    /// needs a reconstruction to land inside the five awaits this function makes, and nothing over
-    /// HTTP can be timed that precisely; proving it in-process needs a whole `ServerState`, which
-    /// needs a `ResolvedConfig`, which is only constructible by pointing a process-global env var
-    /// at a config file. `tests/serve.rs`'s
-    /// `a_dormant_repin_and_the_agent_rebuilt_after_it_agree` covers what is reachable -- that the
-    /// PATCH takes the dormant path at all, and that the row and the agent rebuilt from it agree
-    /// afterwards -- but not the serialisation, which only shows up under a race it cannot create.
+    /// What it defends here: the function decides what to write on the strength of the session
+    /// *not* being resident, then awaits five times before writing. Without the reconstruction
+    /// lock, any turn, scheduler fire, compaction or rewind arriving meanwhile rebuilds the agent
+    /// from the *old* profile; the row then moves and the session runs, bills and gauges the
+    /// profile it had left until it is evicted -- hours, at the default idle timeout.
     ///
-    /// So this is what stands between a future edit and a silent regression. What it defends: the
-    /// function decides what to write on the strength of the session *not* being resident, then
-    /// awaits five times before writing. Without the lock, any turn, scheduler fire, compaction or
-    /// rewind arriving meanwhile rebuilds the agent from the *old* profile; the row then moves and
-    /// the session runs, bills and gauges the profile it had left until it is evicted -- hours, at
-    /// the default idle timeout.
+    /// `tests/serve.rs`'s `a_dormant_repin_and_the_agent_rebuilt_after_it_agree` covers what is
+    /// reachable -- that the PATCH takes the dormant path at all, and that the row and the agent
+    /// rebuilt from it agree afterwards -- but not the serialisation, which only shows up under a
+    /// race it cannot create.
     #[test]
     fn the_dormant_repin_serialises_against_reconstruction() {
-        let source = include_str!("sessions.rs");
-        let body = source
-            .split("async fn repin_dormant_session(")
-            .nth(1)
-            .expect("the function this test is about")
-            .split("\n/// ")
-            .next()
-            .expect("splitting always yields a first part");
-        assert!(
-            body.contains("session_info(id)"),
-            "the scanned region no longer covers the function body, so this test proves nothing"
-        );
-        let lock = body.find("lock_session_reconstruction(id)").expect(
-            "the repin must hold the reconstruction lock, or the residency it decided on can \
-                 stop being true while it writes",
-        );
-        let recheck = body
-            .find("state.sessions.read().await.contains_key(&id)")
-            .expect(
-                "and it must re-check residency under that lock, returning `Ok(None)` so the \
-                 caller takes the resident path and the agent moves with the row",
-            );
-        let write = body.find("update_session_metadata_atomic").expect(
-            "the write this whole arrangement exists to protect is no longer in this function",
-        );
-        assert!(
-            lock < recheck && recheck < write,
-            "the lock must be taken first, the residency re-checked under it, and only then the \
-             row written; found lock@{lock} recheck@{recheck} write@{write}"
-        );
-        // The re-check has to *act*, not merely look. Replacing its `return Ok(None)` with a log
-        // line leaves all three positions intact and reinstates the race, which is how this test
-        // read as coverage while proving nothing; verified green with exactly that edit.
-        assert!(
-            body.get(recheck..write)
-                .is_some_and(|arm| arm.contains("return Ok(None)")),
-            "the residency re-check must hand the caller back to the resident path, not just \
-             observe that the session came back"
-        );
-        // Presence is not enough: `let _ = lock_session_reconstruction(id).await` compiles, reads
-        // as a lock, and drops the guard at the end of that very statement, so every await after
-        // it runs unprotected. That one-character edit kept this test green while reinstating the
-        // whole race, which is the only way this file can regress silently.
-        assert!(
-            body.contains("let _reconstruction ="),
-            "the guard must be bound to a name, not `let _ =`, which drops it immediately and \
-             leaves the five awaits below it unserialised"
-        );
-        assert!(
-            !body.contains("drop(_reconstruction"),
-            "and it must live to the end of the function; dropping it early is the same defect as \
-             never binding it"
-        );
-
-        // The reconstruction lock is per process, so it says nothing about a second `meka serve`
-        // on the same store. Reproduced over HTTP before this: server B answered `200` for a
-        // session server A was running, the row moved, and A went on building requests for the old
-        // profile while both servers' `GET /v1/sessions` reported the new one. Every other writer
-        // of `sessions.provider` holds the session lock; this is the one that did not.
-        let session = body
-            .find("lock_session(id)")
-            .expect("the repin must own the session it is repinning, not just the process's map");
-        assert!(
-            session < write,
-            "the session lock must be held before the row moves; found session@{session} \
-             write@{write}"
-        );
-        assert!(
-            body.contains("let _session ="),
-            "and bound to a name: `let _ =` drops the guard at the end of its own statement, which \
-             is the same silent regression as never taking it"
-        );
-        assert!(
-            !body.contains("drop(_session"),
-            "and it must live to the end of the function, for the same reason"
+        crate::server::reattach::assert_dormant_fast_path_is_serialised(
+            include_str!("sessions.rs"),
+            "async fn repin_dormant_session(",
+            "session_info(id)",
+            "update_session_metadata_atomic",
         );
     }
 }

@@ -53,7 +53,7 @@ pub enum PermissionDecision {
         (status = 403, description = "Insufficient scope", body = ProblemDetail),
         (status = 404, description = "Session or request not found / already resolved", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
-        (status = 422, description = "Invalid body", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))

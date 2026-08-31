@@ -225,7 +225,9 @@ The bound stops a *new* attempt starting rather than capping the total, so the w
 
 Use it before trying a direction you might want to back out of, or before `/compact` if you'd rather keep the uncompacted conversation around. To go back, exit and resume the original with `meka -r <old-id>`.
 
-The copy is a fully independent session with no link back to its source. See [Forking a Session](./sessions.md#forking-a-session) for exactly what it carries.
+The copy is a fully independent session with no link back to its source. (`/fork` only ever runs
+against the session you are in, which is never a sub-agent, so the sub-agent case below cannot arise
+here.) See [Forking a Session](./sessions.md#forking-a-session) for exactly what it carries.
 
 ## Shell Escape
 

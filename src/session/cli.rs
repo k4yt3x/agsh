@@ -210,7 +210,28 @@ pub(crate) async fn import_session(
     // Human-facing confirmation and resume guidance go to stderr; the bare root ID stays on stdout
     // so `id=$(meka session import ...)` and piping keep working. Plain (unstyled) to match the
     // other one-shot CLI messages; `render_hint`'s dark-grey styling is for the REPL.
-    if count > 1 {
+    //
+    // The resume line is conditional for the reason `meka session fork`'s is: exporting a worker
+    // on its own and importing it here produces a row that carries spawn terms with no parent, and
+    // `meka -r` refuses exactly that. Printing it unconditionally handed the user a command this
+    // release had just made illegal, one line after telling them the import worked.
+    let spawned = match session_manager.spawn_terms(root_new_id).await {
+        Ok(terms) => terms.is_some(),
+        Err(error) => {
+            tracing::debug!(
+                "could not read the imported row to choose a hint, assuming top-level: {}",
+                error
+            );
+            false
+        }
+    };
+    if spawned {
+        eprintln!(
+            "Imported a sub-agent's conversation. It carries the terms the session that spawned \
+             it set, and that session is not in this archive, so `meka -r` will refuse it. It is \
+             readable with `meka session export` and `meka session list --include-children`."
+        );
+    } else if count > 1 {
         eprintln!(
             "Imported session with {} sub-agent(s). Resume with: meka -r {}",
             count - 1,
@@ -319,7 +340,37 @@ pub(crate) async fn fork_session_command(
         .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
 
     tracing::info!("forked session {} into {}", session_id, forked.id);
-    eprintln!("Forked session. Resume with: meka -r {}", forked.id);
+    // A fork of a sub-agent is a sibling under the same parent, so the copy is a worker too and
+    // `meka -r` refuses it. Printing the resume line anyway would hand the user a command that
+    // answers with a refusal -- the copy is real and readable, but continuing it is the parent's
+    // job, and that is what the hint has to say.
+    // A read failure decides only which hint is printed, so it must not fail a fork that has
+    // already landed -- but it must not be silent either: the fallback prints `meka -r`, which is
+    // the wrong advice for a copy of a worker, so a reader of the logs needs to know the question
+    // went unanswered.
+    let spawned = match session_manager.spawn_terms(forked.id).await {
+        Ok(terms) => terms,
+        Err(error) => {
+            tracing::debug!(
+                "could not read the fork's row to choose a hint, assuming top-level: {}",
+                error
+            );
+            None
+        }
+    };
+    match spawned.map(|terms| terms.parent) {
+        Some(Some(parent)) => eprintln!(
+            "Forked session. It is a sub-agent of {parent}, like the session it copies, so \
+             continue it with `agent_followup` from {parent} rather than `meka -r`."
+        ),
+        // A copy of a worker whose parent is not in this store. Still a worker, still not
+        // resumable, and with no id to name; saying so beats printing `meka -r`.
+        Some(None) => eprintln!(
+            "Forked session. It carries the terms another session spawned the original under, and \
+             that session is not in this store, so `meka -r` will refuse it."
+        ),
+        None => eprintln!("Forked session. Resume with: meka -r {}", forked.id),
+    }
     println!("{}", forked.id);
     Ok(())
 }

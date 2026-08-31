@@ -125,6 +125,30 @@ pub struct ImportSessionRecord {
     pub tool_outputs: Vec<(String, String)>,
 }
 
+/// A row's evidence that another session spawned it. See [`SessionManager::spawn_terms`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnTerms {
+    /// The session that spawned it, when that row is in this store.
+    ///
+    /// `None` for a worker whose parent link did not survive an export and re-import. The
+    /// conversation is still a worker's, which is what makes this an `Option` inside a type that
+    /// only exists when the answer is yes, rather than the answer itself.
+    pub parent: Option<Uuid>,
+}
+
+/// "Is this row a sub-agent's conversation?", for a `WHERE` clause.
+///
+/// The SQL half of [`SessionManager::spawn_terms`]; see that function for why both columns are
+/// read. `qualifier` is the table alias with its dot (`"s."`) or empty for an unaliased query.
+/// Interpolated rather than parameterised because it names columns, not values, and takes the
+/// alias as an argument rather than being a `const` so a joined query cannot silently pick the
+/// wrong table's columns.
+pub fn spawned_session_sql(qualifier: &str) -> String {
+    format!(
+        "({qualifier}parent_session_id IS NOT NULL OR {qualifier}subagent_spec_json IS NOT NULL)"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: Uuid,
@@ -1042,12 +1066,18 @@ impl SessionManager {
                 } else {
                     None
                 };
-                // Here rather than inside the helper, so the `?` above is what guarantees a copy is
-                // in place before an older one is removed. See `prune_older_backups`.
+                migrations::apply(connection, plan, &context)?;
+                // After `apply`, never before. Two orderings have to hold at once and only this one
+                // gives both: a copy must exist before an older one is removed, which the `?` on
+                // `back_up_before_migrating` above guarantees, *and* the older copy must survive a
+                // migration that fails. `apply` rolls its own transaction back and reports "The
+                // store is unchanged", but deleting a file is not part of that transaction, so
+                // pruning first made a failed upgrade destroy the copy the user is told to fall
+                // back on -- and every retry took another one. Once `apply` has returned `Ok`, the
+                // copies below it are genuinely superseded. See `prune_older_backups`.
                 if let Some(target) = &backup {
                     prune_older_backups(&database_path, target);
                 }
-                migrations::apply(connection, plan, &context)?;
                 // Reconciliation rather than creation, and outside the ledger for that reason: it
                 // asks whether this database's FTS triggers are the ones this build requires and
                 // makes them so, which is as true of a store created a minute ago as of one carried
@@ -1182,9 +1212,17 @@ impl SessionManager {
                 // own advice can act on. A sub-agent row copies its parent's binding, so counting
                 // children reported a number many times what the user could see, about rows that
                 // `meka -r <id> --provider <name>` is not for.
+                //
+                // [`spawned_session_sql`], so "top-level" means here what it means in that listing.
+                // An imported worker has no parent link, so keying on the link alone counted a row
+                // the user cannot see and cannot repin -- the same disagreement, in the one place
+                // whose whole job is to state a number the user is about to act on.
                 connection.query_row(
-                    "SELECT COUNT(*) FROM sessions
-                     WHERE provider = ?1 AND parent_session_id IS NULL",
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions
+                         WHERE provider = ?1 AND NOT {}",
+                        spawned_session_sql("")
+                    ),
                     rusqlite::params![profile],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1401,6 +1439,53 @@ impl SessionManager {
         Ok((session_id, lock))
     }
 
+    /// Whether a row is a sub-agent's conversation, and its parent when the link survived.
+    ///
+    /// The one answer to that question for every caller that needs it in Rust;
+    /// [`spawned_session_sql`] is the same rule for the callers that need it in a `WHERE` clause.
+    /// `Ok(None)` means top-level, and also means "no such row", which every caller here already
+    /// answers for separately.
+    ///
+    /// **Both columns, because either alone is wrong.** A worker normally carries a parent link and
+    /// a spec together, but `session export` on a worker alone emits a `parent_id` pointing outside
+    /// the archive and `import_sessions` resolves that to `NULL` while copying
+    /// `subagent_spec_json` faithfully. The result is a real row, produced by two documented
+    /// commands, that is a worker's conversation with no parent in this store.
+    /// [`crate::refuse_a_spawned_session`] reads it that way and refuses it -- correctly -- so
+    /// every rule *around* that refusal has to agree, or 0.44's own surfaces walk a user into it:
+    /// `meka -c` selecting an orphan it cannot then drive, `session import` printing a `meka -r`
+    /// that is already illegal, and `POST /schedule` accepting a job that fails on every fire.
+    pub async fn spawn_terms(&self, session_id: Uuid) -> Result<Option<SpawnTerms>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection
+                    .query_row(
+                        "SELECT parent_session_id, subagent_spec_json FROM sessions WHERE id = ?1",
+                        rusqlite::params![session_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to read session spawn terms: {}", error))
+            })
+            .map(|row| {
+                let (parent, spec) = row?;
+                if parent.is_none() && spec.is_none() {
+                    return None;
+                }
+                Some(SpawnTerms {
+                    parent: parent.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
+                })
+            })
+    }
+
     /// The recorded spawn terms for a sub-agent session, or `None` for a top-level session.
     pub async fn load_subagent_spec(&self, session_id: Uuid) -> Result<Option<String>> {
         self.connection
@@ -1420,7 +1505,7 @@ impl SessionManager {
             })
     }
 
-    /// Copy `source`'s conversation into a brand-new top-level session and return it, or `Ok(None)`
+    /// Copy `source`'s conversation into a new session and return it, or `Ok(None)`
     /// when `source` doesn't exist (callers map that to their own not-found shape). The whole copy
     /// is one transaction, so a failure leaves no half-built session behind.
     ///
@@ -1433,17 +1518,26 @@ impl SessionManager {
     /// - **`created_at` / `updated_at`**, both stamped to now. Retention GC deletes by `updated_at`
     ///   at every agent startup, so inheriting the source's would let a fork of an old session be
     ///   swept before its first turn.
-    /// - **`parent_session_id`**, left NULL. That column means "sub-agent parent", and
-    ///   [`Self::list_sessions`] hides rows that have one, so reusing it for fork lineage would
-    ///   make every fork invisible to `meka session list`.
     /// - **Sub-agent children.** A child links to its parent only through `parent_session_id`,
     ///   while the sub-agent's *result* already sits in the parent's own event log as a tool
     ///   result, so the copy is self-contained without them. This is the intended divergence from
     ///   [`Self::import_sessions`], which copies the tree because an archive should restore whole.
-    /// - **`subagent_spec_json`**, left NULL for the same reason as `parent_session_id`: a fork is
-    ///   top-level, and spawn terms on a session nothing spawned would describe a relationship that
-    ///   no longer exists. [`Self::import_sessions`] does carry it, because there the relationship
-    ///   is carried too.
+    ///
+    /// **`parent_session_id` and `subagent_spec_json` travel, and are the reason this is not just a
+    /// column list.** They used to be written NULL unconditionally, on the reasoning that a fork is
+    /// top-level and [`Self::list_sessions`] hides rows that have a parent. That is right for a
+    /// fork of a top-level session, where both are already NULL and copying changes nothing, and
+    /// wrong for a fork of a sub-agent: it produced a *drivable* copy of a worker's whole
+    /// conversation, with no spawn terms and therefore no `[subagents]` denials, no memory or
+    /// instruction grants, and -- since `create_child_session` writes no `permission` -- the host's
+    /// level rather than the worker's.
+    ///
+    /// That is exactly the escalation [`crate::refuse_a_spawned_session`] refuses at both agent
+    /// builders, reachable by anyone holding `sessions:w` in one extra call, so the refusal was a
+    /// boundary with a door beside it. Carrying both columns is what makes "a session's row says
+    /// whether something spawned it" survive a copy, which is the property that one check rests on.
+    /// A fork of a worker is a sibling under the same parent, continued the same way: through
+    /// `agent_followup`.
     ///
     /// Copying in SQL rather than through the export/import structs is deliberate: routing a fork
     /// through that envelope is precisely how `additional_roots` came to be silently dropped. The
@@ -1523,14 +1617,16 @@ impl SessionManager {
                 // can append an event to the source between the row copy and the message copy.
                 let rows = txn.execute(
                     "INSERT INTO sessions (
-                         id, created_at, updated_at, parent_session_id, cwd, permission,
+                         id, created_at, updated_at, parent_session_id, subagent_spec_json,
+                         cwd, permission,
                          capabilities_json, token_id, additional_roots_json, provider,
                          stat_turns,
                          stat_input_tokens, stat_output_tokens,
                          stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
                          stat_redactions, stat_redacted_images, stat_redacted_bytes
                      )
-                     SELECT ?1, ?2, ?2, NULL, COALESCE(?3, cwd), permission,
+                     SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
+                            COALESCE(?3, cwd), permission,
                             capabilities_json, ?4,
                             CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, provider,
                             stat_turns,
@@ -2195,11 +2291,29 @@ impl SessionManager {
             .map_err(|error| MekaError::Database(format!("failed to count compactions: {}", error)))
     }
 
+    /// The session `meka -c` resumes: the most recently touched one a host can actually drive.
+    ///
+    /// Top-level only, like [`Self::list_sessions`]'s default, and for a sharper reason than
+    /// tidiness. A sub-agent's row is touched by its own turns, so a worker still running when its
+    /// parent's turn ends -- which `agent_spawn`'s `background` parameter makes ordinary -- sorts
+    /// above the session the user was actually in. Picking it used to resume the worker
+    /// unrestricted; since `crate::refuse_a_spawned_session` it is refused instead, and `-c` would
+    /// dead-end on a session the user never named with no way to ask for the next one down.
+    ///
+    /// [`spawned_session_sql`] rather than `parent_session_id IS NULL`, so the filter answers the
+    /// same question the refusal does. An imported worker has no parent link and is refused all the
+    /// same, so keying on the link alone let `-c` select one and then decline it -- exactly the
+    /// dead-end above, and permanent, because nothing newer can outrank it.
     pub async fn last_session_id(&self) -> Result<Option<Uuid>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
                 let result: std::result::Result<String, _> = connection.query_row(
-                    "SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1",
+                    &format!(
+                        "SELECT id FROM sessions
+                         WHERE NOT {}
+                         ORDER BY updated_at DESC LIMIT 1",
+                        spawned_session_sql("")
+                    ),
                     [],
                     |row| row.get(0),
                 );
@@ -2301,9 +2415,15 @@ impl SessionManager {
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
+                // The shared rule, so `--include-children` covers the same rows the refusal treats
+                // as children. Keying on the parent link alone listed an imported worker among the
+                // top-level sessions and then declined to run it, with the refusal's own text
+                // telling the reader to pass `--include-children` to see a row that was already in
+                // front of them.
+                let not_spawned = format!("NOT {}", spawned_session_sql("s."));
                 let mut clauses: Vec<&str> = Vec::new();
                 if !include_children {
-                    clauses.push("s.parent_session_id IS NULL");
+                    clauses.push(&not_spawned);
                 }
                 if cwd_filter_string.is_some() {
                     clauses.push("s.cwd = :cwd");
@@ -4384,6 +4504,184 @@ mod tests {
         );
     }
 
+    /// Forking a worker gives another worker, not a laundered top-level session.
+    ///
+    /// The fork used to write `NULL` into `parent_session_id` and omit `subagent_spec_json`
+    /// entirely, so the copy read as top-level and `crate::refuse_a_spawned_session` admitted it.
+    /// That handed anyone with `sessions:w` -- or a shell, via `meka session fork` -- a drivable
+    /// copy of a worker's whole conversation with no `[subagents]` denials, no memory or
+    /// instruction grants, and the host's permission, which is the escalation the refusal exists
+    /// to stop. The refusal is a boundary only while a copy cannot cross it.
+    ///
+    /// Both arms, because carrying the columns unconditionally would be its own bug: a fork of an
+    /// ordinary session must stay top-level or `list_sessions` would hide every fork.
+    /// `-c` resumes the newest session it can actually drive, not merely the newest row.
+    ///
+    /// A sub-agent's row is touched by its own turns, so a worker still running when its parent's
+    /// turn ends -- which `agent_spawn`'s `background` parameter makes ordinary -- sorts above the
+    /// session the user was last in. Picking it used to resume the worker unrestricted; since
+    /// `crate::refuse_a_spawned_session` it would dead-end on a refusal instead, with no way to ask
+    /// for the next one down.
+    ///
+    /// The child is created second so it is unambiguously the newer row: without the filter this
+    /// returns it, which is the whole failure.
+    #[tokio::test]
+    async fn the_last_session_is_the_newest_one_a_host_can_drive() {
+        let manager = test_manager().await;
+        let parent = manager
+            .create_session(None, "profile".to_string())
+            .await
+            .expect("a top-level session");
+        let (worker, _lock) = manager
+            .create_child_session(parent, None, None, "profile".to_string())
+            .await
+            .expect("a worker, written after its parent and so the newer row");
+        assert_ne!(parent, worker);
+
+        assert_eq!(
+            manager.last_session_id().await.expect("read"),
+            Some(parent),
+            "a worker is not resumable, so offering it to `-c` is offering a dead end"
+        );
+    }
+
+    /// The rows `-c` and `session list` skip are the rows the refusal declines, not a near-miss.
+    ///
+    /// A worker exported alone and re-imported keeps `subagent_spec_json` and loses its parent
+    /// link, and `refuse_a_spawned_session` reads that row as a worker -- correctly, since nothing
+    /// else can reconstruct the tools and level it ran under. A filter keyed on the parent alone
+    /// therefore disagreed with the refusal about the same row, which is worse than either answer:
+    /// `-c` offered the orphan, printed `Continuing session:`, and then declined it, *permanently*,
+    /// because no later session can outrank a row that is always the newest thing in the store.
+    /// The list did the mirror of it, presenting the orphan as top-level while the refusal's own
+    /// text told the reader to pass `--include-children` to see it.
+    ///
+    /// Written through the connection rather than by exporting and importing, because what is
+    /// under test is the shape, not the route to it: [`SessionManager::spawn_terms`] and
+    /// [`spawned_session_sql`] have to agree about a row holding spawn terms and no parent,
+    /// however it came to exist.
+    #[tokio::test]
+    async fn an_imported_worker_is_a_worker_to_every_filter() {
+        let manager = test_manager().await;
+        let drivable = manager
+            .create_session(None, "profile".to_string())
+            .await
+            .expect("a top-level session");
+        let orphan = manager
+            .create_session(None, "profile".to_string())
+            .await
+            .expect("a second row, newer, which the import will turn into a worker");
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET subagent_spec_json = ?2 WHERE id = ?1",
+                    rusqlite::params![orphan.to_string(), "{\"tools\":[]}"],
+                )
+            })
+            .await
+            .expect("plant the spawn terms an import would copy");
+
+        assert_eq!(
+            manager
+                .spawn_terms(orphan)
+                .await
+                .expect("read")
+                .map(|terms| terms.parent),
+            Some(None),
+            "spawn terms with no parent are still spawn terms"
+        );
+        assert!(
+            manager.spawn_terms(drivable).await.expect("read").is_none(),
+            "and an ordinary session must not be caught by the same rule"
+        );
+
+        assert_eq!(
+            manager.last_session_id().await.expect("read"),
+            Some(drivable),
+            "`-c` has to skip the orphan and reach the session it can actually drive"
+        );
+
+        let (listed, _) = manager
+            .list_sessions(50, false, None, None)
+            .await
+            .expect("list");
+        let ids: Vec<Uuid> = listed.iter().map(|row| row.id).collect();
+        assert!(
+            ids.contains(&drivable) && !ids.contains(&orphan),
+            "the default listing is the drivable ones: {ids:?}"
+        );
+        let (with_children, _) = manager
+            .list_sessions(50, true, None, None)
+            .await
+            .expect("list");
+        assert!(
+            with_children.iter().any(|row| row.id == orphan),
+            "and `--include-children` is where the refusal says to look for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_of_a_worker_is_a_worker() {
+        let manager = test_manager().await;
+        let parent = manager
+            .create_session(None, "profile".to_string())
+            .await
+            .expect("a top-level session");
+        let (worker, _lock) = manager
+            .create_child_session(
+                parent,
+                None,
+                Some("{\"tools\":[]}".to_string()),
+                "profile".to_string(),
+            )
+            .await
+            .expect("a worker of that session");
+
+        let forked_worker = manager
+            .fork_session(worker, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("the worker exists");
+        let info = manager
+            .session_info(forked_worker.id)
+            .await
+            .expect("read")
+            .expect("the copy exists");
+        assert_eq!(
+            info.parent_id,
+            Some(parent),
+            "a fork of a sub-agent is a sibling under the same parent, which is what keeps it \
+             undrivable by a host"
+        );
+        assert_eq!(
+            manager
+                .load_subagent_spec(forked_worker.id)
+                .await
+                .expect("read the copy's spec"),
+            Some("{\"tools\":[]}".to_string()),
+            "and it carries the terms it was spawned under, or `agent_followup` would rebuild it \
+             as something it never was"
+        );
+
+        let forked_root = manager
+            .fork_session(parent, ForkOverrides::default())
+            .await
+            .expect("fork")
+            .expect("the parent exists");
+        assert_eq!(
+            manager
+                .session_info(forked_root.id)
+                .await
+                .expect("read")
+                .expect("the copy exists")
+                .parent_id,
+            None,
+            "a fork of an ordinary session stays top-level; inventing a parent would hide every \
+             fork from `meka session list`"
+        );
+    }
+
     #[tokio::test]
     async fn fork_of_an_unknown_session_is_none() {
         let manager = test_manager().await;
@@ -4426,7 +4724,9 @@ mod tests {
             "capabilities_json",
             "token_id",
             "additional_roots_json",
-            // Deliberately not copied by a fork; see `fork_session`'s doc comment.
+            // Copied by a fork, together with `parent_session_id`: a fork of a sub-agent is a
+            // sibling under the same parent, and a copy that dropped either would be a drivable
+            // worker with no spawn terms. See `fork_session`'s doc comment.
             "subagent_spec_json",
             "stat_turns",
             "stat_input_tokens",
@@ -4537,19 +4837,41 @@ mod tests {
             .await
             .expect("create parent");
         for _ in 0..3 {
+            // On the parent's own profile, which is what makes this test mean anything: created on
+            // a different one, `provider = ?1` excludes them by itself and the spawn filter is
+            // never consulted. It said "on the parent's profile" while doing the opposite, so
+            // deleting the filter outright left the suite green.
             let (_id, lock) = manager
-                .create_child_session(parent, None, None, "test-profile".to_string())
+                .create_child_session(parent, None, None, "work".to_string())
                 .await
                 .expect("spawn a worker");
             lock.expect("claim the worker's lock");
         }
+        // And an imported worker, which holds spawn terms and no parent link. It is the row the
+        // parent-only filter used to count, and the one a user cannot act on: `provider remove`
+        // warns how many sessions it would strand, and this is not one of them.
+        let orphan = manager
+            .create_session(None, "work".to_string())
+            .await
+            .expect("create the row an import would write");
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET subagent_spec_json = ?2 WHERE id = ?1",
+                    rusqlite::params![orphan.to_string(), "{\"tools\":[]}"],
+                )
+            })
+            .await
+            .expect("plant the spawn terms an import would copy");
+
         assert_eq!(
             manager
                 .count_sessions_on_provider("work")
                 .await
                 .expect("count"),
             1,
-            "three workers on the parent's profile are not three more sessions to move"
+            "workers on the parent's profile are not more sessions to move, however they got here"
         );
     }
 
@@ -8388,6 +8710,56 @@ mod tests {
             std::fs::read(&planted).expect("still there"),
             b"the only copy",
             "a prune that ran before the copy landed would have left the user with none"
+        );
+    }
+
+    /// A migration that fails leaves the copy it was going to supersede where it is.
+    ///
+    /// The sibling of [`nothing_is_pruned_when_no_fresh_copy_landed`], guarding the other end of
+    /// the same ordering. That one proves nothing is pruned before a copy lands; this one proves
+    /// nothing is pruned before the migration those copies exist to undo has actually committed.
+    ///
+    /// The failure driven here is the one the 0.43-to-0.44 upgrade actually hits: a `config.toml`
+    /// that will not parse leaves `sessions_name_their_provider` with a carried-forward session it
+    /// cannot name a profile for, so it refuses and rolls back. `apply` restores the store, but a
+    /// deleted file is not part of that transaction, so a prune that ran first would already have
+    /// taken the copy `upgrading.md` tells the user to fall back on -- and a retry, which is what
+    /// the guide's own instructions produce, would take the next one.
+    #[tokio::test]
+    async fn a_failed_migration_keeps_the_copy_it_would_have_superseded() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let database_path = temp_dir.path().join("meka.db");
+        {
+            let connection = rusqlite::Connection::open(&database_path).expect("open");
+            connection
+                .execute_batch(crate::session::migrations::baseline_for_test())
+                .expect("a store with work pending");
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'now', 'now')",
+                    [],
+                )
+                .expect("a session that has to be given a profile");
+        }
+        let planted = temp_dir.path().join("meka.db.v1.bak");
+        std::fs::write(&planted, b"the only copy").expect("plant");
+
+        let error = SessionManager::open(
+            Some(&database_path),
+            &crate::session::migrations::Context::on_unreadable_config(),
+        )
+        .await
+        .err()
+        .expect("a session that cannot be given a profile refuses the migration");
+        assert!(
+            error.to_string().contains("carried-forward"),
+            "the refusal should be the one this test aims at, not some other: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&planted).expect("still there"),
+            b"the only copy",
+            "a prune that ran before the migration committed would have destroyed the copy the \
+             failed upgrade tells the user to fall back on"
         );
     }
 

@@ -2074,6 +2074,17 @@ fn live_permission(
     .unwrap_or(config.host_permission)
 }
 
+/// Whether any of `due` belongs to this session and is not parked.
+///
+/// Separated from the two database reads around it so the rule can be asserted directly: a job at
+/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancellable, reported as held), so
+/// "there is a due row" and "something will run" are different questions and the watcher has to ask
+/// the second one.
+fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
+    due.iter()
+        .any(|job| job.session_id == session_id && job.attempts < MAX_CLAIM_ATTEMPTS)
+}
+
 /// Whether waking this session's prompt would actually produce work.
 ///
 /// The scheduler watcher used to raise its flag on `list_due_scheduled_jobs` alone, a pure SQL
@@ -2087,17 +2098,6 @@ fn live_permission(
 /// only way to know whether its gate passes is to run the probe, and running a side-effecting probe
 /// twice per poll to answer the same question would be worse than the interruption. The invariant
 /// is that anything this refuses, `prepare` would also have refused -- never the reverse.
-/// Whether any of `due` belongs to this session and is not parked.
-///
-/// Separated from the two database reads around it so the rule can be asserted directly: a job at
-/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancellable, reported as held), so
-/// "there is a due row" and "something will run" are different questions and the watcher has to ask
-/// the second one.
-fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
-    due.iter()
-        .any(|job| job.session_id == session_id && job.attempts < MAX_CLAIM_ATTEMPTS)
-}
-
 pub async fn wake_would_produce_work(
     session_manager: &crate::session::SessionManager,
     config: &crate::config::ResolvedScheduleConfig,

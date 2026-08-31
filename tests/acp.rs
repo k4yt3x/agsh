@@ -5340,6 +5340,148 @@ fn acp_advertises_fork_capability() {
     );
 }
 
+/// `session/fork` refuses a sub-agent's id, and says so as a caller error before copying anything.
+///
+/// A fork of a sub-agent is a sibling under the same parent (`SessionManager::fork_session`), so
+/// the copy is a worker too and `build_session_runtime` refuses to build it. That refusal alone is
+/// safe but useless to a client: it arrives as `InternalError` -- for something the caller got
+/// wrong -- naming the *copy's* id, which the client has never seen and which `discard_failed_fork`
+/// has already deleted. The HTTP door answers 422 up front for the same reason; this is its
+/// sibling, and it was left open when that one was closed.
+///
+/// The worker id comes from the store rather than from a listing, because ACP's `session/list`
+/// shows top-level sessions and a client holding a sub-agent id got it some other way.
+#[test]
+fn acp_session_fork_refuses_a_sub_agent_before_copying_it() {
+    let spawn_round = [
+        serde_json::json!({ "kind": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
+        serde_json::json!({ "kind": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "tool_use" }),
+    ];
+    let plain = [
+        serde_json::json!({ "kind": "text", "text": "ok" }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+    ];
+    // The parent's spawning turn, the worker's own reply, then the parent's closing text.
+    let script = serde_json::json!([spawn_round, plain, plain]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let source_id = harness.new_session();
+    let id = harness.prompt(&source_id, "spawn a worker");
+    harness.collect_updates(&source_id, id);
+
+    let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let worker: String = store
+        .query_row(
+            "SELECT id FROM sessions WHERE parent_session_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the spawn should have left exactly one worker row");
+    let before: i64 = store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count");
+    drop(store);
+
+    let refused = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": worker,
+            "cwd": harness.config_dir.clone(),
+            "mcpServers": [],
+        }),
+    );
+    assert_invalid_params(&refused, "session/fork on a sub-agent");
+    // `data`, not `message`: `invalid_params_error` puts the sentence there and leaves `message`
+    // as the protocol's fixed "Invalid params".
+    let detail = refused["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&worker) && detail.contains("agent_followup"),
+        "the refusal must name the id the client sent and the door that can continue it: {refused}"
+    );
+
+    let store = rusqlite::Connection::open(harness.database()).expect("reopen the store");
+    let after: i64 = store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        before, after,
+        "refusing before the copy is the point; a rolled-back copy is a worse answer, not an \
+         equivalent one"
+    );
+}
+
+/// `session/load` refuses a sub-agent before it locks or writes its row.
+///
+/// The sibling of the `session/fork` test above, and the door that most needed one: the guard was
+/// written for `session/load` and landed on `session/resume`, so the method editors actually call
+/// kept every side effect. Nothing caught it, because no test existed for either handler's guard.
+///
+/// Asserts the write, not only the refusal. Reaching `build_session_runtime` is what makes this
+/// visible from outside: by then the handler has taken the worker's file lock, rewritten `cwd`,
+/// retired the background work its parent left running and replaced its roots, and answers
+/// `-32603 Internal error` for something the caller got wrong. `cwd` is the one a test can see
+/// cheaply, and it is not cosmetic: at `workspace` it is the writable boundary, and it is the
+/// directory a scheduled gate is re-checked in.
+#[test]
+fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
+    let spawn_round = [
+        serde_json::json!({ "kind": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
+        serde_json::json!({ "kind": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "tool_use" }),
+    ];
+    let plain = [
+        serde_json::json!({ "kind": "text", "text": "ok" }),
+        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+    ];
+    let script = serde_json::json!([spawn_round, plain, plain]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let source_id = harness.new_session();
+    let id = harness.prompt(&source_id, "spawn a worker");
+    harness.collect_updates(&source_id, id);
+
+    let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let (worker, cwd_before): (String, Option<String>) = store
+        .query_row(
+            "SELECT id, cwd FROM sessions WHERE parent_session_id IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the spawn should have left exactly one worker row");
+    drop(store);
+
+    // A directory that exists and differs from the worker's, so a handler that got as far as the
+    // `cwd` write would leave a difference this test can see.
+    let elsewhere = std::path::Path::new(&harness.config_dir).join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("create the directory the load would move it to");
+
+    let refused = harness.request(
+        "session/load",
+        serde_json::json!({
+            "sessionId": worker,
+            "cwd": elsewhere.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert_invalid_params(&refused, "session/load on a sub-agent");
+    let detail = refused["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&worker) && detail.contains("agent_followup"),
+        "the refusal must name the id the client sent and the door that can continue it: {refused}"
+    );
+
+    let store = rusqlite::Connection::open(harness.database()).expect("reopen the store");
+    let cwd_after: Option<String> = store
+        .query_row("SELECT cwd FROM sessions WHERE id = ?1", [&worker], |row| {
+            row.get(0)
+        })
+        .expect("the worker row is still readable");
+    assert_eq!(
+        cwd_before, cwd_after,
+        "refusing before the write is the point; a refusal that has already moved the session is \
+         not an equivalent answer"
+    );
+}
+
 /// `session/fork` mints a new session carrying the source's conversation, and leaves the source
 /// open: both are addressable afterwards.
 #[test]
