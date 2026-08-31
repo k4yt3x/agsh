@@ -130,11 +130,20 @@ These two are also the only parameters meka type-checks. A `background` that is 
 
 ## Scratchpad Parameter
 
-All tools support an optional `scratchpad` string parameter. When provided, the tool's output is saved to the scratchpad under that name instead of being returned inline. This lets the agent store large outputs for later processing without consuming conversation context.
+A `scratchpad` string parameter saves a tool's output to the scratchpad under that name instead of returning it inline, so a large result stays out of the conversation.
 
 ```text
 execute_command({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
 ```
+
+It is honoured on **every** tool, MCP servers included: the redirect happens where the result is
+recorded, not inside the tool. Eleven built-ins also *advertise* it in their schema, which is how the
+model discovers it: `read_file`, `edit_file`, `write_file`, `find_files`, `search_contents`,
+`fetch_url`, `search_web`, `execute_command`, `conversation_read`, `agent_spawn` and
+`agent_followup`.
+
+Three of those lift a cap when it is set, producing their full untruncated output: `find_files` (500
+results), `search_contents` (100 matches) and `fetch_url` (`max_length`).
 
 ## How Tool Calls Work
 
@@ -153,9 +162,9 @@ A built-in tool for managing a structured task list during a session. The agent 
 
 Inputs (all optional):
 
-- `title` — a short heading summarizing the overall goal; rendered as the list's heading (`TODO: <title>`). **Required whenever you pass `items`**, and persists across later `set` updates.
-- `items` — replace the whole list. Each entry is a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order.
-- `set` — a sparse status update keyed by task number, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working.
+- `title` -- a short heading summarizing the overall goal; rendered as the list's heading (`TODO: <title>`). **Required whenever you pass `items`**, and persists across later `set` updates.
+- `items` -- replace the whole list. Each entry is a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order.
+- `set` -- a sparse status update keyed by task number, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working.
 
 Task statuses are `pending`, `in_progress`, `completed`, and `cancelled`. Calling `todo` with no arguments simply reads the current list.
 
@@ -173,7 +182,7 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 **Context is granted, not inherited.** A sub-agent starts with a clean slate and receives only what you ask for:
 
-- `memory: "read"` grants read access to your memory store. Default `"none"`, because memories from unrelated work are context the worker pays for and reasons from. Sub-agents can never write to the store — record anything worth keeping yourself, from the worker's report.
+- `memory: "read"` grants read access to your memory store. Default `"none"`, because memories from unrelated work are context the worker pays for and reasons from. Sub-agents can never write to the store -- record anything worth keeping yourself, from the worker's report.
 - `instructions: "inherit"` hands over your [instructions file](../usage/instructions.md) verbatim. Default `"none"`, because those instructions describe *you*: your persona, how to address the user, what to volunteer. A worker handed one task by one of your turns is not you. Grant them when the task needs the project's standing rules and quoting the relevant ones into `prompt` would be lossy or expensive; pass a `skill` when the direction is reusable.
 
 Neither can be granted beyond what you hold yourself, so authority only narrows going down a chain of sub-agents. A worker you gave no memory cannot give its own worker any.
@@ -184,9 +193,9 @@ Neither can be granted beyond what you hold yourself, so authority only narrows 
 
 A sub-agent is not a one-shot. Its conversation persists under its own session, so you can go back to it.
 
-- **`agent_list`** — the sub-agents this session spawned, one per line as `<id>\t<cwd>\tturns=<n>\tlast_active=<timestamp>`. Direct children only: a worker's own sub-agents belong to it and appear in *its* list.
-- **`agent_followup({agent, prompt, scratchpad?})`** — asks a sub-agent another question. It still has its own conversation, so it can build on what it already found rather than starting from your summary of it. Returns its new report.
-- **`agent_delete({agent})`** — discards a sub-agent: its conversation, its scratchpad entries, and any sub-agents it spawned in turn. Nothing it wrote to disk is touched. Worth doing once you have what you needed, so a long session isn't carrying every worker it ever ran.
+- **`agent_list`** -- the sub-agents this session spawned, one per line as `<id>\t<cwd>\tturns=<n>\tlast_active=<timestamp>`. Direct children only: a worker's own sub-agents belong to it and appear in *its* list.
+- **`agent_followup({agent, prompt, scratchpad?})`** -- asks a sub-agent another question. It still has its own conversation, so it can build on what it already found rather than starting from your summary of it. Returns its new report.
+- **`agent_delete({agent})`** -- discards a sub-agent: its conversation, its scratchpad entries, and any sub-agents it spawned in turn. Nothing it wrote to disk is touched. Worth doing once you have what you needed, so a long session isn't carrying every worker it ever ran.
 
 All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's workers.
 
@@ -243,9 +252,9 @@ Search and re-read this session's **full** conversation, including earlier turns
 conversation_search({"query": "auth token", "regex": false, "limit": 20})
 ```
 
-- `query` (required) — text to search for; a literal substring (case-insensitive) unless `regex` is set.
-- `regex` — treat `query` as a case-sensitive regular expression. Default: `false`.
-- `limit` — maximum matches to return (capped at 100). Default: 20.
+- `query` (required) -- text to search for; a literal substring (case-insensitive) unless `regex` is set.
+- `regex` -- treat `query` as a case-sensitive regular expression. Default: `false`.
+- `limit` -- maximum matches to return (capped at 100). Default: 20.
 
 `conversation_read` reads turns by the `#N` index that `conversation_search` reports:
 
@@ -253,9 +262,9 @@ conversation_search({"query": "auth token", "regex": false, "limit": 20})
 conversation_read({"start": 47, "count": 3})
 ```
 
-- `start` (required) — 1-based message index to read from.
-- `count` — number of consecutive messages to read (max 20). Default: 1.
-- `scratchpad` — save the output to a scratchpad entry instead of returning it inline.
+- `start` (required) -- 1-based message index to read from.
+- `count` -- number of consecutive messages to read (max 20). Default: 1.
+- `scratchpad` -- save the output to a scratchpad entry instead of returning it inline.
 
 After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `conversation_search` and `conversation_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
 
@@ -280,11 +289,7 @@ This exists because the pushed `[Context budget]` block is rendered once, at the
 
 `context_compact` requests a compaction at the end of the current turn:
 
-- `instructions` — what to preserve or drop. Takes precedence over the default summary sections.
-- `keep_recent` — whether to keep the most recent turns verbatim. Default `true`; `false` starts clean.
+- `instructions` -- what to preserve or drop. Takes precedence over the default summary sections.
+- `keep_recent` -- whether to keep the most recent turns verbatim. Default `true`; `false` starts clean.
 
 There is a third tool, `context_replace`, that exists only inside a checkpoint turn and is how the agent submits its summary. It is deliberately absent from the ordinary catalogue and from `[tools]` configuration. See [Compacting a Session](../usage/sessions.md#compacting-a-session).
-
-## Redirecting output to the scratchpad
-
-Several tools (`execute_command`, `find_files`, `search_contents`, `fetch_url`, `agent_spawn`) accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 500, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.

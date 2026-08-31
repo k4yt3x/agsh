@@ -50,10 +50,14 @@ Any model available through the Claude Messages API; meka forwards the model str
 
 ## Custom Base URL
 
-To use a Claude-API-compatible proxy or gateway:
+To use a Claude-API-compatible proxy or gateway, set the profile's `base_url`. Add it when creating
+the profile, or change it later:
 
 ```bash
-meka --provider work
+meka provider add gateway --type anthropic-messages --model claude-opus-5 \
+    --base-url https://gateway.example.com/anthropic
+
+meka provider set gateway base_url https://gateway.example.com/anthropic
 ```
 
 A trailing `/v1` is dropped, since meka appends it per request: publish `https://gateway.example.com/anthropic` or `https://gateway.example.com/anthropic/v1`, either works.

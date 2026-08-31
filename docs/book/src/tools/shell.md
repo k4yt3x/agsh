@@ -79,7 +79,7 @@ Read-mode sandboxes still permit outbound network (the threat model intentionall
 
 **`ask` and `unrestricted` keep the full parent environment.** These are the trusted-operation paths where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a sandboxed shell command, switch to one of them for that turn.
 
-For `ask` specifically this is worth stating outright, because the approval prompt shows you a *command* and not its environment: an approved `npm test` whose postinstall script reads `process.env` sees `ANTHROPIC_API_KEY` and every other secret in meka's environment, on a sandbox that deliberately leaves the network open. That is the same reach an approved `write_file` has, which is the point of the level — the prompt is what you are trusting, not a scrub behind it. If you want the scrub, `workspace` keeps it and confines writes to the workspace roots.
+For `ask` specifically this is worth stating outright, because the approval prompt shows you a *command* and not its environment: an approved `npm test` whose postinstall script reads `process.env` sees `ANTHROPIC_API_KEY` and every other secret in meka's environment, on a sandbox that deliberately leaves the network open. That is the same reach an approved `write_file` has, which is the point of the level -- the prompt is what you are trusting, not a scrub behind it. If you want the scrub, `workspace` keeps it and confines writes to the workspace roots.
 
 #### Linux: pick a backend
 

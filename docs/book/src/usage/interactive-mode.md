@@ -23,7 +23,7 @@ meka uses Emacs-style keybindings (provided by reedline).
 | Key | Action |
 |-----|--------|
 | Enter | Submit the current prompt |
-| Alt+Enter | Insert a newline (for multi-line input) |
+| Alt+Enter, Shift+Enter | Insert a newline (for multi-line input) |
 | Shift+Tab | Cycle the permission mode, skipping any not in `[permissions].enabled` (by default none &rarr; read &rarr; workspace &rarr; unrestricted &rarr; none) |
 
 ### Navigation
@@ -86,7 +86,7 @@ The color provides a visual cue about the agent's current capabilities. Orange m
 
 ## Multi-Line Input
 
-Press **Alt+Enter** to insert a newline instead of submitting. The prompt changes to show continuation:
+Press **Alt+Enter** or **Shift+Enter** to insert a newline instead of submitting. The prompt changes to show continuation:
 
 ```text
 meka [r] > write a python script that
@@ -115,6 +115,10 @@ meka supports `/` prefix commands for controlling the shell:
 | `/fork` | Branch into a copy of this session, freezing the original where you are |
 | `/export` | Write the session to `session-<id>.md` and print where it landed |
 | `/cd [path]` | Change working directory; with no path, return to where meka was started (`~` still goes home) |
+| `/skill` | List installed [skills](./skills.md) |
+| `/skill <name> [extra...]` | Invoke a skill as the next turn, prepending anything you type after the name |
+| `/memory` | List saved [memories](./memory.md), most important first |
+| `/memory <name>` | Print one memory's body |
 | `/schedule` | List this session's scheduled jobs |
 | `/schedule cancel <id>` | Cancel a scheduled job by id or unique prefix |
 | `/tasks` | List this session's [background tasks](./background.md) |

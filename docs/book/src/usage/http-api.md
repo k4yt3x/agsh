@@ -300,7 +300,7 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
 
 ### Detecting a rewritten history
 
-`GET /messages` returns the *materialised* view: what the model can currently see. Three things rewrite it rather than appending to it — compaction, `POST /rewind`, and a mid-turn repair of a malformed request — and after any of them your copy is no longer a prefix of the server's.
+`GET /messages` returns the *materialised* view: what the model can currently see. Three things rewrite it rather than appending to it -- compaction, `POST /rewind`, and a mid-turn repair of a malformed request -- and after any of them your copy is no longer a prefix of the server's.
 
 Two signals cover this:
 
@@ -442,7 +442,7 @@ curl -N -H "Authorization: Bearer $TOKEN" \
      "http://localhost:8080/v1/sessions/$SESSION/stream"
 ```
 
-The stream opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you actually rejoined, which is the only way to tell "my stream resumed" from "a newer turn started while I was away". That opening event is synthesised by the reconnect rather than replayed, so unlike the original it carries no `started_at` and no `id:` — a resumed stream must not move your stored resume position backwards before the replay has run. Every event after it is the real thing, ids included. The stream always terminates: if the turn has already finished, the buffered tail and its terminal event are delivered and the connection closes.
+The stream opens with a `turn.started` carrying `"resumed": true` and the `turn_id` you actually rejoined, which is the only way to tell "my stream resumed" from "a newer turn started while I was away". That opening event is synthesised by the reconnect rather than replayed, so unlike the original it carries no `started_at` and no `id:` -- a resumed stream must not move your stored resume position backwards before the replay has run. Every event after it is the real thing, ids included. The stream always terminates: if the turn has already finished, the buffered tail and its terminal event are delivered and the connection closes.
 
 Three limits, all deliberate:
 
@@ -573,7 +573,7 @@ Scopes are flat: `memory:r` does not imply `memory:w`, and neither implies the o
 
 An unrecognised scope logs a warning at startup and grants nothing, so a typo like `sessions:write` is visible rather than silently inert.
 
-> **Note:** `[skills] agent_managed` and `[memory] access` govern what the *model* may do on its own initiative. They do not gate these endpoints. A token is the operator acting remotely, equivalent to running `meka skill add` in a shell, so a `skills:w` token writes skills even when `agent_managed = false`.
+> **Note:** `[skills] agent_managed` and `[memory] enabled` govern what the *model* may do on its own initiative. They do not gate these endpoints. A token is the operator acting remotely, equivalent to running `meka skill add` in a shell, so a `skills:w` token writes skills even when `agent_managed = false`.
 
 ### Token configuration
 
@@ -630,7 +630,7 @@ Idempotency keys are **ignored for streaming responses**; streaming clients shou
 |---|---|---|
 | `POST /turn` (blocking, with a key) | yes | cached response returned |
 | `POST /cancel`, `DELETE /v1/sessions/{id}`, `DELETE /v1/sessions/{id}/tasks/{task_id}` | yes | already-done is the same state |
-| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure — treat it as success if you are retrying blind |
+| `DELETE /v1/skills/{name}`, `/v1/memory/{name}`, `/v1/schedule/{job_id}` | yes, but | the resource is gone, so the retry answers **404**. Expected, not a failure -- treat it as success if you are retrying blind |
 | `PUT /v1/skills/{name}`, `PUT /v1/memory/{name}` | yes | same body writes the same skill file or memory row |
 | `POST /compact` | mostly | a second compaction summarises the summary; fidelity drops, nothing is lost |
 | `POST /rewind` | **no** | drops another turn. A client that retries on a connection error loses conversation |
@@ -669,10 +669,10 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 |------|--------|---------|
 | `/errors/auth` | 401 | Missing or invalid bearer token |
 | `/errors/auth-scope` | 403 | Token lacks the required scope |
-| `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}` — a better token will not help |
+| `/errors/session-permission` | 403 | The token is fine; the *session* sits too low. Raise it with `PATCH /v1/sessions/{id}` -- a better token will not help |
 | `/errors/session-not-found` | 404 | Unknown session ID |
 | `/errors/not-found` | 404 | Unknown skill, memory, MCP server, background task, or turn stream |
-| `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel` — there is no turn to cancel |
+| `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel` -- there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's DB lock (e.g. two `meka serve` instances sharing one DB); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-cancelled` | 409 | Turn was cancelled |
@@ -948,9 +948,9 @@ Key points:
 
 `GET /v1/sessions` takes `include_children=true` to list sub-agent sessions alongside top-level ones, and `cwd=<path>` to filter by working directory. Every session record carries `parent_id`, which is what reconnects a spawned worker to the session that dispatched it.
 
-A memory record carries both `updated_at` (when the row last changed) and `recorded_at` (when the memory was made, stamped once at creation), plus its `tags`. The two timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, and it is `recorded_at` that the model is shown as an age. `PUT /v1/memory/{name}` accepts `tags` with the same omit-to-keep rule as `body` — omit to leave an existing memory's labels alone, send `[]` to clear them.
+A memory record carries both `updated_at` (when the row last changed) and `recorded_at` (when the memory was made, stamped once at creation), plus its `tags`. The two timestamps are deliberately separate: a description edit moves `updated_at` without the note saying anything new, and it is `recorded_at` that the model is shown as an age. `PUT /v1/memory/{name}` accepts `tags` with the same omit-to-keep rule as `body` -- omit to leave an existing memory's labels alone, send `[]` to clear them.
 
-`GET /v1/memory/{name}` answers **404** for a name that is not stored, with no 422 case: a memory is a row, so there is no file to be present but unparseable. Reading through this endpoint deliberately does *not* increment the memory's read count — an operator is not the agent recalling anything, and the count feeds search ranking.
+`GET /v1/memory/{name}` answers **404** for a name that is not stored, with no 422 case: a memory is a row, so there is no file to be present but unparseable. Reading through this endpoint deliberately does *not* increment the memory's read count -- an operator is not the agent recalling anything, and the count feeds search ranking.
 
 Descriptions and bodies are returned **exactly as stored**, not as they are rendered into a model's context: this endpoint is a backup and inspection door, like `meka memory export`, and stripping characters out of a note on the way through would make a restore lossy. JSON escaping keeps that safe in transit, but a client that decodes and prints the text to a terminal should neutralise it, as meka does at its own render boundaries.
 
@@ -968,7 +968,7 @@ No job of any kind can be created on a session at `none`, gated or not: nothing 
 
 A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the database.
 
-`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools — the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation. A job that a scheduler sweep retired between the lookup and the delete is a 404 as well, for the same reason: 204 means this request cancelled the job, not merely that it is gone.
+`DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools -- the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation. A job that a scheduler sweep retired between the lookup and the delete is a 404 as well, for the same reason: 204 means this request cancelled the job, not merely that it is gone.
 
 Cancelling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `cancelled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 

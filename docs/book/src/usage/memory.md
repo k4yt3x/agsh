@@ -37,7 +37,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 ### Omitting a field keeps what is there
 
-`memory_write`'s `body`, `tags` and `priority` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update — a reworded description, say — a single call that cannot cost the note its contents, its labels or its rank. To clear the first two, pass `""` and `[]` explicitly.
+`memory_write`'s `body`, `tags` and `priority` are all optional, and omitting any of them **keeps whatever the memory already had**. That makes a metadata-only update -- a reworded description, say -- a single call that cannot cost the note its contents, its labels or its rank. To clear the first two, pass `""` and `[]` explicitly.
 
 `PUT /v1/memory/{name}` and `meka memory add <name> --force` follow the same rule.
 
@@ -52,7 +52,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 | 5 | Default |
 | 6–9 | Situational or short-lived notes |
 
-Within one priority band, the most recently *recorded* memory sorts first — so a fresh note never displaces a standing rule just for being new.
+Within one priority band, the most recently *recorded* memory sorts first -- so a fresh note never displaces a standing rule just for being new.
 
 Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. `meka memory list` prints the distribution so you can see that happening and rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
 
@@ -79,9 +79,9 @@ Nothing is lost. `memory_search` covers the whole store, including the entries t
 
 **Ranking** combines three things, so the result is what you probably meant rather than merely what matched:
 
-- **relevance** — BM25, weighting a hit on the name above the description, and the description above the body.
-- **importance** — the declared priority, blended with how often you have actually read the memory. A memory opened forty times is important whatever it was labelled two years ago, which is the counterweight to priority drift.
-- **freshness** — a gentle decay on `recorded`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
+- **relevance** -- BM25, weighting a hit on the name above the description, and the description above the body.
+- **importance** -- the declared priority, blended with how often you have actually read the memory. A memory opened forty times is important whatever it was labelled two years ago, which is the counterweight to priority drift.
+- **freshness** -- a gentle decay on `recorded`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
 
 **Fuzzy matching** works in four senses, and the result says which one answered so a guess is not mistaken for a recalled fact:
 
@@ -93,11 +93,11 @@ Nothing is lost. `memory_search` covers the whole store, including the entries t
 | Unsegmented text | `深圳` inside `办公室在深圳南山区` | Retried as a literal substring |
 | Different wording | `verbosity` for `terse` | Pass several phrasings in `queries` |
 
-The second and third rows are the two the stemmer alone does not cover. SQLite's Porter strips inflections (`deploys`, `shipping`, `running`) but not every derivation: `deployment` does not stem to `deploy`, so a search for it used to miss a memory whose body says `Deploys`. The prefix retry therefore runs in both directions — shortening the *query* as well as matching the start of the stored word — and says it was a prefix match either way.
+The second and third rows are the two the stemmer alone does not cover. SQLite's Porter strips inflections (`deploys`, `shipping`, `running`) but not every derivation: `deployment` does not stem to `deploy`, so a search for it used to miss a memory whose body says `Deploys`. The prefix retry therefore runs in both directions -- shortening the *query* as well as matching the start of the stored word -- and says it was a prefix match either way.
 
-The fourth row is why word-splitting is not the whole story. The tokenizer divides on non-alphanumerics, so Chinese, Japanese and Thai prose — and a long identifier, path or URL — arrive as a single token that only matches in full. When nothing else answers, meka scans for the query as plain text instead, and says that is what it did.
+The fourth row is why word-splitting is not the whole story. The tokenizer divides on non-alphanumerics, so Chinese, Japanese and Thai prose -- and a long identifier, path or URL -- arrive as a single token that only matches in full. When nothing else answers, meka scans for the query as plain text instead, and says that is what it did.
 
-The last row is the important one: `queries` is a **list**, and supplying synonyms costs nothing. `["terse", "brevity", "verbosity"]` in one call finds a memory that used any of them, which is the answer to "the agent has to guess the words it used months ago" — it does not have to guess right, only to guess several times.
+The last row is the important one: `queries` is a **list**, and supplying synonyms costs nothing. `["terse", "brevity", "verbosity"]` in one call finds a memory that used any of them, which is the answer to "the agent has to guess the words it used months ago" -- it does not have to guess right, only to guess several times.
 
 Results carry enough to act on without a follow-up read: name, priority, age, read count, description, and the body itself when it is short.
 
@@ -110,7 +110,7 @@ meka memory verify              # check the index
 meka memory verify --rebuild    # regenerate it from the table
 ```
 
-`verify` checks two things: that the index is structurally sound, and that it holds exactly as many documents as the store does. It deliberately does not claim more. FTS5's own `integrity-check` does **not** compare an external-content index against its content table, so a memory whose text changed while a trigger was not firing leaves both checks happy — only searching for the new wording reveals it. If search is missing something you know is there, rebuild; it is one pass over the table and cannot lose a memory, because the index is derived.
+`verify` checks two things: that the index is structurally sound, and that it holds exactly as many documents as the store does. It deliberately does not claim more. FTS5's own `integrity-check` does **not** compare an external-content index against its content table, so a memory whose text changed while a trigger was not firing leaves both checks happy -- only searching for the new wording reveals it. If search is missing something you know is there, rebuild; it is one pass over the table and cannot lose a memory, because the index is derived.
 
 ## Agent tools
 
@@ -130,7 +130,7 @@ Saved memory 'alice-tz' (priority 5). It is in your memory store from the next
 turn on, and memory_search will find it whatever the index has room to list.
 
 Note: 'alice-timezone' already says something very similar. If this is the same
-fact, call memory_write on 'alice-timezone' instead and delete 'alice-tz' — two
+fact, call memory_write on 'alice-timezone' instead and delete 'alice-tz' -- two
 near-copies both stay in the index for ever and neither supersedes the other.
 ```
 

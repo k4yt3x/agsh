@@ -5,8 +5,8 @@ The scratchpad is a session-scoped working memory that the agent can use to stor
 ## When the Scratchpad is Used
 
 - **Proactively**: The agent stores intermediate results (extracted text, API responses, research notes) for later use.
-- **Via `scratchpad` parameter**: Any tool can save its output directly to the scratchpad by including a `scratchpad` parameter in the tool call.
-- **Automatically**: When a tool's output exceeds 30,000 characters, it is saved to the scratchpad under an auto-generated name (e.g., `execute_command_1`) and replaced with a preview in the conversation.
+- **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad Parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
+- **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `execute_command_a1b2c3_1`) and replaced with a preview.
 
 ## Tools
 

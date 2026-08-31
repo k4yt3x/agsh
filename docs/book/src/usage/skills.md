@@ -241,7 +241,7 @@ agent_spawn(skill: "summarize-financial-news", prompt: "focus on UK markets")
 
 `prompt` is optional when `skill` is given; if both are supplied, `prompt` is prepended to the skill body as extra direction (the same ordering as `meka --skill <name> [prompt]`).
 
-A skill is the reusable unit of worker instruction. Sub-agents do not receive the [instructions file](./instructions.md) unless the spawn call asks for it, since it describes the top-level agent rather than a delegate — so a skill is usually the better way to give a worker standing direction.
+A skill is the reusable unit of worker instruction. Sub-agents do not receive the [instructions file](./instructions.md) unless the spawn call asks for it, since it describes the top-level agent rather than a delegate -- so a skill is usually the better way to give a worker standing direction.
 
 ## Invoking a Skill from the CLI
 

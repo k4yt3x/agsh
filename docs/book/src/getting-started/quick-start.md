@@ -32,7 +32,7 @@ After setup, you will see a prompt:
 meka [r] >
 ```
 
-The `[r]` indicates **read** permission mode (the default). The agent can read files and search, but cannot write files or run commands.
+The `[r]` indicates **read** permission mode (the default). The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
 
 ## 3. Ask It Something
 
@@ -50,7 +50,7 @@ Press **Shift+Tab** to cycle the permission to `workspace`, where the agent may 
 meka [w] >
 ```
 
-Now the agent can execute commands and modify files:
+Now it can modify files too, and its shell may write inside the same boundary:
 
 ```text
 meka [w] > create a file called hello.txt with the text "hello world"

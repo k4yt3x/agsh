@@ -295,7 +295,7 @@ That matters more here than anywhere else in meka. A shell pipeline puts its con
 prompt that fills its rows from the top and stops hides the exact part you are being asked about.
 
 The limits: 20 lines and 60 rows per argument, and 100 rows of block before further arguments are
-dropped and named — 161 rows at the very worst. Those sit an order of magnitude above anything a real
+dropped and named -- 161 rows at the very worst. Those sit an order of magnitude above anything a real
 tool call carries; they are there so a call with two hundred invented arguments cannot scroll the
 real one off the top of your screen without saying so.
 

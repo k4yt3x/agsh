@@ -75,12 +75,12 @@ longer sees the reasoning recorded under the old provider, for the reason above.
 `--writable-root` is not restored, because it belongs to the process rather than the session; pass
 it again. See [permissions](./permissions.md) for why recording it would be wrong.
 
-**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it — resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
+**A resumed session opens in the directory it recorded**, not the one your shell is in. `meka -c` from anywhere reopens the session where it was working, and `/cd` is the only thing that moves it. This is deliberate: at [`workspace`](./permissions.md) the working directory *is* the writable boundary, so adopting the shell's would silently widen it -- resume a project session from `$HOME` and the whole home directory becomes writable, with a [scheduled job](./scheduling.md) able to fire before you could react. If the recorded directory has since been removed, meka warns and opens where you are. To get back to your shell's directory, run `/cd` with no argument.
 
 A resume restores the conversation, not the world it ran in. The messages come back verbatim, which means the agent reads its own earlier tool calls and can reasonably assume their effects still hold. Two kinds of state do not survive the process that made them:
 
 - **Which files have been read.** meka tracks reads in memory so `edit_file` can refuse to write over a file the agent has not seen. A new process starts with that record empty, so the first edit to any file asks for a `read_file` first.
-- **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription — these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
+- **Anything an MCP server was holding.** A loaded database, an authenticated session, a subscription -- these belong to the server's process, not to the conversation, and a reconnect drops them. meka has no way to model what a given server keeps open.
 
 Everything else is restated in the per-turn context on every turn regardless (permission level, working directory, todo list, tool catalogue), and background tasks that were running deliver an `interrupted` outcome, so none of those can go stale unnoticed.
 
@@ -201,9 +201,9 @@ meka session delete --all                  # everything
 
 Deleting a session also removes its messages, scratchpad entries, and any sub-agent children.
 
-A session is locked from the moment it exists — the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, and for forks made by the REPL or an editor. Copying a conversation holds it still too: `meka session fork` and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
+A session is locked from the moment it exists -- the lock is taken before the row is written, so a sweep in another terminal cannot catch it in between. That holds for new sessions, for sub-agent sessions, and for forks made by the REPL or an editor. Copying a conversation holds it still too: `meka session fork` and `meka session export` refuse a session another process has open, because a copy taken mid-turn ends on a user message the model never answered and restores as an unusable session. `meka session rewind` has always done this.
 
-No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp — resuming does not — so a REPL left at its prompt past the window looks expired while somebody is sitting in front of it.
+No deletion touches a session another meka process has open. Naming one by id fails and says so; `--all`, `--older-than-days` and the startup sweep skip it and report how many they left behind. This matters most for the startup sweep, because only turns bump a session's timestamp -- resuming does not -- so a REPL left at its prompt past the window looks expired while somebody is sitting in front of it.
 
 See [Config File](../configuration/config-file.md#session) for details.
 

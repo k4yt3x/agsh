@@ -20,6 +20,35 @@ tar -xzf meka-*.tar.gz
 cp meka ~/.local/bin/
 ```
 
+## Container
+
+Every tagged release publishes an image to the GitHub Container Registry:
+
+```bash
+docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
+```
+
+The image carries the binary and nothing else, so a session inside it starts with no config and no
+database. Mount both to reach an existing setup:
+
+```bash
+docker run --rm -it \
+    -v ~/.config/meka:/root/.config/meka:ro \
+    -v ~/.local/share/meka:/root/.local/share/meka:rw \
+    ghcr.io/k4yt3x/meka:latest
+```
+
+The data directory has to be writable: it holds `meka.db`, which is where sessions and every
+credential live.
+
+### `mekabox`
+
+[`contrib/container/mekabox`](https://github.com/k4yt3x/meka/blob/master/contrib/container/mekabox)
+does that mounting for you, against a stock `archlinux:latest` with your *host* binary bind-mounted
+in, and starts the agent at `unrestricted` with instructions saying it may install whatever the task
+needs. It is the answer to "let it do anything, just not to my machine": the container is disposable
+and the host config is mounted read-only. It picks podman over docker when both are present.
+
 ## Cargo Install
 
 If you have [Rust](https://www.rust-lang.org/tools/install) installed, you can install meka directly from the Git repository:

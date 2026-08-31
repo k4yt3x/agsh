@@ -186,7 +186,17 @@ context_window = 131072
 
 ### `max_output_tokens`
 
-Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on the [`thinking`](#thinking) mode; OpenAI 32k when an effort is set; otherwise the API default). Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000). `meka provider add` and `meka provider set` both refuse a profile that fails this, and it is validated again at startup.
+Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default:
+
+| Backend | Default when unset |
+|---|---|
+| Claude, [`thinking`](#thinking) `adaptive` | 64000 |
+| Claude, `budgeted` | twice the resolved budget, or 32000, whichever is larger |
+| Claude, `off` | 32000 |
+| `openai-chat-completions` with an [`effort`](#effort) set | 32000, since reasoning spends output tokens |
+| Everything else, both Responses backends included | the endpoint's own |
+
+Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget_tokens`](#thinkingbudget_tokens), else 16000). `meka provider add` and `meka provider set` both refuse a profile that fails this, and it is validated again at startup.
 
 ```toml
 [providers.work]
@@ -379,7 +389,7 @@ Stored credentials with no profile: archive
 ```
 
 `meka provider remove archive` then deletes it. The same applies to MCP servers, reported by [`meka
-mcp list`](#meka-mcp-cli) and cleaned by `meka mcp remove <name>`.
+mcp list`](../usage/mcp.md#meka-mcp-cli) and cleaned by `meka mcp remove <name>`.
 
 ## Examples
 
@@ -546,7 +556,7 @@ so it needs a bound counted in rows, and the marker says rows rather than preten
 
 The line cap is exact, brackets and indentation included. The block cap is not: it is checked before
 an argument is rendered rather than after, so the block reaches at most the block cap plus one
-argument's own budget plus the line naming what went — 93 rows.
+argument's own budget plus the line naming what went -- 93 rows.
 
 The block cap drops whole arguments and names them rather than cutting wherever row 60 lands.
 Knowing that `path` was passed but not shown beats seeing 60 rows of `content` and never learning
@@ -633,7 +643,7 @@ Default: `true`
 Both apply to **anything printed between two prompts**, not only agent responses. That span is the
 unit, whatever filled it: a turn, a slash command's output (`/tasks`, `/memory`, `/help`, …), an
 error, a scheduled job waking the shell to run several turns at once, or any combination. It is
-bracketed once, by whichever of those printed first and last — never once per turn inside it, and
+bracketed once, by whichever of those printed first and last -- never once per turn inside it, and
 never twice because two things both thought they owned the spacing.
 
 The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
@@ -641,12 +651,12 @@ screen exactly as it found it. In practice every slash command says something, e
 list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,
 because the prompt itself is the confirmation; a successful `/clear`, because the cleared screen is;
 and a scheduled wake that finds nothing left to run. `!command` is the one exception in the other
-direction — it is always bracketed, because meka hands the terminal to the child process and never
+direction -- it is always bracketed, because meka hands the terminal to the child process and never
 learns whether it wrote anything, so a silent `!touch file` still gets its blank lines.
 
 Turning a setting off removes that blank line and nothing else. The spacing *between* blocks of a
-single response — a tool indicator and the answer that follows it, or a thinking block and the text
-after it — is not controlled by either flag and does not change.
+single response -- a tool indicator and the answer that follows it, or a thinking block and the text
+after it -- is not controlled by either flag and does not change.
 
 ### `display.show_token_usage`
 
@@ -822,7 +832,7 @@ context_messages = 100
 
 Delete sessions older than this many days, at agent startup. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
 
-Two kinds of session are spared whatever their timestamp says, and the sweep reports how many it left behind. A session another meka process has open is skipped — only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+Two kinds of session are spared whatever their timestamp says, and the sweep reports how many it left behind. A session another meka process has open is skipped -- only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
 
 **Default: unset, meaning nothing is deleted.** Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
 
@@ -923,7 +933,9 @@ See [Instructions](../usage/instructions.md) for the full picture. In short: wri
 
 ## `[mcp]`
 
-Settings for MCP (Model Context Protocol) tool servers. MCP allows meka to discover and use tools provided by external servers.
+Which MCP servers to connect to, and what their tools are allowed to do. The [MCP](../usage/mcp.md)
+page covers the rest: the `meka mcp` command suite, where a server's secrets live, the OAuth flows,
+the connection lifecycle, and the resource and prompt tools.
 
 ### `[[mcp.servers]]`
 
@@ -957,15 +969,6 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `strict` | Default for every server's `required` flag. When `true`, all enabled servers gate the turn; when `false` (the default) only servers with `required = true` do. An unavailable optional server doesn't stop the turn; its failure is logged once when it happens, and its live state is shown by `/mcp list` in the REPL or probed with `meka mcp reconnect <name>`. |
 | `grace_seconds` | Per-turn cap on how long to wait for still-`Pending` servers to connect before deciding. Default `3`. Set to `0` to skip waiting (useful for scripts that want to fail fast). |
 | `connect_timeout_seconds` | Per-server timeout for connect + `initialize` + `list_tools`. A hung stdio spawn or slow HTTPS handshake can't stall the whole fleet past this bound. Default `30`. |
-
-### Startup concurrency
-
-MCP servers connect in parallel at startup, partitioned by transport so a fleet of stdio servers (process-spawn bound) doesn't fight a fleet of HTTP servers (network bound):
-
-- stdio: `MEKA_MCP_STDIO_CONCURRENCY` (default `3`)
-- http: `MEKA_MCP_HTTP_CONCURRENCY` (default `20`)
-
-These env vars are tuning knobs: rarely needed, but useful if you're running ~30 stdio servers on a constrained box (lower it) or ~50 HTTP servers (raise it).
 
 ### Permission resolution
 
@@ -1112,169 +1115,13 @@ headers = { X-Api-Key = "${GITHUB_MCP_TOKEN}" }
 
 `env`, `args` and `headers` may *contain* a secret, but they are not one: `env` sets a subprocess's whole environment, `args` carries connection strings, and `headers` carries `X-Tenant-Id` as readily as `X-Api-Key`. meka cannot tell which is which, so they stay in `config.toml` and `${VAR}` is how you keep a value out of it.
 
-A bearer token and an OAuth client secret are unambiguously secrets, so they are not config at all. They live in meka's database and are set with `meka mcp add --auth-token-stdin` / `--client-secret-stdin`, or afterwards with `meka mcp login`. See [Credentials](#credentials).
-
-### Environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MEKA_MCP_TOOL_TIMEOUT` | `600000` ms (600 s) | Per-call timeout for MCP tools. Triggers `notifications/cancelled` on expiry. |
-
-### `meka mcp` CLI
-
-Manage configured servers without editing `config.toml` by hand:
-
-| Command | Action |
-|---|---|
-| `meka mcp list` | Print all configured servers, plus any stored OAuth credential that no server claims (see [Leftover credentials](#leftover-credentials)). |
-| `meka mcp get <name>` | Print full details for one server. |
-| `meka mcp add <name> <url-or-command> [args...] [flags]` | Persist a server. Transport is auto-detected: a URL starting with `http[s]://` means HTTP, anything else means stdio. Preserves existing formatting/comments via `toml_edit`. |
-| `meka mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. A name with stored credentials but no config entry is cleaned rather than refused. |
-| `meka mcp disable <name>` | Set `disabled = true` on the server entry. The next `meka` start skips it entirely. |
-| `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
-| `meka mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |
-| `meka mcp tools <name>` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. |
-| `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. |
-| `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |
-
-#### Credentials
-
-An MCP server's bearer token, OAuth client secret and OAuth token bundle are stored in meka's database (`mcp_credentials`, keyed by server name and kind), never in `config.toml`. This is the same rule providers follow, and for the same reason: `config.toml` is a plaintext file people commit, sync and share.
-
-Each is read from stdin so it never reaches `ps` output or your shell history. One command reads one secret, so `--auth-token-stdin` and `--client-secret-stdin` cannot be combined:
-
-```console
-$ pass show notion-token | meka mcp add notion https://mcp.notion.com/mcp --auth-token-stdin
-$ pass show acme-secret | meka mcp login acme --client-secret-stdin
-```
-
-A confidential OAuth client holds two at once: the long-lived client secret it authenticates with, and the refreshable bundle it obtained. Store the secret first, then run `meka mcp login <name>` to complete the flow. Refreshing the bundle leaves the client secret alone.
-
-`meka mcp get <name>` lists which kinds a server has, without printing any of them, and shows the origin an OAuth bundle was issued for as `issued for: <scheme>://<host>[:port]`. That flags the case a rotated `url` leaves behind: a bundle minted against the old host is still stored and still sent, so the line names a mismatch rather than letting the next call fail as a bare `401`. `meka mcp list` names servers that have a stored credential but no `[[mcp.servers]]` entry, which is what a hand-edited config strands.
-
-#### `meka mcp add` flags
-
-| Flag | Purpose |
-|------|---------|
-| `--transport <stdio\|http>` | Override the auto-detected transport. |
-| `--env KEY=VALUE` | Environment variable for stdio (repeatable). |
-| `--header KEY=VALUE` | HTTP header (repeatable). |
-| `--auth <oauth\|client-credentials\|client-credentials-jwt>` | Configure the `[auth]` block. |
-| `--auth-token-stdin` | Read a static bearer token from stdin and store it. Mutually exclusive with `--auth`. |
-| `--client-secret-stdin` | Read an OAuth client secret from stdin and store it. Required by `--auth client-credentials`. |
-| `--client-id` | OAuth / client-credentials client identifier. Not a secret, so it goes in `config.toml`. |
-| `--signing-key <PATH>`, `--signing-algorithm <ALG>` | JWT signing material (`client-credentials-jwt` only). |
-| `--scope <SCOPE>` | OAuth scope (repeatable). |
-| `--redirect-port <PORT>` | Fixed OAuth redirect port (default: ephemeral). |
-| `--permission <none\|read\|workspace\|ask\|unrestricted>` | Per-server permission cap (applies to all tools on the server). |
-| `--allow-tool <NAME>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
-| `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
-| `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
-| `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`workspace`/`ask`/`unrestricted`. |
-| `--required` | Persist `required = true`, so a turn is rejected while this server isn't connected. Omitted, the server inherits `[mcp].strict` and is optional by default. |
-| `--disabled` | Persist `disabled = true`, so the server is skipped entirely at startup. Re-enable with `meka mcp enable <name>`. |
-
-#### Example: Notion
-
-These signposts are `info` logs, so they need `-v`; at the default `warn` level the command
-succeeds silently and the exit code carries the result. Timestamps and targets are elided here.
-
-```console
-$ meka -v mcp add notion https://mcp.notion.com/mcp
-added 'notion' to ~/.config/meka/config.toml
-probe: 'notion' requires OAuth
-running OAuth authorization for 'notion' (use --no-login to skip)
-no [auth] block for 'notion'; assuming OAuth authorization_code
-…
-authorized 'notion'
-```
-
-`meka mcp add` on an HTTP endpoint:
-
-1. **Probe**: issues an unauthenticated `GET` (3 s timeout, redirects off) and classifies the response per the MCP authorization spec + RFC 6750 + RFC 9728:
-
-   - `2xx` → server is open, no login needed.
-   - `401` / `403` with `WWW-Authenticate: Bearer …` → OAuth required. The `resource_metadata="…"` attribute (RFC 9728) is captured at DEBUG.
-   - Any other status → couldn't infer, prints the status code.
-   - Network failure → prints the error.
-
-2. **Auto-login**: if the probe says OAuth is required (or `--auth oauth` was explicitly set), the OAuth authorization_code flow runs immediately as though the user had chained `meka mcp login <name>` themselves. The synthesised `[auth] = oauth` block is written back to `config.toml` on success.
-
-3. **Rollback on failure**: if the OAuth flow errors out, the entry we just wrote is purged from `config.toml` (alongside any partial credentials), leaving the user's config clean. The command exits non-zero.
-
-4. **`--no-login`**: skips step 2. The entry is still persisted and the probe's hint is still printed; run `meka mcp login <name>` when ready. Useful for scripted setup or when you expect to edit `[auth]` by hand.
-
-The probe and the auto-login only run for HTTP servers, and only when the user didn't provide `--auth-token-stdin` (static bearer) or `--auth` (other than `oauth`). Stdio servers skip both.
-
-#### Remote hosts / SSH sessions
-
-The OAuth flow redirects the browser to `http://127.0.0.1:<port>/callback`. When meka is running on a different host than the browser (SSH session, container, Codespace, WSL), the browser can't reach back and shows a "connection refused" error page. meka handles this automatically:
-
-- While `meka mcp login <name>` waits for the callback it also watches stdin.
-- The browser's address bar still contains the full callback URL (including `code` and `state`) even when the connection fails. Copy it, paste it into the meka prompt, and press Enter.
-- Whichever completes first, the TCP callback or the pasted URL, wins.
-
-meka opens the browser silently and prints the URL exactly once, so the flow works the same whether
-or not a browser is reachable. The `authorized` line is an `info` log, shown here with `-v`.
-
-```console
-$ meka -v mcp login notion
-open this URL in your browser to authorize:
-
-https://mcp.notion.com/authorize?response_type=code&…
-
-waiting up to 120s for the callback, or paste the callback URL here and press Enter:
-http://127.0.0.1:46437/callback?code=…&state=…     ← paste here
-authorized 'notion'
-```
-
-#### REPL parity
-
-Inside the REPL:
-- `/mcp list`: list configured servers.
-- `/mcp reconnect <server>`: reconnect smoke-test.
-- `/mcp login <server>` / `/mcp logout <server>`: run the auth flow or revoke.
-- `/mcp <server>:<prompt> [args...]`: render a server-defined prompt as the next user turn.
-
-### Resources and prompts
-
-In addition to tools, meka exposes MCP resources and prompts through several builtin tools (deferred: the agent calls `load_tool` first to fetch the schema, then invokes them):
-
-| Builtin | Purpose |
-|---------|---------|
-| `mcp_resource_list` | List resources from one or every configured server. |
-| `mcp_resource_read` | Read a resource by `server` + `uri`; text inline, binary base64-encoded. |
-| `mcp_prompt_list` | List prompts from one or every configured server, including their declared arguments. |
-| `mcp_prompt_get` | Render a prompt by `server` + `name` with optional `arguments`; returns `<role>: <text>` lines. |
-| `mcp_resource_subscribe` | Subscribe to `resources/updated` notifications for a specific URI. |
-| `mcp_resource_unsubscribe` | Cancel a prior subscription. |
-| `mcp_resource_updates_list` | Print every resource that has been reported as updated since the session started. |
-
-### Connection lifecycle
-
-- **Reconnection** is automatic for all transports (stdio, plain HTTP, OAuth-authenticated HTTP) when the transport closes mid-session. HTTP transports use exponential backoff (1s, 2s, 4s, 8s, 16s, capped 30s, max 5 attempts); stdio gets one immediate retry. The reconnect runs on a blocking thread to work around an upstream rmcp bug where the auth future is `!Send`.
-- **Failed initial connect** is retried in the background with its own backoff (5s doubling to a 5 minute ceiling) until the server comes up, and the server's tools are registered into every live session when it does. A server that is slow to boot, or that starts after meka, therefore recovers on its own rather than staying `failed` for the life of the process. This matters most for a `required` server, where every turn is rejected until it connects.
-- **Session-expired recovery**: rmcp transparently re-initialises HTTP sessions on 404 / JSON-RPC `-32001`. meka relies on this; no per-call handling is required.
-- **Cancellation**: when the agent cancels a tool call (e.g. Ctrl-C), meka sends `notifications/cancelled` to the server with the in-flight request id so the server can stop work.
-- **Timeouts**: tool calls default to 600 s; override with `MEKA_MCP_TOOL_TIMEOUT` in ms.
-- **Tool list refresh**: on `tools/list_changed`, meka re-discovers the server's tools and hot-swaps them in the registry; no restart needed.
-- **Progress notifications**: MCP tool calls attach a per-request `progressToken`; incoming `notifications/progress` render as a live status line under the tool invocation.
-- **Call identity**: `tools/call` carries two extra keys in `_meta` alongside the progress token. `meka/sessionId` is the UUID of the session the call came from, letting a server scope per-session state (a cache, a workspace, an audit trail) to one conversation; a sub-agent reports its own child session id. `meka/toolUseId` is the provider's tool-use id for the call. Both are absent for calls made outside a session, such as connection-time handshakes.
-- **Server instructions**: `InitializeResult.instructions` is captured once per connection and delivered in the per-turn context (sanitised + truncated to 2048 chars) under `[MCP server instructions]`. A server that connects late, or reconnects with different instructions, is announced as a change rather than rewriting anything already sent.
-- **stdio server logs**: a stdio server's own stderr (many servers log there) is captured, not inherited, so it never corrupts the REPL display. Each line is re-emitted on meka's `tracing` stream at `debug` level tagged with the server name, so it stays silent at default verbosity and surfaces under `-v` / `RUST_LOG`.
-- `resources/list_changed`, `prompts/list_changed`, and `resources/updated` notifications are logged at `info`/`debug` level.
-
-### Server-to-client features
-
-| Feature | meka behaviour |
-|---------|----------------|
-| `elicitation/create` | Routed to the calling session's frontend (REPL / ACP form or URL prompt) with a 60s timeout. Auto-declines when no in-flight tool call's frontend is registered or the user doesn't answer in time. |
+A bearer token and an OAuth client secret are unambiguously secrets, so they are not config at all. They live in meka's database and are set with `meka mcp add --auth-token-stdin` / `--client-secret-stdin`, or afterwards with `meka mcp login`. See [Credentials](../usage/mcp.md#credentials).
 
 ### `[mcp.servers.auth]`
 
 OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with a stored bearer token.
 
-The client secret is not a field here. It is a secret, so it lives in the database: set it with `meka mcp add --client-secret-stdin` or `meka mcp login <name> --client-secret-stdin`. See [Credentials](#credentials).
+The client secret is not a field here. It is a secret, so it lives in the database: set it with `meka mcp add --client-secret-stdin` or `meka mcp login <name> --client-secret-stdin`. See [Credentials](../usage/mcp.md#credentials).
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -1414,7 +1261,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 
 | Key | Purpose |
 |---|---|
-| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tools list` to see the canonical names. |
+| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](../usage/mcp.md#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tools list` to see the canonical names. |
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `ask`, `unrestricted`. |
 
@@ -1467,9 +1314,9 @@ These are floors. An orchestrator can restrict a particular worker further with 
 
 Two things a sub-agent might inherit are deliberately absent: the memory store and the [instructions file](../usage/instructions.md). Both are granted per call by [`agent_spawn`](../tools/overview.md#agent_spawn) and default to nothing.
 
-The distinction is what config can actually enforce. A *capability* can be withheld: a tool the registry never registered cannot be reached, however the parent phrases the task. *Context* cannot. An agent holding the instructions has them verbatim in its own system prompt, and one with `memory_read` can read any memory — so either can be copied into a worker's prompt whatever config says. A `[subagents].memory = "none"` key would look like a boundary while stopping only the worker's own browsing, not the content reaching it, and a control that reads as a guarantee but isn't one is worse than none.
+The distinction is what config can actually enforce. A *capability* can be withheld: a tool the registry never registered cannot be reached, however the parent phrases the task. *Context* cannot. An agent holding the instructions has them verbatim in its own system prompt, and one with `memory_read` can read any memory -- so either can be copied into a worker's prompt whatever config says. A `[subagents].memory = "none"` key would look like a boundary while stopping only the worker's own browsing, not the content reaching it, and a control that reads as a guarantee but isn't one is worse than none.
 
-The other half of the argument is that the config guardrail existed for a failure mode that no longer applies. It was there because the parent might *forget* — which only matters for things that are on by default. Both of these now default to off, so forgetting produces a clean worker.
+The other half of the argument is that the config guardrail existed for a failure mode that no longer applies. It was there because the parent might *forget* -- which only matters for things that are on by default. Both of these now default to off, so forgetting produces a clean worker.
 
 ## `[skills]`
 
@@ -1549,7 +1396,7 @@ claim_lease = "1h"
 
 `claim_lease` is how long a crashed host's occurrence stays unavailable before another host takes it. A due job is leased rather than consumed, so the row survives until the turn is delivered and a host that dies mid-delivery costs a retry rather than the occurrence. Raise it only if a gate probe plus a turn could plausibly exceed an hour; lowering it below that risks a second host taking an occurrence the first is still running, which the session lock catches at the cost of a deferral and a re-run gate probe. A host refuses to start on a value at or under `gate_timeout`, since a lease that cannot outlast the host's own probe is never right; that check does not cover the turn after the probe, which is unbounded, so leave headroom on top of it.
 
-`max_consecutive_fires` interleaves sessions: without it, one session's whole backlog runs to completion before another session's single due job is reached. Jobs past the budget keep their occurrence, run no gate, and are taken by the next sweep most-overdue first. It bounds a batch rather than a rate — sweeps do not overlap and the next starts as soon as the last ends, so a backlog still produces one turn per job, just in interleaved groups. `0` is rejected, since it would hold every job over forever; use `enabled = false` to turn scheduling off.
+`max_consecutive_fires` interleaves sessions: without it, one session's whole backlog runs to completion before another session's single due job is reached. Jobs past the budget keep their occurrence, run no gate, and are taken by the next sweep most-overdue first. It bounds a batch rather than a rate -- sweeps do not overlap and the next starts as soon as the last ends, so a backlog still produces one turn per job, just in interleaved groups. `0` is rejected, since it would hold every job over forever; use `enabled = false` to turn scheduling off.
 
 Setting `enabled = false` keeps the three `schedule_*` tool schemas out of every request and leaves existing jobs on disk without firing.
 

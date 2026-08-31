@@ -31,6 +31,12 @@ cargo install --locked --git https://github.com/k4yt3x/meka.git
 
 Building from source needs Rust 1.95 or newer and a C toolchain, which `rusqlite` uses to compile the bundled SQLite.
 
+Tagged releases also publish a container image, which the [`mekabox`](contrib/container/mekabox) wrapper uses to run the agent unrestricted against a disposable filesystem:
+
+```bash
+docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
+```
+
 ## Quick Start
 
 Add a provider profile with `meka provider add`. It runs the OAuth login (or prompts for an API key), stores the secret in the database, and writes the profile to `~/.config/meka/config.toml`:
