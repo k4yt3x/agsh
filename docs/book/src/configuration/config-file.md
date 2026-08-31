@@ -1605,6 +1605,44 @@ Maximum request body size in bytes. Requests exceeding this limit are rejected w
 |------|---------|
 | `integer` | `10485760` (10 MiB) |
 
+### `serve.relay_provider_errors`
+
+Whether a 502's payload carries the provider's own response text, as a `provider_response` member
+alongside `detail`.
+
+On by default. The upstream's error type is the actionable part of a failed turn, and "consult the
+server log" is no answer to anyone driving a meka they do not operate. `meka acp` has always handed
+the same text to its client, so withholding it on HTTP left the text just as public while making the
+one surface quieter.
+
+What it can expose is usually the upstream's response body, which can name the *operator's*
+provider account and its rate-limit posture: a fact about your billing relationship rather than about
+the caller or the conversation, which is why this is a switch rather than a decision meka makes for
+you. Not always, though. The member carries the failing call's error message, and for some failures
+that is meka's own sentence about the call rather than anything the provider sent.
+
+**It reaches `sessions:r`, not only `sessions:w`.** Submitting a turn takes the write scope, but the
+failure also rides the terminal `turn.failed` event, and `GET /v1/sessions/{id}/stream` replays that
+to any reader. Turn this off where read-only tokens go to people who may watch a session but are not
+entitled to the account behind it.
+
+```toml
+[serve]
+relay_provider_errors = false
+```
+
+`detail` is unchanged either way, so a client reading only that sees the same sentence and a
+context overflow keeps its "shorten it before retrying" remedy. Off, the member is simply absent
+and the text goes to the server log alone.
+
+Bounded to the provider's own response. A required MCP server that is down still reports only the
+server names under `/errors/mcp-unavailable`, because that reason is meka's own subprocess text and
+has carried a command line and its filesystem path. This key does not turn that on.
+
+| Type | Default |
+|------|---------|
+| `boolean` | `true` |
+
 ### `serve.docs`
 
 Whether to serve the Swagger UI at `/v1/docs` and the OpenAPI document at `/v1/openapi.json`.

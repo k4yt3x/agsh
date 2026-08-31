@@ -192,6 +192,26 @@ resolved when the migration ran (no profile configured yet), sessions are left w
 so; resume such a session once with `--provider <name>` to record it. The migration says which
 profile it recorded and on how many sessions; run once with `-v` if you want to see it.
 
+**A `502` from `meka serve` now carries the provider's own response text**, as a `provider_response`
+member on the Problem Detail. It used to be withheld and written only to the server log.
+
+The reason for the change is that the redaction defended less than it appeared to: `meka acp` has
+always handed the same text to its client, so withholding it on HTTP left the text just as public
+while making the one surface quieter. What it cost was the upstream's error type, which is the one
+part of a failed turn a client can act on.
+
+**Know who can read it before you leave it on.** An upstream refusal can name your provider account,
+your organisation, and your rate-limit posture. Submitting a turn takes `sessions:w`, but the
+failure is also carried by the terminal `turn.failed` event, and re-attaching to a stream takes only
+`sessions:r` -- so a read-only token sees it too. If you issue read-only tokens to people who may
+observe a session but are not entitled to the account behind it, set `[serve]
+relay_provider_errors = false`. Nothing else changes: `detail` carries the same sentence either way,
+and with the key off the member is simply absent.
+
+The `503` for a required MCP server that is down is not affected and still reports only the server
+names. That reason is meka's own subprocess text and has carried a command line and its filesystem
+path, which is a different disclosure and not one this key governs.
+
 **`GET /v1/info` no longer returns `provider` or `model`.** Read them from `GET /v1/providers`
 instead, which lists every configured profile with its `name`, its `type` (the backend), its
 `model`, and `active: true` on the one a session gets when it names none. The old fields held the

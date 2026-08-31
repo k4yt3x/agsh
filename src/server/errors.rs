@@ -124,6 +124,60 @@ impl ProblemDetail {
 /// stall. An hour is far past any real rate-limit window and far short of that.
 const RELAYED_RETRY_AFTER_CAP: u32 = 3_600;
 
+/// Shared by the two [`ErrorKind::ProviderUnavailable`] arms, which differ only in whether there is
+/// a `Retry-After` to relay. Named rather than written twice because a caller matching on `type`
+/// gets one answer and a human reading `detail` must not get two.
+const PROVIDER_UNAVAILABLE_DETAIL: &str =
+    "the provider did not complete this turn; its response is in the server log";
+
+/// The most of an upstream's response `provider_response` will repeat, in bytes.
+///
+/// Not a redaction measure. The arm below records why a length bound failed as one: it keeps the
+/// start, which is where an identifier sits. Keeping the start is right for *this* purpose, since
+/// that is also where the error type sits.
+///
+/// Bounded at all because the text is attacker-influenced and repeated to more than one reader. It
+/// arrives from `response.text()` with no cap of its own, it is copied into every 502 body, and the
+/// terminal `turn.failed` event carrying it is retained in the per-turn replay ring for reconnects.
+/// A `base_url` is user-supplied, so a misconfigured endpoint answering a multi-megabyte error page
+/// should cost a truncated string rather than a copy per reader. Same reasoning as
+/// [`RELAYED_RETRY_AFTER_CAP`] above.
+///
+/// Far above any real provider error, which run to a few hundred bytes of JSON.
+const RELAYED_BODY_CAP: usize = 4 * 1024;
+
+/// Truncation marker, charged against [`RELAYED_BODY_CAP`] rather than added on top of it.
+const TRUNCATION_MARKER: &str = "… (truncated; full text in the server log)";
+
+/// The two constants above are subtracted from each other, so their relationship is load-bearing
+/// rather than incidental. Asserted at compile time because the failure is otherwise a runtime
+/// panic inside a handler, on attacker-influenced input: the subtraction underflows, and a wrapped
+/// `usize` then indexes far past the end of the string.
+const _: () = assert!(
+    RELAYED_BODY_CAP > TRUNCATION_MARKER.len() + 4,
+    "RELAYED_BODY_CAP must exceed the marker by at least one UTF-8 character, or \
+     `bounded_upstream_body` underflows its budget"
+);
+
+/// Repeat at most [`RELAYED_BODY_CAP`] bytes of `message`, marking the cut when one happens.
+///
+/// The result never exceeds the cap and is never longer than the input, because the marker comes
+/// out of the budget instead of being appended to it. Added on top, a body a few bytes over the cap
+/// came back larger than it went in, while telling the reader it had been shortened.
+///
+/// Cuts on a character boundary. Multi-byte text is ordinary here -- a provider error in Japanese,
+/// an emoji in a proxy's HTML page -- and slicing mid-codepoint panics.
+fn bounded_upstream_body(message: &str) -> String {
+    if message.len() <= RELAYED_BODY_CAP {
+        return message.to_string();
+    }
+    let mut end = RELAYED_BODY_CAP - TRUNCATION_MARKER.len();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &message[..end], TRUNCATION_MARKER)
+}
+
 /// Catalogue of stable error types, matching the HTTP API docs table. Each variant maps to a
 /// `type` URI plus a fixed `title`. New variants land alongside new endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +234,39 @@ pub enum ErrorKind {
     InvalidBody,
     PayloadTooLarge,
     ConcurrencyLimit,
+    /// An upstream call failed for a reason meka could not place in one of the classes below.
+    ///
+    /// **A catch-all, not a "permanent" bucket, and the difference is worth stating because the
+    /// obvious reading of the name is the wrong one.** It is the `else` arm of
+    /// [`crate::error::provider_http_error`] plus every site that builds a bare
+    /// [`crate::error::MekaError::Provider`], so a revoked credential lands here, and so do a 408,
+    /// a 425, a 200 whose body was replaced by a proxy's HTML, and any mid-stream error type
+    /// outside the retryable allowlists. Several of those are transient; meka simply did not
+    /// recognise them as such.
+    ///
+    /// So it means "not classified as transient", which is weaker than "will fail again", and the
+    /// docs must not promise the stronger thing. [`Self::ProviderUnavailable`] is the positive
+    /// signal and this is its absence.
     Provider,
+    /// The upstream failed in a way meka's own classifier had already labelled transient.
+    ///
+    /// A 502 like [`Self::Provider`], and a distinct `type` for the reason
+    /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again
+    /// after a pause. Its absence is not the opposite claim, only the lack of this one; see
+    /// [`Self::Provider`].
+    ///
+    /// **The two used to be one type, and a relayed `Retry-After` was the only thing telling them
+    /// apart.** That header is absent from most of this variant's own instances: a transport
+    /// failure has no response to carry one, a mid-stream `overloaded_error` has no headers to
+    /// read, and [`crate::error::parse_retry_after`] reads only the delta-seconds form, so an
+    /// upstream answering with an HTTP date sends none meka can use. An overload therefore arrived
+    /// byte-identical to a dead credential, and a client had to choose between retrying that
+    /// credential forever and dropping turns a second attempt would have completed.
+    ///
+    /// Claims a *class*, never an outcome, and says nothing about how many attempts meka made.
+    /// `should_retry_provider_error` declines to retry at all once any output has reached the
+    /// stream or the retry budget is spent, so this can arrive after three attempts or after none.
+    ProviderUnavailable,
     /// The conversation no longer fits the model's context window, and meka could not compact it
     /// down far enough (or `auto_compact` is off).
     ///
@@ -229,6 +315,7 @@ impl ErrorKind {
             Self::PayloadTooLarge => "https://meka.so/errors/payload-too-large",
             Self::ConcurrencyLimit => "https://meka.so/errors/concurrency-limit",
             Self::Provider => "https://meka.so/errors/provider",
+            Self::ProviderUnavailable => "https://meka.so/errors/provider-unavailable",
             Self::ContextOverflow => "https://meka.so/errors/context-overflow",
             Self::McpUnavailable => "https://meka.so/errors/mcp-unavailable",
             Self::Internal => "https://meka.so/errors/internal",
@@ -255,6 +342,7 @@ impl ErrorKind {
             Self::PayloadTooLarge => "Request body exceeds configured limit",
             Self::ConcurrencyLimit => "Process-wide concurrency limit reached",
             Self::Provider => "Provider call failed",
+            Self::ProviderUnavailable => "Provider temporarily unavailable",
             Self::ContextOverflow => "Conversation exceeds the model's context window",
             Self::McpUnavailable => "Required MCP server is not ready",
             Self::Internal => "Internal server error",
@@ -289,11 +377,42 @@ impl IntoResponse for ProblemDetail {
     }
 }
 
-/// Best-effort mapping from internal `MekaError` to a Problem Detail. Used by handlers that
-/// propagate agent-layer errors back to the client. Variants without a dedicated HTTP shape
-/// land on `internal` (500). Refine on demand as new error paths surface.
-impl From<&MekaError> for ProblemDetail {
-    fn from(error: &MekaError) -> Self {
+impl ProblemDetail {
+    /// Best-effort mapping from internal `MekaError` to a Problem Detail. Used by handlers that
+    /// propagate agent-layer errors back to the client. Variants without a dedicated HTTP shape
+    /// land on `internal` (500). Refine on demand as new error paths surface.
+    ///
+    /// `relay_provider_errors` is `[serve] relay_provider_errors`, and it decides whether the four
+    /// upstream arms attach the provider's own response as a `provider_response` extension member.
+    /// It does not touch `detail`, which is meka's own sentence and identical in both states. A
+    /// parameter rather than a `From` impl precisely so it cannot be forgotten: a `.into()` that
+    /// silently picked one policy is how a deployment configured to withhold would have gone on
+    /// publishing from whichever call site missed the memo.
+    ///
+    /// Deliberately not extended to [`MekaError::McpTurnGated`], whose reasons are meka's own
+    /// subprocess text rather than a provider's response; see the key's own documentation.
+    pub fn for_error(error: &MekaError, relay_provider_errors: bool) -> Self {
+        // An extension member rather than a replacement for `detail`, because the two carry
+        // different things and neither substitutes for the other. `detail` is meka's own sentence
+        // and for a context overflow it is the entire remedy ("shorten it before retrying"), which
+        // relaying by overwrite would have deleted in exchange for a JSON blob. A client wanting to
+        // branch on the upstream's error type also wants one well-known field, not prose to parse.
+        //
+        // Closured rather than repeated per arm so the four cannot drift into disagreeing about
+        // what relaying means. Where `detail` does point at the server log -- three of the four
+        // arms; the overflow arm gives a remedy instead -- that stays true either way, since every
+        // arm logs the body unconditionally and saying so is not wrong just because the payload now
+        // carries it too.
+        let attach = |problem: ProblemDetail, message: &String| -> ProblemDetail {
+            if relay_provider_errors {
+                problem.with(
+                    "provider_response",
+                    Value::from(bounded_upstream_body(message)),
+                )
+            } else {
+                problem
+            }
+        };
         match error {
             // Adjacent, and to the same shape [`crate::server::reattach::agent_build_problem`]
             // gives them, because the two arrive the same way: a builder refusing something the
@@ -316,51 +435,81 @@ impl From<&MekaError> for ProblemDetail {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 message.clone(),
             ),
-            // Every one of these is an upstream failure rather than anything the HTTP caller got
-            // wrong, and what is left to say is that the upstream would not serve this turn, which
-            // is what 502 means.
+            // Everything upstream that the arm below did not claim. Deliberately *not* described as
+            // permanent: this is `provider_http_error`'s `else`, so a revoked credential lands here
+            // and so does a 408, a 425, and any mid-stream error type outside the retryable
+            // allowlists. Some of those are transient and meka merely failed to recognise them.
+            // "Not classified as transient" is the whole claim, and `ErrorKind::Provider` carries
+            // the longer version of why the stronger one would be false.
             //
-            // Not *because* the agent loop exhausted its retries first, which is only sometimes
-            // true: `should_retry_provider_error` gives up immediately once any output has reached
-            // the frontend, and a cancelled turn abandons the sequence wherever it stands. So one
-            // of these can arrive after three attempts or after one. The mapping does not depend on
-            // which, and saying it did would be inventing a guarantee.
+            // `InvalidRequest` belongs with it rather than with the arm below despite naming a 400.
+            // What the upstream called invalid is the conversation meka assembled, which the caller
+            // neither sent nor can fix by correcting its own payload, and sending it again
+            // unchanged gets the same 400 back.
             //
-            // `RetryableProvider`, `StreamError` and `ContextOverflow` belong here rather than
-            // merely filling the match. All three used to fall through to the `other` arm, which
-            // answers 500 and logs at `error!` as an unhandled internal fault, sending an operator
-            // to look in the wrong process for a failure meka had classified correctly.
+            // Logged always, and relayed when `[serve] relay_provider_errors` says so. That body
+            // can hold an account identifier, a rate-limit posture, and on one backend a fragment
+            // of the request that triggered it, which is why publishing it is the operator's call
+            // rather than this module's; `attach` above is where the answer is applied and
+            // `ServeConfig::relay_provider_errors` is where it is argued.
             //
-            // Logged rather than relayed. `MekaError::Provider` can carry the upstream's verbatim
-            // response body, which is not meka's to publish to an HTTP caller: it has held an
-            // account identifier, a rate-limit posture, and on one backend a fragment of the
-            // request that triggered it.
+            // Withholding was the default until 0.44 and `webhook.rs` still states that policy for
+            // outbound deliveries -- identifiers and status travel, content does not -- which is
+            // right there, because a webhook URL is a string in a config file rather than a caller
+            // holding a token. The difference is who is on the other end.
             //
-            // A length bound was the first attempt and did not work, for a reason worth recording:
-            // it keeps the *start* of the body, and every one of those lives at the start of a JSON
-            // error object. Most provider errors are also shorter than any sensible bound, so the
-            // common case was relayed whole and the cut fired only on the long ones. The policy
-            // here is the one `webhook.rs` already states for outbound deliveries -- identifiers
-            // and status travel, content does not -- and the log is where an operator reads the
-            // rest.
-            MekaError::Provider(message)
-            | MekaError::InvalidRequest(message)
-            | MekaError::StreamError(message) => {
+            // A length bound was tried as a *redaction* technique and did not work, for a reason
+            // worth keeping: it keeps the *start* of the body, and every one of those identifiers
+            // lives at the start of a JSON error object. `RELAYED_BODY_CAP` is a size bound rather
+            // than a redaction one and does not revisit that.
+            MekaError::Provider(message) | MekaError::InvalidRequest(message) => {
                 tracing::warn!("provider error: {}", message);
-                ProblemDetail::new(
+                let problem = ProblemDetail::new(
                     ErrorKind::Provider,
                     StatusCode::BAD_GATEWAY,
                     "the provider rejected or failed this turn; its response is in the server log",
-                )
+                );
+                attach(problem, message)
             }
-            // Its own arm only to keep the upstream's `Retry-After`, which the neighbours have
-            // nothing equivalent to. Same status and same type: a client switching on those cannot
-            // tell this from the arm above, and should not need to.
+            // The transient half, under its own type: failures meka's own classifier labelled
+            // retryable, so the answer is recovered from the branch it took rather than guessed at
+            // here. It says nothing about how many attempts followed. `should_retry_provider_error`
+            // declines to retry at all once any output has reached the frontend or the retry budget
+            // is spent, so one of these can arrive after three attempts or after none, and reading
+            // a count into the type would be inventing a guarantee.
             //
-            // The hint is worth relaying because it is fresh rather than spent. It is read from the
-            // headers of the *final* attempt, and the agent loop gives up rather than sleeping
-            // again, so nothing has elapsed against it by the time it arrives here. Dropping it
-            // leaves a client backing off blind against a server that was told the number.
+            // Split from the arm above because a client's sensible responses differ, and sharing
+            // one type left it unable to choose. A relayed `Retry-After` was the only
+            // thing separating them, and it is missing from most instances of this very
+            // arm: a transport failure never received a response to carry one, a
+            // mid-stream `overloaded` event has no headers, and `parse_retry_after`
+            // reads only delta-seconds. The 529 a bridge sees most often
+            // therefore arrived byte-identical to a dead credential.
+            //
+            // `StreamError` is here rather than above because every producer is transport-shaped:
+            // an idle timeout, an `Err` from the SSE stream itself, and a stream that
+            // ended before its terminal event. A malformed SSE payload is *not* one of
+            // them, being skipped with a `warn!` and a `continue`, so nothing in this
+            // arm resends into a body the provider will reject identically forever.
+            //
+            // Both used to fall through to the `other` arm, which answers 500 and logs at `error!`
+            // as an unhandled internal fault, sending an operator to look in the wrong process for
+            // a failure meka had classified correctly.
+            MekaError::StreamError(message) => {
+                tracing::warn!("provider error: {}", message);
+                let problem = ProblemDetail::new(
+                    ErrorKind::ProviderUnavailable,
+                    StatusCode::BAD_GATEWAY,
+                    PROVIDER_UNAVAILABLE_DETAIL,
+                );
+                attach(problem, message)
+            }
+            // The `Retry-After`, when there is one, is worth relaying because it is fresh rather
+            // than spent. It is read from the headers of the *final* attempt, and the agent loop
+            // gives up rather than sleeping again, so nothing has elapsed against it by the time it
+            // arrives here. Dropping it leaves a client backing off blind against a server that was
+            // told the number. `StreamError` above has no equivalent, which is the only reason
+            // these two are separate arms rather than one.
             //
             // Clamped, because `parse_retry_after` relays whatever the header said and a broken or
             // hostile upstream can say a year. `u32` seconds is also what `ProblemDetail` carries,
@@ -371,10 +520,13 @@ impl From<&MekaError> for ProblemDetail {
                 ..
             } => {
                 tracing::warn!("provider error: {}", message);
-                let problem = ProblemDetail::new(
-                    ErrorKind::Provider,
-                    StatusCode::BAD_GATEWAY,
-                    "the provider rejected or failed this turn; its response is in the server log",
+                let problem = attach(
+                    ProblemDetail::new(
+                        ErrorKind::ProviderUnavailable,
+                        StatusCode::BAD_GATEWAY,
+                        PROVIDER_UNAVAILABLE_DETAIL,
+                    ),
+                    message,
                 );
                 match retry_after {
                     Some(delay) => problem.with_retry_after(
@@ -400,12 +552,13 @@ impl From<&MekaError> for ProblemDetail {
             // nothing to drop.
             MekaError::ContextOverflow(message) => {
                 tracing::warn!("context overflow: {}", message);
-                ProblemDetail::new(
+                let problem = ProblemDetail::new(
                     ErrorKind::ContextOverflow,
                     StatusCode::BAD_GATEWAY,
                     "the conversation exceeds the model's context window and could not be \
                      compacted further; shorten it before retrying",
-                )
+                );
+                attach(problem, message)
             }
             // The last variant that was falling into the `other` arm with a fault of its own, and
             // the one where 500 read worst: a required MCP server being down is a clean, fully
@@ -484,19 +637,72 @@ mod tests {
     #[test]
     fn meka_error_provider_maps_to_502() {
         let error = MekaError::Provider("upstream 529".into());
-        let problem = ProblemDetail::from(&error);
+        let problem = ProblemDetail::for_error(&error, false);
         assert_eq!(problem.status, 502);
         assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
     }
 
-    /// A 502 must not carry the provider's own response text.
+    /// The size bound never exceeds the cap, never grows the input, and cuts on a character
+    /// boundary.
+    ///
+    /// The four-byte case carries a one-byte prefix on purpose: `RELAYED_BODY_CAP` is 4096, which
+    /// is itself divisible by four, so an unprefixed run of four-byte characters lands the cut on a
+    /// boundary already and a naive slice would pass. Only a misaligned input exercises the walk.
+    #[test]
+    fn the_relayed_body_is_bounded_and_cut_on_a_character_boundary() {
+        for (label, body) in [
+            ("three-byte", "\u{3042}".repeat(RELAYED_BODY_CAP)),
+            (
+                "four-byte misaligned",
+                format!("a{}", "\u{1F642}".repeat(RELAYED_BODY_CAP)),
+            ),
+            (
+                "mixed",
+                format!(
+                    "{}{}",
+                    "a".repeat(RELAYED_BODY_CAP - 1),
+                    "\u{3042}".repeat(16)
+                ),
+            ),
+            // Just over the cap: adding a marker on top used to return more bytes than it was
+            // given, which is the one size a bound must not grow.
+            ("one byte over", "a".repeat(RELAYED_BODY_CAP + 1)),
+        ] {
+            let out = bounded_upstream_body(&body);
+            assert!(
+                out.len() <= RELAYED_BODY_CAP,
+                "{label}: a bound that can be exceeded is not one; got {} bytes",
+                out.len()
+            );
+            assert!(
+                out.len() <= body.len(),
+                "{label}: truncation must not grow the input; {} -> {}",
+                body.len(),
+                out.len()
+            );
+            assert!(out.contains("truncated"), "{label} must mark the cut");
+            assert!(
+                body.starts_with(&out[..out.len() - TRUNCATION_MARKER.len()]),
+                "{label}: the kept part must be the input's own prefix, which is where a \
+                 provider's error type sits"
+            );
+        }
+        let exact = "x".repeat(RELAYED_BODY_CAP);
+        assert_eq!(
+            bounded_upstream_body(&exact),
+            exact,
+            "a body exactly at the cap is relayed whole, not marked truncated"
+        );
+    }
+
+    /// The operator's switch decides whether a 502 carries the provider's own response text.
     ///
     /// That body has held an account identifier, a rate-limit posture and a fragment of the
     /// request; whoever holds a `sessions:w` token is not necessarily whoever holds the provider
     /// account. Truncating it was the first attempt and kept the start, which is where all three
     /// live in a JSON error object.
     #[test]
-    fn a_provider_failure_does_not_relay_the_upstream_body() {
+    fn the_upstream_body_travels_only_when_the_operator_asked_for_it() {
         let leaky = "{\"error\":{\"account_uuid\":\"acct-0f3c\",\"type\":\"rate_limit_error\",\
                      \"message\":\"organization has exceeded its quota\"}}";
         for error in [
@@ -508,25 +714,50 @@ mod tests {
                 server_error_on_completion: false,
             },
             MekaError::StreamError(leaky.to_string()),
+            // In the loop, not merely documented. `http-api.md` promises this arm relays like the
+            // others, and nothing else in the suite calls it with relaying on: deleting its
+            // `attach` left a documented member silently absent with everything green.
+            MekaError::ContextOverflow(leaky.to_string()),
         ] {
-            let problem = ProblemDetail::from(&error);
-            // Load-bearing, and not decoration around the redaction checks. Without it the variants
-            // added later pass this test even with their arm deleted: the catch-all's detail is
-            // "internal server error; consult server logs", which contains neither secret and does
-            // contain "server log" as a substring of "server logs".
-            assert_eq!(problem.status, 502, "{error}");
-            let detail = problem.detail.unwrap_or_default();
+            let withheld = ProblemDetail::for_error(&error, false);
+            // Kept because a deleted arm falls to the catch-all, whose detail is "internal server
+            // error; consult server logs" -- it contains neither secret and does contain "server
+            // log" as a substring of "server logs", so the redaction checks alone would pass it.
+            assert_eq!(withheld.status, 502, "{error}");
+            let body = serde_json::to_string(&withheld).expect("serialize");
             assert!(
-                !detail.contains("acct-0f3c"),
-                "the upstream body reached the caller: {detail}",
+                !body.contains("acct-0f3c") && !body.contains("exceeded its quota"),
+                "the upstream body reached the caller: {body}",
             );
+            // The three provider arms point at the log; the overflow arm spends its `detail` on the
+            // remedy instead ("shorten it before retrying") and names no log, which is right and is
+            // why this is not asserted across the loop.
+            let detail = withheld.detail.as_deref().unwrap_or_default().to_string();
+            if !matches!(error, MekaError::ContextOverflow(_)) {
+                assert!(
+                    detail.contains("server log"),
+                    "and the caller must be told where the detail went: {error}",
+                );
+            }
             assert!(
-                !detail.contains("exceeded its quota"),
-                "the upstream body reached the caller: {detail}",
+                !detail.is_empty(),
+                "every arm owes the caller a sentence of meka's own: {error}",
             );
-            assert!(
-                detail.contains("server log"),
-                "and the caller must be told where the detail went: {detail}",
+
+            // The whole body, not just `detail`: an arm that moved the text into an extension
+            // would satisfy a `detail`-only assertion while publishing exactly what the operator
+            // turned off. `provider_response` is flattened to the top level like every other
+            // extension, so one serialisation covers both places it could hide.
+            let relayed = ProblemDetail::for_error(&error, true);
+            assert_eq!(
+                relayed.extensions.get("provider_response"),
+                Some(&Value::from(leaky)),
+                "with relaying on, the upstream's own words must reach the caller: {error}",
+            );
+            assert_eq!(
+                relayed.detail, withheld.detail,
+                "relaying adds a member; it must not rewrite meka's own sentence, which for a \
+                 context overflow is the entire remedy: {error}",
             );
         }
     }
@@ -540,12 +771,13 @@ mod tests {
     #[test]
     fn meka_error_invalid_request_maps_to_502() {
         let error = MekaError::InvalidRequest("400 invalid_request_error".into());
-        let problem = ProblemDetail::from(&error);
+        let problem = ProblemDetail::for_error(&error, false);
         assert_eq!(problem.status, 502);
         assert_eq!(problem.type_uri, "https://meka.so/errors/provider");
     }
 
-    /// An upstream failure reaches the caller as one rather than as an internal fault.
+    /// An upstream failure reaches the caller as one rather than as an internal fault, and says it
+    /// was the transient kind.
     ///
     /// Both used to fall through to the catch-all, so exhausting the retries on a 429 answered 500
     /// and logged itself as an unhandled internal fault, sending an operator to look in the wrong
@@ -554,8 +786,13 @@ mod tests {
     /// The type URI is asserted alongside the status because the two travel together: one error
     /// type answering with two different statuses is what a client keying on the type cannot
     /// handle.
+    ///
+    /// `StreamError` is in here rather than with `Provider` because every producer is
+    /// transport-shaped -- an idle timeout, an `Err` from the SSE stream, a stream that ended
+    /// before its terminal event -- and a malformed payload is skipped rather than raised, so
+    /// nothing here invites a resend into a body the provider rejects identically every time.
     #[test]
-    fn an_exhausted_upstream_failure_maps_to_502() {
+    fn an_exhausted_upstream_failure_maps_to_502_as_unavailable() {
         for error in [
             MekaError::RetryableProvider {
                 message: "529 overloaded, four attempts".into(),
@@ -564,13 +801,62 @@ mod tests {
             },
             MekaError::StreamError("connection closed mid-stream".into()),
         ] {
-            let problem = ProblemDetail::from(&error);
+            let problem = ProblemDetail::for_error(&error, false);
             assert_eq!(problem.status, 502, "{error}");
             assert_eq!(
-                problem.type_uri, "https://meka.so/errors/provider",
+                problem.type_uri, "https://meka.so/errors/provider-unavailable",
                 "{error}"
             );
         }
+    }
+
+    /// A transient failure carrying no `Retry-After` is still distinguishable from a permanent one.
+    ///
+    /// This is the whole complaint, as a test. The two shared `/errors/provider`, so a relayed
+    /// `Retry-After` was the only thing separating them, and it is absent from most transient
+    /// failures: a transport error has no response to read a header from, a mid-stream `overloaded`
+    /// event has no headers at all, and `parse_retry_after` understands only delta-seconds. An
+    /// overload therefore reached a bridge byte-identical to a revoked credential, leaving it to
+    /// choose between retrying a dead token forever and discarding turns a second attempt would
+    /// have completed.
+    ///
+    /// `retry_after: None` is the load-bearing part of the setup. With a header present the two
+    /// were already distinguishable, so a version of this test that supplied one would pass against
+    /// the shape it exists to reject.
+    #[test]
+    fn a_transient_failure_without_a_retry_after_is_still_distinguishable() {
+        let transient = ProblemDetail::for_error(
+            &MekaError::RetryableProvider {
+                message: "529 overloaded".into(),
+                retry_after: None,
+                server_error_on_completion: false,
+            },
+            false,
+        );
+        let permanent =
+            ProblemDetail::for_error(&MekaError::Provider("401 invalid x-api-key".into()), false);
+
+        assert_eq!(
+            transient.retry_after_seconds, None,
+            "the setup must be the case with no header, or this proves nothing"
+        );
+        assert_eq!(transient.status, permanent.status, "both are 502");
+        assert_ne!(
+            transient.type_uri, permanent.type_uri,
+            "with no `Retry-After` to tell them apart, `type` is all a client has left"
+        );
+        assert_eq!(
+            transient.type_uri,
+            "https://meka.so/errors/provider-unavailable"
+        );
+        assert_eq!(permanent.type_uri, "https://meka.so/errors/provider");
+
+        // The titles too, for the reason `a_context_overflow_is_502_under_its_own_type` asserts
+        // its own: `type` is what a client switches on, but `title` is what a UI renders, and
+        // nothing else in the suite would notice the two variants being given one string.
+        assert_eq!(transient.title, "Provider temporarily unavailable");
+        assert_eq!(permanent.title, "Provider call failed");
+        assert_ne!(transient.title, permanent.title);
     }
 
     /// A required MCP server that never came up answers 503 under its own type, and its reasons
@@ -593,7 +879,12 @@ mod tests {
                 ("exa".to_string(), "handshake timed out".to_string()),
             ],
         };
-        let problem = ProblemDetail::from(&error);
+        // `true`, which is the case that can actually fail. `[serve] relay_provider_errors` governs
+        // the *provider's* response and is documented in three places as not reaching this arm, but
+        // asserting it with relaying off proved only that the off switch works. Adding `attach()`
+        // here would have published a spawn failure's command line and path to every caller with
+        // nothing going red.
+        let problem = ProblemDetail::for_error(&error, true);
 
         assert_eq!(problem.status, 503);
         assert_eq!(problem.type_uri, "https://meka.so/errors/mcp-unavailable");
@@ -619,33 +910,42 @@ mod tests {
     /// rather than saturate if the cast were unguarded.
     #[test]
     fn a_retryable_failure_relays_the_upstream_retry_after() {
-        let problem = ProblemDetail::from(&MekaError::RetryableProvider {
-            message: "429 rate limited".into(),
-            retry_after: Some(std::time::Duration::from_secs(30)),
-            server_error_on_completion: false,
-        });
+        let problem = ProblemDetail::for_error(
+            &MekaError::RetryableProvider {
+                message: "429 rate limited".into(),
+                retry_after: Some(std::time::Duration::from_secs(30)),
+                server_error_on_completion: false,
+            },
+            false,
+        );
         assert_eq!(problem.retry_after_seconds, Some(30));
         assert_eq!(
             problem.extensions.get("retry_after"),
             Some(&Value::from(30))
         );
 
-        let absurd = ProblemDetail::from(&MekaError::RetryableProvider {
-            message: "529 overloaded".into(),
-            retry_after: Some(std::time::Duration::from_secs(31_536_000)),
-            server_error_on_completion: false,
-        });
+        let absurd = ProblemDetail::for_error(
+            &MekaError::RetryableProvider {
+                message: "529 overloaded".into(),
+                retry_after: Some(std::time::Duration::from_secs(31_536_000)),
+                server_error_on_completion: false,
+            },
+            false,
+        );
         assert_eq!(
             absurd.retry_after_seconds,
             Some(RELAYED_RETRY_AFTER_CAP),
             "a header saying a year must be clamped, not relayed and not wrapped"
         );
 
-        let silent = ProblemDetail::from(&MekaError::RetryableProvider {
-            message: "connection reset".into(),
-            retry_after: None,
-            server_error_on_completion: false,
-        });
+        let silent = ProblemDetail::for_error(
+            &MekaError::RetryableProvider {
+                message: "connection reset".into(),
+                retry_after: None,
+                server_error_on_completion: false,
+            },
+            false,
+        );
         assert_eq!(
             silent.retry_after_seconds, None,
             "a transport failure has no header to relay, so meka must not invent one"
@@ -661,11 +961,14 @@ mod tests {
     /// relaxed to make a match arm simpler, that loop comes back.
     #[test]
     fn a_context_overflow_is_502_under_its_own_type() {
-        let problem = ProblemDetail::from(&MekaError::ContextOverflow(
-            "API returned status 400: {\"error\":{\"account_uuid\":\"acct-0f3c\",\"message\":\
+        let problem = ProblemDetail::for_error(
+            &MekaError::ContextOverflow(
+                "API returned status 400: {\"error\":{\"account_uuid\":\"acct-0f3c\",\"message\":\
              \"prompt is too long: 250000 tokens > 200000 maximum\"}}"
-                .into(),
-        ));
+                    .into(),
+            ),
+            false,
+        );
         assert_eq!(problem.status, 502);
         assert_eq!(
             problem.type_uri, "https://meka.so/errors/context-overflow",
@@ -697,7 +1000,7 @@ mod tests {
     #[test]
     fn meka_error_session_locked_carries_session_id() {
         let id = uuid::Uuid::nil();
-        let problem = ProblemDetail::from(&MekaError::SessionLocked(id));
+        let problem = ProblemDetail::for_error(&MekaError::SessionLocked(id), false);
         assert_eq!(problem.status, 409);
         assert_eq!(problem.type_uri, "https://meka.so/errors/session-locked");
         assert_eq!(

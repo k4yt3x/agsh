@@ -657,9 +657,11 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 
 > **Error detail redaction:** Validation errors (`422`) return a generic detail message (e.g. `"invalid session creation request body"`) rather than echoing internal field names or parser diagnostics. Consult the [OpenAPI spec](#endpoint-reference) for the expected request schema.
 >
-> A `502` on a turn says only that the provider rejected or failed it; it carries none of the provider's own response. An upstream refusal can contain account identifiers, rate-limit posture, and fragments of the request that triggered it, and none of that is meka's to publish to an HTTP caller. The full text goes to the server log, which is where an operator reads it. The same holds for the `503` a turn gets when a required MCP server is down: the server names travel, the connector's reason does not, since it has carried a command line and its path.
+> A `502` on a turn carries the provider's own response text in a `provider_response` member **when `[serve] relay_provider_errors` is on, which is the default**; a deployment that has turned it off omits the member entirely. It exists because the upstream's error type is the actionable part and a client that cannot see it is left guessing. `detail` stays meka's own sentence either way, so nothing is traded for it, and the relayed text is capped at 4 KiB with the cut marked. The full text goes to the server log regardless.
 >
-> The MCP endpoints under `/v1/mcp` are the deliberate exception, and the difference is who asked. A caller naming one server and asking why it will not connect is asking *for* that reason, so `GET /v1/mcp/{name}/tools` and `POST /v1/mcp/{name}/reconnect` do relay it. A caller asking for a completion is not, and does not get it.
+> **`provider_response` is readable at `sessions:r`.** Submitting a turn takes `sessions:w`, but the failure also rides the terminal `turn.failed` event, which `GET /v1/sessions/{id}/stream` replays to any reader. Since an upstream refusal can name the *operator's* provider account and its rate-limit posture, set `[serve] relay_provider_errors = false` where read-only tokens go to people who may watch a session but are not entitled to the account behind it.
+>
+> The `503` a turn gets when a required MCP server is down is not covered by that key and never relays: the server names travel, the connector's reason does not, since it is meka's own subprocess text and has carried a command line and its path. The endpoints under `/v1/mcp` do relay their reason, since a caller naming one server and asking why it will not connect is asking *for* it.
 
 ### Error types
 
@@ -683,16 +685,23 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
 | `/errors/stream-detached` | 500 | SSE-only. A re-attached stream ended with no recorded outcome because the turn's task died; read `GET /messages` for what completed |
-| `/errors/provider` | 502 | Upstream provider call failed. Covers both a transient outage and a permanent one such as a bad credential or a misconfigured `base_url`, so it carries no promise that resending helps |
-| `/errors/context-overflow` | 502 | The conversation exceeds the model's context window and could not be compacted further. **Do not retry unchanged**; shorten it first |
+| `/errors/provider` | 502 | An upstream call failed for a reason meka could not classify as transient. Usually permanent (a revoked credential, a `base_url` that is not the API), but it is a catch-all, so treat it as "no reason to expect a retry to help" rather than "a retry cannot help" |
+| `/errors/provider-unavailable` | 502 | The upstream failed in a way meka's classifier had already labelled transient. **Worth one backed-off resend.** Carries a `Retry-After` when the upstream gave one, which most of the time it did not |
+| `/errors/context-overflow` | 502 | The conversation exceeds the model's context window and could not be compacted further. **Do not retry unchanged**; shorten it first. Carries `provider_response` like the two above, since the upstream is what refused it |
 | `/errors/mcp-unavailable` | 503 | An MCP server marked `required` was not connected, so the turn was refused before reaching the provider. The `servers` extension names them; each one's reason is in the server log |
 | `/errors/internal` | 500 | Unhandled server error |
 
 Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the same error shape, then close the connection.
 
-> The two 502s are the ones worth branching on. `/errors/provider` says the upstream would not serve this turn, and is worth one backed-off resend; it does not say how many attempts meka made first, because it gives up as soon as any output has reached the stream and a cancelled turn abandons the sequence wherever it stands, so a permanent failure and an exhausted one look the same from here. `/errors/context-overflow` says the request itself no longer fits, and will not fit next time either: retrying it unchanged loops until your client gives up. Shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
+> The three 502s are the ones worth branching on. `/errors/provider-unavailable` is the positive signal: meka's classifier recognised the failure as transient, which covers an overload, a 5xx, a dropped connection and a stalled stream. Resend it after a pause. `/errors/context-overflow` is the flat refusal: the request no longer fits and will not fit next time either, so retrying it unchanged loops until your client gives up; shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
 >
-> A `Retry-After` on a `/errors/provider` response is the upstream's own, relayed up to an hour; meka reads only the delta-seconds form, so an upstream that answers with an HTTP date sends none. Honour it in preference to your own backoff. `/errors/context-overflow` never carries one.
+> **`/errors/provider` is the absence of the first signal, not the opposite of it.** It is a catch-all covering everything meka could not place, so a revoked credential lands there and so does a 408, a truncated response body, and any mid-stream error type meka does not yet recognise. Most of the time it is permanent and worth surfacing to a human rather than retrying, but do not build a client that will *never* retry it: one unhurried resend is reasonable, an unbounded loop is not.
+>
+> **Branch on `type`, not on `Retry-After`.** A `Retry-After` is present only when the upstream volunteered one in delta-seconds form, which most transient failures do not: a dropped connection never produced a response to carry a header, a mid-stream `overloaded_error` has no headers at all, and an upstream answering with an HTTP date sends none meka can read. Treating its absence as "permanent" discards turns a second attempt would have completed, which is the reason these two types exist separately.
+>
+> Neither provider type says how many attempts meka made first. It declines to retry at all once any output has reached the stream or its retry budget is spent, and a cancelled turn abandons the sequence wherever it stands, so one of these can reach you after three attempts or after none. `/errors/provider-unavailable` claims a failure class, not that your next attempt will succeed.
+>
+> A `Retry-After` on a `/errors/provider-unavailable` response is the upstream's own, relayed up to an hour. Honour it in preference to your own backoff. The other two never carry one.
 
 ## Discovery endpoints
 

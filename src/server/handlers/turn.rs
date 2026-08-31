@@ -171,7 +171,7 @@ pub struct NoticeView {
         (status = 422, description = "Invalid body, or the id names a sub-agent's conversation. Read `type`: `/errors/invalid-body` is worth resending with a corrected payload, `/errors/session-not-drivable` never is", body = ProblemDetail),
         (status = 429, description = "Concurrency limit reached or idempotency-key cache full", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
-        (status = 502, description = "The provider refused or failed this turn. Read `type`: `/errors/provider` is worth resending after a pause, `/errors/context-overflow` is not until the conversation is shortened", body = ProblemDetail),
+        (status = 502, description = "The provider refused or failed this turn. Read `type`: `/errors/provider-unavailable` was classified as transient and is worth resending after a pause, `/errors/provider` is the catch-all for everything else and usually needs the account or endpoint fixed, and `/errors/context-overflow` needs the conversation shortened first", body = ProblemDetail),
         (status = 503, description = "An MCP server marked `required` was not connected, so the turn never reached the provider", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
@@ -351,6 +351,7 @@ pub async fn submit_turn(
             turn_guard,
             state.webhooks.clone(),
             idempotency_ticket,
+            state.config.relay_provider_errors,
         )
         .await
         .map(IntoResponse::into_response)
@@ -599,6 +600,10 @@ impl Drop for StreamGuard {
     }
 }
 
+// Eight now that the relay policy travels with the turn. Bundling them into a struct would hide
+// which ones the spawned task actually captures, and taking `ServerState` whole would hand this
+// function the session map and the idempotency cache it has no business touching.
+#[allow(clippy::too_many_arguments)]
 async fn run_blocking_turn(
     entry: crate::server::state::SessionEntry,
     session_id: Uuid,
@@ -607,6 +612,7 @@ async fn run_blocking_turn(
     turn_guard: TurnGuard,
     webhooks: crate::server::webhook::WebhookDispatcher,
     idempotency_ticket: Option<crate::server::idempotency::IdempotencyTicket>,
+    relay_provider_errors: bool,
 ) -> Result<Json<TurnResponse>, ProblemDetail> {
     // `try_lock_owned`, and the turn runs on a spawned task, for the same reason the streaming
     // path does it: axum drops a handler's future when the client disconnects, and a turn is not a
@@ -704,7 +710,7 @@ async fn run_blocking_turn(
                     crate::server::sse::SseEventType::TurnFailed
                 };
                 notify_turn_end(&webhooks, event_type, turn_id, session_id);
-                Err(ProblemDetail::from(&error))
+                Err(ProblemDetail::for_error(&error, relay_provider_errors))
             }
         };
         // Inside the task, so a client that hung up still records its outcome against the key.
@@ -780,6 +786,7 @@ async fn run_streaming_turn(
     let entry_for_task = entry.clone();
     let cancel_for_task = cancellation.clone();
     let shutdown_for_task = state.shutdown.clone();
+    let relay_for_task = state.config.relay_provider_errors;
     let webhooks_for_task = state.webhooks.clone();
 
     // Spawn the turn so the SSE response can return immediately.
@@ -816,6 +823,7 @@ async fn run_streaming_turn(
             usage,
             turn_id,
             session_id,
+            relay_for_task,
         );
         notify_turn_end(&webhooks_for_task, event_type, turn_id, session_id);
         entry_for_task.frontend.record_terminal(event_type, data)
@@ -993,6 +1001,7 @@ fn terminal_event_parts(
     usage: UsageView,
     turn_id: Uuid,
     session_id: Uuid,
+    relay_provider_errors: bool,
 ) -> (crate::server::sse::SseEventType, serde_json::Value) {
     if let Ok(Ok(outcome)) = &turn_result {
         return finished_parts(outcome, usage, turn_id, session_id);
@@ -1011,7 +1020,9 @@ fn terminal_event_parts(
         }
         Ok(Err(error)) => {
             let instance = format!("/v1/sessions/{}/turn", session_id);
-            let problem = crate::server::errors::ProblemDetail::from(&error).instance(instance);
+            let problem =
+                crate::server::errors::ProblemDetail::for_error(&error, relay_provider_errors)
+                    .instance(instance);
             (
                 crate::server::sse::SseEventType::TurnFailed,
                 serde_json::json!({
@@ -1092,7 +1103,9 @@ async fn join_terminal(
 /// stream slot open for a reconnect to read.
 fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid) -> Event {
     let (event_type, data) =
-        terminal_event_parts(Err(panic), false, UsageView::default(), turn_id, session_id);
+        // The flag is a don't-care here: a `JoinError` takes the panic arm, which renders a fixed
+        // `/errors/internal` payload and never reaches an upstream message to relay or withhold.
+        terminal_event_parts(Err(panic), false, UsageView::default(), turn_id, session_id, false);
     // Sent without an `id:` field. The generator lives on the task that just died, and id 0 is
     // already `turn.started`; reusing it would have a client store 0 as its resume position and
     // replay the whole turn on reconnect. An SSE event with no id leaves the client's stored

@@ -319,6 +319,28 @@ pub struct ServeConfig {
     pub max_concurrent_turns: Option<usize>,
     /// Request body size limit (bytes). Default 10 MiB.
     pub max_body_bytes: Option<usize>,
+    /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
+    /// extension member. Default `true`. `detail` is meka's own sentence and is identical either
+    /// way.
+    ///
+    /// On, because the upstream's error type is the actionable part of a failed turn and "consult
+    /// the server log" is no answer to anyone running against a meka they do not operate. `meka
+    /// acp` has always handed the same text to its client, so withholding it on HTTP left the text
+    /// just as public while making the one surface quieter.
+    ///
+    /// **What it can expose.** Usually the upstream's response body, which can name the
+    /// *operator's* provider account and its rate-limit posture. Not always, though: the
+    /// member carries the failing call's error message, and for some failures that is meka's
+    /// own sentence about the call rather than anything the provider sent.
+    ///
+    /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
+    /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
+    /// /v1/sessions/{id}/stream` replays that to any reader.
+    ///
+    /// Turn it off where read-only tokens go to people who may watch a session but are not
+    /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way:
+    /// it reports server names only, and that reason is meka's own subprocess text.
+    pub relay_provider_errors: Option<bool>,
     /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
     /// `/v1/openapi.json`. Default `false`.
     ///
@@ -1662,6 +1684,9 @@ pub struct ResolvedServeConfig {
     pub shutdown_drain_timeout: std::time::Duration,
     pub max_concurrent_turns: Option<usize>,
     pub max_body_bytes: usize,
+    /// Whether a 502 carries the provider's own response as a `provider_response` member. On
+    /// unless turned off.
+    pub relay_provider_errors: bool,
     /// Whether `/v1/docs` and `/v1/openapi.json` are served. Off unless asked for.
     pub docs: bool,
     /// How many SSE events per turn to retain for `Last-Event-ID` replay.
@@ -1792,6 +1817,7 @@ impl ResolvedServeConfig {
                 .unwrap_or(std::time::Duration::from_secs(30)),
             max_concurrent_turns: raw.max_concurrent_turns,
             max_body_bytes: raw.max_body_bytes.unwrap_or(10 * 1024 * 1024),
+            relay_provider_errors: raw.relay_provider_errors.unwrap_or(true),
             docs: raw.docs.unwrap_or(false),
             // Matches the broadcast channel's capacity: retaining more than the live channel can
             // buffer would let a client replay events a *connected* consumer would have been

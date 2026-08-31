@@ -2744,11 +2744,90 @@ fn streaming_provider_failure_emits_turn_failed_event() {
         "stream must emit turn.failed when provider errors mid-stream; body was:\n{}",
         body,
     );
+    // Quoted, so the match ends where the type does. Bare, this is a *prefix* of
+    // `/errors/provider-unavailable` and passes against either one, which is exactly the shape
+    // `the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one` exists to tell
+    // apart. The `fail` kind is `MekaError::Provider`, so this one is the permanent type.
     assert!(
-        body.contains("https://meka.so/errors/provider"),
+        body.contains("\"https://meka.so/errors/provider\""),
         "turn.failed payload must carry the provider error type; body was:\n{}",
         body,
     );
+}
+
+/// A transient upstream failure and a permanent one reach an SSE client under different `type`s.
+///
+/// The mekabridge team's report, end to end. Both are 502s inside `turn.failed`, and both arrive
+/// here carrying no `Retry-After`: `fail_retryable` is scripted with `retry_after_secs: null`
+/// because that is the case the header cannot rescue, and `fail_stream` never had a response to
+/// read one from. With the types shared, a bridge holding these two payloads had nothing left to
+/// branch on, and had to choose between retrying a revoked credential forever and dropping turns a
+/// second attempt would have completed.
+///
+/// Three rounds for the transient kinds because `MAX_PROVIDER_RETRIES` is 2: the agent retries them
+/// and the assertion is about what it answers once those are spent, not about the first failure.
+/// A one-round script would exhaust the mock instead and prove something else.
+#[test]
+fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
+    for (kind, rounds, expected) in [
+        ("fail", 1, "https://meka.so/errors/provider"),
+        (
+            "fail_retryable",
+            3,
+            "https://meka.so/errors/provider-unavailable",
+        ),
+        (
+            "fail_stream",
+            3,
+            "https://meka.so/errors/provider-unavailable",
+        ),
+    ] {
+        let round = serde_json::json!([
+            { "kind": kind, "message": "scripted upstream failure", "retry_after_secs": null }
+        ]);
+        let script = serde_json::Value::Array(vec![round; rounds]);
+        let harness = ServeTestHarness::spawn("", script);
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .send()
+            .expect("create");
+        let id = create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let body = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .json(&serde_json::json!({"message": "go", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body");
+
+        assert!(
+            body.contains("event: turn.failed"),
+            "{kind} must fail the turn; body was:\n{body}"
+        );
+        assert!(
+            body.contains(&format!("\"{expected}\"")),
+            "{kind} must arrive as {expected}; body was:\n{body}"
+        );
+        // The status inside the payload, not just the type. Without it a regression that answered
+        // 500 under the right `type` passes here, and one error type reporting two statuses is
+        // exactly what a client keying on the type cannot handle.
+        assert!(
+            body.contains("\"status\":502"),
+            "{kind} must carry 502 alongside its type; body was:\n{body}"
+        );
+        // Only meaningful for `fail_retryable`, which is the one kind here that *could* have
+        // carried a header and was scripted with none. Left applying to all three so a future
+        // kind added to this table inherits it.
+        assert!(
+            !body.contains("\"retry_after\""),
+            "the setup must be the case with no Retry-After, or {kind} proves nothing; body was:\n\
+             {body}"
+        );
+    }
 }
 
 /// `outcome: "allow"` on the mid-turn permission response unblocks the parked tool call
@@ -9251,5 +9330,170 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
         problem["type"].as_str(),
         Some("https://meka.so/errors/session-not-drivable"),
         "and it says which kind of 422 it is, so a client stops rewriting its payload: {problem}"
+    );
+}
+
+/// The operator's switch decides whether the upstream's own words reach the caller, and both
+/// settings are exercised because only one of them is the default.
+///
+/// An upstream refusal can name the *operator's* provider account rather than anything about the
+/// caller or the conversation, so `[serve] relay_provider_errors = false` exists for deployments
+/// whose tokens go to people not entitled to it. Nothing else in the suite covers the key: the
+/// resolution defaults it to `true`, and a regression flipping that, or dropping the member
+/// entirely, would leave every other test green.
+///
+/// `detail` is asserted equal across the two runs, which is the property that makes this member
+/// additive. Relaying by overwriting `detail` would have deleted meka's own sentence -- and on a
+/// context overflow that sentence is the entire remedy.
+#[test]
+fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() {
+    let secret = "acct-0f3c-operator-only";
+    let script = serde_json::json!([[
+        { "kind": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
+    ]]);
+
+    let mut details = Vec::new();
+    for (extra, expect_relayed) in [("", true), ("relay_provider_errors = false", false)] {
+        let harness = ServeTestHarness::spawn(extra, script.clone());
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .send()
+            .expect("create");
+        let id = create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .json(&serde_json::json!({"message": "go"}))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+
+        assert_eq!(body["status"], 502, "{body}");
+        let relayed = body
+            .get("provider_response")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| text.contains(secret));
+        assert_eq!(
+            relayed,
+            expect_relayed,
+            "with `{extra}` the upstream body must {} the caller: {body}",
+            if expect_relayed { "reach" } else { "not reach" }
+        );
+        // The whole serialised body, so a member renamed or moved elsewhere in the payload still
+        // counts as reaching the caller rather than slipping past a check on one field.
+        if !expect_relayed {
+            assert!(
+                !body.to_string().contains(secret),
+                "the upstream body reached the caller by another route: {body}"
+            );
+        }
+        details.push(body["detail"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(
+        details[0], details[1],
+        "the key adds a member; it must not rewrite meka's own sentence"
+    );
+}
+
+/// The switch reaches the streaming path too, which is the one its own documentation calls risky.
+///
+/// The streaming path reads the key into its own binding (`relay_for_task`), which the blocking
+/// test above never reaches because it posts a non-streaming turn: hardcoding that binding to
+/// `true` left every test green. It is the value that reaches the terminal `turn.failed` payload,
+/// which `record_terminal` retains for the reattach endpoint to replay at `sessions:r` -- the chain
+/// the config key exists for. This test reads the `POST /turn` stream rather than reattaching, so
+/// it covers the payload the retained terminal is built from.
+#[test]
+fn relay_provider_errors_is_honoured_on_the_streaming_path() {
+    let secret = "acct-0f3c-operator-only";
+    let script = serde_json::json!([[
+        { "kind": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
+    ]]);
+
+    for (extra, expect_relayed) in [("", true), ("relay_provider_errors = false", false)] {
+        let harness = ServeTestHarness::spawn(extra, script.clone());
+        let create = harness
+            .request(reqwest::Method::POST, "/v1/sessions")
+            .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+            .send()
+            .expect("create");
+        let id = create.json::<serde_json::Value>().expect("parse")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let body = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .json(&serde_json::json!({"message": "go", "stream": true}))
+            .send()
+            .expect("send")
+            .text()
+            .expect("body");
+
+        assert!(
+            body.contains("event: turn.failed"),
+            "the turn must fail so there is a payload to judge; body was:\n{body}"
+        );
+        assert_eq!(
+            body.contains(secret),
+            expect_relayed,
+            "with `{extra}` the streaming terminal must {} the upstream body; body was:\n{body}",
+            if expect_relayed { "carry" } else { "omit" }
+        );
+    }
+}
+
+/// An upstream that answers with megabytes does not get to repeat them to every reader.
+///
+/// The text is `response.text()` with no cap of its own and `base_url` is user-supplied, so this is
+/// attacker-influenced input copied into every 502 body *and* into the terminal event the per-turn
+/// replay ring retains for reconnects.
+///
+/// The body carries a distinctive head so the test can see *which* part survived. A run of one
+/// repeated character could not: keeping the start, the end or the middle would all have looked
+/// identical, while the docs promise the start, which is where a provider's error type sits.
+#[test]
+fn a_relayed_upstream_body_is_size_bounded() {
+    let head = "UPSTREAM-ERROR-TYPE-HERE";
+    let script = serde_json::json!([[
+        { "kind": "fail", "message": format!("{head}{}", "x".repeat(64 * 1024)) }
+    ]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "go"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+
+    let relayed = body["provider_response"].as_str().expect("the member");
+    // The documented cap exactly, not a loose multiple of it. At `< 8 KiB` the constant could be
+    // doubled with this test still green while the API reference went on promising 4 KiB.
+    assert!(
+        relayed.len() <= 4 * 1024,
+        "a 64 KiB upstream body must be cut to the documented 4 KiB; got {} bytes",
+        relayed.len()
+    );
+    assert!(
+        relayed.starts_with(head),
+        "and the start must survive, which is where the error type sits: {}",
+        &relayed[..relayed.len().min(60)]
+    );
+    assert!(
+        relayed.contains("truncated"),
+        "and the cut must be visible to the reader"
     );
 }

@@ -43,8 +43,8 @@ use crate::{
 ///
 /// The two carry the same 422 and different `type` URIs, because a `Config` refusal is answered by
 /// changing the request or the installation and this one never is: no payload addressed at a
-/// worker's id is acceptable. Kept in step with [`ProblemDetail::from`], which classifies the same
-/// pair when one reaches a handler that does not build an agent.
+/// worker's id is acceptable. Kept in step with [`ProblemDetail::for_error`], which classifies the
+/// same pair when one reaches a handler that does not build an agent.
 pub(crate) fn agent_build_problem(id: Uuid, context: &str, error: anyhow::Error) -> ProblemDetail {
     let problem = match error.downcast_ref::<crate::error::MekaError>() {
         Some(crate::error::MekaError::Config(message)) => ProblemDetail::new(

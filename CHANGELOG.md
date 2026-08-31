@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `provider add` gains six flags for the remaining profile fields, so any profile is one command.
 - A turn whose repair did not help points at `/rewind` before it fails.
 - Refusing a sub-agent's id carries `/errors/session-not-drivable`, which no payload makes acceptable.
+- `/errors/provider-unavailable` marks an upstream failure meka classified as transient and worth resending.
+- `[serve] relay_provider_errors`, on by default, controls whether a 502 carries the provider's error text.
 
 ### Changed
 
@@ -80,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /v1/sessions/{id}/rewind` works on a sub-agent and on a dormant session, without loading it.
 - `meka -c` resumes the newest top-level session, skipping a sub-agent that ran more recently.
 - `provider set` refuses `redact_thinking` on `anthropic-messages`, which never sends the beta.
+- **Breaking:** a 502 carries the provider's response as `provider_response`, where it was withheld.
 
 ### Removed
 

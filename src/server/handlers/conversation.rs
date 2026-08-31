@@ -84,7 +84,7 @@ pub struct CompactResponse {
         (status = 409, description = "Turn in flight; cancel first", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, nothing to compact, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
-        (status = 502, description = "The provider refused or failed the summarising turn. `/errors/context-overflow` here means the conversation will not fit even to summarise it", body = ProblemDetail),
+        (status = 502, description = "The provider refused or failed the summarising turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything meka could not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarise it", body = ProblemDetail),
     ),
     security(("bearerAuth" = []))
 )]
@@ -197,7 +197,10 @@ pub async fn compact(
                 cancellation,
             )
             .await
-            .map_err(|error| ProblemDetail::from(&error).with("session_id", id.to_string()))?;
+            .map_err(|error| {
+                ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+                    .with("session_id", id.to_string())
+            })?;
         (outcome, runtime.messages.len())
     };
     // Releases the guard, not a reborrow of it: `drop(runtime)` on the `&mut *runtime` above is a

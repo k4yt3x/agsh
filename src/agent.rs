@@ -821,11 +821,10 @@ impl TurnRecovery {
                 // content in this turn") asserted something meka does not know and, on an overload,
                 // was simply false.
                 //
-                // No provider body here either. `reason` is the verbatim rejection text from
-                // `error::provider_http_error`, and the HTTP error path was fixed to stop relaying
-                // it because it has carried an account identifier and a fragment of the request;
-                // under `serve` this notice rides the same response and reinstated exactly that.
-                // The full text is on the `warn!` immediately above, at default verbosity.
+                // No provider body here. `reason` is the verbatim rejection text from
+                // `error::provider_http_error`, and this notice reaches the REPL and ACP as well as
+                // `serve`, where `[serve] relay_provider_errors` does not apply. The full text is on
+                // the `warn!` immediately above, at default verbosity.
                 // Names the way back, and names the *right* one. What a degrade removes is gone
                 // from the conversation, not from the session: the log is append-only, so the
                 // superseded rows are still on disk. But `--format json` is the only export that
