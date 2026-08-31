@@ -2,7 +2,7 @@
 
 The **Anthropic Messages API** (`POST {base_url}/v1/messages`) with an API key. Use this when you have an Anthropic API key, billed per token; to bill a Claude subscription instead, see [`claude-subscription`](./claude-subscription.md), which speaks the same protocol.
 
-The protocol is not Anthropic's alone. Databricks, Vercel AI Gateway, LiteLLM, Synthetic and Ollama all serve `/v1/messages`, as does Amazon Bedrock on its Anthropic-compatible host (`https://bedrock-mantle.{region}.api.aws/anthropic`, with an API key, *not* `bedrock-runtime`, which is SigV4 and `/model/{id}/invoke`). This backend reaches any of them via `base_url`, which is why it is named for the protocol rather than for Claude.
+The protocol is not Anthropic's alone. Databricks, OpenRouter, Vercel AI Gateway, LiteLLM, Synthetic and Ollama all serve `/v1/messages`, as does Amazon Bedrock on its Anthropic-compatible host (`https://bedrock-mantle.{region}.api.aws/anthropic`, with an API key, *not* `bedrock-runtime`, which is SigV4 and `/model/{id}/invoke`). This backend reaches any of them via `base_url`, which is why it is named for the protocol rather than for Claude.
 
 ## Configuration
 

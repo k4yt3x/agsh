@@ -660,6 +660,20 @@ pub(super) async fn drive_claude_sse_stream(
 
                                 if block_type == "thinking" {
                                     in_thinking = true;
+                                    // Both schemas make `signature` required on a thinking block
+                                    // sent back, and require it verbatim, but it does not always
+                                    // arrive as a `signature_delta`. Anthropic opens the block with
+                                    // an empty one and fills it by delta; OpenRouter sends no delta
+                                    // at all for a non-Anthropic model, leaving that empty string
+                                    // as the value. Losing it there costs every later request in
+                                    // the session, rejected for the missing field.
+                                    //
+                                    // Assigned rather than merged, so a block that opens without
+                                    // the field cannot inherit the signature of an earlier one.
+                                    current_thinking_signature = content_block
+                                        .get("signature")
+                                        .and_then(|signature| signature.as_str())
+                                        .map(str::to_string);
                                     // Announce the block itself, before any estimate: this is the
                                     // earliest point the pause becomes explainable, and on a
                                     // redacted block it is otherwise the only thing that happens
@@ -1422,6 +1436,123 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, StreamEvent::Error(_))),
             "and say so on the stream: {events:?}",
+        );
+    }
+
+    fn thinking_opaque(events: &[StreamEvent]) -> Option<OpaqueReasoning> {
+        events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ThinkingComplete { opaque } => Some(opaque.clone()),
+                _ => None,
+            })
+            .expect("a thinking block must complete")
+    }
+
+    /// A signature carried only by `content_block_start` must survive to the echo. OpenRouter sends
+    /// it there and no `signature_delta` at all for a non-Anthropic model, and its schema, like
+    /// Anthropic's, makes the field required on the way back. Dropping it rejected every request
+    /// after the first with `invalid_union` at `messages[n].content`, killing the session.
+    #[tokio::test]
+    async fn a_thinking_signature_sent_only_on_the_start_event_is_kept() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert_eq!(
+            thinking_opaque(&events),
+            Some(OpaqueReasoning::Signed {
+                signature: String::new(),
+            }),
+            "an empty signature is still the value the API returned: {events:?}",
+        );
+    }
+
+    /// Anthropic sends the real signature as trailing deltas, so the start event must seed the
+    /// accumulator rather than displace what those deltas append.
+    #[tokio::test]
+    async fn a_thinking_signature_sent_as_deltas_still_accumulates() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"def\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert_eq!(
+            thinking_opaque(&events),
+            Some(OpaqueReasoning::Signed {
+                signature: "abcdef".to_string(),
+            }),
+            "{events:?}",
+        );
+    }
+
+    /// The other direction: a backend that returns no signature at all gets none back. Anthropic
+    /// requires the field "exactly as returned by the API", so inventing an empty one to satisfy
+    /// the schema would be sending a value that was never issued.
+    #[tokio::test]
+    async fn a_thinking_block_returned_unsigned_stays_unsigned() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert_eq!(thinking_opaque(&events), None, "{events:?}");
+    }
+
+    /// One accumulator serves every block, and only `content_block_stop` clears it. A gateway that
+    /// omits that event would otherwise hand the next block the previous one's signature, pairing a
+    /// signature with reasoning it does not authenticate -- which Anthropic rejects as a modified
+    /// block. `anthropic-messages` reaches any `base_url`, so the stream is untrusted input.
+    #[tokio::test]
+    async fn an_unterminated_thinking_block_does_not_lend_its_signature_to_the_next() {
+        let (events, outcome) = decode_sse(concat!(
+            "event: content_block_start\n",
+            "data: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"FIRST\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"unrelated\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert_eq!(
+            thinking_opaque(&events),
+            None,
+            "the second block was opened without a signature: {events:?}",
         );
     }
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A thinking signature sent on `content_block_start` is kept, unbreaking tool calls via OpenRouter.
+
 ## [0.44.0] - 2026-08-31
 
 ### Added
