@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A thinking signature sent on `content_block_start` is kept, unbreaking tool calls via OpenRouter.
+- `newline_after_prompt` now also separates the `Continuing session:` banner from replayed history.
 
 ## [0.44.0] - 2026-08-31
 

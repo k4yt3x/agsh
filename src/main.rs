@@ -1688,13 +1688,20 @@ async fn run_interactive(
                 // text) unbracketed.
                 if render::render_message_history(
                     render::last_n_turns(messages.as_slice(), n),
-                    &history_render_options(&config),
+                    &render::HistoryRenderOptions {
+                        leading_blank: config.newline_after_prompt,
+                        ..history_render_options(&config)
+                    },
                 ) {
                     with_console(&console, |console| console.announce_foreign_output());
                 }
             }
             _ => {
-                if reprint_last_message(messages.as_slice(), config.render_mode) {
+                if reprint_last_message(
+                    messages.as_slice(),
+                    config.render_mode,
+                    config.newline_after_prompt,
+                ) {
                     with_console(&console, |console| console.announce_foreign_output());
                 }
             }
@@ -2875,10 +2882,22 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
         input_style: config.input_style,
         newline_before_prompt: config.newline_before_prompt,
         newline_after_prompt: config.newline_after_prompt,
+        // `/history` is separated from the command line by the episode's own blank; only the resume
+        // path, where the banner spent that blank, asks for one, and it passes
+        // `newline_after_prompt` rather than `true` so tight spacing stays tight.
+        leading_blank: false,
     }
 }
 
-fn reprint_last_message(messages: &[provider::Message], render_mode: render::RenderMode) -> bool {
+/// `leading_blank` is emitted only once there is something to print under it, so a last message
+/// that renders to nothing (a tool-call-only turn) leaves the banner unbracketed rather than
+/// trailing a blank into the prompt. Callers pass `newline_after_prompt`: it is that separator,
+/// displaced below the `Continuing session:` banner that spent the original.
+fn reprint_last_message(
+    messages: &[provider::Message],
+    render_mode: render::RenderMode,
+    leading_blank: bool,
+) -> bool {
     let Some(last) = messages.last() else {
         return false;
     };
@@ -2901,6 +2920,9 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
         }
     };
 
+    if leading_blank {
+        eprintln!();
+    }
     let mut renderer = render::StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(&text) {
         tracing::debug!("failed to render last message delta: {}", error);

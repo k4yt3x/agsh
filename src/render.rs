@@ -2519,6 +2519,15 @@ pub struct HistoryRenderOptions {
     /// Blank line after each user prompt (mirrors `[display].newline_after_prompt`). Acts as the
     /// visual separator between the prompt and the agent's first response block.
     pub newline_after_prompt: bool,
+    /// Blank line before the first thing this renders, for a caller that has already printed
+    /// something the history must not butt against. Deferred to the first real output, so a slice
+    /// that renders to nothing leaves no stray blank behind.
+    ///
+    /// `/history` leaves this off: the episode's `newline_after_prompt` blank already separates it
+    /// from the command line. A resume sets it to `newline_after_prompt`, because the
+    /// `Continuing session:` banner is what spent that blank and this is the same separator moved
+    /// below the banner, so it answers to the same setting.
+    pub leading_blank: bool,
 }
 
 /// Reprint a slice of historical messages styled to match the live REPL output. Inter-block spacing
@@ -2538,12 +2547,13 @@ pub fn render_message_history(
         return false;
     }
     let mut spacing = OutputSpacing::new();
-    // The caller (e.g. the `/history` dispatch) is expected to emit the leading blank, the
-    // equivalent of the live REPL's `newline_after_prompt`, between its own command line and this
-    // rendered history. So the very first user prompt we render must skip its own
-    // `newline_before_prompt` to avoid stacking blanks. Once anything has been emitted, the inner
-    // spacing rules take over and turn-to-turn transitions get their own blanks naturally.
+    // The blank above this history is the caller's, either its episode's `newline_after_prompt`
+    // (`/history`) or `leading_blank` (a resume). So the very first user prompt we render must skip
+    // its own `newline_before_prompt` to avoid stacking blanks. Once anything has been emitted, the
+    // inner spacing rules take over and turn-to-turn transitions get their own blanks naturally.
     let mut emitted_any = false;
+    // Deferred to the first real output so a slice that renders nothing leaves no stray blank.
+    let mut pending_leading_blank = opts.leading_blank;
     for message in messages {
         for block in &message.content {
             match block {
@@ -2552,17 +2562,19 @@ pub fn render_message_history(
                         if text.trim().is_empty() {
                             continue;
                         }
-                        if spacing.before_text() {
-                            eprintln!();
-                        }
+                        separate(spacing.before_text(), &mut pending_leading_blank);
                         render_assistant_text(text, opts.render_mode);
                         emitted_any = true;
                     }
                     Role::User => {
-                        let leading_blank = opts.newline_before_prompt && emitted_any;
+                        // Consumed only on success: `render_user_prompt` owns the blank and prints
+                        // nothing at all for a prompt that strips to empty.
+                        let leading_blank =
+                            pending_leading_blank || (opts.newline_before_prompt && emitted_any);
                         if !render_user_prompt(text, opts.input_style, leading_blank) {
                             continue;
                         }
+                        pending_leading_blank = false;
                         if opts.newline_after_prompt {
                             eprintln!();
                         }
@@ -2574,34 +2586,29 @@ pub fn render_message_history(
                 // replayed/exported transcript notes the attachment instead of dropping it
                 // silently.
                 ContentBlock::Image { .. } => {
-                    if spacing.before_text() {
-                        eprintln!();
-                    }
+                    separate(spacing.before_text(), &mut pending_leading_blank);
                     eprintln!("[image]");
                     emitted_any = true;
                 }
                 ContentBlock::Thinking { thinking, .. } => {
                     if opts.show_thinking && !thinking.trim().is_empty() {
-                        if spacing.before_thinking() {
-                            eprintln!();
-                        }
+                        separate(spacing.before_thinking(), &mut pending_leading_blank);
                         render_thinking_block(thinking, true);
                         emitted_any = true;
                     }
                 }
                 ContentBlock::RedactedThinking { .. } => {
                     if opts.show_thinking {
-                        if spacing.before_thinking() {
-                            eprintln!();
-                        }
+                        separate(spacing.before_thinking(), &mut pending_leading_blank);
                         render_thinking_block("[redacted thinking]", true);
                         emitted_any = true;
                     }
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
-                    if spacing.before_tool_indicator(opts.tool_params) {
-                        eprintln!();
-                    }
+                    separate(
+                        spacing.before_tool_indicator(opts.tool_params),
+                        &mut pending_leading_blank,
+                    );
                     render_tool_indicator(name, input, None, opts.tool_params);
                     emitted_any = true;
                 }
@@ -2626,6 +2633,17 @@ fn render_assistant_text(text: &str, render_mode: RenderMode) {
     }
     if let Err(error) = renderer.finish() {
         tracing::debug!("history: failed to finish assistant render: {}", error);
+    }
+}
+
+/// Emit the blank line separating a block from what precedes it.
+///
+/// `pending_leading` is taken whether or not `needed` is set, so the first block spends it and no
+/// later one can print it again. A short-circuiting `||` would leave it armed behind a block that
+/// asked for its own separator.
+fn separate(needed: bool, pending_leading: &mut bool) {
+    if std::mem::take(pending_leading) || needed {
+        eprintln!();
     }
 }
 
@@ -6939,6 +6957,7 @@ mod tests {
             input_style: nu_ansi_term::Style::default(),
             newline_before_prompt: true,
             newline_after_prompt: true,
+            leading_blank: false,
         };
         assert!(render_message_history(&messages, &opts_with_thinking));
         // And off: the call must still complete cleanly.
@@ -6965,6 +6984,7 @@ mod tests {
             input_style: nu_ansi_term::Style::default(),
             newline_before_prompt: true,
             newline_after_prompt: true,
+            leading_blank: false,
         };
         assert!(!render_message_history(&[], &opts));
 
@@ -6991,5 +7011,23 @@ mod tests {
             },
         ];
         assert!(!render_message_history(&invisible, &opts));
+    }
+
+    /// The armed blank is spent by the first block to print, whether or not that block also asked
+    /// for a separator of its own. Leaving it armed there re-arms it for a later block, which puts
+    /// the resume banner's blank line in the middle of the replayed history instead of above it.
+    #[test]
+    fn test_separate_spends_the_armed_blank_even_when_the_block_asked_for_one() {
+        let mut both = true;
+        separate(true, &mut both);
+        assert!(!both, "a block with its own separator must still spend it");
+
+        let mut armed_only = true;
+        separate(false, &mut armed_only);
+        assert!(!armed_only);
+
+        let mut neither = false;
+        separate(false, &mut neither);
+        assert!(!neither);
     }
 }
