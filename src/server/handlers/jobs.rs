@@ -542,11 +542,6 @@ pub async fn create(
 /// provably dead is still reported as such. Passing the level as an `Option` is what lets that
 /// happen; resolving it to a default first, or skipping the call, reports a parked job as healthy
 /// on the one surface a client would ask.
-///
-/// (The two paragraphs that used to open this comment described
-/// `session_permission_from_row` below, and were left attached here when this function was
-/// inserted above it. Rustdoc showed them as this function's summary and left that one
-/// undocumented.)
 async fn render_batch(
     state: &ServerState,
     jobs: Vec<ScheduledJob>,
@@ -618,31 +613,26 @@ fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<St
 /// ([`crate::tools::ToolRegistry::build_for_subagent`] passes no schedule config), so until this
 /// the rule was held by omission at the tool door and by nothing at all here.
 ///
-/// **The authority escalation this used to be the only guard against is now closed a level down**,
-/// by [`crate::refuse_a_spawned_session`]: both agent builders refuse a session that records a
-/// parent, so a job keyed to a worker cannot wake it unrestricted because nothing can wake it at
-/// all. That is where the rule belongs, since `POST /v1/sessions/{id}/turn`, ACP `session/load`,
-/// re-attach and `meka -r` reach the same builders and a scheduling-only guard left every one of
-/// them open.
+/// **The authority escalation is closed a level down**, by [`crate::refuse_a_spawned_session`]:
+/// both agent builders refuse a session that records a parent, so a job keyed to a worker cannot
+/// wake it unrestricted because nothing can wake it at all. That is where the rule belongs, since
+/// `POST /v1/sessions/{id}/turn`, ACP `session/load`, re-attach and `meka -r` reach the same
+/// builders and a scheduling-only guard left every one of them open.
 ///
-/// So what this refusal is worth is narrower now, and worth stating rather than leaving to be
-/// rediscovered: a job on a worker is refused *when it is created*, naming the session to use
-/// instead, rather than being accepted and then failing on every fire until someone reads a log.
-/// It is a diagnosis, not a boundary, and deleting it would cost a good error rather than reopen a
-/// hole.
+/// What this refusal is worth is therefore narrow: a job on a worker is refused *when it is
+/// created*, naming the session to use instead, rather than being accepted and then failing on
+/// every fire until someone reads a log. A diagnosis, not a boundary.
 ///
 /// `SessionNotDrivable` rather than `AuthScope` or `SessionPermission`: no token and no permission
 /// level changes the answer, so routing it at either would send a client off to re-provision a
 /// token or to `PATCH /v1/sessions/{id}` for a refusal neither can lift. Nor `InvalidBody`, which
-/// is where this used to land and which reads as "resend with a corrected payload"; the sibling
-/// doors that refuse the same id answer the same `type`. [`create`] routes its gate refusals by the
-/// same rule.
+/// reads as "resend with a corrected payload"; the sibling doors that refuse the same id answer the
+/// same `type`. [`create`] routes its gate refusals by the same rule.
 ///
 /// Takes [`crate::session::SpawnTerms`] rather than a parent, so it asks the question
-/// [`crate::refuse_a_spawned_session`] asks. Keyed on the parent alone it admitted a job on an
-/// imported worker -- `201 Created`, then `session unavailable: Session is a sub-agent's
-/// conversation` in the log on every fire, at the poll cadence, forever. That is precisely the
-/// outcome this function's remaining value is described above as preventing.
+/// [`crate::refuse_a_spawned_session`] asks. Keyed on the parent alone it admits a job on an
+/// imported worker: `201 Created`, then `session unavailable: Session is a sub-agent's
+/// conversation` in the log on every fire, at the poll cadence, forever.
 fn refuse_subagent_session(
     id: Uuid,
     spawned: Option<crate::session::SpawnTerms>,

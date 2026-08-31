@@ -253,11 +253,11 @@ pub enum FrontendEvent {
     /// A complete thinking block, as text to show. Emitted after the provider's `ThinkingComplete`
     /// stream event.
     ///
-    /// Deliberately carries no opaque half. It used to hold a `signature`, unread, against a future
-    /// replay -- but replay reads the conversation log, where the block keeps its provider-tagged
+    /// Deliberately carries no opaque half. No `signature` against a future replay: replay reads
+    /// the conversation log, where the block keeps its provider-tagged
     /// [`crate::provider::OpaqueReasoning`]. A bare blob here would be an undiscriminated Claude
-    /// MAC or OpenAI sealed reasoning, which is the conflation that shape exists to prevent, and
-    /// it cloned kilobytes per block for a reader that never came.
+    /// MAC or OpenAI sealed reasoning, which is the conflation that shape exists to prevent, and it
+    /// cloned kilobytes per block for a reader that never came.
     ThinkingBlock { content: String },
     /// The model has started composing a tool call: the name has arrived, the arguments have not.
     ///

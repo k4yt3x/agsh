@@ -5,13 +5,13 @@
 //! and both apply to *anything* printed in between. The unit is therefore an **episode**, and this
 //! module owns it.
 //!
-//! Two rules make the shapes that used to break unrepresentable.
+//! Two rules make the shapes that break unrepresentable.
 //!
-//! **One owner, and it is the one that always runs.** The blanks used to be opened by the agent
-//! (`FrontendEvent::TurnStarted`) and closed by the agent on success but by the host on failure, so
-//! a turn that failed before it started, or a slash command that answered without running a turn at
-//! all, was bracketed once or not at all. An episode is closed by whoever is about to draw the next
-//! prompt, which happens exactly once per prompt whatever went on before it.
+//! **One owner, and it is the one that always runs.** Split ownership -- the agent opening the
+//! blanks on `FrontendEvent::TurnStarted` and closing them on success, the host closing them on
+//! failure -- brackets a turn that failed before it started, or a slash command that answered
+//! without running a turn, once or not at all. An episode is closed by whoever is about to draw the
+//! next prompt, which happens exactly once per prompt whatever went on before it.
 //!
 //! **An episode either prints, and gets its brackets, or it leaves no trace.** The opening blank is
 //! *armed* rather than printed, and fires just before the episode's first real output, so nothing
@@ -49,8 +49,8 @@ pub enum RowState {
 ///
 /// They gate *printing* and nothing else. Every state transition below runs identically with them
 /// off, which is the difference between "no blank line here" and "the spacing machine stops
-/// advancing" -- the latter used to leak the previous turn's last block into the next one and print
-/// the blank the setting had just disabled.
+/// advancing"; the latter leaks the previous turn's last block into the next one and prints the
+/// blank the setting just disabled.
 #[derive(Debug, Clone, Copy)]
 pub struct Spacing {
     pub newline_before_prompt: bool,
@@ -156,8 +156,8 @@ impl State {
 ///
 /// Every blank line meka prints between two prompts is one of the three in [`Emit`], and this is
 /// the only place any of them is decided. Split out from the printing for the same reason
-/// `repl::indicator_action` is: the bugs this replaces all lived in a dispatch that mixed the two,
-/// where the only way to see a wrong answer was to run a terminal and look at it.
+/// `repl::indicator_action` is: in a dispatch that mixes the two, the only way to see a wrong
+/// answer is to run a terminal and look at it.
 pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
     let mut next = state;
     match action {
@@ -505,7 +505,7 @@ impl Console {
     }
 
     /// Whether a text block is still open, for the frontend's tests: a run left open past the end
-    /// of its episode is the shape that used to flush a failed turn's tail under the next prompt.
+    /// of its episode is what flushes a failed turn's tail under the next prompt.
     #[cfg(test)]
     pub fn has_open_text(&self) -> bool {
         self.renderer.is_some()
@@ -515,7 +515,7 @@ impl Console {
     ///
     /// The one bit of console state a caller outside this module can observe without a terminal,
     /// and enough to answer the question the relay's test asks: did a log line reach the console at
-    /// all, or did it go round it to stderr as it used to.
+    /// all, or go round it to stderr.
     #[cfg(test)]
     pub fn has_printed(&self) -> bool {
         self.state.printed()
@@ -674,9 +674,9 @@ mod tests {
         }
     }
 
-    /// Every path that used to be bracketed by whoever happened to notice: a turn that failed
-    /// before it started, a slash command answering without a turn, a command that ran several
-    /// turns. All of them are one episode with one bracket.
+    /// Every path that would otherwise be bracketed by whoever happened to notice: a turn that
+    /// failed before it started, a slash command answering without a turn, a command that ran
+    /// several turns. All of them are one episode with one bracket.
     #[test]
     fn every_episode_is_bracketed_the_same_however_it_answered() {
         let error_only = run(BOTH, &[
@@ -726,7 +726,7 @@ mod tests {
     }
 
     /// The same wake, but something did run: the prompt row is real output's backdrop and must be
-    /// kept, which is what the hand-written terminator in the wake path used to do alone.
+    /// kept.
     #[test]
     fn a_wake_that_runs_something_keeps_the_prompt_it_broke_out_of() {
         let emits = run(BOTH, &[
@@ -781,8 +781,8 @@ mod tests {
         assert_eq!(emits[3].settle, Settle::Nothing);
     }
 
-    /// Output the console cannot see still has to start on a row of its own. This is the rule the
-    /// approval prompt used to enforce by hand and the MCP elicitation prompt never did: a server's
+    /// Output the console cannot see still has to start on a row of its own. Enforced here rather
+    /// than by hand at each prompt, which is how the MCP elicitation path goes without: a server's
     /// progress line parks the cursor mid-row, and meka's own chrome continuing that row is what
     /// makes a forged prompt possible.
     #[test]

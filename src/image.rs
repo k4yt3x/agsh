@@ -161,8 +161,8 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 /// with what it has and returns a picture. A guard that passes that is not a guard, and JPEG is the
 /// format most likely to arrive truncated, so meka drives the same decoder itself with strict mode
 /// on. Measured: strict refuses truncation at every fraction from 10% to 99% and refuses a
-/// corrupted scan, while accepting 34 real JPEGs (baseline, progressive, optimised, 4:4:4,
-/// grayscale) unchanged.
+/// corrupted scan, while accepting baseline, progressive, optimised, 4:4:4 and grayscale JPEGs
+/// unchanged.
 ///
 /// The alternative considered and rejected was checking for a trailing `FF D9` end-of-image marker.
 /// It is worse in both directions: it misses corruption that leaves the marker intact, and it
@@ -674,7 +674,7 @@ mod tests {
     /// Its JPEG codec hardcodes `set_strict_mode(false)`, so `ImageReader::decode` returns a
     /// picture for a stream truncated to a tenth of its bytes. Every fraction is checked because
     /// the interesting ones are the *late* truncations: a 99% JPEG is what an interrupted download
-    /// or a full disk actually produces, and it looked perfect to the check this replaces.
+    /// or a full disk produces, and a header-only check calls it perfect.
     #[test]
     fn test_prepare_refuses_a_truncated_jpeg_at_every_depth() {
         let jpeg = synthesize_detailed_jpeg(400, 400);
@@ -785,8 +785,8 @@ mod tests {
             "the fixture has to pass the byte cap, or it is refused for the wrong reason"
         );
         // Also pins what the *conversion* path says about the same bytes. It has no choice but to
-        // fail, and it used to report a merely-large image as a corrupt one, which sends somebody
-        // to re-export a file that was never broken.
+        // fail, and reporting a merely-large image as a corrupt one sends somebody to re-export a
+        // file that was never broken.
         let ceiling = decode_with_limits(&huge, ImageFormat::Png)
             .expect_err("has to exceed the decode ceiling, or it proves nothing");
         assert!(

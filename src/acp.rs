@@ -1,38 +1,20 @@
 //! `meka acp` subcommand. Speaks the Agent Client Protocol (ACP) on stdio so editor / web /
 //! messenger clients can drive a meka turn end to end.
 //!
-//! # Capability surface
+//! The advertised capability surface, the delegation rules and the wire shapes are documented in
+//! `docs/book/src/usage/acp.md`.
 //!
-//! - **Lifecycle**: `initialize` (with `clientInfo` capture + `agentInfo` advertisement),
-//!   `session/new`, `session/load` (replays the persisted conversation as `session/update`
-//!   notifications), `session/list` (cwd-filtered, cursor-paginated; sub-agent sessions hidden),
-//!   `session/resume`, `session/close`, `session/cancel`, `session/set_mode`.
-//! - **Turn**: `session/prompt` streams `agent_message_chunk`, `agent_thought_chunk`, the full
-//!   `tool_call` + `tool_call_update` lifecycle (with diff content blocks from
-//!   [`crate::frontend::ToolOutputMetadata::Diff`]), and ends with `end_turn` / `cancelled` stop
-//!   reasons. `session/request_permission` handles `ask`-mode tool approvals; per-session sticky
-//!   always/never sets short-circuit subsequent requests. A running `execute_command` pushes its
-//!   output into the open tool call as it arrives, throttled by [`LIVE_OUTPUT_INTERVAL`].
-//! - **Commands + modes**: built-in local commands (`/status`, `/mcp`, `/usage`) and installed
-//!   skills surface as `available_commands_update` palette entries. Local commands render text and
-//!   end the turn with no model call; skills resolve `/<skill-name> [extra]` prompts to the
-//!   rendered skill body before the turn. `Permission` levels map 1:1 to ACP `SessionMode` ids,
-//!   advertised on every session-creation response and mutated live via `session/set_mode`.
-//! - **Delegation**: `read_file` / `write_file` / `edit_file` route through the client's
-//!   `fs/read_text_file` and `fs/write_text_file` when the matching capability is offered, falling
-//!   back to local syscalls otherwise. `execute_command` is deliberately never delegated: meka owns
-//!   the process so its Landlock / bwrap / sandbox-exec / Low-Integrity jail, env scrub, cwd
-//!   resolution, and process-group kill apply in every permission mode. The client's `terminal/*`
-//!   has no equivalent, and routing through it once made `ask` mode -- a mode meka treats as
-//!   sandboxed -- run commands unsandboxed.
+//! **`execute_command` is never delegated to the client's `terminal/*`**, whatever it advertises
+//! and whatever the permission mode. meka owns the process so its Landlock / bwrap / sandbox-exec /
+//! Low-Integrity jail, env scrub, cwd resolution and process-group kill keep applying; the client's
+//! terminal offers no equivalent, so routing through it runs `ask` unsandboxed, a mode meka treats
+//! as sandboxed.
 //!
-//! Multi-session: any number of sessions can coexist in one `meka acp` process. Each session has
-//! its own cwd, permission cell, conversation, cancellation token, and per-session `Agent` +
-//! `AcpFrontend`. Sessions share process-wide dependencies (provider, MCP manager, session DB,
-//! skill cache) via `Arc`. Two sessions can run `session/prompt` calls in parallel; there is no
-//! global mutex serialising turns. Sub-agents reach the parent's client through
-//! [`crate::frontend::PermissionForwardingFrontend`], so their permission prompts and fs delegates
-//! flow through the parent session's editor UI.
+//! Any number of sessions coexist in one process, each with its own cwd, permission cell,
+//! conversation, cancellation token, `Agent` and `AcpFrontend`, over process-wide dependencies held
+//! by `Arc`. Nothing serialises turns, so two `session/prompt` calls run in parallel. A sub-agent
+//! reaches the parent's client through [`crate::frontend::PermissionForwardingFrontend`], so its
+//! permission prompts and fs delegates surface in the parent session's editor UI.
 
 mod elicitation;
 mod schedule;
@@ -1837,11 +1819,11 @@ async fn session_accepts_images(state: &ServerState, session_uuid: uuid::Uuid) -
 ///
 /// **The row is the carrier, and the only one.** `session/set_config_option` writes it before it
 /// reaches for the runtime mutex, precisely so a switch it cannot apply is not lost; this is what
-/// applies it. That used to be a resolved binding parked on the session entry, which only
-/// `session/prompt` drained -- so a scheduled fire or a background-outcome turn ran on the profile
-/// the user had left, and billed that account, while the row, both pickers and the reported window
-/// all said otherwise. A parked value was a second carrier of a fact the row already held, and it
-/// could lose to any other writer of that row.
+/// applies it. A resolved binding parked on the session entry is drained only by `session/prompt`,
+/// so a scheduled fire or a background-outcome turn runs on, and bills, the profile the user has
+/// left, while the row, both pickers and the reported window all say otherwise. A parked value was
+/// a second carrier of a fact the row already held, and it could lose to any other writer of that
+/// row.
 ///
 /// Cheap when nothing has changed: one indexed row read and a comparison, with no resolution at all
 /// unless the two differ.
@@ -3794,15 +3776,13 @@ async fn handle_fork_session(
         Ok(Some(terms)) => {
             return responder.respond_with_error(invalid_params_error(match terms.parent {
                 Some(parent) => format!(
-                    "session {source_uuid} was spawned by session {parent}, and a copy of it is a \
-                     sub-agent under that same parent rather than a session of its own, so there \
-                     is no session to hand back. Continue the conversation with `agent_followup` \
-                     from {parent}."
+                    "session {source_uuid} is a sub-agent of {parent}, so a copy of it is another \
+                     sub-agent and there is no session to hand back. Continue the conversation \
+                     with `agent_followup` from {parent}."
                 ),
                 None => format!(
-                    "session {source_uuid} carries the terms another session spawned it under, so \
-                     it is a sub-agent's conversation and a copy of it is another one. Its parent \
-                     is not in this store, so there is no session to hand back."
+                    "session {source_uuid} is a sub-agent whose parent is not in this store, so a \
+                     copy of it is another sub-agent and there is no session to hand back."
                 ),
             }));
         }

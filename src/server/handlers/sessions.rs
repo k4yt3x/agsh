@@ -589,9 +589,8 @@ pub async fn fork_session(
     {
         let detail = match terms.parent {
             Some(parent) => format!(
-                "session '{id}' was spawned by session '{parent}', and a copy of it is a \
-                 sub-agent under that same parent rather than a session of its own, so this \
-                 endpoint has no live session to return. Read it with \
+                "session '{id}' is a sub-agent of '{parent}', so a copy of it is another \
+                 sub-agent and this endpoint has no live session to return. Read it with \
                  `GET /v1/sessions/{id}/messages`, or continue the conversation with \
                  `agent_followup` from '{parent}'."
             ),
@@ -601,10 +600,8 @@ pub async fn fork_session(
             // caller got a 422 naming an id it had never seen, for a row that no longer existed.
             // That is verbatim the failure this up-front guard exists to prevent.
             None => format!(
-                "session '{id}' carries the terms another session spawned it under, so it is a \
-                 sub-agent's conversation and a copy of it is another one. Its parent is not in \
-                 this store, so there is nothing here that can drive either. Read it with \
-                 `GET /v1/sessions/{id}/messages`."
+                "session '{id}' is a sub-agent whose parent is not in this store, so nothing here \
+                 can drive it or a copy of it. Read it with `GET /v1/sessions/{id}/messages`."
             ),
         };
         return Err(ProblemDetail::new(
@@ -1397,18 +1394,18 @@ pub async fn delete_session(
         }
     }
 
-    // The write lock covers the in-flight re-check and the map removal, and nothing else. It used
-    // to span the DB delete as well, which is a cascading `DELETE` plus a lock-directory sweep that
-    // does blocking `read_dir` / `remove_file` on the connection thread -- and that thread is
-    // shared, so the call can queue behind a large `GET /export` or `POST /import`. Held across
-    // that, and with tokio's `RwLock` being write-preferring, a single DELETE stalls every reader
-    // in the process: `POST /cancel`, `GET /stream`, the GC scan, the background poller.
+    // The write lock covers the in-flight re-check and the map removal, and nothing else. Not
+    // spanning the DB delete, which is a cascading `DELETE` plus a lock-directory sweep doing
+    // blocking `read_dir` / `remove_file` on the connection thread; that thread is shared, so the
+    // call can queue behind a large `GET /export` or `POST /import`. Held across that, and with
+    // tokio's `RwLock` being write-preferring, a single DELETE stalls every reader in the process:
+    // `POST /cancel`, `GET /stream`, the GC scan, the background poller.
     //
     // Shortening it is safe because the map lock is not what serialises this against a concurrent
-    // re-attach: the removed entry still owns the session's cross-process `FileLock`, and holds
-    // it until the end of this function. A request arriving in the gap finds no map entry, loads
-    // the row, fails to take the file lock, and gets `session-locked` -- never a second live entry
-    // for a session being deleted.
+    // re-attach: the removed entry still owns the session's cross-process `FileLock`, and holds it
+    // until the end of this function. A request arriving in the gap finds no map entry, loads the
+    // row, fails to take the file lock, and gets `session-locked` -- never a second live entry for
+    // a session being deleted.
     //
     // The one case that argument does not cover is a session that was already evicted, where there
     // is no entry and so no lock to hold. A re-attach that has taken the file lock and passed its

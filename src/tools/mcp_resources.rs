@@ -139,8 +139,8 @@ impl Tool for ListMcpResourcesTool {
             match crate::mcp::list_resources(&entry, &cancellation).await {
                 Ok(resources) => {
                     for resource in resources {
-                        // rmcp 2.1 flattened `Resource` (the fields that used to sit under `.raw`
-                        // are now directly on the struct).
+                        // rmcp 2.1 flattened `Resource`: its fields sit directly on the struct, not
+                        // under `.raw`.
                         let raw = &resource;
                         let mime = raw.mime_type.as_deref().unwrap_or("");
                         let description = raw.description.as_deref().unwrap_or("");

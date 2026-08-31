@@ -2,7 +2,7 @@
 //!
 //! Provider profiles live in `[providers.<name>]` in config.toml (non-secret settings only); the
 //! credential — an API key or OAuth bundle — is stored in the database keyed by profile name and
-//! acquired here via `add` / `login`. This replaces the old one-shot `meka setup` wizard.
+//! acquired here via `add` / `login`.
 
 use std::io::{self, IsTerminal, Read, Write};
 
@@ -164,8 +164,7 @@ async fn run_add(
         if model_flag.is_none() {
             anyhow::bail!(
                 "`--api-key-stdin` reads the key from stdin, so it cannot prompt for --model. \
-                 Pass it as a flag. `--base-url` is optional; omitting it accepts the backend \
-                 default."
+                 Pass it as a flag."
             );
         }
     }
@@ -829,13 +828,11 @@ fn report_orphaned_profiles(orphans: &[String]) {
     }
     println!();
     println!("Stored credentials with no profile: {}", orphans.join(", "));
-    // Says only what the diff proves. Deleting the block by hand is the usual cause, but an `add`
-    // that stored the secret and then failed to write the profile leaves the same trace, and a hint
-    // that names one cause would send that user looking for an edit they never made.
-    crate::render::render_hint(
-        "left over from a profile that is no longer configured; \
-         delete one with `meka provider remove <name>`",
-    );
+    // The action only. Deleting the block by hand is the usual cause, but an `add` that stored the
+    // secret and then failed to write the profile leaves the same trace, so a hint that named one
+    // cause would send that user looking for an edit they never made; and the line above has
+    // already stated what was found.
+    crate::render::render_hint("delete one with `meka provider remove <name>`");
 }
 
 fn validate_backend(value: &str) -> anyhow::Result<&str> {
@@ -875,10 +872,10 @@ fn join_profile_names(config_file: &config::ConfigFile) -> String {
 /// How a backend proves who it is: an interactive OAuth flow, or a key the user pastes.
 ///
 /// Split out from [`acquire_credential`] so the "every supported backend is accounted for" property
-/// can be tested without running a login. It used to be a bare match arm ending in
-/// `unreachable!()`, which was reachable: [`validate_backend`] accepts anything in
-/// [`crate::provider::SUPPORTED_PROVIDERS`], so adding a backend there and forgetting this match
-/// panicked at the credential step rather than failing to build.
+/// can be tested without running a login. Not a bare match arm ending in `unreachable!()`, which is
+/// reachable: [`validate_backend`] accepts anything in [`crate::provider::SUPPORTED_PROVIDERS`], so
+/// adding a backend there and forgetting this match would panic at the credential step rather than
+/// fail to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CredentialKind {
     /// A Claude subscription login, against Anthropic's authorization server.
@@ -3061,9 +3058,9 @@ model = "untouched"
     /// suite stayed green. It is a pure function of the two documents and a name, so it does not
     /// need the filesystem to be tested -- only to be called.
     ///
-    /// The pairing is what `provider add` used to let through. `run_set`'s comment claimed parity
-    /// with `add` while `add` refused nothing, so the flags below wrote a profile that exited 0 and
-    /// then failed at startup on every later run.
+    /// The pairing `provider add` must not let through. `run_set`'s comment claimed parity with
+    /// `add` while `add` refused nothing, so the flags below wrote a profile that exited 0 and then
+    /// failed at startup on every later run.
     #[test]
     fn a_profile_that_could_not_start_is_refused_by_both_write_doors() {
         let good = r#"[providers.work]
@@ -3257,8 +3254,8 @@ type = "anthropic-messages"
 
     /// An unknown key is refused whichever way it arrived, including behind `--unset`.
     ///
-    /// The refusal used to live inside the value branch, so `--unset modle` skipped it entirely:
-    /// the command exited 0, removed nothing, and told the user nothing. Nothing else would notice,
+    /// The refusal must not live inside the value branch, where `--unset modle` skips it entirely:
+    /// the command exits 0, removes nothing, and tells the user nothing. Nothing else would notice,
     /// because the write it did not do is indistinguishable from a key that was already absent.
     #[test]
     fn an_unknown_key_is_refused_whether_or_not_a_value_came_with_it() {

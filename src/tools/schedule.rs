@@ -592,11 +592,11 @@ mod tests {
     async fn test_a_gate_is_refused_below_write_but_the_reminder_is_not() {
         // Every level below `unrestricted`, not just `read`.
         //
-        // `workspace` is the one that matters: it used to *pass* this door, and that was a
-        // one-call escape -- `schedule_create` with a gate ran arbitrary unconfined commands from
-        // inside the confined mode within one poll interval. `ask` matters for the other reason:
-        // nobody is present at fire time to answer the prompt its safety rests on. Exercising only
-        // `read` left both of those unguarded at the tool door.
+        // `workspace` is the one that matters: letting it *pass* this door is a one-call escape,
+        // since `schedule_create` with a gate runs arbitrary unconfined commands from inside the
+        // confined mode within one poll interval. `ask` matters for the other reason: nobody is
+        // present at fire time to answer the prompt its safety rests on. Exercising only `read`
+        // left both of those unguarded at the tool door.
         for level in [
             Permission::None,
             Permission::Read,
@@ -739,8 +739,8 @@ mod tests {
     }
 
     /// `schedule_list` is where the model looks when it wants detail, so it is where the reason a
-    /// job is dead belongs. The listing used to show the gate's *definition* and stop there, which
-    /// reads as healthy however long the gate has been refused.
+    /// job is dead belongs. Showing the gate's *definition* and stopping there reads as healthy
+    /// however long the gate has been refused.
     #[tokio::test]
     async fn list_reports_a_gate_that_cannot_currently_fire() {
         let (tool, session_id, manager) = harness().await;

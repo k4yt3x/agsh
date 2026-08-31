@@ -23,13 +23,13 @@ fn require_any_read_scope(principal: &Principal) -> Result<(), ProblemDetail> {
 
 /// What this server is, for a client deciding how to talk to it.
 ///
-/// Deliberately carries no provider or model. It used to report both, as the default profile's
-/// backend and model, and `provider` in particular held a *backend* (`anthropic-messages`) while
-/// the `provider` field on `POST /v1/sessions` holds a *profile* (`work`). One word, two meanings,
-/// one API: a client that read one and posted it to the other got a 422. `GET /v1/providers`
-/// already answers both questions and names them apart -- `name` for the profile, `type` for the
-/// backend -- and marks the default with `active`, so the fields here were a duplicate in the wrong
-/// vocabulary rather than the only way to learn anything.
+/// Deliberately carries no provider or model. Reporting both as the default profile's backend and
+/// model makes `provider` hold a *backend* (`anthropic-messages`) while the `provider` field on
+/// `POST /v1/sessions` holds a *profile* (`work`). One word, two meanings, one API: a client that
+/// read one and posted it to the other got a 422. `GET /v1/providers` already answers both
+/// questions and names them apart -- `name` for the profile, `type` for the backend -- and marks
+/// the default with `active`, so the fields here were a duplicate in the wrong vocabulary rather
+/// than the only way to learn anything.
 #[derive(Serialize, ToSchema)]
 pub struct InfoResponse {
     pub version: String,

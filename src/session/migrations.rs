@@ -1,59 +1,43 @@
 //! The schema ledger: the only place in meka that knows a previous version of the store existed.
 //!
-//! Three rules hold this module apart from the rest of the program, and `AGENTS.md` states them as
-//! hard rules because the whole benefit depends on them.
+//! `AGENTS.md`'s "Schema and migrations" section states the four rules and what they buy. What
+//! follows is what enforcing them looks like here.
 //!
 //! **Nothing outside this module may know that an older meka existed.** No fallback reader for a
-//! superseded shape, no `#[serde(alias)]` for a renamed field, no deprecation notice, no branch
-//! whose condition is "was this row written by an older release". Every other reader assumes the
-//! current schema unconditionally, and may do so because [`apply`] has already run by the time any
-//! of them sees the store. That assumption is the thing being bought here. Scattered backwards
-//! compatibility grows with every reader times every shape it has to tolerate and never goes away;
-//! a migration converts once and leaves exactly one shape in the world.
+//! superseded shape, no `#[serde(alias)]` for a renamed field, no branch whose condition is "was
+//! this row written by an older release". Every other reader assumes the current schema
+//! unconditionally, and may do so because [`apply`] has already run by the time it sees the store.
 //!
-//! **A migration is frozen once any store has run it, and so are its dependencies.** Once, not
-//! "once it ships": `user_version` is a positional index into this list, so removing an entry
-//! renumbers every entry after it, and a store stamped between the hole and the new head skips a
-//! step it never ran and then stamps itself current. A development store is a store. It may not
-//! call meka's own code either. It reads and writes raw rows, and inlines whatever the logic meant
-//! at the time it was written. [`gates_become_kind_and_spec`] builds its JSON by hand rather than
-//! through
-//! `Gate::spec`, because a migration that borrowed that function would quietly start doing
-//! something else the day the gate types are refactored, years after the users it ran for stopped
-//! being able to notice.
+//! **A migration is frozen once any store has run it**, development stores included: `user_version`
+//! is a positional index into this list, so removing an entry renumbers every entry after it, and a
+//! store stamped between the hole and the new head skips a step it never ran and then stamps itself
+//! current.
 //!
-//! It may, though, *receive* a fact it cannot work out for itself. That is what [`Context`] carries
-//! and what separates it from the ban above: a function can change meaning under a frozen step, a
-//! `String` cannot. [`sessions_name_their_provider`] needs the profile a session with none recorded
-//! should adopt, `config.toml` is the only place that knows, and this module must not read it.
+//! **A migration may not call meka's own code.** [`gates_become_kind_and_spec`] builds its JSON by
+//! hand rather than through `Gate::spec`, because a borrowed function starts meaning something else
+//! the day the gate types are refactored, years after the users it ran for could notice. It may
+//! *receive* a fact it cannot work out: that is [`Context`], and a `String` cannot change meaning
+//! under a frozen step the way a function can. [`sessions_name_their_provider`] needs the profile a
+//! session with none recorded should adopt, and `config.toml` is the only place that knows.
 //!
-//! **A migration must be safe to run twice.** `user_version` lives in the file header, and the
-//! standard SQLite round trip drops it: `sqlite3 old.db .dump | sqlite3 new.db` produces a store
-//! with the right schema and a version of 0 (plain `VACUUM` keeps it; `.dump` does not). Such a
-//! store is classified by shape, which can only answer "fresh" or "at the baseline", so every step
-//! after the baseline runs again over data that already has them applied.
-//!
-//! [`gates_become_kind_and_spec`] survives that because it was written to: it guards each
-//! `ADD COLUMN` on the column's absence and returns early when `gate_command` is already gone. A
-//! plain `Step::Sql("ALTER TABLE … ADD COLUMN x")` in the same position would fail with
-//! `duplicate column name` and refuse the store on every start, with no way forward. Prefer
-//! `CREATE … IF NOT EXISTS`, guard `ALTER TABLE` on the current column set, and make data
-//! conversions test for the shape they are converting *from* rather than assuming it.
+//! **A migration must be safe to run twice.** `user_version` lives in the file header, and `sqlite3
+//! old.db .dump | sqlite3 new.db` drops it where plain `VACUUM` keeps it. Such a store is
+//! classified by shape, which can only answer "fresh" or "at the baseline", so every step after the
+//! baseline replays over data that already has it. [`gates_become_kind_and_spec`] guards each `ADD
+//! COLUMN` on the column's absence and returns early when `gate_command` is already gone; a plain
+//! `Step::Sql("ALTER TABLE … ADD COLUMN x")` in that position fails with `duplicate column name`
+//! and refuses the store on every start.
 //!
 //! What is *not* banned elsewhere: guards against hand-editing, corruption and bugs. Those name no
-//! release and are equally true of a store meka created five minutes ago, so they stay where the
-//! data is read. `gate_kind` and `gate_spec` must both be set or both be null; an unparseable
-//! `gate_permission` fails closed. Deleting those would turn fail-closed paths into fail-open ones,
-//! and has nothing to do with versioning.
+//! release and are equally true of a store created five minutes ago, so they stay where the data is
+//! read. `gate_kind` and `gate_spec` must both be set or both be null; an unparseable
+//! `gate_permission` fails closed.
 //!
-//! The version lives in `PRAGMA user_version`, a 32-bit slot in the file header that SQLite
-//! reserves for applications and never touches itself. It holds the number of migrations applied,
-//! so head is `MIGRATIONS.len()`. It is transactional, so the DDL and the version bump commit or
-//! fail together and no interruption can leave the schema ahead of the number that describes it.
-//! `VACUUM INTO` copies it, so a restored backup identifies itself correctly. Note that SQLite's
-//! own `PRAGMA schema_version` is a different thing entirely, an internal DDL counter that moves on
-//! its own and differs between logically identical stores; it is not usable for this and must not
-//! be written.
+//! `PRAGMA user_version` is a 32-bit slot in the file header that SQLite reserves for applications
+//! and never touches itself. It holds the number of migrations applied, so head is
+//! `MIGRATIONS.len()`. It is transactional, so the DDL and the version bump commit or fail
+//! together, and `VACUUM INTO` copies it. SQLite's own `PRAGMA schema_version` is an unrelated
+//! internal DDL counter: not usable for this, and must not be written.
 
 use crate::error::{MekaError, Result};
 
@@ -216,10 +200,10 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
 
 /// `1` does not mean what this ledger would mean by it, so it is never taken at face value.
 ///
-/// meka used to carry a different schema system, removed in 0.42, which stamped
-/// `PRAGMA user_version = 1` as a one-shot "this database has been initialised" flag rather than as
-/// a step counter. Every store that any release up to and including 0.41 finished opening still
-/// carries it, which is most stores in existence and was true of the first real one this was tested
+/// A store written before 0.42 carries `PRAGMA user_version = 1` from a different schema system,
+/// which used it as a one-shot "this database has been initialised" flag rather than as a step
+/// counter. Every store that any release up to and including 0.41 finished opening still carries
+/// it, which is most stores in existence and was true of the first real one this was tested
 /// against.
 ///
 /// Read as a ledger version it says "the baseline is applied", and for a 0.42-shaped store that
@@ -516,12 +500,11 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
 /// Every **table** [`BASELINE_0_42`] creates, by the name it appears under in `sqlite_master`.
 ///
 /// Tables only, deliberately. A missing table means the store is not at the baseline and the
-/// classification would be a lie; a missing *index* means the same queries return the same
-/// answers more slowly, and refusing to start over one would be worse than the problem. The
-/// seven indexes the baseline creates are therefore not checked, and not repaired either:
-/// the old `CREATE INDEX IF NOT EXISTS` on every open used to put a dropped one back, and
-/// nothing does now. That is a real if small regression, accepted because the alternative is
-/// the declare-and-heal pattern the ledger exists to replace.
+/// classification would be a lie; a missing *index* means the same queries return the same answers
+/// more slowly, and refusing to start over one would be worse than the problem. The seven indexes
+/// the baseline creates are therefore not checked, and not repaired either: nothing puts a dropped
+/// one back. That is a real if small regression, accepted because the alternative is the
+/// declare-and-heal pattern the ledger exists to replace.
 ///
 /// Read by [`classify_by_shape`] to check that a store claiming to be at the baseline really is.
 /// Deliberately a separate list rather than parsed out of the SQL: it is the *question* asked of an
@@ -799,10 +782,9 @@ fn gates_become_kind_and_spec(transaction: &rusqlite::Transaction<'_>) -> rusqli
 
     if !unconvertible.is_empty() {
         tracing::warn!(
-            "{} scheduled job(s) had a gate that could not be read and were left inert, exactly as \
-             the previous release left them: {}. They will not fire, and they will not appear in \
-             `meka schedule list` or be reachable by `meka schedule cancel`. Recreate them if you \
-             still want them; the pre-migration backup has the originals",
+            "{} scheduled job(s) had a gate that could not be read and stay inert, as the previous \
+             release left them: {}. They will not fire or appear in `meka schedule list`; recreate \
+             them from the pre-migration backup if you still want them",
             unconvertible.len(),
             unconvertible.join(", ")
         );
@@ -879,8 +861,8 @@ fn sessions_name_their_provider(
         if stranded > 0 {
             tracing::warn!(
                 "no provider profile could be resolved, so {} existing session(s) were left \
-                 without one. Configure a provider, then resume such a session with --provider \
-                 once to say which it runs on; that is what records it",
+                 without one. Configure a provider, then resume each with --provider once to \
+                 record which it runs on",
                 stranded
             );
         }
@@ -1308,13 +1290,12 @@ mod tests {
     /// objects it touches were made a moment ago by an earlier step or were already there. Every
     /// guarded step is a candidate, and the guards are why this file has so many of them.
     ///
-    /// **What it cannot catch is renumbering, and the wording here used to claim otherwise.** The
-    /// intermediate store is built by running `MIGRATIONS[..stopped_at]` -- the *current* list --
-    /// so "a store at version N" means whatever this build says N is. Delete an entry and the
-    /// yardstick moves with the ledger: prefix and suffix still compose to the whole list, the
-    /// fingerprints still match, and this test passes. Verified by re-introducing the exact
-    /// deletion that caused the outage; this test was green and only
-    /// [`the_ledger_is_append_only`] failed.
+    /// **What it cannot catch is renumbering.** The intermediate store is built by running
+    /// `MIGRATIONS[..stopped_at]`, the *current* list, so "a store at version N" means whatever
+    /// this build says N is. Delete an entry and the yardstick moves with the ledger: prefix and
+    /// suffix still compose to the whole list, the fingerprints still match, and this test passes.
+    /// Verified by re-introducing the exact deletion that caused the outage; this test was green
+    /// and only [`the_ledger_is_append_only`] failed.
     ///
     /// That is the general shape of every test in this file bar one: the "before" state is built
     /// from the code under test, so no test here can see a defect that depends on what a *previous*
@@ -1444,9 +1425,9 @@ mod tests {
         /// Every entry, in order, because **an entry is frozen once any store has run it** -- which
         /// is not the same as having shipped.
         ///
-        /// This used to pin the released prefix only, on the reasoning that an unreleased entry
-        /// belongs to nobody. It does not: a development store has run it, and `user_version` is a
-        /// positional index, so removing an entry renumbers every entry after it and a store
+        /// Pinning the released prefix only, on the reasoning that an unreleased entry belongs to
+        /// nobody, is not enough. It does not: a development store has run it, and `user_version`
+        /// is a positional index, so removing an entry renumbers every entry after it and a store
         /// stamped between the hole and the new head skips a step it never ran while reporting a
         /// clean migration. That happened. `sessions_record_their_model_overrides` was deleted as
         /// "unreleased, therefore free", and a store at 4 silently lost
@@ -2148,10 +2129,9 @@ mod tests {
         );
     }
 
-    /// The count is what decides whether a migration is refused, so a constant in its place
-    /// disarms the guard while every other test still passes. Mutation-checked: `Ok(0)`, `Ok(1)`
-    /// and `Ok(-1)` all survived the suite until this existed, because the comparison that reads it
-    /// is `after > before` and any constant makes that false.
+    /// The count is what decides whether a migration is refused, so a constant in its place disarms
+    /// the guard while every other test still passes. The comparison that reads this is `after >
+    /// before`, which any constant return value makes false, so the value itself has to be pinned.
     #[test]
     fn dangling_references_are_counted_rather_than_assumed() {
         let mut connection = store_as_0_42_left_it();
@@ -2184,8 +2164,8 @@ mod tests {
     }
 
     /// The warning is the only signal a user gets that a job was left inert, and the only place the
-    /// ids appear. Mutation-checked: deleting the `!` so it fires on the empty case survived the
-    /// suite until this existed, because nothing read the log.
+    /// ids appear. Nothing else reads the log, so without this the guard can be inverted to fire on
+    /// the empty case and stay green.
     #[test]
     fn only_a_store_with_unreadable_gates_is_warned_about() {
         crate::render::log_capture::start();
@@ -2195,7 +2175,7 @@ mod tests {
         let clean_plan = plan(&clean).expect("classified");
         apply(&mut clean, clean_plan, &Context::default()).expect("converted");
         assert!(
-            !crate::render::log_capture::warnings().contains("left inert"),
+            !crate::render::log_capture::warnings().contains("stay inert"),
             "a store whose gates all convert must not be warned about: {}",
             crate::render::log_capture::warnings()
         );
@@ -2205,7 +2185,7 @@ mod tests {
         let damaged_plan = plan(&damaged).expect("classified");
         apply(&mut damaged, damaged_plan, &Context::default()).expect("converted");
         let warnings = crate::render::log_capture::warnings();
-        assert!(warnings.contains("left inert"), "{warnings}");
+        assert!(warnings.contains("stay inert"), "{warnings}");
         assert!(
             warnings.contains("unreadable"),
             "the warning must name the row, since nothing else will: {warnings}"

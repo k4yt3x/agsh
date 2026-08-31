@@ -251,15 +251,15 @@ pub enum ErrorKind {
     /// The upstream failed in a way meka's own classifier had already labelled transient.
     ///
     /// A 502 like [`Self::Provider`], and a distinct `type` for the reason
-    /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again
-    /// after a pause. Its absence is not the opposite claim, only the lack of this one; see
+    /// [`Self::ContextOverflow`] is one: the remedies differ. This one is worth sending again after
+    /// a pause. Its absence is not the opposite claim, only the lack of this one; see
     /// [`Self::Provider`].
     ///
-    /// **The two used to be one type, and a relayed `Retry-After` was the only thing telling them
-    /// apart.** That header is absent from most of this variant's own instances: a transport
-    /// failure has no response to carry one, a mid-stream `overloaded_error` has no headers to
-    /// read, and [`crate::error::parse_retry_after`] reads only the delta-seconds form, so an
-    /// upstream answering with an HTTP date sends none meka can use. An overload therefore arrived
+    /// **A relayed `Retry-After` cannot be what separates this from [`Self::Provider`].** That
+    /// header is absent from most of this variant's own instances: a transport failure has no
+    /// response to carry one, a mid-stream `overloaded_error` has no headers to read, and
+    /// [`crate::error::parse_retry_after`] reads only the delta-seconds form, so an upstream
+    /// answering with an HTTP date sends none meka can use. An overload therefore arrived
     /// byte-identical to a dead credential, and a client had to choose between retrying that
     /// credential forever and dropping turns a second attempt would have completed.
     ///
@@ -287,9 +287,8 @@ pub enum ErrorKind {
     ///
     /// A 503 rather than a 502: the dependency that is unwell is one meka manages rather than the
     /// model provider, and the caller's request was never forwarded to anything. Distinct from
-    /// [`Self::Internal`], which is where this used to land, and which reads as "meka broke"
-    /// and sends an operator to the wrong log; meka classified this one correctly and the fault
-    /// is in a subprocess or a remote MCP server.
+    /// [`Self::Internal`], which reads as "meka broke" and sends an operator to the wrong log: meka
+    /// classified this one correctly, and the fault is in a subprocess or a remote MCP server.
     McpUnavailable,
     Internal,
 }
@@ -479,22 +478,21 @@ impl ProblemDetail {
             // a count into the type would be inventing a guarantee.
             //
             // Split from the arm above because a client's sensible responses differ, and sharing
-            // one type left it unable to choose. A relayed `Retry-After` was the only
-            // thing separating them, and it is missing from most instances of this very
-            // arm: a transport failure never received a response to carry one, a
-            // mid-stream `overloaded` event has no headers, and `parse_retry_after`
-            // reads only delta-seconds. The 529 a bridge sees most often
-            // therefore arrived byte-identical to a dead credential.
+            // one type left it unable to choose. A relayed `Retry-After` was the only thing
+            // separating them, and it is missing from most instances of this very arm: a transport
+            // failure never received a response to carry one, a mid-stream `overloaded` event has
+            // no headers, and `parse_retry_after` reads only delta-seconds. The 529 a bridge sees
+            // most often therefore arrived byte-identical to a dead credential.
             //
             // `StreamError` is here rather than above because every producer is transport-shaped:
-            // an idle timeout, an `Err` from the SSE stream itself, and a stream that
-            // ended before its terminal event. A malformed SSE payload is *not* one of
-            // them, being skipped with a `warn!` and a `continue`, so nothing in this
-            // arm resends into a body the provider will reject identically forever.
+            // an idle timeout, an `Err` from the SSE stream itself, and a stream that ended before
+            // its terminal event. A malformed SSE payload is *not* one of them, being skipped with
+            // a `warn!` and a `continue`, so nothing in this arm resends into a body the provider
+            // will reject identically forever.
             //
-            // Both used to fall through to the `other` arm, which answers 500 and logs at `error!`
-            // as an unhandled internal fault, sending an operator to look in the wrong process for
-            // a failure meka had classified correctly.
+            // Falling through to the `other` arm answers 500 and logs at `error!` as an unhandled
+            // internal fault, sending an operator to look in the wrong process for a failure meka
+            // classified correctly.
             MekaError::StreamError(message) => {
                 tracing::warn!("provider error: {}", message);
                 let problem = ProblemDetail::new(
@@ -539,7 +537,7 @@ impl ProblemDetail {
             // turn. Its own `type` because the remedy is the opposite one. `provider` invites the
             // client to send the same request again, which is right for a 529 and wrong here: the
             // conversation is too long and will be too long next time. Sharing the type left a
-            // correct client retrying forever, so the split is the point rather than tidiness.
+            // correct client retrying forever, so the split is deliberate.
             //
             // Not a 413. That status is spoken for by `max_body_bytes`, which is meka's own limit
             // on the HTTP request rather than the model's window, so reusing it would make one
@@ -664,8 +662,8 @@ mod tests {
                     "\u{3042}".repeat(16)
                 ),
             ),
-            // Just over the cap: adding a marker on top used to return more bytes than it was
-            // given, which is the one size a bound must not grow.
+            // Just over the cap, which is the one size a bound must not grow: adding a marker on
+            // top would return more bytes than it was given.
             ("one byte over", "a".repeat(RELAYED_BODY_CAP + 1)),
         ] {
             let out = bounded_upstream_body(&body);
@@ -779,9 +777,9 @@ mod tests {
     /// An upstream failure reaches the caller as one rather than as an internal fault, and says it
     /// was the transient kind.
     ///
-    /// Both used to fall through to the catch-all, so exhausting the retries on a 429 answered 500
-    /// and logged itself as an unhandled internal fault, sending an operator to look in the wrong
-    /// process for a failure meka had classified correctly.
+    /// Falling through to the catch-all makes an exhausted 429 answer 500 and log itself as an
+    /// unhandled internal fault, sending an operator to look in the wrong process for a failure
+    /// meka classified correctly.
     ///
     /// The type URI is asserted alongside the status because the two travel together: one error
     /// type answering with two different statuses is what a client keying on the type cannot
@@ -862,12 +860,12 @@ mod tests {
     /// A required MCP server that never came up answers 503 under its own type, and its reasons
     /// stay in the log.
     ///
-    /// Both halves matter. This variant used to fall through to the `other` arm, so a subprocess
-    /// that failed to start was reported as `/errors/internal` 500 and logged as an unhandled
-    /// internal fault, which is the one classification that sends an operator looking in the wrong
-    /// process. And a reason string is the connector's own text: it has carried a spawn failure
-    /// complete with the command line and its path, which is the same argument that keeps a
-    /// provider's response body out of the arm above.
+    /// Both halves matter. Falling through to the `other` arm reports a subprocess that failed to
+    /// start as `/errors/internal` 500, logged as an unhandled internal fault, which is the one
+    /// classification that sends an operator looking in the wrong process. And a reason string is
+    /// the connector's own text: it has carried a spawn failure complete with the command line and
+    /// its path, which is the same argument that keeps a provider's response body out of the arm
+    /// above.
     #[test]
     fn a_required_mcp_server_that_is_down_is_503_under_its_own_type() {
         let error = MekaError::McpTurnGated {

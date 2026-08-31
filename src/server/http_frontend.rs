@@ -147,7 +147,7 @@ pub struct TurnStream {
     terminal: Option<SseEvent>,
     /// When the last subscriber went away, or `None` while one is attached.
     ///
-    /// Zero subscribers used to mean "cancel the turn, nobody is listening". That is the right
+    /// Zero subscribers does not mean "cancel the turn, nobody is listening". That is the right
     /// instinct (a turn with no audience is burning provider tokens for nobody) and the wrong
     /// deadline, because the case re-attach exists for looks identical for its first instant: a
     /// client whose connection dropped and is about to come back. The stamp turns the check into a
@@ -572,10 +572,9 @@ impl Frontend for HttpFrontend {
             // Blocking mode: no SSE channel to ask through. Auto-deny and surface the
             // misconfiguration signal in the response so the operator notices.
             self.record_warn_notice(format!(
-                "Permission for '{}' auto-denied: session is in Ask mode but the caller \
-                 requested stream=false, which has no human-in-loop channel. Configure the \
-                 session with permission=workspace or permission=unrestricted to allow these \
-                 tools, or use stream=true.",
+                "Permission for '{}' auto-denied: the session is in Ask mode and stream=false has \
+                 no channel to approve on. Use stream=true, or set permission=workspace or \
+                 permission=unrestricted.",
                 request.tool_name
             ))
             .await;
@@ -587,9 +586,8 @@ impl Frontend for HttpFrontend {
             // burn the full timeout and deny anyway; do it now and say why.
             self.record_warn_notice(format!(
                 "Permission for '{}' auto-denied: the session declared \
-                 supports_permission_prompts=false, so there is no channel to approve on. \
-                 Configure the session with permission=workspace or permission=unrestricted to \
-                 allow these tools.",
+                 supports_permission_prompts=false, so there is no channel to approve on. Set \
+                 permission=workspace or permission=unrestricted.",
                 request.tool_name
             ))
             .await;
@@ -728,10 +726,10 @@ mod tests {
     /// `subscriber_count` has to see a re-attached second consumer, because that count is the only
     /// thing standing between one slow reader and everyone else's turn.
     ///
-    /// The SSE stream task cancels the turn when a consumer lags, and it used to do so
+    /// The SSE stream task cancels the turn when a consumer lags, and must not do so
     /// unconditionally: turn events are a broadcast, so a re-attached client or a second consumer
-    /// is a separate receiver, and one slow reader killed the turn out from under the client that
-    /// was keeping up. The guard is `subscriber_count() <= 1`, and reverting it left all four
+    /// is a separate receiver, and one slow reader would kill the turn out from under the client
+    /// that is keeping up. The guard is `subscriber_count() <= 1`, and reverting it left all four
     /// suites green. This pins the count's semantics, including the part the guard depends on --
     /// that the lagging receiver, which is about to be dropped, is still included while it lives,
     /// which is why the threshold is `<= 1` rather than `== 0`.

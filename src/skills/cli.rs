@@ -157,11 +157,11 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
             }
         }
     }
-    // Namespaced, like the `metadata.` lines above and unlike the bare `key: value` these used to
-    // print. A frontmatter key is chosen by whoever wrote the file, so a bare replay collided with
-    // the modelled lines: a skill carrying a top-level `priority: 3` printed `priority` twice with
-    // two values, and a hostile one could add a second `source_dir:` or `body:` line
-    // contradicting the real one. This is stdout, which the project treats as parseable data.
+    // Namespaced, like the `metadata.` lines above, rather than bare `key: value`. A frontmatter
+    // key is chosen by whoever wrote the file, so a bare replay collided with the modelled lines: a
+    // skill carrying a top-level `priority: 3` printed `priority` twice with two values, and a
+    // hostile one could add a second `source_dir:` or `body:` line contradicting the real one. This
+    // is stdout, which the project treats as parseable data.
     for (key, value) in &skill.extra {
         println!(
             "extra.{}: {}",
@@ -278,20 +278,19 @@ async fn prepare_add(
     // could install a skill the reference validator rejects for a missing required field -- and it
     // did, silently, because meka reads identity from the directory and so never missed the key.
     //
-    // A mismatched `name` needs no check here: `parse_skill_definition` refuses that above, and the
-    // duplicate branch this replaces was unreachable for exactly that reason.
+    // A mismatched `name` needs no check here: `parse_skill_definition` refuses that above, so a
+    // branch for it would be unreachable.
     //
     // Deliberately narrow. A top-level `when_to_use` from a Claude Code skill is a key the spec
     // does not define and meka *preserves* on purpose, so refusing the file over it would
     // contradict the rest of the design. A missing required field is not that.
     if !parsed.conformance.declares_name {
         return Err(MekaError::Config(format!(
-            "{} declares no 'name'; the Agent Skills spec requires one and it must be '{}'. Add \
-             `name: {}` to the file's frontmatter.",
+            "{} declares no 'name', which the Agent Skills spec requires. Add `name: {}` to its \
+             frontmatter.",
             args.from_file
                 .map(display_path)
                 .unwrap_or_else(|| "the file".to_string()),
-            args.name,
             args.name
         )));
     }
@@ -314,11 +313,11 @@ pub async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> Result<
     let skill_md = dir.join("SKILL.md");
     // The replacement lands *first*, and the old bundled files are cleared afterwards.
     //
-    // This used to be `remove_dir_all` and then write, which is a destructive step with no
-    // guarantee anything follows it. A skill directory holding a read-only subdirectory -- an
-    // ordinary shape for vendored data -- had its `SKILL.md` unlinked and then the removal failed
-    // partway, leaving nothing written, nothing to roll back to, and an error reading "failed to
-    // remove" as though nothing had happened. Observed.
+    // Not `remove_dir_all` and then write, which is a destructive step with no guarantee anything
+    // follows it. A skill directory holding a read-only subdirectory -- an ordinary shape for
+    // vendored data -- had its `SKILL.md` unlinked and then the removal failed partway, leaving
+    // nothing written, nothing to roll back to, and an error reading "failed to remove" as though
+    // nothing had happened. Observed.
     //
     // `write_file_atomic` creates the parents, so no separate `create_dir_all` is needed; and
     // because it publishes by rename, the directory never holds a partial `SKILL.md`.
@@ -355,7 +354,7 @@ pub async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> Result<
         kept.sort();
         crate::render::render_hint(&format!(
             "the skill was written, but these files from the previous version could not be \
-             removed and are still in the directory: {}",
+             removed: {}",
             kept.join(", ")
         ));
     }
@@ -487,13 +486,12 @@ pub async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Result<()> 
 /// Look up one skill for the commands that show it, or say why it is not there.
 ///
 /// The failure goes through [`skills::SkillIndex::unavailable`], so `meka skill get`, `meka skill
-/// show` and `--skill` distinguish a name nobody wrote from a file that will not parse. They used
-/// to answer "no skill named 'x'" for both, which put the CLI in the position of denying a skill
-/// the startup warning had just named.
-/// Reads only the file the name points at, so asking about one skill does not report on the rest of
-/// the store. `--skill` resolves here *and* the agent's own discovery runs moments later, so a walk
-/// meant every broken skill in every root was warned about twice per run, about files the user had
-/// not asked after.
+/// show` and `--skill` distinguish a name nobody wrote from a file that will not parse. Answering
+/// "no skill named 'x'" for both puts the CLI in the position of denying a skill the startup
+/// warning has just named. Reads only the file the name points at, so asking about one skill does
+/// not report on the rest of the store. `--skill` resolves here *and* the agent's own discovery
+/// runs moments later, so a walk meant every broken skill in every root was warned about twice per
+/// run, about files the user had not asked after.
 pub(crate) fn require_skill(name: &str, roots: &[std::path::PathBuf]) -> Result<skills::Skill> {
     let found = skills::resolve_skill(name, roots).map_err(MekaError::Config)?;
     match found.find(name) {
@@ -675,9 +673,9 @@ mod tests {
     /// `--from-file` may not install a skill whose `name` disagrees with its directory.
     ///
     /// Refused by `parse_skill_definition`, which every write door goes through, rather than by a
-    /// rule of this command's own: the duplicate check that used to sit here was unreachable behind
-    /// it. What this pins is that `--from-file` -- the one door that copies bytes instead of
-    /// rendering `name:` from the directory -- is still held to it.
+    /// rule of this command's own, which would be unreachable behind it. What this pins is that
+    /// `--from-file` -- the one door that copies bytes instead of rendering `name:` from the
+    /// directory -- is still held to it.
     #[tokio::test]
     async fn add_from_file_refuses_a_name_that_disagrees_with_the_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -948,8 +946,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("scripts")).expect("mkdir");
         std::fs::write(dir.join("scripts/helper.sh"), "#!/bin/sh\n").expect("bundled file");
 
-        // A directory differing only by case: `check_case_collision` refuses, and used to do so
-        // after the delete had already run.
+        // A directory differing only by case: `check_case_collision` refuses, and must do so before
+        // the delete runs.
         //
         // Only representable on a case-sensitive filesystem. Windows and a default macOS volume
         // fold the two names onto one directory, so `create_dir_all` would silently reopen the

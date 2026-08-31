@@ -808,10 +808,9 @@ impl ProbeOutcome {
 
 /// Why a gate may not run at a given level.
 ///
-/// One type so the doors that ask -- `schedule_create`, `POST /v1/sessions/{id}/schedule`,
-/// and the fire-time re-check in [`prepare`] -- give the same answer for the same state. They used
-/// to phrase the single shell rule three ways, which is how one of them came to name a mode that no
-/// longer existed.
+/// One type so the doors that ask -- `schedule_create`, `POST /v1/sessions/{id}/schedule`, and the
+/// fire-time re-check in [`prepare`] -- give the same answer for the same state. Phrased separately
+/// at each door, one of them ends up naming a mode that no longer exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateRefusal {
     /// A shell gate is a bare `sh -c` on a timer with nobody watching.
@@ -1532,12 +1531,8 @@ fn occurrences_between(schedule: &Schedule, from: DateTime<Utc>, to: DateTime<Ut
 /// the wakeup over, so the row is untouched while the host works; a host that turns out to be
 /// unable to run the job says so, and the lease is released rather than completed.
 ///
-/// It used to be the other way round: `prepare` *consumed* the job -- stamped it and advanced its
-/// schedule, or for a one-shot deleted the row -- before the host was asked, so that a prompt which
-/// crashed the process could not re-fire forever. The handback then had to put something back,
-/// which for a one-shot meant an `INSERT` that could not tell a cancellation from its own delete.
-/// [`MAX_CLAIM_ATTEMPTS`] took over the crash protection, and this variant went back to meaning
-/// only what it says.
+/// Crash protection is [`MAX_CLAIM_ATTEMPTS`]'s job, not this variant's, so this means only what it
+/// says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FireOutcome {
     /// The turn ran, or failed in a way that re-running would not fix.
@@ -2015,13 +2010,13 @@ pub(crate) struct Claim {
 
 /// How many undelivered claims a job may accumulate before it stops being retried.
 ///
-/// A lease brings back a hazard that spending the occurrence up front used to prevent: a prompt
-/// that reliably kills the process is claimed again every time its lease expires, forever. Counting
-/// the claims that ended in neither a delivery nor a handback identifies exactly that job, and this
-/// is where it is parked: still listed, still cancellable, reported as held on every surface, and
-/// no longer able to take the daemon down with it. Three, because two is within the range of
-/// ordinary bad luck -- a deploy during a fire, then a machine restart -- and a fourth attempt on
-/// something that has failed three times is not going to be the one that works.
+/// A lease is handed back on expiry, so a prompt that reliably kills the process is otherwise
+/// claimed again forever. Counting the claims that ended in neither a delivery nor a handback
+/// identifies exactly that job, and this is where it is parked: still listed, still cancellable,
+/// reported as held on every surface, and unable to take the daemon down with it. Three, because
+/// two is within the range of ordinary bad luck (a deploy during a fire, then a machine restart)
+/// and a fourth attempt on something that has failed three times is not going to be the one that
+/// works.
 ///
 /// It also bounds the one shape the "advance on a failed probe" rule cannot reach: a job with no
 /// next occurrence, which in practice means a one-shot. There the lease is held rather than
@@ -2087,11 +2082,10 @@ fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
 
 /// Whether waking this session's prompt would actually produce work.
 ///
-/// The scheduler watcher used to raise its flag on `list_due_scheduled_jobs` alone, a pure SQL
-/// predicate, while [`prepare`] declines for several further reasons. Where the row deliberately
-/// does not move -- a job parked at [`MAX_CLAIM_ATTEMPTS`], or a session whose live level cannot do
-/// unattended work -- the job stayed due forever and the watcher re-raised the flag every poll,
-/// interrupting the prompt each time to run nothing.
+/// `list_due_scheduled_jobs` is a pure SQL predicate, while [`prepare`] declines for several
+/// further reasons. Waking on the SQL predicate alone interrupts the prompt every poll to run
+/// nothing, wherever the row deliberately does not move: a job parked at [`MAX_CLAIM_ATTEMPTS`], or
+/// a session whose live level cannot do unattended work.
 ///
 /// This answers the subset of `prepare`'s question that costs a row read and nothing else. It is
 /// deliberately *conservative* rather than exact: a gated job still wakes the prompt, because the
@@ -2171,10 +2165,9 @@ async fn prepare(
     // One lookup, for every job rather than only gated ones, serving the working directory a gate
     // runs in and the live level both the checks below need.
     //
-    // It used to be skipped for an ungated job, on the grounds that such a job had no authority to
-    // re-check. That was wrong about `none`: an ungated job kept firing there, waking a model that
-    // could read nothing and act on nothing. The query costs one row read per job that is actually
-    // due, against a model turn, so paying it unconditionally is not a trade worth thinking about.
+    // Not skipped for an ungated job: at `none` such a job would keep firing, waking a model that
+    // can read nothing and act on nothing. The query costs one row read per job actually due,
+    // against a model turn.
     let session = match session_manager.session_info(job.session_id).await {
         Ok(info) => info,
         Err(error) => {
@@ -2377,14 +2370,12 @@ async fn prepare(
     //
     // This is what arbitrates between hosts, which is why it is conditional. Every `meka serve`,
     // REPL and ACP session polls the same table, so one occurrence is in several hosts' due lists
-    // at once; whoever takes the lease owns it, and the rest return here having neither
-    // evaluated the gate nor spent the occurrence.
+    // at once; whoever takes the lease owns it, and the rest return here having neither evaluated
+    // the gate nor spent the occurrence.
     //
     // The lease is taken *before* the gate runs and released or completed after, so the row is
-    // never absent while this host is working. Claiming used to consume the row instead --
-    // advancing a recurring job's `next_fire_at`, deleting a one-shot outright -- which is why
-    // a refusal had to put something back, and why a crash between the claim and the turn lost
-    // the occurrence, or for a one-shot the entire job.
+    // never absent while this host is working: a refusal has nothing to put back, and a crash
+    // between the claim and the turn expires rather than spending the occurrence.
     let mut claim = Claim {
         owner: SCHEDULER_OWNER.clone(),
         next_fire_at,
@@ -2833,16 +2824,12 @@ impl ScheduleStore {
 
     /// Take this occurrence for this process, by leasing the row rather than consuming it.
     ///
-    /// One shape for both kinds of schedule, and the reason the two used to differ is worth
-    /// recording. A recurring job was claimed by advancing `next_fire_at`, which is a
-    /// compare-and-swap: whoever moves the row off the value every host read owns the occurrence.
-    /// A one-shot has no next occurrence to move to, so it was claimed by *deleting* the row, which
-    /// makes the same arbitration work and is where every problem came from. Deletion overloads one
-    /// piece of state with two facts -- "the user still wants this job" and "this occurrence is
-    /// available" -- so a host that later had to hand the occurrence back could only re-`INSERT`,
-    /// and an `INSERT` cannot tell "I deleted this a moment ago" from "the user cancelled it in
-    /// between". A cancellation issued inside that window was silently undone, and a crash inside
-    /// it destroyed the job outright, since nothing ever put the row back.
+    /// One shape for both kinds of schedule. Arbitrating by consuming the row instead would need
+    /// two: a recurring job advances `next_fire_at`, but a one-shot has no next occurrence and can
+    /// only be *deleted*, which overloads one piece of state with two facts ("the user still wants
+    /// this job" and "this occurrence is available"). A host handing such an occurrence back could
+    /// only re-`INSERT`, and an `INSERT` cannot tell "I deleted this a moment ago" from "the user
+    /// cancelled it in between".
     ///
     /// A lease separates the facts. `claimed_by` says who is delivering this occurrence and
     /// `claimed_until` says how long that claim is good for; the row itself stays put, so a
@@ -2851,9 +2838,8 @@ impl ScheduleStore {
     /// has since been taken changes nothing.
     ///
     /// `occurrence` is the value this host read into its due list, so exactly one host can take a
-    /// given occurrence. `attempts` counts claims that neither completed nor were handed back --
-    /// a host that died, or a probe that could not answer and left its lease to expire -- and is
-    /// what replaces the old protection of spending the occurrence up front; see
+    /// given occurrence. `attempts` counts claims that neither completed nor were handed back, a
+    /// host that died or a probe that could not answer and left its lease to expire; see
     /// [`ScheduledJob::attempts`] and [`MAX_CLAIM_ATTEMPTS`].
     pub(crate) async fn claim_occurrence(
         &self,
@@ -2890,31 +2876,25 @@ impl ScheduleStore {
 
     /// Hand the occurrence back: this host took it and will not deliver it after all.
     ///
-    /// Scoped to `owner`, which is what makes it safe. The refusals that reach here -- a gate whose
-    /// probe broke, a host that cannot run the turn -- all used to put a deleted row back, and
-    /// could not distinguish that from undoing a cancellation. Releasing a lease can only
-    /// affect a row this host still holds, so a job cancelled in the meantime stays cancelled
-    /// and a job another host has since claimed is left alone.
+    /// Scoped to `owner`, which is what makes it safe: releasing a lease can only affect a row this
+    /// host still holds, so a job cancelled in the meantime stays cancelled and a job another host
+    /// has since claimed is left alone.
     ///
     /// `attempts` is reset, because a claim the *host* handed back is not the failure
     /// [`MAX_CLAIM_ATTEMPTS`] is counting. That ceiling is about jobs that cannot be delivered;
     /// this is about a host that could not take one, which says nothing about the job.
     ///
-    /// This is the only way a lease is given up early, and that is the whole disposal rule: a
-    /// claim is either handed back by a host that declined the work, or left to expire. There used
-    /// to be a second, non-forgiving release for a claim that ended without delivering -- a
-    /// panicking turn, an unevaluable probe -- and it was a mistake in a way that is worth
-    /// recording, because it looked like the careful option. Giving the occurrence back at once
-    /// leaves the row due on the next sweep, so those retries came one `poll_interval` apart and
-    /// the ceiling was reached in half a minute, killing jobs whose only problem was a blip.
-    /// Expiry is already the mechanism for "try again later", so nothing needed to be added; a
-    /// call needed to be removed.
+    /// This is the only way a lease is given up early, and that is the whole disposal rule: a claim
+    /// is either handed back by a host that declined the work, or left to expire. A claim that
+    /// ended *without* delivering (a panicking turn, an unevaluable probe) must be left to expire
+    /// rather than released here. Releasing it leaves the row due on the next sweep, so the retries
+    /// come one `poll_interval` apart and [`MAX_CLAIM_ATTEMPTS`] is reached in half a minute,
+    /// killing jobs whose only problem was a blip.
     ///
     /// Matching nothing is ordinary and is not reported: the lease had already expired and someone
     /// else holds the occurrence, which for a host that was declining it anyway is the outcome it
-    /// wanted. Hence `()` rather than a `bool` no caller reads -- the same reason
-    /// [`Self::advance_unclaimed`] returns nothing, and a second instance of the same oversight,
-    /// found by a mutation sweep rather than by reading.
+    /// wanted. Hence `()` rather than a `bool` no caller reads, as with
+    /// [`Self::advance_unclaimed`].
     pub(crate) async fn release_claim(&self, id: &str, owner: &str) -> crate::error::Result<()> {
         let id = id.to_string();
         let owner = owner.to_string();
@@ -2939,16 +2919,16 @@ impl ScheduleStore {
     /// a one-shot, or a cron pattern with nothing left in range -- which is the only place a
     /// scheduled job is deleted by the scheduler rather than by a person.
     ///
-    /// Written *after* delivery, where the fire stamp used to be written before it. That
-    /// ordering existed so a prompt which reliably crashed the process could not be re-selected on
-    /// every restart, at the price of losing the occurrence to any crash at all. The lease's
-    /// `attempts` counter takes over that job and does it better: a crash now costs a retry rather
-    /// than the occurrence, and a job that crashes repeatedly is parked instead of looping.
+    /// Written *after* delivery. That ordering existed so a prompt which reliably crashed the
+    /// process could not be re-selected on every restart, at the price of losing the occurrence to
+    /// any crash at all. The lease's `attempts` counter takes over that job and does it better: a
+    /// crash now costs a retry rather than the occurrence, and a job that crashes repeatedly is
+    /// parked instead of looping.
     ///
     /// `fired_at` is `None` for an occurrence that was *considered* rather than delivered, which is
     /// what a gate saying no amounts to. `last_fired_at` means a turn happened: recording one for
-    /// an evaluation would misreport the job in every listing and re-anchor an interval
-    /// schedule on evaluations rather than on fires.
+    /// an evaluation would misreport the job in every listing and re-anchor an interval schedule on
+    /// evaluations rather than on fires.
     ///
     /// See [`ClaimClosed`] for what the outcomes mean; only one of them is a problem.
     pub(crate) async fn complete_claim(
@@ -3571,10 +3551,10 @@ mod tests {
     /// A pointer into something that is not a JSON document is an error, not an answer.
     ///
     /// The process ran fine, so this is not a spawn failure -- but the predicate describes a shape
-    /// the result does not have, so nothing was measured. It used to decline silently, which is
-    /// survivable for `not-empty` and ruinous for `empty`: a missing value reads as empty, so a
-    /// server that began returning prose or an error string fired the job every interval,
-    /// indefinitely. Both directions are covered here because the asymmetry is the point.
+    /// the result does not have, so nothing was measured. Declining silently is survivable for
+    /// `not-empty` and ruinous for `empty`: a missing value reads as empty, so a server that starts
+    /// returning prose or an error string would fire the job every interval, indefinitely. Both
+    /// directions are covered here because the asymmetry is the point.
     #[test]
     fn a_pointer_into_something_that_is_not_json_is_an_error() {
         for is in [
@@ -3694,7 +3674,8 @@ mod tests {
         }
     }
 
-    /// The three request-parser refusals that used to be silent resolutions or late failures.
+    /// The three request-parser refusals, each of which would otherwise resolve silently or fail
+    /// late.
     #[test]
     fn the_request_parsers_refuse_what_they_cannot_answer() {
         // Naming both halves of a `when` is an ambiguity, not a precedence question. Resolving it
@@ -3767,7 +3748,7 @@ mod tests {
 
     /// A held job says so once, not once per poll interval -- including a one-shot.
     ///
-    /// Retiring a one-shot used to clear its held-back state, on the reasoning that the row was
+    /// Retiring a one-shot must not clear its held-back state on the reasoning that the row is
     /// gone. Once an authority refusal started putting the row back, that clear ran *before* the
     /// refusal on every sweep, so the "first time" check was true every time: a held one-shot
     /// warned every 10 seconds for up to the whole `missed_grace` window. Recurring jobs were
@@ -5621,17 +5602,17 @@ mod tests {
     /// A refused job's row is never deleted, not even for the instant it took to put it back.
     ///
     /// Kept-and-restored and never-touched leave identical rows, which is why the resurrection this
-    /// prevents was invisible: claiming used to delete a one-shot before the refusal was even
-    /// consulted, and the restore is an `INSERT` that cannot tell "I deleted this a moment ago"
-    /// from "the user cancelled it in between" -- so a `schedule_cancel` landing in that window was
-    /// silently undone while both cancel doors reported success.
+    /// prevents was invisible: claiming by deleting a one-shot puts the refusal after the delete,
+    /// and the restore is then an `INSERT` that cannot tell "I deleted this a moment ago" from "the
+    /// user cancelled it in between", so a `schedule_cancel` landing in that window is silently
+    /// undone while both cancel doors report success.
     ///
     /// SQLite's `rowid` is the observable: a re-`INSERT` takes `max(rowid) + 1`, so a row that kept
     /// its rowid was never deleted. Restoring the delete-then-restore shape fails this with two
     /// different values.
     ///
-    /// The second job is not decoration. With one row in the table the deleted rowid is also
-    /// `max + 1`, so SQLite hands the same value straight back and the assertion holds under both
+    /// The second job is not decoration. With one row in the table the deleted rowid is also `max +
+    /// 1`, so SQLite hands the same value straight back and the assertion holds under both
     /// orderings -- which is what this test did until the mutation check caught it.
     #[tokio::test]
     async fn a_refused_one_shot_keeps_its_row_rather_than_being_deleted_and_restored() {
@@ -5765,11 +5746,11 @@ mod tests {
 
     /// A crash between the claim and the delivery costs a retry, not the job.
     ///
-    /// This is what the lease is for. Claiming used to consume the row -- advancing a recurring
-    /// job's `next_fire_at`, deleting a one-shot's row outright -- so a host that died before the
-    /// turn ran left the occurrence spent, and for a one-shot that meant the reminder was gone with
-    /// nothing anywhere to recover it from. Nothing swept for it either, unlike `background_tasks`,
-    /// which is marked `interrupted` when a process takes the session lock.
+    /// This is what the lease is for. Consuming the row to claim it -- advancing a recurring job's
+    /// `next_fire_at`, deleting a one-shot's row outright -- leaves the occurrence spent when a
+    /// host dies before the turn runs, and for a one-shot the reminder is gone with nothing
+    /// anywhere to recover it from. Nothing swept for it either, unlike `background_tasks`, which
+    /// is marked `interrupted` when a process takes the session lock.
     #[tokio::test]
     async fn a_crash_between_the_claim_and_the_turn_does_not_lose_the_job() {
         let harness = SchedulerHarness::new().await;
@@ -5813,12 +5794,11 @@ mod tests {
 
     /// A job whose turn keeps taking the host down is parked rather than retried forever.
     ///
-    /// The counterpart the lease requires. Spending the occurrence up front used to make a
-    /// crash-on-every-fire job cost one occurrence per crash and move on; a lease hands the same
-    /// occurrence back every time, so without a ceiling a prompt that kills the process is claimed
-    /// again on every sweep, forever. The row is kept rather than deleted: it stays listed,
-    /// cancellable, and reported as held, because meka cannot tell a poisonous prompt from an
-    /// unlucky one and destroying a user's job on that guess would be worse.
+    /// The counterpart the lease requires. A lease hands the same occurrence back every time, so
+    /// without a ceiling a prompt that kills the process is claimed again on every sweep, forever.
+    /// The row is kept rather than deleted: it stays listed, cancellable, and reported as held,
+    /// because meka cannot tell a poisonous prompt from an unlucky one and destroying a user's job
+    /// on that guess would be worse.
     #[tokio::test]
     async fn a_job_that_keeps_crashing_its_host_is_parked_rather_than_retried_forever() {
         let harness = SchedulerHarness::new().await;
@@ -6145,8 +6125,7 @@ mod tests {
 
     /// A one-shot is retired the moment it comes due, before its gate is consulted: its moment has
     /// passed either way. The writes that follow a fire must therefore tolerate the row being gone,
-    /// which is what this pins -- an earlier version issued them unconditionally and relied on the
-    /// updates happening to match nothing.
+    /// rather than issuing unconditionally and relying on the updates happening to match nothing.
     #[tokio::test]
     async fn test_a_one_shot_with_a_declining_gate_is_retired_without_firing() {
         let harness = SchedulerHarness::new().await;
@@ -6365,9 +6344,9 @@ mod tests {
     /// it. Before this the write was unconditional, so both advanced the row and both went on to
     /// fire.
     ///
-    /// One shape for both kinds of schedule now, which is the point of leasing rather than
-    /// consuming: a one-shot used to be claimed by deleting its row, so the same test had to be
-    /// written twice and the delete had nothing to hand back.
+    /// One shape for both kinds of schedule, which is the point of leasing rather than consuming:
+    /// claiming a one-shot by deleting its row needs a second shape, and the delete has nothing to
+    /// hand back.
     #[tokio::test]
     async fn test_only_one_host_can_claim_an_occurrence() {
         for (label, schedule) in [
@@ -6970,10 +6949,10 @@ mod tests {
 
     /// A cancellation issued while a host holds the lease is not undone by the handback.
     ///
-    /// This is the failure the lease exists for. Claiming a one-shot used to delete its row, so the
-    /// handback was an `INSERT` that could not tell "I deleted this a moment ago" from "the user
-    /// cancelled it in between" -- and put the job back either way, silently discarding the
-    /// cancellation. A release is scoped to the claim, so it cannot recreate anything.
+    /// This is the failure the lease exists for. Claiming a one-shot by deleting its row makes the
+    /// handback an `INSERT` that cannot tell "I deleted this a moment ago" from "the user cancelled
+    /// it in between", and puts the job back either way, silently discarding the cancellation. A
+    /// release is scoped to the claim, so it cannot recreate anything.
     #[tokio::test]
     async fn a_cancellation_during_a_claim_is_not_undone_by_the_handback() {
         let harness = SchedulerHarness::new().await;
@@ -7125,11 +7104,10 @@ mod tests {
 
     /// A handback releases the occurrence *this* host holds, and nothing else.
     ///
-    /// The restore used to be a whole-row upsert applied by id, so a host that lost the claim and
-    /// was then refused the session lock overwrote the winner's `next_fire_at` with a time already
-    /// in the past, and the job came due again on the very next tick while the winner was still
-    /// running the turn. One hourly occurrence produced three gate runs and two agent turns that
-    /// way.
+    /// A whole-row upsert applied by id would let a host that lost the claim and was then refused
+    /// the session lock overwrite the winner's `next_fire_at` with a time already in the past,
+    /// bringing the job due on the very next tick while the winner is still running the turn. One
+    /// hourly occurrence produced three gate runs and two agent turns that way.
     ///
     /// Scoping to the lease makes that structural rather than careful: the shape below is a host
     /// whose lease expired and was taken over while it was still working, which is the only way two

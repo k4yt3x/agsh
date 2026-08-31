@@ -257,7 +257,7 @@ mod tests {
     /// shared body builder, so it is asserted on both sides.
     #[test]
     fn an_openai_extension_is_never_sent_to_an_endpoint_that_may_not_know_it() {
-        // Even with effort set, which is the condition that used to pull `include` in.
+        // Even with effort set, which is the condition that pulls `reasoning` in.
         let body = provider(Some("high"), None).build_body("s", &[Message::user("hi")], &[]);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert!(body.get("include").is_none(), "{body}");

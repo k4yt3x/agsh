@@ -192,10 +192,10 @@ impl SkillIndex {
     /// Why this name did not resolve, in one line, for whoever asked for it.
     ///
     /// The single phrasing behind every door that reports a skill as unavailable: `meka skill get`
-    /// and `show`, `--skill`, `agent_spawn`, ACP's `/name`, and the two HTTP readers. Each used to
-    /// compose its own "not found", so [`Self::skip_reason`] reached two of seven and the rest went
-    /// on telling a user who had just read the startup warning naming that very file that the skill
-    /// did not exist.
+    /// and `show`, `--skill`, `agent_spawn`, ACP's `/name`, and the two HTTP readers. Composed
+    /// separately at each site, [`Self::skip_reason`] reaches only some of them and the rest tell a
+    /// user who has just read the startup warning naming that very file that the skill does not
+    /// exist.
     ///
     /// The tools say more than this to the *model*, because a model hearing "not found" will
     /// improvise the procedure and one hearing this must not; see `skill_read`.
@@ -273,9 +273,9 @@ fn foreign_location(index: &SkillIndex, name: &str, native_root: &Path) -> Optio
 ///
 /// Two facts, both for `meka skill add --from-file`, which is the one write door that copies the
 /// user's bytes instead of rendering its own and so has to inspect what it is about to install.
-/// Everything else that used to live here answered whether *another* client would take the file.
-/// The reference library owns that question and ships a command for it; meka's job is to be
-/// conformant, not to grade.
+/// Anything answering whether *another* client would take the file does not belong here. The
+/// reference library owns that question and ships a command for it; meka's job is to be conformant,
+/// not to grade.
 ///
 /// Neither can be recomputed from a [`Skill`]: sanitising shrinks a description, and the directory
 /// name is what survives, so by then the file's own answers are gone.
@@ -283,12 +283,11 @@ fn foreign_location(index: &SkillIndex, name: &str, native_root: &Path) -> Optio
 pub struct Conformance {
     /// Whether the file declared a `name:` at all.
     ///
-    /// A flag rather than the string it used to be, because the string had one reader and that
-    /// reader asked a question [`parse_skill_definition`] has already answered above it: a
-    /// declared name disagreeing with the directory is refused there, so no `Skill` can exist
-    /// carrying one. The branch was therefore unreachable, and deleting it left the value read
-    /// nowhere. Presence is the part still worth knowing, since the spec requires the key and
-    /// only this door can install a file without it.
+    /// A flag rather than the declared string: [`parse_skill_definition`] refuses a declared name
+    /// that disagrees with the directory, so no `Skill` can exist carrying one and the only
+    /// question left is whether the key was there. The branch was therefore unreachable, and
+    /// deleting it left the value read nowhere. Presence is the part still worth knowing, since
+    /// the spec requires the key and only this door can install a file without it.
     pub declares_name: bool,
     /// Length as the file had it, before sanitising collapsed runs of whitespace. The cap is
     /// measured on the raw value, so a description that sits just over it cannot slip under by
@@ -388,8 +387,8 @@ pub fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 /// A duplicate is reported rather than silently dropped: two roots holding a `deploy` means the
 /// agent is running one of them and not the other, and which one is not obvious from either file.
 ///
-/// Returns what it could not load as well as what it could. The failure used to be logged here and
-/// then dropped, which left `skill_read` answering "not found" for a file sitting in the store; see
+/// Returns what it could not load as well as what it could. Logging the failure here and dropping
+/// it leaves `skill_read` answering "not found" for a file sitting in the store; see
 /// [`SkippedSkill`].
 pub fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
     let mut merged: Vec<Skill> = Vec::new();
@@ -883,14 +882,14 @@ pub fn parse_skill_definition(
 ) -> Result<Skill, String> {
     // Refused, not warned about. meka answers to the Agent Skills specification, so a directory
     // whose name the spec does not allow is not a skill meka has: loading it and mentioning the
-    // problem in a log line left the store non-conformant while the index said everything was
-    // fine. The skip is reported like any other, so the name is named and can be fixed.
+    // problem in a log line left the store non-conformant while the index said everything was fine.
+    // The skip is reported like any other, so the name is named and can be fixed.
     //
-    // This subsumes the addressability check discovery used to do. A name of alphanumerics and
-    // hyphens cannot hold a separator, a `..`, a control character or anything else that renders
-    // as something other than itself, so every loaded name is safe to print into the `[Skills]`
-    // index and to join back onto a root. [`validate_addressable_name`] survives for the *delete*
-    // doors, which must still reach a directory this refuses.
+    // This subsumes discovery's addressability check. A name of alphanumerics and hyphens cannot
+    // hold a separator, a `..`, a control character or anything else that renders as something
+    // other than itself, so every loaded name is safe to print into the `[Skills]` index and to
+    // join back onto a root. [`validate_addressable_name`] survives for the *delete* doors, which
+    // must still reach a directory this refuses.
     if let Some(problem) = skill_name_problem(name) {
         return Err(problem);
     }
@@ -1089,15 +1088,14 @@ pub fn yaml_value_to_string(value: &serde_norway::Value) -> String {
 }
 
 /// Load the body (post-frontmatter) of a skill and prepend the [`skill_context_header`] so every
-/// consumer (the `skill` tool, `--skill`, `/skill`, `agent_spawn`'s skill delegation, and
-/// `meka skill show`) sees the skill's base directory.
+/// consumer (the `skill` tool, `--skill`, `/skill`, `agent_spawn`'s skill delegation, and `meka
+/// skill show`) sees the skill's base directory.
 ///
-/// The body is passed through verbatim. meka used to expand `${MEKA_SKILL_DIR}` and
-/// `${MEKA_SESSION_ID}` here, which made every skill that used them meka-specific: the same file
-/// would not run under another Agent Skills host, and an imported skill had to have its own host's
-/// spelling rewritten. Nothing in meka needs the expansion either, because meka never executes a
-/// skill body; the text is only ever read by a model that has just been told the base directory by
-/// the header above it.
+/// The body is passed through verbatim. Expanding `${MEKA_SKILL_DIR}` or `${MEKA_SESSION_ID}` here
+/// would make every skill using them meka-specific: the same file would not run under another Agent
+/// Skills host, and an imported skill would need its own host's spelling rewritten. Nothing in meka
+/// needs the expansion either, because meka never executes a skill body; the text is only ever read
+/// by a model that has just been told the base directory by the header above it.
 pub async fn load_skill_body(skill: &Skill) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&skill.body_path)
         .await
@@ -1336,12 +1334,11 @@ fn description_problem(description: &str) -> Option<String> {
 
 /// Write one skill's `SKILL.md`, creating its directory if needed, and return the skill as written.
 ///
-/// The *written* skill, not the requested one, and that distinction is the point. A caller reports
-/// what it did, and the only honest source for that is the bytes that reached disk: this function
-/// already parses them for the guard below, so handing them back costs nothing and closes the gap
-/// where `skill_write` told the model it had saved "priority 2" onto a file that says 5. It cannot
-/// always record what it was asked to -- see [`render_skill_file`] on a `metadata` it may not
-/// replace -- so a caller that echoes its own arguments is a caller that will eventually lie.
+/// The *written* skill, not the requested one. A caller reports what it did, and the only honest
+/// source is the bytes that reached disk, which this function already parses for the guard below.
+/// It cannot always record what it was asked to (see [`render_skill_file`] on a `metadata` it may
+/// not replace), so a caller echoing its own arguments would eventually report "priority 2" onto a
+/// file that says 5.
 ///
 /// The agent-facing counterpart to `meka skill add`, and the reason it is a store function rather
 /// than living in the tool: the name is joined onto `root` here, so [`validate_skill_name`] has to
@@ -1476,7 +1473,7 @@ pub fn write_skill(
     };
 
     // Start from what the file said and change only what was asked for. Rebuilding from a fixed
-    // list of fields is what used to lose every frontmatter key meka did not model.
+    // list of fields loses every frontmatter key meka does not model.
     let mut merged = match existing_skill {
         Some(existing) => existing,
         None => Skill {
@@ -1882,10 +1879,10 @@ mod tests {
 
     /// A long description survives a round-trip through the store.
     ///
-    /// The 500-char cap used to live in `sanitize_stored_description`, which runs at parse time, so
-    /// the truncated form was the only copy in the process and the next write put it back to disk
-    /// truncated. Descriptions of 800-900 characters are ordinary in the Agent Skills ecosystem,
-    /// and nothing warned. The cap now lives on the index render path instead.
+    /// The 500-char cap must not live in `sanitize_stored_description`, which runs at parse time:
+    /// the truncated form would be the only copy in the process, and the next write would put it
+    /// back to disk truncated. Descriptions of 800-900 characters are ordinary in the Agent Skills
+    /// ecosystem, and nothing warned. The cap now lives on the index render path instead.
     #[test]
     fn a_long_description_is_not_truncated_on_the_way_in() {
         let long = "d".repeat(900);
@@ -1920,9 +1917,9 @@ mod tests {
     /// every turn, so a planted newline opens what looks like a new instruction section and an
     /// escape reaches the terminal rendering it.
     ///
-    /// The guard used to sit at parse, which made it destructive: the parsed `Skill` is the only
+    /// The guard must not sit at parse, which makes it destructive: the parsed `Skill` is the only
     /// copy the process holds and a write rebuilds the file from it, so an unrelated `skill_write`
-    /// persisted the sanitised text over the author's. `sanitize_text` filters the whole `Cf`
+    /// would persist the sanitised text over the author's. `sanitize_text` filters the whole `Cf`
     /// category, so a description needing a zero-width non-joiner came back permanently broken.
     /// Both halves are asserted here: the parse is byte-faithful, and every path that shows the
     /// description neutralises it.
@@ -2603,11 +2600,11 @@ mod tests {
 
     /// An empty skill directory is not a broken skill, so nothing reports it as one.
     ///
-    /// Discovery used to record it with the `read_to_string` ENOENT as its reason, which two other
-    /// pieces then acted on: the `[Skills]` index announced an empty folder to the model as a
-    /// procedure it could not read, and `skill_write` refused to create the skill because the name
-    /// "exists on disk". `reject_unreadable`'s comment asserted this case was already excluded; it
-    /// was not, and nothing checked.
+    /// Recording it with the `read_to_string` ENOENT as its reason misleads two other readers: the
+    /// `[Skills]` index announces an empty folder to the model as a procedure it cannot read, and
+    /// `skill_write` refuses to create the skill because the name "exists on disk".
+    /// `reject_unreadable`'s comment asserted this case was already excluded; it was not, and
+    /// nothing checked.
     #[test]
     fn a_directory_with_no_skill_file_is_not_a_broken_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2634,11 +2631,12 @@ mod tests {
 
     /// Reading such a file works; rewriting it is refused, and the file is left exactly as it was.
     ///
-    /// The refusal replaces four places that used to carry on regardless -- an arm in the renderer,
-    /// another in the author stamp, a gate in `take_priority`, and a line in `skill_write`'s
-    /// confirmation explaining to the model why the rank it asked for had not applied. All four
-    /// existed because meka had nowhere spec-legal to record `meka-priority` or `author` and chose
-    /// to do something else rather than say so. One refusal is the whole of it now.
+    /// The refusal is what keeps four other places from carrying on regardless: an arm in the
+    /// renderer, another in the author stamp, a gate in `take_priority`, and a line in
+    /// `skill_write`'s confirmation explaining to the model why the rank it asked for did not
+    /// apply. All four existed because meka had nowhere spec-legal to record `meka-priority` or
+    /// `author` and chose to do something else rather than say so. One refusal is the whole of it
+    /// now.
     #[test]
     fn a_metadata_that_is_not_a_map_refuses_the_rewrite() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3083,9 +3081,9 @@ mod tests {
         );
     }
 
-    /// One unreadable extra root must not pin the cache. It used to veto the whole snapshot, which
-    /// froze the skill list for the life of the process and made `invalidate` a no-op -- so a
-    /// `skill_write` into meka's own store stayed invisible to `skill_read`.
+    /// One unreadable extra root must not pin the cache. Vetoing the whole snapshot would freeze
+    /// the skill list for the life of the process and make `invalidate` a no-op, leaving a
+    /// `skill_write` into meka's own store invisible to `skill_read`.
     #[tokio::test]
     async fn an_unreadable_extra_root_does_not_freeze_the_native_one() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3097,7 +3095,7 @@ mod tests {
             "---\ndescription: version one\n---\nbody\n",
         );
         // A regular file where a directory is expected: `read_dir` fails with ENOTDIR, which is not
-        // `NotFound` and so used to be fatal to the snapshot.
+        // `NotFound` and would otherwise be fatal to the snapshot.
         let broken = temp.path().join("not-a-directory");
         std::fs::write(&broken, "").expect("seed");
 
@@ -3544,9 +3542,9 @@ mod tests {
 
     /// The body reaches the model byte-for-byte, with only the base-directory header in front.
     ///
-    /// The `${...}` assertions are the point: meka used to expand `${MEKA_SKILL_DIR}` and
-    /// `${MEKA_SESSION_ID}`, which is what tied a skill to meka. Asserting that they survive
-    /// untouched is what stops the substitution being quietly reintroduced.
+    /// The `${...}` assertions are the point: expanding `${MEKA_SKILL_DIR}` or `${MEKA_SESSION_ID}`
+    /// is what would tie a skill to meka. Asserting that they survive untouched is what stops the
+    /// substitution being quietly reintroduced.
     #[tokio::test]
     async fn test_load_skill_body_passes_the_body_through_verbatim() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3762,8 +3760,8 @@ mod tests {
         )
         .expect("seed");
 
-        // Both arms: an omitted body used to silently render the file empty, and an explicit body
-        // is no better, since the caller still cannot know what it is replacing.
+        // Both arms: an omitted body would silently render the file empty, and an explicit body is
+        // no better, since the caller still cannot know what it is replacing.
         for body in [None, Some("replacement")] {
             let error = super::write_skill(temp.path(), "triage", "new desc", 5, None, body)
                 .expect_err("must refuse an unparseable file");
@@ -4048,10 +4046,10 @@ mod tests {
     /// it. Both hops must see the write without the mtime bump the other cache tests fake, because
     /// nothing bumps the clock between two tool calls in the same turn.
     ///
-    /// The second write is the one that used to be at risk: creating a skill adds a key to the
-    /// snapshot and is detected whatever the timestamps say, but *updating* one changed only the
-    /// mtime, so a coarse-resolution filesystem could serve the pre-edit body to the `agent_spawn`
-    /// the edit was preparing. The size in the snapshot is what closes that.
+    /// The second write is the one at risk: creating a skill adds a key to the snapshot and is
+    /// detected whatever the timestamps say, but *updating* one changes only the mtime, so a
+    /// coarse-resolution filesystem could serve the pre-edit body to the `agent_spawn` the edit was
+    /// preparing. The size in the snapshot is what closes that.
     #[tokio::test]
     async fn test_cache_sees_a_write_and_a_rewrite_without_waiting() {
         let temp = tempfile::tempdir().expect("tempdir");

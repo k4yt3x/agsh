@@ -192,10 +192,10 @@ pub async fn run_serve(
 
 /// Fire every session's cancellation token during a graceful drain.
 ///
-/// This is now the only thing that stops an in-flight turn on shutdown. The streaming handler used
-/// to watch `state.shutdown` in its own `select!` as well, which was redundant with this and has
-/// been dropped; the turn task still reads the shutdown token, but only to label its terminal event
-/// `server_shutdown` rather than `client`.
+/// This is now the only thing that stops an in-flight turn on shutdown. The streaming handler does
+/// not watch `state.shutdown` in its own `select!`, which would be redundant with this. The turn
+/// task still reads the shutdown token, but only to label its terminal event `server_shutdown`
+/// rather than `client`.
 async fn drain_active_sessions(state: &ServerState) {
     let sessions = state.sessions.read().await;
     for entry in sessions.values() {

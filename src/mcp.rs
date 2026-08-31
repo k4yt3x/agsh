@@ -543,12 +543,12 @@ impl ServerEntry {
 
     /// Re-list this server's tools after a reconnect has swapped in a new transport.
     ///
-    /// A reconnect used to end at the transport, on the reasoning that the tool adapters already
-    /// exist and resolve the live peer at dispatch time. That is true of *dispatch* and not of the
-    /// *list*: the peer on the other side is a new session with a new `InitializeResult`, and a
-    /// fresh `initialize` produces no `tools/list_changed` because the client is expected to list.
-    /// So a server redeployed with a tool dropped kept being advertised, and one added was never
-    /// learned.
+    /// Ending a reconnect at the transport, on the reasoning that the tool adapters already exist
+    /// and resolve the live peer at dispatch time, leaves the tool list stale. That is true of
+    /// *dispatch* and not of the *list*: the peer on the other side is a new session with a new
+    /// `InitializeResult`, and a fresh `initialize` produces no `tools/list_changed` because the
+    /// client is expected to list. So a server redeployed with a tool dropped kept being
+    /// advertised, and one added was never learned.
     ///
     /// Inline rather than spawned: the four resource and prompt retry sites reconnect and then
     /// immediately retry their request, and a listing that lands after the retry would leave the
@@ -1342,9 +1342,8 @@ impl McpClientManager {
 
     /// Close every connected server, in place.
     ///
-    /// Takes `&self` deliberately. This used to consume `self`, so callers had to `try_unwrap` an
-    /// `Arc<Self>` first and the whole graceful path was skipped whenever anything else still held
-    /// a reference - which was always, because the manager holds the tool registries it serves
+    /// Takes `&self` deliberately. Takes `&self`. Consuming `self` would make callers `try_unwrap`
+    /// an `Arc<Self>` first, which never succeeds: the manager holds the tool registries it serves
     /// (`attached_registries`) and those registries hold the six `mcp_resource_*` / `mcp_prompt_*`
     /// tools, each of which holds an `Arc` back to the manager. Sole ownership was unreachable by
     /// construction, so `close_with_timeout` never ran and stdio children were left to rmcp's drop
@@ -1503,8 +1502,8 @@ pub(crate) fn warn_on_stale_tool_config(
             }
             if disabled.iter().any(|d| d == name) {
                 tracing::warn!(
-                    "MCP server '{}': eager_load_tools entry '{}' is also in disabled_tools \
-                     (the tool won't be registered at all, so eager-loading it is a no-op)",
+                    "MCP server '{}': eager_load_tools entry '{}' is also in disabled_tools, so \
+                     eager-loading it is a no-op",
                     server_name,
                     name
                 );
@@ -2080,11 +2079,11 @@ pub(crate) mod tests {
 
         // Every global default, including the two that are themselves at or below `read`.
         //
-        // Those two are the whole point. `default_permission = "read"` used to send a refused hint
-        // straight back to `Read`, which is bit-for-bit what trusting it would have done, so the
-        // knob changed nothing but a label. `"none"` was worse: a required level of `None` is
-        // permitted at every tier, so the tool ran even at `--permission none`. This test asserted
-        // the invariant in its name while only ever passing `Some(Unrestricted)` and `None`.
+        // Those two are the whole point. With `default_permission = "read"`, sending a refused hint
+        // back to `Read` is bit-for-bit what trusting it would do, so the knob would change nothing
+        // but a label. `"none"` was worse: a required level of `None` is permitted at every tier,
+        // so the tool ran even at `--permission none`. This test asserted the invariant in its name
+        // while only ever passing `Some(Unrestricted)` and `None`.
         for default in [
             Some(Permission::Unrestricted),
             Some(Permission::Ask),
@@ -2646,8 +2645,8 @@ pub(crate) mod tests {
 
     /// A reconnect is a new session with the server, and its tool set is only knowable by asking.
     ///
-    /// The reconnect path used to end at the transport, justified by "the tool adapters already
-    /// exist and resolve the live peer at dispatch time" -- true of dispatch, and not of the list.
+    /// Ending the reconnect path at the transport is justified by "the tool adapters already exist
+    /// and resolve the live peer at dispatch time", which is true of dispatch and not of the list.
     /// A fresh `initialize` produces no `tools/list_changed`, because the client is the one
     /// expected to list, so a server redeployed with a tool dropped kept being advertised for the
     /// life of the process and one added was never learned.
@@ -2765,11 +2764,11 @@ pub(crate) mod tests {
 
     /// Shutdown must run while the manager is still shared.
     ///
-    /// It used to consume `self`, so the caller had to win an `Arc::try_unwrap` first - and never
-    /// could: the manager holds the registries it serves, and each of those holds six
-    /// `mcp_resource_*` / `mcp_prompt_*` tools that hold the manager back. Sole ownership was
-    /// unreachable by construction, so the close handshake never ran on any launch that had an MCP
-    /// server to close, and every exit warned about it instead.
+    /// Consuming `self` would make the caller win an `Arc::try_unwrap` first, which it never can:
+    /// the manager holds the registries it serves, and each of those holds six `mcp_resource_*` /
+    /// `mcp_prompt_*` tools that hold the manager back. Sole ownership was unreachable by
+    /// construction, so the close handshake never ran on any launch that had an MCP server to
+    /// close, and every exit warned about it instead.
     ///
     /// The cycle is built here rather than described, so a future change that reintroduces it is
     /// caught: `attach_registry` puts a registry inside the manager, `install_tools_on` puts tools

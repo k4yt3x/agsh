@@ -57,10 +57,10 @@ pub struct Memory {
     /// write by the upsert itself (see [`store::MemoryStore::write`]).
     ///
     /// Distinct from [`Self::updated_at`] because the two answer different questions and only one
-    /// of them is the one being asked. A `memory_write` that reworded a description used to move
-    /// the one timestamp there was, which made a years-old note render as "today", sort to the top
-    /// of its priority band, and arrive through `memory_read` under the caption "Saved today. This
-    /// is what you recorded then".
+    /// of them is the one being asked. With one timestamp, a `memory_write` that merely rewords a
+    /// description makes a years-old note render as "today", sort to the top of its priority band,
+    /// and arrive through `memory_read` under the caption "Saved today. This is what you recorded
+    /// then".
     pub recorded_at: SystemTime,
     /// When the row was last written. Reported by `meka memory get` and the HTTP API; it takes no
     /// part in ordering, ranking or the rendered age.
@@ -382,10 +382,10 @@ pub fn render_description_for_model(description: &str) -> String {
 /// date is worse than no date, because it reads as a fact the model can rely on.
 pub fn render_age(recorded: SystemTime, now: SystemTime) -> String {
     // A stamp in the future is its own answer, not "today". `duration_since` fails for one, and
-    // folding that to zero told the model a note dated next year had been written this morning --
-    // while the same row sorts to the top of its priority band, so the memory most likely to be
-    // wrong is also the most prominent. Reachable through clock skew between two machines sharing a
-    // data directory, or a hand-written date. Saying so is what lets the model discount it.
+    // folding that to zero tells the model a note dated next year was written this morning, while
+    // the same row sorts to the top of its priority band, so the memory most likely to be wrong is
+    // also the most prominent. Reachable through clock skew between two machines sharing a data
+    // directory, or a hand-written date. Saying so is what lets the model discount it.
     let Ok(elapsed) = now.duration_since(recorded) else {
         return "at a future date".to_string();
     };

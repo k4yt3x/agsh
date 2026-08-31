@@ -185,11 +185,11 @@ impl Tool for LoadToolTool {
         } else {
             String::new()
         };
-        // Only claimed when something actually loaded. The trailer used to be appended
-        // unconditionally, so a call naming one unregistered tool came back as an error followed
-        // by "The full schema is now available on your next turn" -- a flat contradiction, and the
-        // one sentence a model reads to decide whether to call the tool. Found by a sub-agent that
-        // tried to load `memory_write` it had not been granted, and said the line was misleading.
+        // Only claimed when something actually loaded. Appended unconditionally, the trailer turns
+        // a call naming one unregistered tool into an error followed by "The full schema is now
+        // available on your next turn": a flat contradiction, in the one sentence a model reads to
+        // decide whether to call the tool. Found by a sub-agent that tried to load `memory_write`
+        // it had not been granted, and said the line was misleading.
         let body = if resolved == 0 {
             sections.join("\n\n---\n\n")
         } else {
@@ -304,9 +304,9 @@ mod tests {
         let text = ContentBlock::tool_result_text_content(&result.content);
         assert!(text.contains("not registered"));
         assert!(text.contains("[Tool discovery]"));
-        // And it must not also claim the schema arrived. The trailer used to be appended whatever
-        // happened, so a failed load read as an error immediately contradicted by "The full schema
-        // is now available on your next turn" -- the one sentence the model uses to decide whether
+        // And it must not also claim the schema arrived. Appended whatever happened, the trailer
+        // makes a failed load read as an error immediately contradicted by "The full schema is now
+        // available on your next turn", which is the one sentence the model uses to decide whether
         // to go ahead and call the tool.
         assert!(
             !text.contains("next turn"),

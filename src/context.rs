@@ -605,10 +605,10 @@ fn detect_os_description() -> Option<String> {
 /// come from [`crate::agent::AgentOptions`], which is constructed once and never rebuilt, so this
 /// function cannot render differently twice in one session.
 ///
-/// The tool catalogue, skills, and MCP server instructions used to live here and are the reason
-/// that guarantee did not hold: all three can change mid-session. They now travel in the per-turn
-/// `<context>` block via [`WorldSnapshot`], which is appended rather than mutated. The narrow
-/// signature is the enforcement mechanism: there is nothing dynamic left to pass in.
+/// The tool catalogue, skills and MCP server instructions do not live here, because all three can
+/// change mid-session and this is sent once. They now travel in the per-turn `<context>` block via
+/// [`WorldSnapshot`], which is appended rather than mutated. The narrow signature is the
+/// enforcement mechanism: there is nothing dynamic left to pass in.
 pub fn build_system_prompt(sandboxed_shell: bool, user_instructions: Option<&str>) -> String {
     let mut prompt = String::new();
 
@@ -970,9 +970,9 @@ fn render_skill_section(
 /// the store, its frontmatter has a typo, and from inside the session that is indistinguishable
 /// from a procedure nobody wrote.
 ///
-/// Memory used to have the same paragraph, and no longer needs one: a memory is a database row, so
-/// there is no parse to fail and no file to be unreadable. Skills stay on files because a
-/// `SKILL.md` is a shared spec other clients read.
+/// Memory needs no such paragraph: a memory is a database row, so there is no parse to fail and no
+/// file to be unreadable. Skills stay on files because a `SKILL.md` is a shared spec other clients
+/// read.
 fn render_unreadable_skills(skipped: &[crate::skills::SkippedSkill]) -> String {
     if skipped.is_empty() {
         return String::new();
@@ -1215,13 +1215,13 @@ fn render_standing_memories(
 /// What became of the priority-0 memories the inline band could not fit.
 ///
 /// Separate from [`render_standing_memories`] because only the caller knows the answer. The band
-/// used to state its own overflow as "N further priority-0 memories are listed by description
-/// below", on the reasoning that a standing memory the inline budget dropped still falls through to
-/// the index like everything else. That holds for a small store and fails for a large one: the
-/// index rations [`MEMORY_INDEX_MAX_BYTES`] across the *whole* store, so the overflow competes with
-/// it, and past a few dozen standing memories some of them lose. Measured at 140 priority-0
-/// memories: the band promised 118 below, the index had room for 72, and 46 standing directives
-/// reached the model nowhere at all while the block asserted they were listed.
+/// does not state its own overflow as "N further priority-0 memories are listed by description
+/// below", tempting as that is on the reasoning that a standing memory the inline budget dropped
+/// still falls through to the index like everything else. That holds for a small store and fails
+/// for a large one: the index rations [`MEMORY_INDEX_MAX_BYTES`] across the *whole* store, so the
+/// overflow competes with it, and past a few dozen standing memories some of them lose. Measured at
+/// 140 priority-0 memories: the band promised 118 below, the index had room for 72, and 46 standing
+/// directives reached the model nowhere at all while the block asserted they were listed.
 ///
 /// The count being wrong is the smaller half. Priority 0 is the tier whose contract is "these
 /// always apply", so one that appears in no part of the context is a rule the model is being held
@@ -2111,11 +2111,11 @@ mod tests {
 
     /// The standing band may not promise what the index below cannot deliver.
     ///
-    /// The band used to state its own overflow as "N further priority-0 memories are listed by
-    /// description below", reasoning that whatever the inline budget dropped still falls through to
-    /// the index. The index rations [`MEMORY_INDEX_MAX_BYTES`] across the whole store, so past a
-    /// few dozen standing memories the overflow loses that competition. Measured against a real
-    /// store of 140: the band promised 118 below, 72 were listed, and 46 standing directives
+    /// The band does not state its own overflow as "N further priority-0 memories are listed by
+    /// description below", on the reasoning that whatever the inline budget dropped still falls
+    /// through to the index. The index rations [`MEMORY_INDEX_MAX_BYTES`] across the whole store,
+    /// so past a few dozen standing memories the overflow loses that competition. Measured against
+    /// a real store of 140: the band promised 118 below, 72 were listed, and 46 standing directives
     /// reached the model nowhere while the block asserted they were there.
     ///
     /// Both halves are asserted, because either alone passes against a wrong implementation: a
@@ -3458,8 +3458,8 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("- **mcp__notion__search**"))
             .expect("mcp__notion__search entry present");
-        // Summary char cap + one-line prose scaffolding; well under the 2048 char full description
-        // that used to ship here.
+        // Summary char cap plus one-line prose scaffolding, well under a 2048-char full
+        // description.
         let line_len = entry_line.chars().count();
         assert!(
             line_len <= TOOL_SUMMARY_MAX_CHARS + 60,
@@ -3654,7 +3654,7 @@ mod tests {
 
     /// The invariant this whole design exists for. The system prompt heads the cached prefix, so a
     /// byte moving here re-caches the tools array and every message behind it. Registering a tool,
-    /// installing a skill, and connecting an MCP server are the three things that used to move it.
+    /// installing a skill and connecting an MCP server are the three things that move it.
     #[test]
     fn test_system_prompt_ignores_everything_that_changes_mid_session() {
         let baseline = build_system_prompt(true, Some("Never use pip."));
@@ -3824,10 +3824,10 @@ mod tests {
 
     /// A diff that cannot restate every changed memory must *name* the ones it cut.
     ///
-    /// It used to send them to the `[Memory]` index instead, which is the last full render and so
-    /// predates the very writes being announced. Eight priority-0 directives written in one turn
-    /// rendered three and told the model the other five were somewhere they were not; a model that
-    /// went looking found the pre-write index and read the superseded text as current.
+    /// Not the `[Memory]` index, which is the last full render and so predates the very writes
+    /// being announced. Eight priority-0 directives written in one turn rendered three and told the
+    /// model the other five were somewhere they were not; a model that went looking found the
+    /// pre-write index and read the superseded text as current.
     #[test]
     fn a_diff_that_cuts_a_memory_names_it_rather_than_pointing_at_the_index() {
         // Eight standing directives written in one turn, which is what a compaction checkpoint
@@ -4154,13 +4154,13 @@ mod tests {
         }
     }
 
-    /// The one exemption from the loop above, stated rather than left as a hole in it.
+    /// The one exemption from the loop above.
     ///
     /// `recorded` is in the snapshot and out of the diff comparison, so two snapshots differing
     /// only in it are unequal and render nothing. That is the intent -- re-saving a memory whose
     /// content has not changed is not something to announce -- but the drift guard's promise reads
-    /// as unconditional, so the exception needs a test of its own or the next person adding a
-    /// field learns the wrong rule from it.
+    /// as unconditional, so the exception needs a test of its own or the next person adding a field
+    /// learns the wrong rule from it.
     #[test]
     fn a_rewritten_memory_with_nothing_new_to_say_is_not_announced() {
         let catalogue = catalogue_with(MEMORY_INDEX_TOOL);

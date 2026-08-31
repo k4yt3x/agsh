@@ -13,34 +13,23 @@ pub(crate) const MAX_PROVIDER_RETRIES: u32 = 2;
 /// How long a retry sequence may have been running before a further attempt is refused, measured
 /// from the first attempt.
 ///
-/// The attempt cap alone bounds the number of tries, not what they cost. An attempt that fails fast
-/// is cheap, but one that fails by running out `read_timeout` costs 300 seconds
-/// ([`crate::provider::STREAM_IDLE_TIMEOUT`]), and three of those is fifteen minutes of a user
-/// waiting on a turn that will fail anyway -- plus, on a non-streaming call, up to three
-/// completions the provider may have generated and charged for.
+/// The attempt cap bounds the number of tries, not what they cost. An attempt that fails by running
+/// out `read_timeout` costs 300 seconds ([`crate::provider::STREAM_IDLE_TIMEOUT`]), and three of
+/// those is fifteen minutes of a user waiting on a turn that will fail anyway, plus up to three
+/// completions a non-streaming provider may have generated and charged for.
 ///
-/// One window, so a call that hung for its whole `read_timeout` is *not* tried again: it spends the
-/// budget exactly, and `elapsed >= RETRY_BUDGET` refuses the next attempt. That is the deliberate
-/// shape. Retrying is for a call that failed without costing much -- a reset connection, a refused
-/// port, a body that stopped short -- and a provider that accepted the request and then went silent
-/// for five minutes has already taken more of the user's turn than a second silence is worth.
+/// One window, so a call that hung for its whole `read_timeout` spends the budget exactly and
+/// `elapsed >= RETRY_BUDGET` refuses the next attempt. Retrying is for a call that failed without
+/// costing much: a reset connection, a refused port, a body that stopped short.
 ///
-/// It bounds when the next attempt may *start*, not what the sequence totals, and the difference is
-/// worth stating rather than rounding off. `should_retry_provider_error` is asked only once an
-/// attempt has already failed, so the sequence still costs whatever the attempt running when the
-/// budget ran out cost. A failure just short of the window is the expensive case: one at 299
-/// seconds permits a second attempt that may itself run the full 300, for about 600 in total. A
-/// total is not available to bound, because a streaming attempt has no length of its own --
-/// `read_timeout` resets on every event -- so the only honest ceiling is on starting another one.
+/// It bounds when the next attempt may *start*, not what the sequence totals, so a failure just
+/// short of the window permits a second attempt that may itself run the full 300. A total is not
+/// available to bound, because a streaming attempt has no length of its own (`read_timeout` resets
+/// on every event), so the only honest ceiling is on starting another one.
 ///
-/// Tied to that timeout rather than picked, so the two cannot drift. It is deliberately generous
-/// against the ordinary case, where a rate-limited provider answers in milliseconds and the whole
-/// sequence costs the 3 seconds of backoff.
-///
-/// This is the layer that can bound the cost. The classifier cannot: it sees one failure with no
-/// idea how long the sequence has run, and an earlier attempt to bound it there by refusing to
-/// retry timeouts made an undelivered request terminal (see
-/// `crate::error::provider_transport_error`).
+/// Tied to that timeout rather than picked, so the two cannot drift. This is also the only layer
+/// that *can* bound the cost: the classifier sees one failure with no idea how long the sequence
+/// has run.
 pub(crate) const RETRY_BUDGET: Duration = crate::provider::STREAM_IDLE_TIMEOUT;
 
 /// Delay cap for the computed exponential backoff (no `Retry-After` header present).
@@ -208,11 +197,11 @@ mod reprieve_tests {
 
     /// The reprieve waits as long as the provider asked, within the same bounds as a retry.
     ///
-    /// It used to sleep the constant and drop `retry_after` on the floor, which read badly once
-    /// stated: a `503` carrying `Retry-After: 60` had both retries wait the full minute on the
-    /// provider's own instruction, and then the wait that decides whether to *delete the user's
-    /// content* was eight seconds. All three bounds are asserted, because each exists for a
-    /// different reason and a single-value test would pin none of them.
+    /// Sleeping the constant and dropping `retry_after` reads badly once stated: a `503` carrying
+    /// `Retry-After: 60` has both retries wait the full minute on the provider's own instruction,
+    /// and then the wait that decides whether to *delete the user's content* is eight seconds. All
+    /// three bounds are asserted, because each exists for a different reason and a single-value
+    /// test would pin none of them.
     #[test]
     fn the_reprieve_honours_the_hint_between_its_floor_and_the_shared_cap() {
         assert_eq!(

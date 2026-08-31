@@ -646,10 +646,10 @@ impl OutputRelay {
 /// How much of one stream meka will hold in the turn's memory before moving it to a file.
 ///
 /// There is no cap on how much a command may print, and there should not be: `execute_command` was
-/// deliberately changed to stop truncating at 30 KB. But the drain used to accumulate one
-/// unbounded `Vec<u8>`, and a command that writes faster than the turn ends (measured at 2.2 GB/s
-/// for `cat /dev/zero`) took the process with it. Past this point the bytes go to disk and the
-/// result names the file, so the output is still complete and still reachable, just not resident.
+/// deliberately changed to stop truncating at 30 KB. But a drain accumulating one unbounded
+/// `Vec<u8>` takes the process down with any command that writes faster than the turn ends, `cat
+/// /dev/zero` being the extreme. Past this point the bytes go to disk and the result names the
+/// file, so the output is still complete and still reachable, just not resident.
 const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// How much of each end of an overflowing stream stays in the result inline. Enough that the model
@@ -701,7 +701,7 @@ thread_local! {
     ///
     /// There is no other way in. Both directories `capture_path` can pick fall back to each other
     /// by design, so no environment a test could arrange reliably fails the open, and those arms
-    /// are exactly where the state machine used to go wrong. Thread-local rather than a static so a
+    /// are exactly where the state machine can go wrong. Thread-local rather than a static so a
     /// test that sets it cannot disturb the capture tests running beside it; `#[tokio::test]` is
     /// single-threaded, so the value is visible across the awaits below.
     static FORCE_CAPTURE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -775,12 +775,12 @@ fn capture_path() -> std::path::PathBuf {
     // `MEKA_DATA_DIR` first, so a run isolated to a scratch directory keeps its captures there too
     // rather than dropping them in the real user's cache.
     //
-    // Empty and relative values are rejected here rather than assumed away. The comment that used
-    // to sit here claimed `default_database_path` guarantees absoluteness; it does not -- it
-    // *warns* and falls back to the platform data dir (src/session.rs), so meka starts normally
-    // with its database in the right place while a relative or empty value reached this join
-    // and scattered capture files, holding whole command outputs, under whatever directory meka
-    // happened to start in. Same guard, same reason, applied to the sibling that missed it.
+    // Empty and relative values are rejected here rather than assumed away. `default_database_path`
+    // does not guarantee absoluteness: it *warns* and falls back to the platform data dir
+    // (src/session.rs), so meka starts normally with its database in the right place while a
+    // relative or empty value reaches this join and scatters capture files, holding whole command
+    // outputs, under whatever directory meka started in. Same guard, same reason, applied to the
+    // sibling that missed it.
     let directory = std::env::var_os("MEKA_DATA_DIR")
         .map(std::path::PathBuf::from)
         .filter(|path| {
@@ -1420,8 +1420,8 @@ mod tests {
 
     /// The relay must survive the stream outgrowing the ceiling.
     ///
-    /// `relayed` is an index into the same buffer the capture trims, and the trim used to clamp it
-    /// to the new length rather than shift it by what was dropped. That marked the carried
+    /// `relayed` is an index into the same buffer the capture trims, so the trim has to shift it by
+    /// what was dropped rather than clamp it to the new length. That marked the carried
     /// incomplete-UTF-8 bytes as sent, so the next read began mid-character, `valid_up_to()`
     /// returned 0, and its whole 8 KB vanished from the live stream while still reaching the
     /// capture. Only multi-byte output shows it, and only once past the ceiling: the two conditions
@@ -1601,12 +1601,12 @@ mod tests {
 
     /// When the capture cannot be opened, the head still has to be the head.
     ///
-    /// A failed capture used to leave the state as "not capturing yet", so crossing the ceiling a
-    /// second time 8 MiB later ran the whole opening sequence again and overwrote `head` with a
-    /// slice from the middle of the stream -- which the result then printed as the beginning, under
-    /// a notice that named the elision but not the lie. The same re-entry could also open a capture
-    /// on the second attempt, holding only the bytes from that point on while the notice called it
-    /// the complete output.
+    /// A failed capture left as "not capturing yet" runs the whole opening sequence again when the
+    /// ceiling is crossed a second time 8 MiB later, overwriting `head` with a slice from the
+    /// middle of the stream, which the result then prints as the beginning under a notice that
+    /// names the elision but not the lie. The same re-entry could also open a capture on the second
+    /// attempt, holding only the bytes from that point on while the notice called it the complete
+    /// output.
     #[tokio::test]
     async fn a_failed_capture_keeps_the_real_head_and_does_not_retry() {
         FORCE_CAPTURE_FAILURE.with(|forced| forced.set(true));

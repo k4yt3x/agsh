@@ -954,9 +954,9 @@ impl ReadStamp {
 
 /// Files a tool has read this session, and what they looked like at the time.
 ///
-/// A set of paths would answer "has this been read", which is the question `edit_file` used to ask.
-/// It could not answer "is that read still valid", so an edit against a file rewritten in between
-/// (by a shell command, a concurrent agent, or the user's editor) silently clobbered.
+/// A set of paths answers only "has this been read", which is a weaker question. It could not
+/// answer "is that read still valid", so an edit against a file rewritten in between (by a shell
+/// command, a concurrent agent, or the user's editor) silently clobbered.
 pub type ReadTracker = Arc<RwLock<HashMap<PathBuf, ReadStamp>>>;
 
 #[derive(Debug, Default)]
@@ -1182,9 +1182,9 @@ impl ToolRegistry {
     /// [`Self::register`] directly ([`mcp_resources::register_all`] and
     /// [`subagent::register_subagent_tools`]). Those two exist because their tools are built from
     /// collaborators the generic builder doesn't have, and routing them past `register_builtin`
-    /// used to mean routing them past the filters with it: naming an MCP meta-tool or
-    /// `agent_spawn` in a deny list did nothing at all. Any future direct registration should
-    /// come through here too.
+    /// routes them past the filters with it: naming an MCP meta-tool or `agent_spawn` in a deny
+    /// list would then do nothing at all. Any future direct registration should come through here
+    /// too.
     pub(crate) fn admits(&self, name: &str) -> bool {
         if !self.builtin_filter.admits(name) {
             tracing::info!(
@@ -1198,7 +1198,7 @@ impl ToolRegistry {
 
     /// Like [`Self::admits`] but consulting only `[tools].disabled_tools`, not `allowed_tools`.
     ///
-    /// For the MCP meta-tools, which an exhaustive `allowed_tools` never used to reach. See
+    /// For the MCP meta-tools, which an exhaustive `allowed_tools` does not reach. See
     /// [`BuiltinToolFilter::denies`] for why widening it now would break working configs.
     pub(crate) fn admits_infrastructure(&self, name: &str) -> bool {
         if self.builtin_filter.denies(name) {

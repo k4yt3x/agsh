@@ -275,9 +275,9 @@ impl Drop for FileLock {
 ///
 /// The lock has to be taken the instant the row exists, and for a session the agent creates that
 /// instant is inside `Agent::run_turn_retaining` -- seconds or minutes before the host gets control
-/// back. Claiming it afterwards, which is what the REPL used to do, left a fresh session unlocked
-/// for the whole of its first turn, and a second `meka` invocation attached to it and interleaved
-/// its own messages into the same conversation.
+/// back. Claiming it afterwards leaves a fresh session unlocked for the whole of its first turn, so
+/// a second `meka` invocation attaches to it and interleaves its own messages into the same
+/// conversation.
 ///
 /// The host still owns the lifetime: the lock outlives any one turn, `/fork` replaces it, and it is
 /// dropped last on the way out so the session stays held until the process really ends. Sharing a
@@ -618,19 +618,14 @@ fn back_up_before_migrating(
 /// choosing the name and renaming -- a path that is not valid UTF-8 is one, refused at
 /// `staging.to_str()` -- leaves no backup at all.
 ///
-/// One backup rather than one per release. The store holds every conversation and every memory, so
-/// a copy per schema-changing upgrade is a full duplicate accumulating forever in a directory
-/// nobody opens (`~/.local/share/meka`, `%APPDATA%\meka`), and conversations carry images as inline
-/// base64, so "full" is not small.
+/// One backup rather than one per release. The store holds every conversation and every memory, and
+/// conversations carry images as inline base64, so a copy per schema-changing upgrade is a full
+/// duplicate accumulating forever in a directory nobody opens.
 ///
-/// **What that costs, stated rather than argued away.** The copy kept is of the store *after* the
-/// migration before this one, so it cannot undo a conversion whose bug is found late: a step that
-/// silently mis-converts, goes unnoticed, and is followed by another schema-changing upgrade takes
-/// the only pre-conversion copy with it. That is a real loss and not the same thing as the copy
-/// being stale, which is what an earlier draft of this comment claimed. It is accepted because the
-/// alternative was an unbounded pile whose cost is certain, while this one is conditional on a bug
-/// that outlives a release; `upgrading.md` says the same to users rather than implying the older
-/// copy was never worth anything.
+/// **What that costs.** The copy kept is of the store *after* the migration before this one, so it
+/// cannot undo a conversion whose bug is found late: a step that silently mis-converts, goes
+/// unnoticed, and is followed by another schema-changing upgrade takes the only pre-conversion copy
+/// with it. `upgrading.md` says the same to users.
 ///
 /// Only names this module could have produced are touched; see [`is_backup_name`], which matches
 /// against what [`free_backup_path`] actually emits rather than against "some digits". A
@@ -641,11 +636,8 @@ fn back_up_before_migrating(
 /// merely resembles a backup. Every byte tested is ASCII, and ASCII cannot occur inside a
 /// multi-byte sequence, so splitting on it is sound on both platforms.
 ///
-/// Every failure is a `warn!` and nothing more, so that a filesystem that will not let a file go
-/// cannot turn a migration that worked into a refusal to start. Reaching one takes something
-/// narrower than a read-only directory -- that already stopped the copy itself, upstream of here --
-/// such as an immutable file, a sticky-bit directory owned by someone else, or a Windows sharing
-/// violation.
+/// Every failure is a `warn!` and nothing more, so a filesystem that will not let a file go cannot
+/// turn a migration that worked into a refusal to start.
 fn prune_older_backups(database_path: &Path, keep: &Path) {
     let (Some(directory), Some(store_name), Some(keep_name)) = (
         database_path.parent(),
@@ -800,15 +792,15 @@ fn remove_partial_backup(staging: &Path) {
 /// The copy is staged at `<name>.partial` and renamed into place, so an abnormal exit between the
 /// two leaves a `.partial` behind. Checking only the target then chose that same name again, and
 /// `create_new` failed `EEXIST` on every subsequent start: measured, one `kill -9` during the
-/// upgrade of a 90 MB store, then three consecutive runs all refusing with
-/// `failed to create the pre-migration backup … File exists` and the store still at its old
-/// version. A single interrupted upgrade wedged meka permanently, which is the opposite of what
-/// staging was introduced to achieve.
+/// upgrade of a 90 MB store, then three consecutive runs all refusing with `failed to create the
+/// pre-migration backup … File exists` and the store still at its old version. A single interrupted
+/// upgrade wedged meka permanently, which is the opposite of what staging was introduced to
+/// achieve.
 ///
-/// Exhaustion is an error rather than a fallback to the unsuffixed name. It used to be safe to
-/// return the occupied base, because `VACUUM INTO` refuses a non-empty target; staging moved the
-/// write to `.partial` and the final step to `std::fs::rename`, which does not refuse anything. So
-/// the old fallback silently overwrote the *oldest* backup, the one most likely to matter.
+/// Exhaustion is an error rather than a fallback to the unsuffixed name. Returning the occupied
+/// base is not safe here: the write is staged to `.partial` and finished with `std::fs::rename`,
+/// which refuses nothing, where `VACUUM INTO` would have refused a non-empty target. So the old
+/// fallback silently overwrote the *oldest* backup, the one most likely to matter.
 fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBuf> {
     let base = {
         let mut name = database_path.as_os_str().to_os_string();
@@ -1156,12 +1148,11 @@ impl SessionManager {
 
     /// Create a session and take its lock, in that order: the lock **before** the row.
     ///
-    /// The ordering is the entire point, and it is the reverse of what every caller used to do.
-    /// Committing the row first leaves a window -- microseconds wide, but real -- in which the
-    /// session is visible to `SELECT id FROM sessions` and held by nobody.
-    /// [`Self::delete_all_sessions`] enumerates at delete time, so it lands inside that window,
-    /// takes the lock legitimately, and cascades the conversation away underneath the process
-    /// creating it. Measured at **42 lost turns in 11,948** with four creators against two
+    /// The ordering is the entire point. Committing the row first leaves a window -- microseconds
+    /// wide, but real -- in which the session is visible to `SELECT id FROM sessions` and held by
+    /// nobody. [`Self::delete_all_sessions`] enumerates at delete time, so it lands inside that
+    /// window, takes the lock legitimately, and cascades the conversation away underneath the
+    /// process creating it. Measured at **42 lost turns in 11,948** with four creators against two
     /// `meka session delete --all` loops: each one ends `FOREIGN KEY constraint failed` with the
     /// user's prompt gone. Targeted `meka session delete <id>` never reproduced it, because its id
     /// list is gathered before the creator exists -- which is what identifies the window as
@@ -1505,9 +1496,9 @@ impl SessionManager {
             })
     }
 
-    /// Copy `source`'s conversation into a new session and return it, or `Ok(None)`
-    /// when `source` doesn't exist (callers map that to their own not-found shape). The whole copy
-    /// is one transaction, so a failure leaves no half-built session behind.
+    /// Copy `source`'s conversation into a new session and return it, or `Ok(None)` when `source`
+    /// doesn't exist (callers map that to their own not-found shape). The whole copy is one
+    /// transaction, so a failure leaves no half-built session behind.
     ///
     /// What travels: the event log verbatim (per-event timestamps included), `tool_outputs`,
     /// `permission`, `capabilities_json`, the cumulative stats, and `cwd` / `additional_roots`
@@ -1523,26 +1514,18 @@ impl SessionManager {
     ///   result, so the copy is self-contained without them. This is the intended divergence from
     ///   [`Self::import_sessions`], which copies the tree because an archive should restore whole.
     ///
-    /// **`parent_session_id` and `subagent_spec_json` travel, and are the reason this is not just a
-    /// column list.** They used to be written NULL unconditionally, on the reasoning that a fork is
-    /// top-level and [`Self::list_sessions`] hides rows that have a parent. That is right for a
-    /// fork of a top-level session, where both are already NULL and copying changes nothing, and
-    /// wrong for a fork of a sub-agent: it produced a *drivable* copy of a worker's whole
-    /// conversation, with no spawn terms and therefore no `[subagents]` denials, no memory or
-    /// instruction grants, and -- since `create_child_session` writes no `permission` -- the host's
-    /// level rather than the worker's.
+    /// **`parent_session_id` and `subagent_spec_json` travel.** Written NULL, a fork of a sub-agent
+    /// would be a *drivable* copy of a worker's whole conversation carrying no spawn terms: no
+    /// `[subagents]` denials, no memory or instruction grants, and the host's permission level
+    /// rather than the worker's. Carrying both columns is what makes "a session's row says whether
+    /// something spawned it" survive a copy, which is the property
+    /// [`crate::refuse_a_spawned_session`] rests on. A fork of a worker is a sibling under the same
+    /// parent, continued the same way: through `agent_followup`.
     ///
-    /// That is exactly the escalation [`crate::refuse_a_spawned_session`] refuses at both agent
-    /// builders, reachable by anyone holding `sessions:w` in one extra call, so the refusal was a
-    /// boundary with a door beside it. Carrying both columns is what makes "a session's row says
-    /// whether something spawned it" survive a copy, which is the property that one check rests on.
-    /// A fork of a worker is a sibling under the same parent, continued the same way: through
-    /// `agent_followup`.
-    ///
-    /// Copying in SQL rather than through the export/import structs is deliberate: routing a fork
-    /// through that envelope is precisely how `additional_roots` came to be silently dropped. The
-    /// column list below lives next to the schema, and `fork_copies_every_session_column` fails
-    /// when a new column appears without a decision about it.
+    /// Copied in SQL rather than through the export/import structs, which silently drop any column
+    /// they do not model. The column list below lives next to the schema, and
+    /// `fork_copies_every_session_column` fails when a new column appears without a decision about
+    /// it.
     pub async fn fork_session(
         &self,
         source: Uuid,
@@ -1697,46 +1680,27 @@ impl SessionManager {
     /// (`warn!`); a per-file unlink failure (e.g. a root-owned file left by a container run) is
     /// expected and logged at `debug!`.
     ///
-    /// Nothing is unlinked without first taking its lock. The rule used to be "unlink any file
-    /// whose id is not in the live set", justified by a session's row being committed before its
-    /// lock file is acquired -- which constrains the *creator*, not the sweeper: this `SELECT` can
-    /// finish before a row commits while the `read_dir` below runs after that session's lock file
-    /// exists. Measured against a running `meka serve`, **21 of 401** live sessions had their lock
-    /// file unlinked, after which `meka -r <id> --oneshot` attached to a session `serve` still held
-    /// and wrote a full turn into it. Unlinking does not release a held `flock`, so the two
-    /// processes then held locks on different inodes and neither could see the other.
+    /// **Nothing is unlinked without first taking its lock.** A missing row does not prove the file
+    /// is garbage: this `SELECT` can finish before a session's row commits while the `read_dir`
+    /// below runs after that session's lock file exists, and [`Self::create_session_locked`] takes
+    /// the lock *before* the insert. Unlinking does not release a held `flock`, so a wrong guess
+    /// leaves two processes holding locks on different inodes, neither able to see the other, both
+    /// writing turns into one session. Only the `flock` separates genuine garbage from a session
+    /// being created this instant.
     ///
-    /// Taking the lock answers the question directly rather than inferring it, and it is the only
-    /// thing here that does. An earlier version of this comment argued that a lock file comes into
-    /// existence only *after* its row has committed, so a fresh `session_exists` was the whole
-    /// answer. That is no longer true and was not worth relying on:
-    /// [`Self::create_session_locked`] now takes the lock *before* the insert, precisely so a row
-    /// cannot be visible to a sweep while unheld. A file with no row is therefore either genuine
-    /// garbage from an earlier run or a session being created this instant, and only the `flock`
-    /// can tell them apart.
+    /// `session_exists` runs first because it is the cheaper question and the common answer is "the
+    /// row is there, leave it alone".
     ///
-    /// `session_exists` runs first anyway, because it is the cheaper question and the common answer
-    /// is "the row is there, leave it alone" -- no reason to open and lock a file to learn that.
+    /// One window is accepted rather than closed. [`try_lock_file`] opens and then locks, two
+    /// syscalls with nothing between, and a sweep that `read_dir`s inside that gap can take a
+    /// creator's lock and unlink its file; the creator then commits a row with nothing on disk to
+    /// claim it, and the next sweep re-creates the path, locks it, and deletes the row mid-turn. It
+    /// needs the sweep running at that instant, which happens only at [`SessionManager::open`] and
+    /// after a delete, with a `session_exists` round trip between the `read_dir` and the `flock`.
     ///
-    /// One window is left and is accepted rather than closed. [`try_lock_file`] opens and then
-    /// locks, two syscalls with nothing between; a sweep that `read_dir`s inside that gap can take
-    /// a creator's lock and unlink its file, leaving that session to run unheld. It is
-    /// sub-microsecond and it needs the sweep to be running at that instant (only at
-    /// [`SessionManager::open`] and after a delete, with a `session_exists` round trip between its
-    /// `read_dir` and the `flock`).
-    ///
-    /// What it costs is not merely a guarantee. A creator whose file is unlinked keeps its `flock`
-    /// on an inode with no name and then commits its row, so from that moment the session has a
-    /// visible row and nothing on disk to claim it -- and the next sweep re-creates the path, locks
-    /// it, and deletes the row mid-turn. That is the same loss, reached one step later. The trade
-    /// is still strongly favourable, because the window it replaced was thousands of times wider
-    /// and needed no second coincidence at all, but it is a smaller chance of the same outcome
-    /// rather than a lesser outcome.
-    ///
-    /// Those counts are from Unix. Windows `LockFileEx` will not let an open file be unlinked, so
-    /// the same bug takes a different shape there -- the `remove_file` fails rather than succeeding
-    /// and stranding two holders on separate inodes. Proving the file is unheld before unlinking it
-    /// is the right answer on both.
+    /// On Windows `LockFileEx` will not let an open file be unlinked, so the same mistake makes
+    /// `remove_file` fail rather than stranding two holders on separate inodes. Proving the file is
+    /// unheld is the right answer on both.
     async fn prune_orphan_lock_files(&self) {
         let live_ids: std::collections::HashSet<String> = match self
             .connection
@@ -2202,8 +2166,8 @@ impl SessionManager {
             })
     }
 
-    /// Load the persisted cumulative stats for a session, used to seed `SessionStats` on resume.
-    /// Returns all-zero when the session row doesn't exist yet (fresh session).
+    /// Load the persisted cumulative stats for a session, seeding `SessionStats` on resume. Returns
+    /// all-zero when the session row doesn't exist yet (fresh session).
     pub async fn load_session_stats(
         &self,
         session_id: Uuid,
@@ -2296,9 +2260,9 @@ impl SessionManager {
     /// Top-level only, like [`Self::list_sessions`]'s default, and for a sharper reason than
     /// tidiness. A sub-agent's row is touched by its own turns, so a worker still running when its
     /// parent's turn ends -- which `agent_spawn`'s `background` parameter makes ordinary -- sorts
-    /// above the session the user was actually in. Picking it used to resume the worker
-    /// unrestricted; since `crate::refuse_a_spawned_session` it is refused instead, and `-c` would
-    /// dead-end on a session the user never named with no way to ask for the next one down.
+    /// above the session the user was actually in. `crate::refuse_a_spawned_session` refuses a
+    /// worker, so picking one would dead-end `-c` on a session the user never named, with no way to
+    /// ask for the next one down.
     ///
     /// [`spawned_session_sql`] rather than `parent_session_id IS NULL`, so the filter answers the
     /// same question the refusal does. An imported worker has no parent link and is refused all the
@@ -2684,10 +2648,11 @@ impl SessionManager {
     /// The lock check is not a nicety. `updated_at` is bumped by turns only, and resuming a session
     /// does not touch it, so a REPL left sitting at its prompt past the window is a perfect
     /// candidate for deletion while a human is looking at it. Any start that goes through
-    /// `async_main` runs this sweep, so a completely unrelated `meka` in another terminal used to
-    /// announce `deleted 1 session(s)` and destroy the live one. What the operator saw was their
-    /// next turn running against the provider and *then* failing on a foreign-key violation, with
-    /// the answer paid for and lost, and every later turn in that REPL failing the same way.
+    /// `async_main` runs this sweep, so without it a completely unrelated `meka` in another
+    /// terminal destroys the live session and announces `deleted 1 session(s)`. What the operator
+    /// saw was their next turn running against the provider and *then* failing on a foreign-key
+    /// violation, with the answer paid for and lost, and every later turn in that REPL failing the
+    /// same way.
     ///
     /// A locked *child* is not separately checked. The cascade would take one with its parent, but
     /// children are sub-agent rows and nothing ever locks those; a child that could be locked would
@@ -2766,12 +2731,11 @@ impl SessionManager {
     ///
     /// `still_eligible` is a SQL predicate re-applied inside the delete, so the statement decides
     /// on the rows as they are rather than on a list read earlier. Selecting candidates and then
-    /// deleting them by id is two statements where there used to be one, and a condition checked
-    /// only in the first is a condition that can stop being true in between: the retention sweep's
-    /// "no schedule ahead of it" is the case that matters, because a job created against a
-    /// sub-agent child in that gap would be cascaded away with a parent nothing has locked. A
-    /// `&'static str` and never anything derived from input; `""` for a caller with no further
-    /// condition, which is `--all`.
+    /// deleting them by id is two statements, and a condition checked only in the first can stop
+    /// being true in between: the retention sweep's "no schedule ahead of it" is the case that
+    /// matters, because a job created against a sub-agent child in that gap would be cascaded away
+    /// with a parent nothing has locked. A `&'static str` and never anything derived from input;
+    /// `""` for a caller with no further condition, which is `--all`.
     ///
     /// Chunked because a lock is an open file descriptor: a sweep over ten thousand expired
     /// sessions would otherwise hold ten thousand at once and hit the process limit, turning a
@@ -3063,10 +3027,10 @@ impl SessionManager {
     /// Delete a session, refusing with [`MekaError::SessionLocked`] if another meka process has it
     /// open. The door for a caller acting on a session it does not hold: `meka session delete`.
     ///
-    /// `meka session delete <id>` against a live REPL used to exit 0 having said nothing at all --
-    /// the count goes through `tracing::info!`, invisible at the default level -- while the row and
-    /// its messages cascaded away underneath a conversation that carried on as if nothing had
-    /// happened, until its next turn failed on a foreign-key violation.
+    /// Without it, `meka session delete <id>` against a live REPL exits 0 having said nothing at
+    /// all (the count goes through `tracing::info!`, invisible at the default level) while the row
+    /// and its messages cascade away underneath a conversation that carries on until its next turn
+    /// fails on a foreign-key violation.
     pub async fn delete_session_unless_attached(&self, session_id: Uuid) -> Result<bool> {
         let lock = self.lock_session(session_id)?;
         let deleted = self.delete_session_row(session_id).await?;
@@ -4074,12 +4038,11 @@ mod tests {
 
     /// A child records the profile it was given, not the one on its parent's row.
     ///
-    /// The two are the same on every ordinary path, and this used to be a `SELECT … provider FROM
-    /// sessions` that made them the same by construction. They come apart for exactly as long as a
-    /// repin that could not take the runtime lock, which is what ACP's `session/set_config_option`
-    /// does mid-turn: the row moves, the agent does not, and a worker spawned in that window ran on
-    /// one account while its row claimed the other. Whoever calls this owes it the profile the
-    /// worker is actually built on; `agent_spawn` reads both from the same cell.
+    /// The two are the same on every ordinary path. They come apart for exactly as long as a repin
+    /// that could not take the runtime lock, which is what ACP's `session/set_config_option` does
+    /// mid-turn: the row moves, the agent does not, and a worker spawned in that window ran on one
+    /// account while its row claimed the other. Whoever calls this owes it the profile the worker
+    /// is actually built on; `agent_spawn` reads both from the same cell.
     ///
     /// Asserted with the two deliberately different, because passing the parent's own profile
     /// cannot tell the new behaviour from the old.
@@ -4506,22 +4469,21 @@ mod tests {
 
     /// Forking a worker gives another worker, not a laundered top-level session.
     ///
-    /// The fork used to write `NULL` into `parent_session_id` and omit `subagent_spec_json`
-    /// entirely, so the copy read as top-level and `crate::refuse_a_spawned_session` admitted it.
-    /// That handed anyone with `sessions:w` -- or a shell, via `meka session fork` -- a drivable
-    /// copy of a worker's whole conversation with no `[subagents]` denials, no memory or
-    /// instruction grants, and the host's permission, which is the escalation the refusal exists
-    /// to stop. The refusal is a boundary only while a copy cannot cross it.
+    /// A fork writing `NULL` into `parent_session_id` and omitting `subagent_spec_json` leaves a
+    /// copy that reads as top-level, which `crate::refuse_a_spawned_session` then admits. That
+    /// handed anyone with `sessions:w` -- or a shell, via `meka session fork` -- a drivable copy of
+    /// a worker's whole conversation with no `[subagents]` denials, no memory or instruction
+    /// grants, and the host's permission, which is the escalation the refusal exists to stop. The
+    /// refusal is a boundary only while a copy cannot cross it.
     ///
     /// Both arms, because carrying the columns unconditionally would be its own bug: a fork of an
-    /// ordinary session must stay top-level or `list_sessions` would hide every fork.
-    /// `-c` resumes the newest session it can actually drive, not merely the newest row.
+    /// ordinary session must stay top-level or `list_sessions` would hide every fork. `-c` resumes
+    /// the newest session it can actually drive, not merely the newest row.
     ///
     /// A sub-agent's row is touched by its own turns, so a worker still running when its parent's
     /// turn ends -- which `agent_spawn`'s `background` parameter makes ordinary -- sorts above the
-    /// session the user was last in. Picking it used to resume the worker unrestricted; since
-    /// `crate::refuse_a_spawned_session` it would dead-end on a refusal instead, with no way to ask
-    /// for the next one down.
+    /// session the user was last in. Picking it would dead-end on
+    /// `crate::refuse_a_spawned_session`'s refusal, with no way to ask for the next one down.
     ///
     /// The child is created second so it is unambiguously the newer row: without the filter this
     /// returns it, which is the whole failure.
@@ -4847,9 +4809,9 @@ mod tests {
                 .expect("spawn a worker");
             lock.expect("claim the worker's lock");
         }
-        // And an imported worker, which holds spawn terms and no parent link. It is the row the
-        // parent-only filter used to count, and the one a user cannot act on: `provider remove`
-        // warns how many sessions it would strand, and this is not one of them.
+        // And an imported worker, which holds spawn terms and no parent link. A parent-only filter
+        // counts this row, and it is one a user cannot act on: `provider remove` warns how many
+        // sessions it would strand, and this is not one of them.
         let orphan = manager
             .create_session(None, "work".to_string())
             .await
@@ -4976,9 +4938,8 @@ mod tests {
         ]);
     }
 
-    /// Regression: every in-memory `open()` mints a temp lock dir, and nothing used to remove it,
-    /// so a few hundred `cargo test` runs left thousands of stray directories in the system temp
-    /// dir.
+    /// Every in-memory `open()` mints a temp lock dir; unremoved, a few hundred `cargo test` runs
+    /// leave thousands of stray directories in the system temp dir.
     #[tokio::test]
     async fn in_memory_lock_dir_is_removed_when_the_last_clone_drops() {
         let manager = test_manager().await;
@@ -5545,13 +5506,12 @@ mod tests {
     /// come out of it in WAL: converting a rollback journal takes an exclusive lock, and a database
     /// left unconverted is a permanent contention problem, not a slow start.
     ///
-    /// What this does *not* isolate is the retry loop, and the reason is worth stating rather than
-    /// leaving to be rediscovered. `rusqlite` installs a five-second busy timeout at open, so any
-    /// hold shorter than that is waited out on the first attempt and the retry never runs. The case
-    /// the retry exists for is the one where SQLite declines to consult the busy handler for this
-    /// pragma at all -- observed at a couple of launches per few hundred, and not reproducible on
-    /// demand. So this pins the property (a contended open waits and gets WAL) and the retry's own
-    /// arm is covered by argument, not by a test.
+    /// What this does *not* isolate is the retry loop. `rusqlite` installs a five-second busy
+    /// timeout at open, so any hold shorter than that is waited out on the first attempt and the
+    /// retry never runs. The case the retry exists for is the one where SQLite declines to consult
+    /// the busy handler for this pragma at all -- observed at a couple of launches per few hundred,
+    /// and not reproducible on demand. So this pins the property (a contended open waits and gets
+    /// WAL) and the retry's own arm is covered by argument, not by a test.
     ///
     /// The writer is a plain `rusqlite` connection holding `BEGIN EXCLUSIVE`, which is what an
     /// unrelated process mid-transaction looks like from outside.
@@ -7350,10 +7310,10 @@ mod tests {
     /// A refresh may only replace the credential it was derived from.
     ///
     /// Two meka processes refreshing at once both present the same refresh token, and against an
-    /// issuer with a reuse window both succeed. The blind upsert this replaces left the database
-    /// holding whichever finished last -- the token the issuer had already superseded -- and the
-    /// symptom arrived at the *next* launch as `invalid_grant` with nothing naming the cause. The
-    /// loser adopts the winner's credential instead, so the store and the issuer agree.
+    /// issuer with a reuse window both succeed. A blind upsert leaves the database holding
+    /// whichever refresh finished last, which is the token the issuer has already superseded, and
+    /// the symptom arrives at the *next* launch as `invalid_grant` with nothing naming the cause.
+    /// The loser adopts the winner's credential instead, so the store and the issuer agree.
     #[tokio::test]
     async fn test_a_refresh_cannot_overwrite_a_credential_it_did_not_read() {
         let manager = SessionManager::open(Some(Path::new(":memory:")), &Default::default())
@@ -8024,8 +7984,8 @@ mod tests {
     }
 
     /// `meka schedule list` and `cancel` work from a job id, so they need every job regardless of
-    /// when it is due. An earlier version approximated that with "due within the next century",
-    /// which left a job scheduled past that horizon invisible and therefore uncancellable.
+    /// when it is due. Approximating it with "due within the next century" leaves a job scheduled
+    /// past that horizon invisible and therefore uncancellable.
     #[tokio::test]
     async fn test_list_all_includes_jobs_beyond_any_due_horizon() {
         let manager = test_manager().await;
@@ -8328,10 +8288,10 @@ mod tests {
 
     /// Running out of names is an error, not a fallback to the occupied one.
     ///
-    /// It used to be safe to return the base name, because `VACUUM INTO` refuses a non-empty
-    /// target. Staging moved the write to `.partial` and the final step to `std::fs::rename`, which
-    /// refuses nothing, so the old fallthrough silently overwrote the *oldest* backup: the one most
-    /// likely to be the one that mattered.
+    /// Returning the base name would be safe only if the write still went through `VACUUM INTO`,
+    /// which refuses a non-empty target. Staging moved the write to `.partial` and the final step
+    /// to `std::fs::rename`, which refuses nothing, so the old fallthrough silently overwrote the
+    /// *oldest* backup: the one most likely to be the one that mattered.
     #[test]
     fn running_out_of_backup_names_refuses_rather_than_overwriting_the_oldest() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -8377,12 +8337,10 @@ mod tests {
     /// When no backup can be taken, the migration refuses and the store is left where it was.
     ///
     /// Reached here by exhausting every name, which is the one way to make the copy impossible that
-    /// a test can force deterministically. Two earlier attempts are worth recording because both
-    /// stopped working, and for good reasons: a read-only data directory does not work because
+    /// a test can force deterministically. A read-only data directory does not work, because
     /// `SessionManager::open` calls `restrict_permissions(parent, 0o700)` on the way in and widens
-    /// it back; occupying the staging name with a directory no longer works because
-    /// `free_backup_path` now treats a taken `.partial` as a taken pair and steps past it, which is
-    /// the fix for the wedge described on that function.
+    /// it back. Occupying the staging name with a directory does not work either, because
+    /// `free_backup_path` treats a taken `.partial` as a taken pair and steps past it.
     #[tokio::test]
     async fn a_migration_that_cannot_be_backed_up_refuses_and_changes_nothing() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -8674,9 +8632,7 @@ mod tests {
     /// is exactly that: `back_up_before_migrating` gets as far as `staging.to_str()` and refuses
     /// there, with a name already picked and no copy written.
     ///
-    /// An earlier version of this module's comments claimed no such test existed and rested the
-    /// guarantee on control flow alone. Control flow is still what enforces it; this is the test
-    /// that would notice if someone rearranged that.
+    /// Control flow is what enforces the ordering; this is what notices a rearrangement of it.
     #[cfg(unix)]
     #[tokio::test]
     async fn nothing_is_pruned_when_no_fresh_copy_landed() {

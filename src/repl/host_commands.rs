@@ -4,13 +4,14 @@
 //! need something only the host loop has: the live `Agent`, the conversation, the session id that
 //! `/fork` moves. Those are forwarded and answered here.
 //!
-//! **One owner, checked by the compiler.** The split used to be a hand-written list of variants in
-//! `repl.rs` and a `match` in `main.rs` that ended in `_ => {}`. They agreed, but nothing made
-//! them: adding a variant to the forwarding list and forgetting the match produced a command that
-//! was sent, silently did nothing, and still got its episode brackets -- a blank-line sandwich
-//! around no output, which is exactly what `Console::announce_foreign_output` warns against three
-//! lines above that match. [`SlashCommand::answered_by`] is now exhaustive and so is
-//! [`answer`], so a new variant fails to compile in both places.
+//! **One owner, checked by the compiler.** Split across a hand-written list of variants in
+//! `repl.rs` and a `match` in `main.rs` ending in `_ => {}`, the two have to agree with nothing
+//! making them. They agreed, but nothing made them: adding a variant to the forwarding list and
+//! forgetting the match produced a command that was sent, silently did nothing, and still got its
+//! episode brackets -- a blank-line sandwich around no output, which is exactly what
+//! `Console::announce_foreign_output` warns against three lines above that match.
+//! [`SlashCommand::answered_by`] is now exhaustive and so is [`answer`], so a new variant fails to
+//! compile in both places.
 
 use std::sync::Arc;
 
@@ -22,9 +23,9 @@ use crate::{
 
 /// What the host loop does once a command has been answered.
 ///
-/// A return value rather than a `break` inside the arm, because extracting the dispatcher moved it
-/// out of the loop it used to sit in. Only two of the arms need it: `/fork` and the rest leave the
-/// loop running, while a REPL thread that has gone away ends it.
+/// A return value rather than a `break` inside the arm, because the dispatcher sits outside the
+/// loop. Only two of the arms need it: `/fork` and the rest leave the loop running, while a REPL
+/// thread that has gone away ends it.
 pub(crate) enum AfterCommand {
     Continue,
     Leave,
@@ -54,22 +55,20 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
     } = ctx;
     let session_id_cell = session_id;
     let mut session_id = *session_id_cell;
-    // Every command answered here says something, even if only that a list is empty,
-    // and much of it prints through the `cli` modules the console cannot see. One
-    // announcement covers all of them.
+    // Every command answered here says something, even if only that a list is empty, and much of it
+    // prints through the `cli` modules the console cannot see. One announcement covers all of them.
     //
-    // There is deliberately no "does this one answer by running a turn" exception any
-    // more. Announcing is idempotent within an episode -- the opening blank is spent
-    // once, by whichever writer gets there first -- so a command that runs a turn is
-    // spaced identically whether the turn happens or it bails first. The predicate
-    // that used to make that distinction is what left `/skill nosuchskill` printing
-    // its error flush against both the line above and the prompt below.
+    // There is deliberately no "does this one answer by running a turn" exception any more.
+    // Announcing is idempotent within an episode -- the opening blank is spent once, by whichever
+    // writer gets there first -- so a command that runs a turn is spaced identically whether the
+    // turn happens or it bails first. A predicate making that distinction leaves `/skill
+    // nosuchskill` printing its error flush against both the line above and the prompt below.
     //
-    // "Answered here" is the qualification, and it is why this is gated rather than
-    // unconditional: the arm below for the six the REPL owns prints nothing at all. In debug it
-    // trips an assertion, but in release it is a silent no-op, and announcing first would give it
-    // exactly the blank-line sandwich this call's own doc warns against -- in the builds where
-    // nothing is watching.
+    // "Answered here" is the qualification, and it is why this is gated rather than unconditional:
+    // the arm below for the six the REPL owns prints nothing at all. In debug it trips an
+    // assertion, but in release it is a silent no-op, and announcing first would give it exactly
+    // the blank-line sandwich this call's own doc warns against -- in the builds where nothing is
+    // watching.
     if command.answered_by() == repl::Answerer::Host {
         with_console(console, |console| console.announce_foreign_output());
     }

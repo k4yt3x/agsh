@@ -1423,10 +1423,10 @@ mod tests {
 
     /// Losing one compare-and-swap must not turn every later write into an unconditional one.
     ///
-    /// The state after a lost swap used to be recorded as "nothing was read", which is also the
-    /// state the interactive authorisation flow is in -- and that state takes the blind-upsert
-    /// arm. So a process that lost a single race went back to overwriting the row for the rest of
-    /// its run, with every token it wrote descended from a credential another process had already
+    /// The state after a lost swap must not be recorded as "nothing was read", which is also the
+    /// state the interactive authorisation flow is in, and that state takes the blind-upsert arm.
+    /// So a process that lost a single race went back to overwriting the row for the rest of its
+    /// run, with every token it wrote descended from a credential another process had already
     /// superseded. The invariant [`TokenStore::replace_mcp_credentials`] states -- that the stored
     /// credential never moves backwards -- held only until the first race.
     #[tokio::test]

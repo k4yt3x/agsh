@@ -132,13 +132,13 @@ impl Permission {
     /// with no `Confinement`, no sandbox and meka's full environment, so the level that authorises
     /// it must be the one that promises no boundary.
     ///
-    /// `Workspace` used to pass, on the reasoning that it is *safer* than the old top rung for
-    /// unattended work. That is true of `execute_command`, which `workspace` confines, and false
-    /// of a gate, which bypasses every backend. The result was a one-call escape: at `workspace`,
-    /// a single `schedule_create` with a `gate` ran arbitrary commands outside the boundary within
+    /// `Workspace` does not pass, tempting as it is on the reasoning that it is *safer* than the
+    /// top rung. That is true of `execute_command`, which `workspace` confines, and false of a
+    /// gate, which bypasses every backend. The result was a one-call escape: at `workspace`, a
+    /// single `schedule_create` with a `gate` ran arbitrary commands outside the boundary within
     /// one poll interval, no race and no user interaction, while `execute_command` at the same
-    /// level was confined and is refused outright when it cannot be. The interactive shell must
-    /// not have a higher bar than the unattended one.
+    /// level was confined and is refused outright when it cannot be. The interactive shell must not
+    /// have a higher bar than the unattended one.
     ///
     /// A named predicate rather than a `matches!` repeated at each door, because the four sites had
     /// already drifted into phrasing the same rule three different ways.
@@ -202,11 +202,11 @@ impl Permission {
     ///
     /// One consequence is worth knowing because it looks like a bug and is not: this is **not
     /// monotone in `parent`**. Tightening a parent from `unrestricted` to `workspace` moves a child
-    /// that asked for `ask` *sideways* to `workspace`, so a sub-agent that used to stop and ask now
-    /// runs unattended. Nothing has escaped -- the child holds exactly the parent's authority, and
-    /// its reach shrank from the whole filesystem to the workspace roots -- but the user tightened
-    /// a setting and got fewer prompts, which is a real surprise. The alternative is the meet,
-    /// `ask` under `workspace` giving `read`, which trades the surprise for a sub-agent that
+    /// that asked for `ask` *sideways* to `workspace`, so a sub-agent that would stop and ask runs
+    /// unattended instead. Nothing has escaped -- the child holds exactly the parent's authority,
+    /// and its reach shrank from the whole filesystem to the workspace roots -- but the user
+    /// tightened a setting and got fewer prompts, which is a real surprise. The alternative is the
+    /// meet, `ask` under `workspace` giving `read`, which trades the surprise for a sub-agent that
     /// silently cannot write at all. Both are defensible; this one is chosen and pinned by
     /// `tightening_a_parent_can_move_an_ask_child_sideways_to_workspace`.
     pub fn clamp_to(self, parent: Permission) -> Permission {
@@ -561,15 +561,15 @@ mod tests {
     fn clamp_to_never_exceeds_the_parent_for_any_pair() {
         // The containment table, written out rather than derived.
         //
-        // The loop that used to stand here asserted `requested.clamp_to(parent).is_within(parent)`,
-        // which is true for *any* definition of `is_within` that is reflexive: `clamp_to` returns
-        // either `self` (when it is already within) or `parent` (which is within itself). Widening
-        // `Workspace.is_within(Ask)` to `true` -- the dangerous direction, since it would hand a
-        // child unattended writes under a parent whose safety is the prompt -- left that loop
-        // passing. Only the three hand-written pairs below ever guarded anything.
+        // Asserting `requested.clamp_to(parent).is_within(parent)` is vacuous: it holds for *any*
+        // reflexive `is_within`, because `clamp_to` returns either `self` (when it is already
+        // within) or `parent` (which is within itself). Widening `Workspace.is_within(Ask)` to
+        // `true` -- the dangerous direction, since it would hand a child unattended writes under a
+        // parent whose safety is the prompt -- left that loop passing. Only the three hand-written
+        // pairs below ever guarded anything.
         //
-        // Rows are the child, columns the parent, in `EVERY` order:
-        // none, read, workspace, ask, unrestricted.
+        // Rows are the child, columns the parent, in `EVERY` order: none, read, workspace, ask,
+        // unrestricted.
         const CONTAINED: [[bool; 5]; 5] = [
             // none is within everything
             [true, true, true, true, true],
@@ -809,8 +809,8 @@ mod tests {
     /// `ask` is out because a gate fires on a timer with nobody watching, so the prompt that is its
     /// entire safety will never be answered. `workspace` is out because a shell gate is spawned
     /// with no sandbox at all, so a level whose whole meaning is a write boundary cannot honestly
-    /// authorise one. `workspace` used to pass here, and that was a one-call escape:
-    /// `schedule_create` with a `gate` ran arbitrary unconfined commands from inside the confined
+    /// authorise one. `workspace` must not pass here: it is a one-call escape, since
+    /// `schedule_create` with a `gate` runs arbitrary unconfined commands from inside the confined
     /// mode.
     ///
     /// Spelled out per level rather than looped, because the two exclusions are different arguments

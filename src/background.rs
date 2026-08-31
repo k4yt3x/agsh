@@ -589,7 +589,7 @@ impl BackgroundStore {
     /// be redelivered on every restart, turning one bad result into a boot loop. Losing one report
     /// is the cheaper failure.
     ///
-    /// The scheduler used to do the same and no longer does.
+    ///
     /// [`crate::schedule::ScheduleStore::complete_claim`] writes *after* the turn, because a lease
     /// plus an attempt ceiling gives it the same boot-loop protection without paying an occurrence
     /// for every crash. A background outcome has no lease to hold, so it keeps the cruder rule.

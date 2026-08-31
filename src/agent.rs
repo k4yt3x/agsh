@@ -78,11 +78,10 @@ pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 ///
 /// It exists because a mid-session switch has to reach two things the agent does not own.
 /// `agent_spawn` and `agent_followup` build a worker from the parent's provider, and the
-/// `context_*` tools report the window the model is being gauged against. Both used to hold a copy
-/// taken when the session was assembled, so `/provider`, `PATCH /v1/sessions/{id}` and ACP's
-/// `session/set_config_option` moved the agent and left them behind: a worker spawned afterwards
-/// ran on the profile the user had just left, and billed that account, while the child's own row
-/// recorded the new one.
+/// `context_*` tools report the window the model is being gauged against. A copy taken when the
+/// session was assembled would be left behind by `/provider`, `PATCH /v1/sessions/{id}` and ACP's
+/// `session/set_config_option`: a worker spawned afterwards would run on, and bill, the profile the
+/// user had just left, while the child's own row recorded the new one.
 #[derive(Clone)]
 pub struct PublishedBinding {
     resolved: Arc<std::sync::RwLock<ResolvedBinding>>,
@@ -174,10 +173,9 @@ const MAX_OVERFLOW_RETRIES: u32 = 1;
 /// turn making progress through many tool rounds can spend the list once per round.
 ///
 /// One such round costs at most four request *sequences* -- the refusal itself, the outage
-/// reprieve's unchanged re-send, then one per tier -- each of them
-/// [`crate::provider::retry::MAX_PROVIDER_RETRIES`] + 1 attempts, plus the reprieve's one
-/// deliberate wait. Lengthening this list adds a sequence to that figure, and the figure is per
-/// round rather than per turn.
+/// reprieve's unchanged re-send, then one per tier -- each of
+/// [`crate::provider::retry::MAX_PROVIDER_RETRIES`] + 1 attempts, plus the reprieve's wait.
+/// Lengthening this list adds a sequence to that figure.
 ///
 /// Ordered, because the tiers are not alternatives. [`DegradeTier::Attachments`] leaves every tool
 /// call and result standing and removes only what a text-only conversation never had, which is the
@@ -200,12 +198,12 @@ const DEGRADE_TIERS: [DegradeTier; 2] = [DegradeTier::Attachments, DegradeTier::
 /// so nothing in it is known-accepted. The floor has to say the same, and zero is the only value
 /// that does.
 ///
-/// It used to be set to the post-compaction `messages.len()`, which is the opposite claim: that
-/// everything present is known-good. The clamp in `repair_rejected_content` then read the two as an
-/// *empty* suspect window, both tiers found nothing, and the degrade-and-retry became silently
-/// inert for the rest of the turn -- in exactly the large-conversation case that triggers a
-/// compaction and is likeliest to be carrying a refused attachment. It failed quietly: with no tier
-/// spent, even the `/rewind` hint stayed suppressed.
+/// Setting it to the post-compaction `messages.len()` makes the opposite claim: that everything
+/// present is known-good. The clamp in `repair_rejected_content` then read the two as an *empty*
+/// suspect window, both tiers found nothing, and the degrade-and-retry became silently inert for
+/// the rest of the turn -- in exactly the large-conversation case that triggers a compaction and is
+/// likeliest to be carrying a refused attachment. It failed quietly: with no tier spent, even the
+/// `/rewind` hint stayed suppressed.
 ///
 /// The cost is reach. Index 0 is the summary, plain text no tier touches, but the verbatim tail
 /// after it came from earlier turns, so a degrade here can empty a tool exchange this turn did not
@@ -226,10 +224,10 @@ enum DegradeTier {
     ///
     /// Reaches content [`Self::Attachments`] cannot. A tool result is usually text, and a provider
     /// that refuses one -- a body it cannot encode, a filter, sheer size -- leaves nothing for the
-    /// first tier to remove, so the turn used to die with the refused text still committed and
-    /// every later turn re-sent it. This also reaches the *arguments*, which no tier that
-    /// preserves the call can: a `tool_use` the provider objects to is repaired only by ceasing
-    /// to be one.
+    /// first tier to remove, so without a later tier the turn dies with the refused text still
+    /// committed and every later turn re-sends it. This also reaches the *arguments*, which no tier
+    /// that preserves the call can: a `tool_use` the provider objects to is repaired only by
+    /// ceasing to be one.
     ToolExchanges,
 }
 
@@ -1175,10 +1173,9 @@ impl Agent {
     /// The window this agent gauges against, and the one every collaborator watching the published
     /// cell sees.
     ///
-    /// Read rather than mirrored onto a field of its own. It used to be `options.context_window`,
-    /// kept true by an assignment here and another in `Agent::new` -- two hand-written statements
-    /// enforcing what the cell already guarantees, which is precisely the shape that broke when a
-    /// third holder was added and only two of them were remembered.
+    /// Read rather than mirrored onto a field of its own. Read from the cell rather than mirrored
+    /// into `options.context_window`: hand-written assignments enforcing what the cell already
+    /// guarantees break the day a third holder is added and only two are remembered.
     pub(crate) fn context_window(&self) -> u64 {
         self.published_binding.context_window()
     }
@@ -1541,12 +1538,11 @@ impl Agent {
 
     /// Park the lock on a session this agent has just created where the host can reach it.
     ///
-    /// The REPL used to claim the lock in its post-turn block, which measured out as: no lock file
-    /// at all for the six seconds of a first turn, and a second `meka -c --oneshot` in that window
-    /// writing into the same conversation. The stored log came out
-    /// `user, user, assistant, assistant`, which the Anthropic Messages API then refuses for
-    /// non-alternating roles -- so the session was not merely muddled but unusable from that point
-    /// on. `--oneshot` had no claim at any point.
+    /// Claiming the lock in the REPL's post-turn block instead leaves no lock file at all for the
+    /// whole of a first turn, so a second `meka -c --oneshot` in that window writes into the same
+    /// conversation. The stored log came out `user, user, assistant, assistant`, which the
+    /// Anthropic Messages API then refuses for non-alternating roles -- so the session was not
+    /// merely muddled but unusable from that point on. `--oneshot` had no claim at any point.
     ///
     /// `None` means the claim could not be made at all, which
     /// [`crate::session::SessionManager::create_session_locked`] has already warned about. The turn
@@ -1682,13 +1678,12 @@ impl Agent {
         // prompt, and a transient `SQLITE_BUSY` should not cost the turn itself.
         //
         // `memories_readable` is what stops that degradation becoming a lie. An empty `Vec` here is
-        // indistinguishable from an empty *store*, so the world-state diff read it as every memory
-        // having been deleted and told the model so -- by name -- and then, on the next turn that
-        // read successfully, announced them all as "saved or updated" when nothing had been
-        // written. A store that cannot be read is not a store that is empty, and the model acts on
-        // the difference.
-        // Skipped outright when no tool can open the index, exactly as the schedule and background
-        // reads are. `index()` materialises every row and carries the standing band's bodies, and
+        // indistinguishable from an empty *store*, so the world-state diff reads it as every memory
+        // having been deleted, tells the model so by name, and then on the next successful read
+        // announces them all as "saved or updated" when nothing was written. A store that cannot be
+        // read is not a store that is empty, and the model acts on the difference. Skipped outright
+        // when no tool can open the index, exactly as the schedule and background reads are.
+        // `index()` materialises every row and carries the standing band's bodies, and
         // `WorldSnapshot::new` then declines to render any of it -- so an installation with
         // `[memory] enabled = false` was paying a full-table read per turn for a list it dropped.
         // "Readable" for a store nobody asked about is `true`: nothing failed, so there is nothing
@@ -4243,11 +4238,11 @@ fn neutralised_arguments() -> serde_json::Value {
 ///
 /// **Nothing here changes the shape of the conversation.** A `tool_use` stays a `tool_use` and a
 /// `tool_result` stays a `tool_result`, so the one invariant both APIs enforce on replay -- that
-/// the two are matched -- cannot be broken by the repair. That is the whole design. An earlier
-/// version replaced the pair with plain text, which meant a `tool_result` whose call sat in
-/// already-accepted history had to be special-cased or it would be orphaned, and every provider
-/// refuses an orphan outright: a rejection this function exists to recover from would have become a
-/// permanent one it cannot. Keeping the shape deletes that hazard rather than handling it.
+/// the two are matched -- cannot be broken by the repair. That is the whole design. Replacing the
+/// pair with plain text would orphan any `tool_result` whose call sits in already-accepted history
+/// unless that case were special-cased, and every provider refuses an orphan outright: the
+/// rejection this function exists to recover from would become a permanent one it cannot. Keeping
+/// the shape deletes that hazard rather than handling it.
 ///
 /// Two more things fall out of the same choice. The turn still ends in a `tool_use`, so the
 /// reasoning the provider issued for it stays valid and is left alone. And the result keeps
@@ -4255,11 +4250,11 @@ fn neutralised_arguments() -> serde_json::Value {
 /// ([`Agent::resolve_and_execute_tool`] produces exactly this for a denied permission or an unknown
 /// name), so the model needs no new concept and no frontend needs new rendering.
 ///
-/// The arguments move into the result rather than staying on the call. Size is the way a
-/// `tool_use` earns a refusal -- the model can emit a very large one -- so leaving it in place
-/// would leave the tier unable to reach the thing that may have caused the failure. They are
-/// quoted, truncated, in the result, which puts what was sent and why it failed in one block,
-/// which is where the model already looks to find out what happened to a call.
+/// The arguments move into the result rather than staying on the call. Size is the way a `tool_use`
+/// earns a refusal -- the model can emit a very large one -- so leaving it in place would leave the
+/// tier unable to reach the thing that may have caused the failure. They are quoted, truncated, in
+/// the result, which puts what was sent and why it failed in one block, which is where the model
+/// already looks to find out what happened to a call.
 fn neutralise_tool_exchanges(messages: &[Message], reason: &str) -> Option<Vec<Message>> {
     // Quoted here rather than looked up per result, because a result reports a call that appears
     // earlier in the window and the rewrite below visits blocks in order.
@@ -4455,10 +4450,10 @@ fn should_retry_provider_error(
 
 /// Run [`Provider::complete`] under the same retry policy a streamed turn gets.
 ///
-/// Compaction used to call `complete` with a bare `?`, so one transient `429` in the middle of it
-/// was terminal. That is worse than it sounds, because of where the failure surfaces: the
-/// checkpoint turn drops to the standalone summariser with only a `warn!`, and a failure in *that*
-/// is re-labelled [`MekaError::ContextOverflow`] by `recover_from_context_overflow` and reaches the
+/// Calling `complete` with a bare `?` makes one transient `429` in the middle of a compaction
+/// terminal. That is worse than it sounds, because of where the failure surfaces: the checkpoint
+/// turn drops to the standalone summariser with only a `warn!`, and a failure in *that* is
+/// re-labelled [`MekaError::ContextOverflow`] by `recover_from_context_overflow` and reaches the
 /// caller as 502 `/errors/context-overflow` -- telling a client to shorten a conversation whose
 /// real problem was rate limiting. Compaction is a provider call like any other and there was never
 /// an argument for it deserving fewer attempts than the turn it exists to rescue.
@@ -5062,12 +5057,12 @@ mod tests {
 
     /// The number three separate sites divide by, pinned exactly.
     ///
-    /// Every operator in `window * PERCENT / 100` and in the guard around it used to be flippable
-    /// with the suite still green: nineteen surviving mutants across the reactive check, the
-    /// proactive projection and the overflow-recovery arm. The tests that drove compaction all
-    /// *forced* it, so they proved the machinery runs and said nothing about when it starts. A
-    /// wrong threshold is silent either way -- compact every turn and lose history, or never
-    /// compact and have the provider reject the turn.
+    /// Every operator in `window * PERCENT / 100` and in the guard around it is flippable without a
+    /// test that pins the threshold, across the reactive check, the proactive projection and the
+    /// overflow-recovery arm. The tests that drove compaction all *forced* it, so they proved the
+    /// machinery runs and said nothing about when it starts. A wrong threshold is silent either way
+    /// -- compact every turn and lose history, or never compact and have the provider reject the
+    /// turn.
     #[tokio::test]
     async fn the_auto_compaction_threshold_is_eighty_percent_of_the_window() {
         let provider: Arc<dyn Provider> =
@@ -5284,7 +5279,7 @@ mod tests {
         (agent, session_manager)
     }
 
-    /// The wiring, not the method: deleting the call in `run_turn` used to pass every test.
+    /// The wiring, not the method: nothing else fails when the call in `run_turn` is deleted.
     ///
     /// `WorldSnapshot::carry_memories_from` had a test that called it directly, so the branch that
     /// decides *when* to call it was uncovered and a mutation removing it survived. What it guards
@@ -8182,7 +8177,8 @@ mod tests {
     }
 
     /// What the second tier is for. A tool result carrying only text offers `Attachments` nothing,
-    /// which used to end the turn with that text committed and every later turn re-sending it.
+    /// which without a later tier ends the turn with that text committed and every later turn
+    /// re-sending it.
     #[test]
     fn test_a_text_only_tool_exchange_is_beyond_the_first_tier_and_reached_by_the_second() {
         let messages = [
@@ -8273,8 +8269,8 @@ mod tests {
     }
 
     /// A result whose call sits in already-accepted history is emptied like any other, and simply
-    /// has no arguments to quote. Nothing is removed, so nothing can be orphaned -- which is the
-    /// property that made the special case this test used to cover unnecessary.
+    /// has no arguments to quote. Nothing is removed, so nothing can be orphaned, which is what
+    /// makes an orphan special case unnecessary.
     #[test]
     fn test_a_result_whose_call_is_outside_the_window_is_emptied_without_quoting_it() {
         let messages = [tool_result_text("call_from_before", "the refused body")];
@@ -9230,13 +9226,11 @@ mod tests {
     }
 
     /// Once a tool loop pushes the assembled request past `context_messages`, the window moves
-    /// forward with it. This is the trade the per-round truncation makes, stated rather than
-    /// implied.
+    /// forward with it. This is the trade the per-round truncation makes.
     ///
-    /// The test this replaces asserted the opposite -- that the base stays frozen for the whole
-    /// turn -- which was true when the cap was applied once at turn start, and is the behaviour
-    /// that made `context_messages` stop applying the moment a turn made its second provider call.
-    /// It could not see the change because it drove a copy of the assembly that omitted the
+    /// Applying the cap once at turn start would freeze the base for the whole turn, which is what
+    /// makes `context_messages` stop applying the moment a turn makes its second provider call. It
+    /// could not see the change because it drove a copy of the assembly that omitted the
     /// truncation; against the real path it asserts 7 where the answer is 5.
     ///
     /// The cost is real and belongs here: a prefix that moves is a prefix the provider cannot serve
@@ -9348,11 +9342,11 @@ mod tests {
         );
     }
 
-    /// Regression: the tool catalogue, skill list, and MCP instructions used to live in the system
-    /// prompt, which is sent unconditionally. They now live in one user message, which
-    /// `truncate_messages_for_context` will drop once the conversation outgrows
-    /// `context_messages` (200 by default). Without this check the snapshot would still claim the
-    /// model had been told, and a long session would run with no catalogue at all.
+    /// The tool catalogue, skill list and MCP instructions do not live in the system prompt, which
+    /// is sent unconditionally. They now live in one user message, which
+    /// `truncate_messages_for_context` will drop once the conversation outgrows `context_messages`
+    /// (200 by default). Without this check the snapshot would still claim the model had been told,
+    /// and a long session would run with no catalogue at all.
     #[test]
     fn test_world_state_is_restated_once_it_scrolls_out_of_the_window() {
         // Rendered at index 0, window of 200.

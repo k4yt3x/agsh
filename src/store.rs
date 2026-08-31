@@ -158,13 +158,13 @@ const STORE_LOCK_FILE: &str = ".meka-store.lock";
 
 /// An exclusive `flock` on one store root, held until dropped.
 ///
-/// A skill write is read-modify-write -- read `SKILL.md`, compose the new contents from what was
-/// read, write it back -- and until this existed nothing serialised them across processes.
-/// `config.toml` has had [`crate::config::lock_config_file`] and sessions have `FileLock`; the
-/// store an agent writes to constantly had an in-process mutex at best. Two `meka skill add` runs,
-/// or `meka serve` racing a CLI edit, therefore each read the same file and the loser's change
-/// vanished with both reporting success. Memory needs none of this now: its write is one statement
-/// in one transaction, and SQLite serialises writers across processes.
+/// A skill write is read-modify-write: read `SKILL.md`, compose the new contents from what was
+/// read, write it back. Nothing else serialises them across processes. `config.toml` has had
+/// [`crate::config::lock_config_file`] and sessions have `FileLock`; the store an agent writes to
+/// constantly had an in-process mutex at best. Two `meka skill add` runs, or `meka serve` racing a
+/// CLI edit, therefore each read the same file and the loser's change vanished with both reporting
+/// success. Memory needs none of this now: its write is one statement in one transaction, and
+/// SQLite serialises writers across processes.
 ///
 /// Unique temp names in [`crate::config::write_file_atomic`] stopped the *splice*, where the
 /// published file was a mixture of two documents. They cannot stop a lost update, because both
@@ -356,14 +356,14 @@ pub(crate) const MAX_ENTRY_NAME_LEN: usize = 64;
 ///
 /// There is deliberately no length cap, so no stored name can be beyond reach.
 ///
-/// One used to sit here, bounding the cost of `memory_read`'s miss path: it loads the index and
-/// runs an edit distance per stored name, measured at 48 s for a 200,000-character argument
-/// against 20,000 memories, synchronously on a runtime worker with the cancellation token ignored.
-/// Refusing the argument did bound that, and re-created the exact wedge this function exists to
-/// end one length short: a row whose name ran past 64 characters was listed to the model in the
-/// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
-/// `DELETE /v1/memory/{name}` alike, while `meka memory export` refused the whole store on its
-/// account and told the reader to run `meka memory remove`, which refused it too.
+/// The cost being bounded is `memory_read`'s miss path: it loads the index and runs an edit
+/// distance per stored name, synchronously on a runtime worker with the cancellation token ignored,
+/// which for a 200,000-character argument against 20,000 memories takes tens of seconds. Refusing
+/// the argument did bound that, and re-created the exact wedge this function exists to end one
+/// length short: a row whose name ran past 64 characters was listed to the model in the `[Memory]`
+/// index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and `DELETE
+/// /v1/memory/{name}` alike, while `meka memory export` refused the whole store on its account and
+/// told the reader to run `meka memory remove`, which refused it too.
 ///
 /// The cost is bounded where it is actually incurred instead. [`crate::tools::did_you_mean_hint`]
 /// skips any candidate whose length differs from the argument by more than the edit threshold,

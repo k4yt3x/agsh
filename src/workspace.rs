@@ -122,15 +122,13 @@ fn retain_broadest(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 ///
 /// **This is the one definition of the boundary.** The in-process fence on `write_file` /
 /// `edit_file` / `scratchpad_save_file` and every sandbox dialect (Landlock, Bubblewrap, Seatbelt,
-/// the Windows restricted token) all derive their allow-list from here and nowhere else, so the
-/// file tools and the shell cannot end up disagreeing about where a write may land. That asymmetry
-/// is the specific failure this function exists to make unrepresentable.
+/// the Windows restricted token) derive their allow-list from here and nowhere else, so the file
+/// tools and the shell cannot disagree about where a write may land.
 ///
-/// Roots come back **canonical**, with symlinks resolved. That is what makes containment checks
+/// Roots come back **canonical**, with symlinks resolved, which is what makes the containment check
 /// meaningful: the target of a write is canonicalised too, so a symlink planted inside the
 /// workspace and pointing out of it (`<root>/escape -> /etc`) resolves to `/etc/...` and fails the
-/// prefix test. Comparing as-spelled would let exactly that through. It also means the boundary is
-/// stated in the filesystem's own terms rather than the user's spelling, which is what the kernel
+/// prefix test. It also states the boundary in the filesystem's own terms, which is what the kernel
 /// backends match on.
 ///
 /// A root that does not resolve is **dropped**, not passed through. A path that cannot be
@@ -204,20 +202,17 @@ fn is_usable_root(path: &Path) -> bool {
 /// A root is refused when it *is* one of these, and when it is an **ancestor** of one. Both
 /// directions un-mask: bwrap binds each root after its tmpfs masks and the later mount wins, so
 /// `--writable-root /var` restores the host's world-writable `/var/tmp` inside the sandbox just as
-/// surely as `--writable-root /var/tmp` would. Measured both ways. The ancestor case is the one
-/// that bites in practice, because `$XDG_RUNTIME_DIR` lives under `$HOME` on WSL, on minimal
-/// window managers, and wherever someone set `XDG_RUNTIME_DIR=$HOME/.xdg`; a root at `$HOME` then
-/// hands the session bus socket back to a confined shell, which is exactly what the masks exist to
-/// prevent.
+/// surely as `--writable-root /var/tmp` would. The ancestor case is the one that bites in practice,
+/// because `$XDG_RUNTIME_DIR` lives under `$HOME` on WSL, on minimal window managers, and wherever
+/// someone set `XDG_RUNTIME_DIR=$HOME/.xdg`; a root at `$HOME` then hands the session bus socket
+/// back to a confined shell, which is exactly what the masks exist to prevent.
 ///
 /// A root *under* a masked path is fine and is deliberately allowed -- the bind restores only that
 /// subdirectory, not the masked directory itself -- except for the two socket trees below, which
 /// are refused as whole subtrees because everything in them is the kind of socket being hidden.
 ///
-/// An earlier version of this comment said `/tmp` and `/var/tmp` were "deliberately absent" from
-/// the set because they "hold no IPC socket meka's masks care about". That was false on any
-/// ordinary desktop and is recorded in the changelog as a security fix; the list below is the
-/// authority.
+/// The list below is the authority. `/tmp` and `/var/tmp` are in it: "they hold no IPC socket
+/// meka's masks care about" is false on any ordinary desktop.
 pub(crate) fn is_system_root(path: &Path) -> bool {
     if path.parent().is_none() {
         // The filesystem root itself, and on Windows a bare drive prefix.
@@ -233,9 +228,8 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
         // restores the entire host `/tmp`, including every X11, D-Bus and tmux socket living there,
         // which is a hole straight back out of the sandbox: measured, by reaching a tmux server
         // over a socket under `/tmp` from inside a confined shell and having it create a file in
-        // `$HOME`, outside every workspace root. `/tmp` and `/var/tmp` used to be admitted on the
-        // reasoning that they "hold no IPC socket meka's masks care about", which is false on any
-        // ordinary desktop.
+        // `$HOME`, outside every workspace root. `/tmp` and `/var/tmp` are not admitted: "they hold
+        // no IPC socket meka's masks care about" is false on any ordinary desktop.
         //
         // Refusing `/tmp` costs a session started with `cd /tmp` its write boundary, which is the
         // safe direction: the alternative is a boundary that reports itself as holding while the
@@ -412,8 +406,7 @@ impl WriteScope {
             //
             // At `none` and `read` this yields the workspace roots rather than nothing, which is a
             // deliberate difference from `Confinement::resolve`, whose catch-all is `ReadOnly` and
-            // grants no write at all. The two are *not* the same decision, and an earlier version
-            // of this comment claimed they were:
+            // grants no write at all. The two are *not* the same decision:
             //
             // - `Confinement::resolve` answers "what may a command meka did not write do", and the
             //   honest answer at `read` is nothing.
@@ -600,9 +593,8 @@ mod tests {
     /// (`resolve_write_target`, via `resolve_existing_prefix`). The fixture stands in for that
     /// caller by canonicalising before it asks.
     ///
-    /// The test used to be named as though this layer resolved the link, which is false of the code
-    /// under test: feeding it the *spelled* path would return `true`, and the reason that is safe
-    /// is that no caller ever does.
+    /// This layer does not resolve the link: feeding it the *spelled* path returns `true`, and the
+    /// reason that is safe is that no caller ever does.
     #[test]
     #[cfg(unix)]
     fn a_resolved_path_leading_out_of_the_workspace_is_not_within_it() {
@@ -1026,10 +1018,10 @@ mod tests {
 
         // Against a *populated* root set, which is what makes this an independent check.
         //
-        // It used to run against the roots this same call had just proved empty, so
-        // `is_within_roots` was `.any()` over `&[]` -- false for every input, and true of the
-        // function no matter what it did. Only an `is_within_roots` that always returned `true`
-        // could fail it. The comment above it described a fix that had not been made.
+        // Run against the roots this same call has just proved empty, `is_within_roots` is `.any()`
+        // over `&[]`: false for every input, and true of the function no matter what it does. Only
+        // an `is_within_roots` that always returned `true` could fail it. The comment above it
+        // described a fix that had not been made.
         let real = base.join("real");
         std::fs::create_dir(&real).expect("real root");
         let roots = writable_roots(&shared(&real), &test_roots());

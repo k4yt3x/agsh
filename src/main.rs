@@ -60,10 +60,9 @@ use crate::{
 /// A failure whose message has already been printed in meka's own format.
 ///
 /// Returning the error itself would print it twice, since `main`'s `anyhow::Result` prints whatever
-/// it is given; returning `Ok(())` is what the interactive host used to do, which told every
-/// supervisor and wrapper script that a session it had refused to open was a successful run. This
-/// carries the exit status and nothing else, so the host keeps its own rendering (colour, and the
-/// provider hint underneath) and still fails.
+/// it is given; returning `Ok(())` tells every supervisor and wrapper script that a session meka
+/// refused to open was a successful run. This carries the exit status and nothing else, so the host
+/// keeps its own rendering (colour, and the provider hint underneath) and still fails.
 #[derive(Debug)]
 struct AlreadyReported;
 
@@ -149,23 +148,22 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         let cli_ref = &cli;
         return runtime.block_on(async move {
             // Read off disk rather than from a `ResolvedConfig` this path deliberately does not
-            // build. Opening the store is what migrates it, and a store carried forward by
-            // `meka provider list` must record the same profile one carried forward by `meka`
-            // would.
+            // build. Opening the store is what migrates it, and a store carried forward by `meka
+            // provider list` must record the same profile one carried forward by `meka` would.
             //
             // Two values, and the difference matters. The ledger takes the one `default_provider`
             // picks, ignoring `--provider`: it stamps a profile onto every session that predates
-            // meka recording one, once and irreversibly, and that must not turn on a flag the
-            // first invocation after an upgrade happened to carry. `meka session import` takes the
-            // flag-aware one, where choosing per run is exactly what `--provider` is for.
-            // An unreadable `config.toml` is carried to the ledger as itself rather than collapsing
+            // meka recording one, once and irreversibly, and that must not turn on a flag the first
+            // invocation after an upgrade happened to carry. `meka session import` takes the
+            // flag-aware one, where choosing per run is exactly what `--provider` is for. An
+            // unreadable `config.toml` is carried to the ledger as itself rather than collapsing
             // into "nothing resolved", because the two must not produce the same write: the adopt
-            // step runs once and irreversibly, so a parse error used to strand every existing
-            // session against no profile with nothing said. It is not turned into a hard error
-            // here, though, because `meka mcp remove` and `meka provider remove` edit the raw
-            // document through `toml_edit` and are how a user *repairs* such a file; refusing every
-            // subcommand would close the only door out. The migration refuses instead, and only
-            // when it actually has rows to stamp.
+            // step runs once and irreversibly, so a parse error read as "nothing resolved" strands
+            // every existing session against no profile with nothing said. It is not turned into a
+            // hard error here, though, because `meka mcp remove` and `meka provider remove` edit
+            // the raw document through `toml_edit` and are how a user *repairs* such a file;
+            // refusing every subcommand would close the only door out. The migration refuses
+            // instead, and only when it actually has rows to stamp.
             let (default_profile, context) = match config::default_profile_on_disk(None) {
                 Ok(adopted) => {
                     let flag_aware = config::default_profile_on_disk(cli_ref.provider.as_deref())?;
@@ -500,9 +498,8 @@ pub struct SharedDeps {
     ///
     /// A `String` and not the `Option` on [`ResolvedConfig`], because `build_shared_deps` runs
     /// `validate()` first and a host that reaches this point has one. Resolving it once, where
-    /// that guarantee is established, is what lets `session/new` and `POST /v1/sessions` take
-    /// it without a branch for a state they cannot observe; both used to carry one, and
-    /// neither could be tested or reached.
+    /// that guarantee is established, is what lets `session/new` and `POST /v1/sessions` take it
+    /// without a branch for a state they cannot observe, and so cannot test or reach.
     pub default_profile: String,
     pub session_manager: SessionManager,
     /// Providers by profile, built on demand.
@@ -524,8 +521,8 @@ pub struct SharedDeps {
 /// Warn once about `[tools]` and `[subagents]` entries that match nothing.
 ///
 /// Called from both agent-assembly entry points. `meka acp` and `meka serve` build their agents
-/// through `build_shared_deps` and so used to emit no warning at all: a typo in either block denied
-/// nothing, silently, at every verbosity.
+/// through `build_shared_deps`, so without a call here a typo in either block denies nothing,
+/// silently, at every verbosity.
 fn warn_on_stale_tool_config(
     config: &ResolvedConfig,
     builtin_filter: &crate::tools::BuiltinToolFilter,
@@ -586,20 +583,18 @@ async fn refuse_a_spawned_session(
     };
     let door = match parent {
         Some(parent) => format!(
-            "was spawned by session {parent} and runs under the terms it was spawned with, which \
-             only its parent can apply. Continue it with `agent_followup` from session {parent}"
+            "is a sub-agent of session {parent}, and only its parent can apply the terms it runs \
+             under. Continue it with `agent_followup` from session {parent}"
         ),
         // An imported worker whose parent did not come with it. There is no session to point at, so
         // say what it is rather than naming a door that is not there.
-        None => "carries the terms another session spawned it under, so it is a sub-agent's \
-                 conversation rather than a session of its own. Its parent is not in this store, \
-                 which is what importing a worker on its own leaves behind, and without it nothing \
-                 can reconstruct the tools and permission it ran with"
+        None => "is a sub-agent whose parent is not in this store, so nothing here can \
+                 reconstruct the tools and permission it ran with"
             .to_string(),
     };
     Err(crate::error::MekaError::SessionNotDrivable(format!(
-        "session {session_id} {door}. Reading it is unaffected: `meka session export`, \
-         `meka session list --include-children` and the HTTP read endpoints all still serve it."
+        "session {session_id} {door}. Reading it is unaffected: `meka session export` and the \
+         HTTP read endpoints still serve it."
     ))
     .into())
 }
@@ -1750,13 +1745,13 @@ async fn run_interactive(
             agent_event_sender: agent_event_sender.clone(),
         }));
 
-    // MCP progress / elicitation events now flow through the per-session `Frontend` trait, not the
-    // process-global sinks they used to be wired through here. Progress:
-    // `ReplFrontend::emit(McpProgress)` and the matching ACP impl carry the event to the right
-    // UI. Elicitation: `Frontend::handle_elicitation` runs the round-trip on whichever frontend
-    // the in-flight call's `progress::register` recorded. The agent_event_sender is still the
-    // bridge between `ReplFrontend` (on the agent's task) and the blocking REPL thread; that
-    // wiring happens inside `ReplFrontend` itself.
+    // MCP progress and elicitation events flow through the per-session `Frontend` trait, not
+    // through process-global sinks wired up here. Progress: `ReplFrontend::emit(McpProgress)` and
+    // the matching ACP impl carry the event to the right UI. Elicitation:
+    // `Frontend::handle_elicitation` runs the round-trip on whichever frontend the in-flight call's
+    // `progress::register` recorded. The agent_event_sender is still the bridge between
+    // `ReplFrontend` (on the agent's task) and the blocking REPL thread; that wiring happens inside
+    // `ReplFrontend` itself.
 
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
@@ -2279,8 +2274,8 @@ async fn run_interactive(
             }
             ReplEvent::Command(command) => {
                 // The dispatcher moved to `repl::host_commands`, exhaustive over `SlashCommand`.
-                // It used to be 553 lines here ending in `_ => {}`, which is how a forwarded
-                // command could arrive, match nothing, and still get its episode brackets.
+                // Written inline it is hundreds of lines ending in `_ => {}`, which is how a
+                // forwarded command arrives, matches nothing, and still gets its episode brackets.
                 let after =
                     repl::host_commands::answer(command, repl::host_commands::HostCommandContext {
                         agent: &agent,
@@ -2390,10 +2385,9 @@ async fn run_interactive(
 /// Close the MCP servers on the way out.
 ///
 /// [`mcp::McpClientManager::shutdown`] takes `&self`, so this runs regardless of how many owners
-/// the `Arc` still has. It used to `try_unwrap` first and warn when that failed, which it always
-/// did: the manager holds the registries it serves, and those registries hold six tools that each
-/// hold the manager back, so the graceful path was unreachable and every run ended by leaving its
-/// stdio children to rmcp's drop guard.
+/// the `Arc` still has. A `try_unwrap` here always fails: the manager holds the registries it
+/// serves, and those registries hold six tools that each hold the manager back, so the graceful
+/// path is unreachable and every run ends by leaving its stdio children to rmcp's drop guard.
 async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
     manager.shutdown_within(mcp::SHUTDOWN_BUDGET).await;
 }
@@ -2680,10 +2674,9 @@ async fn run_tools_subcommand(
             }));
             catalogue.sort_by(|left, right| left.0.cmp(&right.0));
 
-            // `format_columns`, like every other listing meka prints. The fixed `{:<20}` this used
-            // to hand-roll silently ran its columns together for any name longer than the width,
-            // and a namespaced MCP tool (`mcp__mekabridge__send_file`) is 26
-            // characters.
+            // `format_columns`, like every other listing meka prints. A hand-rolled `{:<20}`
+            // silently runs its columns together for any name longer than the width, and a
+            // namespaced MCP tool (`mcp__mekabridge__send_file`) is 26 characters.
             let rows: Vec<Vec<String>> = catalogue
                 .iter()
                 .map(|(name, description, required, is_deferred)| {
@@ -3026,12 +3019,12 @@ async fn resolve_session_resume(
     };
 
     // Before the lock, the repin and the permission write, which is the whole reason it is here
-    // rather than only at the two call sites below. Both hosts used to refuse *after* this
-    // function returned, which covered `--provider` -- computed here, committed there -- and
-    // missed `--permission`, which this function commits itself a few lines down. A run that
-    // declines to touch a session was rewriting its recorded level on the way to saying so, and
-    // that value is what `session list --include-children`, `GET /v1/sessions/{id}` and
-    // `session export` all report the worker as having run at.
+    // rather than only at the two call sites below. Refusing *after* this function returns covers
+    // `--provider`, computed here and committed there, and misses `--permission`, which this
+    // function commits itself a few lines down. A run that declines to touch a session was
+    // rewriting its recorded level on the way to saying so, and that value is what `session list
+    // --include-children`, `GET /v1/sessions/{id}` and `session export` all report the worker as
+    // having run at.
     refuse_a_spawned_session(session_manager, Some(id)).await?;
 
     let lock = session_manager.lock_session(id)?;

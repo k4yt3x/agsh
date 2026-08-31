@@ -468,9 +468,9 @@ struct MekaPrompt {
 /// Shared handle to the live context-token counter plus the model window, for the optional prompt
 /// gauge. The counter is the agent's `last_context_tokens` (updated after each turn / on compact).
 ///
-/// Both are handles. The window used to be a `u64` read from the process default profile before the
-/// agent existed, so a session resumed onto another profile, or moved by `/provider`, kept dividing
-/// by a window it was not being gauged against, and the prompt and `/status` disagreed.
+/// Both are handles. A `u64` read from the process default profile before the agent exists leaves a
+/// session resumed onto another profile, or moved by `/provider`, dividing by a window it is not
+/// gauged against, so the prompt and `/status` disagree.
 struct ContextIndicator {
     tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
     window: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -795,12 +795,11 @@ pub enum Answerer {
 impl SlashCommand {
     /// Which side answers this command.
     ///
-    /// Exhaustive, and that is the whole point. This used to be a hand-written list of variants in
-    /// the forwarding arm and a `match` in the host loop that ended in `_ => {}`; they agreed, but
-    /// nothing made them. A variant added to the forwarding list and forgotten in the host was
-    /// sent, silently did nothing, and still got its episode brackets -- a blank line either side
-    /// of no output. Both sides now read this, so a new variant fails to compile until both have
-    /// been considered.
+    /// Exhaustive, and that is the whole point. A hand-written list of variants in the forwarding
+    /// arm plus a `match` in the host loop ending in `_ => {}` have to agree, with nothing making
+    /// them. A variant added to the forwarding list and forgotten in the host was sent, silently
+    /// did nothing, and still got its episode brackets -- a blank line either side of no output.
+    /// Both sides now read this, so a new variant fails to compile until both have been considered.
     pub fn answered_by(&self) -> Answerer {
         match self {
             SlashCommand::Cd { .. } => Answerer::Repl,
@@ -2009,8 +2008,8 @@ fn drain_pending_stdin() {
         // Stop only on EOF, EAGAIN (buffer empty, the usual exit) or an error -- never on a short
         // read.
         //
-        // A short read used to end the loop, on the reasoning that it meant the buffer was drained.
-        // In canonical mode that is false: the tty hands over exactly one line per `read`, whatever
+        // A short read does not mean the buffer is drained, so it must not end the loop. In
+        // canonical mode that is false: the tty hands over exactly one line per `read`, whatever
         // the buffer size, so a user who typed two lines ahead had the first discarded and the
         // second left sitting there to answer the prompt about to be drawn. One queued line is the
         // whole attack this function exists to stop. Termination is unchanged: `O_NONBLOCK` is set
@@ -2179,8 +2178,8 @@ fn handle_cd(
     Ok(canonical)
 }
 
-/// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
-/// `AgentOptions`; they are UI concerns and now belong to the frontend impl.
+/// Construction-time configuration for [`ReplFrontend`]. UI concerns, so they live on the frontend
+/// impl rather than on `AgentOptions`.
 pub struct ReplFrontendConfig {
     /// Where everything printed between two prompts goes, shared with the REPL thread and the host
     /// loop. The frontend decides *what* to say and the console decides how it is spaced, which is
@@ -2614,8 +2613,8 @@ mod approval_prompt_tests {
         assert_eq!(super::answer_from_read(Ok(2), "y\n"), Some("y\n"));
     }
 
-    /// Nonsense used to deny outright, which threw away an answer the user was in the middle of
-    /// giving and cost an agent round-trip to recover.
+    /// Denying outright on nonsense throws away an answer the user is in the middle of giving, and
+    /// costs an agent round-trip to recover.
     #[test]
     fn test_nonsense_asks_again_rather_than_deciding() {
         let mut answers = ["asdfasdf".to_string(), "y".to_string()].into_iter();
@@ -2957,9 +2956,9 @@ mod frontend_tests {
 
     /// `Agent::run_turn` emits `TurnFinished` only when the turn succeeded, so an interrupt or a
     /// provider error leaves the text block holding whatever arrived first. Ending the *episode* is
-    /// what flushes it, which is what puts it under the turn it belongs to. It used to be flushed
-    /// by the next turn's `TurnStarted`, which printed it under the following prompt as though the
-    /// model had said it in answer to something else.
+    /// what flushes it, which is what puts it under the turn it belongs to. Flushed by the next
+    /// turn's `TurnStarted`, it prints under the following prompt as though the model had said it
+    /// in answer to something else.
     #[tokio::test]
     async fn a_failed_turn_flushes_its_partial_answer_when_the_episode_ends() {
         let console = console();
@@ -3617,11 +3616,11 @@ mod tests {
 
     /// The completer follows the skill set rather than the one it was built with.
     ///
-    /// It used to hold a `Vec<String>` frozen at construction. With `[skills] agent_managed`,
-    /// `skill_write` and `skill_delete` move that set mid-session, so Tab went on offering a skill
-    /// the agent had deleted and `/skill <name>` then failed on a name Tab had just supplied. The
-    /// prompt loop refreshes the shared handle before every `read_line`; this is the half of that
-    /// arrangement a unit test can reach.
+    /// A `Vec<String>` frozen at construction cannot follow a list that changes. With `[skills]
+    /// agent_managed`, `skill_write` and `skill_delete` move that set mid-session, so Tab went on
+    /// offering a skill the agent had deleted and `/skill <name>` then failed on a name Tab had
+    /// just supplied. The prompt loop refreshes the shared handle before every `read_line`; this is
+    /// the half of that arrangement a unit test can reach.
     #[test]
     fn the_skill_completer_follows_a_set_that_changes_under_it() {
         let completer = completer_at(crate::workspace::test_cwd());
@@ -4122,8 +4121,8 @@ mod tests {
         ));
     }
 
-    /// `/memory <name>` shows that memory. It used to fall through to the bare-list arm, silently
-    /// discarding the name and listing everything instead.
+    /// `/memory <name>` shows that memory. Falling through to the bare-list arm silently discards
+    /// the name and lists everything instead.
     #[test]
     fn test_parse_memory_slash_shows_named_memory() {
         match parse_slash_command("/memory alice-timezone") {

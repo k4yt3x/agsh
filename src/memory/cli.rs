@@ -225,9 +225,9 @@ pub async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
     // Named for the memory and suffixed `.md`, so the editor picks the right syntax mode and its
     // title bar says which note this is.
     let scratch = memory::memory_file_in(&directory, name);
-    // Exactly what is stored, never the sanitised rendering. Whatever the editor does not touch
-    // has to come back byte for byte, or editing one word silently strips every zero-width joiner
-    // in the note -- which is what this door used to do.
+    // Exactly what is stored, never the sanitised rendering. Whatever the editor does not touch has
+    // to come back byte for byte, or editing one word silently strips every zero-width joiner in
+    // the note.
     let original = entry.body.clone().unwrap_or_default();
     let edited = match edit_in(&scratch, &original) {
         Ok(edited) => edited,
@@ -344,12 +344,11 @@ fn unsaved_edit(directory: &Path, scratch: &Path, original: &str, reason: String
 /// from [`run_edit`] that do not write, because the question is the same at each and answering it
 /// separately is how the unchanged-body branch came to delete a `:saveas` copy.
 ///
-/// Three deliberate choices, each from a measured failure:
+/// Three deliberate choices:
 ///
 /// - **Anything that cannot be read counts as worth keeping**, including a directory this function
-///   cannot enumerate. This is the last chance to preserve the text, and a wrong guess deletes
-///   somebody's work. The enumeration failure used to fall through to "nothing to keep", which is
-///   the one direction that cannot be undone.
+///   cannot enumerate. This is the last chance to preserve the text, and falling through to
+///   "nothing to keep" is the one direction that cannot be undone.
 /// - **Only regular files are read.** `read_to_string` on a FIFO blocks for ever -- `meka memory
 ///   edit` hung until it was killed -- and on a 2 GB file it reads the lot into memory, measured at
 ///   1.9 GB resident. Anything that is not a plain file is kept without being read.
@@ -522,8 +521,8 @@ pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
     }
 
     // Created only now that every memory is known to be writable, so a refused export leaves no
-    // directory behind either. It used to be created before the checks above, which meant the one
-    // command that says "nothing was exported" still changed the filesystem.
+    // directory behind either. Created after the checks above, so the one command that says
+    // "nothing was exported" does not change the filesystem.
     let created_directory = missing_directory;
     if created_directory {
         create_private_export_dir(directory)?;
@@ -653,10 +652,9 @@ fn remove_partial_export(written: &[PathBuf], directory: &Path, created_director
 
 /// `meka memory verify [--rebuild]`: check the search index against the table, and repair it.
 ///
-/// The index is derived and disposable, but until this existed nothing in meka could say whether
-/// it was in step or put it back, and the docs handed the user a raw `sqlite3` incantation. A
-/// desync is silent by nature -- searches simply stop finding things -- so the check has to be
-/// reachable.
+/// The index is derived and disposable, but a desync is silent by nature, so the check has to be
+/// reachable without a raw `sqlite3` incantation. A desync is silent by nature -- searches simply
+/// stop finding things -- so the check has to be reachable.
 pub async fn run_verify(store: &MemoryStore, rebuild: bool) -> Result<()> {
     if rebuild {
         store.rebuild_index().await?;
@@ -822,11 +820,11 @@ mod tests {
 
     /// An edit must return everything the editor did not touch, byte for byte.
     ///
-    /// The store used to sanitise on read, so `meka memory edit` read a stripped body, handed that
-    /// to `$EDITOR`, and wrote the result back -- permanently destroying every format character in
-    /// the note on an edit to one unrelated word. `meka memory show` then displayed the stripped
-    /// text, so nothing revealed the loss. Measured: a Persian ZWNJ, the ZWJ holding an emoji
-    /// sequence together, and a carriage return all vanished.
+    /// A store that sanitises on read makes `meka memory edit` a data-loss door: it reads a
+    /// stripped body, hands that to `$EDITOR` and writes the result back, destroying every format
+    /// character in the note on an edit to one unrelated word. `meka memory show` then displayed
+    /// the stripped text, so nothing revealed the loss. Measured: a Persian ZWNJ, the ZWJ holding
+    /// an emoji sequence together, and a carriage return all vanished.
     #[tokio::test]
     async fn an_edit_does_not_strip_what_the_editor_left_alone() {
         let store = MemoryStore::in_memory().await.expect("store");

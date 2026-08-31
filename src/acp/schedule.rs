@@ -149,8 +149,7 @@ async fn deliver_outcomes(
     if let Err(error) = super::apply_recorded_binding(state, &mut runtime).await {
         tracing::warn!(
             "holding a background outcome report for session {}: its recorded provider could not \
-             be resolved, and running the turn on another profile would bill the wrong account. It \
-             is retried on the next sweep: {}",
+             be resolved. It is retried on the next sweep: {}",
             runtime.session_uuid,
             error
         );
@@ -242,9 +241,8 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
     // real misconfiguration does not.
     if let Err(error) = super::apply_recorded_binding(&state, &mut runtime).await {
         tracing::warn!(
-            "job {} did not run: its session's recorded provider could not be resolved, and \
-             running the turn on another profile would bill the wrong account. Fix the profile, or \
-             move the session with `meka -r <id> --provider <name>`: {}",
+            "job {} did not run: its session's recorded provider could not be resolved. Fix the \
+             profile, or move the session with `meka -r <id> --provider <name>`: {}",
             job_id,
             error
         );

@@ -450,8 +450,8 @@ impl Tool for MemoryReadTool {
         {
             Some(entry) => entry,
             None => {
-                // A half-remembered name is the common miss at scale, and it used to end the line.
-                // Pointing at the near-miss costs nothing and is the same recovery an unknown
+                // A half-remembered name is the common miss at scale, and on its own it ends the
+                // line. Pointing at the near-miss costs nothing and is the same recovery an unknown
                 // *tool* name already gets.
                 let index = self
                     .memories
@@ -1055,9 +1055,9 @@ impl Tool for MemoryDeleteTool {
             message,
         })?;
 
-        // One `DELETE`, and the row carries its own read counts away with it. Both halves used to
-        // be separate steps against a second table keyed by name, and the doors disagreed twice:
-        // one leaked the counters the others cleared, and one refused a file the others removed.
+        // One `DELETE`, and the row carries its own read counts away with it. Separate steps
+        // against a second table keyed by name let the doors disagree twice: one leaks the counters
+        // the others clear, and one refuses a file the others remove.
         if !self
             .memories
             .delete(name)
@@ -1152,11 +1152,11 @@ mod tests {
             message.contains("description is required to create it"),
             "creating without a description must say which case this is: {message}"
         );
-        // The shape, not just the substring. The refusal used to ride a
-        // `rusqlite::Error::InvalidParameterName`, so the model received `database error: failed
-        // to write memory: Error("Invalid parameter name: no memory named ...")` -- a user-input
-        // mistake dressed as a database fault, with a prefix inviting a retry under a different
-        // `name`. The substring assertion above passed the whole time.
+        // The shape, not just the substring. Carried on a `rusqlite::Error::InvalidParameterName`
+        // the model receives `database error: failed to write memory: Error("Invalid parameter
+        // name: no memory named ...")`, a user-input mistake dressed as a database fault, with a
+        // prefix inviting a retry under a different `name`. The substring assertion above passed
+        // the whole time.
         assert!(
             !message.contains("database error") && !message.contains("Invalid parameter name"),
             "a missing description is a refusal, not a database fault: {message}"
@@ -1278,7 +1278,7 @@ mod tests {
             memories: memories.clone(),
         };
 
-        // Past the write door's 64-character cap, which used to make it unreachable.
+        // Past the write door's 64-character cap, so nothing can create it.
         let long = "l".repeat(120);
         memories
             .plant_row_for_test(&long, "written straight to the column")
@@ -1368,8 +1368,8 @@ mod tests {
         );
     }
 
-    /// `body` has always been optional, so a priority change is a call the schema invites. It used
-    /// to render the absence as an empty body and delete everything the memory said.
+    /// `body` has always been optional, so a priority change is a call the schema invites.
+    /// Rendering the absence as an empty body deletes everything the memory said.
     #[tokio::test]
     async fn test_write_without_a_body_keeps_the_existing_one() {
         let memories = store().await;
@@ -1637,10 +1637,10 @@ mod tests {
         assert!(text.contains("not live state"), "{text}");
     }
 
-    /// The tools run at `Permission::Read`, so a name that escapes its store would be
-    /// an arbitrary-file write available in read-only mode.
-    /// A priority must land on the same value whichever door it came through. `as_u64` used to
-    /// reject a negative outright while the frontmatter path clamped it to 0.
+    /// The tools run at `Permission::Read`, so a name that escapes its store would be an
+    /// arbitrary-file write available in read-only mode. A priority must land on the same value
+    /// whichever door it came through. `as_u64` rejects a negative outright where the frontmatter
+    /// path clamps it to 0.
     #[tokio::test]
     async fn test_write_clamps_priority_like_the_file_path() {
         let memories = store().await;
@@ -2081,8 +2081,8 @@ mod tests {
         assert!(miss.contains("several phrasings"), "{miss}");
     }
 
-    /// A half-remembered name is the common miss at scale. "No such memory" used to end the line;
-    /// pointing at the near-miss is the same recovery an unknown tool name already gets.
+    /// A half-remembered name is the common miss at scale. "No such memory" on its own ends the
+    /// line; pointing at the near-miss is the same recovery an unknown tool name gets.
     #[tokio::test]
     async fn test_read_suggests_a_near_miss_name() {
         let memories = store().await;

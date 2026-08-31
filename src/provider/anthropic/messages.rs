@@ -381,14 +381,13 @@ mod tests {
 
     /// A read that fails after the headers arrived keeps the hint those headers carried.
     ///
-    /// Parsing `Retry-After` and passing it on are separate acts, and an earlier version did only
-    /// the first: every read site parsed the header into a local and then handed
-    /// [`crate::error::provider_transport_error`] a `None`, so a provider that had just said "wait
-    /// 60 seconds" was retried on plain 1s/2s backoff. The classifier's own tests cannot catch
-    /// that, because they supply the argument themselves; this one makes a real site parse a real
-    /// header. Asserting the message as well as the hint is what pins it to the read site: a 429
-    /// whose body *did* arrive is also retryable and also carries the hint, but says so in
-    /// `provider_http_error`'s words.
+    /// Parsing `Retry-After` and passing it on are separate acts: a read site that parses the
+    /// header into a local and then hands [`crate::error::provider_transport_error`] a `None`
+    /// retries a provider that just said "wait 60 seconds" on plain 1s/2s backoff. The classifier's
+    /// own tests cannot catch that, because they supply the argument themselves; this one makes a
+    /// real site parse a real header. Asserting the message as well as the hint is what pins it to
+    /// the read site: a 429 whose body *did* arrive is also retryable and also carries the hint,
+    /// but says so in `provider_http_error`'s words.
     #[tokio::test]
     async fn a_truncated_body_keeps_the_rate_limit_hint() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

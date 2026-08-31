@@ -643,12 +643,12 @@ impl Tool for AgentSpawnTool {
                 tool_name: "agent_spawn".to_string(),
                 message: format!("failed to create sub-agent session: {}", error),
             })?;
-        // Held for the whole of the worker's run, then released with this scope. A sub-agent's row
-        // used to be locked by nothing at all, so a concurrent `meka session delete --all` could
-        // take it and cascade the conversation away mid-turn. A failure to claim is a warning
-        // rather than a refusal, matching the primary agent's own creation path: the id is one
-        // nobody else can be holding, so the only way here is a filesystem problem, and refusing to
-        // spawn over that would break installations that work today.
+        // Held for the whole of the worker's run, then released with this scope. Unlocked, a
+        // sub-agent's row can be taken by a concurrent `meka session delete --all` and its
+        // conversation cascaded away mid-turn. A failure to claim is a warning rather than a
+        // refusal, matching the primary agent's own creation path: the id is one nobody else can be
+        // holding, so the only way here is a filesystem problem, and refusing to spawn over that
+        // would break installations that work today.
         let _sub_session_lock = match sub_session_lock {
             Ok(lock) => Some(lock),
             Err(error) => {
@@ -1685,12 +1685,11 @@ fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> R
 
 /// Restrict an `EnabledPermissions` set to the modes *contained by* `ceiling`.
 ///
-/// Not "at or below", which is what this used to say and is a different question. The ladder is a
-/// partial order and the predicate is [`Permission::is_within`], so `workspace` and `ask` exclude
-/// each other in both directions: neither is within the other, and an `ask` ceiling therefore
-/// drops `workspace` from the set rather than keeping it as something lower down. Reading the doc
-/// as a `<=` over the discriminants would predict the opposite for exactly the pair this release
-/// introduced.
+/// Not "at or below", which is a different question. The ladder is a partial order and the
+/// predicate is [`Permission::is_within`], so `workspace` and `ask` exclude each other in both
+/// directions: neither is within the other, and an `ask` ceiling therefore drops `workspace` from
+/// the set rather than keeping it as something lower down. Reading the doc as a `<=` over the
+/// discriminants would predict the opposite for exactly the pair this release introduced.
 ///
 /// Defense-in-depth for the permission clamp: sub-agents have no runtime permission-switch path
 /// today, so their initial level is what governs, but bounding the enabled set means any future
@@ -1813,11 +1812,11 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
 
 /// The sub-agent's system prompt.
 ///
-/// `user_instructions` is `None` unless the `agent_spawn` call asked for them, which is the reverse
-/// of how this used to work. Instructions are installation-wide and describe the top-level agent:
-/// its persona, how it should address the user, what it should volunteer. A worker handed a task by
-/// another agent is not that agent, and inheriting the persona unasked is how a sub-agent ends up
-/// talking to the user as though it were the one they are speaking to.
+/// `user_instructions` is `None` unless the `agent_spawn` call asked for them. Instructions are
+/// installation-wide and describe the top-level agent: its persona, how it should address the user,
+/// what it should volunteer. A worker handed a task by another agent is not that agent, and
+/// inheriting the persona unasked is how a sub-agent ends up talking to the user as though it were
+/// the one they are speaking to.
 ///
 /// They remain *grantable* because they are also where project conventions live, and a parent that
 /// judges a task needs the standing rules can hand them over verbatim rather than paraphrasing them
@@ -2258,9 +2257,9 @@ mod tests {
             .expect("in-memory session manager")
     }
 
-    // (Permission gating and "Unknown tool" fold-into-ToolOutput semantics that used to live in
-    // `run_subagent_tool` are now exercised by the shared `Agent::run_turn` path's tool-dispatch
-    // logic, covered by `src/agent.rs` and `src/tools.rs` test suites.)
+    // (Permission gating and "Unknown tool" fold-into-ToolOutput semantics belong to the shared
+    // `Agent::run_turn` tool-dispatch path, covered by the `src/agent.rs` and `src/tools.rs`
+    // suites.)
 
     #[tokio::test]
     async fn test_subagent_registry_has_independent_todo_list() {
@@ -2332,12 +2331,12 @@ mod tests {
 
     /// The window has to come off the same live binding as the provider.
     ///
-    /// `build_subagent` reads the provider from `live_binding.current()` but used to take the
-    /// window from `parent_options`, a clone frozen when the session was assembled. After a
-    /// `/provider`, `PATCH` or `set_config_option` switch the two disagreed, and a worker talked to
-    /// the new profile while auto-compacting against the size of the one the session had left: on
-    /// the way down it never compacted and the provider refused its turn, on the way up it
-    /// compacted from the first round.
+    /// `build_subagent` reads the provider from `live_binding.current()`, so the window must come
+    /// from there too rather than from `parent_options`, a clone frozen when the session was
+    /// assembled. After a `/provider`, `PATCH` or `set_config_option` switch the two disagreed, and
+    /// a worker talked to the new profile while auto-compacting against the size of the one the
+    /// session had left: on the way down it never compacted and the provider refused its turn, on
+    /// the way up it compacted from the first round.
     ///
     /// `parent_options` no longer carries a window at all, so the two can no longer be taken from
     /// different places. This stays as the behavioural check that the worker gauges against what
@@ -3748,7 +3747,7 @@ mod tests {
             assert_eq!(registered.required_permission(), *required);
         }
         // The other direction: a fifth tool added to `register_subagent_tools` and not to the
-        // catalogue would vanish from `meka tools list` exactly as the whole family used to.
+        // catalogue vanishes from `meka tools list`.
         let registered_names: Vec<String> = registry
             .tool_catalogue()
             .into_iter()

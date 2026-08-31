@@ -1,53 +1,43 @@
 //! The memory store: the `memories` table, its FTS5 index, and the ranked retrieval over both.
 //!
-//! **This is the source of truth.** Memories used to be Markdown files with this database as a
-//! derived mirror, and keeping two mutable copies in step is where the subsystem's defects lived:
-//! mtime precision, a dirty set that reached discovery but not the index, a sync-versus-publish
-//! race, usage rows pruned against the wrong set, and an entire apparatus for reporting files that
-//! would not parse. One copy removes all of it. See `docs/book/src/usage/memory.md` for the
-//! user-facing consequence, which is that `meka memory export` replaces `grep`.
+//! **The table is the source of truth**, not a mirror of anything on disk. See
+//! `docs/book/src/usage/memory.md` for the user-facing consequence, which is that `meka memory
+//! export` replaces `grep`.
 //!
-//! # What SQLite is doing that this module no longer has to
+//! # What SQLite holds, so this module does not
 //!
 //! - **The FTS index is external-content** (`content='memories'`), so three triggers keep it in
-//!   step and there is no sync function to get wrong. It stays derived and disposable even though
-//!   the content no longer is: `INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` repairs
-//!   it from the table at any time.
+//!   step and there is no sync function to get wrong. It stays derived and disposable: `INSERT INTO
+//!   memories_fts(memories_fts) VALUES('rebuild')` repairs it from the table.
 //! - **`name` is `UNIQUE COLLATE NOCASE`**, which is the case-collision check.
 //! - **Omit-to-keep is in the upsert**, not in a Rust branch. See [`MemoryStore::write`].
 //! - **A transaction is the read-modify-write lock**, across processes, so no write door needs an
-//!   `flock`. The one in-process mutex that remains is [`MemoryStore::lock_duplicate_check`], which
-//!   guards an advisory read-then-report, not the write itself.
+//!   `flock`. The one in-process mutex left is [`MemoryStore::lock_duplicate_check`], which guards
+//!   an advisory read-then-report rather than the write.
 //!
-//! # Three traps
+//! # Four traps
 //!
 //! **`bm25()` returns a negative number, and more negative is better.** [`Ranking::score`] negates
 //! before multiplying by the importance weights; without that the multiplication orders the results
 //! backwards, and it does so silently.
 //!
-//! **A model-supplied query is not FTS5 syntax.** `*`, `"`, `NEAR` and `OR` are all operators, and
-//! a query containing them would either error or quietly mean something else. [`Terms`] tokenizes
-//! on the Rust side and re-emits each token as a quoted string literal, so the model's words are
-//! only ever words.
+//! **A model-supplied query is not FTS5 syntax.** `*`, `"`, `NEAR` and `OR` are all operators, so a
+//! query containing them would either error or quietly mean something else. [`Terms`] tokenizes on
+//! the Rust side and re-emits each token as a quoted string literal.
 //!
 //! **Never `INSERT OR REPLACE` into `memories`, and never `UPDATE` its `id`.** Both are a
 //! delete-then-insert that can change the rowid, which unanchors every row of the external-content
-//! index. `ON CONFLICT DO UPDATE` is the only upsert shape allowed here. A column added to
-//! `memories` and left out of the three triggers desyncs the index just as silently, and FTS5's
-//! own `integrity-check` will *not* tell you: on an external-content table it verifies the index's
+//! index; `ON CONFLICT DO UPDATE` is the only upsert shape allowed here. A column added to
+//! `memories` and left out of the three triggers desyncs the index just as silently, and FTS5's own
+//! `integrity-check` will *not* tell you: on an external-content table it verifies the index's
 //! internal structure and never compares it to the content. [`MemoryStore::integrity_check`]
-//! therefore counts documents as well, [`repair_a_desynced_index`] runs that same comparison at
-//! every open and repairs what it finds, `meka memory verify` is how a user runs it by hand, and
-//! `rebuild_index` is the only real repair.
-//!
-//! # A fourth, learned the hard way
+//! therefore counts documents as well, [`repair_a_desynced_index`] runs that comparison at every
+//! open, `meka memory verify` runs it by hand, and `rebuild_index` is the only real repair.
 //!
 //! **`sqlite_master.sql` is not the text you submitted.** SQLite strips `IF NOT EXISTS` and drops
-//! the trailing `;`, so a build that compares its own literal against the stored one to decide
-//! whether the schema has drifted concludes "drifted" every single time. This module did exactly
-//! that, and the cost was a full index rebuild on every process start, hidden behind a doc comment
-//! asserting the opposite. See [`canonical_trigger_sql`]. The general lesson is the one the header
-//! above keeps repeating in other forms: a property nothing tests is a property nothing holds.
+//! the trailing `;`, so comparing a build's own literal against the stored one to detect drift
+//! answers "drifted" every time, and the repair then runs on every process start. See
+//! [`canonical_trigger_sql`].
 
 use std::{
     sync::Arc,
@@ -201,15 +191,13 @@ fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
 /// see, and is skipped when that rebuild just ran, since it would only re-ask a question one pass
 /// of the table has already answered.
 ///
-/// The triggers are created by [`sync_triggers`] and nowhere else, deliberately. A
-/// `CREATE TRIGGER IF NOT EXISTS` pass ahead of it first looked harmless and was the opposite: a
-/// trigger that had gone *missing*, however it went missing, was silently put back before
-/// `sync_triggers` read `sqlite_master`, so the comparison matched, no rebuild ran, and every write
-/// that landed while it was absent stayed out of the index for good.
+/// The triggers are created by [`sync_triggers`] and nowhere else, which is also why the ledger's
+/// baseline creates the tables but not the triggers. A `CREATE TRIGGER IF NOT EXISTS` pass ahead of
+/// it looks harmless and is the opposite: a trigger that had gone *missing* is silently put back
+/// before `sync_triggers` reads `sqlite_master`, so the comparison matches, no rebuild runs, and
+/// every write that landed while it was absent stays out of the index for good.
 /// [`repair_a_desynced_index`] cannot see that either, because a missed *update* leaves the
-/// document counts equal. Reproduced end to end: an edit made with `memories_au` dropped was still
-/// unfindable after a normal restart, with `meka memory verify` reporting the store sound. That is
-/// also why the ledger's baseline creates the tables but not the triggers.
+/// document counts equal.
 ///
 /// Letting [`sync_triggers`] own creation costs nothing on a fresh database: it finds none of the
 /// three, takes the replacement path, and creates all three plus a rebuild of an empty table inside
@@ -1026,12 +1014,12 @@ impl MemoryStore {
                         // A sentinel the caller maps back to a plain refusal, not a `rusqlite`
                         // variant that renders as one.
                         //
-                        // This used to be `InvalidParameterName`, whose `Display` is "Invalid
-                        // parameter name: {name}". Wrapped by `tokio_rusqlite` and then by
-                        // `MekaError::Database`, the model received `database error: failed to
-                        // write memory: Error("Invalid parameter name: no memory named 'x'
-                        // exists...")` -- a user-input mistake dressed as a database fault, with a
-                        // prefix inviting a retry under a different `name`.
+                        // Not `InvalidParameterName`, whose `Display` is "Invalid parameter name:
+                        // {name}". Wrapped by `tokio_rusqlite` and then by `MekaError::Database`,
+                        // the model received `database error: failed to write memory:
+                        // Error("Invalid parameter name: no memory named 'x' exists...")` -- a
+                        // user-input mistake dressed as a database fault, with a prefix inviting a
+                        // retry under a different `name`.
                         return Err(rusqlite::Error::QueryReturnedNoRows);
                     }
                 }
@@ -1092,25 +1080,24 @@ impl MemoryStore {
     /// `$EDITOR`, and comes back whenever the user saves -- minutes later, on a store an agent may
     /// have written to meanwhile. Going back through `write` meant sending the *description* read
     /// before the editor opened, so an edit to the body silently reverted a description the agent
-    /// had changed in between. Measured: the agent's reworded description and an appended line
-    /// both vanished, with both commands reporting success.
+    /// had changed in between. Measured: the agent's reworded description and an appended line both
+    /// vanished, with both commands reporting success.
     ///
-    /// One `UPDATE` naming one column fixed that for every *other* column, and left the body
-    /// itself an unlocked read-modify-write across a window bounded only by how long somebody
-    /// leaves an editor open. Measured, with the editor held for four seconds: the agent wrote
-    /// "WHAT THE AGENT LEARNED" and the store ended up holding the pre-editor text plus the human's
-    /// line, with both commands reporting success and nothing said.
+    /// One `UPDATE` naming one column fixed that for every *other* column, and left the body itself
+    /// an unlocked read-modify-write across a window bounded only by how long somebody leaves an
+    /// editor open. Measured, with the editor held for four seconds: the agent wrote "WHAT THE
+    /// AGENT LEARNED" and the store ended up holding the pre-editor text plus the human's line,
+    /// with both commands reporting success and nothing said.
     ///
     /// So the `WHERE` carries the body that was read, which makes this a compare-and-swap and the
     /// lost update unrepresentable. Deliberately not a lock: an editor may stay open for an hour,
     /// and a store the agent cannot write to for an hour is a worse failure than a refused save.
     ///
-    /// A refusal is only the safer answer if the caller keeps what it could not write. This comment
-    /// used to say the user still had their text in the editor's buffer, which was wrong --
-    /// `meka memory edit` waits for the editor to *exit* -- and on the strength of it the CLI
-    /// deleted its scratch file before calling this, so a refused save destroyed the user's work
-    /// rather than the agent's. See [`crate::memory::cli::run_edit`], which now keeps the file and
-    /// names it.
+    /// A refusal is only the safer answer if the caller keeps what it could not write. The user
+    /// does not still have their text in the editor's buffer: `meka memory edit` waits for the
+    /// editor to *exit*. A CLI that deletes its scratch file before calling this therefore destroys
+    /// the user's work on a refused save, not the agent's. See [`crate::memory::cli::run_edit`],
+    /// which now keeps the file and names it.
     pub async fn write_body(&self, name: &str, expected: &str, body: String) -> Result<BodyWrite> {
         let name = name.to_string();
         let expected = expected.to_string();
@@ -1178,8 +1165,8 @@ impl MemoryStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
                     // `snippet()` and `bm25()` read the *index*; every stored column comes from
-                    // `memories` through the rowid the index is anchored to. One join replaces the
-                    // duplicated metadata columns the mirror used to carry.
+                    // `memories` through the rowid the index is anchored to. One join, rather than
+                    // metadata columns duplicated into a mirror.
                     "SELECT m.name, m.description, m.body, m.priority, m.recorded_at,
                             m.read_count,
                             snippet(memories_fts, ?2, '', '', '…', 24),
@@ -1371,9 +1358,9 @@ impl MemoryStore {
     /// the note -- and an operator reading through the HTTP API is not the agent recalling
     /// anything, so neither should move the ranking the agent gets.
     ///
-    /// One statement against the row itself. This used to be a second table keyed by name, which
-    /// produced two separate defects: counters outliving the memory they described, and counters
-    /// destroyed when a memory was briefly unreadable. Neither is expressible now.
+    /// One statement against the row itself. A second table keyed by name produces two separate
+    /// defects: counters outliving the memory they describe, and counters destroyed when a memory
+    /// is briefly unreadable. Neither is expressible now.
     pub async fn record_read(&self, name: &str) -> Result<()> {
         let name = name.to_string();
         let now = crate::memory::render_recorded(SystemTime::now());
@@ -2405,10 +2392,10 @@ mod tests {
 
     /// The store hands back what is stored, byte for byte.
     ///
-    /// It used to sanitise here, which made `meka memory edit` a data-loss door: it reads a body,
-    /// gives it to `$EDITOR`, and writes back the result, so an edit to one unrelated word
-    /// destroyed every format character in the note. Neutralising now happens at each render
-    /// boundary instead -- see `crate::memory::render_for_model` and the tests around it.
+    /// Sanitising here makes `meka memory edit` a data-loss door: it reads a body, gives it to
+    /// `$EDITOR` and writes back the result, so an edit to one unrelated word destroys every format
+    /// character in the note. Neutralising now happens at each render boundary instead -- see
+    /// `crate::memory::render_for_model` and the tests around it.
     #[tokio::test]
     async fn the_store_returns_stored_bytes_not_a_rendering() {
         let body = "ordinary\n\u{1b}[2Jcleared \u{200d} joined";
@@ -2696,9 +2683,9 @@ mod tests {
             .expect("plant the tags");
 
         let tags = &store.index().await.expect("index")[0].tags;
-        // Dropped, not repaired. The filter used to hand back `in31mfra` -- the printable remains
-        // of the escape sequence, spliced into a tag that reads as real and that nobody wrote --
-        // and `dep\u{202e}loy` reduced to `deploy`. Neither is a tag a write door would have
+        // Dropped, not repaired. Filtering instead of refusing hands back `in31mfra`, the printable
+        // remains of the escape sequence spliced into a tag that reads as real and that nobody
+        // wrote, and reduces `dep\u{202e}loy` to `deploy`. Neither is a tag a write door would have
         // accepted, and nothing downstream marks a tag as altered, so both rendered as fact.
         // `UPPER` is gone for the same reason it always was: `validate_tag` refuses uppercase.
         assert!(

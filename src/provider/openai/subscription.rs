@@ -883,9 +883,9 @@ mod tests {
         assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
     }
 
-    /// Both asks used to hinge on an effort being configured: with none, the shared body omits
-    /// `reasoning` entirely, so there was nothing for the `include` to attach to and the profile a
-    /// user gets by default asked ChatGPT for neither a summary nor encrypted reasoning. Codex
+    /// Neither ask may hinge on an effort being configured: with none, the shared body omits
+    /// `reasoning` entirely, so there is nothing for the `include` to attach to, and the profile a
+    /// user gets by default would ask ChatGPT for neither a summary nor encrypted reasoning. Codex
     /// sends `reasoning` on every request and omits only the fields it has no value for.
     #[test]
     fn an_unconfigured_profile_still_asks_for_a_summary_and_encrypted_reasoning() {
@@ -1180,12 +1180,9 @@ mod tests {
     /// what_the_token_endpoint_answered_decides_whether_a_refresh_is_retried`. The classification
     /// they exercise lives in one place (`crate::error::oauth_refresh_error`, reached through
     /// `provider::exchange_refresh_token`), so this is a wiring test: what it proves is that *this*
-    /// backend reaches that path, with its own
-    /// `context`, and that its answer still comes back as this backend's own message. Both halves
-    /// have been wrong here before -- every answer used to become a bare `MekaError::Provider`, so
-    /// an outage at the token endpoint killed a turn `ensure_valid_credential` was called from the
-    /// middle of, and a mutation sweep later showed the Codex copy of that branch was the one no
-    /// test could see.
+    /// backend reaches that path, with its own `context`, and that its answer still comes back as
+    /// this backend's own message. A bare `MekaError::Provider` here kills a turn
+    /// `ensure_valid_credential` was called from the middle of, on an outage at the token endpoint.
     #[tokio::test]
     async fn what_the_codex_token_endpoint_answered_decides_whether_a_refresh_is_retried() {
         for (status_line, body, retryable) in [

@@ -615,8 +615,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_contents_cancelled_search_is_interrupted() {
-        // Regression: the tool used to ignore its cancellation token, so a search rooted high in
-        // the tree ran to completion no matter what the user did.
+        // An ignored cancellation token leaves a search rooted high in the tree running to
+        // completion no matter what the user does.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..50 {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "match\n").expect("write");

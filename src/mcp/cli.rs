@@ -150,12 +150,10 @@ fn report_orphaned_credentials(orphans: &[String]) {
     }
     println!();
     println!("Stored credentials with no server: {}", orphans.join(", "));
-    // Says only what the diff proves: the config no longer names this server. Deleting the entry by
-    // hand is the usual cause, but a rollback that itself failed leaves the same trace.
-    crate::render::render_hint(
-        "left over from a server that is no longer configured; \
-         delete one with `meka mcp remove <name>`",
-    );
+    // The action only. Why the credential is here is not something the diff can say -- deleting the
+    // entry by hand is the usual cause, but a rollback that itself failed leaves the same trace --
+    // and the line above has already stated what was found.
+    crate::render::render_hint("delete one with `meka mcp remove <name>`");
 }
 
 /// Run `meka mcp get <name>`. Prints a single server config in detail.

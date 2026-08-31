@@ -170,10 +170,10 @@ impl RelayWriter {
     /// Tell the console that output it cannot see is about to land on the current row.
     ///
     /// Off-prompt is precisely when the row may not be free. A turn draws the thinking indicator as
-    /// a [`crate::console::RowState::Transient`] line the writer intends to overwrite or erase, and
-    /// a mid-turn `warn!` -- which the retry path emits at default verbosity -- used to print onto
-    /// that row and then be wiped by the next `Settle::Erase`. The warning was the whole point of
-    /// the retry being visible, so losing it lost the only evidence the turn was struggling.
+    /// a [`crate::console::RowState::Transient`] line the writer intends to overwrite or erase, so
+    /// a mid-turn `warn!` -- which the retry path emits at default verbosity -- printing onto that
+    /// row is wiped by the next `Settle::Erase`. The warning was the whole point of the retry being
+    /// visible, so losing it lost the only evidence the turn was struggling.
     ///
     /// **`try_lock`, never `lock`.** [`Console`] logs: `text_delta`, `close_text` and the stdout
     /// flush all emit `tracing::debug!` on failure, so a thread already inside a console method can

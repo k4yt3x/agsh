@@ -92,10 +92,10 @@ impl Confinement {
 
 /// Hand back any standing OS-level grant this process placed, before an exit that will not unwind.
 ///
-/// A no-op on every platform but Windows, and that asymmetry is the point. Landlock, bubblewrap and
-/// seatbelt confine a child process and die with it, leaving nothing behind to clean up. The
-/// Windows boundary is instead an ACE written onto the user's own directories, which outlives the
-/// process unless something takes it back, so it needs a counterpart the others do not.
+/// A no-op on every platform but Windows. Landlock, bubblewrap and seatbelt confine a child process
+/// and die with it, leaving nothing behind to clean up. The Windows boundary is instead an ACE
+/// written onto the user's own directories, which outlives the process unless something takes it
+/// back, so it needs a counterpart the others do not.
 ///
 /// Call this immediately before each [`std::process::exit`], which skips destructors: see the call
 /// sites in `main.rs` and `server.rs`. A crash or `SIGKILL` still leaves the ACE standing, which
@@ -136,9 +136,9 @@ mod landlock_boundary {
                 .expect("cstring"),
         ];
         // The exit code carries the result, so `status.success()` is an assertion rather than a
-        // formality. The script used to end in `; true`, which made "the confined shell itself must
-        // run" pass whatever happened inside it: a ruleset that denied every write, or one that
-        // allowed every write, produced the same success. Only the two `exists()` checks below were
+        // formality. The script must not end in `; true`, which makes "the confined shell itself
+        // must run" pass whatever happened inside it: a ruleset denying every write and one
+        // allowing every write produce the same success. Only the two `exists()` checks below were
         // doing any work.
         let script = format!(
             "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
@@ -462,8 +462,8 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
             // installed, etc.).
             tracing::warn!(
                 "read-mode sandbox unavailable: {} (configured: {}); read-mode shell commands \
-                 will fail until [shell].sandbox_backend in config.toml (or \
-                 MEKA_SANDBOX_BACKEND) names a usable backend, or sandboxing is disabled",
+                 will fail until [shell].sandbox_backend names a usable backend, or sandboxing \
+                 is disabled",
                 reason,
                 state.backend,
             );
@@ -497,16 +497,15 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
                 missing.push("abstract Unix sockets and cross-domain signals (v6)");
             }
             missing.push("pathname Unix sockets (v9)");
-            // Deliberately does not name Bubblewrap as the remedy, which it used to. Measured:
-            // bwrap masks four directories and unmounts nothing else, and it never unshares the
-            // network namespace, so a socket in the abstract namespace or under `$HOME` stays
-            // reachable from inside it. On this axis Landlock at v9 is the *stronger* backend, and
-            // sending a user to install bwrap to close these channels sent them the wrong way.
+            // Deliberately does not name Bubblewrap as the remedy. Measured: bwrap masks four
+            // directories and unmounts nothing else, and it never unshares the network namespace,
+            // so a socket in the abstract namespace or under `$HOME` stays reachable from inside
+            // it. On this axis Landlock at v9 is the *stronger* backend, and sending a user to
+            // install bwrap to close these channels sent them the wrong way.
             tracing::warn!(
                 "Landlock ABI v{} write-protects the filesystem but does not restrict {}; a \
                  read-mode command can still reach a local service over those channels. A newer \
-                 kernel closes them; Bubblewrap does not, since it masks only its own four \
-                 directories and leaves the network namespace shared",
+                 kernel closes them, and Bubblewrap does not",
                 abi_version,
                 missing.join(", "),
             );
@@ -1922,7 +1921,7 @@ pub mod windows_impl {
     const DELETE: u32 = 0x0001_0000;
     /// Inheritable by both files and subdirectories, so one ACE on the root covers the tree.
     ///
-    /// The doc line used to sit on `DELETE` above, describing the wrong constant.
+    /// Belongs on this constant, not on `DELETE` above.
     const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
     const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
@@ -2240,8 +2239,8 @@ pub mod windows_impl {
     /// does not tighten the filesystem boundary, it just breaks the process.
     ///
     /// Returns an owned copy of the SID's bytes. The caller must keep it alive across the
-    /// `CreateRestrictedToken` call, which reads through the pointer into it -- see the note in the
-    /// body for why this copies rather than leaking the whole `TOKEN_GROUPS` buffer as it used to.
+    /// `CreateRestrictedToken` call, which reads through the pointer into it; see the note in the
+    /// body for why this copies rather than leaking the whole `TOKEN_GROUPS` buffer.
     unsafe fn logon_session_sid(token: HANDLE) -> Option<Vec<u8>> {
         let mut needed = 0u32;
         unsafe { GetTokenInformation(token, TokenGroups, ptr::null_mut(), 0, &mut needed) };
@@ -2357,8 +2356,7 @@ pub mod windows_impl {
             // did not work.
             tracing::warn!(
                 "could not allocate a console ({}); shell commands at `workspace` will fail to \
-                 start, because a restricted child can only inherit a console and this process \
-                 has none. Running meka from a terminal avoids it",
+                 start. Running meka from a terminal avoids this",
                 std::io::Error::last_os_error()
             );
             return;
@@ -3861,9 +3859,9 @@ mod tests {
     /// A root that is not valid UTF-8 is still made writable.
     ///
     /// The parameter is built as an `OsString` and the path pushed whole, so there is no UTF-8
-    /// requirement to fail. It used to be `to_str()` with a `continue`, which meant such a root was
-    /// silently dropped from the allow-list and the command ran with it still read-only -- a
-    /// boundary quietly narrower than the one meka reported.
+    /// requirement to fail. A `to_str()` with a `continue` drops such a root silently from the
+    /// allow-list and runs the command with it still read-only, a boundary quietly narrower than
+    /// the one meka reported.
     #[test]
     #[cfg(unix)]
     fn a_non_utf8_root_still_becomes_a_seatbelt_parameter() {

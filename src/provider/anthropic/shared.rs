@@ -2181,7 +2181,7 @@ mod tests {
     /// Locks in the contract that `build_body_within_budget` returns a user-visible
     /// [`crate::provider::Notice`] (rather than printing to stderr directly) when redaction kicks
     /// in. The agent loop then forwards it through `Frontend::emit`, which is how ACP clients see
-    /// the redaction signal that used to silently bypass them.
+    /// the redaction signal at all.
     #[test]
     fn test_build_body_within_budget_returns_notice_on_redaction() {
         use std::cell::Cell;

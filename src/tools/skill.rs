@@ -70,10 +70,10 @@ impl Tool for SkillReadTool {
         let skill = match skills.find(&name) {
             Some(skill) => skill,
             // "No such skill" and "it is right there and meka cannot read it" call for opposite
-            // responses, and both used to arrive as "not found" -- so a model handed a procedure
-            // whose file has a typo in its frontmatter was told the procedure does not exist, and
-            // would go on to improvise one. `memory_read` was changed to stop telling exactly this
-            // lie; this is the same fix on the sibling store.
+            // responses. Collapsed into "not found", a model handed a procedure whose file has a
+            // typo in its frontmatter is told the procedure does not exist, and improvises one.
+            // `memory_read` was changed to stop telling exactly this lie; this is the same fix on
+            // the sibling store.
             None => {
                 let hint = match skills.skip_reason(&name) {
                     Some(reason) => format!(
@@ -1074,11 +1074,11 @@ mod tests {
 
     /// A skill whose file is unreadable is reported as unreadable, not as absent.
     ///
-    /// The two call for opposite responses and both used to arrive as "not found", so a model
-    /// handed a procedure with a typo in its frontmatter was told the procedure does not exist --
-    /// and the reasonable next move, improvising its own version, is the worst available one.
-    /// `memory_read` was changed to stop telling this lie; skills kept telling it because discovery
-    /// computed the reason and then threw it away.
+    /// The two call for opposite responses. Collapsed into "not found", a model handed a procedure
+    /// with a typo in its frontmatter is told the procedure does not exist, and the reasonable next
+    /// move, improvising its own version, is the worst available one. `memory_read` was changed to
+    /// stop telling this lie; skills kept telling it because discovery computed the reason and then
+    /// threw it away.
     #[tokio::test]
     async fn read_says_a_broken_skill_is_broken_rather_than_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1112,10 +1112,9 @@ mod tests {
 
     /// `skill_write` surfaces the store's refusal of a `metadata` it cannot record in.
     ///
-    /// It used to write anyway and then explain, in the model's context, that the rank it asked for
-    /// had not applied "because this skill's 'metadata' is not a map" -- a sentence about YAML
-    /// shapes that only existed because three other places had quietly done something other than
-    /// what was asked. Refusing says it once, to the party who can fix it.
+    /// Refused rather than written and then explained away, in the model's context, as a rank that
+    /// did not apply "because this skill's 'metadata' is not a map": a sentence about YAML shapes,
+    /// in place of doing what was asked. Refusing says it once, to the party who can fix it.
     #[tokio::test]
     async fn write_surfaces_the_refusal_of_a_metadata_it_cannot_record_in() {
         let temp = tempfile::tempdir().expect("tempdir");

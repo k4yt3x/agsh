@@ -489,8 +489,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_files_cancelled_walk_is_interrupted() {
-        // Regression: the tool used to ignore its cancellation token entirely, so an over-broad
-        // walk could not be stopped by Ctrl+C, by ACP `session/cancel`, or by anything else.
+        // An ignored cancellation token leaves an over-broad walk unstoppable by Ctrl+C, by ACP
+        // `session/cancel`, or by anything else.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..50 {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");

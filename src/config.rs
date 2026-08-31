@@ -146,11 +146,11 @@ pub struct ResolvedScheduleConfig {
     /// higher level, because every session `serve` creates records its own; the host's level only
     /// answers for a row that has none.
     ///
-    /// Deliberately *not* a ceiling, which is what this comment used to claim. `--permission` on
-    /// `meka serve` is a starting default, and every session `serve` itself creates persists a
-    /// level of its own, so restarting at `read` does not disarm a gate an `unrestricted` session
-    /// authored. What does bound it is `enabled_permissions` below, which the operator can only
-    /// narrow in `config.toml` and which no session can exceed.
+    /// Deliberately *not* a ceiling. `--permission` on `meka serve` is a starting default, and
+    /// every session `serve` itself creates persists a level of its own, so restarting at `read`
+    /// does not disarm a gate an `unrestricted` session authored. What does bound it is
+    /// `enabled_permissions` below, which the operator can only narrow in `config.toml` and which
+    /// no session can exceed.
     pub host_permission: crate::permission::Permission,
     /// The modes this installation permits at all.
     ///
@@ -1336,8 +1336,8 @@ pub(crate) fn sort_profile_keys(profile: &mut toml_edit::Item) {
 /// One profile resolved into everything needed to build a provider for it.
 ///
 /// This exists because a provider is no longer a property of the process. A session names the
-/// profile it runs with, so any given turn may need a profile that is not the configured default,
-/// and the resolution that used to happen once at startup has to be callable per profile name.
+/// profile it runs with, so any given turn may need one that is not the configured default:
+/// resolution has to be callable per profile name rather than once at startup.
 ///
 /// `context_window` and `vision` ride along despite not reaching
 /// [`crate::provider::ProviderBuilder`]: both are stated per profile, so a session that switches
@@ -1460,13 +1460,12 @@ pub(crate) fn resolve_device_id(
 /// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
 /// `--resume` flags.
 ///
-/// A real type rather than the `Option<String>` with a `"last"` sentinel this replaces: the
-/// sentinel meant `-c` had to take an optional value, which made it the only flag on the root
-/// command that could swallow the following argument. `meka -c "fix the bug"` read the prompt as a
-/// session prefix and failed with either a confusing lookup error or, under `--oneshot`, a claim
-/// that no prompt was given. Splitting the two intents into a boolean and a value-taking flag puts
-/// both in line with every other root flag and removes the ambiguity at the parser rather than
-/// guessing at it afterwards.
+/// A real type rather than an `Option<String>` with a `"last"` sentinel: the sentinel makes `-c`
+/// take an optional value, which would make it the only flag on the root command that can swallow
+/// the following argument. `meka -c "fix the bug"` read the prompt as a session prefix and failed
+/// with either a confusing lookup error or, under `--oneshot`, a claim that no prompt was given.
+/// Splitting the two intents into a boolean and a value-taking flag puts both in line with every
+/// other root flag and removes the ambiguity at the parser rather than guessing at it afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionResume {
     /// `--continue`: the most recently updated session.
@@ -2470,11 +2469,11 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
 
 /// Load `config.toml`, returning the parsed file and any error that stopped it from parsing.
 ///
-/// A malformed config used to warn and fall back to `ConfigFile::default()`, which is the worst of
-/// the options: one mistyped key silently reconfigured the whole agent, running it with no provider
-/// profiles, no MCP servers and default permissions, off a single line the user could easily scroll
-/// past. The error is carried instead and raised by [`ResolvedConfig::validate`], alongside the
-/// profile-selection failures, so `from_cli` can stay infallible.
+/// Warning and falling back to `ConfigFile::default()` is the worst of the options: one mistyped
+/// key silently reconfigures the whole agent, running it with no provider profiles, no MCP servers
+/// and default permissions, off a single line the user can easily scroll past. The error is carried
+/// instead and raised by [`ResolvedConfig::validate`], alongside the profile-selection failures, so
+/// `from_cli` can stay infallible.
 ///
 /// The line between failing and continuing is whether a command *consults* the parsed config. One
 /// that does can only answer from empty defaults, which reads as fact: `meka provider list`
@@ -2515,8 +2514,8 @@ pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
 /// indistinguishable from "your profiles are gone". `meka provider add <existing>` is the sharp
 /// edge: its duplicate guard is the parsed map, so an empty one lets the add through to
 /// `upsert_profile_document`, which replaces the profile's table wholesale and drops every field
-/// the flags didn't set. An unparseable config used to route the user straight into that ("no
-/// provider profile named 'work'. Run `meka provider add work` to create it.").
+/// the flags didn't set. An unparseable config must not route the user into that ("no provider
+/// profile named 'work'. Run `meka provider add work` to create it.").
 pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
     let (config_file, error) = load_config_file();
     match error {
@@ -2567,9 +2566,7 @@ fn resolve_permission(
                     // came back with the whole ladder reachable by Shift+Tab. Falling back to the
                     // narrowest useful set keeps a failed parse from widening authority.
                     tracing::warn!(
-                        "[permissions].enabled was empty after filtering, so none of the modes \
-                         you listed could be used; falling back to `read` alone rather than to \
-                         the default set, which would be wider than what you asked for"
+                        "no usable mode in [permissions].enabled; falling back to `read` alone"
                     );
                     EnabledPermissions::from_modes([Permission::Read])
                         .unwrap_or(EnabledPermissions::DEFAULT)
@@ -3236,9 +3233,9 @@ impl ResolvedConfig {
             ));
         }
         // `context_messages = 0` reads as "send no history", which is not a thing the provider APIs
-        // accept: a request needs at least the current user message. It also used to index one past
-        // the end of the message slice on the first turn and panic -- fatal in the REPL, and under
-        // ACP it left the client's `session/prompt` waiting forever with no response.
+        // accept: a request needs at least the current user message. Indexing one past the end of
+        // the message slice on the first turn panics: fatal in the REPL, and under ACP it leaves
+        // the client's `session/prompt` waiting forever with no response.
         if self.context_messages == Some(0) {
             return Err(crate::error::MekaError::Config(format!(
                 "[session].context_messages = 0 would send no conversation at all. Remove the \

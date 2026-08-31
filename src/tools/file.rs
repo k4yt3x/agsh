@@ -206,8 +206,7 @@ async fn lock_path_for_write(canonical: &Path) -> tokio::sync::OwnedMutexGuard<(
 /// inode it verified, on every platform, which is a different piece of machinery from a path
 /// function. The sandbox is documented as defence against an agent damaging user data by accident
 /// rather than as an adversarial boundary, and winning this race requires a *concurrent* writer
-/// deliberately planting the symlink mid-call, so the residual is stated rather than engineered
-/// away.
+/// deliberately planting the symlink mid-call, so the residual is
 async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
     use std::path::Component;
 
@@ -431,11 +430,11 @@ fn render_windowed_read(
         window.lines().count()
     };
     if shown_lines == 0 {
-        // Two different facts, and the ceiling one used to be reported as the other. A minified
-        // JSON blob or a base64 capture is one enormous line, so the window is empty because that
-        // single line does not fit, not because the offset ran off the end -- and answering "offset
-        // 0 is past the end of a file which has 1 line" is both self-contradictory and reads as
-        // "unreadable" when the truth is "ask for it differently".
+        // Two different facts, and reporting the ceiling as the other misdescribes the file. A
+        // minified JSON blob or a base64 capture is one enormous line, so the window is empty
+        // because that single line does not fit, not because the offset ran off the end -- and
+        // answering "offset 0 is past the end of a file which has 1 line" is both
+        // self-contradictory and reads as "unreadable" when the truth is "ask for it differently".
         if cut_by_ceiling {
             return format!(
                 "(no lines: the first line at offset {} of '{}' is itself larger than the {} MiB \
@@ -883,11 +882,11 @@ impl FileRoute {
 /// The file's current contents for `write_file`'s diff metadata: `Ok(None)` when it does not exist,
 /// `Err` when it exists and cannot be read.
 ///
-/// The two used to collapse to `None`, and the staleness guard runs only on `Some` -- so a file
-/// that exists but cannot be re-read (past the 16 MiB ceiling, or not valid UTF-8) skipped the
-/// check entirely and was overwritten from a stale copy without a word. That is fail-open on
-/// exactly the files where a blind overwrite costs most. `edit_file` refuses when it cannot verify;
-/// this is the same posture, and `force` remains the escape hatch for both.
+/// Collapsed to `None`, the two are indistinguishable, and the staleness guard runs only on `Some`:
+/// a file that exists but cannot be re-read (past the 16 MiB ceiling, or not valid UTF-8) would
+/// skip the check entirely and be overwritten from a stale copy without a word. That is fail-open
+/// on exactly the files where a blind overwrite costs most. `edit_file` refuses when it cannot
+/// verify; this is the same posture, and `force` remains the escape hatch for both.
 async fn local_old_text(target: &Path) -> std::result::Result<Option<String>, std::io::Error> {
     match read_file_to_string(target).await {
         Ok(text) => Ok(Some(text)),
@@ -1254,12 +1253,11 @@ impl Tool for ReadFileTool {
         // Disclose the cut whenever one happened, not only for a bare `read_file`.
         //
         // `effective_limit` defaults to `DEFAULT_LINE_LIMIT` regardless of whether `offset` was
-        // given, but the notice used to be gated on *both* being absent -- so
-        // `read_file({path, offset: 0})` on a 50,000-line log returned exactly 2,000 lines, with no
-        // marker and no line count, and the model answered "the log contains no errors" from four
-        // percent of the file. This is the failure the `find_files` / `search_contents` disclosures
-        // exist to prevent; a definitive-sounding answer drawn from a silent truncation is worse
-        // than an error.
+        // given, so gating the notice on *both* being absent leaves `read_file({path, offset: 0})`
+        // on a 50,000-line log returning exactly 2,000 lines with no marker and no line count, and
+        // the model answering "the log contains no errors" from four percent of the file. This is
+        // the failure the `find_files` / `search_contents` disclosures exist to prevent; a
+        // definitive-sounding answer drawn from a silent truncation is worse than an error.
         let shown_lines = result.lines().count();
         // An offset past the end returns nothing, and nothing reads as "the file is empty" -- which
         // is a different fact, and the one the model will act on. Say which it is.
@@ -1896,10 +1894,10 @@ mod workspace_fence {
 
     /// The refusal must land *before* `create_dir_all`.
     ///
-    /// The check used to be reachable only after canonicalisation, which happens after the parents
-    /// are made. A refused write to a deep path outside the boundary would then have created that
-    /// whole chain of directories on its way to being refused, which is the enforcing code
-    /// performing the write it exists to prevent.
+    /// Reached only after canonicalisation, the check would run after the parents are already made.
+    /// A refused write to a deep path outside the boundary would then have created that whole chain
+    /// of directories on its way to being refused, which is the enforcing code performing the write
+    /// it exists to prevent.
     #[tokio::test]
     async fn a_refused_write_creates_no_directories() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2059,11 +2057,11 @@ mod workspace_fence {
     /// A write preserves an ACL the target's owner set, rather than replacing it with the
     /// directory's inheritance.
     ///
-    /// `rename` installs a *new* file, so the published path used to carry whatever the parent
-    /// directory hands out: a file its owner had explicitly denied a principal came back permitting
-    /// them, and the tool reported success. `ReplaceFileW` is the Win32 call whose whole purpose is
-    /// to keep the replaced file's security descriptor, and this is the assertion that meka is
-    /// actually using it.
+    /// `rename` installs a *new* file, so without this the published path carries whatever the
+    /// parent directory hands out: a file its owner had explicitly denied a principal comes back
+    /// permitting them, and the tool reports success. `ReplaceFileW` is the Win32 call whose whole
+    /// purpose is to keep the replaced file's security descriptor, and this is the assertion that
+    /// meka is actually using it.
     ///
     /// Uses `icacls` rather than the security API: this asserts what an administrator auditing the
     /// file would see, and reading it back through the same API that set it would prove less.
@@ -2116,8 +2114,8 @@ mod workspace_fence {
     ///
     /// `is_within_roots` admits a path equal to a root on purpose, and `write_file_bytes` names its
     /// temp file with `with_file_name` -- which for a root is a sibling of the root, one level
-    /// *above* the workspace. So `write_file({path: ".", force: true})` used to create, write and
-    /// `sync_all` the model's content there before the rename failed with `EISDIR`. The content was
+    /// *above* the workspace. Without it, `write_file({path: ".", force: true})` creates, writes
+    /// and `sync_all`s the model's content before the rename fails with `EISDIR`. The content was
     /// removed by the error path, but it existed on disk outside the boundary, and a crash in that
     /// window leaves it.
     #[tokio::test]
@@ -2591,9 +2589,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_falls_back_when_client_cannot_serve_path() {
-        // Regression: a delegate failure used to abort the read. Editors serve `fs/read_text_file`
-        // only for the project they have open, so every skill, prompt, and config file read under
-        // ACP became a hard tool error -- with the file sitting right there, readable.
+        // A delegate failure must not abort the read. Editors serve `fs/read_text_file` only for
+        // the project they have open, so every skill, prompt, and config file read under ACP became
+        // a hard tool error -- with the file sitting right there, readable.
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let file_path = temp_dir.path().join("outside-the-project.md");
         std::fs::write(&file_path, "on-disk contents\n").expect("failed to write");
@@ -2638,12 +2636,12 @@ mod tests {
         assert!(error.to_string().contains("Internal error"), "{}", error);
     }
 
-    /// The agent dispatches every tool call in one assistant message concurrently, so two
-    /// `edit_file` calls on the same file used to both read the original, both pass the freshness
-    /// gate against a stamp taken before either wrote, and the second write discarded the first --
-    /// with both results reporting success. Serialising them means the loser sees the winner's
-    /// content: either it applies on top, or its `old_string` no longer matches and it says so.
-    /// Silently reporting two successes for one surviving edit is the outcome ruled out.
+    /// The agent dispatches every tool call in one assistant message concurrently, so without
+    /// serialisation two `edit_file` calls on the same file both read the original, both pass the
+    /// freshness gate against a stamp taken before either wrote, and the second write discards the
+    /// first, with both results reporting success. Serialising them means the loser sees the
+    /// winner's content: either it applies on top, or its `old_string` no longer matches and it
+    /// says so. Silently reporting two successes for one surviving edit is the outcome ruled out.
     #[tokio::test]
     async fn concurrent_edits_to_one_file_cannot_both_report_success_and_lose_one() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2868,11 +2866,11 @@ mod tests {
 
     /// A regex read is a read, so it has to leave the tracker in the same terms as any other.
     ///
-    /// It used to route locally on the grounds that searching has no `fs/*` call of its own, which
-    /// left the find-then-edit path -- grep for the anchor, then edit it, the most ordinary thing
-    /// the agent does -- searching the disk while the edit went to the buffer, and recording a
-    /// stamp the freshness check could not compare against that buffer. The check does not fail
-    /// loudly in that state; it declines to run.
+    /// Routing locally on the grounds that searching has no `fs/*` call of its own breaks the
+    /// find-then-edit path -- grep for the anchor, then edit it, the most ordinary thing the agent
+    /// does -- by searching the disk while the edit goes to the buffer, and recording a stamp the
+    /// freshness check cannot compare against that buffer. The check does not fail loudly in that
+    /// state; it declines to run.
     #[tokio::test]
     async fn test_a_delegated_regex_read_searches_and_stamps_the_editors_copy() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3489,13 +3487,13 @@ mod tests {
 
     /// `write_file` through a symlink must name the same file `read_file` and `edit_file` name.
     ///
-    /// All three canonicalize now, but `write_file` used to canonicalize only the parent and
-    /// re-join the filename, so a symlinked final component gave it a path the other two never
-    /// use. Three things followed from that one mismatch: the freshness check looked up a tracker
-    /// key nothing writes and so never fired, `edit_file` and `write_file` on the one file took
-    /// different per-path locks and stopped being serialised against each other, and the write
-    /// itself landed on the link rather than through it -- replacing a dotfile-managed symlink
-    /// with a regular file and leaving the file the model had just read untouched.
+    /// All three canonicalize. Canonicalizing only the parent and re-joining the filename, as
+    /// `write_file` could, gives a symlinked final component a path the other two never use. Three
+    /// things followed from that one mismatch: the freshness check looked up a tracker key nothing
+    /// writes and so never fired, `edit_file` and `write_file` on the one file took different
+    /// per-path locks and stopped being serialised against each other, and the write itself landed
+    /// on the link rather than through it -- replacing a dotfile-managed symlink with a regular
+    /// file and leaving the file the model had just read untouched.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_write_file_follows_a_symlink_to_the_file_it_read() {
@@ -3596,11 +3594,10 @@ mod tests {
 
     /// The Windows half of `test_write_file_follows_a_symlink_to_the_file_it_read`.
     ///
-    /// This used to assert the opposite -- that a symlinked target was refused -- which made
-    /// Windows the one platform where `write_file` and `edit_file` disagreed about whether a link
-    /// could be written at all. The guard still stands one level up, in the canonicalisation that
-    /// resolves the target before the write, which is where a swap is a redirection rather than the
-    /// user's own indirection.
+    /// Refusing a symlinked target here would make Windows the one platform where `write_file` and
+    /// `edit_file` disagree about whether a link can be written at all. The guard still stands one
+    /// level up, in the canonicalisation that resolves the target before the write, which is where
+    /// a swap is a redirection rather than the user's own indirection.
     #[cfg(windows)]
     #[tokio::test]
     async fn test_write_file_follows_a_symlink_on_windows() {
@@ -3919,9 +3916,8 @@ mod tests {
 
     /// The same race as above, routed through `write_file` instead of `edit_file`.
     ///
-    /// A whole-file rewrite is the *more* destructive of the two, and it used to be the unguarded
-    /// one: the model's stale copy replaced the user's saved edit with no error and no re-read
-    /// prompt.
+    /// A whole-file rewrite is the *more* destructive of the two: unguarded, the model's stale copy
+    /// replaces the user's saved edit with no error and no re-read prompt.
     #[tokio::test]
     async fn a_whole_file_rewrite_cannot_silently_clobber_a_concurrent_edit() {
         let temp_dir = tempfile::tempdir().expect("tempdir");

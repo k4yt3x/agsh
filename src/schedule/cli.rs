@@ -17,9 +17,8 @@ const SCHEDULE_TRUNCATE: usize = 24;
 /// part of a real check (`gh pr checks 123 --json state`) is legible, since the point of showing it
 /// is that an operator can recognise what runs unattended.
 const GATE_CHECK_TRUNCATE: usize = 40;
-/// Same, for the fire condition. It used to be one of two fixed words and needed no ceiling; it now
-/// renders a regular expression or a JSON pointer, both written by the model and neither bounded or
-/// validated beyond compiling.
+/// Same, for the fire condition. It renders a regular expression or a JSON pointer, both written by
+/// the model and neither bounded nor validated beyond compiling.
 const GATE_WHEN_TRUNCATE: usize = 28;
 /// Same, for the trailing prompt. Last column, so it is never padded, but a paragraph-long prompt
 /// would still wrap the row into unreadability.
@@ -155,10 +154,10 @@ const COLUMNS: [&str; 7] = [
 /// [`crate::render::sanitize_to_line`], and why the separation matters: `render` prints, so the
 /// sanitising it does had no way to be asserted.
 ///
-/// "All" is meant literally, and did not used to be: the `Prompt` cell was truncated and not
-/// sanitised. `split_whitespace` had been doing half the job by dropping newlines, so a forged row
-/// was impossible and an injected colour sequence was not -- and that gap was invisible in a test
-/// that loops over every cell while planting escapes in only two of them.
+/// "All" is meant literally: an untruncated, sanitised `Prompt` cell included. `split_whitespace`
+/// had been doing half the job by dropping newlines, so a forged row was impossible and an injected
+/// colour sequence was not -- and that gap was invisible in a test that loops over every cell while
+/// planting escapes in only two of them.
 ///
 /// The `Schedule` cell goes through the same helper without ever having been a way in: everything
 /// `Schedule::describe` can emit is a formatted timestamp, a `humantime` duration, or a cron

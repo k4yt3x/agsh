@@ -10,7 +10,9 @@ practice, then meka-specific rules.
 ## Code
 
 - Correctness and clarity first. Speed and efficiency are secondary unless stated otherwise.
-- Comments explain *why*, never *what*. If a comment restates the code, delete it.
+- Comments explain *why*, never *what*: a constraint from outside this file, or why an
+  obvious-looking alternative is wrong. Not history, not user-facing documentation, not argument for
+  the choice; `git log` and `docs/book/src/` hold those. If it restates the code, delete it.
 - Add functionality to existing files unless it is genuinely a new component. Avoid many small files.
 - No creative additions beyond what was asked.
 - Full words in names, no abbreviations.
@@ -43,8 +45,8 @@ Verification is graded by what it catches, not by how much of it there is.
 **Per release**: one structural review, docs and changelog. Don't run a cross-platform suite by hand
 per change; CI already runs the matrix on every push.
 
-**Rarely**: mutation testing. It pays while a suite is thin; its yield approaches zero once the suite
-is dense, while its cost grows with the codebase. Run it when a subsystem is new, not as a gate.
+**Rarely**: mutation testing. Run it when a subsystem is new, not as a gate; its yield falls as the
+suite densifies while its cost grows with the codebase.
 
 Reproduce a defect before fixing it, and re-run the reproduction after. A fix verified only by a
 passing suite was verified against the thing that already missed it.
@@ -143,6 +145,11 @@ mdbook build docs/book
 `rustdoc::invalid_html_tags`: a bare `<word>` parses as an unclosed tag. Backtick it, or rephrase if
 the comment is also a clap help string, where backticks render literally.
 
+`fmt --check` does not enforce `comment_width`: `wrap_comments` silently declines some comments (in
+a macro body, in a method chain) and still exits 0, so a paragraph left for rustfmt to wrap can ship
+at 400 columns. After `fmt`, `awk 'length>100 && /^[[:space:]]*\/\//'` the changed files; reword
+what it prints, or break it by hand.
+
 ## Clap help text
 
 `///` doc comments must render within 80 columns under `-h`. Verify by running the binary for every
@@ -167,7 +174,7 @@ success.
 `println!` / `eprintln!` only for: requested data; content the user must copy, type, or visit; REPL
 command output; and hard errors. Everything else is `tracing`.
 
-The stream is a contract, not a style choice:
+The stream is a contract:
 
 - **stdout**: only the data the command was invoked to obtain.
 - **stderr**: everything else, including prompts, live UI, indicators, hints, status and errors,
@@ -179,11 +186,10 @@ Levels: `error!` for an unrecoverable failure about to propagate; `warn!` for a 
 or rollback the user should see by default; `info!` for lifecycle signposts; `debug!` for
 module-level diagnostics.
 
-Never invert this either: a command's primary output must not be a `tracing::info!`, or the user
-needs `-v` to see what they asked for. `ok:` confirmations are logs, not prints; the exit code carries
-success. Drop preambles that precede
-the actionable line. Honour a config flag that explicitly requests visible output; don't demote it to
-`info!`.
+Don't invert it either: a command's primary output must not be a `tracing::info!`, or the user needs
+`-v` to see what they asked for. `ok:` confirmations are logs, not prints; the exit code carries
+success. Drop preambles before the actionable line. Honour a config flag that asks for visible
+output; don't demote it to `info!`.
 
 ## Configuration surfaces
 
@@ -212,11 +218,8 @@ the actionable line. Honour a config flag that explicitly requests visible outpu
 ## A profile is indivisible
 
 A provider profile is a named bundle: backend, endpoint, credential, model, and every model-tied knob.
-A session selects one by name and records that name. **Nothing overrides a field inside one.**
-
-Selecting a bundle and partially rewriting one are different acts; only the second produces
-combinations nobody configured, and it fails silently because the mismatched fields are never stated
-together.
+A session selects one by name and records that name. **Nothing overrides a field inside one**, or the
+run gets a combination nobody configured and no field states the mismatch.
 
 - **`--provider <name>` selects**, and is the only provider flag on a run.
 - **`provider add` / `set` write profile fields.** `set` edits one key in place via `toml_edit`,
@@ -246,10 +249,9 @@ transaction, behind an automatic backup. Four rules:
    the same reason the ledger is.
 
 Rules 2 and 4 are enforced by `the_ledger_is_append_only` and `no_migration_calls_meka_s_own_code`;
-rules 1 and 3 are not, and decay silently. The first test digests *every* entry, so a legitimate
-append fires it too: the correct response is to add the new entry's line to the expected vector, never
-to paste current values over the existing ones. The second matches `super::` as well as `crate::`,
-because this module is a child of `session`.
+rules 1 and 3 are not, and decay silently. The first digests *every* entry, so a legitimate append
+fires it too: add the new entry's line to the expected vector, never paste current values over the
+existing ones.
 
 Rule 1 has two sanctioned exceptions, both of which converge on the current shape rather than
 interpreting an old one: `classify_by_shape`, which runs once per store and stamps its answer, and
@@ -272,10 +274,10 @@ the most recent schema-changing upgrade is undoable.
 Names are read by the model every turn and `tool_catalogue` is sorted, so a name is both label and
 sort key.
 
-- **A family shares a noun prefix**: `<subsystem>_<verb>`. The prefix makes the family arrive as one
-  block, so it is functional rather than cosmetic. It names what the tools act on, which is not always
-  the module they live in. Where a subsystem manages more than one kind of object, qualify before the
-  verb and keep the object first. A verb that merely mentions a noun does not make it a managed object.
+- **A family shares a noun prefix**: `<subsystem>_<verb>`, which is what makes the family arrive as
+  one sorted block. It names what the tools act on, which is not always the module they live in.
+  Where a subsystem manages more than one kind of object, qualify before the verb and keep the object
+  first. A verb that merely mentions a noun does not make it a managed object.
 - **A standalone tool reads as a verb phrase**: `<verb>_<object>`. A subsystem with one operation may
   use the bare noun.
 

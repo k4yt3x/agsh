@@ -514,10 +514,10 @@ pub async fn rewind(
                 (entry, guard)
             }
             // Not resident: rewound straight on the store, without reviving anything. A rewind is
-            // an edit to the event log, not a turn, so the agent this used to build was needed
-            // only to hold the result -- and a session with no runtime has nothing to hold. This
-            // is also what makes the endpoint symmetrical with `meka session rewind`, which has
-            // always been a store-only operation and therefore always worked on a sub-agent.
+            // an edit to the event log, not a turn, so an agent built here would be needed only to
+            // hold the result, and a session with no runtime has nothing to hold. This is also what
+            // makes the endpoint symmetrical with `meka session rewind`, which has always been a
+            // store-only operation and therefore always worked on a sub-agent.
             None => {
                 drop(map);
                 if let Some(response) = rewind_dormant_session(&state, id, body.turns).await? {

@@ -78,10 +78,9 @@ pub(crate) fn default_base_url(backend: &str) -> Option<&'static str> {
 /// Messages API. `/status` and `meka provider add` both key off this, so they agree about which
 /// profiles the [`ThinkingMode`] setting is even meaningful for.
 ///
-/// A single function rather than a test at each site. Both used to ask
-/// `backend.starts_with("claude")`, which was true of every Anthropic backend only while they were
-/// *named* for Claude; the protocol name `anthropic-messages` silently falls out of a prefix test,
-/// and nothing about the failure is visible except a missing line.
+/// A single function rather than a test at each site. A `backend.starts_with("claude")` test holds
+/// only while every Anthropic backend is *named* for Claude: the protocol name `anthropic-messages`
+/// silently falls out of it, and nothing about the failure is visible except a missing line.
 pub(crate) fn backend_takes_thinking(backend: &str) -> bool {
     matches!(backend, "anthropic-messages" | "claude-subscription")
 }
@@ -324,15 +323,15 @@ pub(crate) struct RefreshExchange<'a> {
 
 /// Spend a refresh token at an issuer's token endpoint and hand back its decoded response.
 ///
-/// One copy of a branch both subscription backends used to keep their own version of. The shape was
-/// identical -- POST the grant, classify the answer, decode the payload -- and only the payload
-/// differs, so the generic parameter is exactly the part that was ever really different: Claude's
-/// issuer states `expires_in` and an account uuid, ChatGPT's states neither and has to be read out
-/// of the JWTs.
+/// One copy of a branch both subscription backends would otherwise keep their own version of. The
+/// shape was identical -- POST the grant, classify the answer, decode the payload -- and only the
+/// payload differs, so the generic parameter is exactly the part that was ever really different:
+/// Claude's issuer states `expires_in` and an account uuid, ChatGPT's states neither and has to be
+/// read out of the JWTs.
 ///
-/// The duplication was not theoretical. A mutation sweep deleted the `!` from the Codex copy's
-/// `if !status.is_success()` and no test noticed, because the Claude copy was the one under test;
-/// two hand-written copies of a classification means two chances to get it wrong and two places to
+/// The duplication was not theoretical. A mutation sweep deleted the `!` from the Codex copy's `if
+/// !status.is_success()` and no test noticed, because the Claude copy was the one under test; two
+/// hand-written copies of a classification means two chances to get it wrong and two places to
 /// remember when it changes. Both call sites keep their own test even so, since each still has to
 /// prove it reaches this function at all.
 ///
@@ -347,11 +346,10 @@ pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
         .client
         .post(exchange.token_url)
         .timeout(REFRESH_TIMEOUT)
-        // One order for both backends, where they used to list the same three fields in two
-        // different orders. `serde_json` is built with `preserve_order`, so this does change the
-        // bytes the Claude endpoint receives; it cannot change what they mean, because a JSON
-        // object is an unordered collection (RFC 8259 §1) and nothing here is signed over. Worth
-        // saying only
+        // One order for both backends, which otherwise list the same three fields in two different
+        // orders. `serde_json` is built with `preserve_order`, so this does change the bytes the
+        // Claude endpoint receives; it cannot change what they mean, because a JSON object is an
+        // unordered collection (RFC 8259 §1) and nothing here is signed over. Worth saying only
         // because this is the backend whose request shape is otherwise reproduced from a capture.
         .json(&serde_json::json!({
             "client_id": exchange.client_id,
@@ -411,8 +409,8 @@ pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
 /// Where the row has moved on -- another process refreshed first, or a `meka provider login`
 /// completed while this round trip was in flight -- the stored value is newer than what this
 /// refresh produced, and adopting it is both correct and what keeps the issuer's live token and the
-/// database in agreement. The blind upsert this replaces left them disagreeing silently, and the
-/// symptom arrived at the *next* launch as `invalid_grant` with nothing naming the cause.
+/// database in agreement. A blind upsert leaves them disagreeing silently, and the symptom arrives
+/// at the *next* launch as `invalid_grant` with nothing naming the cause.
 ///
 /// A write that cannot be made at all is a warning rather than an error: the session in hand still
 /// has a working token, and failing the turn over a persistence problem would be the worse trade.
@@ -441,9 +439,8 @@ pub(crate) async fn store_refreshed_credential(
         }
         Ok(crate::session::CredentialWrite::Superseded(_)) => {
             tracing::warn!(
-                "'{}' was written by something else while this refresh was in flight, and what it \
-                 holds now cannot authenticate this session; continuing on the token just minted \
-                 and leaving the stored credential alone",
+                "'{}' was written by something else during this refresh and what it holds now \
+                 cannot authenticate this session; continuing on the token just minted",
                 profile
             );
             refreshed
@@ -724,10 +721,10 @@ pub struct AccountUsage {
 
 /// Whether a Claude request asks for extended thinking, and which wire encoding it uses.
 ///
-/// One knob rather than two. Thinking used to be a global on/off plus a shape meka inferred from
-/// the model name, and that inference is what this replaces: `anthropic-messages` reaches any
-/// Anthropic-compatible endpoint, so meka cannot tell which encoding the far side implements. The
-/// profile states it, and is the user's to keep correct if they later change `model`.
+/// One knob rather than two. Stated rather than inferred from the model name: `anthropic-messages`
+/// reaches any Anthropic-compatible endpoint, so meka cannot tell which encoding the far side
+/// implements. The profile states it, and is the user's to keep correct if they later change
+/// `model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingMode {
@@ -756,10 +753,10 @@ impl ThinkingMode {
     }
 
     /// The one spelling of each mode, for anything that writes or displays it: the TOML `meka
-    /// provider add` emits, and the `/status` block. Both used to carry their own copy of this
-    /// match, which is two hand-written mappings that have to agree with each other, with serde's
-    /// `rename_all` on the way back in, and with the values clap accepts on the way in from the CLI
-    /// - four derivations of the same three strings, with nothing checking them against each other.
+    /// provider add` emits, and the `/status` block. One copy, because a per-backend match is two
+    /// hand-written mappings that have to agree with each other, with serde's `rename_all` on the
+    /// way back in, and with the values clap accepts from the CLI: four derivations of the same
+    /// three strings, with nothing checking them against each other.
     pub fn as_str(self) -> &'static str {
         match self {
             ThinkingMode::Adaptive => "adaptive",
@@ -1697,10 +1694,10 @@ struct CachedProvider {
 
 /// Providers, built on demand for whichever profile is asked for and kept for reuse.
 ///
-/// Replaces the single `Arc<dyn Provider>` that used to be built once at startup and shared by
-/// every session. That was right while the profile was a property of the process; it is wrong now
-/// that a session records the one it runs with, because two sessions in one `meka serve` may name
-/// different profiles and both have to work.
+/// A single `Arc<dyn Provider>` built once at startup cannot serve sessions on different profiles.
+/// That was right while the profile was a property of the process; it is wrong now that a session
+/// records the one it runs with, because two sessions in one `meka serve` may name different
+/// profiles and both have to work.
 ///
 /// Reuse is the reason this caches rather than building per turn: an `Arc<dyn Provider>` owns a
 /// `reqwest::Client` and therefore a connection pool, and rebuilding one per turn would throw away
@@ -2205,9 +2202,9 @@ mod tests {
 
     /// Each profile resolves its own thinking mode, and nothing at the run level can outrank it.
     ///
-    /// There used to be a `--thinking` on the registry that did, which is exactly the shape this
-    /// pins shut: a flag applied where a profile's value is read makes one profile's mode every
-    /// profile's, and a session that resolved a different profile got a mode its own never stated.
+    /// A registry-level `--thinking` is exactly the shape this pins shut: a flag applied where a
+    /// profile's value is read makes one profile's mode every profile's, so a session resolving a
+    /// different profile gets a mode its own never stated.
     #[tokio::test]
     async fn each_profile_resolves_its_own_thinking_mode() {
         let mut profiles = profiles(&["adaptive", "off"]);
@@ -2249,8 +2246,8 @@ mod tests {
         }
         let registry = test_registry(profiles).await;
         let config_dir = tempfile::tempdir().expect("tempdir");
-        // Seeded with the profile, so `persist` takes its write path rather than the bail it used
-        // to take by accident against the real file.
+        // Seeded with the profile, so `persist` takes its write path rather than bailing against
+        // the real file.
         std::fs::write(
             config_dir.path().join("config.toml"),
             "[providers.sub]\ntype = \"claude-subscription\"\n",
@@ -2280,11 +2277,11 @@ mod tests {
         );
     }
 
-    /// The memo used to be keyed on the profile and its overrides alone, so a built provider
-    /// outlived the credential it was built from: `meka provider login work` run against the store
-    /// a `meka serve` was already using rotated the key, and every later build in the running
-    /// process still handed out the provider holding the revoked one. The writer is another
-    /// process, so this has to be a pull rather than an invalidation hook.
+    /// Keyed on the profile and its overrides alone, the memo lets a built provider outlive the
+    /// credential it was built from: `meka provider login work` against the store a running `meka
+    /// serve` is using rotates the key, and every later build in that process still hands out the
+    /// provider holding the revoked one. The writer is another process, so this has to be a pull
+    /// rather than an invalidation hook.
     #[tokio::test]
     async fn rotating_a_credential_retires_the_provider_built_from_it() {
         let mut profiles = profiles(&["work"]);
@@ -2752,10 +2749,9 @@ mod tests {
 
     /// A `tool_result` whose `content` is a bare string is refused, not silently wrapped.
     ///
-    /// `content` is a list, and it used to accept a string too, which was the shape meka persisted
-    /// before the field could hold images. Nothing pinned that, so this pins its removal: the
-    /// release script rewrites those rows, and if this ever passes again the script has quietly
-    /// become optional while still being the only thing that converts them.
+    /// `content` is a list, and the bare-string form must stay unparseable: the release script is
+    /// the only thing that converts those rows, and a silent wrap here would make it optional while
+    /// leaving it the only converter.
     #[test]
     fn a_tool_result_content_written_as_a_string_no_longer_parses() {
         let stored =

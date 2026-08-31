@@ -227,9 +227,8 @@ pub(crate) async fn import_session(
     };
     if spawned {
         eprintln!(
-            "Imported a sub-agent's conversation. It carries the terms the session that spawned \
-             it set, and that session is not in this archive, so `meka -r` will refuse it. It is \
-             readable with `meka session export` and `meka session list --include-children`."
+            "Imported a sub-agent's conversation. Its parent is not in this archive, so `meka -r` \
+             will refuse it. Read it with `meka session export`."
         );
     } else if count > 1 {
         eprintln!(
@@ -360,14 +359,13 @@ pub(crate) async fn fork_session_command(
     };
     match spawned.map(|terms| terms.parent) {
         Some(Some(parent)) => eprintln!(
-            "Forked session. It is a sub-agent of {parent}, like the session it copies, so \
-             continue it with `agent_followup` from {parent} rather than `meka -r`."
+            "Forked session. It is a sub-agent of {parent}, so continue it with `agent_followup` \
+             from {parent} rather than `meka -r`."
         ),
         // A copy of a worker whose parent is not in this store. Still a worker, still not
         // resumable, and with no id to name; saying so beats printing `meka -r`.
         Some(None) => eprintln!(
-            "Forked session. It carries the terms another session spawned the original under, and \
-             that session is not in this store, so `meka -r` will refuse it."
+            "Forked session. Its parent is not in this store, so `meka -r` will refuse it."
         ),
         None => eprintln!("Forked session. Resume with: meka -r {}", forked.id),
     }
@@ -1226,8 +1224,8 @@ mod tests {
         ));
     }
 
-    /// Multi-root sessions used to come back from an export as single-root: the column existed but
-    /// no export/import struct carried it.
+    /// Without it a multi-root session comes back from an export as single-root: the column exists,
+    /// but no export/import struct carries it.
     #[tokio::test]
     async fn test_session_export_preserves_additional_roots() {
         use std::path::{Path, PathBuf};

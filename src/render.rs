@@ -744,8 +744,8 @@ fn theme_style(scope: &str) -> Option<(Option<Color>, FontStyle)> {
     let style = highlighter.style_for_stack(&stack);
     let foreground = style.foreground;
     // syntect hands back the enclosing context's foreground for an unmatched scope. Passing that
-    // through would paint every element the same colour, i.e. exactly the flat problem this
-    // replaces, so treat "same as the context" as "unstyled" and leave termimad's default in place.
+    // through would paint every element the same colour, so treat "same as the context" as
+    // "unstyled" and leave termimad's default in place.
     let default_foreground = highlighter
         .style_for_stack(&[Scope::new(MARKDOWN_CONTEXT_SCOPE).ok()?])
         .foreground;
@@ -1375,9 +1375,9 @@ const TOOL_VALUE_MIN_WIDTH: usize = 16;
 struct BlockLimits {
     /// Source lines shown under one argument's key before the rest is summarised as a count.
     ///
-    /// Counted in the value's own lines, so the `... N more lines` marker means what it says. An
-    /// earlier version capped rendered rows and reported that as lines, which told the reader of a
-    /// 100-line file that 108 lines were hidden.
+    /// Counted in the value's own lines, so the `... N more lines` marker means what it says.
+    /// Capping rendered *rows* and reporting those as lines tells the reader of a 100-line file
+    /// that 108 lines were hidden.
     lines_per_argument: usize,
     /// Rows one argument may occupy, however many lines or elements are under its key.
     ///
@@ -1866,8 +1866,8 @@ fn block_indent(depth: usize, width: usize) -> String {
 
 /// Fit one of meka's own stand-in words into the budget it was given.
 ///
-/// `(no printable text)` is nineteen columns and used to be emitted whatever the budget, so a value
-/// with no room left still overflowed the line by the width of the word describing it.
+/// `(no printable text)` is nineteen columns, so emitting it whatever the budget overflows the line
+/// by the width of the word describing the value.
 fn marker_text(marker: &str, budget: usize) -> String {
     truncate_to_width(marker, budget)
 }
@@ -2137,10 +2137,10 @@ pub struct ModelStatus<'a> {
 
 /// The body of the session-status block, without ANSI and without the header line.
 ///
-/// Split out because every non-REPL frontend needs the same numbers in a different envelope, and
-/// the only way to get them used to be to re-implement the formatting: ACP did, and the two
-/// drifted. Pairs with [`render_session_status`], which is this plus the coloured header, printed.
-/// The same shape as [`format_account_usage`] / [`render_account_usage`], for the same reason.
+/// Split out because every non-REPL frontend needs the same numbers in a different envelope; with
+/// no shared body each re-implements the formatting and they drift. Pairs with
+/// [`render_session_status`], which is this plus the coloured header, printed. The same shape as
+/// [`format_account_usage`] / [`render_account_usage`], for the same reason.
 pub fn format_session_status(
     snap: &crate::stats::SessionStatsSnapshot,
     model: &ModelStatus,
@@ -2173,11 +2173,10 @@ pub fn format_session_status(
     // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
     //
     // Shown from turn zero, at `0 / <window>`, rather than waiting for occupancy to be non-zero.
-    // The window used to be inferred from the model name, so before the first turn there was
-    // nothing to report but a guess. It is now the profile's `context_window` or a documented
-    // default, and meka neither probes for it nor checks it against the model - which makes this
-    // the only place a user can confirm the number their session will actually budget against.
-    // Getting it wrong is otherwise invisible until compaction misbehaves several turns in.
+    // The window is the profile's `context_window` or a documented default, and meka neither probes
+    // for it nor checks it against the model, which makes this the only place a user can confirm
+    // the number their session budgets against. Getting it wrong is otherwise invisible until
+    // compaction misbehaves several turns in.
     if context_window > 0 {
         let pct = ((context_tokens as f64 / context_window as f64) * 100.0).round() as u64;
         let remaining = context_window.saturating_sub(context_tokens);
@@ -2432,13 +2431,12 @@ pub struct MissingSessionProfile<'a> {
 /// `provider::look_up_profile` names the profile the row wants, lists the configured ones, and
 /// tells the reader to restore it or move off it. The session id is the single fact it cannot
 /// reach, and `-r <id> --provider <name>` is the only command that rewrites a row's binding, so
-/// that is what this adds. It used to add two more lines: `Run meka provider list to see
-/// configured profiles`, which that error had just listed, and `Or bring the profile back: meka
-/// provider add <recorded> --type claude-subscription --model claude-opus-5`, which restated
-/// "add it back to config.toml" as a command that *invents the profile's type and model*. meka
-/// never saw the deleted profile; it may have been `openai-responses` on another model entirely,
-/// and running that line would create a different profile under the name the session wants. A
-/// wrong command is worse than no command.
+/// that is what this adds. Two further lines are deliberately absent. `Run meka provider list to
+/// see configured profiles` restates what that error has just listed, and `Or bring the profile
+/// back: meka provider add <recorded> --type ... --model ...` *invents the profile's type and
+/// model*. meka never saw the deleted profile; it may have been `openai-responses` on another model
+/// entirely, and running that line would create a different profile under the name the session
+/// wants. A wrong command is worse than no command.
 ///
 /// `None` says nothing about *why* setup failed: the caller prints the error first, and it is as
 /// often a configured profile missing its credential as no profile at all. That case names no
@@ -2755,11 +2753,9 @@ const THINKING_MAX_ROWS_PER_LINE: usize = 20;
 
 /// Rows a whole fully-shown thinking block may occupy.
 ///
-/// Every other surface that prints model output has a block-level ceiling; this one was left
-/// without because its line count used to be its row count. Wrapping broke that: each line may now
-/// become twenty rows, so two thousand lines of reasoning became forty thousand rows of terminal.
-/// Generous, because `show_content = true` is a request to see the reasoning, and the cut keeps the
-/// end, where a conclusion lives.
+/// A per-line ceiling is not enough on its own: one line may wrap to twenty rows, so two thousand
+/// lines of reasoning fill forty thousand rows of terminal. Generous, because `show_content = true`
+/// is a request to see the reasoning, and the cut keeps the end, where a conclusion lives.
 const THINKING_MAX_ROWS: usize = 400;
 
 /// Fixed chrome in `Thinking... <preview>`.
@@ -4021,9 +4017,8 @@ mod tests {
         assert_eq!(truncate_to_width("", 5), "");
     }
 
-    /// The case this exists for: reasoning that opens with a short header used to preview as
-    /// `Thinking... Key facts:` and nothing else, because the newline ended the line while most of
-    /// the width was still unused.
+    /// Reasoning that opens with a short header must not preview as `Thinking... Key facts:` and
+    /// nothing else: the newline ends the line while most of the width is still unused.
     #[test]
     fn test_collapse_to_line_pulls_content_up_past_a_short_first_line() {
         assert_eq!(
@@ -4067,10 +4062,9 @@ mod tests {
         assert_eq!(collapse_to_line("\n\n   \n", 80), "");
     }
 
-    /// Reasoning is model output, and the preview used to show only its first line, so an escape
-    /// further down could not reach the terminal. Pulling words up across newlines opened that
-    /// path: a model steered by attacker-controlled text it has read can clear the screen and
-    /// repaint a permission prompt.
+    /// Reasoning is model output, and pulling words up across newlines carries text from below the
+    /// first line into the preview: a model steered by attacker-controlled text it has read can
+    /// clear the screen and repaint a permission prompt.
     #[test]
     fn test_a_thinking_preview_carries_no_escapes_from_below_the_first_line() {
         let reasoning = "Checking the file.\n\u{1b}[2J\u{1b}[1;1H[ask] Shell cat README (Y/n)";
@@ -4087,9 +4081,9 @@ mod tests {
         assert_eq!(body, "one\n  two\n  three");
     }
 
-    /// Stripping escapes was not the whole of it. `Thinking... ` prefixes only the first line, so a
-    /// second line of reasoning used to land at column zero in the same grey as
-    /// `render_session_id`, and reproduced it byte-for-byte with no trick at all.
+    /// Stripping escapes is not the whole of it. `Thinking... ` prefixes only the first line, so an
+    /// unindented second line of reasoning lands at column zero in the same grey as
+    /// `render_session_id` and reproduces it byte-for-byte, with no escape at all.
     #[test]
     fn test_a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
         let forged = "Let me check.\nContinuing session: 550e8400-e29b-41d4-a716-446655440000";
@@ -4410,9 +4404,9 @@ mod tests {
             "   ",
         ];
         let long_key = "k".repeat(300);
-        // Deep nesting and variation selectors are the two shapes that broke the invariant while an
-        // earlier version of this test passed: it fed `nasty` only to the thinking and todo
-        // assertions, and its inputs stopped at three levels.
+        // Deep nesting and variation selectors are the two shapes that break the invariant while a
+        // test feeding `nasty` only to the thinking and todo assertions, at three levels, stays
+        // green.
         let mut deep = serde_json::json!("SECRET_PAYLOAD");
         for level in 0..25 {
             deep = serde_json::json!({ format!("k{}", level): deep });
@@ -4791,9 +4785,8 @@ mod tests {
         );
     }
 
-    /// Every other surface that prints model output has a block ceiling. This one went without,
-    /// because its line count used to be its row count -- until wrapping turned two thousand lines
-    /// of reasoning into forty thousand rows of terminal.
+    /// A per-line ceiling is not enough on its own: one line may wrap to twenty rows, so two
+    /// thousand lines of reasoning fill forty thousand rows of terminal.
     #[test]
     fn test_a_full_thinking_block_has_a_ceiling() {
         let reasoning = (0..2000)
@@ -5030,9 +5023,9 @@ mod tests {
         assert!(rendered.ends_with("- 4999"), "{}", rendered);
     }
 
-    /// The block cap used to cut a flat line list wherever line 60 landed, which threw away the
-    /// trailing arguments silently and reported a count of rendered lines that said nothing about
-    /// how much was hidden. Losing `path` entirely made `full` less informative than `summary`.
+    /// A block cap that cuts a flat line list wherever line 60 lands drops the trailing arguments
+    /// silently and reports a count of rendered lines that says nothing about how much is hidden.
+    /// Losing `path` entirely would make `full` less informative than `summary`.
     #[test]
     fn test_arguments_that_do_not_fit_are_named_rather_than_dropped() {
         let long = (0..40)
@@ -5054,9 +5047,9 @@ mod tests {
         assert_eq!(rendered.matches("    ... 10 more lines").count(), 2);
     }
 
-    /// The failure the per-argument budget exists to prevent: one enormous argument used to consume
-    /// the whole block and take every argument after it down silently, so a `write_file` showed 60
-    /// lines of `content` and never said which file.
+    /// The failure the per-argument budget exists to prevent: one enormous argument consuming the
+    /// whole block and taking every argument after it down silently, so a `write_file` shows 60
+    /// lines of `content` and never says which file.
     #[test]
     fn test_one_huge_argument_no_longer_hides_the_ones_after_it() {
         let long = (0..1000)
@@ -5200,7 +5193,7 @@ mod tests {
         }
     }
 
-    /// A cut that cannot fit its marker used to emit the bare prefix, which reads as a complete
+    /// A cut that cannot fit its marker must not emit the bare prefix, which reads as a complete
     /// name. Whatever the budget, the output has to say it was cut.
     #[test]
     fn test_a_cut_always_says_it_was_cut() {
@@ -5367,10 +5360,10 @@ mod tests {
         assert_eq!(params(serde_json::json!("bare")), "  bare");
     }
 
-    /// A top-level array used to fall through to `Value::to_string` and print as raw JSON, which
-    /// contradicts the format's own rule that arrays are bullets.
-    /// The todo list prints unindented at column zero, so model text carrying a newline needs no
-    /// trick at all to sit among meka's own output looking like part of it.
+    /// Falling through to `Value::to_string` prints a top-level array as raw JSON, contradicting
+    /// the format's own rule that arrays are bullets. The todo list prints unindented at column
+    /// zero, so model text carrying a newline needs no trick at all to sit among meka's own output
+    /// looking like part of it.
     #[test]
     fn test_a_todo_list_cannot_plant_a_line_of_its_own() {
         use crate::tools::todo::{TodoItem, TodoStatus};
@@ -6073,9 +6066,9 @@ mod tests {
     }
 
     /// A turn whose final delta ends in a newline leaves the buffer empty while a table or an
-    /// unterminated fence is still pending. `finish` used to skip its drains in that case, so a
-    /// reply ending in a markdown table lost the table completely. Asserts on the renderer's own
-    /// state because the drain itself writes to stdout.
+    /// unterminated fence is still pending. Skipping the drains in that case loses a reply's
+    /// trailing table completely. Asserts on the renderer's own state because the drain itself
+    /// writes to stdout.
     ///
     /// The cases are listed per mode because the two buffer differently: syntect collects table
     /// rows in `raw_table_lines`, while termimad hands tables to minimad and holds partial ones in
@@ -6152,7 +6145,7 @@ mod tests {
         "```rust\nlet t20 = 1;\n\nlet t21 = 2;\n```\n\nt22\n",
         "```\nt23\n",
         // A line that starts with `|` but doesn't end with one sits between prose and a fence:
-        // this is the shape that used to spin the flush loop forever.
+        // this is the shape that can spin the flush loop forever.
         "| t24\n```rust\nlet t25 = 3;\n```\n",
         "```rust\nlet t26 = 4;\n```\n| t27 | t28 |\n|---|---|\n| t29 | t30 |\n\n",
         "> t31\n\n---\n\nt32\n",
@@ -6195,13 +6188,13 @@ mod tests {
     /// After one pass, everything the flush could legally render must be gone from the buffer.
     ///
     /// Two things qualify. Prose is settled once a blank line follows it, so no blank line may
-    /// remain. A complete fenced block is self-delimiting and is taken the moment its opening
-    /// fence line is whole, so no complete fence line may remain either. What is allowed to stay
-    /// is the final open block: a trailing table, an unfinished paragraph, a partial line.
+    /// remain. A complete fenced block is self-delimiting and is taken the moment its opening fence
+    /// line is whole, so no complete fence line may remain either. What is allowed to stay is the
+    /// final open block: a trailing table, an unfinished paragraph, a partial line.
     ///
-    /// Stopping earlier than that is the failure this guards. It is how the flush loop used to
-    /// hang, and even with the loop's progress check it would silently defer the rest of the turn
-    /// to `finish`, so output arrives in one burst at the end instead of streaming.
+    /// Stopping earlier than that is the failure this guards: it hangs the flush loop, and even
+    /// with the loop's progress check it silently defers the rest of the turn to `finish`, so
+    /// output arrives in one burst at the end instead of streaming.
     #[test]
     fn test_flush_consumes_everything_it_can_in_one_pass() {
         for document in STREAMING_CORPUS {

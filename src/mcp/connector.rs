@@ -305,8 +305,8 @@ pub(crate) async fn connect_one(
     // reachable, just its tool list failed. Surface it as a warn and leave tool set empty.
     //
     // Bounded by the same `connect_timeout` as the connect itself: `tools/list` is a request to the
-    // server just made, and a server that accepts the connection and then never answers used to
-    // hold this task open for the life of the process.
+    // server just made, and unbounded, a server that accepts the connection and then never answers
+    // holds this task open for the life of the process.
     let discovery = tokio::time::timeout(
         connect_timeout,
         discover_and_register_tools(&entry, mcp_default_permission, &manager),
@@ -584,10 +584,10 @@ pub(super) async fn connect_server(
             let mut command = command;
             // Scrub the environment before layering the server's own `env` on top.
             //
-            // A stdio MCP server is a child process that talks to the network, and it used to
-            // inherit every variable meka was started with: `ANTHROPIC_API_KEY`, `AWS_*`,
-            // `GITHUB_TOKEN`, the lot. Configuring a server is a decision to run its code, not a
-            // decision to hand it every credential on the machine. What survives is the same
+            // A stdio MCP server is a child process that talks to the network, and an inherited
+            // environment hands it every variable meka was started with: `ANTHROPIC_API_KEY`,
+            // `AWS_*`, `GITHUB_TOKEN`, the lot. Configuring a server is a decision to run its code,
+            // not a decision to hand it every credential on the machine. What survives is the same
             // curated base a read-mode shell gets (`PATH`, `HOME`, locale), so servers still
             // resolve their own binaries; a server that genuinely needs a secret asks for it by
             // name, and `${VAR}` in the `env` table still reads it from meka's environment.

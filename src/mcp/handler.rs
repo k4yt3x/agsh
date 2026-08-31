@@ -140,10 +140,10 @@ impl ClientHandler for MekaClientHandler {
     }
 
     /// Notification that a server-side URL elicitation the user was sent to complete has finished.
-    /// rmcp 3.1 removed the typed hook this used to have, so it now arrives as an unrecognised
-    /// method: the wire notification still exists, but the SDK no longer routes it anywhere
-    /// specific. meka's [`Self::create_elicitation`] already returned its response synchronously,
-    /// so nothing needs to drive here; log it for observability.
+    /// rmcp 3.1 has no typed hook for this, so it arrives as an unrecognised method: the wire
+    /// notification exists, but the SDK routes it nowhere specific. meka's
+    /// [`Self::create_elicitation`] already returned its response synchronously, so nothing needs
+    /// to drive here; log it for observability.
     fn on_custom_notification(
         &self,
         notification: CustomNotification,
@@ -596,11 +596,11 @@ fn convert_tool_result_content(
     let mut text_dropped: usize = 0;
     // Counted across the whole result, not per buffer.
     //
-    // The ceiling used to be compared against `text_buf.len()` alone, and the accepted-image arm
-    // calls `flush_text`, which `mem::take`s the buffer. A result shaped `[4 MiB text][small
-    // PNG][4 MiB text][PNG]...` therefore passed the guard on every round and the cap bounded
-    // nothing: the resident total is the sum of the flushed blocks, which is what the model is
-    // sent.
+    // Compared against `text_buf.len()` alone the ceiling misses what has already been flushed: the
+    // accepted-image arm calls `flush_text`, which `mem::take`s the buffer. A result shaped `[4 MiB
+    // text][small PNG][4 MiB text][PNG]...` therefore passed the guard on every round and the cap
+    // bounded nothing: the resident total is the sum of the flushed blocks, which is what the model
+    // is sent.
     let mut text_kept: usize = 0;
 
     let flush_text = |buf: &mut String, out: &mut Vec<ToolResultContent>| {
@@ -1054,8 +1054,8 @@ mod tests {
         }
     }
 
-    /// Between meka's own memory guard and the ceiling providers accept there used to be a band
-    /// where an MCP image was forwarded purely so the provider could answer 400.
+    /// Between meka's own memory guard and the ceiling providers accept lies a band where an MCP
+    /// image would be forwarded purely so the provider could answer 400.
     #[test]
     fn test_convert_tool_result_content_image_rejects_over_the_provider_ceiling() {
         use rmcp::model::ContentBlock;

@@ -285,25 +285,25 @@ pub async fn ensure_session_loaded(
     // the one that arrives. Hydrating the event log for a session about to be refused is wasted
     // besides.
     //
-    // Deliberately *not* justified by the `claim_session` sweep below, which is what an earlier
-    // version of this comment claimed. That sweep is keyed on this id and a worker has no
-    // `background_tasks` rows to key: `Agent::enable_background` is reached only through
-    // `assemble_agent`, which is the host builders' path, and `Agent::new_subagent` never calls it.
-    // The UPDATE matches zero rows. Recording that here because the placement is right for the
-    // reason above and would otherwise keep being re-justified by a harm that cannot occur.
+    // Deliberately *not* justified by the `claim_session` sweep below. That sweep is keyed on this
+    // id and a worker has no `background_tasks` rows to key: `Agent::enable_background` is reached
+    // only through `assemble_agent`, which is the host builders' path, and `Agent::new_subagent`
+    // never calls it. The UPDATE matches zero rows. Recording that here because the placement is
+    // right for the reason above and would otherwise keep being re-justified by a harm that cannot
+    // occur.
     //
     // Here rather than at each door, because every write-side session endpoint funnels through this
     // function: `/turn`, `/compact`, `/rewind`, `/responses`, the fork's read-back and the
-    // scheduler fire. Placing it at the doors is what left `patch_session` needing its own copy
-    // for the one branch that never calls this.
+    // scheduler fire. Placing it at the doors is what left `patch_session` needing its own copy for
+    // the one branch that never calls this.
     //
     // On the cold path only, which the two fast-path returns above skip. That is safe because a
-    // worker cannot become *resident*: the only code that inserts into `state.sessions` is
-    // `POST /v1/sessions` (a fresh row with no parent), the fork handler (which refuses a worker
-    // source before copying, so its copy is never one) and this function. The other two writers of
-    // that map only ever remove. Residency therefore implies the row already passed here. Moving
-    // the check above the fast path would buy nothing and put a store read on every request to a
-    // live session; a future inserter belongs behind this rule rather than in front of it.
+    // worker cannot become *resident*: the only code that inserts into `state.sessions` is `POST
+    // /v1/sessions` (a fresh row with no parent), the fork handler (which refuses a worker source
+    // before copying, so its copy is never one) and this function. The other two writers of that
+    // map only ever remove. Residency therefore implies the row already passed here. Moving the
+    // check above the fast path would buy nothing and put a store read on every request to a live
+    // session; a future inserter belongs behind this rule rather than in front of it.
     crate::refuse_a_spawned_session(&state.shared.session_manager, Some(id))
         .await
         .map_err(|error| agent_build_problem(id, "failed to read session", error))?;
@@ -616,9 +616,9 @@ mod tests {
     }
 
     /// A configuration refusal is the caller's to fix and its message is meka's own, so it goes
-    /// back verbatim with a 422. Creation used to sanitise it to a 500, which is where a fresh
-    /// `meka serve` lands first: the profile is configured but has no credential, and the one
-    /// sentence saying so went to a log file the caller cannot read.
+    /// back verbatim with a 422. Sanitising it to a 500 hides where a fresh `meka serve` lands
+    /// first: the profile is configured but has no credential, and the one sentence saying so goes
+    /// to a log file the caller cannot read.
     #[test]
     fn a_configuration_refusal_reaches_the_caller_instead_of_becoming_a_500() {
         let id = Uuid::new_v4();

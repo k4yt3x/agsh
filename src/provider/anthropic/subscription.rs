@@ -3661,7 +3661,7 @@ mod tests {
     /// A minimal in-process OAuth refresh endpoint that counts hits. Returns a valid refresh
     /// response on every call so the provider path completes; the test then asserts the hit count.
     /// `state_expiry` distinguishes a well-behaved issuer from one that answers without an
-    /// `expires_in`, which is the input that used to make the token due again on arrival.
+    /// `expires_in`, which would otherwise make the token due again on arrival.
     async fn run_mock_refresh_endpoint(
         listener: tokio::net::TcpListener,
         hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -3780,13 +3780,13 @@ mod tests {
     /// the classifier.
     ///
     /// The wiring rather than the rule: `crate::error::oauth_refresh_error` has its own tests, and
-    /// this asserts that the refresh path calls it. Every answer used to become a bare
-    /// `MekaError::Provider`, which the agent loop drops, so a 503 from the token endpoint ended
-    /// the turn while a 503 from the messages endpoint two lines later was retried; and since
-    /// `ensure_valid_credential` runs inside `complete` and `stream`, that was a live turn lost to
-    /// an outage with nothing to do with the conversation. The 400 is the opposite failure: it must
-    /// *not* be retried, and it has to name the profile, because two accounts of one backend can
-    /// coexist and "log in again" alone does not say where.
+    /// this asserts that the refresh path calls it. A bare `MekaError::Provider` is dropped by the
+    /// agent loop, so a 503 from the token endpoint would end the turn while a 503 from the
+    /// messages endpoint two lines later is retried; and since `ensure_valid_credential` runs
+    /// inside `complete` and `stream`, that is a live turn lost to an outage with nothing to do
+    /// with the conversation. The 400 is the opposite failure: it must *not* be retried, and it has
+    /// to name the profile, because two accounts of one backend can coexist and "log in again"
+    /// alone does not say where.
     #[tokio::test]
     async fn what_the_token_endpoint_answered_decides_whether_a_refresh_is_retried() {
         for (status_line, body, truncate, retryable) in [

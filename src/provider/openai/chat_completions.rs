@@ -758,8 +758,8 @@ mod tests {
     /// vLLM-backed endpoints coalesce the final tool-call delta into the same chunk as
     /// `finish_reason`, rather than sending `finish_reason` alone with an empty delta the way
     /// OpenAI does. The chunk below is a real capture. Skipping the delta on a chunk that carries a
-    /// `finish_reason` used to drop the tool call outright, leaving `StopReason::ToolUse` with no
-    /// tool-use block, which the agent surfaced as "the model returned an empty response".
+    /// `finish_reason` drops the tool call outright, leaving `StopReason::ToolUse` with no tool-use
+    /// block, which the agent surfaces as "the model returned an empty response".
     #[tokio::test]
     async fn test_stream_chunk_keeps_tool_call_coalesced_with_finish_reason() {
         let chunk = serde_json::json!({

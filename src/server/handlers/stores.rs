@@ -536,11 +536,10 @@ pub async fn put_memory(
         None => None,
     };
 
-    // One upsert, one transaction, and no lock. This door used to take the store's `flock` and run
-    // on the blocking pool because the write was a read-modify-write over a file: two overlapping
-    // PUTs to one name gave last-writer-wins over a stale read, and 113 of 2,400 concurrent ones
-    // failed outright on the temp file. Omit-to-keep now lives in the SQL, so there is no read to
-    // go stale and SQLite serialises the writers.
+    // One upsert, one transaction, and no lock. No `flock` and no blocking pool: the write is a
+    // single statement rather than a read-modify-write over a file, which is what would make two
+    // overlapping PUTs to one name last-writer-wins over a stale read. Omit-to-keep now lives in
+    // the SQL, so there is no read to go stale and SQLite serialises the writers.
     let written = state
         .shared
         .memories
@@ -579,9 +578,9 @@ pub async fn delete_memory(
 ) -> Result<StatusCode, ProblemDetail> {
     scope::require(&principal, "memory:w")?;
     crate::memory::validate_memory_lookup(&name).map_err(store_error)?;
-    // 404 from `rows_affected`, not from a pre-check. The two used to be separate statements, and
-    // between them a name could stop existing: this endpoint then answered 422 `invalid-body` for
-    // something already gone, which a client switching on `type` reads as "fix your request".
+    // 404 from `rows_affected`, not from a pre-check. As separate statements a name can stop
+    // existing between them, and this endpoint then answers 422 `invalid-body` for something
+    // already gone, which a client switching on `type` reads as "fix your request".
     if !state
         .shared
         .memories
