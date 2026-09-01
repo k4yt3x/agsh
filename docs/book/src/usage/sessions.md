@@ -267,7 +267,7 @@ Turning it off leaves the standalone summarizer to write every summary, which sa
 
 ### Auto-Compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation when the input token count exceeds 80% of the context window. This runs between turns, not during tool loops. The check is both reactive (the previous turn's reported usage) and proactive (an estimate of the next request, so a turn whose own input jumps over the window is compacted before it is sent). As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
+When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation when the input token count exceeds 80% of the context window. The threshold check runs between turns, not during tool loops. It is both reactive (the previous turn's reported usage) and proactive (an estimate of the next request, so a turn whose own input jumps over the window is compacted before it is sent). As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]
@@ -277,7 +277,7 @@ context_window = 200000  # optional override
 
 ### Agent-Initiated Compaction
 
-The agent doesn't have to wait for the threshold. `context_compact` asks for a compaction at the end of the current turn:
+The agent doesn't have to wait for the threshold. `context_compact` asks for a compaction before the agent's next step: it runs once the current batch of tool calls finishes, and the turn then carries on against the summary. What it reclaims is history from earlier turns: with the default `keep_recent`, the tail is cut back to a clean user boundary, so the current turn stays verbatim and an agent that filled its window with this turn's own tool results gets little back. One compaction per turn: a further request once the first has run is ignored, and the agent can ask again on a later turn.
 
 ```text
 context_compact(instructions: "the day's work is in memory now", keep_recent: false)
@@ -285,7 +285,7 @@ context_compact(instructions: "the day's work is in memory now", keep_recent: fa
 
 `keep_recent: false` skips the verbatim tail entirely, so the summary is all that remains. That is the difference between compacting and turning the page, and it's what makes a "start of a new day" routine work: a scheduled job at midnight can write the day's diary to memory, then compact clean, instead of carrying yesterday's context forward indefinitely.
 
-The request is deferred to the end of the turn rather than applied where it is made, so compaction still never happens mid-tool-loop.
+The request is parked rather than applied where it is made: a tool cannot rewrite the conversation the agent loop is holding. It is drained at the next boundary between rounds, once the batch's tool results are in, which is what lets the rest of the turn run against the summary.
 
 ### What the Agent Sees
 

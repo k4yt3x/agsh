@@ -8230,6 +8230,349 @@ fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
     );
 }
 
+/// The agent chose the moment, so it gets to act on the result: a compaction it asked for lands
+/// before its next step, not after its last one.
+///
+/// The round order is the evidence. `context_compact` is answered by the summariser *first*, and
+/// only then does the model produce "after the compaction", a round it could not have reached at
+/// all while the request was drained after the tool loop, because by then the turn was over.
+#[test]
+fn a_requested_compaction_lets_the_turn_continue() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "kind": "tool_use_end", "input": {} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "a summary" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "after the compaction" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        // A spare round, so the count assertion below is real. With exactly three, a second
+        // compaction draws an exhausted round, fails on the empty summary, and emits nothing --
+        // and the assertion would hold whether or not the slot had been emptied.
+        [
+            { "kind": "text", "text": "a spare round" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
+    let id = start_streaming_session(&harness);
+    let body = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "compact yourself", "stream": true}))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+
+    assert!(
+        body.contains("after the compaction"),
+        "the turn has to resume against the compacted context, not end at the request: {}",
+        body
+    );
+    // Exactly one, which is also what keeps the post-loop drain from compacting a second time: it
+    // takes unconditionally, and the in-loop drain has already emptied the slot.
+    //
+    // Deliberately not asserted: that `turn.finished` is last. The handler mints it after
+    // `run_turn` returns, so it is last however this turn behaved, and pinning it would read as
+    // coverage of an ordering nothing here can break.
+    assert_eq!(
+        sse_event_names(&body)
+            .iter()
+            .filter(|name| *name == "context.compacted")
+            .count(),
+        1,
+        "one request, one compaction, and the client told about it: {}",
+        body
+    );
+}
+
+/// One turn honours one request. Now that a compaction lands mid-turn, an agent that asks on every
+/// iteration would summarise on every iteration, each round costing a summariser call and, with a
+/// checkpoint configured, several more. The second ask is answered and deferred, not run.
+#[test]
+fn a_turn_honours_one_compaction_request_however_many_it_gets() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "kind": "tool_use_end", "input": {} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "first summary" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "tool_use_start", "id": "tu_2", "name": "context_compact" },
+            { "kind": "tool_use_end", "input": {} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
+    let id = start_streaming_session(&harness);
+    let body = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "compact twice", "stream": true}))
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+
+    let compactions = sse_event_names(&body)
+        .iter()
+        .filter(|name| *name == "context.compacted")
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "the second request in one turn must be deferred, not honoured: {}",
+        body
+    );
+}
+
+/// Stopping the turn stops the compaction it asked for, before the window is replaced.
+///
+/// The request is parked by a tool that ignores its cancellation token, so it survives the
+/// interrupt. Running it anyway replaces the whole window and -- because a fired token makes
+/// `run_checkpoint_turn` return early -- does it through the standalone summariser, writing nothing
+/// to memory. That is the failure `compacting_after_a_cancelled_turn_still_runs_the_checkpoint`
+/// exists to prevent, reached through a different door.
+///
+/// Pins the outcome, not which guard delivers it. Two now stand in the way -- the drain declines to
+/// start, and `compact_session` refuses to rewrite -- and this passes with either, so neutering one
+/// alone will not fail it. The window staying intact is the property worth holding; see
+/// `an_interrupt_inside_a_requested_compaction_still_spares_the_window` for the case only the
+/// second one catches.
+#[test]
+fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
+    // The slow half is a *tool*, not a stream event: the interrupt has to land after
+    // `context_compact` has already parked its request and before the loop drains it, which is a
+    // window only a running tool batch holds open.
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "kind": "tool_use_end", "input": {} },
+            { "kind": "tool_use_start", "id": "tu_2", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 5"} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "a summary" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "compact then stop"}))
+            .send()
+            .expect("send")
+            .status()
+    });
+
+    harness.wait_until_in_flight(&id);
+    let cancel = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/cancel", id),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204);
+    let _ = turn.join().expect("turn thread");
+
+    let messages = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", id),
+        )
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+    assert!(
+        !messages.contains("a summary"),
+        "the interrupted turn must not have had its window replaced by a summariser: {}",
+        messages
+    );
+}
+
+/// The same stop, one instant later: an interrupt that arrives *inside* the compaction.
+///
+/// Guarding only the drain's entry covers the narrow case. Nothing between there and the rewrite
+/// is cancellable: `run_checkpoint_turn` answers a fired token with `Ok(None)` and hands on to the
+/// summariser, and `provider.complete` takes no token, so the compaction reports success and the
+/// window goes anyway. The checkpoint is skipped precisely because the token fired, so what
+/// replaces the conversation is a summary written without the agent, with nothing saved.
+#[test]
+fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
+    // The checkpoint round is the slow one, so the cancel lands after the drain's own guard has
+    // already passed and the compaction is under way.
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "kind": "tool_use_end", "input": {} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        // Ends on a tool call, not `end_turn`: that sends `run_checkpoint_turn` round the loop to
+        // its per-round token check, which is where a fired token turns into `Ok(None)` and hands
+        // the compaction to the standalone summariser below.
+        [
+            { "kind": "sleep", "ms": 4000 },
+            { "kind": "tool_use_start", "id": "tu_2", "name": "memory_search" },
+            { "kind": "tool_use_end", "input": {"query": "anything"} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "STANDALONE SUMMARY" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "compact then stop mid-compaction"}))
+            .send()
+            .expect("send")
+            .status()
+    });
+
+    harness.wait_until_in_flight(&id);
+    std::thread::sleep(Duration::from_millis(800));
+    let cancel = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/cancel", id),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204);
+    let _ = turn.join().expect("turn thread");
+
+    let messages = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", id),
+        )
+        .send()
+        .expect("send")
+        .text()
+        .expect("body");
+    assert!(
+        !messages.contains("STANDALONE SUMMARY"),
+        "a stop landing inside the compaction must not still replace the window with a summary \
+         written without the agent: {}",
+        messages
+    );
+}
+
+/// Stopping during an *emergency* compaction is reported as a stop, not as an overflow.
+///
+/// The emergency path turns any error from `compact_session` into `ContextOverflow`, which was
+/// harmless while that call could not fail on an interrupt. Now that it refuses to rewrite the
+/// window on a fired token, relabelling would answer a user who pressed stop with "the
+/// conversation exceeds the model's context window" -- and a 502 `/errors/context-overflow` --
+/// telling them to shorten a conversation that was never the problem.
+///
+/// Emergency skips the checkpoint by design, so the only window a cancel can land in is the
+/// summariser call; the mock holds it open with a sleep.
+#[test]
+fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() {
+    // A first, ordinary turn: the emergency path is gated on `messages.len() > 1`, so a
+    // conversation that is still just its opening prompt never reaches the compaction at all.
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "first turn" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "fail_context_overflow", "message": "too large" }
+        ],
+        [
+            { "kind": "sleep", "ms": 4000 },
+            { "kind": "text", "text": "an emergency summary" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "recovered" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "warm up"}))
+        .send()
+        .expect("send");
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let session = id.clone();
+    let turn = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({"message": "overflow then stop"}))
+            .send()
+            .expect("send")
+            .text()
+            .unwrap_or_default()
+    });
+
+    harness.wait_until_in_flight(&id);
+    std::thread::sleep(Duration::from_millis(800));
+    let cancel = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/cancel", id),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204);
+    let body = turn.join().expect("turn thread");
+
+    assert!(
+        !body.contains("context-overflow"),
+        "a stop during the emergency compaction must not be reported as a context overflow: {}",
+        body
+    );
+}
+
 /// The compaction SSE event is the one signal a streaming client has that its mirror of the
 /// conversation was rewritten mid-turn. Nothing asserted it before.
 #[test]
@@ -8240,12 +8583,14 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
             { "kind": "tool_use_end", "input": {} },
             { "kind": "message_end", "stop_reason": "tool_use" }
         ],
+        // The summariser draws first now that the drain runs mid-loop; the model's own reply is
+        // the round after it. Labelled in that order so the fixture reads as what happens.
         [
-            { "kind": "text", "text": "requested" },
+            { "kind": "text", "text": "a summary" },
             { "kind": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "a summary" },
+            { "kind": "text", "text": "the reply" },
             { "kind": "message_end", "stop_reason": "end_turn" }
         ]
     ]);

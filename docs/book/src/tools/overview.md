@@ -38,7 +38,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`memory_delete`](../usage/memory.md) | Read | Delete a saved memory |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
 | [`context_check`](./overview.md#context_check--context_compact) | Read | Measure the context window live: occupancy, headroom, compaction count |
-| [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction at the end of this turn |
+| [`context_compact`](./overview.md#context_check--context_compact) | Read | Ask for a compaction before the next step of this turn |
 | [`conversation_search`](./overview.md#conversation_search--conversation_read) | Read | Search the full conversation history, including compacted turns |
 | [`conversation_read`](./overview.md#conversation_search--conversation_read) | Read | Read conversation turns by index |
 | [`schedule_create`](../usage/scheduling.md) | Read | Schedule a future turn for this session |
@@ -287,7 +287,7 @@ Compactions so far: none, so nothing has been summarized away yet.
 
 This exists because the pushed `[Context budget]` block is rendered once, at the start of a turn, and so does not move while the agent works. During a long tool loop it is stale. See [What the Agent Sees](../usage/sessions.md#what-the-agent-sees).
 
-`context_compact` requests a compaction at the end of the current turn:
+`context_compact` requests a compaction before the agent's next step. It runs once the current batch of tool calls finishes, and the turn then continues against the summary; one request is honoured per turn.
 
 - `instructions` -- what to preserve or drop. Takes precedence over the default summary sections.
 - `keep_recent` -- whether to keep the most recent turns verbatim. Default `true`; `false` starts clean.

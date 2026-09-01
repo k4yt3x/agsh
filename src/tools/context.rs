@@ -32,12 +32,13 @@ use crate::{
     session::SessionManager,
 };
 
-/// A compaction the agent asked for, parked until the turn it was asked in finishes.
+/// A compaction the agent asked for, parked until the loop reaches a point that can run it.
 ///
 /// Tools hold no `&mut Conversation` - the agent loop owns it for the duration of the turn - so
-/// `context_compact` cannot compact where it stands. It records the request here and `run_turn`
-/// drains it once the tool loop is done, which also preserves the invariant that compaction happens
-/// between turns and never mid-loop.
+/// `context_compact` cannot compact where it stands. It records the request here and the tool loop
+/// drains it once the batch's results are in, which is what lets the turn carry on against the
+/// summary instead of ending at the request. A turn that fails before reaching that point leaves
+/// the request behind, and the drain after the loop takes it so it cannot fire against a later one.
 pub type PendingCompaction = Arc<std::sync::Mutex<Option<CompactRequest>>>;
 
 /// The summary a checkpoint turn submitted, and what it decided about the tail.
@@ -202,12 +203,26 @@ impl Tool for ContextCompactTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "context_compact".to_string(),
-            description: "Compact this conversation when the turn ends. Earlier turns become a \
-                          summary you write, after a checkpoint for saving anything that must \
-                          outlive them. Use it when a stretch of work is done rather than \
-                          waiting for auto-compaction mid-task. `conversation_search` still \
-                          reaches the full history."
-                .to_string(),
+            // Branched for the same reason the result below is: this is the only text the model
+            // reads *before* it decides. Told it will get a checkpoint on an installation that
+            // has none, it defers the one action that had to happen first, and the deferral is
+            // unrecoverable because the summary is written without it.
+            description: if self.checkpoint_enabled {
+                "Compact this conversation before your next step. Earlier turns become a summary \
+                 you write, after a checkpoint for saving anything that must outlive them, and \
+                 this turn then carries on against it. Use it when a stretch of work is done \
+                 rather than waiting for auto-compaction mid-task. `conversation_search` still \
+                 reaches the full history."
+                    .to_string()
+            } else {
+                "Compact this conversation before your next step. Earlier turns become a summary \
+                 written without you, and this turn then carries on against it. There is no \
+                 checkpoint on this installation, so save anything that must outlive this \
+                 conversation to memory in the same batch as this call: afterwards is too late. \
+                 Use it when a stretch of work is done rather than waiting for auto-compaction \
+                 mid-task. `conversation_search` still reaches the full history."
+                    .to_string()
+            },
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -249,18 +264,23 @@ impl Tool for ContextCompactTool {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Last call wins rather than first: a turn that asks twice most likely refined what it
-        // wanted, and refusing the second would silently apply the stale instructions.
+        // Last call wins rather than first, within the batch the loop drains as a unit: a model
+        // that asks twice before the drain most likely refined what it wanted, and keeping the
+        // first would silently apply the stale instructions. Across batches the decision is not
+        // here but at the drain, which acts on one request per turn and drops the rest.
         *pending = Some(request);
         Ok(ToolOutput::text(
             if self.checkpoint_enabled {
-                "Compaction will run when this turn ends. Finish what you are doing; you will get \
-                 a checkpoint to save anything durable before the summary replaces your context."
+                "Compaction runs once this batch of tool calls finishes, and then this turn \
+                 continues against the summary. You will get a checkpoint first, to save anything \
+                 durable. One compaction per turn; to compact again, ask on a later turn."
                     .to_string()
             } else {
-                "Compaction will run when this turn ends. There is no checkpoint on this \
-                 installation, so the summary will be written without you: save anything that \
-                 must outlive this conversation to memory now, before you finish this turn."
+                "Compaction runs once this batch of tool calls finishes, and then this turn \
+                 continues against the summary. There is no checkpoint on this installation, so \
+                 the summary is written without you and anything not already in memory is gone \
+                 from your context. One compaction per turn; to compact again, ask on a \
+                 later turn."
                     .to_string()
             },
             false,

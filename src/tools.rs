@@ -1482,12 +1482,12 @@ impl ToolRegistry {
 
         if self.background_enabled() {
             for definition in &mut definitions {
-                // `context_compact` is excluded: it does not do work, it parks a request that
-                // `run_turn` drains once the tool loop ends. Detaching it would race that drain -
-                // the spawned call may set the request after the drain has already run - leaving it
-                // to fire against the next, unrelated turn, which is the exact hazard the drain is
-                // written to prevent. It would also persist a `background_tasks` row for an
-                // operation that takes microseconds.
+                // `context_compact` is excluded: it does not do work, it parks a request the tool
+                // loop drains as soon as the batch's results are in. Detaching it would race that
+                // drain - the spawned call may set the request after the drain has already run -
+                // leaving it to fire a round later than the agent asked for, or against the next
+                // turn entirely. It would also persist a `background_tasks` row for an operation
+                // that takes microseconds.
                 if definition.name == "context_compact" {
                     continue;
                 }

@@ -163,6 +163,39 @@ pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
 /// overflows, looping won't help.
 const MAX_OVERFLOW_RETRIES: u32 = 1;
 
+/// How many compactions a single turn may honour on the agent's own request.
+///
+/// Each one costs a summariser call and, with `[session].compact_checkpoint` on, up to
+/// [`CHECKPOINT_MAX_ITERATIONS`] more. A model that asks again in the same turn is answered by the
+/// tool and then dropped, not carried forward: it can ask again on a later turn, and meanwhile a
+/// confused agent is bounded to one round rather than a loop.
+const MAX_REQUESTED_COMPACTIONS: u32 = 1;
+
+/// Say what a checkpoint durably wrote, on every path out of a compaction that ran one.
+///
+/// `/compact` reports this to the user directly (`render::compaction_summary`); the four automatic
+/// paths discard the outcome, so without this a reactive, proactive or agent-requested compaction
+/// would write instance-scoped notes with no trace at any verbosity. A function rather than a line
+/// at the end because an interrupt now returns early, and the writes are durable the moment they
+/// run: the report has to leave with the error too, not only with the summary.
+///
+/// `info!` rather than `warn!`: a lifecycle signpost, not a problem.
+fn report_checkpoint_memories(memories_written: &[String]) {
+    if memories_written.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "checkpoint wrote {} memor{}: {}",
+        memories_written.len(),
+        if memories_written.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        memories_written.join(", "),
+    );
+}
+
 /// What a turn is willing to destroy of its own content in order to get a request accepted, least
 /// damaging first. A tier that failed is undone before the next is tried, and running off the end
 /// fails the turn.
@@ -521,7 +554,8 @@ pub struct Agent {
     /// the agent itself: an estimate is good enough to inform a decision but not to drive one, and
     /// the real occupancy is already known exactly from [`Self::last_context_tokens`].
     context_overhead_tokens: Arc<std::sync::atomic::AtomicU64>,
-    /// A compaction `context_compact` asked for, drained by `run_turn` once the tool loop is done.
+    /// A compaction `context_compact` asked for, drained by the tool loop as soon as the batch's
+    /// results are in, so the turn that asked carries on against the summary.
     /// `None` on registries that never register the tool (sub-agents).
     pending_compaction: Option<crate::tools::context::PendingCompaction>,
     /// How many times this session has been compacted, for the `[Context budget]` block.
@@ -628,6 +662,11 @@ struct TurnRecovery {
     /// Bounds the emergency compact-and-retry on a [`MekaError::ContextOverflow`] so a request
     /// that stays too large after one compaction fails cleanly instead of looping.
     overflow_retries: u32,
+    /// Bounds the compactions this turn honours on the agent's own request, the way
+    /// [`Self::overflow_retries`] bounds the emergency one. Counted per turn rather than per
+    /// session: asking again on the next turn is a fresh decision, and refusing it there would
+    /// leave a long session unable to compact on purpose at all.
+    requested_compactions: u32,
     /// How many entries of [`DEGRADE_TIERS`] this turn has already spent, so a tier that failed is
     /// not tried again and the turn runs out of ideas after the last one. Bounds the
     /// degrade-and-retry the way [`Self::overflow_retries`] bounds the compact-and-retry, but
@@ -706,9 +745,37 @@ impl TurnRecovery {
             )
             .await
         {
+            // An interrupt is not an overflow, and became reachable here only once
+            // `compact_session` began refusing to rewrite the window on a fired token. Relabelling
+            // it would answer a user who pressed stop with "the conversation exceeds the model's
+            // context window", and under `serve` with a 502 `/errors/context-overflow` -- telling
+            // them to shorten a conversation that was never the problem.
+            if matches!(compact_error, MekaError::Interrupted) {
+                return Err(compact_error);
+            }
             tracing::warn!("emergency compaction failed: {}", compact_error);
             return Err(MekaError::ContextOverflow(reason));
         }
+        self.after_conversation_rewrite(agent, messages);
+        Ok(())
+    }
+
+    /// Re-anchor the turn against a conversation a compaction just replaced.
+    ///
+    /// Every number below addresses the *old* conversation, so leaving any of them costs the rest
+    /// of the turn: the request would be assembled from a base that no longer exists, and the
+    /// degrade-and-retry would measure itself against messages that are gone.
+    ///
+    /// Deliberately absent: `prompt_only_events`, whose staleness is exactly what stops a
+    /// withdrawal from firing against a rewritten log, and `overflow_retries`, which bounds the
+    /// emergency retry per turn and must survive a compaction to do that.
+    ///
+    /// Absent for a different reason: `pending_repair`. Both callers sit where it is already
+    /// `None` -- the overflow path undoes it first, and the tool loop's drain runs after
+    /// `persist_vindicated_repair` has taken it. A third caller placed before a 2xx would need to
+    /// undo the repair itself; this does not, and would otherwise leave the log describing a
+    /// conversation the compaction replaced.
+    fn after_conversation_rewrite(&mut self, agent: &Agent, messages: &Conversation) {
         self.base_messages = Arc::from(truncate_messages_for_context(
             messages.as_slice(),
             agent.options.context_messages,
@@ -716,7 +783,6 @@ impl TurnRecovery {
         self.turn_start_len = messages.len();
         self.suspect_floor = SUSPECT_FLOOR_AFTER_REWRITE;
         self.tiers_tried = 0;
-        Ok(())
     }
 
     /// Degrade the content appended since the last accepted request and retry, after the provider
@@ -1643,8 +1709,10 @@ impl Agent {
         *self.shared_session_id.write().await = Some(sid);
 
         // Auto-compact if the last turn's context occupancy exceeded the threshold fraction of the
-        // context window. This runs between turns (not mid-tool-loop) so the stable base_messages
-        // invariant is preserved.
+        // context window. This check runs between turns, before the loop opens, which is why it
+        // needs no re-anchoring of its own. Compaction itself is not confined here: the emergency
+        // retry and the agent's own `context_compact` both run inside the loop and re-anchor
+        // through `TurnRecovery::after_conversation_rewrite`.
         if let Some(threshold) = self.auto_compact_threshold() {
             let last_tokens = self
                 .last_context_tokens
@@ -1904,6 +1972,7 @@ impl Agent {
             suspect_floor,
             prompt_only_events,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: user_eagerly_saved,
@@ -2309,6 +2378,71 @@ impl Agent {
                     }
 
                     messages.append(result_message);
+
+                    // A compaction `context_compact` asked for, run here rather than after the
+                    // loop so the agent that chose the moment gets to act on the result: it takes
+                    // its checkpoint, then this turn carries on against the summary. Draining it
+                    // after the loop meant the one origin the agent picked was the only one that
+                    // never helped the turn it was picked in.
+                    //
+                    // After the whole batch, not the moment the tool ran: a `context_compact`
+                    // issued alongside other calls lets their results into the conversation being
+                    // summarised, and `keep_recent` (default true) keeps that fresh tail verbatim.
+                    //
+                    // The guard is dropped before the `.await` below; held across one it would make
+                    // this future non-`Send` and break every `tokio::spawn` of a turn.
+                    let requested = self.pending_compaction.as_ref().and_then(|pending| {
+                        pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                    });
+                    if let Some(request) = requested {
+                        // An early-out, not the safety net. `context_compact` ignores its
+                        // cancellation token, so the request outlives an interrupt; starting a
+                        // compaction on a turn the user has stopped spends a checkpoint attempt
+                        // and a summariser call for a result that is then thrown away. The
+                        // guarantee that the window survives lives at the other end, in
+                        // `compact_session`, which refuses to rewrite on a fired token and catches
+                        // the interrupt that arrives after this point too. The loop head breaks
+                        // the turn on the next pass, so dropping the request here is all that is
+                        // owed.
+                        if cancellation.is_cancelled() {
+                            tracing::debug!("dropping a compaction request on an interrupted turn");
+                        } else if recovery.requested_compactions < MAX_REQUESTED_COMPACTIONS {
+                            recovery.requested_compactions += 1;
+                            tracing::info!("compacting at the agent's request");
+                            match self
+                                .compact_session(
+                                    session_id,
+                                    messages,
+                                    request,
+                                    cancellation.clone(),
+                                )
+                                .await
+                            {
+                                // Every index the turn holds addresses the conversation this just
+                                // replaced.
+                                Ok(_) => recovery.after_conversation_rewrite(self, messages),
+                                // An interrupt is not a failure to report: the loop's own check
+                                // breaks the turn on the next pass, and warning here would put a
+                                // line about compaction in front of every Ctrl+C that lands
+                                // during one.
+                                Err(_) if cancellation.is_cancelled() => {}
+                                // Non-fatal otherwise, as it is on the post-loop path: the turn's
+                                // own work is what the user asked for, and it can still finish
+                                // uncompacted.
+                                Err(error) => {
+                                    tracing::warn!("requested compaction failed: {}", error)
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                "ignoring a second compaction request in one turn; the agent may \
+                                 ask again next turn"
+                            );
+                        }
+                    }
                 } else {
                     // No tool calls: the assistant message stands alone and ends the turn. Save it
                     // before breaking so the persistent log includes it.
@@ -2416,8 +2550,11 @@ impl Agent {
             _ => {}
         }
 
-        // A compaction `context_compact` asked for, run now that the tool loop has drained and the
-        // turn's events are persisted.
+        // The sweeper for a request the tool loop's own drain never reached. A turn that parked one
+        // and then failed before that drain is the only way to arrive here holding a request, and
+        // the `result.is_ok()` below then declines to act on it -- so this exists to empty the
+        // slot, not to compact. Emptying it is the load-bearing half: the slot outlives the
+        // turn.
         //
         // Taken in its own binding rather than inside the `if` below so the `std::sync::MutexGuard`
         // is dropped before the `.await`; held across one it would make this future non-`Send` and
@@ -3471,6 +3608,34 @@ impl Agent {
                 .into_iter()
                 .collect();
 
+        // The last point before the window is destroyed, and the only one that catches an interrupt
+        // arriving *inside* the compaction rather than before it. Nothing above here is cancellable
+        // end to end: `run_checkpoint_turn` answers a fired token with `Ok(None)` rather than an
+        // error, which sends it on to the summariser, and `provider.complete` takes no token at
+        // all. Without this a stop lands, the summariser is paid for anyway, and the conversation
+        // is replaced by a summary written without the agent -- the checkpoint it would have had is
+        // exactly what the fired token skipped.
+        //
+        // Every origin but `Manual`, and the exception is the point rather than an oversight. A
+        // compaction the *turn* asked for is incidental to work the user has just stopped, so
+        // stopping it is what was meant. `/compact` is the opposite: the compaction is itself the
+        // thing asked for, and an interrupt there ends the checkpoint and falls back to the
+        // summariser rather than abandoning the request. That is pinned by
+        // `an_interrupt_ends_the_checkpoint_and_falls_back`, and is why this cannot simply test
+        // the token.
+        //
+        // Memories the checkpoint already wrote stay written; they are durable the moment they run
+        // and are not this call's to undo.
+        if request.origin != CompactOrigin::Manual && cancellation.is_cancelled() {
+            // Reported before returning for the same reason the success path reports it: a
+            // checkpoint that wrote memories and then hit the interrupt has left durable,
+            // instance-scoped notes on disk, and every automatic path discards the outcome. The
+            // `info!` below is unreachable from here, so without this the writes leave no trace at
+            // any verbosity.
+            report_checkpoint_memories(&memories_written);
+            return Err(MekaError::Interrupted);
+        }
+
         let summary_user_message = Message::user(&context_message);
         messages.replace_for_compaction(
             summary_user_message,
@@ -3536,6 +3701,12 @@ impl Agent {
         // The model's view of which files it has read is reset by the summary; drop the
         // read-tracker so `edit_file` re-reads rather than trusting a pre-compaction read (also
         // bounds its growth).
+        //
+        // Since `context_compact` began draining mid-turn this also forgets reads the *current*
+        // turn made, so an `edit_file` after a compaction it asked for is refused until the file is
+        // read again. Kept deliberately: whether the read survived depends on where the kept tail
+        // was cut, and re-reading costs a call where trusting a read that fell out of the window
+        // costs a blind edit.
         self.tool_registry.clear_read_tracker().await;
 
         // Same reasoning for the tool/skill/MCP picture: the turns that carried it are now behind
@@ -3561,22 +3732,7 @@ impl Agent {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // `/compact` reports this to the user directly (`render::compaction_summary`); the four
-        // automatic paths discard the outcome, so without this line a reactive, proactive or
-        // agent-requested compaction would write durable, instance-scoped notes with no trace at
-        // any verbosity. `info!` rather than `warn!`: this is a lifecycle signpost, not a problem.
-        if !memories_written.is_empty() {
-            tracing::info!(
-                "checkpoint wrote {} memor{}: {}",
-                memories_written.len(),
-                if memories_written.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                memories_written.join(", "),
-            );
-        }
+        report_checkpoint_memories(&memories_written);
 
         // One more generation of remove from the original turns. Left alone when the count has not
         // been read yet, so the lazy seed below still picks up the true figure including this one.
@@ -4475,10 +4631,16 @@ fn should_retry_provider_error(
 /// the checkpoint was interrupted and `compact_session` has fallen back to
 /// [`Agent::summarize_via_provider`], which is the tier that guarantees the window actually
 /// shrinks; `an_interrupt_ends_the_checkpoint_and_falls_back` pins that. Refusing to send on a
-/// cancelled token would make Ctrl+C during an auto-compaction leave the conversation exactly as
+/// cancelled token would make Ctrl+C during a `/compact` leave the conversation exactly as
 /// oversized as it was, so the next turn fails on a window the user believes they just reclaimed.
 /// What the user stopped is the long agentic checkpoint, which stops; one summarisation call is
 /// what stopping it costs.
+///
+/// True of `Manual` only, since `compact_session` began refusing to rewrite on a fired token for
+/// every other origin. There the summary this returns is discarded rather than applied, so the
+/// call is paid for and thrown away -- the price of the summariser having no cancellation point of
+/// its own, and the reason the tool loop declines to start a compaction it already knows is
+/// stopped.
 async fn complete_with_retry(
     provider: &Arc<dyn Provider>,
     system_prompt: &str,
@@ -4951,6 +5113,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
@@ -5025,6 +5188,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
@@ -6122,6 +6286,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -6278,6 +6443,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -6339,6 +6505,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -8527,6 +8694,7 @@ mod tests {
             suspect_floor: 0,
             prompt_only_events: 0,
             overflow_retries: 0,
+            requested_compactions: 0,
             tiers_tried: 1,
             pending_repair: None,
             user_saved: true,
