@@ -18,6 +18,10 @@ Those editors only reach the keys they own, so a bad key anywhere else (`[sessio
 
 Set the `MEKA_CONFIG_DIR` environment variable to override the default location entirely. The value points at the `meka` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
 
+Everything meka keeps in that directory is content you put there: `config.toml`, `skills/`, and `instructions.md` or `instructions/` if you use them. It is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
+
+Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
+
 ## Providers
 
 Providers are configured as **named profiles** under `[providers.<name>]`. Each profile pins a

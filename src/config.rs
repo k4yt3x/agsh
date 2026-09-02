@@ -2222,6 +2222,97 @@ fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
+/// `(device, inode)` on Unix, `(volume serial, file index)` on Windows: what makes "the thing I
+/// locked" and "the thing at this path" the same question.
+type FileIdentity = (u64, u64);
+
+/// Read the identity of an already-open file, from the descriptor rather than the path.
+///
+/// A platform that is neither Unix nor Windows gets a compile error here rather than a lock nothing
+/// revalidates.
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain data with no niche, so an all-zero value is a
+    // valid one to hand out for filling.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is borrowed from a live `File` for the duration of the call, and the
+    // pointer is to a stack local of exactly the type the call expects.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+/// How many times [`lock_path`] will re-take a lock whose resource was replaced underneath it.
+///
+/// A retake costs one extra wait, and each one needs the resource to have been replaced while this
+/// process was blocked on the previous inode. Bounded so a caller cannot wait forever on something
+/// replacing the resource in a loop.
+const MAX_LOCK_RETAKES: usize = 32;
+
+/// An exclusive `flock` keyed to the inode currently at a path, so a lock can be taken on the
+/// resource itself rather than on a file beside it.
+///
+/// Holding the open file is holding the lock: closing the descriptor releases it, on drop or when
+/// the kernel reaps the process.
+pub(crate) struct PathLock {
+    _file: std::fs::File,
+}
+
+/// Take [`PathLock`] on `path`, opened by `open`, and prove afterwards that it is still the live
+/// resource.
+///
+/// A waiter blocks on the inode it opened, and that inode can be removed and something else
+/// recreated under the same name before it wakes. Re-reading the identity is what stops it holding
+/// an unlinked inode nobody else can reach while the next arrival locks the replacement, each blind
+/// to the other.
+///
+/// The window this closes is the wait, not the whole critical section: a replacement landing after
+/// the check leaves the holder on the old inode with no way to notice, exactly as it would have
+/// left a lock file that the same `rm -rf` deleted. Nothing here defends against that.
+///
+/// Each iteration blocks in the kernel rather than polling, and only repeats when the check fails.
+pub(crate) fn lock_path(
+    path: &Path,
+    open: fn(&Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<PathLock> {
+    for _ in 0..MAX_LOCK_RETAKES {
+        let file = open(path)?;
+        let held = file_identity(&file)?;
+        file.lock()?;
+
+        let live = open(path).and_then(|current| file_identity(&current));
+        match live {
+            Ok(live) if live == held => return Ok(PathLock { _file: file }),
+            _ => drop(file),
+        }
+    }
+    // Not `WouldBlock`, which promises the caller that nothing was attempted and a retry may work.
+    // This call did block, repeatedly, and gave up.
+    Err(std::io::Error::other(format!(
+        "gave up locking '{}' after {} retakes; something is replacing it continuously",
+        path.display(),
+        MAX_LOCK_RETAKES
+    )))
+}
+
 /// Exclusive cross-process lock over `config.toml`, held for a whole read-modify-write.
 ///
 /// Every editor of the file reads it, mutates a `toml_edit` document, and writes the whole thing
@@ -2232,19 +2323,17 @@ fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
 /// `ProviderRegistry::device_id_for` the first time a `claude-subscription` profile that states
 /// none is resolved.
 ///
-/// The lock lives beside the file rather than on it, because the editors replace the file by rename
-/// and a lock held on the replaced inode would guard nothing.
+/// Taken on the config directory wherever the platform allows it, so a tree people keep under
+/// version control gains no lock file; [`open_config_lock_target`] has why the directory rather
+/// than the file, and the platform that cannot do either.
+///
 /// Reentrant within a thread. `flock` is associated with the open file description, so a second
-/// `open` in the same process conflicts with the first exactly as another process would: nesting
-/// `lock_config_file()` inside a held one self-deadlocks. That nesting is real -- `meka mcp add` on
-/// an HTTPS URL holds the lock and then calls `persist_auth_block_for`, which wants it too -- so
-/// the depth is tracked and only the outermost acquisition touches the file.
+/// `open` in the same process conflicts with the first exactly as another process would, and a
+/// nested `lock_config_file()` would self-deadlock; the depth counter is what keeps the outermost
+/// acquisition the only one that touches the file.
 pub(crate) enum ConfigFileLock {
     /// The outermost acquisition on this thread; owns the `flock` and releases it on drop.
-    Held {
-        _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
-        _lock: Box<fd_lock::RwLock<std::fs::File>>,
-    },
+    Held { _lock: PathLock },
     /// A nested acquisition. The outer guard still holds the file; this one only keeps the depth
     /// accurate so the outer release happens at the right moment.
     Reentrant,
@@ -2270,6 +2359,33 @@ impl Drop for ConfigFileLock {
     }
 }
 
+/// Open whichever inode carries the config lock.
+///
+/// The directory, not `config.toml`. Editors publish the file by `rename`, so a lock on the file
+/// stops excluding anyone the moment its holder writes: the holder is left on an unlinked inode
+/// while an arrival locks the replacement and enters a section the holder has not left.
+/// [`crate::mcp::cli`]'s `purge_server` would notice, revoking a credential over the network after
+/// its write. A directory's inode survives every write beneath it, and locking one adds no file to
+/// a tree people keep under version control.
+#[cfg(unix)]
+fn open_config_lock_target(directory: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(directory)
+}
+
+/// A file, because Windows locks are mandatory rather than advisory and `File::lock` takes the
+/// whole byte range, so a lock on `config.toml` makes it unreadable to the read-modify-write
+/// holding it -- `ERROR_LOCK_VIOLATION` from `read_to_string` on the owning thread. `LockFileEx`
+/// also rejects a directory handle with `ERROR_INVALID_PARAMETER`, leaving nowhere else to put it.
+#[cfg(windows)]
+fn open_config_lock_target(directory: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(directory.join(".config.toml.lock"))
+}
+
 /// Take [`ConfigFileLock`]. Blocks until the holder releases it, which is right for a CLI edit:
 /// the alternative is failing a `meka mcp add` because a background `device_id` write happened to
 /// be in flight.
@@ -2281,26 +2397,23 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
 
     let directory = meka_config_dir()
         .ok_or_else(|| std::io::Error::other("could not determine the config directory"))?;
+    // 0700 straight from `mkdir(2)`, as [`write_file_atomic`] does. A pre-existing directory is
+    // left alone here and tightened by that function on the write this lock is being taken for,
+    // which is also the only place that knows whether a symlink took the write out of meka's tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&directory)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&directory)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(directory.join(".config.toml.lock"))?;
 
-    let mut lock = Box::new(fd_lock::RwLock::new(file));
-    let guard = lock.write()?;
-    // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
-    // lock's heap address is stable for as long as the box lives, and the field order above drops
-    // `_guard` before `_lock`. Same shape as `FileLock` in `crate::session`.
-    let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
-        unsafe { std::mem::transmute(guard) };
+    let lock = lock_path(&directory, open_config_lock_target)?;
     CONFIG_LOCK_DEPTH.with(|depth| depth.set(1));
-    Ok(ConfigFileLock::Held {
-        _guard: guard,
-        _lock: lock,
-    })
+    Ok(ConfigFileLock::Held { _lock: lock })
 }
 
 /// Write `content` to `path` atomically: serialise to a `<name>.<pid>.<seq>.tmp` beside it,
@@ -6069,11 +6182,6 @@ thinking = "budgeted"
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new\n");
     }
 
-    /// Dotfile managers (stow, chezmoi, yadm) leave `config.toml` as a link into a tracked repo.
-    /// `rename(2)` replaces the directory entry, so writing without resolving first turned the link
-    /// into a regular file: the tracked copy went stale, every later edit diverged from it, and the
-    /// next `stow --restow` reverted them all. The write has to land on the target.
-    #[cfg(unix)]
     /// `write_file_atomic` makes each *write* atomic, which does nothing for a lost update: two
     /// editors that each read, mutate and write back will silently discard whichever finished
     /// first. The lock is what makes the read and the write one critical section.
@@ -6149,6 +6257,154 @@ thinking = "budgeted"
         drop(reacquired);
 
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+    }
+
+    /// Taking the lock must not add a file to the config directory. People keep that directory in a
+    /// dotfiles repository, and a lock file there is a working-tree change meka had no reason to
+    /// make. Windows is excluded because it writes `.config.toml.lock` there by design; see
+    /// [`open_config_lock_target`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn taking_the_config_lock_adds_nothing_to_the_config_directory() {
+        let _env = CONFIG_DIR_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // touches it and is held across the whole set -> use -> clear cycle.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+
+        let held = lock_config_file().expect("lock");
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read config dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        drop(held);
+
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        // The directory is the lock, so a command that takes it and then bails writes nothing at
+        // all -- not even an empty `config.toml`.
+        assert!(entries.is_empty(), "locking created {entries:?}");
+    }
+
+    /// A write must not end the critical section it happens inside.
+    ///
+    /// Callers hold the lock past their write: `purge_server` revokes a credential over the network
+    /// after writing `config.toml`. Keying the lock to the file's inode would let the next arrival
+    /// in the instant the publishing `rename` lands, while the holder is still working.
+    #[tokio::test]
+    async fn writing_the_config_does_not_release_the_lock_held_across_it() {
+        let _env = CONFIG_DIR_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "counter = 0\n").expect("seed");
+
+        let held = lock_config_file().expect("lock");
+        write_file_atomic(&path, "counter = 1\n").expect("publish over the file being guarded");
+
+        let contender = std::thread::spawn(|| drop(lock_config_file().expect("contender")));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let contender_got_in = contender.is_finished();
+
+        drop(held);
+        contender.join().expect("contender");
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        assert!(
+            !contender_got_in,
+            "the write let a second process in while the first was still holding the lock"
+        );
+    }
+
+    /// A waiter must end up on whatever the path names when it wakes, not on what it queued on.
+    ///
+    /// Replacing the target while a waiter is blocked on it leaves that waiter holding an unlinked
+    /// inode, free for the next arrival to lock the live one and enter alongside it. The identity
+    /// re-check in [`lock_path`] is what closes that window.
+    ///
+    /// Pinned from the outside: while the woken waiter holds the lock, a third acquisition must
+    /// block. It does not if the waiter is holding the dead inode. The waiter also has to have
+    /// *waited*, or it reached `open` after the rename and never took the retake path at all.
+    #[test]
+    fn a_waiter_ends_up_holding_whatever_replaced_what_it_waited_for() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        fn open(path: &Path) -> std::io::Result<std::fs::File> {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("target");
+        std::fs::write(&path, b"first").expect("seed");
+
+        let first = lock_path(&path, open).expect("first");
+
+        // Queues on the inode that is about to be replaced.
+        let waiter_holds = Arc::new(AtomicBool::new(false));
+        let waiter_may_release = Arc::new(AtomicBool::new(false));
+        let waiter = std::thread::spawn({
+            let (path, holds, may_release) = (
+                path.clone(),
+                waiter_holds.clone(),
+                waiter_may_release.clone(),
+            );
+            move || {
+                let queued_at = std::time::Instant::now();
+                let held = lock_path(&path, open).expect("waiter");
+                let waited = queued_at.elapsed();
+                holds.store(true, Ordering::SeqCst);
+                while !may_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                drop(held);
+                waited
+            }
+        });
+
+        // Let it block, then publish a new inode over the one it is waiting on and release.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"second").expect("replacement");
+        std::fs::rename(&replacement, &path).expect("publish a new inode");
+        drop(first);
+
+        while !waiter_holds.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The waiter now holds what it believes is the lock. Prove it is the live one.
+        let contender = std::thread::spawn({
+            let path = path.clone();
+            move || drop(lock_path(&path, open).expect("contender"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let contender_got_in = contender.is_finished();
+
+        waiter_may_release.store(true, Ordering::SeqCst);
+        let waited = waiter.join().expect("waiter");
+        contender.join().expect("contender");
+
+        // Without this the test can pass for the wrong reason: a waiter slow enough to reach `open`
+        // after the rename locks the live inode first time and never exercises the retake at all.
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "the waiter took {waited:?}, so it never queued on the inode that was replaced"
+        );
+        assert!(
+            !contender_got_in,
+            "a third acquisition took the lock while the waiter held it, so the waiter is holding \
+             an inode that is no longer at the path"
+        );
     }
 
     /// Concurrent writers of one path must not splice their contents together.

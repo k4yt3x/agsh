@@ -701,6 +701,11 @@ fn skill_remove_waits_for_a_store_lock_another_process_holds() {
     )
     .expect("seed");
 
+    // Hold the lock the way another meka would: the store root itself, or on Windows the sidecar
+    // that `LockFileEx` needs because it refuses a directory handle.
+    #[cfg(unix)]
+    let lock_file = std::fs::File::open(&skills).expect("open the store root");
+    #[cfg(windows)]
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -708,8 +713,7 @@ fn skill_remove_waits_for_a_store_lock_another_process_holds() {
         .truncate(false)
         .open(skills.join(".meka-store.lock"))
         .expect("open the store lock");
-    let mut lock = fd_lock::RwLock::new(lock_file);
-    let guard = lock.write().expect("hold the store lock");
+    lock_file.lock().expect("hold the store lock");
 
     let mut blocked = meka()
         .env("MEKA_CONFIG_DIR", &config)
@@ -727,7 +731,7 @@ fn skill_remove_waits_for_a_store_lock_another_process_holds() {
         "and must not have removed anything yet"
     );
 
-    drop(guard);
+    drop(lock_file);
     assert!(blocked.wait().expect("wait").success(), "then it completes");
     assert!(!skills.join("victim").exists(), "and the skill is gone");
 }

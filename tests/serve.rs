@@ -8688,7 +8688,7 @@ fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
 
 /// Two requests arriving together for a session this process has evicted must both be served.
 ///
-/// Reconstruction takes the session's cross-process `fd_lock`, so without serialisation the loser
+/// Reconstruction takes the session's cross-process file lock, so without serialisation the loser
 /// raced the winner for it and got a `session-locked` 409 whose documented remedy ("retry against
 /// the process that holds it") pointed at this very process. `lock_session_reconstruction` makes
 /// the loser wait and then find the winner's entry.
@@ -9504,9 +9504,8 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
         .truncate(false)
         .open(&lock_path)
         .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
-    let mut held = fd_lock::RwLock::new(held);
-    let _guard = held
-        .try_write()
+    // Released where `held` closes, at the end of the test.
+    held.try_lock()
         .expect("the worker's lock is free for this test to take");
 
     let refused = harness

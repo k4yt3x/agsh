@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.44.3"
+version = "0.44.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -21,7 +21,6 @@ crossterm = "0.29"
 dirs = "6"
 eventsource-stream = "0.2"
 fast_html2md = "0.0"
-fd-lock = "4"
 futures = "0.3"
 glob = "0.3"
 grep-matcher = "0.1"
@@ -76,7 +75,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 winres = "0.1"
 
 [dev-dependencies]
-fd-lock = "4"
 filetime = "0.2.29"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"

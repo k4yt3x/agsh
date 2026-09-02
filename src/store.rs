@@ -152,11 +152,15 @@ pub(crate) fn editor_command(path: &std::path::Path) -> Option<std::process::Com
     Some(command)
 }
 
-/// Name of the lock file the skill store keeps in its root. Ignored by discovery, which walks
-/// directories.
+/// Name of the sidecar lock file in a store root, which Windows needs because `LockFileEx` refuses
+/// a directory handle. Ignored by discovery, which walks directories.
+#[cfg(windows)]
 const STORE_LOCK_FILE: &str = ".meka-store.lock";
 
 /// An exclusive `flock` on one store root, held until dropped.
+///
+/// Taken on the root directory itself wherever the platform allows it, for the reason
+/// `config::open_config_lock_target` gives; Windows alone still needs a file.
 ///
 /// A skill write is read-modify-write: read `SKILL.md`, compose the new contents from what was
 /// read, write it back. Nothing else serialises them across processes. `config.toml` has had
@@ -170,8 +174,7 @@ const STORE_LOCK_FILE: &str = ".meka-store.lock";
 /// published file was a mixture of two documents. They cannot stop a lost update, because both
 /// writers are behaving correctly at the file level and simply disagree about what was there.
 pub(crate) struct StoreLock {
-    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
-    _lock: Box<fd_lock::RwLock<std::fs::File>>,
+    _lock: crate::config::PathLock,
 }
 
 /// Take [`StoreLock`] on `root`. Blocks until any other holder releases it.
@@ -200,28 +203,24 @@ pub(crate) fn lock_store(root: &std::path::Path) -> std::io::Result<StoreLock> {
     #[cfg(not(unix))]
     std::fs::create_dir_all(root)?;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true).truncate(false);
-    // The lock file is meka's own bookkeeping and sits inside the store; no reason for it to be
-    // the one world-readable thing in a 0700 directory.
+    // The root directory, for the reason `config::open_config_lock_target` gives: entries beneath
+    // it are published by rename, so a lock on one stops excluding when its holder writes.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(root.join(STORE_LOCK_FILE))?;
+    let lock = crate::config::lock_path(root, |path| std::fs::File::open(path))?;
 
-    let mut lock = Box::new(fd_lock::RwLock::new(file));
-    let guard = lock.write()?;
-    // SAFETY: `guard` borrows from `*lock`. The box is moved, not the `RwLock` inside it, so the
-    // lock's heap address is stable for as long as the box lives, and the field order above drops
-    // `_guard` before `_lock`. Same shape as `ConfigFileLock` and `FileLock`.
-    let guard: fd_lock::RwLockWriteGuard<'static, std::fs::File> =
-        unsafe { std::mem::transmute(guard) };
-    Ok(StoreLock {
-        _guard: guard,
-        _lock: lock,
-    })
+    // `LockFileEx` rejects a directory handle with `ERROR_INVALID_PARAMETER` even when
+    // `FILE_FLAG_BACKUP_SEMANTICS` opened it, so Windows locks a file inside the root instead.
+    #[cfg(windows)]
+    let lock = crate::config::lock_path(&root.join(STORE_LOCK_FILE), |path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+    })?;
+
+    Ok(StoreLock { _lock: lock })
 }
 
 /// Refuse a store path that is a symlink, so a write stays inside the store it was aimed at.
@@ -517,7 +516,7 @@ mod tests {
     }
     use super::*;
 
-    /// The store root is created at 0700, and its lock file at 0600.
+    /// The store root is created at 0700.
     ///
     /// This is the only thing that runs on a delete-only path, and it runs before
     /// [`crate::config::write_file_atomic`] on every write path, so a `create_dir_all` taking the
@@ -525,7 +524,7 @@ mod tests {
     /// names are exactly what it should not be publishing to every local user.
     #[cfg(unix)]
     #[test]
-    fn a_store_root_and_its_lock_file_are_private() {
+    fn a_store_root_is_private() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -540,16 +539,57 @@ mod tests {
                 & 0o777
         };
         assert_eq!(mode(&root), 0o700, "store root created world-listable");
-        assert_eq!(
-            mode(&root.join(STORE_LOCK_FILE)),
-            0o600,
-            "the lock file is meka's own bookkeeping inside a 0700 directory"
-        );
         drop(guard);
 
         // Idempotent: locking an existing root neither fails nor loosens it.
         drop(lock_store(&root).expect("lock again"));
         assert_eq!(mode(&root), 0o700);
+    }
+
+    /// Claiming a store must not put anything inside it. Users keep skill stores in a git
+    /// repository, and a lock file there is a working-tree change meka had no reason to make.
+    #[cfg(unix)]
+    #[test]
+    fn locking_a_store_leaves_nothing_behind_in_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("store");
+        let guard = lock_store(&root).expect("lock");
+
+        let entries: Vec<_> = std::fs::read_dir(&root)
+            .expect("read store root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "locking the store created {entries:?} inside it"
+        );
+        drop(guard);
+    }
+
+    /// The claim is real, not merely file-free: a second acquisition waits for the first.
+    #[test]
+    fn a_store_lock_excludes_a_second_holder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("store");
+        let guard = lock_store(&root).expect("lock");
+
+        let contender = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let taken = lock_store(&root).expect("second lock");
+                drop(taken);
+            })
+        };
+
+        // The contender cannot finish while the first lock is held.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !contender.is_finished(),
+            "a second holder took the store lock while it was held"
+        );
+        drop(guard);
+        contender.join().expect("contender");
     }
 
     /// A name becomes a file name, and Windows reserves these regardless of extension. Rejected on

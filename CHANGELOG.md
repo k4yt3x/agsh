@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.4] - 2026-09-02
+
+### Changed
+
+- Editing config locks the config directory, so no `.config.toml.lock` is written on Unix.
+- A skill store is claimed by locking its directory, so no `.meka-store.lock` is written on Unix.
+- File locks use `std::fs::File`, so meka no longer depends on `fd-lock` directly.
+
 ## [0.44.3] - 2026-09-01
 
 ### Changed
@@ -1772,7 +1780,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.3...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.4...HEAD
+[0.44.4]: https://github.com/k4yt3x/meka/compare/0.44.3...0.44.4
 [0.44.3]: https://github.com/k4yt3x/meka/compare/0.44.2...0.44.3
 [0.44.2]: https://github.com/k4yt3x/meka/compare/0.44.1...0.44.2
 [0.44.1]: https://github.com/k4yt3x/meka/compare/0.44.0...0.44.1

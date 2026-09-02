@@ -2234,7 +2234,7 @@ mod tests {
     ///
     /// Isolated, because the thing under test *writes a config file and takes a cross-process file
     /// lock*. Unisolated it read the developer's real `~/.claude.json`, then `create_dir_all`ed and
-    /// `flock`ed `~/.config/meka/.config.toml.lock` with no timeout, so a `meka` running in another
+    /// `flock`ed `~/.config/meka` with no timeout, so a `meka` running in another
     /// terminal would hang `cargo test` outright. It escaped rewriting the real `config.toml` only
     /// because `persist` bails when no profile of that name is there to write into, which is luck
     /// rather than design: a developer with a profile named `sub` had their device id rewritten.

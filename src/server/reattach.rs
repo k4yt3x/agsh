@@ -93,7 +93,7 @@ pub async fn require_session_exists(state: &ServerState, id: Uuid) -> Result<(),
 
 /// One reconstruction at a time per session id.
 ///
-/// Reconstruction takes the session's `fd_lock`, so two requests arriving together for a session
+/// Reconstruction takes the session's file lock, so two requests arriving together for a session
 /// this process has not loaded raced: the loser got a `session-locked` 409 whose documented remedy
 /// ("another process holds it") was wrong, because the holder was this process, a millisecond
 /// ahead. Serialising makes the loser wait and then find the winner's entry on the re-check below.

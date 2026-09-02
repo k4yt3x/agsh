@@ -27,7 +27,6 @@ use std::{
     sync::Arc,
 };
 
-use fd_lock::{RwLock as FdRwLock, RwLockWriteGuard as FdRwLockWriteGuard};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tokio_rusqlite::Connection;
@@ -251,24 +250,9 @@ impl Drop for EphemeralLockDir {
 /// Two things are locked this way: a session, so only one meka is ever attached to a conversation,
 /// and a provider profile's credential, so only one meka at a time is rotating its refresh token.
 ///
-/// Internally this is a self-referential struct: `guard` borrows from `*lock` (a `Box` for stable
-/// heap address). The explicit [`Drop`] impl drops `guard` before `lock` regardless of field
-/// declaration order, the safety invariant of the lifetime transmute used during construction.
+/// Closing the descriptor is what releases the lock, so holding the file is holding the claim.
 pub struct FileLock {
-    guard: std::mem::ManuallyDrop<FdRwLockWriteGuard<'static, File>>,
-    lock: std::mem::ManuallyDrop<Box<FdRwLock<File>>>,
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // SAFETY: `guard` borrows from `*lock`; drop it first so the borrow never outlives the
-        // borrowee. This ordering is explicit here and does not depend on the field declaration
-        // order above. Neither field is touched again after this.
-        unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.guard);
-            std::mem::ManuallyDrop::drop(&mut self.lock);
-        }
-    }
+    _file: File,
 }
 
 /// Where a session's lock lives while a host and its agent both need to reach it.
@@ -344,29 +328,15 @@ fn try_lock_file(path: &std::path::Path) -> Result<Option<FileLock>> {
             ))
         })?;
 
-    let mut lock = Box::new(FdRwLock::new(file));
-    let guard = match lock.try_write() {
-        Ok(guard) => guard,
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(error) => {
-            return Err(MekaError::Database(format!(
-                "failed to acquire lock '{}': {}",
-                path.display(),
-                error
-            )));
-        }
-    };
-
-    // SAFETY: `guard` borrows from `*lock`. We move the box (not the RwLock inside it) into the
-    // returned `FileLock`, so the RwLock's heap address is stable for as long as the box lives. The
-    // explicit `Drop` impl on `FileLock` drops `guard` before `lock`, so the borrow never outlives
-    // the borrowee.
-    let guard: FdRwLockWriteGuard<'static, File> = unsafe { std::mem::transmute(guard) };
-
-    Ok(Some(FileLock {
-        guard: std::mem::ManuallyDrop::new(guard),
-        lock: std::mem::ManuallyDrop::new(lock),
-    }))
+    match file.try_lock() {
+        Ok(()) => Ok(Some(FileLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(MekaError::Database(format!(
+            "failed to acquire lock '{}': {}",
+            path.display(),
+            error
+        ))),
+    }
 }
 
 /// How long to keep trying to convert a rollback-journal database to WAL before giving up.
@@ -1011,21 +981,20 @@ impl SessionManager {
         // held for the whole of the schema work so the check and the write it authorises cannot be
         // split. The loser waits, then re-runs against the winner's finished schema and no-ops.
         let lock_path = self.lock_dir.join(format!("{}.lock", SCHEMA_LOCK_STEM));
-        let mut lock_file = FdRwLock::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|error| {
-                    MekaError::Database(format!(
-                        "failed to open schema lock '{}': {}",
-                        lock_path.display(),
-                        error
-                    ))
-                })?,
-        );
-        let _schema_guard = lock_file.write().map_err(|error| {
+        let schema_lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to open schema lock '{}': {}",
+                    lock_path.display(),
+                    error
+                ))
+            })?;
+        // Released where `schema_lock_file` closes, at the end of this function.
+        schema_lock_file.lock().map_err(|error| {
             MekaError::Database(format!(
                 "failed to acquire schema lock '{}': {}",
                 lock_path.display(),
