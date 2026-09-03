@@ -4331,6 +4331,7 @@ mod tests {
             scratchpad_name: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
+            announced_at: None,
             delivered_at: None,
         }
     }

@@ -43,6 +43,21 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    /// Whether a finished task should wake a host, or wait for the next turn to carry it.
+    ///
+    /// Every terminal outcome is delivered; this decides only whether delivering it is worth a turn
+    /// nobody asked for. A cancellation is always somebody's deliberate act -- `/tasks cancel`, the
+    /// `task_cancel` tool, a second Ctrl+C, `POST .../cancel` -- so the one party who would learn
+    /// something from the turn already knows, and a command whose whole purpose is to stop work
+    /// would be starting some. The outcome still reaches the model, on the next turn there is.
+    ///
+    /// The others are nobody's decision: a build finished, a tool failed, or a host died holding
+    /// the task. The agent asked to be told about the first two and cannot infer the third, and
+    /// there may be no human about to type.
+    pub fn wakes_a_host(self) -> bool {
+        !matches!(self, Self::Cancelled)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -101,6 +116,10 @@ pub struct BackgroundTask {
     pub scratchpad_name: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// When subscribers were told, which is the poller's job and happens whether or not a session
+    /// is ever live again. Separate from `delivered_at` because the two stopped coinciding once an
+    /// outcome could wait for a turn instead of causing one.
+    pub announced_at: Option<DateTime<Utc>>,
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
@@ -349,6 +368,173 @@ pub const OUTCOME_INLINE_LIMIT: usize = 4 * 1024;
 /// Longest task label shown in the `[Background]` index and in delivered headers.
 pub const LABEL_MAX_CHARS: usize = 80;
 
+/// What a wake should do with the outcomes waiting on it.
+///
+/// A REPL wake has two doors -- the outcome watcher and `wake_would_produce_work` for a due job --
+/// so the arm cannot infer from *being woken* what woke it. Asked twice per wake, first of what is
+/// pending to decide whether to claim at all, then of what was actually claimed. One definition, so
+/// the two answers cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeDelivery {
+    /// Leave them undelivered. Claiming would stamp an outcome that nothing goes on to deliver.
+    Wait,
+    /// Something in the batch is nobody's decision, so it earns a turn of its own.
+    OwnTurn,
+    /// Nothing in the batch warrants a turn, but a job fired: it rides that job's prompt.
+    RideAFiredJob,
+}
+
+impl OutcomeDelivery {
+    /// Whether this answer justifies stamping the batch delivered.
+    pub fn claims(self) -> bool {
+        !matches!(self, Self::Wait)
+    }
+}
+
+/// Decide [`OutcomeDelivery`] for a batch, given whether a scheduled job fired on the same wake.
+pub fn wake_outcome_delivery(ready: &[BackgroundTask], a_job_fired: bool) -> OutcomeDelivery {
+    if ready.iter().any(|task| task.status.wakes_a_host()) {
+        OutcomeDelivery::OwnTurn
+    } else if a_job_fired && !ready.is_empty() {
+        OutcomeDelivery::RideAFiredJob
+    } else {
+        // Includes the empty batch, whichever door woke this: there is nothing to deliver, and a
+        // fired job's prompt goes out unchanged.
+        OutcomeDelivery::Wait
+    }
+}
+
+/// Take this session's undelivered outcomes and stamp them, ready to ride on a turn.
+///
+/// Empty on a database error rather than propagating, because failing to *report* a finished task
+/// must not also fail the turn the caller was about to run. Not delivering is better than
+/// delivering forever: without the stamp the next drain would repeat these, and every drain after
+/// it.
+pub async fn claim_undelivered_outcomes(
+    agent: &crate::agent::Agent,
+    session_manager: &crate::session::SessionManager,
+    session_id: uuid::Uuid,
+) -> Vec<BackgroundTask> {
+    if !a_turn_can_carry_them(agent).await {
+        return Vec::new();
+    }
+    claim_outcomes_now(session_manager, session_id).await
+}
+
+/// [`claim_undelivered_outcomes`] without the readiness gate.
+///
+/// For a caller that is not about to run a turn -- the one-shot's post-turn report, which prints to
+/// stderr on the way out -- and for tests that drive the claim concurrently with a store but no
+/// agent. A caller that *is* about to run a turn must use the gated form, or a turn refused before
+/// it touches the conversation leaves the batch stamped and unreadable.
+pub(crate) async fn claim_outcomes_now(
+    session_manager: &crate::session::SessionManager,
+    session_id: uuid::Uuid,
+) -> Vec<BackgroundTask> {
+    let store = session_manager.background_store();
+    let ready = match store.list_undelivered_background_tasks(session_id).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::warn!("failed to load background task outcomes: {}", error);
+            return Vec::new();
+        }
+    };
+    if ready.is_empty() {
+        return ready;
+    }
+    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+    let claimed = match store.mark_background_tasks_delivered(&ids).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            tracing::warn!(
+                "failed to stamp background outcomes as delivered: {}",
+                error
+            );
+            return Vec::new();
+        }
+    };
+    // Only what this caller won. Listing and stamping are two statements, and a poller can claim
+    // the same row in the gap: whoever the `WHERE delivered_at IS NULL` refuses reports nothing,
+    // rather than both of them reporting it.
+    only_what_was_won(ready, &claimed)
+}
+
+/// Keep only the outcomes a stamp actually won.
+///
+/// The stamps are compare-and-swaps that return the rows they took, and every caller must report
+/// against that rather than against the snapshot it chose from: two claimers reading the same row
+/// as unclaimed is the ordinary case, and acting on the read is how the same outcome reaches the
+/// model twice. Four call sites asked this and each wrote the filter out; naming it is what stops
+/// the fifth forgetting.
+pub fn only_what_was_won(ready: Vec<BackgroundTask>, claimed: &[String]) -> Vec<BackgroundTask> {
+    ready
+        .into_iter()
+        .filter(|task| claimed.contains(&task.id))
+        .collect()
+}
+
+/// Whether the turn that would carry these outcomes can start at all.
+///
+/// `Agent::run_turn` gates on MCP readiness as its first statement, before it touches the
+/// conversation, so a required server that is down refuses every turn -- and a batch stamped ahead
+/// of one is a batch nobody is ever told about, because the stamp is one-way. Every claimer asks
+/// this first: [`claim_undelivered_outcomes`] for the hosts that fold a batch into somebody's
+/// prompt, and the two pollers directly, since they stamp with
+/// [`BackgroundStore::mark_background_tasks_delivered`] to render the batch as a turn of its own.
+pub async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
+    match agent.ensure_ready_for_turn().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "holding background task outcomes: a turn cannot start right now: {}",
+                error
+            );
+            false
+        }
+    }
+}
+
+/// The retention a carrier prompt deserves once an outcome may be riding on it.
+///
+/// A recurring job asks for [`crate::agent::PromptRetention::WithdrawOnFailure`] because its next
+/// occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That stops
+/// being true the moment an outcome joins it: the row is stamped delivered before the turn starts
+/// and is never handed out again, so withdrawing the message loses the only copy. Three hosts fold
+/// an outcome into a fired job's prompt and all three ask this, rather than each remembering.
+pub fn retention_carrying(
+    riding: &[BackgroundTask],
+    job: crate::agent::PromptRetention,
+) -> crate::agent::PromptRetention {
+    if riding.is_empty() {
+        job
+    } else {
+        crate::agent::PromptRetention::Keep
+    }
+}
+
+/// [`render_outcomes`] ahead of a prompt somebody else wrote.
+///
+/// The standalone form ends "Pick the work back up from here", which is right when it *is* the
+/// prompt and wrong above an unrelated question. Joining rather than appending a message of its own
+/// is what keeps this off the conversation as a turn boundary: a lone user message opens a turn
+/// (`crate::conversation::opens_turn`), and one nobody answers would be rewound in place of the
+/// user's last exchange and sent as a second consecutive user turn.
+pub fn render_outcomes_before(tasks: &[BackgroundTask], prompt: &str) -> String {
+    format!(
+        "{}\n---\n\n{}",
+        render_outcomes_with_trailer(tasks, PREAMBLE_TRAILER),
+        prompt
+    )
+}
+
+/// What the standalone form tells the model to do next.
+const STANDALONE_TRAILER: &str = "\nYou started these earlier and did not wait for them. Pick the \
+    work back up from here; do not restate this header.\n";
+
+/// The same, for a report that precedes a prompt of its own.
+const PREAMBLE_TRAILER: &str = "\nYou started these earlier and did not wait for them. Read them, \
+    then answer what follows; do not restate this header.\n";
+
 /// Render one or more finished tasks as the user-turn text that delivers them.
 ///
 /// The header is not decoration, for the same reason [`crate::schedule::Wakeup::render_prompt`]
@@ -360,6 +546,10 @@ pub const LABEL_MAX_CHARS: usize = 80;
 /// Several outcomes ready at once coalesce into one turn rather than one turn each, as the
 /// scheduler already does for a backlog.
 pub fn render_outcomes(tasks: &[BackgroundTask]) -> String {
+    render_outcomes_with_trailer(tasks, STANDALONE_TRAILER)
+}
+
+fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> String {
     let mut rendered = format!(
         "[Background {} reporting at {}]",
         if tasks.len() == 1 {
@@ -369,10 +559,7 @@ pub fn render_outcomes(tasks: &[BackgroundTask]) -> String {
         },
         Utc::now().with_timezone(&Local).format("%Y-%m-%d %H:%M %Z"),
     );
-    rendered.push_str(
-        "\nYou started these earlier and did not wait for them. Pick the work back up from here; \
-         do not restate this header.\n",
-    );
+    rendered.push_str(trailer);
 
     for task in tasks {
         rendered.push_str(&format!(
@@ -538,7 +725,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 ORDER BY started_at DESC",
             vec![session_id.to_string()],
         )
@@ -553,7 +740,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
             vec![session_id.to_string()],
         )
@@ -575,7 +762,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
             "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
-             started_at, finished_at, delivered_at FROM background_tasks \
+             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
              ORDER BY finished_at ASC",
             vec![session_id.to_string()],
@@ -596,9 +783,9 @@ impl BackgroundStore {
     pub async fn mark_background_tasks_delivered(
         &self,
         ids: &[String],
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<Vec<String>> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let ids = ids.to_vec();
         let delivered_at = chrono::Utc::now().to_rfc3339();
@@ -608,19 +795,85 @@ impl BackgroundStore {
                 // caller renders every one of these into a single turn, and stamping only some of
                 // them would repeat the rest alongside it on the next tick.
                 let txn = connection.transaction()?;
+                let mut claimed = Vec::new();
                 {
-                    let mut statement =
-                        txn.prepare("UPDATE background_tasks SET delivered_at = ?2 WHERE id = ?1")?;
+                    let mut statement = txn.prepare(
+                        "UPDATE background_tasks SET delivered_at = ?2 \
+                         WHERE id = ?1 AND delivered_at IS NULL",
+                    )?;
                     for id in &ids {
-                        statement.execute(rusqlite::params![id, delivered_at])?;
+                        if statement.execute(rusqlite::params![id, delivered_at])? == 1 {
+                            claimed.push(id.clone());
+                        }
                     }
                 }
                 txn.commit()?;
-                Ok(())
+                Ok(claimed)
             })
             .await
             .map_err(|error| {
                 MekaError::Database(format!("failed to mark tasks delivered: {}", error))
+            })
+    }
+
+    /// A session's finished-but-unannounced tasks, oldest first.
+    ///
+    /// The poller's own question, and deliberately not [`Self::list_undelivered_background_tasks`]:
+    /// telling subscribers a task finished needs nothing from a live session, while telling the
+    /// model needs a turn. An outcome that waits for one must stay undelivered without also being
+    /// re-announced on every poll.
+    ///
+    /// Bounded to the undelivered pool, which is what keeps it news. `announced_at` is written only
+    /// by `meka serve`, so every task a REPL or ACP session ever ran is unannounced forever in a
+    /// shared store; without this clause, opening one of those sessions in `meka serve` would fire
+    /// `task.finished` for work that finished weeks ago and was reported at the time. A task still
+    /// in the pool has been reported to nobody, which is the case worth pushing.
+    pub async fn list_unannounced_background_tasks(
+        &self,
+        session_id: Uuid,
+    ) -> crate::error::Result<Vec<BackgroundTask>> {
+        self.query_background_tasks(
+            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+             started_at, finished_at, announced_at, delivered_at FROM background_tasks \
+             WHERE session_id = ?1 AND status != 'running' AND announced_at IS NULL \
+             AND delivered_at IS NULL ORDER BY finished_at ASC",
+            vec![session_id.to_string()],
+        )
+        .await
+    }
+
+    /// Stamp a batch announced. One transaction, for the reason
+    /// [`Self::mark_background_tasks_delivered`] gives.
+    pub async fn mark_background_tasks_announced(
+        &self,
+        ids: &[String],
+    ) -> crate::error::Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        let announced_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let txn = connection.transaction()?;
+                let mut claimed = Vec::new();
+                {
+                    let mut statement = txn.prepare(
+                        "UPDATE background_tasks SET announced_at = ?2 \
+                         WHERE id = ?1 AND announced_at IS NULL",
+                    )?;
+                    for id in &ids {
+                        if statement.execute(rusqlite::params![id, announced_at])? == 1 {
+                            claimed.push(id.clone());
+                        }
+                    }
+                }
+                txn.commit()?;
+                Ok(claimed)
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to mark tasks announced: {}", error))
             })
     }
 
@@ -665,10 +918,14 @@ impl BackgroundStore {
         session_id: Uuid,
         id_prefix: &str,
     ) -> crate::error::Result<Option<BackgroundTask>> {
+        if !crate::render::is_usable_id_prefix(id_prefix) {
+            return Ok(None);
+        }
+        let wanted = crate::render::id_prefix_for_matching(id_prefix);
         let tasks = self.list_background_tasks(session_id).await?;
         let matches: Vec<BackgroundTask> = tasks
             .into_iter()
-            .filter(|task| task.id.starts_with(id_prefix))
+            .filter(|task| task.id.starts_with(&wanted))
             .collect();
         match matches.len() {
             0 => Ok(None),
@@ -704,7 +961,8 @@ impl BackgroundStore {
                             scratchpad_name: row.get(6)?,
                             started_at: row.get(7)?,
                             finished_at: row.get(8)?,
-                            delivered_at: row.get(9)?,
+                            announced_at: row.get(9)?,
+                            delivered_at: row.get(10)?,
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -741,6 +999,7 @@ struct BackgroundTaskRow {
     scratchpad_name: Option<String>,
     started_at: String,
     finished_at: Option<String>,
+    announced_at: Option<String>,
     delivered_at: Option<String>,
 }
 
@@ -768,6 +1027,7 @@ impl BackgroundTaskRow {
             scratchpad_name: self.scratchpad_name,
             started_at: parse_time(&self.started_at)?,
             finished_at: parse_optional(self.finished_at)?,
+            announced_at: parse_optional(self.announced_at)?,
             delivered_at: parse_optional(self.delivered_at)?,
         })
     }
@@ -788,6 +1048,7 @@ mod tests {
             scratchpad_name: None,
             started_at: Utc::now() - chrono::Duration::seconds(90),
             finished_at: Some(Utc::now()),
+            announced_at: None,
             delivered_at: None,
         }
     }
@@ -1028,6 +1289,199 @@ mod tests {
         assert!(
             rendered.contains("task_7f3a1c22_execute_command"),
             "{rendered}"
+        );
+    }
+
+    /// Only a cancellation is somebody's deliberate act, so only a cancellation waits.
+    ///
+    /// Every terminal outcome still reaches the model; this decides whether reaching it is worth a
+    /// turn nobody asked for. Written over the whole enum rather than the two cases that motivated
+    /// it, so a status added later has to answer the question rather than inherit an answer.
+    #[test]
+    fn only_a_cancellation_waits_for_a_turn_that_was_happening_anyway() {
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Interrupted,
+        ] {
+            assert!(
+                status.wakes_a_host(),
+                "{} is nobody's decision, so the agent has to be told when it happens",
+                status.as_str()
+            );
+        }
+        assert!(
+            !TaskStatus::Cancelled.wakes_a_host(),
+            "whoever cancelled it already knows, and a stop command must not start a turn"
+        );
+    }
+
+    /// A caller reports what the stamp gave it, not what it read a moment earlier.
+    ///
+    /// Three call sites used to write this filter out and one test covered one of them. The rule is
+    /// the whole of the double-delivery fix: two claimers reading the same row as unclaimed is
+    /// ordinary, the compare-and-swap picks one, and a loser that reports its snapshot anyway
+    /// delivers the outcome a second time.
+    #[test]
+    fn a_report_carries_only_the_outcomes_the_stamp_won() {
+        // Distinct ids: the shared fixture hands out a fixed one, and a filter keyed on id cannot
+        // be tested with two rows that carry the same one.
+        let mut won = task(TaskStatus::Completed, Some("built"));
+        won.id = "11111111-0000-0000-0000-000000000000".to_string();
+        let mut lost = task(TaskStatus::Cancelled, None);
+        lost.id = "22222222-0000-0000-0000-000000000000".to_string();
+        let read = vec![won.clone(), lost.clone()];
+
+        let reported = only_what_was_won(read.clone(), &[won.id.clone()]);
+        assert_eq!(
+            reported.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            vec![&won.id],
+            "the row this caller lost must not be reported by it"
+        );
+        assert!(
+            only_what_was_won(read.clone(), &[]).is_empty(),
+            "a caller that won nothing reports nothing"
+        );
+        assert_eq!(
+            only_what_was_won(read.clone(), &[won.id.clone(), lost.id.clone()]).len(),
+            2,
+            "and winning everything reports everything"
+        );
+    }
+
+    /// A prompt carrying an outcome is never withdrawn, whatever the job asked for.
+    ///
+    /// The branch only matters when a turn fails, so nothing that drives a *successful* turn can
+    /// see it -- which was every test of this path. Withdrawing a carrier prompt destroys the only
+    /// copy of the outcome: the row was stamped delivered before the turn began and
+    /// `list_undelivered_background_tasks` never returns it again.
+    #[test]
+    fn a_prompt_carrying_an_outcome_is_never_withdrawn() {
+        let carried = [task(TaskStatus::Cancelled, None)];
+        for asked in [
+            crate::agent::PromptRetention::Keep,
+            crate::agent::PromptRetention::WithdrawOnFailure,
+        ] {
+            assert_eq!(
+                retention_carrying(&carried, asked),
+                crate::agent::PromptRetention::Keep,
+                "an outcome rides on this prompt, so a failure must not take it with it"
+            );
+        }
+        assert_eq!(
+            retention_carrying(&[], crate::agent::PromptRetention::WithdrawOnFailure),
+            crate::agent::PromptRetention::WithdrawOnFailure,
+            "and a job carrying only its own prompt keeps the job's answer: the next occurrence \
+             regenerates it"
+        );
+        assert_eq!(
+            retention_carrying(&[], crate::agent::PromptRetention::Keep),
+            crate::agent::PromptRetention::Keep
+        );
+    }
+
+    /// The REPL wake arm, over its whole matrix. Two doors raise the same flag, so every
+    /// combination of "what is waiting" and "did a job fire" has to have an answer.
+    ///
+    /// The two that matter: a quiet batch with no fired job must NOT be claimed, because claiming
+    /// stamps it delivered and there is no turn to put it in -- reachable whenever the scheduler
+    /// door woke this and the gate then declined the job. And a quiet batch WITH a fired job must
+    /// be claimed, or the cancellation waits for a user who may never type.
+    #[test]
+    fn a_wake_claims_an_outcome_only_when_a_turn_will_carry_it() {
+        let quiet = [task(TaskStatus::Cancelled, None)];
+        let loud = [task(TaskStatus::Completed, Some("done"))];
+        let mixed = [
+            task(TaskStatus::Cancelled, None),
+            task(TaskStatus::Failed, None),
+        ];
+
+        assert_eq!(
+            wake_outcome_delivery(&[], false),
+            OutcomeDelivery::Wait,
+            "nothing waiting, nothing fired"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&[], true),
+            OutcomeDelivery::Wait,
+            "a job fired with nothing waiting: its prompt goes out unchanged"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&quiet, false),
+            OutcomeDelivery::Wait,
+            "a cancellation alone must not be claimed: there is no turn to carry it, and the stamp \
+             is one-way"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&quiet, true),
+            OutcomeDelivery::RideAFiredJob,
+            "a fired job is a turn that is happening anyway, so the cancellation joins it"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&loud, false),
+            OutcomeDelivery::OwnTurn,
+            "a finished build is nobody's decision, so it earns the turn"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&loud, true),
+            OutcomeDelivery::OwnTurn,
+            "and still does when a job also fired"
+        );
+        assert_eq!(
+            wake_outcome_delivery(&mixed, false),
+            OutcomeDelivery::OwnTurn,
+            "a batch with anything turn-worthy in it goes as a turn entire"
+        );
+
+        assert!(!OutcomeDelivery::Wait.claims());
+        assert!(OutcomeDelivery::OwnTurn.claims());
+        assert!(
+            OutcomeDelivery::RideAFiredJob.claims(),
+            "riding is a delivery, so it stamps"
+        );
+    }
+
+    /// The notice rides on a prompt rather than standing as a message of its own.
+    ///
+    /// A lone user message opens a turn (`crate::conversation::opens_turn`), so one nobody answers
+    /// is a boundary with no turn behind it: `/rewind 1` cuts there instead of at the user's last
+    /// exchange, compaction reads the conversation as ending on an unanswered prompt, and the next
+    /// real prompt goes out as a second consecutive user turn.
+    #[test]
+    fn an_outcome_joins_a_prompt_rather_than_becoming_one() {
+        let task = BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            tool_name: "execute_command".to_string(),
+            label: "sleep 900".to_string(),
+            status: TaskStatus::Cancelled,
+            outcome: None,
+            scratchpad_name: None,
+            announced_at: None,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            delivered_at: None,
+        };
+        let joined = render_outcomes_before(std::slice::from_ref(&task), "what is in this CSV?");
+
+        assert!(
+            joined.ends_with("what is in this CSV?"),
+            "the user's prompt has to be the thing the model answers: {joined}"
+        );
+        assert!(
+            joined.contains("was cancelled"),
+            "and the outcome has to be in it: {joined}"
+        );
+        assert!(
+            !joined.contains("Pick the work back up from here"),
+            "the standalone trailer instructs the model to resume the cancelled work, which is \
+             wrong above somebody else's question: {joined}"
+        );
+        assert!(
+            render_outcomes(std::slice::from_ref(&task))
+                .contains("Pick the work back up from here"),
+            "while the standalone form, which is the whole prompt, still says it"
         );
     }
 }

@@ -25,10 +25,13 @@ See the [`meka provider` CLI reference](./config-file.md#meka-provider-cli) for 
 
 ### `session`
 
-Manage stored sessions: list them, export one as Markdown, or delete them.
+Manage stored sessions: list them, show one in full, export one as Markdown, or delete them.
+
+Every `<SESSION_ID>` is a full id or any unique prefix of one, which is what the listings print.
 
 ```bash
 meka session list [-n <LIMIT>]          # default limit: 20
+meka session show <SESSION_ID>          # full id, cwd, permission, opening message
 meka session export <SESSION_ID> [-o <PATH>]   # -o - prints to stdout
 meka session delete <SESSION_ID>...
 meka session delete --older-than-days <DAYS>
@@ -36,6 +39,21 @@ meka session delete --all
 ```
 
 See [Sessions](../usage/sessions.md#exporting-a-session) for details.
+
+### `schedule`
+
+Inspect and cancel the wakeups the agent scheduled for itself. There is no `create`: a job needs a
+session for its turn to run in, and the agent creates one through `schedule_create`.
+
+Every `<ID>` is a full id or any unique prefix of one, which is what `list` prints.
+
+```bash
+meka schedule list [--session <ID>]     # every session's jobs, or one session's
+meka schedule show <ID>                 # full prompt, gate command, session, withheld reason
+meka schedule cancel <ID>
+```
+
+See [Scheduling](../usage/scheduling.md) for details.
 
 ### `history`
 

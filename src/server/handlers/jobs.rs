@@ -55,8 +55,8 @@ pub struct ScheduledJobView {
     /// Absent means it will, as far as this server can establish. A held job and a healthy watcher
     /// with nothing to report are otherwise identical from outside: neither fires, and
     /// `last_fired_at` is absent for a brand-new job too. The agent gets the same sentence in its
-    /// `[Scheduled]` block and `meka schedule list` gets a `Held` column; this is the third
-    /// reader, and it is the one that can create a job on a session that cannot run it.
+    /// `[Scheduled]` block, `/schedule` gets a `Held` column and `meka schedule show` spells it
+    /// out; this is the reader that can create a job on a session that cannot run it.
     ///
     /// Computed per request from the session's *current* level, not stored, so it tracks a `PATCH
     /// /v1/sessions/{id}` without the job being rewritten.
@@ -792,9 +792,10 @@ pub async fn cancel(
             ProblemDetail::internal_sanitized("failed to resolve scheduled job", error)
                 .with("job_id", job_id.clone())
         })?;
+    let wanted = crate::render::id_prefix_for_matching(&job_id);
     let matches: Vec<&ScheduledJob> = jobs
         .iter()
-        .filter(|job| job.id.starts_with(&job_id))
+        .filter(|job| crate::render::is_usable_id_prefix(&job_id) && job.id.starts_with(&wanted))
         .collect();
     let resolved = match matches.as_slice() {
         [job] => job.id.clone(),
@@ -866,7 +867,20 @@ pub struct BackgroundTaskView {
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
-    /// When the outcome was handed to the agent. `null` means it is still waiting to be delivered
+    /// When subscribers were told, which is when `task.finished` fired for this task. Absent when
+    /// nobody has been told yet.
+    ///
+    /// A row migrated from before the split carries its `delivered_at` here, which records that
+    /// the outcome was reported rather than that any endpoint received it: the store cannot
+    /// know whether one was subscribed at the time.
+    ///
+    /// Separate from `delivered_at` because the two answer different questions and stopped
+    /// happening together: announcing needs nothing from a live session, while telling the agent
+    /// needs a turn. A client polling this after a `task.finished` can otherwise not tell
+    /// "announced, waiting for a turn" from "never announced at all".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announced_at: Option<String>,
+    /// When the outcome was handed to the agent. Absent when it is still waiting to be delivered
     /// on the session's next turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
@@ -884,6 +898,7 @@ impl From<crate::background::BackgroundTask> for BackgroundTaskView {
             scratchpad_name: task.scratchpad_name,
             started_at: task.started_at.to_rfc3339(),
             finished_at: task.finished_at.map(|at| at.to_rfc3339()),
+            announced_at: task.announced_at.map(|at| at.to_rfc3339()),
             delivered_at: task.delivered_at.map(|at| at.to_rfc3339()),
         }
     }

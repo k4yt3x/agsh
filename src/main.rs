@@ -1112,50 +1112,21 @@ async fn report_background_survivors(agent: &Agent) {
     }
 }
 
-/// Claim this session's undelivered task outcomes, ready to be rendered into one turn.
+/// [`crate::background::claim_undelivered_outcomes`] for the REPL, which reaches these paths before
+/// it has a session to claim against.
 ///
 /// Stamped delivered *before* the turn runs, matching the scheduler's own claim and for the same
 /// reason: an outcome that reliably wedges the process would otherwise be redelivered on every
 /// restart, turning one bad result into a boot loop. Losing one report is the cheaper failure.
-///
-/// Returns empty on a database error rather than propagating, because failing to *report* a
-/// finished task must not also fail whatever else the caller was about to do.
 async fn collect_background_outcomes(
+    agent: &agent::Agent,
     session_manager: &SessionManager,
     session_id: Option<uuid::Uuid>,
 ) -> Vec<crate::background::BackgroundTask> {
     let Some(session_id) = session_id else {
         return Vec::new();
     };
-    let ready = match session_manager
-        .background_store()
-        .list_undelivered_background_tasks(session_id)
-        .await
-    {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!("failed to load background task outcomes: {}", error);
-            return Vec::new();
-        }
-    };
-    if ready.is_empty() {
-        return ready;
-    }
-    let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-    if let Err(error) = session_manager
-        .background_store()
-        .mark_background_tasks_delivered(&ids)
-        .await
-    {
-        tracing::warn!(
-            "failed to stamp background outcomes as delivered: {}",
-            error
-        );
-        // Not delivering is better than delivering forever: without the stamp the next tick would
-        // repeat these, and every tick after it.
-        return Vec::new();
-    }
-    ready
+    crate::background::claim_undelivered_outcomes(agent, session_manager, session_id).await
 }
 
 /// Run a `/compact` with Ctrl+C wired to a fresh cancellation token, aborting the listener
@@ -1528,6 +1499,21 @@ async fn run_oneshot(
     .await?;
     install_interrupt_handler(&agent, Arc::clone(&console));
 
+    // A resume inherits whatever the last process left undelivered, and this turn is the only one
+    // this run has. Joined to the prompt rather than appended as its own message, for the reason
+    // `background::render_outcomes_before` gives. The collection *after* the turn stays: it reports
+    // what finished while this turn ran, which no turn is left to carry.
+    let outcomes = if config.background.enabled {
+        collect_background_outcomes(&agent, &session_manager, session_id).await
+    } else {
+        Vec::new()
+    };
+    let prompt = if outcomes.is_empty() {
+        prompt
+    } else {
+        crate::background::render_outcomes_before(&outcomes, &prompt)
+    };
+
     match run_turn_interruptible(
         &agent,
         &mut session_id,
@@ -1583,7 +1569,13 @@ async fn run_oneshot(
         // session sweeps whatever the *last* process left running into `interrupted`, and without
         // this a one-shot resume would answer the prompt and exit while that report sat
         // undelivered.
-        let outcomes = collect_background_outcomes(&session_manager, session_id).await;
+        //
+        // Ungated, unlike the claim before the turn: this one is printed for the human on the way
+        // out, so whether a turn could start is not a question about it.
+        let outcomes = match session_id {
+            Some(id) => crate::background::claim_outcomes_now(&session_manager, id).await,
+            None => Vec::new(),
+        };
         if !outcomes.is_empty() {
             // Printed rather than delivered as a turn: the agent's answer has already been given
             // and the process is on its way out, so this is for the human reading the output.
@@ -2007,7 +1999,10 @@ async fn run_interactive(
                         .list_undelivered_background_tasks(current)
                         .await
                     {
-                        Ok(ready) if !ready.is_empty() => {
+                        // Only for an outcome that warrants a turn, mirroring
+                        // `wake_would_produce_work` above: waking for one that will wait tears the
+                        // prompt down and redraws it to do nothing.
+                        Ok(ready) if ready.iter().any(|task| task.status.wakes_a_host()) => {
                             schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(_) => {}
@@ -2195,12 +2190,36 @@ async fn run_interactive(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Outcomes are collected here, alongside the due jobs, so one wake delivers both
                 // rather than one of them and then another tick.
-                let outcomes = if config.background.enabled {
-                    collect_background_outcomes(&session_manager, session_id).await
-                } else {
-                    Vec::new()
+                //
+                // Peeked before being claimed, because claiming stamps them delivered and this arm
+                // has two doors: the watcher raises the same flag for a due job
+                // (`wake_would_produce_work`), so a wake can arrive with only a cancellation
+                // waiting. Claiming then would either spend the turn this change exists to abolish
+                // or, when the gate declines the job, stamp an outcome that nothing delivers.
+                let pending = match (config.background.enabled, session_id) {
+                    (true, Some(current)) => session_manager
+                        .background_store()
+                        .list_undelivered_background_tasks(current)
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!("failed to load background task outcomes: {}", error);
+                            Vec::new()
+                        }),
+                    _ => Vec::new(),
                 };
-                if !outcomes.is_empty() {
+                let outcomes =
+                    if crate::background::wake_outcome_delivery(&pending, !fired.is_empty())
+                        .claims()
+                    {
+                        collect_background_outcomes(&agent, &session_manager, session_id).await
+                    } else {
+                        Vec::new()
+                    };
+                // Asked again of what was actually claimed, rather than trusting the peek: a task
+                // can reach a terminal state in the gap between the two.
+                let delivery =
+                    crate::background::wake_outcome_delivery(&outcomes, !fired.is_empty());
+                if delivery == crate::background::OutcomeDelivery::OwnTurn {
                     let prompt = crate::background::render_outcomes(&outcomes);
                     match run_turn_interruptible(
                         &agent,
@@ -2221,14 +2240,28 @@ async fn run_interactive(
                         }
                     }
                 }
+                // A quiet batch was claimed only because a job fired, so it rides that job's prompt
+                // rather than becoming a turn of its own. The first one carries it; the rest are
+                // turns in their own right that the model has already been told about it in.
+                let mut riding = (delivery == crate::background::OutcomeDelivery::RideAFiredJob)
+                    .then_some(outcomes);
                 for wakeup in fired {
-                    let prompt = wakeup.render_prompt();
+                    let ready = riding.take().unwrap_or_default();
+                    let retention = crate::background::retention_carrying(
+                        &ready,
+                        wakeup.job.prompt_retention(),
+                    );
+                    let prompt = if ready.is_empty() {
+                        wakeup.render_prompt()
+                    } else {
+                        crate::background::render_outcomes_before(&ready, &wakeup.render_prompt())
+                    };
                     match run_turn_interruptible(
                         &agent,
                         &mut session_id,
                         &mut messages,
                         prompt,
-                        wakeup.job.prompt_retention(),
+                        retention,
                     )
                     .await
                     {
@@ -2250,6 +2283,18 @@ async fn run_interactive(
                 }
             }
             ReplEvent::UserInput(input) => {
+                // An outcome that did not warrant a turn of its own rides on this one. Joined to
+                // the prompt rather than appended as its own message: see `render_outcomes_before`.
+                let outcomes = if config.background.enabled {
+                    collect_background_outcomes(&agent, &session_manager, session_id).await
+                } else {
+                    Vec::new()
+                };
+                let input = if outcomes.is_empty() {
+                    input
+                } else {
+                    crate::background::render_outcomes_before(&outcomes, &input)
+                };
                 match run_turn_interruptible(
                     &agent,
                     &mut session_id,
@@ -3235,7 +3280,7 @@ async fn apply_session_repin(
 /// leading hex chars.
 ///
 /// Errors out cleanly when the prefix matches zero or multiple sessions.
-async fn resolve_session_id(
+pub(crate) async fn resolve_session_id(
     session_manager: &SessionManager,
     value: &str,
 ) -> anyhow::Result<uuid::Uuid> {
@@ -3252,9 +3297,17 @@ async fn resolve_session_id(
         1 => Ok(matches[0]),
         _ => {
             let listing: Vec<String> = matches.iter().map(|id| id.to_string()).collect();
+            // "at least" once the scan's own bound is reached, because the count would otherwise
+            // be the cap rather than the truth. Every id it did fetch is named either way, which
+            // is what the caller needs to pick one.
             anyhow::bail!(
-                "ambiguous prefix '{}' matches {} sessions: {}",
+                "ambiguous prefix '{}' matches {}{} sessions: {}",
                 value,
+                if matches.len() >= crate::session::PREFIX_MATCH_CAP {
+                    "at least "
+                } else {
+                    ""
+                },
                 matches.len(),
                 listing.join(", "),
             )

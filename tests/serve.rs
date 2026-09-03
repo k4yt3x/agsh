@@ -7353,6 +7353,133 @@ fn cancelling_a_running_background_task_stops_it() {
     );
 }
 
+/// A cancelled task reports on the next turn, without spending one of its own.
+///
+/// The predicate test in `background.rs` covers only `wakes_a_host`; every branch that consults it
+/// could be deleted with the suite still green. This one is written against the two that meet in
+/// `meka serve`: the poller must leave the outcome alone, and `submit_turn` must fold it into the
+/// caller's own message. Folding rather than appending is the point -- a lone user message opens a
+/// turn (`conversation::opens_turn`), so a notice delivered as its own message would be rewound in
+/// place of the user's last exchange and sent as a second consecutive user turn.
+///
+/// The script is the assertion that no turn was spent: it holds exactly one round after the
+/// cancellation, so a poller that delivered would consume it and leave the real turn to fail.
+#[test]
+fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "answered the question" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    // Polled fast, so "the poller did not deliver" is a fact about the branch rather than about
+    // the test finishing before the first tick.
+    let harness = ServeTestHarness::spawn(
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+    );
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut task_id = String::new();
+    while Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(task) = body["tasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["status"] == "running"))
+        {
+            task_id = task["id"].as_str().expect("task id").to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!task_id.is_empty(), "no background task started");
+
+    let messages = |harness: &ServeTestHarness| -> Vec<serde_json::Value> {
+        let body: serde_json::Value = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/messages", id),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        body["messages"].as_array().expect("messages").clone()
+    };
+    let before = messages(&harness);
+
+    let cancel = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+
+    // Several poll intervals, so a delivering poller has every chance to prove itself.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        messages(&harness).len(),
+        before.len(),
+        "a cancellation must add no message of its own: it would be a turn boundary with no turn \
+         behind it"
+    );
+
+    let turn: serde_json::Value = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "what is in this CSV?"}))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        turn["stop_reason"], "end_turn",
+        "the round the poller must not have eaten is this turn's: {}",
+        turn
+    );
+
+    let after = messages(&harness);
+    let carrier = after
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("the turn's own user message");
+    let text = carrier["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("was cancelled") && text.contains("what is in this CSV?"),
+        "the outcome must ride inside the user's own message, not beside it: {}",
+        text
+    );
+    assert!(
+        !after
+            .windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user"),
+        "two consecutive user turns must never reach the provider: {:#?}",
+        after
+    );
+}
+
 /// A session with a detached command still running is not idle, however long since its last turn.
 ///
 /// The GC counted in-flight *turns* only, so a session whose turn had finished but whose background
@@ -7435,6 +7562,440 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
         task["status"], "running",
         "a command that is still running must not be reported as interrupted: {}",
         after
+    );
+}
+
+/// A fire that fails keeps the outcome that was riding on it.
+///
+/// A recurring job asks for `WithdrawOnFailure`, because its next occurrence regenerates the
+/// prompt. That stops being true the moment an outcome joins it: the row is stamped delivered
+/// before the turn starts and is never handed out again, so withdrawing the message destroys the
+/// only copy. `retention_carrying` is what notices, and its three call sites were reachable only
+/// by a turn that actually fails -- which every other test of this path avoids.
+#[test]
+fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The fire's own round, which fails after the prompt has been persisted.
+        [
+            { "kind": "fail", "message": "error sending request: connection refused" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut task_id = String::new();
+    while Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(task) = body["tasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["status"] == "running"))
+        {
+            task_id = task["id"].as_str().expect("task id").to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!task_id.is_empty(), "no background task started");
+
+    let job = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/schedule", id),
+        )
+        .json(&serde_json::json!({"prompt": "PROBE_FAILING_FIRE", "every": "1s"}))
+        .send()
+        .expect("send");
+    assert_eq!(job.status(), 201, "the job must be created");
+
+    let cancel = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+
+    // The fire runs, carries the cancellation, and its provider call fails. The prompt must stay.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: serde_json::Value = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/messages", id),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let carried = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| {
+                message["role"] == "user"
+                    && message["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("was cancelled"))
+            });
+        if carried {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a failed fire withdrew the prompt and took the outcome with it; the row is stamped \
+             delivered and will never be handed out again: {}",
+            body
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A scheduled fire announces the outcome it claims, not just delivers it.
+///
+/// Three doors claim from the undelivered pool and all three must announce, because the stamp is
+/// one-way: `list_unannounced_background_tasks` also requires `delivered_at IS NULL`, so a row a
+/// fire delivered can never be announced afterwards. Reachable without any race on a restart, where
+/// the load sweep retires a task the dead host left running and a due job claims it before the
+/// poller has ticked.
+#[test]
+fn a_scheduled_fire_announces_what_it_claims() {
+    let (port, rx) = spawn_webhook_listener();
+    // The poller only sweeps *resident* sessions, so evicting this one takes it out of reach: the
+    // scheduled fire revives it through `ensure_session_loaded`, and is then the only thing that
+    // can announce. A short idle timeout plus a poll interval long enough that the first tick
+    // arrives after the eviction is what arranges that -- the same shape as a restart, where the
+    // load sweep retires the task and a due job claims it before the poller has ever ticked.
+    let config = format!(
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n\
+         \n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"10s\"\n\n\
+         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
+         events = [\"task.finished\"]\n",
+        port
+    );
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "ran the job" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with("", &config, script, "sk_test_token", &[
+        "sessions:r",
+        "sessions:w",
+        "schedule:r",
+        "schedule:w",
+    ]);
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut task_id = String::new();
+    while Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(task) = body["tasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["status"] == "running"))
+        {
+            task_id = task["id"].as_str().expect("task id").to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!task_id.is_empty(), "no background task started");
+
+    // Created before the cancellation, so nothing has to touch the session afterwards: an HTTP
+    // request would make it resident again and hand the poller its chance.
+    let job = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/schedule", id),
+        )
+        .json(&serde_json::json!({"prompt": "PROBE_ANNOUNCE", "every": "1s"}))
+        .send()
+        .expect("send");
+    assert_eq!(job.status(), 201, "the job must be created");
+
+    let cancel = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+
+    let delivery = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the fire that claimed the outcome must also announce it");
+    let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
+    assert_eq!(body["event"], "task.finished");
+    assert_eq!(body["status"], "cancelled", "body was {}", body);
+}
+
+/// A scheduled fire carries a cancellation that has been waiting for a turn.
+///
+/// The third door. A user turn and the poller's own report were both folded; a scheduled job runs a
+/// turn too, and a session whose only traffic is scheduled work would otherwise never learn its
+/// task was cancelled -- which is the promise `TaskStatus::wakes_a_host` makes when it declines to
+/// wake one. `meka serve` and ACP both had the gap; this pins the serve half.
+#[test]
+fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "ran the job" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w", "schedule:r", "schedule:w"],
+    );
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut task_id = String::new();
+    while Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(task) = body["tasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["status"] == "running"))
+        {
+            task_id = task["id"].as_str().expect("task id").to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!task_id.is_empty(), "no background task started");
+
+    let cancel = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+
+    // The only turn from here on is the job's, so anything the model is told rides its prompt.
+    let job = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{}/schedule", id),
+        )
+        .json(&serde_json::json!({"prompt": "PROBE_SCHEDULED_PROMPT", "every": "1s"}))
+        .send()
+        .expect("send");
+    assert_eq!(job.status(), 201, "the job must be created");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body: serde_json::Value = harness
+            .request(
+                reqwest::Method::GET,
+                &format!("/v1/sessions/{}/messages", id),
+            )
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let fired = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| {
+                message["role"] == "user"
+                    && message["content"][0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("PROBE_SCHEDULED_PROMPT"))
+            })
+            .cloned();
+        if let Some(fired) = fired {
+            let text = fired["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains("was cancelled"),
+                "the job's prompt must carry the outcome that was waiting for a turn: {}",
+                text
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scheduled job never fired: {}",
+            body
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A cancelled task is announced to subscribers without being delivered to the model.
+///
+/// This is the whole point of splitting `announced_at` from `delivered_at`, and the two halves fail
+/// in opposite directions: without the split, deferring the model's copy re-fires the webhook on
+/// every poll, and firing it once costs the turn the deferral exists to avoid. Nothing else pins
+/// the announce half -- the payload test above rides the ordinary completed path, which announced
+/// correctly before the change too.
+#[test]
+fn a_cancelled_task_is_announced_without_being_delivered() {
+    let (port, rx) = spawn_webhook_listener();
+    let config = format!(
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n\n         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\n         secret = \"s\"\nevents = [\"task.finished\"]\n",
+        port
+    );
+    let script = serde_json::json!([
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn(&config, script);
+    let id = start_streaming_session(&harness);
+    harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "run it"}))
+        .send()
+        .expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut task_id = String::new();
+    while Instant::now() < deadline {
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if let Some(task) = body["tasks"]
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["status"] == "running"))
+        {
+            task_id = task["id"].as_str().expect("task id").to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!task_id.is_empty(), "no background task started");
+
+    let messages_before = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", id),
+        )
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["messages"]
+        .as_array()
+        .expect("messages")
+        .len();
+
+    let cancel = harness
+        .request(
+            reqwest::Method::DELETE,
+            &format!("/v1/sessions/{}/tasks/{}", id, &task_id[..8]),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(cancel.status(), 204, "the task must cancel");
+
+    let delivery = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a cancelled task must still reach subscribers");
+    let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
+    assert_eq!(body["event"], "task.finished");
+    assert_eq!(body["status"], "cancelled", "body was {}", body);
+
+    // Announcing must not have delivered: the conversation is untouched, and a second delivery must
+    // not arrive on any later poll.
+    assert!(
+        rx.recv_timeout(Duration::from_secs(2)).is_err(),
+        "a task is announced once, not on every poll"
+    );
+    let messages_after = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{}/messages", id),
+        )
+        .send()
+        .expect("send")
+        .json::<serde_json::Value>()
+        .expect("parse")["messages"]
+        .as_array()
+        .expect("messages")
+        .len();
+    assert_eq!(
+        messages_after, messages_before,
+        "telling subscribers must not spend a turn telling the model"
     );
 }
 

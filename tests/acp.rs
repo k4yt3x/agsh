@@ -6223,3 +6223,327 @@ enabled = ["read", "unrestricted"]
     );
     assert_eq!(provider_option(&after)["currentValue"], "other");
 }
+
+/// An ACP scheduled fire carries a cancellation that was waiting, as `meka serve`'s does.
+///
+/// The ACP half of the third door, and the half with no coverage: deleting the fold there left the
+/// suite green. The job row is seeded directly so the fire is due immediately; what is under test
+/// is what the turn's prompt carries, not the scheduler's arithmetic.
+#[test]
+fn an_acp_scheduled_fire_carries_a_cancellation_that_was_waiting() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ran the job" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[background]
+enabled = true
+
+[schedule]
+poll_interval = "200ms"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
+    let sid = harness.new_session();
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let now = chrono::Utc::now();
+        connection
+            .execute(
+                "INSERT INTO background_tasks \
+                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), &sid, now.to_rfc3339()],
+            )
+            .expect("seed the cancelled task");
+        // Due a minute ago, so the very next sweep fires it.
+        connection
+            .execute(
+                "INSERT INTO scheduled_jobs \
+                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec, gate_last_output, \
+                  gate_permission, created_at, last_fired_at, next_fire_at) \
+                 VALUES (?1, ?2, 'every', '60s', 'PROBE_ACP_FIRE', NULL, NULL, NULL, NULL, ?3, \
+                         NULL, ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    &sid,
+                    now.to_rfc3339(),
+                    (now - chrono::Duration::seconds(60)).to_rfc3339(),
+                ],
+            )
+            .expect("seed the due job");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let fired: Option<String> = connection
+            .query_row(
+                "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' \
+                 AND content LIKE '%PROBE_ACP_FIRE%' ORDER BY id ASC LIMIT 1",
+                rusqlite::params![&sid],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(text) = fired {
+            assert!(
+                text.contains("was cancelled"),
+                "the job's prompt must carry the outcome that was waiting: {text}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scheduled job never fired"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The ACP poller delivers a completed outcome as a turn, exactly once.
+///
+/// Nothing drove `deliver_outcomes` at all. A completed task is the case that *does* warrant a
+/// turn, which is what makes it the one that exercises this function: the claim, the stamp, the
+/// turn, and that no later sweep repeats it.
+///
+/// Its claimed-filter is not pinned here and cannot be by a test with one claimer -- the filter is
+/// a no-op until something else claims the same row concurrently. The rule itself is covered by
+/// `background::tests::a_report_carries_only_the_outcomes_the_stamp_won`.
+#[test]
+fn the_acp_poller_delivers_a_finished_task_once() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "noted the build finished" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[background]
+enabled = true
+
+[schedule]
+poll_interval = "200ms"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
+    let sid = harness.new_session();
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let now = chrono::Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO background_tasks \
+                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 VALUES (?1, ?2, 'execute_command', 'cargo build', 'completed', '42 passed', \
+                         ?3, ?3)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), &sid, now],
+            )
+            .expect("seed the finished task");
+    }
+
+    // The poller has one round to spend. A second delivery would find none and the turn would fail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let carried: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'user' \
+                 AND content LIKE '%cargo build%'",
+                rusqlite::params![&sid],
+                |row| row.get(0),
+            )
+            .expect("count");
+        if carried > 0 {
+            assert_eq!(carried, 1, "the outcome must be reported exactly once");
+            let delivered: Option<String> = connection
+                .query_row(
+                    "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
+                    rusqlite::params![&sid],
+                    |row| row.get(0),
+                )
+                .expect("read the task");
+            assert!(
+                delivered.is_some(),
+                "and stamped, so no later sweep repeats it"
+            );
+            // Several more poll intervals: a sweep that re-delivered would add a second message.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let again: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'user' \
+                     AND content LIKE '%cargo build%'",
+                    rusqlite::params![&sid],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(again, 1, "and it stays reported once");
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the poller never delivered the finished task"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The ACP poller leaves a cancellation alone instead of spending a turn on it.
+///
+/// The sibling of the fold test below: one proves the outcome arrives, this proves it does not
+/// arrive as a turn of its own. Both halves are needed, because either failure mode alone looks
+/// like the other passing.
+#[test]
+fn the_acp_poller_does_not_spend_a_turn_on_a_cancellation() {
+    // One round only. A poller that delivers would consume it and the prompt below would fail.
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "answered" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[background]
+enabled = true
+
+[schedule]
+poll_interval = "200ms"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
+    let sid = harness.new_session();
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        connection
+            .execute(
+                "INSERT INTO background_tasks \
+                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    &sid,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("seed the cancelled task");
+    }
+
+    // Several poll intervals, so a delivering poller has every chance to prove itself.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let messages: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1",
+                rusqlite::params![&sid],
+                |row| row.get(0),
+            )
+            .expect("count messages");
+        assert_eq!(
+            messages, 0,
+            "a cancellation must add no message of its own: it would be a turn boundary with no \
+             turn behind it"
+        );
+        let delivered: Option<String> = connection
+            .query_row(
+                "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
+                rusqlite::params![&sid],
+                |row| row.get(0),
+            )
+            .expect("read the task");
+        assert!(
+            delivered.is_none(),
+            "and it must stay in the pool for the next real turn to carry"
+        );
+    }
+
+    // The round the poller must not have eaten is this prompt's.
+    let id = harness.prompt(&sid, "what is in this CSV?");
+    let response = harness.await_response(id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the prompt must still have a round to run on: {response}"
+    );
+}
+
+/// A cancelled task rides the editor's next prompt, in ACP as it does in `meka serve`.
+///
+/// ACP has no test for any of the background-outcome path, so every guard in it -- the poller's
+/// `wakes_a_host` branch, this fold, the `PromptRetention` it runs under -- could be deleted with
+/// the suite green. Seeded straight into the store rather than run for real: what is under test is
+/// what the editor's prompt carries, not whether `sleep` works.
+#[test]
+fn a_cancelled_task_rides_the_editors_next_prompt() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "answered" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[background]
+enabled = true
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
+    let sid = harness.new_session();
+
+    // A terminal, undelivered, unannounced task: exactly what `/tasks cancel` leaves behind.
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        connection
+            .execute(
+                "INSERT INTO background_tasks \
+                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    &sid,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("seed the cancelled task");
+    }
+
+    let id = harness.prompt(&sid, "what is in this CSV?");
+    let response = harness.await_response(id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the prompt must run: {response}"
+    );
+
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let user_text: String = connection
+        .query_row(
+            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' \
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&sid],
+            |row| row.get(0),
+        )
+        .expect("the prompt's user message");
+    assert!(
+        user_text.contains("was cancelled"),
+        "the outcome must ride inside the editor's own prompt: {user_text}"
+    );
+    assert!(
+        user_text.contains("what is in this CSV?"),
+        "and the prompt has to still be there: {user_text}"
+    );
+
+    let delivered: Option<String> = connection
+        .query_row(
+            "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
+            rusqlite::params![&sid],
+            |row| row.get(0),
+        )
+        .expect("read the task");
+    assert!(
+        delivered.is_some(),
+        "and riding a turn is a delivery, so it must be stamped"
+    );
+}

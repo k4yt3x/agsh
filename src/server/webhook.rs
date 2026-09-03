@@ -60,6 +60,24 @@ impl WebhookEvent {
     }
 }
 
+/// Whether subscribers were told, so a caller knows if it may go on to deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Announced {
+    /// Nothing was owed.
+    Nothing,
+    /// Everything owed was told.
+    Told,
+    /// The stamp failed, so the batch must be left for the next sweep rather than delivered.
+    Failed,
+}
+
+impl Announced {
+    /// Whether the caller may go on to stamp these delivered.
+    pub fn may_deliver(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
 /// One delivery's body. Flattened into the JSON object alongside the event-specific `data`.
 #[derive(Debug, Serialize)]
 struct DeliveryBody<'a> {
@@ -114,6 +132,72 @@ impl WebhookDispatcher {
             endpoints: Arc::new(endpoints),
             client,
         }
+    }
+
+    /// Stamp a batch of finished tasks announced and tell subscribers, at most once each.
+    ///
+    /// The two consumers of the undelivered pool both call this, because an outcome must be
+    /// announced whichever one takes it: the poller sweeps everything terminal, and a user turn can
+    /// claim an outcome inside the same tick the poller would have swept it. Stamped before the
+    /// send, so a task is announced once even if the process dies mid-batch; the send is detached
+    /// anyway and reports its own failures.
+    ///
+    /// Nothing here waits on a delivery turn. The fact a task finished is the news, and it should
+    /// not wait on a model call that may itself fail, nor on a session ever being live again.
+    pub async fn announce_finished_tasks(
+        &self,
+        store: &crate::background::BackgroundStore,
+        tasks: &[crate::background::BackgroundTask],
+    ) -> Announced {
+        let unannounced: Vec<&crate::background::BackgroundTask> = tasks
+            .iter()
+            .filter(|task| task.announced_at.is_none())
+            .collect();
+        if unannounced.is_empty() {
+            return Announced::Nothing;
+        }
+        let ids: Vec<String> = unannounced.iter().map(|task| task.id.clone()).collect();
+        let claimed = match store.mark_background_tasks_announced(&ids).await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to stamp background outcomes as announced: {}",
+                    error
+                );
+                // The caller has to hold the batch. Delivering it anyway would stamp
+                // `delivered_at`, and the announce pool requires that to be NULL -- so one
+                // `SQLITE_BUSY`, an ordinary thing with two meka processes on a store, would cost
+                // the webhook permanently. The delivered claim already fails this way; so does
+                // this now.
+                return Announced::Failed;
+            }
+        };
+        // Sent for what the stamp actually won, not for the snapshot it was chosen from. Filtered
+        // in place rather than through `only_what_was_won`, which owns its input: these are
+        // borrowed rows and cloning them to drop them again would be the only difference. Both
+        // callers read `announced_at IS NULL` before either writes, so sending off the snapshot
+        // delivers the same event twice; the `WHERE` clause is the arbiter and this is where its
+        // answer is honoured. The delivered claim is filtered the same way at its three sites.
+        for task in unannounced
+            .into_iter()
+            .filter(|task| claimed.contains(&task.id))
+        {
+            self.send(
+                WebhookEvent::TaskFinished,
+                // No `label`. It is the tool's primary argument, which for `execute_command` is
+                // the shell command line -- the highest-entropy field in the system and the one
+                // most likely to carry a credential someone pasted into a `curl`. A subscriber
+                // that wants it reads `GET /v1/sessions/{id}/tasks` with its own token, which is
+                // the whole reason deliveries carry identifiers rather than content.
+                serde_json::json!({
+                    "task_id": task.id,
+                    "session_id": task.session_id,
+                    "tool_name": task.tool_name,
+                    "status": task.status.as_str(),
+                }),
+            );
+        }
+        Announced::Told
     }
 
     /// Queue `event` for delivery to every endpoint subscribed to it.
@@ -360,6 +444,85 @@ mod tests {
             first.len(),
             "sha256=".len() + 64,
             "SHA-256 hex is 64 characters"
+        );
+    }
+
+    /// A batch whose announcement could not be recorded is held, not delivered.
+    ///
+    /// The announce pool requires `delivered_at IS NULL`, so a caller that delivered anyway would
+    /// put the row outside it forever -- one `SQLITE_BUSY`, an ordinary thing with two meka
+    /// processes on a store, costing the webhook permanently. The delivered claim already fails
+    /// this way; this is what lets the announce fail the same way.
+    ///
+    /// The store is broken by dropping the table under a live connection, matching how
+    /// `agent`'s store-failure tests do it: a real error on the real write path.
+    #[tokio::test]
+    async fn a_batch_whose_announcement_cannot_be_recorded_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let manager = crate::session::SessionManager::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let session_id = manager
+            .create_session(None, "p".to_string())
+            .await
+            .expect("session");
+        let task = crate::background::BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            tool_name: "execute_command".to_string(),
+            label: "sleep 900".to_string(),
+            status: crate::background::TaskStatus::Cancelled,
+            outcome: None,
+            scratchpad_name: None,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            announced_at: None,
+            delivered_at: None,
+        };
+        manager
+            .background_store()
+            .start_background_task(&task)
+            .await
+            .expect("start");
+
+        let dispatcher = WebhookDispatcher::new(Vec::new());
+        assert_eq!(
+            dispatcher
+                .announce_finished_tasks(&manager.background_store(), std::slice::from_ref(&task))
+                .await,
+            Announced::Told,
+            "the premise: a working store records it"
+        );
+
+        // A second row, and a store that can no longer take the stamp.
+        let mut second = task.clone();
+        second.id = uuid::Uuid::new_v4().to_string();
+        manager
+            .background_store()
+            .start_background_task(&second)
+            .await
+            .expect("start");
+        rusqlite::Connection::open(&path)
+            .expect("second connection")
+            .execute_batch("DROP TABLE background_tasks;")
+            .expect("drop the table");
+
+        let outcome = dispatcher
+            .announce_finished_tasks(&manager.background_store(), &[second])
+            .await;
+        assert_eq!(
+            outcome,
+            Announced::Failed,
+            "a stamp that did not happen must be reported as not having happened"
+        );
+        assert!(
+            !outcome.may_deliver(),
+            "and the caller must hold the batch rather than stamp it delivered"
+        );
+        assert!(
+            Announced::Told.may_deliver() && Announced::Nothing.may_deliver(),
+            "the other two answers let the caller carry on"
         );
     }
 

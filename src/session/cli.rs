@@ -11,6 +11,24 @@
 
 use crate::{cli, conversation, provider, render, session::SessionManager};
 
+/// What [`list_sessions`] aims to fit in.
+///
+/// The id takes whatever distinguishes it from the others on screen, the timestamp `19 + 2`, the
+/// provider what its longest name needs up to [`PROVIDER_TRUNCATE`], and the preview the rest. A
+/// full UUID here cost 36 of the 120 to repeat what eight characters usually say, and every command
+/// that takes a session id accepts the prefix this prints; [`show_session`] has the whole one.
+const TABLE_WIDTH: usize = 120;
+
+/// Ceiling on the rendered provider column.
+///
+/// A profile name is a config key the user chose, so nothing bounds it but this. Wide enough for
+/// the descriptive names people actually use -- `openrouter-anthropic-messages` is 29 -- since a
+/// name cut short enough to stop distinguishing two profiles is worse than a shorter preview.
+const PROVIDER_TRUNCATE: usize = 32;
+
+/// Floor on the preview, so a pathological profile name cannot squeeze it to nothing.
+const PREVIEW_MINIMUM: usize = 24;
+
 /// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
 /// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
 /// session import` rejects versions it doesn't recognize.
@@ -534,30 +552,141 @@ pub(crate) async fn run_session_subcommand(
             output,
             format,
         } => {
+            let session_id = crate::resolve_session_id(session_manager, session_id).await?;
             // Held for the same reason `fork` holds it: an export is a snapshot, and a snapshot of
             // a conversation mid-turn carries an unanswered user message that `meka session
             // import` then restores as an unusable session. See `hold_still_for_a_copy`.
-            let _source = hold_still_for_a_copy(session_manager, *session_id)?;
+            let _source = hold_still_for_a_copy(session_manager, session_id)?;
             // The written path is only interesting to the REPL; out here the shell (and the `-o`
             // the user typed) already knows where it went.
-            export_session(session_manager, *session_id, output.as_deref(), *format).await?;
+            export_session(session_manager, session_id, output.as_deref(), *format).await?;
             Ok(())
         }
         cli::SessionAction::Delete {
             session_ids,
             all,
             older_than_days,
-        } => delete_sessions(session_manager, session_ids, *all, *older_than_days).await,
+        } => {
+            // One id that cannot be resolved does not cancel the rest, matching the policy
+            // `delete_sessions` states for a session that is in use: every id the user named is a
+            // separate request.
+            let mut resolved = Vec::with_capacity(session_ids.len());
+            let mut unresolved = Vec::new();
+            for session_id in session_ids {
+                match crate::resolve_session_id(session_manager, session_id).await {
+                    Ok(id) => resolved.push(id),
+                    Err(error) => unresolved.push(error.to_string()),
+                }
+            }
+            for problem in &unresolved {
+                eprintln!("{}", problem);
+            }
+            // A name that resolved to nothing is a refusal like any other, and has to reach the
+            // exit code the same way: `delete_sessions` never learns these ids, so leaving it to
+            // report them exited 0 on `meka session delete <good> <typo>` and a script could not
+            // tell the typo from success. Clap used to catch this by parsing a `Uuid`; taking a
+            // prefix moved the check here.
+            //
+            // Skipped only when every id the user named failed to resolve and no sweep was asked
+            // for, because `delete_sessions` would then read the empty list as "no ids given" and
+            // answer `specify one or more session IDs`, which contradicts the command line. With no
+            // ids at all that message is exactly right, so it still goes through.
+            if !unresolved.is_empty() && resolved.is_empty() && !*all && older_than_days.is_none() {
+                anyhow::bail!(
+                    "{} of the session(s) named could not be resolved; see the errors above",
+                    unresolved.len()
+                );
+            }
+            let outcome = delete_sessions(session_manager, &resolved, *all, *older_than_days).await;
+            if unresolved.is_empty() {
+                return outcome;
+            }
+            outcome?;
+            anyhow::bail!(
+                "{} of {} session(s) named could not be resolved; see the errors above",
+                unresolved.len(),
+                unresolved.len() + resolved.len()
+            )
+        }
         cli::SessionAction::Import { input } => {
             import_session(session_manager, input, default_profile).await
         }
+        cli::SessionAction::Show { session_id } => {
+            let session_id = crate::resolve_session_id(session_manager, session_id).await?;
+            show_session(session_manager, session_id).await
+        }
         cli::SessionAction::Fork { session_id } => {
-            fork_session_command(session_manager, *session_id).await
+            let session_id = crate::resolve_session_id(session_manager, session_id).await?;
+            fork_session_command(session_manager, session_id).await
         }
         cli::SessionAction::Rewind { session_id, turns } => {
-            rewind_session_command(session_manager, *session_id, *turns).await
+            // The turn count is checked before the id is resolved, so `-n 0` blames the argument
+            // rather than reporting a session it never needed to find. Pinned by
+            // `session_rewind_rejects_zero_turns_without_describing_the_conversation`.
+            if *turns == 0 {
+                anyhow::bail!("-n must be 1 or more");
+            }
+            let session_id = crate::resolve_session_id(session_manager, session_id).await?;
+            rewind_session_command(session_manager, session_id, *turns).await
         }
     }
+}
+
+/// `meka session show <id>`: one session, with the id in full.
+///
+/// The listing shortens an id to whatever distinguishes it, which is only safe because this prints
+/// the whole thing. It also carries what the table has no room for: the working directory and the
+/// permission the row records. Not the whole opening message, which `session_info` has already cut
+/// to its first line and 80 characters before this sees it; `meka session export` is the surface
+/// that has all of it.
+async fn show_session(
+    session_manager: &SessionManager,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let session = session_manager
+        .session_info(session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?;
+
+    let mut out = String::new();
+    let mut field = |name: &str, value: &str| {
+        use std::fmt::Write as _;
+        writeln!(out, "{:<12} {}", format!("{}:", name), value).ok();
+    };
+    field("id", &session.id.to_string());
+    field("created", &format_timestamp(&session.created_at));
+    field("updated", &format_timestamp(&session.updated_at));
+    // Sanitised but not capped: a profile name is a config key the user chose, and this is the
+    // surface that does not truncate.
+    field(
+        "provider",
+        &render::sanitize_to_line(&session.provider, usize::MAX),
+    );
+    field("cwd", &match &session.cwd {
+        Some(cwd) => render::sanitize_to_line(&cwd.to_string_lossy(), usize::MAX),
+        None => "-".to_string(),
+    });
+    // Sanitised like its neighbours, and for a reason they do not share: every writer inside meka
+    // stores `Permission::to_string()`, but `import_sessions` takes this field from an archive
+    // verbatim, so the one column here whose value looks like a closed set is the one an outside
+    // file can choose. An unsanitised cell can move the cursor up and rewrite the `id` line above
+    // it, on the command whose whole purpose is printing that id.
+    field(
+        "permission",
+        &render::sanitize_to_line(
+            session
+                .permission
+                .as_deref()
+                .unwrap_or("from process config"),
+            usize::MAX,
+        ),
+    );
+    field(
+        "opening",
+        &render::sanitize_to_line(&session.preview, usize::MAX),
+    );
+    print!("{}", out);
+    Ok(())
 }
 
 /// `meka session rewind`: drop the last `turns` turns from a session that isn't currently open.
@@ -618,25 +747,69 @@ pub(crate) async fn list_sessions(
         return Ok(());
     }
 
-    let rows: Vec<Vec<String>> = sessions
-        .iter()
-        .map(|session| {
-            let mut row = vec![
-                session.id.to_string(),
-                format_timestamp(&session.updated_at),
-                // Sanitised for the same reason every other authored cell in a meka table is: the
-                // value is a config key the user chose, and a table is not a place to reproduce
-                // control characters verbatim.
-                render::sanitize_for_display(&session.provider),
-            ];
-            row.push(session.preview.clone());
-            row
-        })
-        .collect();
+    // The universe a printed prefix will be resolved against, which is every session rather than
+    // the ones this listing chose to show.
+    let resolvable = session_manager.all_session_ids().await?;
     let headers: &[&str] = &["ID", "Updated", "Provider", "Preview"];
-    print!("{}", render::format_columns(headers, &rows));
+    print!(
+        "{}",
+        render::format_columns(headers, &session_rows(&sessions, &resolvable))
+    );
 
     Ok(())
+}
+
+/// One row per session, separated from printing so the sanitising can be asserted.
+///
+/// Both authored cells go through the same helper. The provider used `sanitize_for_display`, which
+/// keeps `\n` and has no cap; the preview had neither and reached the terminal verbatim.
+fn session_rows(
+    sessions: &[crate::session::SessionSummary],
+    resolvable: &[String],
+) -> Vec<Vec<String>> {
+    // A profile name is a config key the user chose, so nothing bounds it but `PROVIDER_TRUNCATE`.
+    // Sized to the longest one actually present rather than to that ceiling: `format_columns` pads
+    // to the widest cell either way, so reserving the ceiling would spend width on nobody.
+    let providers: Vec<String> = sessions
+        .iter()
+        .map(|session| render::sanitize_to_line(&session.provider, PROVIDER_TRUNCATE))
+        .collect();
+    let provider_width = providers
+        .iter()
+        .map(|provider| unicode_width::UnicodeWidthStr::width(provider.as_str()))
+        .chain(std::iter::once("Provider".len()))
+        .max()
+        .unwrap_or(PROVIDER_TRUNCATE);
+    let ids: Vec<String> = sessions
+        .iter()
+        .map(|session| session.id.to_string())
+        .collect();
+    let id_width = render::unique_prefix_len_within(
+        ids.iter().map(String::as_str),
+        resolvable.iter().map(String::as_str),
+    )
+    .max("ID".len());
+    let preview_width = TABLE_WIDTH
+        .saturating_sub(id_width + 2)
+        .saturating_sub(19 + 2)
+        .saturating_sub(provider_width + 2)
+        .max(PREVIEW_MINIMUM);
+
+    sessions
+        .iter()
+        .zip(providers)
+        .zip(&ids)
+        .map(|((session, provider), id)| {
+            vec![
+                id.get(..id_width).unwrap_or(id).to_string(),
+                format_timestamp(&session.updated_at),
+                provider,
+                // The first line of a first message: a model composed it, or an API caller sent it
+                // through `POST /v1/sessions`.
+                render::sanitize_to_line(&session.preview, preview_width),
+            ]
+        })
+        .collect()
 }
 
 pub(crate) async fn delete_sessions(
@@ -692,9 +865,13 @@ pub(crate) async fn delete_sessions(
             .await
         {
             Ok(true) => deleted += 1,
-            // User-facing error: they asked to delete a specific ID and we couldn't find it, so
-            // stderr (not silent) is right.
-            Ok(false) => eprintln!("Session not found: {}", session_id),
+            // A refusal like any other: the user named this id and it did not go away, which a
+            // script must be able to tell from success. Reachable without a race by naming one
+            // session twice -- a prefix and its full id -- where the second pass finds it gone.
+            Ok(false) => {
+                eprintln!("Session not found: {}", session_id);
+                refused.push(*session_id);
+            }
             Err(error) => {
                 eprintln!("Cannot delete {}: {}", session_id, error);
                 refused.push(*session_id);
@@ -733,10 +910,19 @@ fn report_sessions_left_open(sweep: crate::session::SessionSweep) {
     }
 }
 
+/// A stored timestamp as `%Y-%m-%d %H:%M:%S`, or the raw value when it will not parse.
+///
+/// The fallback is sanitised and cut to the width a real timestamp occupies, because it is the one
+/// branch that prints a column's bytes rather than a rendering of them. `import_sessions` copies
+/// `created_at` out of an archive verbatim, so an unparseable value is attacker-chosen on a
+/// supported path: unsanitised it can erase the line above and print a second `id:` line, on the
+/// command whose whole purpose is showing that id. Every other cell on both surfaces is already
+/// sanitised; this was the door they had in common.
 pub(crate) fn format_timestamp(rfc3339: &str) -> String {
+    const RENDERED_WIDTH: usize = "2026-09-02 22:57:28".len();
     chrono::DateTime::parse_from_rfc3339(rfc3339)
         .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|_| rfc3339.to_string())
+        .unwrap_or_else(|_| crate::render::sanitize_to_line(rfc3339, RENDERED_WIDTH))
 }
 
 pub(crate) fn format_session_as_markdown(
@@ -1475,5 +1661,155 @@ mod tests {
             markdown.contains("kept tail answer"),
             "full export must include the retained tail:\n{markdown}"
         );
+    }
+
+    /// The rows as their own resolution universe, for tests about layout rather than about the
+    /// store the ids came from.
+    fn ids_of(sessions: &[crate::session::SessionSummary]) -> Vec<String> {
+        sessions
+            .iter()
+            .map(|session| session.id.to_string())
+            .collect()
+    }
+
+    /// A timestamp that will not parse is still a cell, not a licence to draw.
+    ///
+    /// `import_sessions` copies `created_at` out of an archive verbatim, so this branch prints
+    /// bytes an attacker chose. Unsanitised it erases the line above it and writes a second `id:`
+    /// line, which is a forged answer from the command whose whole job is printing that id.
+    #[test]
+    fn an_unparseable_timestamp_cannot_draw_over_the_line_above_it() {
+        let forged = "\u{1b}[7mCREATED\u{1b}[0m\rid:          00000000-0000-0000-0000-000000000000";
+        let rendered = format_timestamp(forged);
+        assert!(
+            !rendered.contains('\u{1b}') && !rendered.contains('\r'),
+            "no escape or carriage return may survive: {rendered:?}"
+        );
+        assert!(
+            crate::render::display_width(&rendered) <= "2026-09-02 22:57:28".len(),
+            "and it stays inside the column a timestamp occupies: {rendered:?}"
+        );
+        assert_eq!(
+            format_timestamp("2026-09-02T22:57:28Z"),
+            "2026-09-02 22:57:28",
+            "a real timestamp is unaffected"
+        );
+    }
+
+    /// Neither authored cell in `meka session list` can forge a row or carry an escape.
+    ///
+    /// The preview is the first line of a first message: a model composed it, or an API caller sent
+    /// it through `POST /v1/sessions`. It went to the terminal raw and uncapped while the provider
+    /// beside it was sanitised -- the shape of gap that a test asserting on the helper rather than
+    /// on the row would not have found, since the helper was never the broken part.
+    ///
+    /// Capped in terminal columns rather than characters, so a preview of CJK cannot be twice as
+    /// wide as the cap applied to it.
+    #[tokio::test]
+    async fn no_session_row_can_be_forged_by_its_own_preview() {
+        let manager =
+            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                .await
+                .expect("open");
+        let id = manager
+            .create_session(None, "prof\u{1b}[31m\nffffffff  x  y  z".to_string())
+            .await
+            .expect("create");
+        manager
+            .save_event(
+                id,
+                &conversation::Event::Append(crate::provider::Message::user(
+                    "hello\u{1b}[31m\nffffffff-0000-0000-0000-000000000000  2026-01-01 00:00:00  \
+                     other  harmless",
+                )),
+            )
+            .await
+            .expect("seed a first message");
+
+        let (sessions, _) = manager
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
+        let rows = session_rows(&sessions, &ids_of(&sessions));
+        let [row] = rows.as_slice() else {
+            panic!("one session, one row: {rows:?}");
+        };
+        for cell in row {
+            assert!(
+                !cell.contains('\u{1b}') && !cell.contains('\n'),
+                "a cell reaches a terminal verbatim, so neither may survive: {cell:?}"
+            );
+        }
+        assert!(
+            unicode_width::UnicodeWidthStr::width(row[3].as_str()) <= TABLE_WIDTH,
+            "and the preview is capped in columns: {:?}",
+            row[3]
+        );
+    }
+
+    /// The provider column takes what real names need, and the preview spends what is left.
+    ///
+    /// Profile names are descriptive in practice -- `openrouter-anthropic-messages` is 29 columns
+    /// -- and one cut short enough to stop distinguishing two profiles is worse than a shorter
+    /// preview. Reserving the ceiling instead would spend that width even on an installation
+    /// with one four-character name.
+    #[tokio::test]
+    async fn the_provider_column_takes_what_it_needs_and_the_preview_takes_the_rest() {
+        async fn widths(providers: &[&str]) -> (usize, usize) {
+            let manager =
+                SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
+                    .await
+                    .expect("open");
+            for provider in providers {
+                let id = manager
+                    .create_session(None, (*provider).to_string())
+                    .await
+                    .expect("create");
+                manager
+                    .save_event(
+                        id,
+                        &conversation::Event::Append(crate::provider::Message::user(
+                            "word ".repeat(40),
+                        )),
+                    )
+                    .await
+                    .expect("seed");
+            }
+            let (sessions, _) = manager
+                .list_sessions(10, false, None, None)
+                .await
+                .expect("list");
+            let rows = session_rows(&sessions, &ids_of(&sessions));
+            let width = |index: usize| {
+                rows.iter()
+                    .map(|row| unicode_width::UnicodeWidthStr::width(row[index].as_str()))
+                    .max()
+                    .unwrap_or(0)
+            };
+            (width(2).max("Provider".len()), width(3))
+        }
+
+        let (short_provider, wide_preview) = widths(&["stub"]).await;
+        let (long_provider, narrow_preview) =
+            widths(&["openrouter-anthropic-messages", "claude-max"]).await;
+
+        assert_eq!(
+            long_provider, 29,
+            "a real profile name is shown in full, not cut to a fixed ceiling"
+        );
+        assert!(
+            narrow_preview < wide_preview,
+            "and the preview pays for it: {narrow_preview} should be under {wide_preview}"
+        );
+        for (provider, preview) in [
+            (short_provider, wide_preview),
+            (long_provider, narrow_preview),
+        ] {
+            assert_eq!(
+                render::ID_PREFIX + 2 + 19 + 2 + provider + 2 + preview,
+                TABLE_WIDTH,
+                "every combination spends the budget exactly"
+            );
+        }
     }
 }

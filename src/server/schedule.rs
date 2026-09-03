@@ -197,21 +197,69 @@ async fn deliver_ready_outcomes(state: &ServerState) -> std::ops::ControlFlow<()
         if state.shutdown.is_cancelled() {
             return std::ops::ControlFlow::Break(());
         }
-        // Skipped rather than queued behind. This sweep is serial, so waiting on one busy
-        // session delays every later session's outcomes in the same tick. Checked *before
-        // anything is stamped*, so the next tick picks this session up unchanged -- which
-        // is why the delivery below can afford to wait if a turn starts in the gap.
-        // A session that has left the map since the snapshot counts as un-takeable too,
-        // not as idle: falling through would stamp its outcomes and then have
-        // `ensure_session_loaded` rebuild the whole runtime and pin the file lock, which
-        // is exactly the revival this poller documents itself as never doing.
-        if state
-            .sessions
-            .read()
+        // Announcing and delivering are two questions with two answers. Subscribers are told as
+        // soon as a task reaches a terminal state, without waiting for a turn to report it; the
+        // model is told by a turn. They were one step while they always happened together, and
+        // `announced_at` is what lets them come apart.
+        //
+        // Still inside the resident loop, because this poller never revives a session -- so a task
+        // whose session was evicted waits for something to open it, exactly as its delivery does.
+        // What the split buys is independence from the *turn*, not from the session.
+        let unannounced = match state
+            .shared
+            .session_manager
+            .background_store()
+            .list_unannounced_background_tasks(session_id)
             .await
-            .get(&session_id)
-            .is_none_or(|entry| entry.runtime.try_lock().is_err())
         {
+            Ok(unannounced) => unannounced,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to list unannounced background tasks for session {}: {}",
+                    session_id,
+                    error
+                );
+                continue;
+            }
+        };
+        if !state
+            .webhooks
+            .announce_finished_tasks(
+                &state.shared.session_manager.background_store(),
+                &unannounced,
+            )
+            .await
+            .may_deliver()
+        {
+            // Held rather than delivered: stamping `delivered_at` now would put these outside the
+            // announce pool forever, over a database error the next tick will probably not repeat.
+            continue;
+        }
+
+        // Two questions, one acquisition, asked for *delivery* only: is this session takeable, and
+        // could a turn actually start on it. Both must be true before anything is stamped, and
+        // neither is worth a second lock.
+        //
+        // Takeable is skipped rather than queued behind, because this sweep is serial and waiting
+        // on one busy session delays every later session's outcomes in the same tick. A session
+        // that has left the map since the snapshot counts as un-takeable too, not as idle: falling
+        // through would stamp its outcomes and then have `ensure_session_loaded` rebuild the whole
+        // runtime and pin the file lock, which is exactly the revival this poller documents itself
+        // as never doing.
+        //
+        // The readiness half is asked because the turn below gates on the same question as its
+        // first statement, so a required MCP server that is down would otherwise make every sweep
+        // stamp a batch and then refuse the turn that was to report it. The runtime is held across
+        // that await, which is slow only while a server is still connecting -- exactly when no turn
+        // can run here anyway.
+        let takeable = match state.sessions.read().await.get(&session_id) {
+            Some(entry) => match entry.runtime.try_lock() {
+                Ok(runtime) => crate::background::a_turn_can_carry_them(&runtime.agent).await,
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !takeable {
             continue;
         }
         let ready = match state
@@ -232,40 +280,56 @@ async fn deliver_ready_outcomes(state: &ServerState) -> std::ops::ControlFlow<()
                 continue;
             }
         };
-        let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+        // A cancellation never causes a turn, but joins one that is happening anyway: see
+        // `TaskStatus::wakes_a_host`. Left undelivered rather than recorded here, so the next turn
+        // carries it as part of its own prompt instead of as a message of its own -- a lone user
+        // message is a turn boundary (`crate::conversation::opens_turn`) and would be rewound,
+        // compacted around, and sent as a second consecutive user turn.
+        if !ready.iter().any(|task| task.status.wakes_a_host()) {
+            continue;
+        }
+        // Announced again before the stamp, over the pool this sweep actually read. The pass above
+        // ran off an earlier snapshot, and a task reaching a terminal state between the two queries
+        // is absent from that one and present here -- so stamping it delivered first would put it
+        // outside the announce pool forever, since that also requires `delivered_at IS NULL`.
+        // Idempotent: anything already announced is filtered out by its own `announced_at`.
+        if !state
+            .webhooks
+            .announce_finished_tasks(&state.shared.session_manager.background_store(), &ready)
+            .await
+            .may_deliver()
+        {
+            continue;
+        }
         // Stamped before the turn, unlike the scheduler's own completion: an outcome that wedges
-        // the process must not be redelivered on every restart.
-        if let Err(error) = state
+        // the process must not be redelivered on every restart. The cost is that the batch is lost
+        // if the session is evicted between here and `ensure_session_loaded` below and the reload
+        // then finds another process holding the lock -- a narrower loss than a restart loop, and
+        // the same trade the poller has always made.
+        //
+        // The stamp is also the claim, so the turn below reports only what it won: a user turn on
+        // the same session lists and stamps the same rows (`claim_undelivered_outcomes`), and this
+        // sweep's busy test is the runtime mutex, which that path does not hold while it claims.
+        let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
+        let claimed = match state
             .shared
             .session_manager
             .background_store()
             .mark_background_tasks_delivered(&ids)
             .await
         {
-            tracing::warn!(
-                "failed to stamp background outcomes as delivered: {}",
-                error
-            );
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to stamp background outcomes as delivered: {}",
+                    error
+                );
+                continue;
+            }
+        };
+        let ready = crate::background::only_what_was_won(ready, &claimed);
+        if ready.is_empty() {
             continue;
-        }
-        // Fired before the delivery turn rather than after it: the fact a task finished
-        // is the news, and it should not wait on a model call that may itself fail.
-        for task in &ready {
-            state.webhooks.send(
-                crate::server::webhook::WebhookEvent::TaskFinished,
-                // No `label`. It is the tool's primary argument, which for
-                // `execute_command` is the shell command line -- the highest-entropy
-                // field in the system and the one most likely to carry a credential
-                // someone pasted into a `curl`. A subscriber that wants it reads
-                // `GET /v1/sessions/{id}/tasks` with its own token, which is the whole
-                // reason deliveries carry identifiers rather than content.
-                serde_json::json!({
-                    "task_id": task.id,
-                    "session_id": task.session_id,
-                    "tool_name": task.tool_name,
-                    "status": task.status.as_str(),
-                }),
-            );
         }
         if let Err(error) = run_prompt_in_session(
             state,
@@ -474,10 +538,48 @@ async fn run_prompt_in_session(
         *slot = cancellation.clone();
     }
 
+    // A scheduled fire is a turn that is happening anyway, so an outcome that did not warrant one
+    // of its own rides it -- the third door, after a user turn and the poller's own report. Without
+    // this a session whose only traffic is scheduled jobs never learns its task was cancelled,
+    // which is the promise `TaskStatus::wakes_a_host` makes on the poller's behalf.
+    //
+    // Claimed after the lock, so a fire that turns out to be busy cannot stamp an outcome it then
+    // fails to deliver.
+    let riding = match kind {
+        OutOfBand::ScheduledJob { .. } if state.shared.config.background.enabled => {
+            crate::background::claim_undelivered_outcomes(
+                &runtime.agent,
+                &state.shared.session_manager,
+                session_id,
+            )
+            .await
+        }
+        // The batch this turn was started to report is already in `prompt`, and already stamped.
+        _ => Vec::new(),
+    };
+    // Announced here too, because this is the third way an outcome leaves the undelivered pool and
+    // the stamp is one-way: `list_unannounced_background_tasks` also requires `delivered_at IS
+    // NULL`, so a row this claim delivered can never be announced afterwards. Deterministically
+    // reachable on a restart -- the load sweep retires a task the dead host left running, and this
+    // fire claims it before the poller has ticked.
+    // Best-effort, for the reason `submit_turn` gives: the claim above is already stamped, and a
+    // fire that has reached this point should report to the model regardless.
+    let _announced = state
+        .webhooks
+        .announce_finished_tasks(&state.shared.session_manager.background_store(), &riding)
+        .await;
+    let prompt = if riding.is_empty() {
+        prompt
+    } else {
+        crate::background::render_outcomes_before(&riding, &prompt)
+    };
+
     let mut session_uuid = Some(runtime.session_uuid);
     let runtime_inner = &mut *runtime;
     let outcome = match kind {
         OutOfBand::ScheduledJob { retention, .. } => {
+            let retention = crate::background::retention_carrying(&riding, retention);
+
             runtime_inner
                 .agent
                 .run_turn_retaining(

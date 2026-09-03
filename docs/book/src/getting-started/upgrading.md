@@ -125,6 +125,17 @@ output, it needs updating; the default columns are unchanged.
 still goes home. The old behaviour made a bare `/cd` a surprising way to leave the project you were
 working in.
 
+**`meka session delete` refuses ids given alongside `--all`.** It used to take both and quietly do
+the wider thing, so `meka session delete "$ID" --all` with `$ID` unset deleted every session and
+then reported the empty id as a failure -- a complete wipe reported as an error. Naming sessions and
+asking for all of them are two different requests; say one or the other. `--older-than-days` has
+conflicted with both for the same reason since 0.44.
+
+**Every command taking a session, job or task id now accepts a unique prefix of one**, which is what
+the listings print. Full ids still work, so nothing that already worked stops. An ambiguous prefix
+is refused with the candidates named, and an empty one matches nothing rather than the only row --
+`meka schedule cancel "$JOB"` with `$JOB` unset used to cancel whatever job was alone.
+
 **`meka mcp logout <name>` clears every credential that server holds**, not only its OAuth tokens.
 If you were using it to drop a stale token from a server that also has a stored bearer or client
 secret, you will now need to store that again with `meka mcp login`.

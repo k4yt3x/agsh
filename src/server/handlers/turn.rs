@@ -333,9 +333,54 @@ pub async fn submit_turn(
     // still leaves the session idle rather than reporting a turn in flight.
     let images = decode_turn_images(&body.images, entry.binding.current().vision).await?;
 
+    // Taken here rather than inside the two arms below, and *before* the claim: it is the only
+    // per-session admission gate (`TurnGuard::acquire` counts, it does not refuse), so claiming
+    // first meant a 409 stamped an outcome delivered that no turn ever delivered, and
+    // `list_undelivered_background_tasks` never returns a stamped row again. The guard moves into
+    // whichever arm runs, holding from admission to the end of the turn.
+    let runtime = Arc::clone(&entry.runtime).try_lock_owned().map_err(|_| {
+        ProblemDetail::new(
+            ErrorKind::TurnInFlight,
+            StatusCode::CONFLICT,
+            "another turn is already in flight on this session",
+        )
+        .with("session_id", session_id.to_string())
+    })?;
+
+    // An outcome that did not warrant a turn of its own rides on this one, ahead of the caller's
+    // message rather than as a message of its own: see `background::render_outcomes_before`. Both
+    // arms below take the joined prompt, so neither surface can be the one that forgets.
+    let outcomes = if state.shared.config.background.enabled {
+        crate::background::claim_undelivered_outcomes(
+            &runtime.agent,
+            &state.shared.session_manager,
+            session_id,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    // This turn and the poller are the two ways an outcome leaves the undelivered pool, and
+    // subscribers are owed it whichever one takes it: a task that finishes between two ticks and is
+    // claimed here would otherwise never be announced at all.
+    // Best-effort here, unlike the poller: this claim is already stamped, and refusing the user's
+    // turn over a webhook bookkeeping failure would be the wrong trade. It is logged.
+    let _announced = state
+        .webhooks
+        .announce_finished_tasks(&state.shared.session_manager.background_store(), &outcomes)
+        .await;
+    let message = if outcomes.is_empty() {
+        message
+    } else {
+        crate::background::render_outcomes_before(&outcomes, &message)
+    };
+
     if body.stream {
         // SSE responses are streamed live and aren't a single envelope we can cache.
-        run_streaming_turn(state, entry, session_id, message, images, turn_guard).await
+        run_streaming_turn(
+            state, entry, runtime, session_id, message, images, turn_guard,
+        )
+        .await
     } else {
         // The ticket travels *into* the turn, and is committed by the task that runs it rather
         // than here. The turn now outlives a client that hangs up, so leaving the commit on this
@@ -345,6 +390,7 @@ pub async fn submit_turn(
         // finishes is what makes the key mean what the retry-safety table says it means.
         run_blocking_turn(
             entry,
+            runtime,
             session_id,
             message,
             images,
@@ -606,6 +652,7 @@ impl Drop for StreamGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_blocking_turn(
     entry: crate::server::state::SessionEntry,
+    mut runtime: tokio::sync::OwnedMutexGuard<crate::server::state::SessionRuntime>,
     session_id: Uuid,
     message: String,
     images: Vec<crate::provider::ImageSource>,
@@ -614,9 +661,10 @@ async fn run_blocking_turn(
     idempotency_ticket: Option<crate::server::idempotency::IdempotencyTicket>,
     relay_provider_errors: bool,
 ) -> Result<Json<TurnResponse>, ProblemDetail> {
-    // `try_lock_owned`, and the turn runs on a spawned task, for the same reason the streaming
-    // path does it: axum drops a handler's future when the client disconnects, and a turn is not a
-    // computation that can be abandoned halfway.
+    // The turn runs on a spawned task, for the same reason the streaming path does it: axum drops
+    // a handler's future when the client disconnects, and a turn is not a computation that can be
+    // abandoned halfway. The runtime guard comes from `submit_turn`, which takes it as the
+    // admission check before anything is written.
     //
     // A blocking turn outlives most client timeouts -- the default request has no SSE to keep the
     // connection warm, so a 30s reqwest timeout against a turn that runs a build is the ordinary
@@ -632,22 +680,14 @@ async fn run_blocking_turn(
     // `SessionResponse::turn_in_flight` already documents for the streaming path: the work
     // completes, and a client that reconnects reads the reply out of `GET /messages`. It also
     // turns a panic inside the turn into a clean 500 instead of a reset connection.
-    let mut runtime = Arc::clone(&entry.runtime).try_lock_owned().map_err(|_| {
-        ProblemDetail::new(
-            ErrorKind::TurnInFlight,
-            StatusCode::CONFLICT,
-            "another turn is already in flight on this session",
-        )
-        .with("session_id", session_id.to_string())
-    })?;
 
     let _stale = entry.frontend.drain();
 
-    // Publish the cancellation token *after* acquiring the mutex. Publishing before the lock
-    // would let a rejected Turn B overwrite a running Turn A's token, making Turn A
-    // uncancellable. The brief window between lock-acquire and this publish is harmless:
-    // POST /cancel reading the old (session-creation or prior-turn) token is a no-op on an
-    // already-finished turn.
+    // Publish the cancellation token *after* the mutex has been acquired, which `submit_turn` did
+    // before dispatching here. Publishing without the lock would let a rejected Turn B overwrite a
+    // running Turn A's token, making Turn A uncancellable. The window between the acquire and this
+    // publish is harmless whatever its length: `POST /cancel` reading the old (session-creation or
+    // prior-turn) token is a no-op on an already-finished turn.
     let cancellation = CancellationToken::new();
     {
         let mut guard = crate::server::poisoned::write(
@@ -738,23 +778,12 @@ async fn run_blocking_turn(
 async fn run_streaming_turn(
     state: ServerState,
     entry: crate::server::state::SessionEntry,
+    owned_runtime: tokio::sync::OwnedMutexGuard<crate::server::state::SessionRuntime>,
     session_id: Uuid,
     message: String,
     images: Vec<crate::provider::ImageSource>,
     turn_guard: TurnGuard,
 ) -> Result<Response, ProblemDetail> {
-    // Acquire the runtime mutex up front via `try_lock_owned`. The `OwnedMutexGuard` moves
-    // into the spawned task so the lock holds continuously from the admission check to the
-    // end of the turn.
-    let owned_runtime = Arc::clone(&entry.runtime).try_lock_owned().map_err(|_| {
-        ProblemDetail::new(
-            ErrorKind::TurnInFlight,
-            StatusCode::CONFLICT,
-            "another turn is already in flight on this session",
-        )
-        .with("session_id", session_id.to_string())
-    })?;
-
     // Subscribe to the broadcast BEFORE installing: install_stream returns a receiver that
     // captures the first event onwards.
     let _stale = entry.frontend.drain();

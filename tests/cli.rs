@@ -1637,3 +1637,74 @@ fn a_worker_session_refuses_a_resume_from_the_command_line() {
          a level it never ran at"
     );
 }
+
+/// A one-shot run carries an outcome that was waiting, and prints one that lands during it.
+///
+/// `--oneshot` is the fourth host and the one it is easiest to forget: it has no REPL loop, no
+/// poller and exactly one turn. A resume inherits whatever the last process left undelivered -- a
+/// cancellation, or a task the session-load sweep retires as `interrupted` -- and without the fold
+/// that report reached nobody until the run was already over.
+#[test]
+fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    let config = dir.path().join("meka").join("config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config.toml");
+    text.push_str("\n[background]\nenabled = true\n");
+    std::fs::write(&config, text).expect("write config.toml");
+
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(
+        created.status.success(),
+        "the first turn should have created a session: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let id = only_session(dir.path());
+
+    // Exactly what `/tasks cancel` leaves behind for the next process to carry.
+    let now = chrono::Utc::now().to_rfc3339();
+    store(dir.path())
+        .execute(
+            "INSERT INTO background_tasks \
+             (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+             VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), &id, now],
+        )
+        .expect("seed the cancelled task");
+
+    let resumed = run_scripted(dir.path(), &["-r", &id, "--oneshot", "what happened?"]);
+    assert!(
+        resumed.status.success(),
+        "the resumed run should have succeeded: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+
+    let carrier: String = store(dir.path())
+        .query_row(
+            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' \
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&id],
+            |row| row.get(0),
+        )
+        .expect("the resumed turn's user message");
+    assert!(
+        carrier.contains("was cancelled"),
+        "the outcome must ride inside the one turn this run has: {carrier}"
+    );
+    assert!(
+        carrier.contains("what happened?"),
+        "and the prompt has to still be there: {carrier}"
+    );
+
+    let delivered: Option<String> = store(dir.path())
+        .query_row(
+            "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
+            rusqlite::params![&id],
+            |row| row.get(0),
+        )
+        .expect("read the task");
+    assert!(
+        delivered.is_some(),
+        "and riding a turn is a delivery, so the row must be stamped"
+    );
+}

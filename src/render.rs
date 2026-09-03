@@ -2039,18 +2039,20 @@ pub fn render_session_id(label: &str, id: &str) {
 /// (Distinct from the private `format_table`, which lays out *markdown* pipe tables for the
 /// streaming renderer.)
 ///
-/// Width is measured in `char`s, which is correct for the ASCII-dominated data meka tabulates
-/// (names, versions, UUIDs, timestamps); a CJK-heavy cell would pad slightly short. No caller hits
-/// that today.
+/// Width is measured in terminal columns, the same unit [`sanitize_to_line`] truncates in and the
+/// same unit every caller reserves its budget in. Measuring in `char`s instead let a cell whose
+/// characters are two columns wide -- a CJK provider name, an MCP tool name a server chose -- pad
+/// to less than it renders, shifting every column after it on that row and pushing the row past
+/// the budget its cells individually respected.
 pub fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     if headers.is_empty() {
         return String::new();
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|header| display_width(header)).collect();
     for row in rows {
         for (index, cell) in row.iter().take(widths.len()).enumerate() {
-            widths[index] = widths[index].max(cell.chars().count());
+            widths[index] = widths[index].max(display_width(cell));
         }
     }
 
@@ -2062,9 +2064,92 @@ pub fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
-fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
-    use std::fmt::Write as _;
+/// How much of an id a row shows before anything forces it wider: a UUID's first segment.
+pub(crate) const ID_PREFIX: usize = 8;
 
+/// Whether `prefix` could be a prefix of an id meka printed.
+///
+/// Every resolver asks this before matching, because `id.starts_with("")` is true of every id: an
+/// unset shell variable in `meka schedule cancel "$JOB"` otherwise reads as "the only job", and
+/// resolves cleanly right up until the store holds two. The stores are the doors this covers --
+/// sessions, scheduled jobs and background tasks all key on a UUID string.
+///
+/// Rejecting rather than matching everything is also what makes an ambiguity report honest: an
+/// empty prefix names nothing the caller could retype a longer version of.
+pub(crate) fn is_usable_id_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() || character == '-')
+}
+
+/// An id prefix as the resolvers compare it.
+///
+/// Every id meka stores and prints is a lowercase UUID, but the resolvers disagreed about case:
+/// sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while jobs and tasks use
+/// `str::starts_with`. So a pasted `4D71EECA` resolved a session and was reported as no such job --
+/// a clean answer from one command and a false miss from its sibling. Folded once, here.
+pub(crate) fn id_prefix_for_matching(prefix: &str) -> String {
+    prefix.to_ascii_lowercase()
+}
+
+/// Shortest prefix at which every one of `ids` is distinct, never below [`ID_PREFIX`] unless an
+/// id is itself shorter than that.
+///
+/// A prefix is what the reader retypes into `schedule show`, `schedule cancel` or `--session`, all
+/// of which refuse an ambiguous one. Printing a prefix that cannot be used is the failure worth
+/// avoiding, and a full UUID in both id columns spends 76 of the 120 available to say what eight
+/// characters usually say.
+///
+/// Uniqueness is over the rows being rendered. For `meka schedule list` that is every job there is;
+/// a filtered listing can still print a prefix that a wider set makes ambiguous, which those
+/// commands report rather than act on.
+///
+/// Never ends on a UUID's hyphen, since `4d71eeca-` reads as a truncation of nothing.
+/// [`unique_prefix_len`] where the ids on screen are a subset of the ids that must be resolved.
+///
+/// A listing filters: `meka session list` hides sub-agent sessions and honours `-n`, and
+/// `meka schedule list --session` narrows to one conversation. The resolvers do not filter -- they
+/// scan the whole store. Sizing the column to the rows alone therefore printed a prefix that the
+/// `show` beside it refused as ambiguous, which is the one thing the id rule promises cannot
+/// happen. `universe` is what the resolver will search, so the width is the width that resolves.
+pub(crate) fn unique_prefix_len_within<'a>(
+    shown: impl Iterator<Item = &'a str> + Clone,
+    universe: impl Iterator<Item = &'a str> + Clone,
+) -> usize {
+    let universe: std::collections::HashSet<&str> = universe.collect();
+    let longest = shown.clone().map(str::len).max().unwrap_or(ID_PREFIX);
+    for length in ID_PREFIX..longest {
+        if shown
+            .clone()
+            .any(|id| id.as_bytes().get(length - 1) == Some(&b'-'))
+        {
+            continue;
+        }
+        let resolves = shown.clone().all(|id| {
+            let prefix = id.get(..length).unwrap_or(id);
+            universe
+                .iter()
+                .filter(|other| other.starts_with(prefix))
+                .count()
+                == 1
+        });
+        if resolves {
+            return length;
+        }
+    }
+    longest
+}
+
+pub(crate) fn unique_prefix_len<'a>(ids: impl Iterator<Item = &'a str> + Clone) -> usize {
+    // The rows are their own universe, and it is deduplicated by `unique_prefix_len_within`:
+    // repeating an id is ordinary -- a session with several scheduled jobs fills the whole Session
+    // column with itself -- and counting rows made that unsatisfiable, so the column widened to a
+    // full UUID to distinguish an id from itself.
+    unique_prefix_len_within(ids.clone(), ids)
+}
+
+fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
     let mut line = String::new();
     let last = cells.len().saturating_sub(1);
     for (index, cell) in cells.iter().enumerate() {
@@ -2072,8 +2157,14 @@ fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
             // Final column: never padded; nothing follows it.
             line.push_str(cell);
         } else {
+            // Padded by hand rather than with `{:<w$}`, which counts `char`s: the widths above are
+            // terminal columns, and the two disagree on exactly the cells that motivated them.
             let width = widths.get(index).copied().unwrap_or(0);
-            let _ = write!(line, "{:<w$}  ", cell, w = width);
+            line.push_str(cell);
+            for _ in 0..width.saturating_sub(display_width(cell)) {
+                line.push(' ');
+            }
+            line.push_str("  ");
         }
     }
     line.push('\n');
@@ -4345,6 +4436,76 @@ mod tests {
         assert_eq!(
             params(serde_json::json!({"body": "", "tags": [], "meta": {}, "parent": null})),
             "  body: (empty)\n  tags: (empty)\n  meta: (empty)\n  parent: null"
+        );
+    }
+
+    /// A column pads to what it renders, not to how many characters it holds.
+    ///
+    /// Every caller reserves its budget in terminal columns and caps its cells with
+    /// `sanitize_to_line`, which truncates in the same unit. Padding by `char` count broke the
+    /// chain at the last step: two cells capped to the same width, one ASCII and one CJK, produced
+    /// rows of different lengths, so every column after the wide one shifted and the row overran
+    /// the budget its own cells had respected. The cell tests cannot see it, because they measure
+    /// cells rather than the rendered row.
+    #[test]
+    fn a_wide_cell_pads_to_its_rendered_width_not_its_character_count() {
+        let table = super::format_columns(&["Tool", "Status"], &[
+            vec!["aaaa".to_string(), "ok".to_string()],
+            vec!["本本".to_string(), "ok".to_string()],
+        ]);
+        // The header is excluded: the last column is never padded, so its own width is free to
+        // differ. The two data rows end in the same cell, so anything left is the padding.
+        let widths: Vec<usize> = table.lines().skip(1).map(super::display_width).collect();
+        assert_eq!(
+            widths,
+            vec![8, 8],
+            "both rows carry a 4-column cell and then `ok`, so both must render 8 wide:\n{}",
+            table
+        );
+    }
+
+    /// Every id family answers the same way to the same prefix, whatever case it is typed in.
+    ///
+    /// Sessions resolve through SQL `LIKE`, which is ASCII-case-insensitive; jobs and tasks
+    /// resolve through `str::starts_with`, which is not. A pasted uppercase id therefore found a
+    /// session and was reported as no such job -- the two commands disagreeing about the same
+    /// string. `is_usable_id_prefix` accepts `A-F`, so the folding has to happen somewhere.
+    #[test]
+    fn an_uppercase_prefix_matches_the_lowercase_id_it_was_copied_from() {
+        let id = "4d71eeca-9f21-4c3a-b8e7-1a2b3c4d5e6f";
+        for typed in ["4D71EECA", "4d71EEca", "4d71eeca"] {
+            assert!(
+                super::is_usable_id_prefix(typed),
+                "{typed} is a usable prefix"
+            );
+            assert!(
+                id.starts_with(&super::id_prefix_for_matching(typed)),
+                "{typed} must match the id it was copied from"
+            );
+        }
+    }
+
+    /// The empty string is a prefix of every id, which is a destructive answer to give.
+    ///
+    /// `meka schedule cancel "$JOB"` with the variable unset would otherwise resolve to "the only
+    /// job" and delete it, and read as correct for as long as the store held one of anything. Every
+    /// resolver asks this, so the answer cannot differ between the command that shows a job and the
+    /// command that destroys it.
+    #[test]
+    fn an_empty_or_impossible_prefix_matches_nothing_rather_than_everything() {
+        assert!(
+            !super::is_usable_id_prefix(""),
+            "an unset shell variable must not name the only session, job or task"
+        );
+        assert!(!super::is_usable_id_prefix("  "));
+        assert!(
+            !super::is_usable_id_prefix("zz"),
+            "no id contains a non-hex character, so this can only be a typo"
+        );
+        assert!(super::is_usable_id_prefix("4d71eeca"));
+        assert!(
+            super::is_usable_id_prefix("4d71eeca-3f2b-4c1a-9e8d-5a6b7c8d9e0f"),
+            "a full id is a prefix of itself"
         );
     }
 

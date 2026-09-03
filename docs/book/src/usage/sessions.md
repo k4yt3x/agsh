@@ -323,9 +323,26 @@ This shows a table with each session's ID, last update time, provider profile, a
 first message:
 
 ```
-ID                                    Updated              Provider  Preview
-550e8400-e29b-41d4-a716-446655440000  2026-03-14 12:00:00  work      How do I implement a binary search tree?
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  2026-03-13 09:30:00  personal  Fix the login page CSS
+ID        Updated              Provider  Preview
+550e8400  2026-03-14 12:00:00  work      How do I implement a binary search tree?
+a1b2c3d4  2026-03-13 09:30:00  personal  Fix the login page CSS
+```
+
+The ID column shows as much of each id as distinguishes it from the others on screen, widening only
+if two would otherwise read the same. Every command that takes a session id -- `meka -r`, `export`,
+`show`, `fork`, `rewind`, `delete` -- accepts any unique prefix, so what you see is normally what
+you retype. An ambiguous prefix is refused and every match listed, rather than acted on.
+
+Uniqueness is computed over the rows *on screen*, while the commands resolve against every session
+in the store. A listing narrowed by `-n`, or one hiding sub-agent sessions (they are hidden unless
+`--include-children` is given), can therefore print a prefix that a wider set makes ambiguous. That
+fails closed: the command refuses and names both ids, so nothing is acted on and the full id is one
+copy away.
+
+For the whole id, and the working directory and permission the table has no room for:
+
+```bash
+meka session show 550e8400
 ```
 
 By default the 20 most recent sessions are shown. Use `-n` to change:
@@ -490,6 +507,9 @@ Delete all sessions:
 ```bash
 meka session delete --all
 ```
+
+`--all` takes no ids of its own: naming some sessions and then asking for every session are two
+different requests, and it refuses rather than quietly doing the wider one.
 
 ## Input History
 

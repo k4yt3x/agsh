@@ -903,7 +903,20 @@ mod tests {
             }
         });
 
-        let error = probe_client()
+        // Not `probe_client`, whose 500ms connect timeout is there for the dead-port tests beside
+        // this one; here the server is local and the error under test is only reached by walking
+        // reqwest's whole redirect chain.
+        //
+        // Pooling is off because the server above answers one request per `accept()` and then drops
+        // the socket. A later hop that reuses a pooled connection therefore writes into a closed
+        // one and fails as a transport error, and the assertion below sees that instead of the
+        // redirect. Raising the connect timeout did not fix this: it was never a connect timeout.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("a client with no exotic configuration builds");
+        let error = client
             .get(format!("http://{address}/"))
             .send()
             .await

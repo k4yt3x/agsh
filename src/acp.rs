@@ -3159,6 +3159,29 @@ async fn run_prompt_turn(
     // this `Option`. Pass it through anyway for API compatibility with the REPL path that does
     // lazy-create sessions on first prompt.
     let mut session_uuid_opt = Some(*session_uuid);
+    // An outcome that did not warrant a turn of its own rides on this one, ahead of the editor's
+    // prompt rather than as a message of its own: see `background::render_outcomes_before`.
+    let outcomes = if state.shared.config.background.enabled {
+        crate::background::claim_undelivered_outcomes(
+            agent,
+            &state.shared.session_manager,
+            *session_uuid,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let prompt_text = if outcomes.is_empty() {
+        prompt_text
+    } else {
+        // Shown to the editor as well as sent, as the scheduled-fire path does: the model answers
+        // about this text, and a transcript without it reads as an answer to a question nobody
+        // asked. Pushed before the prompt, which is the order the model receives them in.
+        entry
+            .frontend
+            .push_out_of_band_prompt(&crate::background::render_outcomes(&outcomes));
+        crate::background::render_outcomes_before(&outcomes, &prompt_text)
+    };
     // Clone the cancellation token so we can probe `is_cancelled()` after the call returns. The
     // spec mandates that any cancel arriving during a turn must surface as `StopReason::Cancelled`,
     // even when the cancellation manifests as a provider / tool error rather than the clean

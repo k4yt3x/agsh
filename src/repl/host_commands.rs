@@ -365,6 +365,21 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                 with_console(console, |console| console.error(&error));
             }
         }
+        SlashCommand::ScheduleShow { id } => match session_id {
+            Some(session) => {
+                if let Err(error) = crate::schedule::cli::show(
+                    session_manager,
+                    &id,
+                    &config.schedule,
+                    Some(session),
+                )
+                .await
+                {
+                    with_console(console, |console| console.error(&error));
+                }
+            }
+            None => eprintln!("No active session yet."),
+        },
         // Scoped to the session in the REPL, unlike `meka schedule list`, which has no
         // conversation to be "this one" and so shows every session's jobs.
         SlashCommand::ScheduleList => match session_id {
@@ -403,6 +418,16 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
             Some(id) => {
                 if let Err(error) =
                     crate::background::cli::run_list_for_session(session_manager, id).await
+                {
+                    with_console(console, |console| console.error(&error));
+                }
+            }
+            None => eprintln!("No active session yet."),
+        },
+        SlashCommand::TaskShow { id } => match session_id {
+            Some(session) => {
+                if let Err(error) =
+                    crate::background::cli::show(session_manager, session, &id).await
                 {
                     with_console(console, |console| console.error(&error));
                 }

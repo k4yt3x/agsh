@@ -123,14 +123,14 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "schedule",
         aliases: &[],
-        help: "List this session's scheduled jobs, or cancel one by id",
-        arg_hint: "[cancel <id>]",
+        help: "List this session's scheduled jobs, show one, or cancel one by id",
+        arg_hint: "[show <id> | cancel <id>]",
     },
     CommandSpec {
         name: "tasks",
         aliases: &[],
-        help: "List background tasks, or cancel one by id",
-        arg_hint: "[cancel <id|--all>]",
+        help: "List background tasks, show one, or cancel one by id",
+        arg_hint: "[show <id> | cancel <id|--all>]",
     },
     CommandSpec {
         name: "mcp",
@@ -735,11 +735,22 @@ pub enum SlashCommand {
     /// `/memory` (no argument): list saved memories, most important first.
     MemoryList,
     ScheduleList,
+    /// One job in full, including the whole prompt and what a gate runs.
+    ///
+    /// The table dropped `When` and `Check` to fit its budget, and `/schedule` is the surface that
+    /// has no `meka schedule show` to fall back on without leaving the REPL.
+    ScheduleShow {
+        id: String,
+    },
     ScheduleCancel {
         id: String,
     },
     /// `/tasks`: list this session's background tasks.
     TaskList,
+    /// One task in full, including the id the listing shortens.
+    TaskShow {
+        id: String,
+    },
     /// `/tasks cancel <id>`, or `/tasks cancel --all`.
     TaskCancel {
         /// `None` means every running task in this session.
@@ -822,12 +833,14 @@ impl SlashCommand {
             SlashCommand::Rewind { .. } => Answerer::Host,
             SlashCommand::ScheduleCancel { .. } => Answerer::Host,
             SlashCommand::ScheduleList => Answerer::Host,
+            SlashCommand::ScheduleShow { .. } => Answerer::Host,
             SlashCommand::Session => Answerer::Host,
             SlashCommand::SkillInvoke { .. } => Answerer::Host,
             SlashCommand::SkillList => Answerer::Host,
             SlashCommand::Status => Answerer::Host,
             SlashCommand::TaskCancel { .. } => Answerer::Host,
             SlashCommand::TaskList => Answerer::Host,
+            SlashCommand::TaskShow { .. } => Answerer::Host,
             SlashCommand::Usage => Answerer::Host,
         }
     }
@@ -950,11 +963,16 @@ fn parse_memory_slash(rest: &str) -> SlashCommand {
 
 /// Parse the argument to `/schedule …`.
 ///
-/// Bare `/schedule` lists; `/schedule cancel <id>` cancels. There is no `create`: a job's prompt is
-/// prose the agent writes for its own future self, and typing one at the REPL would be doing the
-/// agent's job badly.
+/// Bare `/schedule` lists; `/schedule show <id>` prints one in full; `/schedule cancel <id>`
+/// cancels. There is no `create`: a job's prompt is prose the agent writes for its own future self,
+/// and typing one at the REPL would be doing the agent's job badly.
 fn parse_schedule_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
+    if let Some(id) = rest.strip_prefix("show").map(str::trim)
+        && !id.is_empty()
+    {
+        return SlashCommand::ScheduleShow { id: id.to_string() };
+    }
     match rest.strip_prefix("cancel").map(str::trim) {
         Some(id) if !id.is_empty() => SlashCommand::ScheduleCancel { id: id.to_string() },
         _ => SlashCommand::ScheduleList,
@@ -963,11 +981,16 @@ fn parse_schedule_slash(rest: &str) -> SlashCommand {
 
 /// Parse the argument to `/tasks …`.
 ///
-/// Bare `/tasks` lists; `/tasks cancel <id>` stops one; `/tasks cancel --all` stops them all. There
-/// is no way to *start* one here, for the same reason `/schedule` has no `create`: the decision to
-/// detach belongs to the agent making the call.
+/// Bare `/tasks` lists; `/tasks show <id>` prints one in full; `/tasks cancel <id>` stops one;
+/// `/tasks cancel --all` stops them all. There is no way to *start* one here, for the same reason
+/// `/schedule` has no `create`: the decision to detach belongs to the agent making the call.
 fn parse_tasks_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
+    if let Some(id) = rest.strip_prefix("show").map(str::trim)
+        && !id.is_empty()
+    {
+        return SlashCommand::TaskShow { id: id.to_string() };
+    }
     match rest.strip_prefix("cancel").map(str::trim) {
         Some("--all" | "all") => SlashCommand::TaskCancel { id: None },
         Some(id) if !id.is_empty() => SlashCommand::TaskCancel {
@@ -4229,8 +4252,10 @@ mod tests {
             Some(SlashCommand::MemoryList) => "MemoryList",
             Some(SlashCommand::MemoryShow { .. }) => "MemoryShow",
             Some(SlashCommand::ScheduleList) => "ScheduleList",
+            Some(SlashCommand::ScheduleShow { .. }) => "ScheduleShow",
             Some(SlashCommand::ScheduleCancel { .. }) => "ScheduleCancel",
             Some(SlashCommand::TaskList) => "TaskList",
+            Some(SlashCommand::TaskShow { .. }) => "TaskShow",
             Some(SlashCommand::TaskCancel { .. }) => "TaskCancel",
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",

@@ -352,18 +352,21 @@ break. This one is tracked in memory rather than on the row, so it is known to t
 the job: a restart re-establishes it within two poll intervals, and `meka schedule list`, which is a
 separate process, does not see it.
 
-Three surfaces report it, and each says only what it can establish:
+Four surfaces report it, and each says only what it can establish:
 
 - **`[Scheduled]` and `schedule_list`** carry the full sentence, since the agent is the one that can
   recreate or cancel the job.
-- **`meka schedule list` and `/schedule`** have a `Held` column: `yes` when the job cannot fire,
-  blank when it can, and `?` when this process cannot establish the answer. Blank means "it will
-  fire", not "I did not check". `meka schedule list` is a separate process from any host, so it
-  cannot resolve a tool gate and shows `?` for every one; `/schedule` runs inside a host and uses
-  its MCP manager, so it answers them. Either shows `?` for a job whose session level it could not
-  read, since that is also unestablished rather than fine. Both apply `[permissions].enabled` when
-  reading a session's recorded level, so the column cannot report a job as firing that the host
-  refuses.
+- **`/schedule`** has a `Held` column: `yes` when the job cannot fire, blank when it can, and `?`
+  when this process cannot establish the answer. Blank means "it will fire", not "I did not check".
+  It runs inside a host and uses its MCP manager, so it resolves tool gates; it shows `?` for a job
+  whose session level it could not read, since that is unestablished rather than fine.
+- **`meka schedule show`** spells the same verdict out on a `withheld:` line. It is a separate
+  process from any host and so cannot resolve a tool gate, reporting that as unknown rather than as
+  fine. `meka schedule list` does not carry it at all: a column that is blank on almost every row is
+  a poor use of a table this wide.
+
+  Both apply `[permissions].enabled` when reading a session's recorded level, so neither can report
+  a job as able to fire that the host refuses.
 - **`GET /v1/schedule` and `GET /v1/sessions/{id}/schedule`** carry a `withheld` field with the same
   sentence, absent when the job can fire.
 
@@ -391,11 +394,33 @@ From your side:
 
 ```bash
 meka schedule list                  # every session's jobs
-meka schedule list --session <uuid> # one session
+meka schedule list --session 0b5c   # one session, by id or unique prefix
+meka schedule show 7f3a1b2c         # one job in full, by id or unique prefix
 meka schedule cancel 7f3a1b2c       # by id, or any unique prefix
 ```
 
-In the REPL, `/schedule` lists the current session's jobs and `/schedule cancel <id>` cancels one.
+`list` is a table to scan: job id, the session it wakes, its schedule, how long until it next fires,
+whether it is gated (`shell`, `tool`, or `-`), and the beginning of its prompt. Every cell is bounded
+so the table stays legible.
+
+Both ids print as a UUID's first segment, and widen only if that would show two rows the same
+string, so what you see is normally enough to retype into `show`, `cancel` or `--session`, which
+take any unique prefix. `show` prints both in full.
+
+Normally, because uniqueness is computed over the rows being printed while `show` and `cancel` scan
+every job there is. `list --session <id>` narrows the table, so it can print a prefix that another
+session's job makes ambiguous. It fails closed -- the command refuses and names the ids that
+collided -- and an unfiltered `meka schedule list` always prints a prefix that resolves.
+
+`show` is the one that answers what a job actually does: the whole prompt, the whole command or tool
+a gate runs, the session's full id, when it last fired, and whether it is withheld. Nothing there is
+truncated, which is why it is a separate command rather than a wider table.
+
+In the REPL, `/schedule` lists the current session's jobs, `/schedule show <id>` prints one in full,
+and `/schedule cancel <id>` cancels one. All three answer inside the conversation you are in: a job
+belonging to another session is not found here, which is what makes the ids the listing prints the
+ids the other two take. The table drops the `Session` column, which would repeat one id down every
+row, and spends the width on `Held` instead.
 
 ## Configuration
 

@@ -152,6 +152,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "mcp_credentials_exist_on_every_store",
         step: Step::Rust(mcp_credentials_exist_on_every_store),
     },
+    Migration {
+        name: "background_tasks_announce_before_they_deliver",
+        step: Step::Rust(background_tasks_announce_before_they_deliver),
+    },
 ];
 
 /// What [`plan`] decided, and what [`apply`] will do about it.
@@ -1098,6 +1102,42 @@ fn mcp_credentials_exist_on_every_store(
     Ok(())
 }
 
+/// Separate "subscribers were told" from "the model was told" on a background task.
+///
+/// `delivered_at` answered both while they were the same instant: the poller stamped it, fired the
+/// `task.finished` webhook, and ran the reporting turn in one pass. They stopped coinciding when an
+/// outcome became able to wait for a turn rather than cause one, and one column cannot carry two
+/// facts that no longer happen together -- leaving the stamp off to defer the model's copy also
+/// re-fires the webhook on every poll.
+///
+/// The backfill copies the stamp across for every delivered row, recording that the outcome was
+/// reported rather than that any endpoint received it: a REPL, ACP or one-shot run has no
+/// subscribers, and even `meka serve` sends only to endpoints subscribed at the time. The store
+/// cannot know which, and this is the only answer available to it.
+///
+/// It changes no behaviour. Every path that decides whether to announce also requires
+/// `delivered_at IS NULL`, so a delivered row is never a candidate whatever this column says; the
+/// value is visible only on `GET /v1/sessions/{id}/tasks`, whose field documents the same caveat.
+/// A row still undelivered is left NULL, which is how a task interrupted before any host could
+/// report it finally reaches a subscriber.
+fn background_tasks_announce_before_they_deliver(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns: Vec<String> = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["background_tasks"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if columns.iter().any(|column| column == "announced_at") {
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "ALTER TABLE background_tasks ADD COLUMN announced_at TEXT;
+         UPDATE background_tasks SET announced_at = delivered_at WHERE delivered_at IS NOT NULL;",
+    )
+}
+
 /// 0.44: a scheduled job always fires in the session that created it.
 ///
 /// `isolated` let a job run its turn in a fresh top-level session instead of the conversation that
@@ -1477,6 +1517,10 @@ mod tests {
             (
                 "mcp_credentials_exist_on_every_store",
                 6893219499647049540_u64,
+            ),
+            (
+                "background_tasks_announce_before_they_deliver",
+                4323005247125501473_u64,
             ),
         ];
         let current: Vec<(&str, u64)> = MIGRATIONS
@@ -2691,6 +2735,58 @@ mod tests {
                 .iter()
                 .any(|column| column == "gate_command"),
             "the columns the failed step meant to drop are still there"
+        );
+    }
+
+    /// The column arrives on an existing store, and the backfill restates history without inventing
+    /// any.
+    ///
+    /// A delivered row was announced in the same statement under the old design, so copying the
+    /// stamp across is what did happen. An undelivered one was never announced, and its NULL is
+    /// what lets the poller announce it once -- including an `Interrupted` task that no host ever
+    /// got to report, which previously fired no `task.finished` at all.
+    #[test]
+    fn announcing_is_split_from_delivering_and_backfilled_from_what_happened() {
+        // Seeded *before* migrating, because the backfill is about rows a previous binary wrote.
+        let mut store = store_as_0_42_left_it();
+        store
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'now', 'now');
+                 INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, started_at, delivered_at) \
+                     VALUES ('done', 's', 't', 'l', 'completed', 'now', 'stamped');
+                 INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, started_at, delivered_at) \
+                     VALUES ('waiting', 's', 't', 'l', 'cancelled', 'now', NULL);",
+            )
+            .expect("seed");
+
+        let plan = plan(&store).expect("classified");
+        apply(&mut store, plan, &Context::adopting(Some("p"))).expect("migrated");
+
+        // A `.dump` round trip drops `user_version`, so every step replays over data that has it.
+        let transaction = store.transaction().expect("transaction");
+        background_tasks_announce_before_they_deliver(&transaction).expect("safe to run twice");
+        transaction.commit().expect("commit");
+
+        let announced = |id: &str| -> Option<String> {
+            store
+                .query_row(
+                    "SELECT announced_at FROM background_tasks WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("read")
+        };
+        assert_eq!(
+            announced("done").as_deref(),
+            Some("stamped"),
+            "a delivered row was announced at the same instant, so the stamp carries across"
+        );
+        assert_eq!(
+            announced("waiting"),
+            None,
+            "an undelivered one was never announced, so the poller still owes it"
         );
     }
 }

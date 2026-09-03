@@ -44,6 +44,21 @@ struct Install {
 
 impl Install {
     fn new(newline_before_prompt: bool, newline_after_prompt: bool, extra_display: &str) -> Self {
+        Self::with_extra(
+            newline_before_prompt,
+            newline_after_prompt,
+            extra_display,
+            "",
+        )
+    }
+
+    /// [`Self::new`] plus whole config tables the `[display]` slot cannot hold.
+    fn with_extra(
+        newline_before_prompt: bool,
+        newline_after_prompt: bool,
+        extra_display: &str,
+        extra_tables: &str,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let path = root.path();
         std::fs::create_dir_all(path.join("meka")).expect("config dir");
@@ -57,11 +72,16 @@ impl Install {
                  [display]\nnewline_before_prompt = {newline_before_prompt}\n\
                  newline_after_prompt = {newline_after_prompt}\n{extra_display}\n\
                  [providers.default]\ntype = \"openai-chat-completions\"\n\
-                 model = \"mock-model\"\nbase_url = \"http://127.0.0.1:9/\"\n"
+                 model = \"mock-model\"\nbase_url = \"http://127.0.0.1:9/\"\n{extra_tables}"
             ),
         )
         .expect("write config.toml");
         Self { root }
+    }
+
+    /// The store the spawned REPL is using, for a test that has to read back what a turn recorded.
+    fn database(&self) -> PathBuf {
+        self.root.path().join("data").join("meka").join("meka.db")
     }
 
     fn script(&self, json: &str) -> PathBuf {
@@ -729,5 +749,92 @@ fn a_warning_raised_during_a_turn_is_not_erased_by_the_turn() {
     assert!(
         turn.iter().any(|row| row.contains("recovered answer")),
         "and the answer it was waiting for has to follow it: {turn:#?}"
+    );
+}
+
+/// A cancelled background task rides the next thing the user types, without spending a turn.
+///
+/// The REPL is the most-used host and had no coverage for any of this: the fold, the watcher's
+/// refusal to wake, and the retention the carrier runs under were all deletable with the suite
+/// green. Driven through the pty rather than seeded, so what is under test is the wiring rather
+/// than the predicates the unit tests already pin.
+///
+/// The script holds exactly three rounds, and the watcher polls fast enough to tick several times
+/// between the cancellation and the closing turn: one that woke *and delivered* would eat the third
+/// round and leave that turn nothing to answer with.
+///
+/// Not pinned here: the watcher's own `wakes_a_host` gate. Removing it makes the watcher wake for a
+/// batch the wake arm then declines to claim, so the conversation and the script are untouched and
+/// only a prompt redraw is wasted. It is an optimisation sitting in front of the real guard, and
+/// catching it needs an assertion about drawing rather than about the conversation.
+#[test]
+fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
+    let install = Install::with_extra(
+        true,
+        true,
+        "",
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n",
+    );
+    let script = r#"[
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started it" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "answered the question" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]"#;
+
+    let rows = run_repl(&install, script, &[
+        "run it",
+        "/tasks cancel --all",
+        "what is in this CSV?",
+        "exit",
+    ]);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("answered the question"),
+        "the third round must still be there for the user's own turn: {screen}"
+    );
+
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let user_messages: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT content FROM messages WHERE role = 'user' ORDER BY id ASC")
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query");
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .expect("read")
+    };
+
+    assert_eq!(
+        user_messages.len(),
+        2,
+        "two turns were typed and the cancellation must not have added a third: {user_messages:#?}"
+    );
+    let carrier = user_messages.last().expect("the second turn");
+    assert!(
+        carrier.contains("was cancelled") && carrier.contains("what is in this CSV?"),
+        "the outcome must ride inside the user's own message: {carrier}"
+    );
+
+    let delivered: Option<String> = connection
+        .query_row(
+            "SELECT delivered_at FROM background_tasks LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the task");
+    assert!(
+        delivered.is_some(),
+        "and riding a turn is a delivery, so the row must be stamped"
     );
 }

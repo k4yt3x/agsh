@@ -120,8 +120,10 @@ meka supports `/` prefix commands for controlling the shell:
 | `/memory` | List saved [memories](./memory.md), most important first |
 | `/memory <name>` | Print one memory's body |
 | `/schedule` | List this session's scheduled jobs |
+| `/schedule show <id>` | Show a scheduled job's full details |
 | `/schedule cancel <id>` | Cancel a scheduled job by id or unique prefix |
 | `/tasks` | List this session's [background tasks](./background.md) |
+| `/tasks show <id>` | Show a background task's full details |
 | `/tasks cancel <id>` | Stop one background task by id or unique prefix |
 | `/tasks cancel --all` | Stop every running background task |
 | `/mcp list` | List configured MCP servers with their live state (`pending` / `connected` / `failed` / `disabled`) |

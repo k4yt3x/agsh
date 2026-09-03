@@ -79,11 +79,27 @@ The agent has `task_list` and `task_cancel`. You have:
 
 ```bash
 /tasks                    # list this session's tasks
+/tasks show 7f3a1c22      # one task in full, including its whole id
 /tasks cancel 7f3a1c22    # stop one
 /tasks cancel --all       # stop all of them
 ```
 
-A cancelled task still reports back, so the agent learns it stopped rather than waiting on it.
+A cancelled task still reports back, so the agent learns it stopped rather than waiting on it -- but
+it does not interrupt to say so. Every other outcome wakes the agent when it lands, because nobody
+chose it: a build finished, a tool failed, or a host died holding the task. A cancellation is always
+somebody's deliberate act, and that somebody already knows, so it waits and is read at the top of
+whichever turn the session takes next -- yours, or a scheduled job's -- as part of that message
+rather than as one of its own. Cancelling several tasks costs no turns at all.
+
+Webhooks do not wait on any of that. Under `meka serve`, `task.finished` fires as soon as a task
+reaches a terminal state, rather than when a turn gets around to reporting it -- so a cancelled task
+is announced immediately, and one left running by a host that died is announced when the session is
+next opened, which it was not before.
+
+An outcome that rides a turn is part of that turn's message, so `/rewind` over that exchange takes
+the report with it. The task row is already stamped as reported and is not handed out again, so the
+outcome is gone rather than redelivered. `meka session export` still has it: the log is append-only,
+and a rewind changes what the model sees rather than what was recorded.
 
 ## Ctrl+C
 

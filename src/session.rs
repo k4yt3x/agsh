@@ -828,6 +828,13 @@ fn is_free(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err()
 }
 
+/// How many sessions a prefix scan fetches before it stops counting.
+///
+/// A resolution needs at most two: one match resolves, and any second makes it ambiguous. The rest
+/// exist so the refusal can name what collided. Reported as "at least" when the scan hits it, since
+/// past this point the count is the cap rather than the truth.
+pub(crate) const PREFIX_MATCH_CAP: usize = 17;
+
 impl SessionManager {
     /// Open the store, bringing its schema forward if it is behind.
     ///
@@ -862,6 +869,10 @@ impl SessionManager {
         };
         create_private_dir(&lock_dir)?;
         restrict_permissions(&lock_dir, 0o700);
+        // Owned from the moment it exists, not from the moment the manager is built. Five fallible
+        // steps sit between the two -- opening the connection, the pragmas, the schema lock -- and
+        // each one used to return with the directory already created and nothing left holding it.
+        let ephemeral_lock_dir = is_in_memory.then(|| Arc::new(EphemeralLockDir(lock_dir.clone())));
 
         // Pre-touch the DB file at 0600 so SQLite's `Connection::open` reuses an already-restricted
         // file rather than creating one at umask defaults that we then chmod down; the latter
@@ -950,7 +961,7 @@ impl SessionManager {
 
         let manager = Self {
             connection: Arc::new(connection),
-            _ephemeral_lock_dir: is_in_memory.then(|| Arc::new(EphemeralLockDir(lock_dir.clone()))),
+            _ephemeral_lock_dir: ephemeral_lock_dir,
             lock_dir,
             database_path,
         };
@@ -2292,23 +2303,48 @@ impl SessionManager {
 
     /// Resolve a session-ID prefix (e.g. `d64`) to the matching full UUIDs.
     ///
-    /// Used by `meka -c <prefix>` so the user doesn't have to type the whole UUID. Capped at 16
-    /// matches; ordered most-recent-first so the caller's "ambiguous prefix" listing leads with the
-    /// session the user most likely meant.
+    /// Behind every command that takes a session id, so none of them needs the whole UUID typed.
+    /// Capped at [`PREFIX_MATCH_CAP`] matches; ordered most-recent-first so the caller's "ambiguous
+    /// prefix" listing leads with the session the user most likely meant.
     ///
     /// Anything outside the UUID alphabet (`0-9a-fA-F-`) returns an empty list, both because such
     /// a prefix can't match any real session ID and to keep SQL `LIKE` wildcards (`%`, `_`) from
     /// sneaking through.
+    /// Every session id in the store, which is the set a prefix is resolved against.
+    ///
+    /// A listing filters -- `-n`, and sub-agent sessions hidden by default -- while
+    /// [`Self::find_sessions_by_prefix`] does not. Sizing the printed id column against the rows
+    /// alone therefore printed a prefix that every command taking one would refuse as ambiguous.
+    pub async fn all_session_ids(&self) -> Result<Vec<String>> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare("SELECT id FROM sessions")?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(ids)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to list session ids: {}", error)))
+    }
+
     pub async fn find_sessions_by_prefix(&self, prefix: &str) -> Result<Vec<Uuid>> {
-        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        if !crate::render::is_usable_id_prefix(prefix) {
             return Ok(Vec::new());
         }
         let pattern = format!("{}%", prefix);
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT id FROM sessions WHERE id LIKE ?1 \
-                     ORDER BY updated_at DESC LIMIT 16",
+                    // Two is all a caller needs: one match resolves, and any second makes it
+                    // ambiguous. A cap of 16 was reported verbatim, so 17 colliding sessions read
+                    // as "matches 16" -- a count that is simply wrong. The refusal below names
+                    // every id it fetched, which is why fetching a bounded few is enough.
+                    &format!(
+                        "SELECT id FROM sessions WHERE id LIKE ?1 \
+                         ORDER BY updated_at DESC LIMIT {}",
+                        PREFIX_MATCH_CAP
+                    ),
                 )?;
                 let rows = statement.query_map(rusqlite::params![pattern], |row| {
                     let id: String = row.get(0)?;
@@ -7666,6 +7702,7 @@ mod tests {
             scratchpad_name: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
+            announced_at: None,
             delivered_at: None,
         };
         manager
@@ -7762,6 +7799,387 @@ mod tests {
                 .await
                 .expect("list undelivered")
                 .is_empty()
+        );
+    }
+
+    /// Two claimers, one row, exactly one winner.
+    ///
+    /// Listing and stamping are two statements, and there are now two claimers per host: a poller
+    /// and whichever turn the user sends. Both can read the same row as undelivered before either
+    /// writes, so the `WHERE delivered_at IS NULL` on the stamp is the only arbiter -- without it
+    /// both render the same outcome and the model is told twice.
+    ///
+    /// Two managers over one file on disk, not two clones of one manager: a clone shares an
+    /// `Arc<Connection>` and therefore one worker thread, so the two claims cannot interleave and
+    /// the test proves only that the statement is atomic against itself. Separate connections are
+    /// what a second meka process actually is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_of_two_racing_claimers_takes_each_outcome() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("meka.db");
+        let manager = SessionManager::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let rival = SessionManager::open(Some(&path), &Default::default())
+            .await
+            .expect("a second connection to the same file");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        const ROWS: usize = 24;
+        for index in 0..ROWS {
+            let task = task_fixture(&manager, session_id, &format!("job {index}")).await;
+            manager
+                .background_store()
+                .finish_background_task(
+                    &task.id,
+                    crate::background::TaskStatus::Completed,
+                    None,
+                    None,
+                )
+                .await
+                .expect("finish");
+        }
+
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                crate::background::claim_outcomes_now(&manager, session_id).await
+            })
+        };
+        let second = {
+            let manager = rival;
+            tokio::spawn(async move {
+                crate::background::claim_outcomes_now(&manager, session_id).await
+            })
+        };
+        let (first, second) = (first.await.expect("join"), second.await.expect("join"));
+
+        let mut seen: Vec<String> = first
+            .iter()
+            .chain(second.iter())
+            .map(|task| task.id.clone())
+            .collect();
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            total, ROWS,
+            "every outcome must be claimed exactly once across both claimers, not {total}"
+        );
+        assert_eq!(
+            seen.len(),
+            ROWS,
+            "and no id may appear in both claims: that is one outcome delivered twice"
+        );
+        assert!(
+            manager
+                .background_store()
+                .list_undelivered_background_tasks(session_id)
+                .await
+                .expect("list undelivered")
+                .is_empty(),
+            "and nothing may be left behind"
+        );
+    }
+
+    /// The same arbitration for the announce stamp, which decides who fires `task.finished`.
+    ///
+    /// Two connections for the reason its sibling gives: one manager cloned is one worker thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_of_two_racing_announcers_takes_each_outcome() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("meka.db");
+        let manager = SessionManager::open(Some(&path), &Default::default())
+            .await
+            .expect("open");
+        let rival = SessionManager::open(Some(&path), &Default::default())
+            .await
+            .expect("a second connection to the same file");
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        const ROWS: usize = 24;
+        let mut ids = Vec::new();
+        for index in 0..ROWS {
+            let task = task_fixture(&manager, session_id, &format!("job {index}")).await;
+            manager
+                .background_store()
+                .finish_background_task(
+                    &task.id,
+                    crate::background::TaskStatus::Cancelled,
+                    None,
+                    None,
+                )
+                .await
+                .expect("finish");
+            ids.push(task.id);
+        }
+
+        // Both read the row as unannounced first, which is what the two callers really do.
+        let first = {
+            let (manager, ids) = (manager.clone(), ids.clone());
+            tokio::spawn(async move {
+                manager
+                    .background_store()
+                    .mark_background_tasks_announced(&ids)
+                    .await
+                    .expect("announce")
+            })
+        };
+        let second = {
+            let (manager, ids) = (rival, ids.clone());
+            tokio::spawn(async move {
+                manager
+                    .background_store()
+                    .mark_background_tasks_announced(&ids)
+                    .await
+                    .expect("announce")
+            })
+        };
+        let (first, second) = (first.await.expect("join"), second.await.expect("join"));
+
+        assert_eq!(
+            first.len() + second.len(),
+            ROWS,
+            "a subscriber must hear about each task once: {} + {}",
+            first.len(),
+            second.len()
+        );
+        let mut seen: Vec<&String> = first.iter().chain(second.iter()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), ROWS, "and no id may be won twice");
+    }
+
+    /// An in-memory store takes its lock directory with it when the last handle drops.
+    ///
+    /// On-disk stores keep `locks/` beside the database, where it belongs; an in-memory one gets a
+    /// per-`open()` temp directory so concurrent tests cannot sweep each other's lock files. That
+    /// isolation is only free if something removes it, and nothing else ever will -- a developer's
+    /// temp directory otherwise collects one empty directory per store opened, forever.
+    #[tokio::test]
+    async fn an_in_memory_store_removes_its_temp_lock_directory() {
+        let lock_dir = {
+            let manager = test_manager().await;
+            let lock_dir = manager.lock_dir.clone();
+            assert!(
+                lock_dir.is_dir(),
+                "the store locks somewhere while it is open: {}",
+                lock_dir.display()
+            );
+            // A handle taken from the manager keeps the directory alive, which is the whole reason
+            // the guard is behind an `Arc` rather than owned outright.
+            let token_store = manager.token_store();
+            drop(manager);
+            assert!(
+                lock_dir.is_dir(),
+                "a live `TokenStore` still locks under it: {}",
+                lock_dir.display()
+            );
+            drop(token_store);
+            lock_dir
+        };
+        assert!(
+            !lock_dir.exists(),
+            "the last handle is gone, so nothing is left behind: {}",
+            lock_dir.display()
+        );
+    }
+
+    /// Each stamp is won once, and the loser is told it won nothing.
+    ///
+    /// The stamps are compare-and-swaps and they return the rows they took, which is what every
+    /// caller filters its report by. A second attempt on an already-stamped row must come back
+    /// empty rather than claiming it again -- that empty answer is what stops a second webhook and
+    /// a second delivery. The concurrent case is
+    /// [`only_one_of_two_racing_claimers_takes_each_outcome`]; this is the sequential contract the
+    /// callers read.
+    #[tokio::test]
+    async fn a_second_attempt_on_a_stamped_row_wins_nothing() {
+        let manager = test_manager().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let task = task_fixture(&manager, session_id, "cargo build").await;
+        manager
+            .background_store()
+            .finish_background_task(
+                &task.id,
+                crate::background::TaskStatus::Completed,
+                None,
+                None,
+            )
+            .await
+            .expect("finish");
+        let ids = vec![task.id.clone()];
+
+        assert_eq!(
+            manager
+                .background_store()
+                .mark_background_tasks_delivered(&ids)
+                .await
+                .expect("deliver"),
+            ids,
+            "the first claimer wins the row"
+        );
+        assert!(
+            manager
+                .background_store()
+                .mark_background_tasks_delivered(&ids)
+                .await
+                .expect("deliver")
+                .is_empty(),
+            "and the second wins nothing, so it reports nothing"
+        );
+
+        assert_eq!(
+            manager
+                .background_store()
+                .mark_background_tasks_announced(&ids)
+                .await
+                .expect("announce"),
+            ids,
+            "the first announcer wins the row"
+        );
+        assert!(
+            manager
+                .background_store()
+                .mark_background_tasks_announced(&ids)
+                .await
+                .expect("announce")
+                .is_empty(),
+            "and the second sends no second `task.finished`"
+        );
+    }
+
+    /// A task that goes terminal between the poller's two queries is still announced.
+    ///
+    /// The sweep asks `list_unannounced_background_tasks` and then, separately,
+    /// `list_undelivered_background_tasks`. A task finishing in the gap is absent from the first
+    /// and present in the second, so it was delivered and then unannounceable forever -- both
+    /// pools exclude a delivered row. Announcing the claimed batch as well closes it, and is
+    /// idempotent because the stamp is a compare-and-swap.
+    #[tokio::test]
+    async fn a_task_finishing_between_the_two_queries_is_still_announced() {
+        let manager = test_manager().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+
+        // The announce pass runs first and sees nothing: the task is still running.
+        let early = manager
+            .background_store()
+            .list_unannounced_background_tasks(session_id)
+            .await
+            .expect("list unannounced");
+        let task = task_fixture(&manager, session_id, "cargo build").await;
+        assert!(
+            early.iter().all(|seen| seen.id != task.id),
+            "the task must not be in the earlier snapshot"
+        );
+
+        // It finishes in the gap, so the delivery pass is the first to see it.
+        manager
+            .background_store()
+            .finish_background_task(
+                &task.id,
+                crate::background::TaskStatus::Completed,
+                None,
+                None,
+            )
+            .await
+            .expect("finish");
+        let claimed = crate::background::claim_outcomes_now(&manager, session_id).await;
+        assert_eq!(claimed.len(), 1, "the delivery pass claims it");
+        assert!(
+            claimed[0].announced_at.is_none(),
+            "and it is still unannounced at the point the caller must act on"
+        );
+
+        // Which is why the claimed batch is announced too: nothing else ever can.
+        let ids: Vec<String> = claimed.iter().map(|task| task.id.clone()).collect();
+        let won = manager
+            .background_store()
+            .mark_background_tasks_announced(&ids)
+            .await
+            .expect("announce");
+        assert_eq!(won, ids, "the claim is the last chance to announce it");
+        assert!(
+            manager
+                .background_store()
+                .list_unannounced_background_tasks(session_id)
+                .await
+                .expect("list unannounced")
+                .is_empty(),
+            "and afterwards no pool can return it: a delivered row is excluded from both"
+        );
+    }
+
+    /// The announce pool is the undelivered pool, so old news is never pushed as new.
+    ///
+    /// `announced_at` is written only by `meka serve`, and a data directory is shared: every task a
+    /// REPL or ACP session ever ran sits unannounced forever. Opening one of those sessions in
+    /// `meka serve` must not fire `task.finished` for work that finished weeks ago and was reported
+    /// to the model at the time. A task still undelivered has been reported to nobody, which is the
+    /// case worth pushing -- including one interrupted before any host could report it.
+    #[tokio::test]
+    async fn test_an_outcome_already_reported_is_not_announced_as_news() {
+        let manager = test_manager().await;
+        let session_id = manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let reported = task_fixture(&manager, session_id, "cargo build").await;
+        let unreported = task_fixture(&manager, session_id, "sleep 600").await;
+        for task in [&reported, &unreported] {
+            manager
+                .background_store()
+                .finish_background_task(
+                    &task.id,
+                    crate::background::TaskStatus::Completed,
+                    None,
+                    None,
+                )
+                .await
+                .expect("finish");
+        }
+
+        // Delivered without being announced, which is exactly what a REPL turn leaves behind.
+        manager
+            .background_store()
+            .mark_background_tasks_delivered(std::slice::from_ref(&reported.id))
+            .await
+            .expect("mark delivered");
+
+        let unannounced = manager
+            .background_store()
+            .list_unannounced_background_tasks(session_id)
+            .await
+            .expect("list unannounced");
+        assert_eq!(
+            unannounced.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            vec![&unreported.id],
+            "only the outcome nobody has had is news"
+        );
+
+        manager
+            .background_store()
+            .mark_background_tasks_announced(std::slice::from_ref(&unreported.id))
+            .await
+            .expect("mark announced");
+        assert!(
+            manager
+                .background_store()
+                .list_unannounced_background_tasks(session_id)
+                .await
+                .expect("list unannounced")
+                .is_empty(),
+            "and it is announced once, not on every poll"
         );
     }
 

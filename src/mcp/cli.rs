@@ -344,7 +344,16 @@ pub async fn run_tools(
         .iter()
         .map(|tool| {
             vec![
-                tool.raw_name.clone(),
+                // The server chose this name and it is never validated on the way in, so it
+                // reaches this table exactly as sent. The one listing an operator
+                // reads to decide what a server may do is not a place to reproduce
+                // a newline or an escape.
+                //
+                // Sanitised but never truncated, unlike every other authored cell here. This is
+                // the string the user retypes into `tools`, a per-tool `permission` override or
+                // `--eager-load-tool`, and no command prints it in full elsewhere -- a name cut to
+                // fit a column matches nothing, silently.
+                crate::render::sanitize_to_line(&tool.raw_name, usize::MAX),
                 tool.resolved_permission.to_string(),
                 // A declined hint has to say so here, because this table is where a user checks
                 // what `trust_read_only_hint = false` moved, and the winning source alone cannot

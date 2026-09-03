@@ -1548,6 +1548,17 @@ impl Agent {
         self.mcp_manager = Some(manager);
     }
 
+    /// Whether a turn could start right now, asked before anything irreversible is done for it.
+    ///
+    /// [`Self::run_turn`] gates on this itself, deliberately before it touches the conversation, so
+    /// a refused turn leaves no trace. That ordering is what makes it unsafe to *claim* a
+    /// background outcome first: the claim stamps a row that is never handed out again, and a turn
+    /// refused here would carry it nowhere. `background::claim_undelivered_outcomes` asks this
+    /// before stamping anything, which is why the answer is public.
+    pub async fn ensure_ready_for_turn(&self) -> Result<()> {
+        self.await_mcp_ready().await
+    }
+
     /// Per-turn MCP readiness gate. Applies to every turn (not just the
     /// first) so mid-session reconnects also gate cleanly. Awaits
     /// `grace` for Pending servers to finish connecting, then hands whatever is still not
@@ -2536,6 +2547,23 @@ impl Agent {
                     tracing::error!("failed to save user message on interruption: {}", error);
                 }
             }
+            // Saved rather than popped, because `Keep` means the prompt carries something that
+            // exists nowhere else. This arm is reached only when the eager persist failed, so
+            // popping would take a delivered background outcome out of the conversation as well as
+            // off disk, and its row is already stamped and never handed out again.
+            //
+            // Reached by dropping `messages` under a live connection; see
+            // `test_a_kept_prompt_survives_a_turn_whose_store_could_not_persist_it`.
+            Err(error)
+                if !matches!(error, MekaError::Interrupted)
+                    && !recovery.user_saved
+                    && retention == PromptRetention::Keep =>
+            {
+                let user_event = crate::conversation::Event::Append(user_message.clone());
+                if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
+                    tracing::error!("failed to save user message after a failed turn: {}", error);
+                }
+            }
             Err(error) if !matches!(error, MekaError::Interrupted) && !recovery.user_saved => {
                 messages.pop_unsaved();
                 // The popped message carried this turn's world-state announcement, so put the
@@ -3296,6 +3324,7 @@ impl Agent {
             scratchpad_name: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
+            announced_at: None,
             delivered_at: None,
         };
         // Claim a slot before anything else. Atomic against the sibling calls in this same
@@ -4998,6 +5027,24 @@ mod tests {
         (agent, frontend)
     }
 
+    /// [`test_agent`] against a store on disk, for a test that has to break it from outside.
+    pub(super) async fn test_agent_at(
+        provider: Arc<dyn Provider>,
+        path: &std::path::Path,
+    ) -> (Agent, SessionManager) {
+        let session_manager = SessionManager::open(Some(path), &Default::default())
+            .await
+            .expect("open");
+        (
+            build_test_agent(
+                provider,
+                crate::tools::ToolRegistry::new(),
+                &session_manager,
+            ),
+            session_manager,
+        )
+    }
+
     pub(super) async fn test_agent(provider: Arc<dyn Provider>) -> (Agent, SessionManager) {
         test_agent_with_registry(provider, crate::tools::ToolRegistry::new()).await
     }
@@ -5406,6 +5453,16 @@ mod tests {
             SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
                 .await
                 .expect("in-memory db");
+        let agent = build_test_agent(provider, registry, &session_manager);
+        (agent, session_manager)
+    }
+
+    /// The agent every test harness here builds, separated so one can hand it a different store.
+    fn build_test_agent(
+        provider: Arc<dyn Provider>,
+        registry: crate::tools::ToolRegistry,
+        session_manager: &SessionManager,
+    ) -> Agent {
         let options = AgentOptions {
             streaming: true,
             sandboxed_shell: false,
@@ -5417,7 +5474,7 @@ mod tests {
             mcp_grace: std::time::Duration::from_secs(0),
             system_prompt_override: Some("test".to_string()),
         };
-        let agent = Agent::new(
+        Agent::new(
             PublishedBinding::detached(&ResolvedBinding {
                 provider,
                 binding: "test-profile".to_string(),
@@ -5439,8 +5496,7 @@ mod tests {
             Arc::new(RwLock::new(std::env::temp_dir())),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(crate::stats::SessionStats::default()),
-        );
-        (agent, session_manager)
+        )
     }
 
     /// The wiring, not the method: nothing else fails when the call in `run_turn` is deleted.
@@ -10406,7 +10462,10 @@ mod prompt_retention_tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{PromptRetention, tests::test_agent};
+    use super::{
+        PromptRetention,
+        tests::{test_agent, test_agent_at},
+    };
     use crate::{
         conversation::Conversation,
         provider::mock::{MockEvent, MockProvider},
@@ -10458,6 +10517,103 @@ mod prompt_retention_tests {
         assert!(
             Conversation::from_events(events).is_empty(),
             "the materialized view is empty after a reload too"
+        );
+    }
+
+    /// A `Keep` prompt survives a failed turn, in the conversation and on disk.
+    ///
+    /// `Keep` exists because the prompt may carry something that exists nowhere else -- a
+    /// background outcome, whose row is stamped delivered before the turn starts and is never
+    /// handed out again. A failed turn that discards it therefore destroys the only copy, and the
+    /// user's retry finds nothing left to retry with.
+    ///
+    /// This covers the ordinary failure, where the eager persist succeeded and the withdrawal arm
+    /// must decline to fire. The `!user_saved` arm beside it is covered by
+    /// `test_a_kept_prompt_survives_a_turn_whose_store_could_not_persist_it`.
+    #[tokio::test]
+    async fn test_a_kept_prompt_survives_a_failed_turn() {
+        let (agent, session_manager) = test_agent(unreachable_provider(1)).await;
+        let mut session_id = None;
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn_retaining(
+                &mut session_id,
+                &mut messages,
+                "[Background task reporting] 7f3a1c22 was cancelled after 11s.".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+                PromptRetention::Keep,
+            )
+            .await
+            .expect_err("the provider is unreachable");
+
+        assert!(
+            messages
+                .as_slice()
+                .iter()
+                .any(|message| format!("{:?}", message).contains("was cancelled")),
+            "the outcome must still be in the conversation: {:?}",
+            messages.as_slice()
+        );
+        let sid = session_id.expect("the first turn created the session");
+        let events = session_manager.load_events(sid).await.expect("load events");
+        assert!(
+            !Conversation::from_events(events).is_empty(),
+            "and on disk, so a resume still carries it"
+        );
+    }
+
+    /// A `Keep` prompt survives a failed turn whose *store* failed too.
+    ///
+    /// This is the arm the sibling above cannot reach. `pop_unsaved` runs only when the eager
+    /// persist failed, so a healthy store never gets there -- and popping would take a delivered
+    /// background outcome out of the conversation as well as off disk, its row already stamped and
+    /// never handed out again. `SQLITE_BUSY` with a second meka on the store is the ordinary way
+    /// in.
+    ///
+    /// The store is broken by dropping the table under a live connection, the same way
+    /// `a_turn_whose_store_breaks_does_not_announce_every_memory_as_deleted` does it: a real
+    /// failure on the real write path rather than a stub.
+    #[tokio::test]
+    async fn test_a_kept_prompt_survives_a_turn_whose_store_could_not_persist_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meka.db");
+        let (agent, session_manager) = test_agent_at(unreachable_provider(1), &path).await;
+        let session_id = session_manager
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        let mut session_id = Some(session_id);
+        let mut messages = Conversation::new();
+
+        // Between creating the session and running the turn, so the session exists and only the
+        // message write fails -- which is exactly the state the arm is guarded on.
+        rusqlite::Connection::open(&path)
+            .expect("second connection")
+            .execute_batch("DROP TABLE messages;")
+            .expect("drop the table");
+
+        agent
+            .run_turn_retaining(
+                &mut session_id,
+                &mut messages,
+                "[Background task reporting] 7f3a1c22 was cancelled after 11s.".to_string(),
+                Vec::new(),
+                CancellationToken::new(),
+                PromptRetention::Keep,
+            )
+            .await
+            .expect_err("the provider is unreachable");
+
+        assert!(
+            messages
+                .as_slice()
+                .iter()
+                .any(|message| format!("{:?}", message).contains("was cancelled")),
+            "the outcome is the only copy there is, so a store that cannot hold it must not be a \
+             reason to drop it as well: {:?}",
+            messages.as_slice()
         );
     }
 

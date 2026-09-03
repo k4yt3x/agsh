@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `meka session show <id>` prints one session in full, including its whole id.
+- `meka schedule show <id>` prints one job untruncated: full prompt, gate command, and session.
+- `/tasks show <id>` prints one background task in full, including its whole id and outcome.
+- `/schedule show <id>` prints one job in full, so a gate reads without leaving the REPL.
+- `GET /v1/sessions/{id}/tasks` reports `announced_at`, absent when nobody has been told yet.
+
+### Changed
+
+- Every command taking a session, job or task id accepts any unique prefix of one.
+- Listings shorten an id to what distinguishes it on screen; each `show` prints it in full.
+- `meka schedule list` names the session each job wakes, and fits 120 columns instead of 186.
+- `meka schedule list` shows how long until a job next fires, rather than an absolute timestamp.
+- `meka session list` fits 120 columns instead of 158, spending the width on a longer preview.
+- `/tasks` fits 120 columns instead of ~138, bounding the tool name and elapsed time.
+- Cancelling a background task costs no turn; its report rides your next turn or a job's.
+- **Breaking:** `meka session delete` refuses explicit ids with `--all`, as `--older-than-days` does.
+
+### Fixed
+
+- `task.finished` fires when a task ends, so an interrupted one is announced even if never reported.
+- An empty id prefix matches nothing, instead of cancelling the only job or task in the session.
+- An uppercase id prefix resolves a job or task, as it already resolved a session.
+- A background outcome is no longer discarded unread when the turn that would report it cannot run.
+- `meka session delete` exits non-zero when a session it was asked to delete was not deleted.
+
+### Removed
+
+- `meka schedule list` drops its `When`, `Check` and `Held` columns; `schedule show` carries them.
+
+### Security
+
+- `meka session list` sanitises its preview and timestamp cells, which reached the terminal raw.
+- `/tasks` sanitises the command line and result excerpt it renders, which were passed through raw.
+- `meka mcp tools` sanitises the tool name, which a server chose and which reached the terminal raw.
+
 ## [0.44.4] - 2026-09-02
 
 ### Changed

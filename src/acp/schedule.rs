@@ -89,7 +89,11 @@ pub(super) fn spawn_background_poller(
                     .list_undelivered_background_tasks(session_uuid)
                     .await
                 {
-                    Ok(ready) if !ready.is_empty() => ready,
+                    // A cancellation never causes a turn, but joins one that is happening anyway:
+                    // see `TaskStatus::wakes_a_host`. Judged here rather than inside
+                    // `deliver_outcomes`, so a batch that will wait costs no `touch`, no runtime
+                    // lock and no binding resolve.
+                    Ok(ready) if ready.iter().any(|task| task.status.wakes_a_host()) => ready,
                     Ok(_) => continue,
                     Err(error) => {
                         tracing::warn!(
@@ -100,11 +104,10 @@ pub(super) fn spawn_background_poller(
                         continue;
                     }
                 };
-                // Supervised for the reason the `meka serve` twin documents at
-                // src/server/schedule.rs:175: this runs a whole agent turn, so anything in the
-                // tool loop can panic, and nothing joins this handle -- losing it would strand
-                // the batch that was just stamped `delivered` and every outcome after it, with no
-                // error anywhere. This is the sibling that did not get the guard.
+                // Supervised for the reason `meka serve`'s `spawn_background_poller` documents:
+                // this runs a whole agent turn, so anything in the tool loop can panic, and
+                // nothing joins this handle -- losing it would strand the batch that was just
+                // stamped `delivered` and every outcome after it, with no error anywhere.
                 let sweep = std::panic::AssertUnwindSafe(deliver_outcomes(&state, &entry, &ready));
                 if let Err(panic) = futures::FutureExt::catch_unwind(sweep).await {
                     tracing::error!(
@@ -138,8 +141,11 @@ async fn deliver_outcomes(
     // A turn is activity whoever started it. Without this the idle sweep sees a session whose only
     // traffic is out-of-band as untouched since the user last typed, and evicts it after 24h --
     // taking its schedule out of scope permanently, since `run_due` skips jobs whose session is not
-    // in the live map. `meka serve` stamps on this same path (src/server/schedule.rs:525).
+    // in the live map. `meka serve` stamps on this same path, in `run_prompt_in_session`.
     entry.touch();
+    // Waits, where `meka serve`'s twin skips a busy session and takes it next tick. An editor
+    // serves few sessions and a report the user is waiting on should not be deferred a whole
+    // interval; the cost is that one session mid-prompt stalls the rest of this sweep.
     let mut runtime = entry.runtime.lock().await;
 
     // This turn is a turn like any other, so it runs on the profile the row names -- not on
@@ -156,22 +162,38 @@ async fn deliver_outcomes(
         return;
     }
 
+    // Asked before the stamp, for the reason the serve twin gives: `run_turn` gates on MCP
+    // readiness as its first statement, so a required server that is down would leave every sweep
+    // with a stamped batch and no turn to report it.
+    if !crate::background::a_turn_can_carry_them(&runtime.agent).await {
+        return;
+    }
     let ids: Vec<String> = ready.iter().map(|task| task.id.clone()).collect();
-    if let Err(error) = state
+    // The stamp is the claim, and `ready` was listed before the lock above was taken: a
+    // `session/prompt` that won the mutex in that gap has already claimed and reported some of
+    // these. Reporting what this call actually won is what stops the model hearing it twice.
+    let claimed = match state
         .shared
         .session_manager
         .background_store()
         .mark_background_tasks_delivered(&ids)
         .await
     {
-        tracing::warn!(
-            "failed to stamp background outcomes as delivered: {}",
-            error
-        );
+        Ok(claimed) => claimed,
+        Err(error) => {
+            tracing::warn!(
+                "failed to stamp background outcomes as delivered: {}",
+                error
+            );
+            return;
+        }
+    };
+    let ready = crate::background::only_what_was_won(ready.to_vec(), &claimed);
+    if ready.is_empty() {
         return;
     }
 
-    let prompt = crate::background::render_outcomes(ready);
+    let prompt = crate::background::render_outcomes(&ready);
     entry.frontend.push_out_of_band_prompt(&prompt);
 
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -249,13 +271,42 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
         return FireOutcome::Unrunnable;
     }
 
-    // Now that the session is ours, the transcript reads in order: the trigger, then the reply.
-    entry.frontend.push_scheduled_prompt(&wakeup);
-
     // Publish the token the way the prompt handler does, so `session/cancel` from the editor stops
     // a scheduled turn. Under the lock, so a turn already running cannot have its token replaced.
     let cancellation = tokio_util::sync::CancellationToken::new();
     entry.publish_cancellation(cancellation.clone());
+
+    // A scheduled fire is a turn that is happening anyway, so an outcome that did not warrant one
+    // of its own rides it, as it does on a `session/prompt` the editor sends. Without this a
+    // session whose only traffic is scheduled jobs never learns its task was cancelled. Claimed
+    // under the lock, so a claim cannot outlive the turn that was going to carry it.
+    let riding = if state.shared.config.background.enabled {
+        crate::background::claim_undelivered_outcomes(
+            &runtime.agent,
+            &state.shared.session_manager,
+            runtime.session_uuid,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let retention = crate::background::retention_carrying(&riding, wakeup.job.prompt_retention());
+    let prompt = if riding.is_empty() {
+        wakeup.render_prompt()
+    } else {
+        crate::background::render_outcomes_before(&riding, &wakeup.render_prompt())
+    };
+
+    // Now that the session is ours and the prompt is final, the transcript reads in order: the
+    // trigger, then the reply. Shown *after* the fold is decided rather than before it, so the
+    // editor sees the text the model actually received -- and in the same order, the outcome above
+    // the job's prompt, because that is how `render_outcomes_before` joins them.
+    if !riding.is_empty() {
+        entry
+            .frontend
+            .push_out_of_band_prompt(&crate::background::render_outcomes(&riding));
+    }
+    entry.frontend.push_scheduled_prompt(&wakeup);
 
     let mut session_uuid = Some(runtime.session_uuid);
     let runtime_inner = &mut *runtime;
@@ -264,10 +315,10 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
         .run_turn_retaining(
             &mut session_uuid,
             &mut runtime_inner.messages,
-            wakeup.render_prompt(),
+            prompt,
             Vec::new(),
             cancellation,
-            wakeup.job.prompt_retention(),
+            retention,
         )
         .await;
 
@@ -323,8 +374,10 @@ mod tests {
         let stamp = body
             .find("mark_background_tasks_delivered")
             .expect("the batch is stamped here, or this test is watching the wrong function");
+        // The call, not the word: prose above it mentions `run_turn` by name, and matching that
+        // put the "turn" earlier in the body than the stamp it is supposed to follow.
         let turn = body
-            .find("run_turn")
+            .find(".run_turn(")
             .expect("the turn this whole ordering is about is no longer in this function");
         assert!(
             binding < stamp,

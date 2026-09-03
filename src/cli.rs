@@ -102,8 +102,8 @@ pub enum SessionAction {
     },
     /// Export a session as Markdown or JSON
     Export {
-        /// Session UUID to export
-        session_id: uuid::Uuid,
+        /// Session id, or any unique prefix of one
+        session_id: String,
         /// Output file (`-` for stdout)
         ///
         /// Defaults to `session-<id>.md` for markdown or `session-<id>.json`
@@ -126,10 +126,14 @@ pub enum SessionAction {
     ///   meka session delete --all
     #[command(verbatim_doc_comment)]
     Delete {
-        /// Session UUIDs to delete
-        session_ids: Vec<uuid::Uuid>,
+        /// Session ids, or any unique prefix of each
+        session_ids: Vec<String>,
         /// Delete all sessions
-        #[arg(long, conflicts_with = "older_than_days")]
+        ///
+        /// Conflicts with explicit IDs for the reason `--older-than-days` does: naming some
+        /// sessions and then asking for every session is two different requests, and running the
+        /// wider one silently makes the narrower one look honoured.
+        #[arg(long, conflicts_with_all = ["older_than_days", "session_ids"])]
         all: bool,
         /// Delete sessions not updated in this many days
         ///
@@ -155,8 +159,13 @@ pub enum SessionAction {
     /// The copy carries the original's full conversation and continues from
     /// there; the original is untouched. Prints the new session ID.
     Fork {
-        /// Session UUID to fork
-        session_id: uuid::Uuid,
+        /// Session id, or any unique prefix of one
+        session_id: String,
+    },
+    /// Show a session's full details
+    Show {
+        /// Session id, or any unique prefix of one
+        session_id: String,
     },
     /// Drop the most recent turns from a session
     ///
@@ -164,8 +173,8 @@ pub enum SessionAction {
     /// result. The log is append-only, so `meka session export` still shows
     /// what was dropped. Use this to recover a session the provider refuses.
     Rewind {
-        /// Session UUID to rewind
-        session_id: uuid::Uuid,
+        /// Session id, or any unique prefix of one
+        session_id: String,
         /// Number of turns to drop
         #[arg(short = 'n', long, default_value = "1")]
         turns: usize,
@@ -404,9 +413,14 @@ pub enum ScheduleAction {
     ///   meka schedule list --session 0b5c...
     #[command(verbatim_doc_comment)]
     List {
-        /// Only this session's jobs (default: every session)
+        /// One session's jobs, by id or prefix (default: all)
         #[arg(long)]
         session: Option<String>,
+    },
+    /// Show a job's full details
+    Show {
+        /// Job id, or any unique prefix of one
+        id: String,
     },
     /// Cancel a job by id or unique prefix
     Cancel {
@@ -1055,8 +1069,7 @@ mod tests {
 
     #[test]
     fn test_cli_session_delete_all_subcommand() {
-        let id = "550e8400-e29b-41d4-a716-446655440000";
-        let cli = Cli::parse_from(["meka", "session", "delete", id, "--all"]);
+        let cli = Cli::parse_from(["meka", "session", "delete", "--all"]);
         match cli.command {
             Some(Command::Session {
                 action:
@@ -1064,11 +1077,26 @@ mod tests {
                         session_ids, all, ..
                     },
             }) => {
-                assert_eq!(session_ids.len(), 1);
+                assert!(session_ids.is_empty());
                 assert!(all);
             }
             other => panic!("expected session delete, got {:?}", other),
         }
+    }
+
+    /// Naming sessions and then asking for every session are two different requests.
+    ///
+    /// It used to take both and quietly honour the wider one, so `meka session delete "$ID" --all`
+    /// with `$ID` unset deleted the store and reported the empty id as a failure -- a complete
+    /// success reported as an error, over work nobody asked for. Same reasoning as the
+    /// `--older-than-days` conflicts beside it.
+    #[test]
+    fn test_cli_session_delete_all_conflicts_with_explicit_ids() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            Cli::try_parse_from(["meka", "session", "delete", id, "--all"]).is_err(),
+            "naming an id and asking for --all must be refused"
+        );
     }
 
     /// The manual replacement for size-based auto-cleanup, so it has to actually parse.

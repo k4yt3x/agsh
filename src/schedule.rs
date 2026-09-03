@@ -961,7 +961,8 @@ pub enum Withheld {
     No,
     /// It will not, for this reason.
     Yes(String),
-    /// A tool gate this reader cannot resolve: no dispatcher at all, or a server still connecting.
+    /// Not establishable by this reader: a tool gate it has no dispatcher for or whose server is
+    /// still connecting, or a session whose permission level it could not resolve at all.
     Undetermined,
 }
 
@@ -2762,10 +2763,14 @@ impl ScheduleStore {
         session_id: uuid::Uuid,
         id_prefix: &str,
     ) -> crate::error::Result<Option<String>> {
+        if !crate::render::is_usable_id_prefix(id_prefix) {
+            return Ok(None);
+        }
+        let wanted = crate::render::id_prefix_for_matching(id_prefix);
         let jobs = self.list_scheduled_jobs(session_id).await?;
         let matches: Vec<&ScheduledJob> = jobs
             .iter()
-            .filter(|job| job.id.starts_with(id_prefix))
+            .filter(|job| job.id.starts_with(&wanted))
             .collect();
         let id = match matches.as_slice() {
             [] => return Ok(None),
@@ -4460,6 +4465,59 @@ mod tests {
     ///
     /// Both an ungated and a gated job, because the gate occupies four consecutive columns in the
     /// middle of the row and a shift that starts after them is invisible to a job that has none.
+    /// An empty prefix cancels nothing, on the door the model can reach.
+    ///
+    /// `schedule_cancel {"id": ""}` is a tool call, and `require_str` accepts an empty string, so
+    /// this is reachable without a user typing anything. `"".starts_with` is true of every id, so
+    /// without the guard it resolved to whichever job was alone and destroyed the agent's own
+    /// reminder -- reporting success, and only starting to error once a second job existed.
+    #[tokio::test]
+    async fn cancelling_an_empty_prefix_destroys_no_job() {
+        let harness = SchedulerHarness::new().await;
+        let job = harness
+            .overdue_job_in(
+                harness.session_id,
+                Schedule::parse_every("1h").expect("parses"),
+                None,
+                chrono::Duration::seconds(1),
+            )
+            .await;
+
+        assert!(
+            harness
+                .manager
+                .schedule_store()
+                .cancel_scheduled_job(harness.session_id, "")
+                .await
+                .expect("an empty prefix is a miss, not an error")
+                .is_none(),
+            "an empty prefix must name no job"
+        );
+        assert_eq!(
+            harness
+                .manager
+                .schedule_store()
+                .list_scheduled_jobs(harness.session_id)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "and the job must survive it"
+        );
+
+        // The same id, typed as it was printed, still cancels.
+        assert_eq!(
+            harness
+                .manager
+                .schedule_store()
+                .cancel_scheduled_job(harness.session_id, &job.id[..8])
+                .await
+                .expect("cancel"),
+            Some(job.id),
+            "a real prefix is unaffected by the guard"
+        );
+    }
+
     #[tokio::test]
     async fn every_field_of_a_job_survives_the_round_trip() {
         let harness = SchedulerHarness::new().await;

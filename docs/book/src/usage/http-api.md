@@ -465,7 +465,11 @@ max_retries = 3                        # after the first attempt, default 3
 
 `events` is required and every name must be recognised: an endpoint whose only subscription is a typo would be silently never called, so an unknown event is a startup error rather than a warning.
 
-The four do not overlap. `turn.finished` and `turn.failed` cover turns submitted through `POST /turn`; a turn the *server* started fires `schedule.fired` (which carries its own `status`) or `task.finished` instead, so one occurrence never produces two deliveries. A client that wants to know about everything the agent did should subscribe to all four.
+`turn.finished` and `turn.failed` cover turns submitted through `POST /turn`. A scheduled job's turn fires `schedule.fired` (which carries its own `status`) instead, so no turn produces two deliveries. A turn the server runs purely to report a background outcome fires neither: the news is the task's, and `task.finished` has already carried it.
+
+`task.finished` is not a turn event. It fires when a background task reaches a terminal state, whether or not any turn reports it: a cancelled task fires it with no turn at all, and its outcome then rides whichever turn the session takes next. Expect it alongside a `turn.finished` when a client's own `POST /turn` is what carries the outcome, and expect it on its own for a task interrupted by a host that died, which no turn ever ran.
+
+A client that wants to know about everything the agent did should subscribe to all four.
 
 ### Payloads
 
