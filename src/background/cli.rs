@@ -40,19 +40,16 @@ pub async fn run_list_for_session(
 fn render(tasks: Vec<crate::background::BackgroundTask>) -> Result<()> {
     if tasks.is_empty() {
         // stderr: an empty list is a status note, not the data a script asked for.
-        eprintln!("No background tasks in this session.");
+        crate::render::write_stderr_line("No background tasks in this session.");
         return Ok(());
     }
 
     let rows = task_rows(&tasks);
 
-    print!(
-        "{}",
-        crate::render::format_columns(
-            &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
-            &rows
-        )
-    );
+    crate::render::write_stdout(crate::render::format_columns(
+        &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
+        &rows,
+    ))?;
     Ok(())
 }
 
@@ -141,12 +138,29 @@ pub async fn show(
         )));
     };
 
+    crate::render::write_stdout(show_lines(&task))?;
+    Ok(())
+}
+
+/// One `name: value` line per field, separated from printing so the alignment and the sanitising
+/// can be asserted. Five of the values are model-authored or server-chosen, and this is the one
+/// surface that prints them untruncated.
+fn show_lines(task: &crate::background::BackgroundTask) -> String {
     let mut out = String::new();
     // A free function rather than a closure: the two untruncated blocks below append to `out`
     // directly, and a closure holding it borrowed would rule that out.
     fn field(out: &mut String, name: &str, value: &str) {
         use std::fmt::Write as _;
-        writeln!(out, "{:<10} {}", format!("{}:", name), value).ok();
+        // The longest label plus one, as in `schedule show` and `session show`, so the values line
+        // up without a table. `full output` is both the longest and the only conditional one, so a
+        // width measured against the fields that always print is two columns short of it.
+        if value.is_empty() {
+            // `result:` heads the outcome rather than carrying one, so padding it to the column
+            // would leave a run of trailing spaces on the row.
+            writeln!(out, "{}:", name).ok();
+        } else {
+            writeln!(out, "{:<13} {}", format!("{}:", name), value).ok();
+        }
     }
     field(&mut out, "id", &task.id);
     field(&mut out, "session", &task.session_id.to_string());
@@ -156,7 +170,7 @@ pub async fn show(
         "tool",
         &crate::render::sanitize_to_line(&task.tool_name, usize::MAX),
     );
-    field(&mut out, "elapsed", &format_elapsed(&task));
+    field(&mut out, "elapsed", &format_elapsed(task));
     field(&mut out, "started", &task.started_at.to_rfc3339());
     field(&mut out, "finished", &match task.finished_at {
         Some(at) => at.to_rfc3339(),
@@ -193,8 +207,7 @@ pub async fn show(
             out.push('\n');
         }
     }
-    print!("{}", out);
-    Ok(())
+    out
 }
 
 /// Cancel one task in `session` by full or unique-prefix id, or every running one.
@@ -276,6 +289,93 @@ fn collapse(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::background::BackgroundTask;
+
+    /// Every field starts its value in the same column, including the one that appears only when
+    /// the output overflowed into a scratchpad.
+    ///
+    /// `full output` is the longest label and the only conditional one, so a width measured against
+    /// the fields that always print reads as correct until a task is big enough to need it.
+    #[test]
+    fn every_field_of_a_task_starts_in_the_same_column() {
+        let task = BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            tool_name: "execute_command".to_string(),
+            label: "cargo test --all".to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some("test result: ok".to_string()),
+            scratchpad_name: Some("build-log".to_string()),
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            announced_at: None,
+            delivered_at: None,
+        };
+
+        let rendered = show_lines(&task);
+        // The outcome is indented under `result:` rather than being a field of its own, and
+        // `result:` carries no value to line anything up against. A value may hold colons of its
+        // own -- both timestamps do -- so the label's is the first one.
+        let columns: Vec<(usize, &str)> = rendered
+            .lines()
+            .filter(|line| !line.starts_with(' '))
+            .filter_map(|line| {
+                let label = line.find(':')?;
+                let value = line[label + 1..].find(|c: char| c != ' ')? + label + 1;
+                Some((value, line))
+            })
+            .collect();
+
+        assert!(
+            columns
+                .iter()
+                .any(|(_, line)| line.starts_with("full output:")),
+            "the longest label has to be in the sample, or this proves nothing: {rendered}"
+        );
+        let (first_column, first_line) = *columns.first().expect("the fields rendered");
+        for (column, line) in &columns {
+            assert_eq!(
+                *column, first_column,
+                "`{line}` starts its value at {column}, `{first_line}` at {first_column}"
+            );
+        }
+    }
+
+    /// The values a model or a server chose reach this surface sanitised.
+    ///
+    /// `show` is the one command that prints them untruncated, so it is also the one where a forged
+    /// `status:` row or a cleared screen would be most convincing. `sanitize_to_line` is asked for
+    /// each of them; this checks it was actually asked.
+    #[test]
+    fn a_task_show_sanitises_every_value_it_did_not_write() {
+        let forged = "done\x1b[2J\rstatus:      completed";
+        let task = BackgroundTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::new_v4(),
+            tool_name: format!("mcp__evil__{}", forged),
+            label: forged.to_string(),
+            status: TaskStatus::Completed,
+            outcome: Some(forged.to_string()),
+            scratchpad_name: Some(forged.to_string()),
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+            announced_at: None,
+            delivered_at: None,
+        };
+
+        let rendered = show_lines(&task);
+        assert!(
+            !rendered.contains('\x1b'),
+            "an escape reached the terminal: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\r'),
+            "a carriage return can repaint the row above it: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("done"),
+            "and the text either side of it still shows: {rendered:?}"
+        );
+    }
 
     async fn manager_with_session() -> (SessionManager, uuid::Uuid) {
         let manager =

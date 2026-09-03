@@ -469,6 +469,87 @@ fn the_opening_blank_precedes_the_session_notice() {
     );
 }
 
+/// A run's outer edges border the shell's prompt rather than one of meka's, and a shell lays out
+/// its own. Both blanks were spent against it anyway: one above `Continuing session:`, which is
+/// meka's first word and belongs directly under the command line, and one below `Leaving session:`,
+/// which is its last unless a background task is still running. See
+/// [`the_shutdown_notice_reads_as_one_block_with_the_exit_banner`] for that case.
+///
+/// Two runs over one install, because the second is the only way to reach the resume banner: `-c`
+/// needs a session the first run left behind.
+#[test]
+fn the_shell_s_prompt_gets_neither_blank() {
+    let install = Install::new(true, true, "");
+
+    let leaving = run_repl(&install, TWO_TURNS, &["first", "/exit"]);
+    let last_word = leaving
+        .iter()
+        .position(|row| row.contains("Leaving session"))
+        .unwrap_or_else(|| panic!("the exit banner is shown by default: {leaving:#?}"));
+    assert!(
+        leaving[last_word + 1..].iter().all(String::is_empty) && leaving.len() - last_word <= 2,
+        "only the newline that ends the banner may follow it, not a blank line into the shell \
+         prompt: {leaving:#?}"
+    );
+
+    let continuing = run_repl(&install, TWO_TURNS, &["/exit"]);
+    assert!(
+        continuing
+            .first()
+            .is_some_and(|row| row.contains("Continuing session")),
+        "the resume banner is the first row, with no blank above it: {continuing:#?}"
+    );
+    // The other half, and the one the `printed` bookkeeping exists for: losing the opening blank
+    // must not cost the episode its closing one. Without this the whole suite stays green while
+    // the replayed history butts straight against the first prompt.
+    let first_prompt = continuing
+        .iter()
+        .position(|row| row.contains("/exit"))
+        .unwrap_or_else(|| panic!("the typed line is echoed at the prompt: {continuing:#?}"));
+    assert!(
+        first_prompt > 0 && continuing[first_prompt - 1].is_empty(),
+        "the first prompt is bracketed like every later one: {continuing:#?}"
+    );
+}
+
+/// A task still running at `/exit` puts a second line under the exit banner, and the two read as
+/// one block.
+///
+/// They are both `Chrome`, which asks for no separator, so flush is what two of them do anywhere
+/// else in a session. What makes it worth pinning is that an episode closes between them, early,
+/// to settle the row before the session lock is released: a close that bracketed against a prompt
+/// would put a blank there that nobody chose.
+#[test]
+fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
+    let install = Install::with_extra(true, true, "", "\n[background]\nenabled = true\n");
+    let script = r#"[
+        [
+            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "kind": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "kind": "text", "text": "started it" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]"#;
+
+    let rows = run_repl(&install, script, &["run it", "/exit"]);
+    let banner = rows
+        .iter()
+        .position(|row| row.contains("Leaving session"))
+        .unwrap_or_else(|| panic!("the exit banner is shown by default: {rows:#?}"));
+    assert_eq!(
+        rows.get(banner + 1).map(String::as_str),
+        Some("(stopping 1 background task)"),
+        "the notice is the very next row, with no blank between: {rows:#?}"
+    );
+    assert!(
+        rows[banner + 2..].iter().all(String::is_empty) && rows.len() - banner <= 3,
+        "and nothing follows it into the shell prompt: {rows:#?}"
+    );
+}
+
 /// Most commands answer through the `cli` modules, which print for themselves and are invisible to
 /// the console. They are bracketed by the dispatcher announcing on their behalf; without that the
 /// blank lines follow only the output the console happens to render itself, and `/status` prints

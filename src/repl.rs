@@ -1077,42 +1077,45 @@ fn format_enabled(enabled: EnabledPermissions) -> String {
 }
 
 fn print_help() {
-    eprintln!("Commands:");
+    crate::render::write_stderr_line("Commands:");
     for command in COMMANDS {
         let left = if command.arg_hint.is_empty() {
             format!("/{}", command.name)
         } else {
             format!("/{} {}", command.name, command.arg_hint)
         };
-        eprintln!("  {left:<33}  {}", command.help);
+        crate::render::write_stderr_line(format!("  {left:<33}  {}", command.help));
         if command.name == "mcp" {
             // The /mcp subcommands are arguments, not top-level commands, so they are absent from
             // COMMANDS; list them here so help still documents the full grammar. Keep this set in
             // step with `parse_mcp_slash` and `MCP_SUBCOMMANDS`.
-            eprintln!("  {:<33}  List configured MCP servers", "/mcp list");
-            eprintln!(
+            crate::render::write_stderr_line(format!(
+                "  {:<33}  List configured MCP servers",
+                "/mcp list"
+            ));
+            crate::render::write_stderr_line(format!(
                 "  {:<33}  Reconnect smoke-test for one server",
                 "/mcp reconnect <server>"
-            );
-            eprintln!(
+            ));
+            crate::render::write_stderr_line(format!(
                 "  {:<33}  Run the OAuth flow for a server",
                 "/mcp login <server>"
-            );
-            eprintln!(
+            ));
+            crate::render::write_stderr_line(format!(
                 "  {:<33}  Clear stored credentials for a server",
                 "/mcp logout <server>"
-            );
-            eprintln!(
+            ));
+            crate::render::write_stderr_line(format!(
                 "  {:<33}  Render an MCP prompt as the next turn",
                 "/mcp <server>:<prompt> [args]"
-            );
+            ));
         }
     }
-    eprintln!();
-    eprintln!("Shortcuts:");
-    eprintln!("  !<command>    Execute a shell command directly");
-    eprintln!("  Shift+Tab     Cycle permission level");
-    eprintln!("  Ctrl+D        Exit the shell");
+    crate::render::write_stderr_line("");
+    crate::render::write_stderr_line("Shortcuts:");
+    crate::render::write_stderr_line("  !<command>    Execute a shell command directly");
+    crate::render::write_stderr_line("  Shift+Tab     Cycle permission level");
+    crate::render::write_stderr_line("  Ctrl+D        Exit the shell");
 }
 
 /// Borrow the shared console for one synchronous run of writes.
@@ -1278,13 +1281,18 @@ pub fn run_repl(
         // per prompt is the right cadence for the stat pass, and it happens while the user has not
         // started typing; the parse behind it only runs when the stats have moved.
         refresh_skill_names();
-        // The one place an episode can end, which is what makes the bracket impossible to skip: no
-        // `continue`, `break` or dispatch arm below reaches the next prompt without passing here.
-        with_console(&console, |console| console.close_episode());
+        // The one place an episode can end before a prompt, which is what makes the bracket
+        // impossible to skip: no `continue`, `break` or dispatch arm below reaches the next prompt
+        // without passing here. `main` closes the last one, which no prompt follows.
+        with_console(&console, |console| {
+            console.close_episode(crate::console::Neighbour::Prompt)
+        });
         RELAY.set_at_prompt(true);
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
-        with_console(&console, |console| console.open_episode(row_after(&signal)));
+        with_console(&console, |console| {
+            console.open_episode(row_after(&signal), crate::console::Neighbour::Prompt)
+        });
         // Every exit lowers it, not just a submitted line: a Ctrl+C or a scheduler wake leaves the
         // buffer to be edited further, and it must go back to being edited plainly.
         submitted.store(false, Ordering::Relaxed);
@@ -1664,16 +1672,13 @@ fn render_progress_update(
 ) {
     let line = format_progress_update(update);
     with_console(console, |console| {
+        // Always drawn as far as this can tell. `write_stderr` accepts a failed write rather than
+        // reporting it down the stream that just refused it, so there is nothing left to answer
+        // `false` on: the row is claimed, and a stderr that will not take a progress line will not
+        // take the redraw that replaces it either.
         console.transient(|| {
-            eprint!("{}", line);
-            use std::io::Write;
-            match std::io::stderr().flush() {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::debug!("failed to flush the MCP progress line: {}", error);
-                    false
-                }
-            }
+            crate::render::write_stderr(&line);
+            true
         })
     });
 }
@@ -1771,18 +1776,18 @@ fn resolve_elicitation(
         crate::render::sanitize_to_line(&prompt.server_name, 64)
     );
     let banner_budget = crate::render::output_width().saturating_sub(banner_prefix.chars().count());
-    eprintln!(
+    crate::render::write_stderr_line(format!(
         "{}{}",
         banner_prefix,
         crate::render::sanitize_to_line(&prompt.message, banner_budget)
-    );
+    ));
 
     match &prompt.kind {
         ElicitationKind::Url { url } => {
-            eprint!(
+            crate::render::write_stderr(format!(
                 "Open {} in your browser? [Y/n/s=skip]: ",
                 crate::render::sanitize_to_line(url, 200)
-            );
+            ));
             // Same end-of-input rule as the approval prompt: without it, Ctrl+D counts as the bare
             // Enter that accepts, and opens a server-supplied URL with nobody there to consent.
             let Some(line) = read() else {
@@ -1836,11 +1841,11 @@ fn resolve_elicitation(
                     } else {
                         description
                     };
-                    eprint!(
+                    crate::render::write_stderr(format!(
                         "  {} ({}): ",
                         crate::render::sanitize_to_line(field_name, 64),
                         crate::render::sanitize_to_line(hint, 160)
-                    );
+                    ));
                     // Same end-of-input rule as the URL branch and the approval prompt. Without
                     // it Ctrl+D walked every remaining field with an empty answer and returned an
                     // `Accept` carrying a partial object, rather than declining.
@@ -2101,7 +2106,7 @@ fn handle_approval_request(request: ToolApprovalRequest, console: &Mutex<crate::
         &request.input,
         crate::render::output_width(),
     ) {
-        eprintln!("{}", line.with(crossterm::style::Color::Magenta));
+        crate::render::write_stderr_line(line.with(crossterm::style::Color::Magenta));
     }
 
     let allowed = resolve_approval(
@@ -2111,10 +2116,7 @@ fn handle_approval_request(request: ToolApprovalRequest, console: &Mutex<crate::
             // left the reader to infer both the question and that one was being asked, so the verb
             // is spelled out. In the prompt's own colour rather than dimmed, since this is the line
             // that wants attention.
-            eprint!(
-                "{}",
-                APPROVAL_QUESTION.with(crossterm::style::Color::Magenta)
-            );
+            crate::render::write_stderr(APPROVAL_QUESTION.with(crossterm::style::Color::Magenta));
             if let Err(error) = std::io::Write::flush(&mut std::io::stderr()) {
                 tracing::debug!("failed to flush stderr: {}", error);
             }
@@ -2122,7 +2124,7 @@ fn handle_approval_request(request: ToolApprovalRequest, console: &Mutex<crate::
             let read = std::io::stdin().read_line(&mut response);
             answer_from_read(read, &response).map(str::to_string)
         },
-        |message| eprintln!("{}", message.with(crossterm::style::Color::DarkGrey)),
+        |message| crate::render::write_stderr_line(message.with(crossterm::style::Color::DarkGrey)),
     );
 
     if request.response_sender.send(allowed).is_err() {
@@ -2997,7 +2999,9 @@ mod frontend_tests {
         );
 
         // No `TurnFinished`: this is the failed turn. The episode still ends.
-        with_console(&console, |console| console.close_episode());
+        with_console(&console, |console| {
+            console.close_episode(crate::console::Neighbour::Prompt)
+        });
 
         assert!(
             !with_console(&console, |console| console.has_open_text()),

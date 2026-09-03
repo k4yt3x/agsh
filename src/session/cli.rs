@@ -136,7 +136,7 @@ pub(crate) async fn export_session(
 
     match output {
         Some("-") => {
-            print!("{}", body);
+            crate::render::write_stdout(&body)?;
             Ok(None)
         }
         Some(path) => {
@@ -244,20 +244,24 @@ pub(crate) async fn import_session(
         }
     };
     if spawned {
-        eprintln!(
+        crate::render::write_stderr_line(
             "Imported a sub-agent's conversation. Its parent is not in this archive, so `meka -r` \
              will refuse it. Read it with `meka session export`."
+                .to_string(),
         );
     } else if count > 1 {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "Imported session with {} sub-agent(s). Resume with: meka -r {}",
             count - 1,
             root_new_id
-        );
+        ));
     } else {
-        eprintln!("Imported session. Resume with: meka -r {}", root_new_id);
+        crate::render::write_stderr_line(format!(
+            "Imported session. Resume with: meka -r {}",
+            root_new_id
+        ));
     }
-    println!("{}", root_new_id);
+    crate::render::write_stdout_line(root_new_id)?;
     Ok(())
 }
 
@@ -376,18 +380,21 @@ pub(crate) async fn fork_session_command(
         }
     };
     match spawned.map(|terms| terms.parent) {
-        Some(Some(parent)) => eprintln!(
+        Some(Some(parent)) => crate::render::write_stderr_line(format!(
             "Forked session. It is a sub-agent of {parent}, so continue it with `agent_followup` \
              from {parent} rather than `meka -r`."
-        ),
+        )),
         // A copy of a worker whose parent is not in this store. Still a worker, still not
         // resumable, and with no id to name; saying so beats printing `meka -r`.
-        Some(None) => eprintln!(
-            "Forked session. Its parent is not in this store, so `meka -r` will refuse it."
+        Some(None) => crate::render::write_stderr_line(
+            "Forked session. Its parent is not in this store, so `meka -r` will refuse it.",
         ),
-        None => eprintln!("Forked session. Resume with: meka -r {}", forked.id),
+        None => crate::render::write_stderr_line(format!(
+            "Forked session. Resume with: meka -r {}",
+            forked.id
+        )),
     }
-    println!("{}", forked.id);
+    crate::render::write_stdout_line(forked.id)?;
     Ok(())
 }
 
@@ -579,7 +586,7 @@ pub(crate) async fn run_session_subcommand(
                 }
             }
             for problem in &unresolved {
-                eprintln!("{}", problem);
+                crate::render::write_stderr_line(problem);
             }
             // A name that resolved to nothing is a refusal like any other, and has to reach the
             // exit code the same way: `delete_sessions` never learns these ids, so leaving it to
@@ -651,7 +658,13 @@ async fn show_session(
     let mut out = String::new();
     let mut field = |name: &str, value: &str| {
         use std::fmt::Write as _;
-        writeln!(out, "{:<12} {}", format!("{}:", name), value).ok();
+        if value.is_empty() {
+            // A heading rather than a field, so padding it to the column would leave a run of
+            // trailing spaces on the row. Same rule as `/tasks show`'s `result:`.
+            writeln!(out, "{}:", name).ok();
+        } else {
+            writeln!(out, "{:<12} {}", format!("{}:", name), value).ok();
+        }
     };
     field("id", &session.id.to_string());
     field("created", &format_timestamp(&session.created_at));
@@ -685,7 +698,7 @@ async fn show_session(
         "opening",
         &render::sanitize_to_line(&session.preview, usize::MAX),
     );
-    print!("{}", out);
+    crate::render::write_stdout(&out)?;
     Ok(())
 }
 
@@ -724,12 +737,12 @@ pub(crate) async fn rewind_session_command(
     session_manager.save_event(session_id, &event).await?;
 
     tracing::info!("rewound {} turn(s) from session {}", turns, session_id);
-    eprintln!(
+    crate::render::write_stderr_line(format!(
         "Rewound {} turn(s); {} message(s) remain. The full history is still in \
          `meka session export`.",
         turns,
         conversation.len(),
-    );
+    ));
     Ok(())
 }
 
@@ -743,7 +756,7 @@ pub(crate) async fn list_sessions(
         .await?;
 
     if sessions.is_empty() {
-        eprintln!("No sessions found.");
+        crate::render::write_stderr_line("No sessions found.");
         return Ok(());
     }
 
@@ -751,10 +764,10 @@ pub(crate) async fn list_sessions(
     // the ones this listing chose to show.
     let resolvable = session_manager.all_session_ids().await?;
     let headers: &[&str] = &["ID", "Updated", "Provider", "Preview"];
-    print!(
-        "{}",
-        render::format_columns(headers, &session_rows(&sessions, &resolvable))
-    );
+    crate::render::write_stdout(render::format_columns(
+        headers,
+        &session_rows(&sessions, &resolvable),
+    ))?;
 
     Ok(())
 }
@@ -869,11 +882,14 @@ pub(crate) async fn delete_sessions(
             // script must be able to tell from success. Reachable without a race by naming one
             // session twice -- a prefix and its full id -- where the second pass finds it gone.
             Ok(false) => {
-                eprintln!("Session not found: {}", session_id);
+                crate::render::write_stderr_line(format!("Session not found: {}", session_id));
                 refused.push(*session_id);
             }
             Err(error) => {
-                eprintln!("Cannot delete {}: {}", session_id, error);
+                crate::render::write_stderr_line(format!(
+                    "Cannot delete {}: {}",
+                    session_id, error
+                ));
                 refused.push(*session_id);
             }
         }

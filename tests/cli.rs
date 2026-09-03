@@ -1708,3 +1708,316 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
         "and riding a turn is a delivery, so the row must be stamped"
     );
 }
+
+/// A reader that hangs up mid-answer ends the run cleanly.
+///
+/// `meka --oneshot … | head -1` is the shape one-shot mode exists for, and a short-lived reader is
+/// ordinary, so the write that finds the closed pipe has to be a failure the renderer reports
+/// rather than one it panics on. A panicking write is bad enough on its own; paired with a `Drop`
+/// that flushes on the way out it is worse, because the second panic during the unwind is not an
+/// exit code at all but `SIGABRT`.
+///
+/// Every delta below closes one paragraph and opens another, which is what a real provider streams
+/// and what leaves a partial paragraph buffered: a flush drains only what it can render, so a
+/// buffer emptied by the failing flush leaves the tail nothing to print and hides the fault.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_hangs_up_mid_answer_does_not_abort_the_run() {
+    use std::io::Read as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+
+    let deltas: Vec<String> = (1..40)
+        .map(|index| {
+            format!(
+                r#"{{"kind":"text","text":"end of paragraph {index}.\n\nthe start of paragraph {} which is not yet"}}"#,
+                index + 1
+            )
+        })
+        .collect();
+    let script = dir.path().join("script.json");
+    std::fs::write(
+        &script,
+        format!(
+            r#"[[{},{{"kind":"message_end","stop_reason":"end_turn"}}]]"#,
+            deltas.join(",")
+        ),
+    )
+    .expect("write the provider script");
+
+    let mut child = meka()
+        .args(["--oneshot", "write something long"])
+        .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
+        .env("MEKA_DATA_DIR", dir.path().join("data").join("meka"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("MEKA_MOCK_PROVIDER", "1")
+        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+
+    // One read, then hang up: `head -1` in process form. Reading first is what makes the close land
+    // mid-stream rather than before the first write.
+    {
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut first = [0u8; 1];
+        // The child may not have written yet, and either way the point is to close the pipe.
+        if let Err(error) = stdout.read(&mut first) {
+            panic!("reading one byte from the child failed: {error}");
+        }
+    }
+    let status = child.wait().expect("wait for meka");
+
+    use std::os::unix::process::ExitStatusExt as _;
+    assert!(
+        status.signal().is_none(),
+        "the run died on signal {:?} rather than exiting; a panicking `Drop` on an unwinding \
+         thread aborts, and the last episode's flush is the one write certain to fail again",
+        status.signal()
+    );
+    assert!(
+        status.success(),
+        "and it exited {:?}: a reader that stops reading is its own decision, not a failure of \
+         the run",
+        status.code()
+    );
+}
+
+/// A stdout that will not take the answer fails the run, and says so once.
+///
+/// The counterpart to the broken pipe above, and the reason the two are told apart: a reader that
+/// hangs up chose to, but a full disk did not, and `meka -p … > out.txt` reporting success over an
+/// empty file is the worse failure of the two. Once, because `text_delta` runs per streamed delta
+/// and a real answer is hundreds of them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stdout_that_will_not_take_the_answer_fails_the_run_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+
+    let deltas: Vec<String> = (1..40)
+        .map(|index| {
+            format!(
+                r#"{{"kind":"text","text":"end of paragraph {index}.\n\nthe start of paragraph {} which is not yet"}}"#,
+                index + 1
+            )
+        })
+        .collect();
+    let script = dir.path().join("script.json");
+    std::fs::write(
+        &script,
+        format!(
+            r#"[[{},{{"kind":"message_end","stop_reason":"end_turn"}}]]"#,
+            deltas.join(",")
+        ),
+    )
+    .expect("write the provider script");
+
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full");
+    let run = meka()
+        .args(["--oneshot", "write something long"])
+        .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
+        .env("MEKA_DATA_DIR", dir.path().join("data").join("meka"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("MEKA_MOCK_PROVIDER", "1")
+        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script)
+        .stdout(std::process::Stdio::from(full))
+        .output()
+        .expect("spawn meka");
+
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success(),
+        "losing the answer to a full disk has to reach the exit code: {stderr}"
+    );
+    // Counting the log line, not the phrase: the error report below it says the same thing, and a
+    // count that leaned on the two being worded differently would be a test choosing the wording.
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("did not reach stdout"))
+            .count(),
+        1,
+        "and it has to be said once, not once per delta: {stderr}"
+    );
+}
+
+/// Every command that prints survives a reader that hangs up, and none of them calls that failure.
+///
+/// The renderer was converted first and the rest of the CLI was not, which left `session export
+/// --output - | head` crashing where `--oneshot | head` had just been fixed. `CLAUDE.md` names the
+/// litmus test -- `meka … 2>/dev/null | next-tool` -- so a `print!` that panics is a broken
+/// contract in any of them, not only the streaming one.
+#[cfg(unix)]
+#[test]
+fn no_command_dies_because_its_reader_stopped_reading() {
+    use std::os::fd::FromRawFd as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    let created = run_scripted(dir.path(), &["--oneshot", "hello"]);
+    assert!(created.status.success(), "seed a session");
+    let id = only_session(dir.path());
+
+    // Every command below has to actually reach stdout, or it proves nothing: one that finds
+    // nothing to list says so on stderr and writes no bytes at all, so the pipe never breaks.
+    let skill = dir.path().join("meka").join("skills").join("demo");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    // Bigger than a pipe buffer on purpose. Dropping the read end races the child, and a command
+    // whose whole answer fits in the buffer wins that race and exits cleanly even when its writes
+    // panic -- which is how a listing can pass while the per-line printer beside it crashes.
+    let long = "d".repeat(128 * 1024);
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!("---\nname: demo\ndescription: {long}\n---\n\nBody.\n"),
+    )
+    .expect("write SKILL.md");
+    let config = dir.path().join("meka").join("config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config.toml");
+    text.push_str(
+        "\n[[mcp.servers]]\nname = \"demo\"\ntransport = \"stdio\"\ncommand = \"true\"\n",
+    );
+    std::fs::write(&config, text).expect("write config.toml");
+
+    // The `get` commands first. Those print a line at a time, so the reader's hangup lands between
+    // two writes -- which is what actually crashed. A listing emits its whole table in one write
+    // that fits the pipe buffer, so it survives even unfixed and proves nothing on its own.
+    for args in [
+        vec!["skill", "get", "demo"],
+        vec!["mcp", "get", "demo"],
+        vec!["instructions", "show"],
+        vec!["session", "export", id.as_str(), "--output", "-"],
+        vec!["session", "list"],
+        vec!["session", "show", id.as_str()],
+        vec!["provider", "list"],
+        vec!["mcp", "list"],
+        vec!["skill", "list"],
+        vec!["memory", "list"],
+        vec!["schedule", "list"],
+    ] {
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` fills two descriptors this test then owns.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: closing the read end this test just made, and handing the write end to `Stdio`,
+        // which takes ownership of it.
+        let gone = unsafe {
+            libc::close(ends[0]);
+            std::process::Stdio::from_raw_fd(ends[1])
+        };
+        let mut child = meka()
+            .args(&args)
+            .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
+            .env("MEKA_DATA_DIR", dir.path().join("data").join("meka"))
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .stdout(gone)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn meka {args:?}: {error}"));
+        let status = child.wait().expect("wait for meka");
+
+        use std::os::unix::process::ExitStatusExt as _;
+        assert!(
+            status.signal().is_none(),
+            "`meka {}` died on signal {:?}",
+            args.join(" "),
+            status.signal()
+        );
+        assert!(
+            status.success(),
+            "`meka {}` exited {:?}; a reader that stops reading is its own decision",
+            args.join(" "),
+            status.code()
+        );
+    }
+}
+
+/// A destination the user named is not a pipeline, and losing it is still a failure.
+///
+/// `meka … | head` exits 0 because the reader chose to stop, and that carve-out has to mean the
+/// reader of *stdout*. `--output <fifo>` raises the same `BrokenPipe` from a place the user pointed
+/// at by name; answering 0 there reports success over data that never landed, which is worse than
+/// the crash the carve-out replaced.
+#[cfg(unix)]
+#[test]
+fn a_named_destination_that_goes_away_is_still_a_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_provider_config(dir.path(), "alpha", &["alpha"]);
+    // A transcript bigger than a pipe buffer, or the whole export lands before the reader leaves
+    // and there is no broken pipe left to test.
+    let paragraph = "e".repeat(400);
+    let deltas: Vec<String> = (0..200)
+        .map(|_| format!(r#"{{"kind":"text","text":"{paragraph}\n\n"}}"#))
+        .collect();
+    let script = format!(
+        r#"[[{},{{"kind":"message_end","stop_reason":"end_turn"}}]]"#,
+        deltas.join(",")
+    );
+    assert!(
+        run_scripted_from(dir.path(), dir.path(), &script, &["--oneshot", "hello"])
+            .status
+            .success(),
+        "seed a session"
+    );
+    let id = only_session(dir.path());
+
+    let fifo = dir.path().join("sink");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+    // SAFETY: a nul-terminated path this test owns; `mkfifo` writes nothing back.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    // Opened before the child and non-blocking, so neither side can wait on the other: opening a
+    // fifo for writing blocks until a reader arrives, and for reading until a writer does. A thread
+    // that blocks in `open` would hang the suite instead of failing it whenever meka exits before
+    // it gets that far -- an unknown session, an unreadable config, a refused lock.
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("open the fifo for reading");
+
+    let run = meka()
+        .args(["session", "export", id.as_str(), "--output"])
+        .arg(&fifo)
+        .env("MEKA_CONFIG_DIR", dir.path().join("meka"))
+        .env("MEKA_DATA_DIR", dir.path().join("data").join("meka"))
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+
+    // Take a little and hang up, so the export breaks partway rather than never starting.
+    {
+        use std::io::Read as _;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut taken = [0u8; 8];
+        while std::time::Instant::now() < deadline {
+            match (&reader).read(&mut taken) {
+                Ok(count) if count > 0 => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        drop(reader);
+    }
+    let run = run.wait_with_output().expect("wait for meka");
+
+    assert!(
+        !run.status.success(),
+        "the export never landed, so the command did not do what it was asked: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

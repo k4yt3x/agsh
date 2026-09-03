@@ -737,8 +737,8 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
     let orphans = orphaned_profiles(token_store, &config_file).await?;
 
     if config_file.providers.is_empty() {
-        eprintln!("No provider profiles configured.");
-        report_orphaned_profiles(&orphans);
+        crate::render::write_stderr_line("No provider profiles configured.");
+        report_orphaned_profiles(&orphans)?;
         return Ok(());
     }
     let default = config_file.default_provider.as_deref();
@@ -774,26 +774,23 @@ async fn run_list(token_store: &TokenStore) -> anyhow::Result<()> {
         ]);
     }
     // Requested data goes to stdout via the shared column formatter, matching `meka mcp list`.
-    print!(
-        "{}",
-        crate::render::format_columns(
-            &["Name", "Type", "Model", "Authenticated", "Default"],
-            &rows
-        )
-    );
+    crate::render::write_stdout(crate::render::format_columns(
+        &["Name", "Type", "Model", "Authenticated", "Default"],
+        &rows,
+    ))?;
     // A `default_provider` naming nothing renders as a table with no `*`, which is exactly what "no
     // default set" looks like, and the next `meka` run then fails on a setting the user believes is
     // fine. This listing is where they come to check, so it is where the discrepancy belongs.
     if let Some(default) = default
         && !config_file.providers.contains_key(default)
     {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "`default_provider` names '{}', which is not configured. Run `meka provider use \
              <name>` to point it at one of the profiles above.",
             crate::render::sanitize_for_display(default)
-        );
+        ));
     }
-    report_orphaned_profiles(&orphans);
+    report_orphaned_profiles(&orphans)?;
     Ok(())
 }
 
@@ -822,17 +819,21 @@ async fn orphaned_profiles(
 /// Print the orphan block, if there is one. The names go to stdout with the rest of the answer --
 /// hiding them behind a stderr-only note is how they stayed invisible in the first place -- and the
 /// instruction for acting on them is a stderr hint.
-fn report_orphaned_profiles(orphans: &[String]) {
+fn report_orphaned_profiles(orphans: &[String]) -> anyhow::Result<()> {
     if orphans.is_empty() {
-        return;
+        return Ok(());
     }
-    println!();
-    println!("Stored credentials with no profile: {}", orphans.join(", "));
+    crate::render::write_stdout_line("")?;
+    crate::render::write_stdout_line(format!(
+        "Stored credentials with no profile: {}",
+        orphans.join(", ")
+    ))?;
     // The action only. Deleting the block by hand is the usual cause, but an `add` that stored the
     // secret and then failed to write the profile leaves the same trace, so a hint that named one
     // cause would send that user looking for an edit they never made; and the line above has
     // already stated what was found.
     crate::render::render_hint("delete one with `meka provider remove <name>`");
+    Ok(())
 }
 
 fn validate_backend(value: &str) -> anyhow::Result<&str> {
@@ -1312,10 +1313,10 @@ fn resolve_tuning(
     }
     if !prompt_yes_no("Configure advanced settings? [y/N]: ")? {
         if let Some(defaults) = unset_defaults_summary(&flags, takes_thinking, effective_window) {
-            eprintln!(
+            crate::render::write_stderr_line(format!(
                 "using defaults: {}. Change these under [providers.{}] in config.toml.",
                 defaults, profile_name,
-            );
+            ));
         }
         return Ok(flags);
     }
@@ -1442,7 +1443,7 @@ fn prompt_secret(prompt: &str) -> io::Result<String> {
                 // The Enter the user pressed was not echoed either, so the cursor is still on the
                 // prompt line.
                 drop(_echo);
-                eprintln!();
+                crate::render::write_stderr_line("");
                 return result;
             }
         }
@@ -1527,7 +1528,7 @@ impl Drop for EchoGuard {
 }
 
 fn prompt_line(prompt: &str) -> io::Result<String> {
-    eprint!("{}", prompt);
+    crate::render::write_stderr(prompt);
     // The prompt went to stderr, so that is what has to be flushed; flushing stdout left the
     // prompt sitting in stderr's buffer and the user staring at a blank line.
     io::stderr().flush()?;
@@ -1568,9 +1569,9 @@ fn backend_menu() -> [(&'static str, &'static str); 5] {
 
 fn prompt_backend() -> anyhow::Result<String> {
     let options = backend_menu();
-    eprintln!("Select a provider type:");
+    crate::render::write_stderr_line("Select a provider type:");
     for (index, (id, label)) in options.iter().enumerate() {
-        eprintln!("  {}. {} ({})", index + 1, id, label);
+        crate::render::write_stderr_line(format!("  {}. {} ({})", index + 1, id, label));
     }
     loop {
         let input = prompt_line("> ")?;
@@ -1579,7 +1580,10 @@ fn prompt_backend() -> anyhow::Result<String> {
         {
             return Ok(options[choice - 1].0.to_string());
         }
-        eprintln!("Please enter a number between 1 and {}.", options.len());
+        crate::render::write_stderr_line(format!(
+            "Please enter a number between 1 and {}.",
+            options.len()
+        ));
     }
 }
 
@@ -1631,8 +1635,8 @@ async fn claude_login(
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser: {}", error);
     }
-    eprintln!("\nTo authorize, open this URL in your browser:");
-    eprintln!("    {}\n", url);
+    crate::render::write_stderr_line("\nTo authorize, open this URL in your browser:");
+    crate::render::write_stderr_line(format!("    {}\n", url));
 
     let code_input = prompt_line("After authorizing, paste the authorization code here:\n> ")?;
     if code_input.is_empty() {
@@ -1753,18 +1757,18 @@ async fn codex_login(
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser for Codex login: {}", error);
     }
-    eprintln!("\nTo authorize, open this URL in your browser:");
-    eprintln!("    {}\n", url);
+    crate::render::write_stderr_line("\nTo authorize, open this URL in your browser:");
+    crate::render::write_stderr_line(format!("    {}\n", url));
     if listener.is_some() {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "Waiting up to {}s for the callback on 127.0.0.1:{}...",
             CODEX_CALLBACK_TIMEOUT.as_secs(),
             CODEX_REDIRECT_PORT
-        );
+        ));
     }
     if paste_enabled {
-        eprintln!(
-            "If your browser is on another machine, paste the full callback URL here and press Enter."
+        crate::render::write_stderr_line(
+            "If your browser is on another machine, paste the full callback URL here and press Enter.",
         );
     }
 
@@ -1815,9 +1819,10 @@ async fn read_pasted_codex_callback() -> anyhow::Result<(String, String)> {
                         anyhow::bail!("authorization server returned error: {}", message)
                     }
                     CodexCallback::NotCallback | CodexCallback::Malformed(_) => {
-                        eprintln!(
+                        crate::render::write_stderr_line(
                             "Could not find 'code' and 'state' in that input; paste the full \
                              callback URL and press Enter."
+                                .to_string(),
                         );
                         continue;
                     }
@@ -2190,18 +2195,21 @@ pub async fn run_account_subcommand(
         crate::cli::AccountAction::Usage { .. } => match provider.fetch_usage().await? {
             Some(usage) => match format {
                 crate::cli::OutputFormat::Plain => {
-                    print!("{}", crate::render::format_account_usage(&usage));
+                    crate::render::write_stdout(crate::render::format_account_usage(&usage))?;
                 }
                 crate::cli::OutputFormat::Json => {
                     let out = UsageOutput {
                         provider: &name,
                         usage: &usage,
                     };
-                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)?;
                 }
             },
             None => {
-                eprintln!("Account usage isn't available for provider '{}'.", name);
+                crate::render::write_stderr_line(format!(
+                    "Account usage isn't available for provider '{}'.",
+                    name
+                ));
                 std::process::exit(1);
             }
         },
@@ -2231,15 +2239,22 @@ pub async fn run_account_subcommand(
                 auth,
                 identity,
             };
-            match format {
-                crate::cli::OutputFormat::Plain => print!("{}", format_whoami_plain(&out)),
-                crate::cli::OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&out)?)
+            let written = match format {
+                crate::cli::OutputFormat::Plain => {
+                    crate::render::write_stdout(format_whoami_plain(&out))
                 }
-            }
+                crate::cli::OutputFormat::Json => {
+                    crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)
+                }
+            };
+            // Checked before the write is, because on this one command the status *is* the answer:
+            // a script reads it to decide whether to re-authenticate. Propagating a failed write
+            // first would hand back the code for "stdout went away", and a reader that hung up
+            // turns that into success, which says the credential is fine when it is not.
             if !out.auth.valid {
                 std::process::exit(1);
             }
+            written?;
         }
         crate::cli::AccountAction::Stats { .. } => match provider.fetch_history().await? {
             Some(history) => {
@@ -2248,14 +2263,19 @@ pub async fn run_account_subcommand(
                     history: &history,
                 };
                 match format {
-                    crate::cli::OutputFormat::Plain => print!("{}", format_stats_plain(&out)),
+                    crate::cli::OutputFormat::Plain => {
+                        crate::render::write_stdout(format_stats_plain(&out))?
+                    }
                     crate::cli::OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&out)?)
+                        crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)?
                     }
                 }
             }
             None => {
-                eprintln!("Account history isn't available for provider '{}'.", name);
+                crate::render::write_stderr_line(format!(
+                    "Account history isn't available for provider '{}'.",
+                    name
+                ));
                 std::process::exit(1);
             }
         },

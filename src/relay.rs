@@ -176,10 +176,12 @@ impl RelayWriter {
     /// visible, so losing it lost the only evidence the turn was struggling.
     ///
     /// **`try_lock`, never `lock`.** [`Console`] logs: `text_delta`, `close_text` and the stdout
-    /// flush all emit `tracing::debug!` on failure, so a thread already inside a console method can
-    /// re-enter here, and a blocking acquire on a non-reentrant `Mutex` would deadlock the REPL --
-    /// a far worse outcome than the cosmetic bug being fixed. Failing to acquire falls through to
-    /// exactly the raw-stderr write this has always done.
+    /// flush all report through `render::report_lost_output` on failure, so a thread already inside
+    /// a console method can re-enter here, and a blocking acquire on a non-reentrant `Mutex` would
+    /// deadlock the REPL -- a far worse outcome than the cosmetic bug being fixed. Failing to
+    /// acquire falls through to exactly the raw-stderr write this has always done. That report is
+    /// `warn!` for anything but a reader hanging up, so the re-entrant path runs at the default
+    /// verbosity rather than only under `-vv`, where a `debug!` never reached this writer at all.
     ///
     /// A *poisoned* mutex is recovered rather than treated as contention, which is what
     /// `with_console` in both hosts already does. `TryLockError` folds the two together, so reading
@@ -211,7 +213,7 @@ impl RelayWriter {
 mod tests {
     use super::*;
     use crate::{
-        console::{Console, RowState, Spacing},
+        console::{Console, Neighbour, RowState, Spacing},
         render::RenderMode,
     };
 
@@ -245,7 +247,7 @@ mod tests {
         console
             .lock()
             .expect("console")
-            .open_episode(RowState::Empty);
+            .open_episode(RowState::Empty, Neighbour::Prompt);
         console
             .lock()
             .expect("console")
@@ -271,10 +273,11 @@ mod tests {
 
     /// A console already locked by this thread is written past, not deadlocked on.
     ///
-    /// `Console::text_delta`, `close_text` and the stdout flush all emit `tracing::debug!` when
-    /// their renderer fails, so a thread inside a console method reaches this writer while holding
-    /// the very lock it wants. A blocking acquire would hang the REPL for good; the fallback is the
-    /// raw stderr write that was the only behaviour before this existed.
+    /// `Console::text_delta`, `close_text` and the stdout flush all report through
+    /// `render::report_lost_output` when their renderer fails, so a thread inside a console
+    /// method reaches this writer while holding the very lock it wants. A blocking acquire
+    /// would hang the REPL for good; the fallback is the raw stderr write that was the only
+    /// behaviour before this existed.
     ///
     /// The guard is held across the write, which is exactly the reentrant shape, and the test
     /// completing at all is the assertion.
@@ -286,7 +289,7 @@ mod tests {
         relay.set_at_prompt(false);
 
         let mut held = console.lock().expect("console");
-        held.open_episode(RowState::Empty);
+        held.open_episode(RowState::Empty, Neighbour::Prompt);
 
         relay
             .make_writer()

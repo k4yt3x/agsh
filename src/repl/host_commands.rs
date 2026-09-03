@@ -77,7 +77,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
             Some(id) => with_console(console, |console| {
                 console.session_id("Current session", &id.to_string())
             }),
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::Compact(instructions) => {
             let request = crate::agent::CompactRequest {
@@ -138,13 +138,15 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     });
                 }
                 (_, None) if turns == 0 => {
-                    eprintln!("Nothing to rewind: /rewind takes a turn count of 1 or more.");
+                    crate::render::write_stderr_line(
+                        "Nothing to rewind: /rewind takes a turn count of 1 or more.",
+                    );
                 }
                 (_, None) => {
-                    eprintln!(
+                    crate::render::write_stderr_line(format!(
                         "Nothing to rewind: the conversation has fewer than {} turn(s).",
                         turns
-                    );
+                    ));
                 }
             }
         }
@@ -169,13 +171,16 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                         let shown = std::env::current_dir()
                             .map(|dir| dir.join(&path))
                             .unwrap_or(path);
-                        eprintln!("Exported session to {}", shown.display());
+                        crate::render::write_stderr_line(format!(
+                            "Exported session to {}",
+                            shown.display()
+                        ));
                     }
                     Ok(None) => {}
                     Err(error) => with_console(console, |console| console.error(&error)),
                 }
             }
-            None => eprintln!("No active session to export."),
+            None => crate::render::write_stderr_line("No active session to export."),
         },
         SlashCommand::Fork => match session_id {
             Some(id) => match crate::session::cli::fork_and_lock(session_manager, id).await {
@@ -198,11 +203,13 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     });
                 }
                 Ok(crate::session::cli::ForkHandoff::SourceGone) => {
-                    eprintln!("Session no longer exists: {}", id);
+                    crate::render::write_stderr_line(format!("Session no longer exists: {}", id));
                 }
-                Err(error) => eprintln!("Failed to fork session: {}", error),
+                Err(error) => {
+                    crate::render::write_stderr_line(format!("Failed to fork session: {}", error))
+                }
             },
-            None => eprintln!("No active session to fork."),
+            None => crate::render::write_stderr_line("No active session to fork."),
         },
         SlashCommand::McpList => {
             if let Err(error) = mcp::cli::run_list(
@@ -225,19 +232,22 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
             match mcp::cli::run_reconnect(&config.mcp_servers, token_store, &server).await {
                 // "Connected", not "Reconnected": this is a smoke test on a throwaway
                 // client, and the session's own connection to that server is untouched.
-                Ok(()) => eprintln!("Connected to '{}'.", server),
+                Ok(()) => crate::render::write_stderr_line(format!("Connected to '{}'.", server)),
                 Err(error) => with_console(console, |console| console.error(&error)),
             }
         }
         SlashCommand::McpLogin { server } => {
             match mcp::cli::run_login(&config.mcp_servers, token_store, &server).await {
-                Ok(()) => eprintln!("Authorized '{}'.", server),
+                Ok(()) => crate::render::write_stderr_line(format!("Authorized '{}'.", server)),
                 Err(error) => with_console(console, |console| console.error(&error)),
             }
         }
         SlashCommand::McpLogout { server } => {
             match mcp::cli::run_logout(&config.mcp_servers, token_store, &server).await {
-                Ok(()) => eprintln!("Cleared credentials for '{}'.", server),
+                Ok(()) => crate::render::write_stderr_line(format!(
+                    "Cleared credentials for '{}'.",
+                    server
+                )),
                 Err(error) => with_console(console, |console| console.error(&error)),
             }
         }
@@ -247,7 +257,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
             args,
         } => 'prompt: {
             let Some(manager) = mcp_manager.as_ref() else {
-                eprintln!("No MCP servers configured.");
+                crate::render::write_stderr_line("No MCP servers configured.");
                 break 'prompt;
             };
             let entry = manager.server_entry(&server);
@@ -256,11 +266,11 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                 // loop, skipping the `AgentToReplEvent::Done` send below and
                 // leaving the REPL thread parked in `wait_for_agent` with no
                 // prompt, for good. Same reason as `SkillInvoke`'s `'invoke`.
-                eprintln!(
+                crate::render::write_stderr_line(format!(
                     "Unknown MCP server '{}' (configured: {}).",
                     server,
                     manager.server_names().join(", ")
-                );
+                ));
                 break 'prompt;
             };
             // Map positional args to declared prompt argument names (lookup via
@@ -321,10 +331,10 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                         // prompt renders to nothing would otherwise return the user
                         // straight to a fresh prompt, which reads as "the command
                         // did nothing" rather than "the prompt was empty".
-                        eprintln!(
+                        crate::render::write_stderr_line(format!(
                             "'{}:{}' rendered an empty prompt; nothing to send.",
                             server, prompt_name
-                        );
+                        ));
                     } else {
                         match crate::run_turn_interruptible(
                             agent,
@@ -378,7 +388,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     with_console(console, |console| console.error(&error));
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         // Scoped to the session in the REPL, unlike `meka schedule list`, which has no
         // conversation to be "this one" and so shows every session's jobs.
@@ -394,7 +404,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     with_console(console, |console| console.error(&error));
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::ScheduleCancel { id } => match session_id {
             Some(session) => {
@@ -404,15 +414,21 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     .await
                 {
                     Ok(Some(cancelled)) => {
-                        eprintln!("Cancelled job {}.", &cancelled[..8.min(cancelled.len())]);
+                        crate::render::write_stderr_line(format!(
+                            "Cancelled job {}.",
+                            &cancelled[..8.min(cancelled.len())]
+                        ));
                     }
                     Ok(None) => {
-                        eprintln!("No scheduled job matching '{}'.", id);
+                        crate::render::write_stderr_line(format!(
+                            "No scheduled job matching '{}'.",
+                            id
+                        ));
                     }
                     Err(error) => with_console(console, |console| console.error(&error)),
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::TaskList => match session_id {
             Some(id) => {
@@ -422,7 +438,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     with_console(console, |console| console.error(&error));
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::TaskShow { id } => match session_id {
             Some(session) => {
@@ -432,7 +448,7 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                     with_console(console, |console| console.error(&error));
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::TaskCancel { id } => match session_id {
             Some(session) => {
@@ -442,18 +458,21 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
                 match crate::background::cli::cancel(session_manager, session, id.as_deref()).await
                 {
                     Ok(cancelled) if cancelled.is_empty() => {
-                        eprintln!("No running background tasks.")
+                        crate::render::write_stderr_line("No running background tasks.")
                     }
                     Ok(cancelled) => {
                         for task_id in &cancelled {
                             agent.background_tasks().cancel(task_id).await;
                         }
-                        eprintln!("Cancelling {} background task(s).", cancelled.len());
+                        crate::render::write_stderr_line(format!(
+                            "Cancelling {} background task(s).",
+                            cancelled.len()
+                        ));
                     }
                     Err(error) => with_console(console, |console| console.error(&error)),
                 }
             }
-            None => eprintln!("No active session yet."),
+            None => crate::render::write_stderr_line("No active session yet."),
         },
         SlashCommand::SkillList => {
             if let Err(error) = skills::cli::run_list(&config.skill_roots(), false).await {
@@ -580,9 +599,9 @@ pub(crate) async fn answer(command: SlashCommand, ctx: HostCommandContext<'_>) -
             // conversation, it just wasn't what was asked for.
             if !render::render_message_history(slice, &crate::history_render_options(config)) {
                 if materialised.is_empty() {
-                    eprintln!("No conversation history yet.");
+                    crate::render::write_stderr_line("No conversation history yet.");
                 } else {
-                    eprintln!("Nothing to show.");
+                    crate::render::write_stderr_line("Nothing to show.");
                 }
             }
         }

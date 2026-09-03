@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- No meka command panics when the reader stops reading; `meka … | head` exits cleanly throughout.
+- A stdout that cannot take the output fails the command; a reader that hung up does not.
+- meka no longer prints a blank line against your shell prompt, above its first line or below its last.
+- `Leaving session:` and the background-task notice below it are no longer split by a blank line.
 - `task.finished` fires when a task ends, so an interrupted one is announced even if never reported.
 - An empty id prefix matches nothing, instead of cancelling the only job or task in the session.
 - An uppercase id prefix resolves a job or task, as it already resolved a session.

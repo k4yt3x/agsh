@@ -45,6 +45,22 @@ pub enum RowState {
     PromptParked,
 }
 
+/// Which prompt an episode borders, on the side in question.
+///
+/// The two `[display]` blanks space an episode away from *meka's* prompt. The first episode of a
+/// run has the shell's prompt above it and the last has it below, and a shell lays out its own
+/// prompt: a blank spent against one is a blank meka adds to somebody else's terminal, above
+/// `Continuing session:` on the way in and below `Leaving session:` on the way out.
+///
+/// Like [`Spacing`], and for the same reason, this gates *printing* and nothing else. Declining to
+/// arm the opening blank looks equivalent and is not: `printed` is set when that blank is spent,
+/// and it is what the closing bracket answers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Neighbour {
+    Prompt,
+    Shell,
+}
+
 /// The `[display]` blank-line settings.
 ///
 /// They gate *printing* and nothing else. Every state transition below runs identically with them
@@ -76,8 +92,8 @@ pub enum BlockKind {
 /// without a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    OpenEpisode(RowState),
-    CloseEpisode,
+    OpenEpisode(RowState, Neighbour),
+    CloseEpisode(Neighbour),
     /// Output that `Console` cannot see is about to print: a slash command answering through one of
     /// the `cli` modules, or a child process meka handed the terminal to.
     AnnounceForeign,
@@ -130,6 +146,9 @@ pub struct State {
     /// Whether the `newline_after_prompt` blank is still owed. Armed by `OpenEpisode`, spent by
     /// the first thing that prints.
     pending_after_blank: bool,
+    /// Which prompt this episode opened against, carried because the blank above it is armed at
+    /// the open and spent later, by whatever turns out to print first.
+    opened_against: Neighbour,
     /// Whether this episode has printed anything. Set when the opening blank is spent, *whether or
     /// not the flag let it print*, so it means "something happened" rather than "a blank was
     /// written".
@@ -142,6 +161,8 @@ impl State {
             row: RowState::Empty,
             spacing: OutputSpacing::new(),
             pending_after_blank: false,
+            // Never read before an `OpenEpisode` sets it: nothing is owed until an episode arms it.
+            opened_against: Neighbour::Shell,
             printed: false,
         }
     }
@@ -161,9 +182,10 @@ impl State {
 pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
     let mut next = state;
     match action {
-        Action::OpenEpisode(row) => {
+        Action::OpenEpisode(row, follows) => {
             next.row = row;
             next.pending_after_blank = true;
+            next.opened_against = follows;
             next.printed = false;
             // Unconditional, and the fix for a bug that survived because it looked like a tidy
             // guard: this records "a prompt is what came last", which is true whether or not a
@@ -172,15 +194,18 @@ pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
             next.spacing.after_prompt();
             (Emit::NOTHING, next)
         }
-        Action::CloseEpisode => {
-            let settle = match (state.row, state.printed) {
-                (RowState::Empty, _) => Settle::Nothing,
+        Action::CloseEpisode(precedes) => {
+            let settle = match state.row {
+                RowState::Empty => Settle::Nothing,
                 // A leftover status line is not content and must not survive into the prompt.
-                (RowState::Transient, _) => Settle::Erase,
-                // Nothing printed, so the screen has to look exactly as it did: erasing the stale
-                // prompt lets reedline repaint on this row instead of choosing the one below.
-                (RowState::PromptParked, false) => Settle::Erase,
-                (RowState::PromptParked, true) => Settle::Terminate,
+                RowState::Transient => Settle::Erase,
+                // A parked prompt still here means the episode printed nothing, because whatever
+                // prints settles the row first. So the screen has to look exactly as it did, and
+                // erasing lets reedline repaint on this row instead of choosing the one below.
+                // Asking `printed` too, and terminating where it is set, reads like the guarantee
+                // that a wake keeping its prompt rests on. It is not: `open_output` terminates
+                // that row, before this can run.
+                RowState::PromptParked => Settle::Erase,
             };
             next.row = RowState::Empty;
             next.pending_after_blank = false;
@@ -191,7 +216,9 @@ pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
             (
                 Emit {
                     settle,
-                    before_prompt_blank: state.printed && spacing.newline_before_prompt,
+                    before_prompt_blank: state.printed
+                        && precedes == Neighbour::Prompt
+                        && spacing.newline_before_prompt,
                     ..Emit::NOTHING
                 },
                 next,
@@ -297,7 +324,7 @@ fn spend_pending(next: &mut State, spacing: Spacing) -> bool {
     }
     next.pending_after_blank = false;
     next.printed = true;
-    spacing.newline_after_prompt
+    next.opened_against == Neighbour::Prompt && spacing.newline_after_prompt
 }
 
 /// The single writer for everything that appears between two prompts.
@@ -313,6 +340,12 @@ pub struct Console {
     /// shows what it streamed, in its own episode, instead of having it flushed under the next
     /// prompt.
     renderer: Option<StreamingRenderer>,
+    /// The first write failure stdout reported.
+    ///
+    /// Kept rather than discarded because a host that scripts its output has to be able to fail
+    /// on it, which is what [`Self::take_lost_output`] is for. Saying so is
+    /// [`render::report_lost_output`]'s job, and it says it once per process.
+    lost_output: Option<std::io::Error>,
 }
 
 impl Console {
@@ -322,7 +355,24 @@ impl Console {
             spacing,
             render_mode,
             renderer: None,
+            lost_output: None,
         }
+    }
+
+    /// Name a write that did not reach stdout, and keep it for the caller.
+    fn lost_output(&mut self, what: &str, error: std::io::Error) {
+        render::report_lost_output(what, &error);
+        // A reader that hung up chose to stop reading, so it is not a failure of the run. Anything
+        // else lost the answer to something nobody chose, and a host that is being scripted has to
+        // be able to say so in its exit code.
+        if error.kind() != std::io::ErrorKind::BrokenPipe && self.lost_output.is_none() {
+            self.lost_output = Some(error);
+        }
+    }
+
+    /// Take the failure that cost this run its output, if one did.
+    pub fn take_lost_output(&mut self) -> Option<std::io::Error> {
+        self.lost_output.take()
     }
 
     fn act(&mut self, action: Action) {
@@ -330,29 +380,33 @@ impl Console {
         self.state = next;
         match emit.settle {
             Settle::Nothing => {}
-            Settle::Terminate => eprintln!(),
+            Settle::Terminate => render::write_stderr_line(""),
             Settle::Erase => render::begin_own_line(),
         }
         if emit.after_prompt_blank {
-            eprintln!();
+            render::write_stderr_line("");
         }
         if emit.separator_blank {
-            eprintln!();
+            render::write_stderr_line("");
         }
         if emit.before_prompt_blank {
-            eprintln!();
+            render::write_stderr_line("");
         }
     }
 
-    /// Begin the episode that follows a prompt, given what reedline left on the row.
-    pub fn open_episode(&mut self, row: RowState) {
-        self.act(Action::OpenEpisode(row));
+    /// Begin an episode, given what reedline left on the row and which prompt is above it.
+    pub fn open_episode(&mut self, row: RowState, follows: Neighbour) {
+        // A new episode is a new chance to say that output is not arriving. Once per process is
+        // right for a one-shot run and wrong for a shell someone leaves open all day, where the
+        // first lost answer would otherwise be the only one mentioned.
+        render::reset_lost_output_report();
+        self.act(Action::OpenEpisode(row, follows));
     }
 
-    /// End the episode, immediately before the next prompt is drawn.
-    pub fn close_episode(&mut self) {
+    /// End the episode, immediately before the prompt below it is drawn.
+    pub fn close_episode(&mut self, precedes: Neighbour) {
         self.close_text();
-        self.act(Action::CloseEpisode);
+        self.act(Action::CloseEpisode(precedes));
     }
 
     /// Declare that output this console cannot see is about to print.
@@ -404,7 +458,7 @@ impl Console {
     pub fn line(&mut self, line: &str) {
         self.close_text();
         self.act(Action::Block(BlockKind::Chrome));
-        eprintln!("{}", line);
+        render::write_stderr_line(line);
     }
 
     /// Print through a closure, for the callers whose painter takes arguments this module has no
@@ -453,10 +507,15 @@ impl Console {
 
     /// Draw an in-place status line, returning whether anything reached the terminal.
     ///
-    /// `draw` returns false off a tty, where redrawing in place would instead accumulate one line
-    /// per update. Nothing is spent in that case: an indicator that cannot be drawn must not take
-    /// the episode's opening blank or move the row, or it shifts the layout of the output that
-    /// *is* produced.
+    /// Off a tty this returns before the action, where redrawing in place would instead accumulate
+    /// one line per update. Nothing is spent: an indicator that cannot be drawn must not take the
+    /// episode's opening blank or move the row, or it shifts the layout of the output that *is*
+    /// produced.
+    ///
+    /// A `draw` that answers false *past* that gate has already spent whatever opening blank this
+    /// episode owed, so only the row is restored: the line may be partly on screen. No caller does
+    /// today -- both write through helpers that accept a failed write -- but the contract is the
+    /// one a fallible drawer would need.
     pub fn transient(&mut self, draw: impl FnOnce() -> bool) -> bool {
         if !render::live_indicator_supported() {
             return false;
@@ -542,10 +601,12 @@ impl Console {
             self.act(Action::Block(BlockKind::Text));
             self.renderer = Some(StreamingRenderer::new(self.render_mode));
         }
-        if let Some(renderer) = self.renderer.as_mut()
-            && let Err(error) = renderer.push_delta(text)
-        {
-            tracing::debug!("console renderer push_delta failed: {}", error);
+        let failure = self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| renderer.push_delta(text).err());
+        if let Some(error) = failure {
+            self.lost_output("an answer did not reach stdout", error);
         }
     }
 
@@ -554,17 +615,16 @@ impl Console {
         let Some(mut renderer) = self.renderer.take() else {
             return;
         };
-        // A broken stderr pipe, typically. Log and move on rather than panicking inside a render
-        // path.
         if let Err(error) = renderer.finish() {
-            tracing::debug!("console renderer finish failed: {}", error);
+            self.lost_output("an answer did not reach stdout", error);
         }
-        // The assistant's text goes to stdout while every blank line here goes to stderr, and
-        // `finish` does not flush the termimad path. Without this a final paragraph that did not
-        // end in a newline would sit in the line buffer while the closing blank and the next prompt
-        // were already on screen.
+        // Redundant on every path `finish` completes, which ends in a flush of its own, and kept
+        // for the one it does not: a write that failed part-way leaves `finish` returning early
+        // through `?`, and the assistant's text goes to stdout while the closing blank and the next
+        // prompt go to stderr, so a paragraph left in the line buffer would surface underneath
+        // them.
         if let Err(error) = std::io::stdout().flush() {
-            tracing::debug!("console stdout flush failed: {}", error);
+            self.lost_output("an answer did not reach stdout", error);
         }
     }
 }
@@ -617,9 +677,9 @@ mod tests {
     /// variation on.
     fn plain_turn() -> Vec<Action> {
         vec![
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]
     }
 
@@ -652,6 +712,38 @@ mod tests {
         assert!(!after[2].before_prompt_blank);
     }
 
+    /// The run's outer edges border the shell's prompt, and a shell lays out its own. Both blanks
+    /// were spent against it anyway: one above `Continuing session:` on the way in, and one below
+    /// `Leaving session:` on the way out, where meka draws nothing further.
+    #[test]
+    fn the_shell_s_prompt_gets_neither_bracket() {
+        let first = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbour::Shell),
+            Action::Block(BlockKind::Chrome),
+            Action::CloseEpisode(Neighbour::Prompt),
+        ]);
+        assert!(
+            !first[1].after_prompt_blank,
+            "the resume banner has no typed line above it to be spaced from",
+        );
+        assert!(
+            first[2].before_prompt_blank,
+            "and the first prompt is bracketed like every later one: the banner still records \
+             that the episode printed, it just prints no blank above itself",
+        );
+
+        let last = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::Block(BlockKind::Chrome),
+            Action::CloseEpisode(Neighbour::Shell),
+        ]);
+        assert!(
+            last[1].after_prompt_blank,
+            "the line the user typed is spaced from what it produced, as always",
+        );
+        assert!(!last[2].before_prompt_blank);
+    }
+
     /// The regression that made `newline_after_prompt = false` do nothing from the second turn on:
     /// the block machine stopped being reset when the blank was not printed, so the next episode's
     /// first tool indicator saw the previous episode's text and asked for a separator.
@@ -659,12 +751,12 @@ mod tests {
     fn a_disabled_opening_blank_still_resets_the_block_machine() {
         for spacing in [NEITHER, BEFORE_ONLY] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty),
+                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
                 Action::Block(BlockKind::Text),
-                Action::CloseEpisode,
-                Action::OpenEpisode(RowState::Empty),
+                Action::CloseEpisode(Neighbour::Prompt),
+                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode,
+                Action::CloseEpisode(Neighbour::Prompt),
             ]);
             assert!(
                 !emits[4].separator_blank,
@@ -680,26 +772,26 @@ mod tests {
     #[test]
     fn every_episode_is_bracketed_the_same_however_it_answered() {
         let error_only = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(total_blanks(&error_only), 2);
 
         let foreign = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::AnnounceForeign,
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(total_blanks(&foreign), 2);
 
         // Two turns fired by one wake. The gap between them is the blocks' own separator, not a
         // second pair of prompt brackets.
         let two_turns = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked),
+            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert!(two_turns[1].after_prompt_blank);
         assert!(two_turns[3].before_prompt_blank);
@@ -713,8 +805,8 @@ mod tests {
     fn an_episode_that_prints_nothing_leaves_no_trace() {
         for spacing in [BOTH, NEITHER] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::PromptParked),
-                Action::CloseEpisode,
+                Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
+                Action::CloseEpisode(Neighbour::Prompt),
             ]);
             assert_eq!(total_blanks(&emits), 0);
             assert_eq!(
@@ -730,9 +822,9 @@ mod tests {
     #[test]
     fn a_wake_that_runs_something_keeps_the_prompt_it_broke_out_of() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked),
+            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(emits[1].settle, Settle::Terminate);
         assert_eq!(emits[2].settle, Settle::Nothing);
@@ -744,10 +836,10 @@ mod tests {
     #[test]
     fn a_transient_row_is_erased_by_whatever_prints_next() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::OpenTransient,
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(emits[2].settle, Settle::Erase);
         assert!(
@@ -758,10 +850,10 @@ mod tests {
         // Left drawn at the end of an episode it is still not content, so it must not survive into
         // the prompt.
         let leftover = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
             Action::OpenTransient,
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(leftover[3].settle, Settle::Erase);
     }
@@ -771,14 +863,36 @@ mod tests {
     #[test]
     fn closing_an_episode_twice_closes_it_once() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert!(emits[2].before_prompt_blank);
         assert!(!emits[3].before_prompt_blank);
         assert_eq!(emits[3].settle, Settle::Nothing);
+
+        // The shape the sentence above actually names, which closing twice back-to-back does not
+        // reach: the shutdown path closes, says one more thing, and closes again. The parting word
+        // belongs to no episode, so it takes neither bracket.
+        //
+        // The episode prints nothing before closing, which is what leaves its opening blank still
+        // armed. With a block in there the blank is already spent and the first assertion holds
+        // whatever `CloseEpisode` does with it.
+        let parting_word = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::CloseEpisode(Neighbour::Prompt),
+            Action::Block(BlockKind::Chrome),
+            Action::CloseEpisode(Neighbour::Prompt),
+        ]);
+        assert!(
+            !parting_word[2].after_prompt_blank,
+            "a closed episode owes no opening blank to what prints after it",
+        );
+        assert!(
+            !parting_word[3].before_prompt_blank,
+            "and cannot be bracketed a second time by it",
+        );
     }
 
     /// Output the console cannot see still has to start on a row of its own. Enforced here rather
@@ -788,7 +902,7 @@ mod tests {
     #[test]
     fn foreign_output_settles_the_row_it_lands_on() {
         let after_wake = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked),
+            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
             Action::AnnounceForeign,
         ]);
         assert_eq!(
@@ -798,7 +912,7 @@ mod tests {
         );
 
         let after_status_line = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::OpenTransient,
             Action::AnnounceForeign,
         ]);
@@ -814,9 +928,9 @@ mod tests {
     #[test]
     fn a_transient_line_moves_past_a_parked_prompt_rather_than_over_it() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked),
+            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
             Action::OpenTransient,
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert_eq!(emits[1].settle, Settle::Terminate);
         assert!(
@@ -833,14 +947,14 @@ mod tests {
     #[test]
     fn committing_a_transient_line_keeps_it_and_erasing_it_does_not() {
         let committed = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::OpenTransient,
             Action::CommitTransient,
         ]);
         assert_eq!(committed[2].settle, Settle::Terminate);
 
         let erased = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::OpenTransient,
             Action::EraseTransient,
         ]);
@@ -849,7 +963,7 @@ mod tests {
         // Neither writes anything when no indicator is drawn, which is what lets the frontend call
         // them from a dispatch that cannot know.
         let absent = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::CommitTransient,
             Action::EraseTransient,
         ]);
@@ -862,10 +976,10 @@ mod tests {
     #[test]
     fn the_opening_blank_precedes_whatever_prints_first() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Chrome),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert!(emits[1].after_prompt_blank);
         assert!(!emits[2].after_prompt_blank);
@@ -877,20 +991,20 @@ mod tests {
     fn block_separators_do_not_follow_the_prompt_flags() {
         for spacing in [BOTH, NEITHER, BEFORE_ONLY, AFTER_ONLY] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty),
+                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
                 Action::Block(BlockKind::Text),
-                Action::CloseEpisode,
+                Action::CloseEpisode(Neighbour::Prompt),
             ]);
             assert!(
                 emits[2].separator_blank,
                 "text after a tool indicator is always separated from it",
             );
             let adjacent = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty),
+                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode,
+                Action::CloseEpisode(Neighbour::Prompt),
             ]);
             assert!(
                 !adjacent[2].separator_blank,
@@ -904,11 +1018,11 @@ mod tests {
     #[test]
     fn a_todo_list_brings_its_own_separation() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
             Action::Block(BlockKind::TodoList),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode,
+            Action::CloseEpisode(Neighbour::Prompt),
         ]);
         assert!(!emits[2].separator_blank);
         assert!(!emits[3].separator_blank);
@@ -920,7 +1034,7 @@ mod tests {
     fn output_is_recorded_even_when_no_blank_is_printed() {
         let mut state = State::new();
         for action in [
-            Action::OpenEpisode(RowState::Empty),
+            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
             Action::Block(BlockKind::Text),
         ] {
             let (_, next) = step(state, NEITHER, action);

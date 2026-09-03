@@ -43,7 +43,7 @@ pub enum ListDetail {
 pub async fn run_list(store: &MemoryStore, detail: ListDetail) -> Result<()> {
     let index = store.index().await?;
     if index.is_empty() {
-        eprintln!("No memories saved.");
+        crate::render::write_stderr_line("No memories saved.");
         return Ok(());
     }
 
@@ -64,24 +64,24 @@ pub async fn run_list(store: &MemoryStore, detail: ListDetail) -> Result<()> {
         })
         .collect();
 
-    print!(
-        "{}",
-        crate::render::format_columns(
-            &["Name", "Priority", "Recorded", "Tags", "Description"],
-            &rows
-        )
-    );
+    crate::render::write_stdout(crate::render::format_columns(
+        &["Name", "Priority", "Recorded", "Tags", "Description"],
+        &rows,
+    ))?;
 
     if detail == ListDetail::WithDistribution {
-        println!();
-        println!("{} memories. Priority distribution:", index.len());
+        crate::render::write_stdout_line("")?;
+        crate::render::write_stdout_line(format!(
+            "{} memories. Priority distribution:",
+            index.len()
+        ))?;
         for priority in memory::MIN_PRIORITY..=memory::MAX_PRIORITY {
             let count = index
                 .iter()
                 .filter(|entry| entry.priority == priority)
                 .count();
             if count > 0 {
-                println!("  p{}: {}", priority, count);
+                crate::render::write_stdout_line(format!("  p{}: {}", priority, count))?;
             }
         }
     }
@@ -93,25 +93,31 @@ pub async fn run_list(store: &MemoryStore, detail: ListDetail) -> Result<()> {
 pub async fn run_get(store: &MemoryStore, name: &str) -> Result<()> {
     let entry = require_memory(store, name).await?;
     let now = std::time::SystemTime::now();
-    println!("name: {}", entry.name);
-    println!(
+    crate::render::write_stdout_line(format!("name: {}", entry.name))?;
+    crate::render::write_stdout_line(format!(
         "description: {}",
         memory::render_description_for_model(&entry.description)
-    );
-    println!("priority: {}", entry.priority);
+    ))?;
+    crate::render::write_stdout_line(format!("priority: {}", entry.priority))?;
     // Two dates, because they answer different questions. "recorded" is when the note was made and
     // is stamped once; "updated" is when the row last changed, which a priority nudge moves without
     // the note saying anything new.
-    println!("recorded: {}", memory::render_age(entry.recorded_at, now));
-    println!("updated: {}", memory::render_age(entry.updated_at, now));
-    println!("read count: {}", entry.read_count);
+    crate::render::write_stdout_line(format!(
+        "recorded: {}",
+        memory::render_age(entry.recorded_at, now)
+    ))?;
+    crate::render::write_stdout_line(format!(
+        "updated: {}",
+        memory::render_age(entry.updated_at, now)
+    ))?;
+    crate::render::write_stdout_line(format!("read count: {}", entry.read_count))?;
     if !entry.tags.is_empty() {
-        println!("tags: {}", entry.tags.join(", "));
+        crate::render::write_stdout_line(format!("tags: {}", entry.tags.join(", ")))?;
     }
-    println!(
+    crate::render::write_stdout_line(format!(
         "body: {} bytes",
         entry.body.as_deref().unwrap_or_default().len()
-    );
+    ))?;
     Ok(())
 }
 
@@ -123,9 +129,9 @@ pub async fn run_get(store: &MemoryStore, name: &str) -> Result<()> {
 pub async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
     let entry = require_memory(store, name).await?;
     let body = memory::render_for_model(&entry.body.unwrap_or_default());
-    print!("{}", body);
+    crate::render::write_stdout(&body)?;
     if !body.ends_with('\n') {
-        println!();
+        crate::render::write_stdout_line("")?;
     }
     Ok(())
 }
@@ -457,7 +463,7 @@ pub async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
 pub async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
     let memories = store.export_all().await?;
     if memories.is_empty() {
-        eprintln!("No memories saved; nothing to export.");
+        crate::render::write_stderr_line("No memories saved; nothing to export.");
         return Ok(());
     }
 

@@ -130,6 +130,29 @@ fn main() -> anyhow::Result<()> {
     {
         std::process::exit(1);
     }
+
+    // A reader that stopped reading is not a failure of the command. `meka session export … | head`
+    // ends the moment `head` has its line, and every tool in a pipeline is entitled to do that, so
+    // the exit code says the command did what it was asked. Only for a *broken pipe*: every other
+    // way a write can fail lost data nobody chose to discard, and those keep their status. One arm
+    // here rather than a check per command, because there is a `print` in nearly every one of them.
+    //
+    // The whole chain, not the outermost error: a command returning `MekaError` hands back
+    // `Io(BrokenPipe)` wrapped in it, so asking only the type anyhow is holding never matches.
+    //
+    // And the payload, not the kind. `BrokenPipe` says a pipe broke, not *which*, and the one that
+    // earns a zero is the reader of the answer walking away. A `session export --output <fifo>`
+    // whose reader leaves raises the same kind from a destination the user named, and reporting
+    // success over data that never landed is worse than the crash this replaced.
+    if let Err(error) = &result
+        && error.chain().any(|link| {
+            link.downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.downcast_ref::<render::ReaderHungUp>().is_some())
+        })
+    {
+        return Ok(());
+    }
     result
 }
 
@@ -1104,11 +1127,11 @@ async fn create_agent_from_config(
 async fn report_background_survivors(agent: &Agent) {
     let running = agent.background_tasks().running_count_all().await;
     if running > 0 {
-        eprintln!(
+        render::write_stderr_line(format!(
             "{} background task(s) still running. Press Ctrl+C again during a turn to stop them, \
              or run /tasks cancel --all.",
             running
-        );
+        ));
     }
 }
 
@@ -1422,8 +1445,9 @@ async fn run_oneshot(
     // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
     relay::RELAY.install_console(&console);
     with_console(&console, |console| {
-        console.open_episode(console::RowState::Empty)
+        console.open_episode(console::RowState::Empty, console::Neighbour::Shell)
     });
+    let _last_episode = LastEpisode(Arc::clone(&console));
     let oneshot_frontend: Arc<dyn frontend::Frontend> =
         Arc::new(repl::ReplFrontend::new(repl::ReplFrontendConfig {
             console: Arc::clone(&console),
@@ -1586,8 +1610,8 @@ async fn run_oneshot(
             // the module's one-owner rule rather than a fix for a reachable glitch.
             with_console(&console, |console| {
                 console.chrome(|| {
-                    eprintln!();
-                    eprint!("{}", crate::background::render_outcomes(&outcomes));
+                    render::write_stderr_line("");
+                    render::write_stderr(crate::background::render_outcomes(&outcomes));
                 })
             });
         }
@@ -1610,6 +1634,16 @@ async fn run_oneshot(
 
     if let Some(manager) = mcp_manager {
         shutdown_mcp_manager(manager).await;
+    }
+
+    // A one-shot run is the host that gets scripted, and its answer is the whole point of invoking
+    // it. A stdout that would not take that answer has to reach the exit code, or `meka -p … >
+    // out.txt` against a full disk reports success over an empty file. A reader that hung up is
+    // excluded upstream: it stopped reading on purpose, and every tool in a pipeline is entitled to
+    // do that. Reported here rather than at the write, so the turn still finishes and the session
+    // still records what the model said.
+    if let Some(error) = with_console(&console, |console| console.take_lost_output()) {
+        return Err(anyhow::Error::new(error).context("the answer did not reach stdout"));
     }
 
     Ok(())
@@ -1640,7 +1674,8 @@ async fn run_interactive(
     //
     // Built before the session is resolved because the resume banner, the replayed history and any
     // prompt queued on the command line all belong to the episode that ends at the *first* prompt.
-    // Opening it here is what gives that episode the same brackets every later one gets.
+    // Opening it here is what gives that episode its closing bracket; it gets no opening one,
+    // because what sits above it is the shell's prompt rather than meka's.
     let console = Arc::new(std::sync::Mutex::new(console::Console::new(
         console::Spacing {
             newline_before_prompt: config.newline_before_prompt,
@@ -1653,8 +1688,9 @@ async fn run_interactive(
     // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
     relay::RELAY.install_console(&console);
     with_console(&console, |console| {
-        console.open_episode(console::RowState::Empty)
+        console.open_episode(console::RowState::Empty, console::Neighbour::Shell)
     });
+    let _last_episode = LastEpisode(Arc::clone(&console));
     let repl_console = Arc::clone(&console);
 
     let ResumedSession {
@@ -2368,7 +2404,9 @@ async fn run_interactive(
         });
     }
     // The last episode has no prompt after it, but closing it is still what settles the row and
-    // flushes anything a turn left open. Nothing else runs after this.
+    // flushes anything a turn left open. Not necessarily the end of output: the background-task
+    // notice below can still follow, and prints flush against this line, as two `Chrome` blocks
+    // always do.
     close_console_episode(&console);
     // Emptied after the "Leaving session" message so the lock is held until the very end; the OS
     // releases the underlying flock when the FD closes. Emptied rather than dropped: the slot is
@@ -2757,13 +2795,10 @@ async fn run_tools_subcommand(
                     ]
                 })
                 .collect();
-            print!(
-                "{}",
-                render::format_columns(
-                    &["Name", "Required", "Source", "Visibility", "Description"],
-                    &rows
-                )
-            );
+            render::write_stdout(render::format_columns(
+                &["Name", "Required", "Source", "Visibility", "Description"],
+                &rows,
+            ))?;
         }
     }
     Ok(())
@@ -2783,15 +2818,15 @@ fn run_instructions_subcommand(action: &cli::InstructionsAction) -> anyhow::Resu
                 Some(found) => {
                     // Source to stderr, text to stdout: the text is the data you asked for, so
                     // `2>/dev/null` leaves something pipeable.
-                    eprintln!("Source: {}", found.source);
-                    eprintln!();
-                    println!("{}", found.text);
+                    render::write_stderr_line(format!("Source: {}", found.source));
+                    render::write_stderr_line("");
+                    render::write_stdout_line(&found.text)?;
                 }
-                None => eprintln!(
+                None => render::write_stderr_line(format!(
                     "No instructions configured. Write them to {} (or split them across {}).",
                     display_path(instructions::instructions_file()),
                     display_path(instructions::instructions_dir()),
-                ),
+                )),
             }
         }
         cli::InstructionsAction::Path => {
@@ -2803,7 +2838,7 @@ fn run_instructions_subcommand(action: &cli::InstructionsAction) -> anyhow::Resu
             .flatten()
             {
                 let state = if path.exists() { "present" } else { "absent" };
-                println!("{}\t{}", path.display(), state);
+                render::write_stdout_line(format!("{}\t{}", path.display(), state))?;
             }
         }
     }
@@ -2911,10 +2946,10 @@ async fn run_history_subcommand(
         cli::HistoryAction::List { limit } => {
             let entries = history.recent(*limit as usize)?;
             if entries.is_empty() {
-                eprintln!("No input history.");
+                render::write_stderr_line("No input history.");
             } else {
                 for entry in entries {
-                    println!("{}", entry);
+                    render::write_stdout_line(&entry)?;
                 }
             }
         }
@@ -2939,16 +2974,18 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
         newline_before_prompt: config.newline_before_prompt,
         newline_after_prompt: config.newline_after_prompt,
         // `/history` is separated from the command line by the episode's own blank; only the resume
-        // path, where the banner spent that blank, asks for one, and it passes
-        // `newline_after_prompt` rather than `true` so tight spacing stays tight.
+        // path asks for one, because the episode it prints in opens against the shell's prompt and
+        // so has no blank of its own. It passes `newline_after_prompt` rather than `true` so tight
+        // spacing stays tight.
         leading_blank: false,
     }
 }
 
 /// `leading_blank` is emitted only once there is something to print under it, so a last message
 /// that renders to nothing (a tool-call-only turn) leaves the banner unbracketed rather than
-/// trailing a blank into the prompt. Callers pass `newline_after_prompt`: it is that separator,
-/// displaced below the `Continuing session:` banner that spent the original.
+/// trailing a blank into the prompt. Callers pass `newline_after_prompt`: on a resume the
+/// `Continuing session:` banner stands in for the line you typed, and this is the separator that
+/// would have followed one.
 fn reprint_last_message(
     messages: &[provider::Message],
     render_mode: render::RenderMode,
@@ -2977,14 +3014,14 @@ fn reprint_last_message(
     };
 
     if leading_blank {
-        eprintln!();
+        render::write_stderr_line("");
     }
     let mut renderer = render::StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(&text) {
-        tracing::debug!("failed to render last message delta: {}", error);
+        render::report_lost_output("a replayed message did not reach stdout", &error);
     }
     if let Err(error) = renderer.finish() {
-        tracing::debug!("failed to finish rendering last message: {}", error);
+        render::report_lost_output("a replayed message did not reach stdout", &error);
     }
     true
 }
@@ -3005,8 +3042,48 @@ fn with_console<T>(
         .unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
+/// Close an episode that no meka prompt follows.
+///
+/// Every caller is on the way out of the process: a one-shot turn that has finished or failed, and
+/// the REPL after its loop has broken. The prompt below is the shell's own, which the shell has
+/// already spaced, so this closes without the `newline_before_prompt` blank.
+///
+/// "No prompt below" rather than "no output below": a caller can still have a line to print after
+/// it -- the shutdown notice, an outcome a one-shot run waited for, a `warn!` the relay routes
+/// here. A closed episode arms nothing, so each prints flush against the line above. `repl` closes
+/// the episodes a meka prompt really does follow.
 fn close_console_episode(console: &std::sync::Mutex<console::Console>) {
-    with_console(console, |console| console.close_episode());
+    with_console(console, |console| {
+        console.close_episode(console::Neighbour::Shell)
+    });
+}
+
+/// Closes the run's last episode however its host leaves, on the failing paths as much as the
+/// ordinary one.
+///
+/// Exactly one of those paths has anything to close today: `repl_handle.await?`, which returns only
+/// on a `JoinError` and so means the REPL thread panicked, possibly mid-wake with the prompt it
+/// broke out of still drawn and a partial answer still buffered. Every other early exit either
+/// streams nothing or reports through `console.error`, which flushes and settles the row on its way
+/// past, leaving this nothing to do. So it is insurance against the next exit that streams before
+/// it fails, put where those paths converge rather than at each of them, because a close written at
+/// a door is a close the next `return Err` forgets.
+///
+/// Nothing proves it is installed. Delete either construction and the whole suite stays green,
+/// because reaching that one live path needs a REPL thread made to panic behind a terminal;
+/// `the_last_episode_closes_however_the_host_leaves` pins the `Drop` and not the two call sites.
+///
+/// Closing twice is closing once, so this composes with rather than replaces the explicit closes.
+/// Three of the four have to stay where they are: ahead of the session lock being released, after
+/// the shutdown notice, and ahead of everything a one-shot run still prints once its turn is over.
+/// Only the one on `run_oneshot`'s failing arm is this guard's job now, and it is kept because it
+/// says at the site what the guard says at a distance.
+struct LastEpisode(Arc<std::sync::Mutex<console::Console>>);
+
+impl Drop for LastEpisode {
+    fn drop(&mut self) {
+        close_console_episode(&self.0);
+    }
 }
 
 /// Move a lock into the slot the agent and its host share, replacing whatever was there.
@@ -3379,6 +3456,54 @@ mod tests {
         )
         .await
         .expect("an in-memory store opens")
+    }
+
+    /// A host that leaves through one of its early `?` paths still flushes what it had streamed and
+    /// still settles the row.
+    ///
+    /// Both halves of what the guard is for, and the second is the one with a screen behind it:
+    /// `repl_handle.await?` fires when the REPL thread panicked, which can be mid-wake with the
+    /// prompt it broke out of still drawn.
+    ///
+    /// Only the mechanism is pinned here. Reaching those paths for real needs a failing provider
+    /// registry or a panicking REPL thread behind a terminal, and an assertion the guard's absence
+    /// cannot fail is not coverage.
+    #[test]
+    fn the_last_episode_closes_however_the_host_leaves() {
+        let console = Arc::new(std::sync::Mutex::new(console::Console::new(
+            console::Spacing {
+                newline_before_prompt: true,
+                newline_after_prompt: true,
+            },
+            render::RenderMode::Raw,
+        )));
+        with_console(&console, |console| {
+            console.open_episode(console::RowState::Empty, console::Neighbour::Shell)
+        });
+        {
+            let _last_episode = LastEpisode(Arc::clone(&console));
+            with_console(&console, |console| {
+                console.text_delta("half an answer");
+                // The drawing API cannot reach a parked prompt without a terminal. A wake that
+                // streamed would have settled the row first, so this pairs a parked prompt with an
+                // open block to exercise both halves of the close at once rather than to reproduce
+                // one state the REPL reaches.
+                console.force_row(console::RowState::PromptParked);
+            });
+            assert!(
+                with_console(&console, |console| console.has_open_text()),
+                "the block has to be open, or the guard has nothing to close"
+            );
+        }
+        assert!(
+            !with_console(&console, |console| console.has_open_text()),
+            "leaving the host's scope closes it, whether or not the host reached its own close"
+        );
+        assert_eq!(
+            with_console(&console, |console| console.row()),
+            console::RowState::Empty,
+            "and the stale prompt goes with it, rather than sitting under the shell's"
+        );
     }
 
     /// The Ctrl+C ladder, which nothing else can reach.

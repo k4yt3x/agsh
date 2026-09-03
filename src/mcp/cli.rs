@@ -29,8 +29,8 @@ pub async fn run_list(
     let orphans = orphaned_credentials(servers, token_store).await?;
 
     if servers.is_empty() {
-        eprintln!("No MCP servers configured.");
-        report_orphaned_credentials(&orphans);
+        crate::render::write_stderr_line("No MCP servers configured.");
+        report_orphaned_credentials(&orphans)?;
         return Ok(());
     }
 
@@ -115,8 +115,8 @@ pub async fn run_list(
     } else {
         &["Name", "Transport", "Required", "Permission", "Target"]
     };
-    print!("{}", crate::render::format_columns(headers, &rows));
-    report_orphaned_credentials(&orphans);
+    crate::render::write_stdout(crate::render::format_columns(headers, &rows))?;
+    report_orphaned_credentials(&orphans)?;
     Ok(())
 }
 
@@ -144,16 +144,20 @@ async fn orphaned_credentials(
 /// Print the orphan block, if there is one. The names go to stdout with the rest of the answer --
 /// hiding them behind a stderr-only note is how they stayed invisible in the first place -- and the
 /// instruction for acting on them is a stderr hint.
-fn report_orphaned_credentials(orphans: &[String]) {
+fn report_orphaned_credentials(orphans: &[String]) -> Result<()> {
     if orphans.is_empty() {
-        return;
+        return Ok(());
     }
-    println!();
-    println!("Stored credentials with no server: {}", orphans.join(", "));
+    crate::render::write_stdout_line("")?;
+    crate::render::write_stdout_line(format!(
+        "Stored credentials with no server: {}",
+        orphans.join(", ")
+    ))?;
     // The action only. Why the credential is here is not something the diff can say -- deleting the
     // entry by hand is the usual cause, but a rollback that itself failed leaves the same trace --
     // and the line above has already stated what was found.
     crate::render::render_hint("delete one with `meka mcp remove <name>`");
+    Ok(())
 }
 
 /// Run `meka mcp get <name>`. Prints a single server config in detail.
@@ -166,48 +170,48 @@ pub async fn run_get(
         .iter()
         .find(|c| c.name == name)
         .ok_or_else(|| config_err(format!("no MCP server named '{}'", name)))?;
-    println!("name:        {}", config.name);
-    println!("transport:   {}", match config.transport {
+    crate::render::write_stdout_line(format!("name:        {}", config.name))?;
+    crate::render::write_stdout_line(format!("transport:   {}", match config.transport {
         McpTransport::Stdio => "stdio",
         McpTransport::Http => "http",
-    });
+    }))?;
     // Same order as the `meka mcp list` columns. A disabled server is never started, so it never
     // reaches the turn gate no matter what `required` says; claiming it "gates the turn" would be
     // a flat falsehood, and `strict = true` seeds `required` on disabled servers too.
     if config.disabled {
-        println!("required:    n/a (server is disabled)");
-        println!("disabled:    yes (skipped at startup)");
+        crate::render::write_stdout_line("required:    n/a (server is disabled)")?;
+        crate::render::write_stdout_line("disabled:    yes (skipped at startup)")?;
     } else {
-        println!(
+        crate::render::write_stdout_line(format!(
             "required:    {}",
             if config.required.unwrap_or(false) {
                 "yes (gates the turn)"
             } else {
                 "no"
             }
-        );
+        ))?;
     }
-    println!(
+    crate::render::write_stdout_line(format!(
         "permission:  {}",
         config.permission.as_deref().unwrap_or("(unset)")
-    );
+    ))?;
     if let Some(command) = &config.command {
-        println!("command:     {}", command);
+        crate::render::write_stdout_line(format!("command:     {}", command))?;
     }
     if let Some(args) = &config.args {
-        println!("args:        {:?}", args);
+        crate::render::write_stdout_line(format!("args:        {:?}", args))?;
     }
     if let Some(env) = &config.env {
-        println!("env:         {} keys", env.len());
+        crate::render::write_stdout_line(format!("env:         {} keys", env.len()))?;
         for key in env.keys() {
-            println!("  - {}", key);
+            crate::render::write_stdout_line(format!("  - {}", key))?;
         }
     }
     if let Some(url) = &config.url {
-        println!("url:         {}", url);
+        crate::render::write_stdout_line(format!("url:         {}", url))?;
     }
     if let Some(headers) = &config.headers {
-        println!("headers:     {} entries", headers.len());
+        crate::render::write_stdout_line(format!("headers:     {} entries", headers.len()))?;
     }
     for kind in [
         crate::session::McpCredentialKind::Bearer,
@@ -219,7 +223,7 @@ pub async fn run_get(
             .await?
             .is_some()
         {
-            println!("credential:  {} (stored)", kind.label());
+            crate::render::write_stdout_line(format!("credential:  {} (stored)", kind.label()))?;
         }
     }
     // The endpoint the stored grant was minted against, beside the one this config points at.
@@ -241,10 +245,10 @@ pub async fn run_get(
             .as_deref()
             .filter(|configured| !super::auth::same_origin(&origin, configured));
         match mismatch {
-            Some(configured) => {
-                println!("  issued for: {origin} (does not match url: {configured})")
-            }
-            None => println!("  issued for: {origin}"),
+            Some(configured) => crate::render::write_stdout_line(format!(
+                "  issued for: {origin} (does not match url: {configured})"
+            ))?,
+            None => crate::render::write_stdout_line(format!("  issued for: {origin}"))?,
         }
     }
     if let Some(auth) = &config.auth {
@@ -255,22 +259,22 @@ pub async fn run_get(
             McpAuthConfig::ClientCredentialsJwt { .. } => "client_credentials_jwt",
             McpAuthConfig::OAuth { .. } => "oauth",
         };
-        println!("auth:        {}", auth_label);
+        crate::render::write_stdout_line(format!("auth:        {}", auth_label))?;
     }
     if let Some(allowed) = config.allowed_tools.as_deref() {
-        println!("allowed_tools: {}", allowed.join(", "));
+        crate::render::write_stdout_line(format!("allowed_tools: {}", allowed.join(", ")))?;
     }
     if let Some(disabled) = config.disabled_tools.as_deref() {
-        println!("disabled_tools: {}", disabled.join(", "));
+        crate::render::write_stdout_line(format!("disabled_tools: {}", disabled.join(", ")))?;
     }
     if let Some(perms) = config.tool_permissions.as_ref()
         && !perms.is_empty()
     {
-        println!("tool_permissions:");
+        crate::render::write_stdout_line("tool_permissions:")?;
         let mut keys: Vec<&String> = perms.keys().collect();
         keys.sort();
         for key in keys {
-            println!("  - {} = {}", key, perms[key]);
+            crate::render::write_stdout_line(format!("  - {} = {}", key, perms[key]))?;
         }
     }
     Ok(())
@@ -336,7 +340,7 @@ pub async fn run_tools(
     manager.shutdown_arc().await;
 
     if tools.is_empty() {
-        eprintln!("Server '{}' advertises no tools.", config.name);
+        crate::render::write_stderr_line(format!("Server '{}' advertises no tools.", config.name));
         return Ok(());
     }
 
@@ -371,13 +375,10 @@ pub async fn run_tools(
             ]
         })
         .collect();
-    print!(
-        "{}",
-        crate::render::format_columns(
-            &["Name", "Permission", "Source", "Status", "Description"],
-            &rows,
-        )
-    );
+    crate::render::write_stdout(crate::render::format_columns(
+        &["Name", "Permission", "Source", "Status", "Description"],
+        &rows,
+    ))?;
 
     // The count is commentary on the table, not part of it, so it goes to stderr with the rest of
     // the UI feedback. On stdout it appended a blank line and an English sentence to the data a
@@ -385,28 +386,28 @@ pub async fn run_tools(
     // so `meka mcp tools x 2>/dev/null | awk ...` would work.
     let total = tools.len();
     let allowed = tools.iter().filter(|tool| tool.allowed).count();
-    eprintln!();
-    eprintln!(
+    crate::render::write_stderr_line("");
+    crate::render::write_stderr_line(format!(
         "{} tool{} total, {} allowed, {} blocked",
         total,
         if total == 1 { "" } else { "s" },
         allowed,
         total - allowed
-    );
+    ));
 
     // A tool meka dropped to stay under the per-server ceiling is, from here, indistinguishable
     // from one the server never offered. Say so: this table is where someone goes to find out why
     // the model cannot call something the server's own docs advertise, and a `tracing::warn!` at
     // connect time is not where they will be looking.
     if dropped > 0 {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "{} further tool{} advertised by this server {} not registered: the per-server ceiling \
              is {}",
             dropped,
             if dropped == 1 { "" } else { "s" },
             if dropped == 1 { "was" } else { "were" },
             crate::mcp::MAX_MCP_TOOLS_PER_SERVER,
-        );
+        ));
     }
     Ok(())
 }

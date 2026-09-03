@@ -784,7 +784,9 @@ async fn authenticate_oauth_authorization_code(
     // Print the URL exactly once and try to open the browser silently. Browser-launch failures are
     // expected on headless hosts (SSH, CI, containers), so they stay at `debug`. The user has the
     // URL and can copy it either way.
-    eprintln!("open this URL in your browser to authorize:\n\n{auth_url}\n");
+    crate::render::write_stderr_line(format!(
+        "open this URL in your browser to authorize:\n\n{auth_url}\n"
+    ));
     if let Err(error) = open::that(&auth_url) {
         tracing::debug!("open::that failed to launch browser: {}", error);
     }
@@ -840,15 +842,15 @@ async fn await_oauth_callback(
     let paste_enabled = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
     if paste_enabled {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "waiting up to {}s for the callback, or paste the callback URL here and press Enter:",
             OAUTH_CALLBACK_TIMEOUT.as_secs()
-        );
+        ));
     } else {
-        eprintln!(
+        crate::render::write_stderr_line(format!(
             "waiting up to {}s for the callback.",
             OAUTH_CALLBACK_TIMEOUT.as_secs()
-        );
+        ));
         return accept_http_callback(listener, deadline).await;
     }
 

@@ -171,6 +171,120 @@ impl std::str::FromStr for RenderMode {
     }
 }
 
+/// Write to stdout, returning a failure rather than panicking on it.
+///
+/// `print!` and `println!` panic when the write fails, which is the wrong answer for the one stream
+/// a caller is meant to pipe: `meka --oneshot … | head` closes it mid-answer, and where every other
+/// tool exits, meka crashes. Every write in [`StreamingRenderer`] goes through this or
+/// [`write_stdout_line`], which is what makes the `io::Result` its methods already return the truth
+/// about what reached the terminal rather than a formality.
+pub fn write_stdout(text: impl std::fmt::Display) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    write!(out, "{}", text)
+        .and_then(|()| out.flush())
+        .map_err(reader_hung_up)
+}
+
+/// [`write_stdout`] plus the newline, without building a second string to hold it.
+pub fn write_stdout_line(line: impl std::fmt::Display) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}", line)
+        .and_then(|()| out.flush())
+        .map_err(reader_hung_up)
+}
+
+/// The payload marking a broken pipe as *this process's stdout* rather than any other.
+///
+/// A reader that stops reading is its own decision and meka exits 0 for it, but that has to mean
+/// the reader of the stream the command was writing its answer to. A `BrokenPipe` reaching the same
+/// place from somewhere else -- `session export --output <fifo>`, where the user named a
+/// destination and the data did not land -- is a failure, and answering 0 to it reports success
+/// over lost data. The kind alone cannot tell those apart, so the ones from here carry this.
+#[derive(Debug)]
+pub struct ReaderHungUp;
+
+impl std::fmt::Display for ReaderHungUp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the reader of stdout stopped reading")
+    }
+}
+
+impl std::error::Error for ReaderHungUp {}
+
+/// Tag a stdout failure that was the reader hanging up, leaving every other failure alone.
+///
+/// The kind stays `BrokenPipe`, so [`report_lost_output`] and `Console::lost_output` keep reading
+/// it the way they always have; only the payload is added.
+fn reader_hung_up(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return io::Error::new(io::ErrorKind::BrokenPipe, ReaderHungUp);
+    }
+    error
+}
+
+/// Write chrome to stderr, and accept that a failure here cannot be reported.
+///
+/// `eprint!` and `eprintln!` panic when the write fails, which turns `meka … 2>&1 | head` into a
+/// crash. Unlike stdout there is nothing to hand back: this is the stream a report would go to, so
+/// a caller could only try to say so down the pipe that just refused it. The exit code still
+/// carries whatever the run concluded, which is the part a script reads.
+pub fn write_stderr(text: impl std::fmt::Display) {
+    let mut out = io::stderr().lock();
+    // `.ok()` rather than `?` or a log: see above. Both would write to this same stream.
+    write!(out, "{}", text).ok();
+    out.flush().ok();
+}
+
+/// [`write_stderr`] plus the newline.
+pub fn write_stderr_line(line: impl std::fmt::Display) {
+    let mut out = io::stderr().lock();
+    writeln!(out, "{}", line).ok();
+    out.flush().ok();
+}
+
+/// Whether the terminal has already been told that output is not arriving.
+///
+/// Global rather than per-`Console` because the writers are: `Console::text_delta` asks once per
+/// streamed delta and history replay once per replayed message, and the replay path has no console
+/// to hang a flag on. Without this the correction is hundreds of identical lines, which buries the
+/// one that matters.
+///
+/// Cleared by [`reset_lost_output_report`] when an episode opens, so a REPL that runs for hours
+/// says it once per prompt rather than once ever.
+static LOST_OUTPUT_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report output that did not reach stdout, at the level the failure deserves, once.
+///
+/// A broken pipe is the reader's own decision -- `meka … | head` -- so saying so by default would
+/// put a line on stderr about something the user did on purpose. Any other failure lost the model's
+/// answer to something they did not choose, and a full disk that reports at `debug!` is a silent
+/// one.
+/// Let the next episode speak again. See [`LOST_OUTPUT_REPORTED`].
+pub fn reset_lost_output_report() {
+    LOST_OUTPUT_REPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this is the first report since the last reset, claiming the right to be it.
+///
+/// Split from the static so a test can drive it with a latch of its own. The global one is cleared
+/// by `Console::open_episode`, which several other tests in this binary call, and a clear landing
+/// between two reports made a test that used it flaky roughly once in four hundred runs.
+fn claim_first_report(latch: &std::sync::atomic::AtomicBool) -> bool {
+    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn report_lost_output(what: &str, error: &io::Error) {
+    if !claim_first_report(&LOST_OUTPUT_REPORTED) {
+        return;
+    }
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        tracing::debug!("{}: {}", what, error);
+    } else {
+        tracing::warn!("{}: {}", what, error);
+    }
+}
+
 pub struct StreamingRenderer {
     buffer: String,
     skin: MadSkin,
@@ -279,11 +393,11 @@ impl StreamingRenderer {
                             needs_newline = false;
                         } else if line.is_empty() {
                             self.flush_syntect_table()?;
-                            println!();
+                            write_stdout("\n")?;
                             needs_newline = false;
                         } else {
                             self.flush_syntect_table()?;
-                            print_highlighted_markdown(line);
+                            write_highlighted_markdown(line)?;
                             needs_newline = true;
                         }
                     }
@@ -294,7 +408,7 @@ impl StreamingRenderer {
                     self.flush_syntect_code_block()?;
                     self.flush_syntect_table()?;
                     if needs_newline {
-                        println!();
+                        write_stdout("\n")?;
                     }
                 }
             }
@@ -306,7 +420,7 @@ impl StreamingRenderer {
                 let trimmed = remaining.trim_end_matches('\n');
                 let output = self.finish_termimad_output(trimmed);
                 if !output.is_empty() {
-                    print!("{}", output);
+                    write_stdout(&output)?;
                 }
             }
             RenderMode::Raw => {
@@ -320,7 +434,7 @@ impl StreamingRenderer {
                         self.raw_table_lines.push(line.to_string());
                     } else {
                         self.flush_raw_table()?;
-                        println!("{}", line);
+                        write_stdout_line(line)?;
                     }
                 }
                 self.flush_raw_table()?;
@@ -363,11 +477,10 @@ impl StreamingRenderer {
             } else {
                 self.flush_syntect_table()?;
                 if line.is_empty() {
-                    println!();
+                    write_stdout("\n")?;
                 } else {
-                    print_highlighted_markdown(&format!("{}\n", line));
+                    write_highlighted_markdown(&format!("{}\n", line))?;
                 }
-                io::stdout().flush()?;
             }
         }
         Ok(())
@@ -378,8 +491,7 @@ impl StreamingRenderer {
             return Ok(());
         }
         let lines = std::mem::take(&mut self.code_block_lines);
-        print!("{}", render_code_block_to_string(&lines));
-        io::stdout().flush()
+        write_stdout(render_code_block_to_string(&lines))
     }
 
     fn flush_syntect_table(&mut self) -> io::Result<()> {
@@ -390,9 +502,8 @@ impl StreamingRenderer {
         let lines = std::mem::take(&mut self.raw_table_lines);
         let formatted = format_table(&lines);
         let table_text = formatted.join("\n");
-        print_highlighted_markdown(&table_text);
-        println!();
-        io::stdout().flush()
+        write_highlighted_markdown(&table_text)?;
+        write_stdout("\n")
     }
 
     /// Render markdown prose through termimad.
@@ -429,8 +540,7 @@ impl StreamingRenderer {
     fn flush_termimad(&mut self) -> io::Result<()> {
         let output = self.take_termimad_output();
         if !output.is_empty() {
-            print!("{}", output);
-            io::stdout().flush()?;
+            write_stdout(&output)?;
         }
         Ok(())
     }
@@ -616,8 +726,7 @@ impl StreamingRenderer {
                 self.raw_table_lines.push(line);
             } else {
                 self.flush_raw_table()?;
-                println!("{}", line);
-                io::stdout().flush()?;
+                write_stdout_line(&line)?;
             }
         }
         Ok(())
@@ -631,9 +740,9 @@ impl StreamingRenderer {
         let lines = std::mem::take(&mut self.raw_table_lines);
         let formatted = format_table(&lines);
         for line in &formatted {
-            println!("{}", line);
+            write_stdout_line(line)?;
         }
-        io::stdout().flush()
+        Ok(())
     }
 }
 
@@ -835,9 +944,8 @@ fn markdown_skin() -> &'static MadSkin {
 
 /// Syntax-highlight a chunk of markdown and write it to stdout with 24-bit ANSI color escapes. The
 /// caller is responsible for any surrounding newlines.
-fn print_highlighted_markdown(text: &str) {
-    let output = highlight_markdown_to_string(text);
-    print!("{}", output);
+fn write_highlighted_markdown(text: &str) -> io::Result<()> {
+    write_stdout(highlight_markdown_to_string(text))
 }
 
 /// Returns the ANSI-escaped highlighted text without writing to stdout. Exposed for testing.
@@ -1953,14 +2061,14 @@ pub fn render_tool_indicator(
 ) {
     let (header, block) =
         tool_indicator_parts(name, input, display_summary, params, output_width());
-    eprintln!("{}", header.with(Color::Cyan));
+    write_stderr_line(header.with(Color::Cyan));
     for line in block {
         // A different hue from the header rather than a dimmer shade of it. The normal and bright
         // slots of one colour (4 and 12, 6 and 14) are the same value in a good many terminal
         // themes, so a header/argument split built on brightness renders as no split at all. Grey
         // would separate them but is the colour of a thinking block, which is the neighbour these
         // most need to be told apart from.
-        eprintln!("{}", line.with(Color::Blue));
+        write_stderr_line(line.with(Color::Blue));
     }
 }
 
@@ -2024,7 +2132,7 @@ pub fn sanitize_stream_text(text: &str) -> String {
 }
 
 pub fn render_session_id(label: &str, id: &str) {
-    eprintln!("{}", format!("{}: {}", label, id).with(Color::DarkGrey));
+    write_stderr_line(format!("{}: {}", label, id).with(Color::DarkGrey));
 }
 
 /// Format `rows` into a left-aligned, space-padded column layout, the shared renderer for meka's
@@ -2172,7 +2280,7 @@ fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
 }
 
 pub fn render_hint(message: &str) {
-    eprintln!("{}", message.with(Color::DarkGrey));
+    write_stderr_line(message.with(Color::DarkGrey));
 }
 
 pub(crate) fn format_token_count(n: u64) -> String {
@@ -2200,16 +2308,15 @@ pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
     } else {
         ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round() as u64
     };
-    eprintln!();
-    eprintln!(
-        "{}",
+    write_stderr_line("");
+    write_stderr_line(
         format!(
             "[in {} / cache hit {}% / out {}]",
             format_token_count(total_in),
             cache_hit_pct,
             format_token_count(usage.output_tokens),
         )
-        .with(Color::DarkGrey)
+        .with(Color::DarkGrey),
     );
 }
 
@@ -2329,10 +2436,13 @@ pub fn render_session_status(
     context_window: u64,
 ) {
     render_heading("Session status");
-    eprint!(
-        "{}",
-        format_session_status(snap, model, message_count, context_tokens, context_window)
-    );
+    write_stderr(format_session_status(
+        snap,
+        model,
+        message_count,
+        context_tokens,
+        context_window,
+    ));
 }
 
 /// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the REPL/ACP `/usage`
@@ -2409,7 +2519,7 @@ fn format_money(amount: f64, currency: Option<&str>) -> String {
 /// REPL `/usage` rendering: the shared plain text to stderr (REPL UI feedback). The "not available"
 /// case is handled by the caller via `render_hint`.
 pub fn render_account_usage(usage: &crate::provider::AccountUsage) {
-    eprint!("{}", format_account_usage(usage));
+    write_stderr(format_account_usage(usage));
 }
 
 /// A fixed-width `[####------]` gauge for a 0-100 percentage.
@@ -2470,7 +2580,7 @@ pub(crate) fn format_reset_time(epoch_seconds: i64) -> String {
 
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub fn render_error(error: &dyn std::fmt::Display) {
-    eprintln!("{} {}", "Error:".with(Color::Red), error);
+    write_stderr_line(format!("{} {}", "Error:".with(Color::Red), error));
 }
 
 /// The heading above a block of command output, in the colour every other one uses.
@@ -2478,7 +2588,7 @@ pub fn render_error(error: &dyn std::fmt::Display) {
 /// Exists so the colour is decided once. `Session status` had it inline, and the second heading to
 /// want it would otherwise have copied the constant rather than the convention.
 pub fn render_heading(heading: &str) {
-    eprintln!("{}", heading.with(Color::Cyan));
+    write_stderr_line(heading.with(Color::Cyan));
 }
 
 /// A stage direction about the output rather than output of its own: `(interrupted)`.
@@ -2497,7 +2607,7 @@ pub fn render_heading(heading: &str) {
 ///
 /// Every caller passes one of meka's own strings, so there is nothing here to sanitise.
 pub fn render_annotation(note: &str) {
-    eprintln!("{}", format!("({})", note).with(Color::Yellow));
+    write_stderr_line(format!("({})", note).with(Color::Yellow));
 }
 
 /// A session whose recorded provider profile is not one the config has, and a profile it could be
@@ -2538,15 +2648,15 @@ pub struct MissingSessionProfile<'a> {
 /// `Example:` and describes nothing that exists.
 pub fn render_provider_setup_hint(missing: Option<MissingSessionProfile<'_>>) {
     match missing {
-        Some(missing) => eprintln!(
+        Some(missing) => write_stderr_line(format!(
             "Move this session onto a configured profile: meka -r {} --provider {}",
             missing.session_id, missing.move_to
-        ),
+        )),
         None => {
-            eprintln!(
-                "Example: meka provider add <name> --type claude-subscription --model claude-opus-5"
+            write_stderr_line(
+                "Example: meka provider add <name> --type claude-subscription --model claude-opus-5",
             );
-            eprintln!("Run `meka provider list` to see configured profiles.");
+            write_stderr_line("Run `meka provider list` to see configured profiles.");
         }
     }
 }
@@ -2615,9 +2725,10 @@ pub struct HistoryRenderOptions {
     /// that renders to nothing leaves no stray blank behind.
     ///
     /// `/history` leaves this off: the episode's `newline_after_prompt` blank already separates it
-    /// from the command line. A resume sets it to `newline_after_prompt`, because the
-    /// `Continuing session:` banner is what spent that blank and this is the same separator moved
-    /// below the banner, so it answers to the same setting.
+    /// from the command line. A resume sets it to `newline_after_prompt`, because that episode
+    /// opens against the shell's prompt and gets no blank of its own; the `Continuing session:`
+    /// banner stands in for the line you typed, so the separator below it answers to the same
+    /// setting.
     pub leading_blank: bool,
 }
 
@@ -2667,7 +2778,7 @@ pub fn render_message_history(
                         }
                         pending_leading_blank = false;
                         if opts.newline_after_prompt {
-                            eprintln!();
+                            write_stderr_line("");
                         }
                         spacing.after_prompt();
                         emitted_any = true;
@@ -2678,7 +2789,7 @@ pub fn render_message_history(
                 // silently.
                 ContentBlock::Image { .. } => {
                     separate(spacing.before_text(), &mut pending_leading_blank);
-                    eprintln!("[image]");
+                    write_stderr_line("[image]");
                     emitted_any = true;
                 }
                 ContentBlock::Thinking { thinking, .. } => {
@@ -2720,10 +2831,10 @@ fn render_assistant_text(text: &str, render_mode: RenderMode) {
     // because the next block's `before_*` will add one if appropriate.
     let mut renderer = StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(text) {
-        tracing::debug!("history: failed to render assistant delta: {}", error);
+        report_lost_output("a replayed message did not reach stdout", &error);
     }
     if let Err(error) = renderer.finish() {
-        tracing::debug!("history: failed to finish assistant render: {}", error);
+        report_lost_output("a replayed message did not reach stdout", &error);
     }
 }
 
@@ -2734,7 +2845,7 @@ fn render_assistant_text(text: &str, render_mode: RenderMode) {
 /// asked for its own separator.
 fn separate(needed: bool, pending_leading: &mut bool) {
     if std::mem::take(pending_leading) || needed {
-        eprintln!();
+        write_stderr_line("");
     }
 }
 
@@ -2749,18 +2860,18 @@ fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_befo
         return false;
     }
     if newline_before {
-        eprintln!();
+        write_stderr_line("");
     }
     for line in trimmed.lines() {
         // Sanitised like the assistant text a few lines above. "User" here names the *role*, not
         // necessarily a person at this terminal: an ACP or HTTP client wrote it, or a `--skill`
         // body did, and a replayed session shows whatever the row holds. Leaving it raw made the
         // one message class meka replays without filtering the one an attacker controls end to end.
-        eprintln!(
+        write_stderr_line(format!(
             "{} {}",
             ">".with(Color::Cyan),
             input_style.paint(sanitize_stream_text(line))
-        );
+        ));
     }
     true
 }
@@ -2908,11 +3019,11 @@ fn collapse_to_line(text: &str, max_chars: usize) -> String {
 /// [`collapse_to_line`] still bounds the work on a block that can run to tens of kilobytes;
 /// collapsing only concatenates, so nothing an escape could hide behind survives the later pass.
 pub fn render_thinking_block(thinking: &str, show_full: bool) {
-    eprintln!(
+    write_stderr_line(format!(
         "{}{}",
         THINKING_PREFIX.with(Color::DarkGrey),
         thinking_block_text(thinking, show_full, output_width()).with(Color::DarkGrey),
-    );
+    ));
 }
 
 /// The text [`render_thinking_block`] prints, separated from the printing so both branches can be
@@ -2980,10 +3091,10 @@ pub fn render_todo_list(title: Option<&str>, items: &[crate::tools::todo::TodoIt
         return false;
     }
     let width = output_width();
-    eprintln!();
+    write_stderr_line("");
 
-    eprintln!("{}", todo_heading(title, width).with(Color::White).bold());
-    eprintln!();
+    write_stderr_line(todo_heading(title, width).with(Color::White).bold());
+    write_stderr_line("");
 
     for (index, item) in items.iter().enumerate() {
         let color = match item.status {
@@ -2995,10 +3106,10 @@ pub fn render_todo_list(title: Option<&str>, items: &[crate::tools::todo::TodoIt
         // prints. Colouring in place would put escape bytes in the middle of the string.
         let row = todo_row(index, item, width);
         let (marker, rest) = row.split_at(row.find(' ').map_or(0, |space| space + 1));
-        eprintln!("{}{}", marker, rest.with(color));
+        write_stderr_line(format!("{}{}", marker, rest.with(color)));
     }
 
-    eprintln!();
+    write_stderr_line("");
     true
 }
 
@@ -3521,6 +3632,34 @@ mod tests {
         assert!(
             log_capture::infos().contains("held over"),
             "which is where it does belong"
+        );
+    }
+
+    /// A stdout that stopped taking writes is named once, and named again after a reset.
+    ///
+    /// Once per process is right for a one-shot run and wrong for a shell left open all day, where
+    /// the first lost answer would otherwise be the only one mentioned. The repetition is real:
+    /// `Console::text_delta` asks per streamed delta and history replay per replayed message.
+    ///
+    /// Driven through a latch of this test's own, not the global. `Console::open_episode` clears
+    /// that one, several tests in this binary call it, and they run in parallel; asserting across
+    /// two reports on a shared flag is a race. What that leaves untested is the wiring -- that
+    /// `report_lost_output` reads the global and `open_episode` clears it -- which is two lines.
+    #[test]
+    fn a_lost_answer_is_named_once_until_the_next_episode() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let latch = AtomicBool::new(false);
+        assert!(
+            claim_first_report(&latch),
+            "the first report is the one that speaks"
+        );
+        assert!(!claim_first_report(&latch), "and every later one is silent");
+
+        latch.store(false, Ordering::Relaxed);
+        assert!(
+            claim_first_report(&latch),
+            "until an episode opens, which lets the next lost answer be named too"
         );
     }
 

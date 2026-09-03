@@ -650,6 +650,12 @@ error, a scheduled job waking the shell to run several turns at once, or any com
 bracketed once, by whichever of those printed first and last -- never once per turn inside it, and
 never twice because two things both thought they owned the spacing.
 
+Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
+prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the
+command you typed -- `Continuing session:` on a resume, or the answer to a prompt you passed on the
+command line -- and its last line is followed straight by the shell prompt. Start meka with no
+prompt and there is nothing above its first prompt to space away from, so the rule never comes up.
+
 The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
 screen exactly as it found it. In practice every slash command says something, even if only that a
 list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,

@@ -349,7 +349,7 @@ fn render(
     if jobs.is_empty() {
         // stderr: an empty list is a status note, not the data a script asked for. A caller piping
         // this still gets a clean empty stdout.
-        eprintln!("No scheduled jobs.");
+        crate::render::write_stderr_line("No scheduled jobs.");
         return Ok(());
     }
 
@@ -357,10 +357,10 @@ fn render(
         Layout::Unscoped => &COLUMNS,
         Layout::SessionScoped => &SESSION_SCOPED_COLUMNS,
     };
-    print!(
-        "{}",
-        crate::render::format_columns(headers, &rows_for(jobs, layout, tools, resolvable))
-    );
+    crate::render::write_stdout(crate::render::format_columns(
+        headers,
+        &rows_for(jobs, layout, tools, resolvable),
+    ))?;
     Ok(())
 }
 
@@ -391,7 +391,13 @@ pub(crate) async fn show(
     fn field(out: &mut String, name: &str, value: &str) {
         use std::fmt::Write as _;
         // The width is the longest label plus one, so the values line up without a table.
-        writeln!(out, "{:<12} {}", format!("{}:", name), value).ok();
+        if value.is_empty() {
+            // A heading rather than a field, so padding it to the column would leave a run of
+            // trailing spaces on the row. Same rule as `/tasks show`'s `result:`.
+            writeln!(out, "{}:", name).ok();
+        } else {
+            writeln!(out, "{:<12} {}", format!("{}:", name), value).ok();
+        }
     }
 
     field(&mut out, "id", &job.id);
@@ -461,7 +467,7 @@ pub(crate) async fn show(
         out.push('\n');
     }
 
-    print!("{}", out);
+    crate::render::write_stdout(&out)?;
     Ok(())
 }
 

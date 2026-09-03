@@ -65,3 +65,23 @@ You can resume this session later in interactive mode:
 ```bash
 meka -r 550e8400-e29b-41d4-a716-446655440000
 ```
+
+## Piping
+
+The answer goes to stdout and everything else to stderr, so `meka -p … 2>/dev/null | next-tool`
+hands the next tool only what you asked for. That holds for every command, not just this one.
+
+A reader that stops reading is its own decision, and meka exits `0` for it:
+
+```bash
+meka -p "summarise this log" | head -20     # exits 0; head got its lines
+```
+
+A stdout that *cannot* take the answer is a different thing, and fails the run:
+
+```bash
+meka -p "summarise this log" > /full/disk   # exits non-zero, and says why on stderr
+```
+
+The distinction matters in a script: the first is how pipelines end, the second is data you asked
+for and did not get.

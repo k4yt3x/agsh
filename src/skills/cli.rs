@@ -36,7 +36,7 @@ pub struct AddArgs<'a> {
 /// note on stderr, not data, so a caller piping this gets a clean empty stdout.
 pub async fn run_list(roots: &[std::path::PathBuf], paths: bool) -> Result<()> {
     let skills = skills::discover_skills_in_roots(roots);
-    print_list(&skills.skills, skills::skills_dir().as_deref(), paths);
+    print_list(&skills.skills, skills::skills_dir().as_deref(), paths)?;
     Ok(())
 }
 
@@ -54,12 +54,13 @@ pub async fn run_list(roots: &[std::path::PathBuf], paths: bool) -> Result<()> {
 /// Nothing else about a skill belongs here. `license`, `compatibility`, `allowed-tools`, `version`
 /// and arbitrary `metadata` keys are per-skill detail, which is what `meka skill get` is for; a
 /// column apiece would be mostly empty and would push `Description` off the screen.
-fn print_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool) {
+fn print_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool) -> Result<()> {
     if skills.is_empty() {
-        eprintln!("No skills installed.");
-        return;
+        crate::render::write_stderr_line("No skills installed.");
+        return Ok(());
     }
-    print!("{}", render_list(skills, native_root, paths));
+    crate::render::write_stdout(render_list(skills, native_root, paths))?;
+    Ok(())
 }
 
 /// The table as text. Split from [`print_list`] only so a test can assert on the bytes a user
@@ -115,45 +116,45 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     let body_bytes = std::fs::metadata(&skill.body_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    println!("name: {}", skill.name);
+    crate::render::write_stdout_line(format!("name: {}", skill.name))?;
     // Sanitised like every other cell: a directory name is chosen by whoever put the skill on disk
     // and can carry a newline or an escape, and this line goes straight to a terminal.
-    println!("source_dir: {}", display_path(&skill.source_dir));
-    println!("body_path: {}", display_path(&skill.body_path));
-    println!(
+    crate::render::write_stdout_line(format!("source_dir: {}", display_path(&skill.source_dir)))?;
+    crate::render::write_stdout_line(format!("body_path: {}", display_path(&skill.body_path)))?;
+    crate::render::write_stdout_line(format!(
         "description: {}",
         crate::memory::render_description_for_model(&skill.description)
-    );
-    println!("priority: {}", skill.priority);
-    println!("license: {}", optional(skill.license.as_deref()));
-    println!(
+    ))?;
+    crate::render::write_stdout_line(format!("priority: {}", skill.priority))?;
+    crate::render::write_stdout_line(format!("license: {}", optional(skill.license.as_deref())))?;
+    crate::render::write_stdout_line(format!(
         "compatibility: {}",
         optional(skill.compatibility.as_deref())
-    );
-    println!(
+    ))?;
+    crate::render::write_stdout_line(format!(
         "allowed-tools: {}",
         optional(skill.allowed_tools.as_deref())
-    );
+    ))?;
     // Both halves sanitised: a key is arbitrary YAML text from a file meka may not have written,
     // and an escape or a newline in one reaches the terminal or fakes an extra output line.
     match skill.metadata_map() {
         Some(map) => {
             for (key, value) in map {
-                println!(
+                crate::render::write_stdout_line(format!(
                     "metadata.{}: {}",
                     crate::store::sanitize_stored_description(&skills::yaml_value_to_string(key)),
                     crate::store::sanitize_stored_description(&skills::yaml_value_to_string(value))
-                );
+                ))?;
             }
         }
         // Whatever the file put there instead. Shown rather than skipped: meka keeps it verbatim
         // across a rewrite, so a command that hid it would hide the thing being preserved.
         None => {
             if let Some(value) = skill.metadata.as_ref() {
-                println!(
+                crate::render::write_stdout_line(format!(
                     "metadata: {}",
                     crate::store::sanitize_stored_description(&skills::yaml_value_to_string(value))
-                );
+                ))?;
             }
         }
     }
@@ -163,13 +164,13 @@ pub async fn run_get(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     // hostile one could add a second `source_dir:` or `body:` line contradicting the real one. This
     // is stdout, which the project treats as parseable data.
     for (key, value) in &skill.extra {
-        println!(
+        crate::render::write_stdout_line(format!(
             "extra.{}: {}",
             crate::store::sanitize_stored_description(&skills::yaml_value_to_string(key)),
             crate::store::sanitize_stored_description(&skills::yaml_value_to_string(value))
-        );
+        ))?;
     }
-    println!("body: {} bytes", body_bytes);
+    crate::render::write_stdout_line(format!("body: {} bytes", body_bytes))?;
     Ok(())
 }
 
@@ -180,7 +181,7 @@ pub async fn run_show(name: &str, roots: &[std::path::PathBuf]) -> Result<()> {
     let body = skills::load_skill_body(&skill)
         .await
         .map_err(|error| MekaError::Config(format!("failed to load skill body: {}", error)))?;
-    print!("{}", body);
+    crate::render::write_stdout(&body)?;
     Ok(())
 }
 
@@ -360,7 +361,9 @@ pub async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> Result<
     }
 
     tracing::info!("created skill '{}'", args.name);
-    println!("{}", skill_md.display());
+    // Held rather than propagated: the path is the answer, but `--edit` is the rest of the command,
+    // and a stdout that went away must not decide whether the editor opens.
+    let written = crate::render::write_stdout_line(skill_md.display());
 
     // Released before the editor runs. The lock exists to protect the *write*, which is finished;
     // holding it across an interactive session blocked every other meka skill write in every other
@@ -385,6 +388,7 @@ pub async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> Result<
         }
     }
 
+    written?;
     Ok(())
 }
 
