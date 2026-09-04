@@ -1083,8 +1083,22 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
         "the client must actually have given up for this test to mean anything"
     );
 
-    // Give the abandoned turn room to finish on its own.
-    std::thread::sleep(Duration::from_millis(3000));
+    // Wait for the abandoned turn to finish on its own. Polled rather than slept: the script's own
+    // 2s is most of any fixed budget, so what is left has to cover session setup and the commit on
+    // whatever machine this runs on, and a slow runner reads as an abandoned turn.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        let body: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if body["turn_in_flight"] == false {
+            break;
+        }
+    }
 
     let messages: serde_json::Value = harness
         .request(

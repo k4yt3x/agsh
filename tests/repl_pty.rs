@@ -156,6 +156,21 @@ fn exec_meka(binary: &Path, root: &Path, script: &Path) -> std::io::Error {
         .env("TERM", "xterm-256color")
         .env("COLUMNS", "100")
         .env("LINES", "40")
+        // Everything here asserts where meka's own rows land, so a row the *host* decides to add
+        // shifts every position under it. The sandbox advisories are exactly that: a runner with
+        // Landlock but no Bubblewrap, or an older Landlock ABI, prints two `warn!` lines above the
+        // first banner, and whether it does is a fact about the kernel the suite happens to run on.
+        // Silenced by module rather than by level, because a retry warning reaching the screen is
+        // itself under test (see `a_warning_raised_during_a_turn_is_not_erased_by_the_turn`).
+        //
+        // The two `rmcp` directives are meka's own defaults, restated because `RUST_LOG` replaces
+        // the filter outright rather than adding to it, and dropping them lets an MCP transport's
+        // reconnect chatter print rows of its own.
+        .env(
+            "RUST_LOG",
+            "warn,meka::sandbox=error,rmcp::transport::common::client_side_sse=error,\
+             rmcp::transport::worker=off",
+        )
         .env("MEKA_CONFIG_DIR", root.join("meka"))
         .env("MEKA_DATA_DIR", root.join("data").join("meka"))
         .env("XDG_CONFIG_HOME", root)
