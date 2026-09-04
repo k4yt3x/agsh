@@ -42,6 +42,17 @@ pub enum MockEvent {
     ThinkingDelta {
         text: String,
     },
+    /// A running estimate of the block's size, as Claude's token-count beta reports it.
+    ///
+    /// Scriptable because the beta emits one of these from the *same* wire event that carries a
+    /// visible delta, so the two alternate for the whole block. Nothing else can produce that
+    /// interleaving, and it is the shape `console::indicator_may_draw` exists for.
+    ThinkingProgress {
+        /// `None` is the count the backend reports before the beta has one, and is the shape a
+        /// script wants for "the block is running but nothing can be said about its size yet".
+        #[serde(default)]
+        estimated_tokens: Option<u64>,
+    },
     /// Caps an in-flight thinking block. `opaque` carries whichever wire shape the script is
     /// standing in for -- a Claude signature, or a Responses reasoning item's sealed content. The
     /// agent treats it as pass-through (see [`crate::frontend::FrontendEvent::ThinkingBlock`]), so
@@ -250,6 +261,7 @@ impl Provider for MockProvider {
 
         let mut content: Vec<ContentBlock> = Vec::new();
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut pending_tool: Option<(String, String)> = None;
         let mut stop_reason = StopReason::EndTurn;
 
@@ -288,9 +300,28 @@ impl Provider for MockProvider {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 MockEvent::Text { text: chunk } => text.push_str(&chunk),
-                // Thinking has no place in a non-streaming reply here: the real providers return it
-                // as a block, but no `complete` caller in meka reads one.
-                MockEvent::ThinkingDelta { .. } | MockEvent::ThinkingComplete { .. } => {}
+                MockEvent::ThinkingDelta { text: chunk } => thinking.push_str(&chunk),
+                // A live indicator's running estimate. Nothing survives a non-streaming turn, which
+                // has no indicator to feed.
+                MockEvent::ThinkingProgress { .. } => {}
+                // Folded into a block like the real providers return it. `run_turn`'s non-streaming
+                // branch reads these back out to reach the frontend, so a script that scripts
+                // thinking has to produce one here or that path has nothing to render.
+                MockEvent::ThinkingComplete { opaque } => {
+                    // Flush first, for the same reason `ToolUseStart` does: a block's position
+                    // relative to the text around it is what a replayed turn preserves.
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text {
+                            text: std::mem::take(&mut text),
+                        });
+                    }
+                    if !thinking.is_empty() || opaque.is_some() {
+                        content.push(ContentBlock::Thinking {
+                            thinking: std::mem::take(&mut thinking),
+                            opaque,
+                        });
+                    }
+                }
                 MockEvent::ToolUseStart { id, name } => {
                     // Flush first, so text that preceded this call stays ahead of it and text
                     // between two calls stays between them. Accumulating everything and appending
@@ -422,6 +453,9 @@ impl Provider for MockProvider {
                         }
                         MockEvent::Text { text } => StreamEvent::TextDelta(text),
                         MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
+                        MockEvent::ThinkingProgress { estimated_tokens } => {
+                            StreamEvent::ThinkingProgress { estimated_tokens }
+                        }
                         MockEvent::ThinkingComplete { opaque } => {
                             StreamEvent::ThinkingComplete { opaque }
                         }

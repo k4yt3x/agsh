@@ -85,6 +85,30 @@ pub trait Frontend: Send + Sync {
         false
     }
 
+    /// Whether reasoning forwarded to this frontend is kept somewhere the user or client still has
+    /// it after the turn moves on.
+    ///
+    /// Answers the one thing `content_started` needs to know about a
+    /// [`FrontendEvent::ThinkingDelta`] and the agent cannot: would retrying the attempt
+    /// deliver the same reasoning twice. Only the frontend knows -- the REPL renders deltas
+    /// under `[thinking].show_content` and drops them otherwise, and the SSE stream forwards
+    /// them only for a session that asked for reasoning.
+    ///
+    /// It matters more here than it would for the answer, because reasoning is the *first* thing a
+    /// turn produces. Marking every turn that reasoned would refuse the retry for almost any
+    /// mid-turn provider failure, which is the resilience an overloaded provider most needs; and
+    /// not marking one whose reasoning a client is concatenating corrupts what it rebuilds.
+    ///
+    /// `false` by default, which is right for the frontends that drop reasoning entirely and for
+    /// those that read whole blocks. The latter not because a failed attempt is silent -- a block
+    /// can complete and the attempt fail after it -- but because neither emitter of
+    /// [`FrontendEvent::ThinkingBlock`] can be followed by a retry: the streaming one marks the
+    /// turn started in the same branch, and the non-streaming one re-emits a whole message only
+    /// once the provider call has returned `Ok`, past its own retry loop.
+    fn retains_reasoning(&self) -> bool {
+        false
+    }
+
     /// Handle an MCP `elicitation/create` request: the server asked the user for input (either a
     /// structured form or a URL-consent flow). The frontend is responsible for prompting the user
     /// and returning their response. The default impl declines: the safe behavior when no human
@@ -250,8 +274,20 @@ pub enum FrontendEvent {
     /// is interrupted emits no further events at all, and the error text would land on the
     /// indicator's line.
     ThinkingEnded,
+    /// A streamed chunk of reasoning, as text to show. Multiple deltas concatenate into one block,
+    /// which [`Self::ThinkingBlock`] then closes.
+    ///
+    /// Emitted for **every** block that carries readable text, including the ones a non-streaming
+    /// provider hands back whole, which are forwarded here as a single delta. That invariant is
+    /// what lets each frontend pick a lane once and hold it: a consumer either renders the deltas
+    /// or renders the block, and never has to remember which of the two a given block produced.
+    ThinkingDelta(String),
     /// A complete thinking block, as text to show. Emitted after the provider's `ThinkingComplete`
-    /// stream event.
+    /// stream event, and always preceded by the [`Self::ThinkingDelta`]s carrying the same text.
+    ///
+    /// Still emitted for a consumer that wants reasoning whole -- ACP thought chunks, the blocking
+    /// HTTP response, the one-line preview under `show_content = false` -- and as the end-of-block
+    /// marker for one that streamed it.
     ///
     /// Deliberately carries no opaque half. No `signature` against a future replay: replay reads
     /// the conversation log, where the block keeps its provider-tagged

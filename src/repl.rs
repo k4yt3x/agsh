@@ -2274,14 +2274,44 @@ enum IndicatorAction {
     Drop,
 }
 
-fn indicator_action(event: &FrontendEvent) -> IndicatorAction {
+/// Exhaustive on purpose. A catch-all absorbs a new variant into `Commit` silently, which is right
+/// for most events and wrong for any that renders in the indicator's place or arrives after its
+/// line is gone, and the test below can only catch that for variants someone thought to list.
+/// Spelling every one out moves the gate to the compiler, which does not forget.
+/// `renders_reasoning` is `[thinking].show_content`: whether this frontend is about to print the
+/// reasoning itself. It decides the delta's answer and nothing else.
+fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -> IndicatorAction {
     match event {
         FrontendEvent::ThinkingProgress { .. } => IndicatorAction::Keep,
-        FrontendEvent::ThinkingBlock { .. } => IndicatorAction::Erase,
+        // Erased only when something is about to render in its place, which would otherwise print
+        // `Thinking...` twice for one stretch of reasoning. Erasing is idempotent, which is what
+        // lets every delta after the first ask for it without checking.
+        //
+        // Under the default the deltas render nothing, so erasing would take the counter down for
+        // an empty replacement -- and Claude sends an estimate and a delta from one wire event
+        // under the token-count beta, so the next estimate would reopen the indicator rather than
+        // redraw it, resetting the peak the redraw exists to hold.
+        FrontendEvent::ThinkingDelta(_) if !renders_reasoning => IndicatorAction::Keep,
+        FrontendEvent::ThinkingDelta(_) | FrontendEvent::ThinkingBlock { .. } => {
+            IndicatorAction::Erase
+        }
         FrontendEvent::TurnStarted => IndicatorAction::Drop,
         // Everything else means the thinking phase is over and nothing further will describe it,
         // so the indicator is the only record that the model spent that time.
-        _ => IndicatorAction::Commit,
+        FrontendEvent::SessionStarted { .. }
+        | FrontendEvent::TurnFinished
+        | FrontendEvent::AssistantTextDelta(_)
+        | FrontendEvent::ThinkingEnded
+        | FrontendEvent::ToolCallComposing { .. }
+        | FrontendEvent::ToolCallStarted { .. }
+        | FrontendEvent::ToolCallCompleted { .. }
+        | FrontendEvent::ToolCallOutputDelta { .. }
+        | FrontendEvent::TodoListUpdated { .. }
+        | FrontendEvent::SubAgentActivity { .. }
+        | FrontendEvent::TokenUsage(_)
+        | FrontendEvent::Notice(_)
+        | FrontendEvent::McpProgress(_)
+        | FrontendEvent::Compacted { .. } => IndicatorAction::Commit,
     }
 }
 
@@ -2329,6 +2359,13 @@ impl ReplFrontend {
 
 #[async_trait]
 impl Frontend for ReplFrontend {
+    /// Reasoning stays on screen only when the deltas are what render it. Under the default the
+    /// line shown is built from the completed block, which an attempt that failed never reaches,
+    /// so a retry repeats nothing.
+    fn retains_reasoning(&self) -> bool {
+        self.config.thinking_show_content
+    }
+
     async fn emit(&self, event: FrontendEvent) {
         // Held briefly across synchronous render calls. The agent loop emits events serially per
         // turn, so contention is effectively zero; the lock is purely a `Send + Sync` discipline
@@ -2343,7 +2380,7 @@ impl Frontend for ReplFrontend {
         // than in each arm that prints: the indicator sits on a line the next write would otherwise
         // overwrite halfway, and a missed call site is the kind of omission that only shows up on
         // the one path nobody exercised.
-        match indicator_action(&event) {
+        match indicator_action(&event, self.config.thinking_show_content) {
             IndicatorAction::Keep => {}
             IndicatorAction::Erase => self.erase_thinking_indicator(&mut state),
             IndicatorAction::Commit => self.commit_thinking_indicator(&mut state),
@@ -2365,17 +2402,21 @@ impl Frontend for ReplFrontend {
             // Closed here so a completed turn does not hold its last paragraph until the prompt,
             // and closed again by the episode for a turn that died without reaching this.
             FrontendEvent::TurnFinished => {
-                with_console(&self.config.console, |console| console.close_text());
+                with_console(&self.config.console, |console| console.close_stream());
             }
             FrontendEvent::AssistantTextDelta(text) => {
                 with_console(&self.config.console, |console| console.text_delta(&text));
             }
             FrontendEvent::ThinkingProgress { estimated_tokens } => {
-                // Redraw in place. The text run stays open deliberately: thinking can interleave
-                // with streamed text mid-turn, and closing the renderer here would break one
-                // paragraph into two around a line that gets erased anyway.
+                // The first estimate of a block opens it, which closes whatever was streaming --
+                // the indicator draws from column zero and is kept rather than erased, so it would
+                // otherwise overwrite the last row of an open run and leave the damage on screen.
+                // Later estimates redraw their own row and close nothing. `Console` decides both,
+                // and declines outright while reasoning is already streaming; see
+                // `console::indicator_may_draw`.
+                //
                 // Nothing below produces output without a terminal to redraw on, and the steps
-                // that follow move state shared with every other event: closing a text run and
+                // that follow move state shared with every other event: closing an open run and
                 // taking a blank line from `spacing`. Doing either for an indicator that cannot be
                 // drawn shifts the layout of output that *is* produced.
                 if !render::live_indicator_supported() {
@@ -2397,12 +2438,33 @@ impl Frontend for ReplFrontend {
                 });
             }
             // The indicator was committed by the hook above, which is the whole point of the
-            // event; there is no block text to render.
-            FrontendEvent::ThinkingEnded => {}
+            // event. It also ends a streamed thinking block, for the turns that die mid-reasoning:
+            // the renderer holds a trailing paragraph back until a blank line settles it, so an
+            // unclosed block would surface under the error that follows it on the same stream.
+            //
+            // Only a *thinking* block. This is not a failure signal -- it fires on any block that
+            // completes with nothing readable, which is every block under sealed reasoning and
+            // under `redact-thinking`, on turns whose answer is streaming perfectly well.
+            FrontendEvent::ThinkingEnded => {
+                with_console(&self.config.console, |console| console.close_thinking());
+            }
+            // Which of these two arms renders is decided by config, not by what this block did, so
+            // neither has to ask whether the other already spoke for it.
+            FrontendEvent::ThinkingDelta(text) => {
+                if self.config.thinking_show_content {
+                    with_console(&self.config.console, |console| {
+                        console.thinking_delta(&text)
+                    });
+                }
+            }
             FrontendEvent::ThinkingBlock { content } => {
-                let show_content = self.config.thinking_show_content;
                 with_console(&self.config.console, |console| {
-                    console.thinking_block(&content, show_content)
+                    if self.config.thinking_show_content {
+                        // The text is already on screen; this is only the end of the block.
+                        console.close_thinking();
+                    } else {
+                        console.thinking_preview(&content);
+                    }
                 });
             }
             // The indicator is drawn at `ToolCallStarted`, where the arguments exist to draw it
@@ -2979,6 +3041,129 @@ mod frontend_tests {
         frontend_on(console())
     }
 
+    fn showing_thinking(console: Arc<Mutex<crate::console::Console>>) -> ReplFrontend {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        ReplFrontend::new(ReplFrontendConfig {
+            console,
+            show_session_id_on_create: false,
+            show_token_usage: false,
+            thinking_show_content: true,
+            tool_params: render::ToolParams::Summary,
+            agent_event_sender: sender,
+        })
+    }
+
+    /// Every door out of a streamed thinking block, one per case.
+    ///
+    /// The renderer holds a trailing paragraph back until a blank line settles it, so a block left
+    /// open does not merely linger: its tail surfaces under whatever prints next. Each of these is
+    /// a path that leaves one open if the close is missing from that arm alone, which is why they
+    /// are enumerated rather than sampled.
+    #[tokio::test]
+    async fn every_way_out_of_a_thinking_block_closes_it() {
+        for (name, closer) in [
+            ("the block ended", FrontendEvent::ThinkingBlock {
+                content: "weighing it".into(),
+            }),
+            ("the block ended empty", FrontendEvent::ThinkingEnded),
+            ("the turn finished", FrontendEvent::TurnFinished),
+            ("a tool call followed", FrontendEvent::ToolCallStarted {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/etc/hosts"}),
+                display_summary: None,
+            }),
+            (
+                "the answer started",
+                FrontendEvent::AssistantTextDelta("the answer".into()),
+            ),
+        ] {
+            let console = console();
+            let frontend = showing_thinking(Arc::clone(&console));
+            frontend
+                .emit(FrontendEvent::ThinkingDelta("weighing it".into()))
+                .await;
+            assert!(
+                with_console(&console, |console| console.has_open_thinking()),
+                "a thinking delta opens a block",
+            );
+            frontend.emit(closer).await;
+            assert!(
+                !with_console(&console, |console| console.has_open_thinking()),
+                "the block outlived its end: {name}",
+            );
+        }
+    }
+
+    /// The two streamed kinds share one slot, so reasoning arriving mid-answer has to close the
+    /// answer rather than append to it. Without that the reasoning would be rendered by the
+    /// answer's renderer, onto stdout, inside the paragraph it interrupted.
+    #[tokio::test]
+    async fn reasoning_and_the_answer_never_stream_at_once() {
+        let console = console();
+        let frontend = showing_thinking(Arc::clone(&console));
+
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta("part one".into()))
+            .await;
+        assert!(with_console(&console, |console| console.has_open_text()));
+
+        frontend
+            .emit(FrontendEvent::ThinkingDelta("second thoughts".into()))
+            .await;
+        assert!(with_console(&console, |console| console.has_open_thinking()));
+        assert!(
+            !with_console(&console, |console| console.has_open_text()),
+            "the answer must be flushed before reasoning prints over it",
+        );
+
+        frontend
+            .emit(FrontendEvent::AssistantTextDelta("part two".into()))
+            .await;
+        assert!(with_console(&console, |console| console.has_open_text()));
+        assert!(!with_console(&console, |console| console.has_open_thinking()));
+    }
+
+    /// A thinking block that ends with nothing readable must not end the *answer* with it.
+    ///
+    /// `ThinkingEnded` is not a failure signal: it fires whenever a block completes carrying no
+    /// visible text, which is every block under sealed reasoning and under Claude's
+    /// `redact-thinking`. Those turns stream their answer through the same one slot, so closing it
+    /// indiscriminately cuts a paragraph in two on the stream a caller pipes.
+    #[tokio::test]
+    async fn a_silent_thinking_block_does_not_close_the_answer() {
+        for ender in [FrontendEvent::ThinkingEnded, FrontendEvent::ThinkingBlock {
+            content: "reasoning".into(),
+        }] {
+            let console = console();
+            let frontend = showing_thinking(Arc::clone(&console));
+            frontend
+                .emit(FrontendEvent::AssistantTextDelta("part one, ".into()))
+                .await;
+            assert!(with_console(&console, |console| console.has_open_text()));
+            frontend.emit(ender).await;
+            assert!(
+                with_console(&console, |console| console.has_open_text()),
+                "the answer's run was closed by a thinking event",
+            );
+        }
+    }
+
+    /// The default. Deltas are ignored outright and the one-line preview arrives with the block, so
+    /// nothing streams and the console never opens a thinking block at all.
+    #[tokio::test]
+    async fn without_show_content_a_thinking_delta_prints_nothing() {
+        let console = console();
+        let frontend = frontend_on(Arc::clone(&console));
+        frontend
+            .emit(FrontendEvent::ThinkingDelta("weighing it".into()))
+            .await;
+        assert!(
+            !with_console(&console, |console| console.has_open_thinking()),
+            "the preview is rendered from the block, not streamed",
+        );
+    }
+
     /// `Agent::run_turn` emits `TurnFinished` only when the turn succeeded, so an interrupt or a
     /// provider error leaves the text block holding whatever arrived first. Ending the *episode* is
     /// what flushes it, which is what puts it under the turn it belongs to. Flushed by the next
@@ -3154,14 +3339,13 @@ mod frontend_tests {
 mod tests {
     use super::*;
 
-    /// Enumerates every `FrontendEvent` variant against the indicator decision.
+    /// Pins the events whose action is *not* the common one, plus a sample of those that are.
     ///
-    /// The dispatch has a catch-all, so a variant added later is absorbed silently as `Commit` --
-    /// right for most events and wrong for any that renders in the indicator's place or arrives
-    /// after its line is gone. Listing them here forces that choice to be made deliberately: adding
-    /// a variant without adding it below leaves this test failing on the count.
+    /// Completeness is the compiler's job, not this test's: `indicator_action` matches every
+    /// variant explicitly, so a new one fails to build until somebody chooses. What is left here is
+    /// the part a type cannot state -- that the three exceptions are the exceptions.
     #[test]
-    fn test_every_event_has_a_deliberate_indicator_action() {
+    fn test_the_indicator_exceptions_are_the_exceptions() {
         use crate::frontend::FrontendEvent as E;
 
         let cases: Vec<(E, IndicatorAction)> = vec![
@@ -3170,6 +3354,10 @@ mod tests {
                     estimated_tokens: Some(50),
                 },
                 IndicatorAction::Keep,
+            ),
+            (
+                E::ThinkingDelta("reasoning".to_string()),
+                IndicatorAction::Erase,
             ),
             (
                 E::ThinkingBlock {
@@ -3246,11 +3434,20 @@ mod tests {
 
         for (event, expected) in &cases {
             assert_eq!(
-                indicator_action(event),
+                indicator_action(event, true),
                 *expected,
                 "unexpected indicator action for {event:?}",
             );
         }
+
+        // The one event whose answer depends on the setting. Under the default the deltas render
+        // nothing, so taking the counter down would replace it with an empty row -- and since an
+        // estimate and a delta arrive from one wire event under the token-count beta, the next
+        // estimate would reopen the indicator instead of redrawing it, losing the peak.
+        assert_eq!(
+            indicator_action(&E::ThinkingDelta("reasoning".to_string()), false),
+            IndicatorAction::Keep,
+        );
     }
 
     /// The server's estimate is not monotonic -- a single thinking block was observed reporting

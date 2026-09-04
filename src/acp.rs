@@ -541,6 +541,9 @@ impl Frontend for AcpFrontend {
             // REPL signage an editor has its own UI for -- these two are the opposite case, signals
             // this frontend structurally cannot represent.
             FrontendEvent::ThinkingProgress { .. } | FrontendEvent::ThinkingEnded => return,
+            // ACP takes reasoning whole, from `ThinkingBlock` below. The deltas carry the same text
+            // and forwarding both would double every thought chunk in the thread.
+            FrontendEvent::ThinkingDelta(_) => return,
             FrontendEvent::ThinkingBlock { content, .. } => {
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
                     agent_client_protocol::schema::v1::TextContent::new(content),

@@ -644,6 +644,76 @@ fn a_thinking_block_sits_inside_the_brackets() {
     );
 }
 
+/// Reasoning arrives in chunks that stop wherever the provider's tokeniser did, so a block is one
+/// block however it was cut up: one `Thinking... ` label, and words split across a chunk boundary
+/// rejoined rather than shown broken.
+///
+/// The markers go too. Reasoning is markdown on the backends that emit a summary, where every part
+/// opens with a `**Bold header**` line, so a renderer that shows the asterisks shows them on every
+/// block those backends produce.
+#[test]
+fn a_thinking_block_split_across_deltas_renders_as_one() {
+    const SPLIT: &str = r#"[
+ [{"kind":"thinking_delta","text":"**Weighing the op"},
+  {"kind":"thinking_delta","text":"tions**\n\nBoth are fine."},
+  {"kind":"thinking_complete"},
+  {"kind":"text","text":"Here is the answer."},
+  {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = Install::new(true, true, "\n[thinking]\nshow_content = true\n");
+    let rows = run_repl(&install, SPLIT, &["think about it", "/exit"]);
+
+    let body = between(&rows, "> think about it", "> /exit");
+    assert_eq!(
+        body.iter()
+            .filter(|row| row.contains("Thinking..."))
+            .count(),
+        1,
+        "one label for one block: {body:#?}"
+    );
+    assert!(
+        body.iter().any(|row| row.contains("Weighing the options")),
+        "the split word was rejoined: {body:#?}"
+    );
+    assert!(
+        !body.iter().any(|row| row.contains("**")),
+        "the emphasis markers are styling now, not text: {body:#?}"
+    );
+    assert!(
+        body.iter().any(|row| row.contains("Both are fine.")),
+        "and the rest of the block followed: {body:#?}"
+    );
+    assert!(
+        body.iter().any(|row| row.contains("Here is the answer")),
+        "with the answer after it: {body:#?}"
+    );
+}
+
+/// The default. The block collapses onto the label's row, and the emphasis in it is styling there
+/// too: this is the line most people see, so it cannot be the one that still shows asterisks.
+#[test]
+fn without_show_content_a_thinking_block_is_one_formatted_line() {
+    const SPLIT: &str = r#"[
+ [{"kind":"thinking_delta","text":"**Weighing the options.**\nThe second line."},
+  {"kind":"thinking_complete"},
+  {"kind":"text","text":"Here is the answer."},
+  {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = Install::new(true, true, "");
+    let rows = run_repl(&install, SPLIT, &["think about it", "/exit"]);
+
+    let body = between(&rows, "> think about it", "> /exit");
+    assert!(
+        body.iter()
+            .any(|row| row.contains("Thinking... Weighing the options. The second line.")),
+        "the preview keeps its inline label and flattens the break: {body:#?}"
+    );
+    assert!(
+        !body.iter().any(|row| row.contains("**")),
+        "and its markers are styling, not text: {body:#?}"
+    );
+}
+
 /// A provider notice renders as a hint inside the turn, between the same brackets as everything
 /// else rather than beside them.
 #[test]
@@ -830,6 +900,118 @@ fn a_warning_raised_during_a_turn_is_not_erased_by_the_turn() {
     assert!(
         turn.iter().any(|row| row.contains("recovered answer")),
         "and the answer it was waiting for has to follow it: {turn:#?}"
+    );
+}
+
+/// Showing reasoning costs the turn its retry, rather than showing the reasoning twice.
+///
+/// The retry is gated on nothing model-produced having reached a consumer, and reasoning reaches
+/// one only when it is being rendered. So the same failure recovers under the default (the line
+/// shown is built from a completed block, which a failed attempt never reaches) and does not
+/// recover here, where the deltas are already on screen and a second attempt would repeat them.
+/// `a_warning_raised_during_a_turn_is_not_erased_by_the_turn` pins the other half with the same
+/// script.
+#[test]
+fn showing_reasoning_trades_the_retry_for_not_repeating_it() {
+    let install = Install::new(true, true, "\n[thinking]\nshow_content = true\n");
+    let rows = run_repl(&install, RETRIES_MID_TURN, &["boom", "again", "/exit"]);
+
+    let turn = between(&rows, "> boom", "> again");
+    assert_eq!(
+        turn.iter()
+            .filter(|row| row.contains("weighing the options"))
+            .count(),
+        1,
+        "the reasoning reached the screen more than once: {turn:#?}"
+    );
+    assert!(
+        !turn.iter().any(|row| row.contains("recovered answer")),
+        "the turn retried after its reasoning was already shown: {turn:#?}"
+    );
+}
+
+/// A running token estimate never draws over reasoning already on the screen.
+///
+/// Claude's token-count beta reports an estimate from the *same* wire event that carries a visible
+/// delta, so the two alternate for the whole block. Drawing the counter closes the streamed block
+/// to free the row, and the next delta opens a fresh one behind a second `Thinking... ` label --
+/// once per delta, which shreds one block into a labelled fragment per chunk.
+///
+/// Driven through a pty because the guard sits in front of terminal-only drawing:
+/// `live_indicator_supported` is false in every ordinary test process, so nothing there can reach
+/// the code this protects.
+#[test]
+fn a_token_estimate_never_shreds_the_reasoning_it_counts() {
+    const COUNTED: &str = r#"[
+ [{"kind":"thinking_delta","text":"First I weigh it. "},
+  {"kind":"thinking_progress","estimated_tokens":16},
+  {"kind":"thinking_delta","text":"Then I settle it. "},
+  {"kind":"thinking_progress","estimated_tokens":32},
+  {"kind":"thinking_delta","text":"Then I say so."},
+  {"kind":"thinking_progress","estimated_tokens":48},
+  {"kind":"thinking_complete"},
+  {"kind":"text","text":"Here is the answer."},
+  {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = Install::new(true, true, "[thinking]\nshow_content = true\n");
+    let rows = run_repl(&install, COUNTED, &["think about it", "/exit"]);
+
+    let labels = rows
+        .iter()
+        .filter(|row| row.contains("Thinking... "))
+        .count();
+    assert_eq!(
+        labels, 1,
+        "the block was relabelled once per estimate: {rows:#?}"
+    );
+    let reasoning: String = rows.join(" ");
+    assert!(
+        reasoning.contains("First I weigh it.")
+            && reasoning.contains("Then I settle it.")
+            && reasoning.contains("Then I say so."),
+        "an estimate landed on top of a chunk: {rows:#?}"
+    );
+}
+
+/// Resuming replays the reasoning it recorded, rendered the way the live turn rendered it.
+///
+/// The replay path builds its own renderer rather than sharing the live one's, so nothing but a
+/// resume exercises it: delete the call and every other test stays green, which is how `/history`
+/// and `resume_show_recent` could stop showing reasoning entirely without a failure.
+///
+/// Two runs against one install: the pty harness always passes `-c`, so the second resumes the
+/// session the first recorded.
+#[test]
+fn a_resumed_session_replays_the_reasoning_it_recorded() {
+    const REASONED: &str = r#"[
+ [{"kind":"thinking_delta","text":"**Weighing it** then deciding."},
+  {"kind":"thinking_complete"},
+  {"kind":"text","text":"Here is the answer."},
+  {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = Install::new(
+        true,
+        true,
+        "resume_show_recent = 1\n\n[thinking]\nshow_content = true\n",
+    );
+    let first = run_repl(&install, REASONED, &["think about it", "/exit"]);
+    assert!(
+        first
+            .iter()
+            .any(|row| row.contains("Weighing it then deciding")),
+        "the live turn has to render it before a replay can repeat it: {first:#?}"
+    );
+
+    let resumed = run_repl(&install, REASONED, &["/exit"]);
+    assert!(
+        resumed
+            .iter()
+            .any(|row| row.contains("Weighing it then deciding")),
+        "the resumed session dropped the reasoning it recorded: {resumed:#?}"
+    );
+    assert!(
+        !resumed.iter().any(|row| row.contains("**")),
+        "and replays it rendered, not as source: {resumed:#?}"
     );
 }
 

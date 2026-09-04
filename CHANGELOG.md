@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-09-04
+
 ### Added
 
 - `meka session show <id>` prints one session in full, including its whole id.
@@ -24,29 +26,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka session list` fits 120 columns instead of 158, spending the width on a longer preview.
 - `/tasks` fits 120 columns instead of ~138, bounding the tool name and elapsed time.
 - Cancelling a background task costs no turn; its report rides your next turn or a job's.
-- **Breaking:** `meka session delete` refuses explicit ids with `--all`, as `--older-than-days` does.
+- Under `[thinking].show_content`, reasoning streams as it arrives instead of landing in one lump.
+- Reasoning follows `display.render_mode`, in dark grey throughout, so emphasis shows as bold.
+- The one-line thinking preview styles its markdown too, rather than printing the markers.
+- A shown thinking block has no height limit; asking to see the reasoning asks to see all of it.
+- Showing reasoning costs a turn its retry on a transient failure, rather than sending it twice.
+- **Breaking:** SSE `thinking.delta` sends one chunk per event; concatenate them for the block.
+- **Breaking:** `meka session delete` refuses ids given with `--all`, as `--older-than-days` does.
+
+### Removed
+
+- **Breaking:** the `silent` render mode, which suppressed the answer and kept every bit of chrome.
+- `meka schedule list` drops its `When`, `Check` and `Held` columns; `schedule show` carries them.
 
 ### Fixed
 
+- A turn that did not stream now shows its reasoning; `--no-stream` displayed none at all.
+- A block ending on a paragraph break no longer doubles the blank line before whatever follows it.
 - No meka command panics when the reader stops reading; `meka … | head` exits cleanly throughout.
 - A stdout that cannot take the output fails the command; a reader that hung up does not.
-- meka no longer prints a blank line against your shell prompt, above its first line or below its last.
+- meka prints no blank line against your shell prompt, above its first line or below its last.
 - `Leaving session:` and the background-task notice below it are no longer split by a blank line.
-- `task.finished` fires when a task ends, so an interrupted one is announced even if never reported.
+- `task.finished` fires when a task ends, so an interrupted one is announced even if unreported.
 - An empty id prefix matches nothing, instead of cancelling the only job or task in the session.
 - An uppercase id prefix resolves a job or task, as it already resolved a session.
 - A background outcome is no longer discarded unread when the turn that would report it cannot run.
 - `meka session delete` exits non-zero when a session it was asked to delete was not deleted.
 
-### Removed
-
-- `meka schedule list` drops its `When`, `Check` and `Held` columns; `schedule show` carries them.
-
 ### Security
 
 - `meka session list` sanitises its preview and timestamp cells, which reached the terminal raw.
 - `/tasks` sanitises the command line and result excerpt it renders, which were passed through raw.
-- `meka mcp tools` sanitises the tool name, which a server chose and which reached the terminal raw.
+- `meka mcp tools` sanitises the server-chosen tool name, which reached the terminal raw.
 
 ## [0.44.4] - 2026-09-02
 
@@ -1821,7 +1832,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.44.4...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.45.0...HEAD
+[0.45.0]: https://github.com/k4yt3x/meka/compare/0.44.4...0.45.0
 [0.44.4]: https://github.com/k4yt3x/meka/compare/0.44.3...0.44.4
 [0.44.3]: https://github.com/k4yt3x/meka/compare/0.44.2...0.44.3
 [0.44.2]: https://github.com/k4yt3x/meka/compare/0.44.1...0.44.2

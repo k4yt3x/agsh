@@ -125,6 +125,32 @@ output, it needs updating; the default columns are unchanged.
 still goes home. The old behaviour made a bare `/cd` a surprising way to leave the project you were
 working in.
 
+**`render_mode = "silent"` is gone**, as are `--render-mode silent` and `MEKA_RENDER_MODE=silent`.
+Delete the setting: `termimad` is the default.
+
+A config still carrying it fails to parse, naming the value and the line, and `--render-mode silent`
+is refused by clap. `MEKA_RENDER_MODE=silent` is the quiet one: an unreadable value there has always
+been dropped in favour of the next source, so it falls through to your config file or the default
+rather than saying anything.
+
+It never did what it says. It suppressed the model's answer and nothing else, so a run under it
+printed the session id, the reasoning line, tool indicators, todo lists, notices and token usage,
+and dropped the one thing you were waiting for. Both things it might plausibly have meant are
+shell redirections that already work, and work the right way round: `meka … 2>/dev/null` keeps the
+answer and drops the chrome, `meka … >/dev/null 2>&1` drops both.
+
+**SSE `thinking.delta` now carries one chunk of reasoning per event.** It used to send one event per
+completed block, so a client that opted into `supports_reasoning_stream` and rendered each event as a
+whole block will now show fragments. Concatenate the deltas to rebuild the block, exactly as you
+already do for `assistant_text.delta`. A client that concatenated needs no change, and one that never
+set the capability sees nothing new. A turn the provider answered without streaming still arrives as
+a single delta, so there are no two shapes to tell apart, and `stream: false` still reports each block
+whole in `thinking`.
+
+One consequence worth planning for: a session receiving reasoning gives up its retry on a transient
+provider failure, because the deltas have already reached you and a second attempt would repeat them.
+Leave `supports_reasoning_stream` off if you would rather have the retry.
+
 **`meka session delete` refuses ids given alongside `--all`.** It used to take both and quietly do
 the wider thing, so `meka session delete "$ID" --all` with `$ID` unset deleted every session and
 then reported the empty id as a failure -- a complete wipe reported as an error. Naming sessions and

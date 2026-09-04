@@ -501,7 +501,9 @@ impl HttpFrontend {
     /// broadcast.
     fn event_passes_capability_filter(&self, event: &FrontendEvent) -> bool {
         match event {
-            FrontendEvent::ThinkingBlock { .. } => self.capabilities.supports_reasoning_stream,
+            FrontendEvent::ThinkingDelta(_) | FrontendEvent::ThinkingBlock { .. } => {
+                self.capabilities.supports_reasoning_stream
+            }
             _ => true,
         }
     }
@@ -682,6 +684,31 @@ impl Frontend for HttpFrontend {
     // `delegate_fs_read` / `_fs_write` / `_execute` keep the trait defaults (all return `None`).
     // The HTTP frontend does not expose client-hosted tool delegation. Returning `None`
     // routes the call to the agent's local I/O path.
+
+    /// Reasoning leaves this frontend only as `thinking.delta`, which the stream tells clients to
+    /// concatenate to rebuild the block. A retry that re-sent them would double whatever the client
+    /// rebuilt, so a session receiving them has to cost the turn its retry.
+    ///
+    /// Both halves are needed. The capability alone is the session's *permission* to receive
+    /// reasoning, not evidence that it did: a blocking turn has nothing listening, so the deltas
+    /// reach the recorder and [`super::handlers::turn`] drops them there, serving whole blocks
+    /// instead. Answering on the capability alone refuses the retry on every blocking turn of such
+    /// a session, for reasoning nobody was sent, and reasoning is the first thing a turn produces.
+    ///
+    /// A block *can* complete and the attempt fail after it, so what keeps the whole-block readers
+    /// safe is not that they hear nothing: it is that neither emitter of the block can be followed
+    /// by a retry. The streaming one marks the turn started in the same branch; the non-streaming
+    /// one re-emits a whole message only once the provider call has returned `Ok`, past its own
+    /// retry loop.
+    ///
+    /// The second half is [`Self::is_streaming`] rather than a slot test of its own, for exactly
+    /// the reason that method's own comment gives: a `TurnStream` outlives its turn so a late
+    /// reconnect can read the tail, so the slot stays occupied for the rest of the session once any
+    /// turn has streamed. Asking whether the slot is filled answers "yes" for every later blocking
+    /// turn on that session.
+    fn retains_reasoning(&self) -> bool {
+        self.capabilities.supports_reasoning_stream && self.is_streaming()
+    }
 
     /// SSE-mode disconnect detection, with a reconnect grace period.
     ///
@@ -967,6 +994,12 @@ mod tests {
         let frontend = HttpFrontend::with_capabilities(SessionCapabilities::default());
         let (mut receiver, _ids) =
             frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
+        // The delta is what carries reasoning onto the wire, so it is what the capability has to
+        // gate. Emitting only the block would leave this passing with the filter deleted, since
+        // `sse::translate` drops the block whatever the capability says.
+        frontend
+            .emit(FrontendEvent::ThinkingDelta("musing".into()))
+            .await;
         frontend
             .emit(FrontendEvent::ThinkingBlock {
                 content: "musing".into(),
@@ -991,9 +1024,9 @@ mod tests {
             super::SseEventType::AssistantTextDelta
         );
 
-        // The recorder still has both events (blocking-mode JSON path is unaffected).
+        // The recorder still has all three (blocking-mode JSON path is unaffected).
         let recorder = frontend.drain();
-        assert_eq!(recorder.len(), 2);
+        assert_eq!(recorder.len(), 3);
     }
 
     #[tokio::test]
@@ -1005,9 +1038,7 @@ mod tests {
         let (mut receiver, _ids) =
             frontend.install_stream(16, 16, Duration::from_secs(30), uuid::Uuid::nil());
         frontend
-            .emit(FrontendEvent::ThinkingBlock {
-                content: "musing".into(),
-            })
+            .emit(FrontendEvent::ThinkingDelta("musing".into()))
             .await;
         frontend.end_stream();
         let event = receiver.try_recv().expect("thinking event should stream");

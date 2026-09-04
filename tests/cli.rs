@@ -1098,6 +1098,67 @@ fn write_capable_config(dir: &std::path::Path) {
     .expect("write config.toml");
 }
 
+/// Reasoning reaches the terminal whether or not the turn streamed.
+///
+/// The blocking path returns the message whole, with no event channel to have put its thinking on
+/// while it was being written, so `run_turn` has to re-emit each block by hand. A frontend renders
+/// reasoning from those events and from nothing else, which makes the loop that re-emits them the
+/// only thing standing between a `--no-stream` turn and no sign the model reasoned at all.
+///
+/// Asserted on stderr, which is where reasoning belongs: it is chrome, and a pipe reading stdout
+/// must see only the answer.
+#[test]
+fn reasoning_is_shown_on_a_turn_that_did_not_stream() {
+    const REASONED: &str = r#"[
+  [{"kind":"thinking_delta","text":"weighing the options"},
+   {"kind":"thinking_complete"},
+   {"kind":"text","text":"the answer"},
+   {"kind":"message_end","stop_reason":"end_turn"}]
+]"#;
+    for extra in [vec![], vec!["--no-stream"]] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("meka");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "default_provider = \"mock\"\n\n[providers.mock]\ntype = \
+             \"anthropic-messages\"\nmodel = \"claude-sonnet-4-5\"\n\n[thinking]\nshow_content = \
+             true\n",
+        )
+        .expect("write config.toml");
+
+        let mut args = extra.clone();
+        args.extend(["--oneshot", "ponder"]);
+        let run = run_scripted_from(dir.path(), dir.path(), REASONED, &args);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "run failed with {:?}: {}",
+            extra,
+            stderr
+        );
+        assert!(
+            stderr.contains("weighing the options"),
+            "reasoning missing from stderr with {:?}:\n{}",
+            extra,
+            stderr
+        );
+        assert!(
+            !stdout.contains("weighing the options"),
+            "reasoning must not reach stdout with {:?}:\n{}",
+            extra,
+            stdout
+        );
+        assert!(
+            stdout.contains("the answer"),
+            "the answer belongs on stdout with {:?}:\n{}",
+            extra,
+            stdout
+        );
+    }
+}
+
 /// A resumed session reopens where it was recorded, not where this shell happens to be.
 ///
 /// At `workspace` the working directory *is* the writable boundary, so taking the shell's would

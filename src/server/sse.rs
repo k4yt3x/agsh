@@ -159,14 +159,21 @@ pub fn translate(
             // Closes a transient indicator this stream never carried; see `ThinkingProgress`.
             return None;
         }
-        FrontendEvent::ThinkingBlock { content, .. } => {
+        FrontendEvent::ThinkingDelta(text) => {
             if !capabilities.supports_reasoning_stream {
                 return None;
             }
             (
                 SseEventType::ThinkingDelta,
-                serde_json::json!({ "text": content }),
+                serde_json::json!({ "text": text }),
             )
+        }
+        FrontendEvent::ThinkingBlock { .. } => {
+            // Not forwarded. The deltas above already carried this text, and the agent emits them
+            // for every block that has any -- including the ones a non-streaming provider hands
+            // back whole -- so forwarding the block as well would deliver the reasoning twice. The
+            // blocking response still reads it from the recorder, which sees both.
+            return None;
         }
         // The only event that separates "the model is writing a message" from any other work in a
         // turn: assistant text is usually narration around a call, and `tool_call.executing`
@@ -335,16 +342,35 @@ mod tests {
     }
 
     #[test]
-    fn translate_thinking_block_emits_when_capability_enabled() {
-        let event = FrontendEvent::ThinkingBlock {
-            content: "musing".into(),
-        };
+    fn translate_thinking_delta_emits_when_capability_enabled() {
         let capabilities = SessionCapabilities {
             supports_reasoning_stream: true,
             ..Default::default()
         };
-        let (event_type, _data) = translate(event, capabilities).expect("translates");
+        let (event_type, data) =
+            translate(FrontendEvent::ThinkingDelta("musing".into()), capabilities)
+                .expect("translates");
         assert_eq!(event_type, SseEventType::ThinkingDelta);
+        assert_eq!(data["text"], "musing");
+    }
+
+    /// The deltas above already carried the block's text, and the agent emits them for every block
+    /// that has any, so forwarding the block as well would put the reasoning on the wire twice.
+    #[test]
+    fn translate_drops_the_whole_thinking_block_the_deltas_already_carried() {
+        let capabilities = SessionCapabilities {
+            supports_reasoning_stream: true,
+            ..Default::default()
+        };
+        assert!(
+            translate(
+                FrontendEvent::ThinkingBlock {
+                    content: "musing".into(),
+                },
+                capabilities,
+            )
+            .is_none()
+        );
     }
 
     #[test]

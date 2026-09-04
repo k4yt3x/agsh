@@ -2675,6 +2675,215 @@ fn thinking_delta_streams_with_capability_enabled() {
          body was:\n{}",
         body,
     );
+    // The agent emits the deltas *and* the whole block behind them, for the consumers that want
+    // reasoning in one piece. Forwarding both here would put the same text on the wire twice.
+    assert_eq!(
+        body.matches("let me check").count(),
+        1,
+        "the reasoning reached the wire more than once; body was:\n{}",
+        body,
+    );
+}
+
+/// A retry must not send the reasoning again.
+///
+/// The stream tells clients to concatenate `thinking.delta` payloads to reassemble the block, so a
+/// second copy is not a cosmetic repeat: it is the block doubled in whatever the client rebuilt.
+/// `content_started` is what stops the retry once model output has been forwarded, and reasoning is
+/// model output like the answer is.
+#[test]
+fn a_retry_does_not_send_the_reasoning_twice() {
+    let script = serde_json::json!([
+        [
+            { "kind": "thinking_delta", "text": "weighing the options" },
+            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+        ],
+        [
+            { "kind": "thinking_delta", "text": "weighing the options" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "text", "text": "answer" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "capabilities": {"supports_reasoning_stream": true},
+        }))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "ponder", "stream": true}))
+        .send()
+        .expect("stream");
+    let body = response.text().expect("body");
+    assert_eq!(
+        body.matches("weighing the options").count(),
+        1,
+        "the retry re-sent reasoning the client had already been given; body was:\n{}",
+        body,
+    );
+}
+
+/// A blocking turn keeps its retry, whatever the session's reasoning capability says.
+///
+/// The capability is permission to *receive* reasoning, not evidence of having received it: a
+/// blocking turn installs no stream, so the deltas never leave the frontend and the response is
+/// assembled from whole blocks, which a failed attempt never produces. Refusing the retry there
+/// spends a recoverable turn for nothing -- on essentially every transient failure, since reasoning
+/// is the first thing a turn produces.
+#[test]
+fn a_blocking_turn_retries_even_with_reasoning_enabled() {
+    let script = serde_json::json!([
+        [
+            { "kind": "thinking_delta", "text": "weighing the options" },
+            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+        ],
+        [
+            { "kind": "thinking_delta", "text": "weighing the options" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "text", "text": "answer" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "capabilities": {"supports_reasoning_stream": true},
+        }))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "ponder", "stream": false}))
+        .send()
+        .expect("turn");
+    assert_eq!(
+        response.status(),
+        200,
+        "the blocking turn gave up its retry: {}",
+        response.text().unwrap_or_default()
+    );
+    let body = response.json::<serde_json::Value>().expect("parse");
+    assert_eq!(body["final_text"], "answer");
+}
+
+/// The retry survives a blocking turn that follows a streamed one on the same session.
+///
+/// A `TurnStream` outlives its turn so a late reconnect can still read the tail, so the slot stays
+/// occupied for the rest of the session. Asking whether it is filled -- rather than whether
+/// anything is listening -- answered "reasoning was delivered" for every later blocking turn, and
+/// spent its retry. The single-turn test above cannot see this, because the session has never
+/// streamed.
+#[test]
+fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
+    let script = serde_json::json!([
+        [
+            { "kind": "thinking_delta", "text": "first turn" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "text", "text": "one" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "thinking_delta", "text": "second turn" },
+            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+        ],
+        [
+            { "kind": "thinking_delta", "text": "second turn" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "text", "text": "two" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "capabilities": {"supports_reasoning_stream": true},
+        }))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let streamed = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "one", "stream": true}))
+        .send()
+        .expect("stream");
+    assert_eq!(streamed.status(), 200);
+    drop(streamed.text());
+
+    let blocking = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "two", "stream": false}))
+        .send()
+        .expect("turn");
+    assert_eq!(
+        blocking.status(),
+        200,
+        "the blocking turn gave up its retry because an earlier turn had streamed: {}",
+        blocking.text().unwrap_or_default()
+    );
+}
+
+/// Reasoning arrives in chunks, and each one is its own `thinking.delta`. The count is the
+/// assertion: a client concatenating the payloads gets the block back either way, so only the
+/// number of events distinguishes a stream from a single lump.
+#[test]
+fn thinking_deltas_stream_one_event_per_chunk() {
+    let script = serde_json::json!([
+        [
+            { "kind": "thinking_delta", "text": "first thought " },
+            { "kind": "thinking_delta", "text": "second thought" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "text", "text": "answer" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "capabilities": {"supports_reasoning_stream": true},
+        }))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .json(&serde_json::json!({"message": "ponder", "stream": true}))
+        .send()
+        .expect("stream");
+    let body = response.text().expect("body");
+    assert_eq!(
+        body.matches("event: thinking.delta").count(),
+        2,
+        "one event per chunk; body was:\n{}",
+        body,
+    );
+    assert_eq!(body.matches("first thought").count(), 1, "{}", body);
+    assert_eq!(body.matches("second thought").count(), 1, "{}", body);
 }
 
 /// With the default `capabilities.supports_reasoning_stream: false`, scripted thinking

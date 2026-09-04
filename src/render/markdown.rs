@@ -40,13 +40,16 @@ enum OwnedLine {
 }
 
 /// Owned mirror of minimad's [`Compound`]: a run of text plus the styles covering it.
+///
+/// Readable outside the module because it is also what [`inline_runs`] hands back, for the callers
+/// that lay text out themselves and want only the styling this module resolves.
 #[derive(Clone, Default)]
-struct OwnedCompound {
-    text: String,
-    bold: bool,
-    italic: bool,
-    code: bool,
-    strikeout: bool,
+pub(super) struct OwnedCompound {
+    pub(super) text: String,
+    pub(super) bold: bool,
+    pub(super) italic: bool,
+    pub(super) code: bool,
+    pub(super) strikeout: bool,
 }
 
 impl OwnedCompound {
@@ -58,6 +61,28 @@ impl OwnedCompound {
         compound.strikeout = self.strikeout;
         compound
     }
+}
+
+/// The styled runs of `markdown`, with its block structure discarded.
+///
+/// For a caller that has already flattened its text to one line and does its own layout, so
+/// termimad has nothing left to do: what it wants from this module is only the answer to "which
+/// part of this was emphasis", which is the half a hand-rolled scanner gets wrong. CommonMark
+/// emphasis is context-sensitive enough that `snake_case` and `2 * 3 * 4` both hinge on rules worth
+/// having a real parser for.
+///
+/// Blocks are concatenated in order with nothing between them, since a caller in this position has
+/// no rows to separate: a heading's text is its runs, and a blank line contributes none.
+pub(super) fn inline_runs(markdown: &str) -> Vec<OwnedCompound> {
+    MarkdownDoc::parse(markdown)
+        .lines
+        .into_iter()
+        .flat_map(|line| match line {
+            OwnedLine::Composite { compounds, .. } => compounds,
+            OwnedLine::TableRow(cells) => cells.into_iter().flatten().collect(),
+            OwnedLine::TableRule(_) | OwnedLine::HorizontalRule => Vec::new(),
+        })
+        .collect()
 }
 
 fn to_composite(style: CompositeStyle, compounds: &[OwnedCompound]) -> Composite<'_> {

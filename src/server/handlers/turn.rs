@@ -1257,6 +1257,9 @@ fn assemble_response(
             {
                 thinking_segments.push(content);
             }
+            // The block above already carries this text whole. Accumulating the deltas as well
+            // would report every segment twice.
+            FrontendEvent::ThinkingDelta(_) => {}
             FrontendEvent::ToolCallStarted {
                 id,
                 name,

@@ -2299,12 +2299,47 @@ impl Agent {
                 // that succeeded shows the user nothing at all. Emitted per round, matching the
                 // streaming path, so text the model writes before a tool call still precedes the
                 // indicator `execute_tool_calls` emits for it.
+                //
+                // Reasoning goes through the same shape, delta then block, which is what makes
+                // `ThinkingDelta`'s promise hold on this path too: a frontend reading the deltas
+                // gets one covering the whole block rather than nothing at all.
                 if !self.options.streaming {
                     for block in &assistant_message.content {
-                        if let ContentBlock::Text { text } = block {
-                            self.frontend
-                                .emit(FrontendEvent::AssistantTextDelta(text.clone()))
-                                .await;
+                        match block {
+                            ContentBlock::Text { text } => {
+                                self.frontend
+                                    .emit(FrontendEvent::AssistantTextDelta(text.clone()))
+                                    .await;
+                            }
+                            // `trim` rather than `is_empty`, matching the question replay asks of
+                            // the same block in `render::render_message_history`: a block of
+                            // whitespace has nothing to show, and the two must not disagree about
+                            // that or a resumed transcript gains a block the live turn skipped.
+                            ContentBlock::Thinking { thinking, .. }
+                                if !thinking.trim().is_empty() =>
+                            {
+                                self.frontend
+                                    .emit(FrontendEvent::ThinkingDelta(thinking.clone()))
+                                    .await;
+                                self.frontend
+                                    .emit(FrontendEvent::ThinkingBlock {
+                                        content: thinking.clone(),
+                                    })
+                                    .await;
+                            }
+                            ContentBlock::RedactedThinking { .. } => {
+                                self.frontend
+                                    .emit(FrontendEvent::ThinkingDelta(
+                                        crate::render::REDACTED_THINKING.to_string(),
+                                    ))
+                                    .await;
+                                self.frontend
+                                    .emit(FrontendEvent::ThinkingBlock {
+                                        content: crate::render::REDACTED_THINKING.to_string(),
+                                    })
+                                    .await;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2730,7 +2765,20 @@ impl Agent {
         while let Some(event) = event_receiver.recv().await {
             match event {
                 StreamEvent::ThinkingDelta(text) => {
+                    // Marked like `StreamEvent::TextDelta` marks its first chunk, and for the same
+                    // reason: this is model output a consumer now holds, and a retry would send it
+                    // again. Not the `Notice` exemption -- a notice is meka's own advisory, queued
+                    // before the request is even sent.
+                    //
+                    // Asked of the frontend rather than assumed, because reasoning is the *first*
+                    // thing a turn produces: marking every turn that reasoned would refuse the
+                    // retry for almost any mid-turn failure, which is exactly when an overloaded
+                    // provider needs one. A frontend that discards these loses nothing to a retry.
+                    if self.frontend.retains_reasoning() {
+                        *content_started = true;
+                    }
                     current_thinking.push_str(&text);
+                    self.frontend.emit(FrontendEvent::ThinkingDelta(text)).await;
                 }
                 StreamEvent::ThinkingProgress { estimated_tokens } => {
                     // Deliberately does not set `content_started`: this is a transient indicator
@@ -2742,7 +2790,15 @@ impl Agent {
                 }
                 StreamEvent::ThinkingComplete { opaque } => {
                     let content = std::mem::take(&mut current_thinking);
-                    if content.is_empty() {
+                    // Whether there is anything to *show*, which is the question
+                    // `render::render_message_history` asks of the same block on replay, so a
+                    // resumed transcript cannot gain or lose a block against the live turn.
+                    //
+                    // The deltas above are not held to it: whitespace is content mid-block -- the
+                    // Responses API separates two summary parts with a bare `\n\n` delta -- so the
+                    // question can only be asked once the block is whole, which is here.
+                    let showable = !content.trim().is_empty();
+                    if !showable {
                         // Nothing to render, but the block is over: say so, so a frontend showing a
                         // live indicator can close it here instead of holding the line open for an
                         // event that may never come.
@@ -2752,8 +2808,10 @@ impl Agent {
                     // something opaque. Under `redact-thinking` the text is empty but the signature
                     // must survive to continue the reasoning chain on the next turn, and under the
                     // Responses API the sealed reasoning is the whole of what can be replayed.
+                    // Asked of the raw text rather than the trimmed one: what the provider will
+                    // accept back is not a question about what is worth showing.
                     if !content.is_empty() || opaque.is_some() {
-                        if !content.is_empty() {
+                        if showable {
                             *content_started = true;
                             self.frontend
                                 .emit(FrontendEvent::ThinkingBlock {
@@ -2769,9 +2827,18 @@ impl Agent {
                 }
                 StreamEvent::RedactedThinking { data } => {
                     *content_started = true;
+                    // Delta then block, like every other block carrying visible text. The marker is
+                    // meka's own words rather than the model's, but a frontend that reads the
+                    // deltas would otherwise be the only one that never hears about a redacted
+                    // block at all.
+                    self.frontend
+                        .emit(FrontendEvent::ThinkingDelta(
+                            crate::render::REDACTED_THINKING.to_string(),
+                        ))
+                        .await;
                     self.frontend
                         .emit(FrontendEvent::ThinkingBlock {
-                            content: "[redacted thinking]".to_string(),
+                            content: crate::render::REDACTED_THINKING.to_string(),
                         })
                         .await;
                     content_blocks.push(ContentBlock::RedactedThinking { data });

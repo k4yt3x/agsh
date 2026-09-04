@@ -112,11 +112,6 @@ pub enum RenderMode {
     #[serde(alias = "rich")]
     Termimad,
     Raw,
-    /// Emits no output to stdout/stderr. Used by sub-agents and any other in-process
-    /// [`crate::agent::Agent`] that shouldn't leak to the user's terminal. The
-    /// [`StreamingRenderer`] no-ops for this mode and the `render::*` helpers short-circuit on
-    /// `matches!(mode, RenderMode::Silent)` at each call site.
-    Silent,
 }
 
 impl std::fmt::Display for RenderMode {
@@ -125,7 +120,6 @@ impl std::fmt::Display for RenderMode {
             RenderMode::Syntect => write!(formatter, "syntect"),
             RenderMode::Termimad => write!(formatter, "termimad"),
             RenderMode::Raw => write!(formatter, "raw"),
-            RenderMode::Silent => write!(formatter, "silent"),
         }
     }
 }
@@ -162,9 +156,8 @@ impl std::str::FromStr for RenderMode {
             "syntect" => Ok(RenderMode::Syntect),
             "rich" | "termimad" => Ok(RenderMode::Termimad),
             "raw" => Ok(RenderMode::Raw),
-            "silent" => Ok(RenderMode::Silent),
             other => Err(format!(
-                "unknown render mode '{}' (expected 'syntect', 'termimad', 'raw', or 'silent')",
+                "unknown render mode '{}' (expected 'syntect', 'termimad', or 'raw')",
                 other
             )),
         }
@@ -285,6 +278,162 @@ pub fn report_lost_output(what: &str, error: &io::Error) {
     }
 }
 
+/// Which stream a [`StreamingRenderer`] writes to, and therefore whose width it measures.
+///
+/// The two streams differ in what a failure means, so one enum decides both: `Stdout` hands
+/// failures back, because a scripted host has to fail on a lost answer, and `Stderr` swallows them,
+/// because a report would go to the stream that just refused it (see [`write_stderr`]).
+///
+/// It also picks which stream is asked for the terminal width. One field for both is what stops the
+/// two from disagreeing: a renderer measuring a stream it does not write to wraps to a width its
+/// own output never had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    Stdout,
+    Stderr,
+}
+
+impl Sink {
+    fn write(self, text: &str) -> io::Result<()> {
+        match self {
+            Sink::Stdout => write_stdout(text),
+            Sink::Stderr => {
+                write_stderr(text);
+                Ok(())
+            }
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        match self {
+            Sink::Stdout => std::io::IsTerminal::is_terminal(&io::stdout()),
+            Sink::Stderr => std::io::IsTerminal::is_terminal(&io::stderr()),
+        }
+    }
+
+    fn flush(self) -> io::Result<()> {
+        match self {
+            Sink::Stdout => io::stdout().flush(),
+            Sink::Stderr => Ok(()),
+        }
+    }
+}
+
+/// Split `text` into what to write now and how many row endings to hold back.
+///
+/// The last byte is not always the row ending: syntect closes a highlighted line with a reset
+/// *after* its newline, so a plain `trim_end_matches('\n')` finds nothing to hold on that path.
+/// Trailing escapes are stepped over and rejoin the text they belong to, which puts the reset ahead
+/// of the row ending rather than behind it: an attribute left open across one is what `ESC[K` then
+/// erases with (see [`write_own_line_prelude`]).
+fn split_held_newlines(text: &str) -> (String, usize) {
+    let escapes: Vec<(usize, usize)> = CSI_PATTERN
+        .find_iter(text)
+        .map(|found| (found.start(), found.end()))
+        .collect();
+    let mut end = text.len();
+    let mut unread = escapes.len();
+    let mut newlines = 0;
+    let mut peeled = String::new();
+    // Newlines and escapes *alternate* at the end, so both have to be walked. A highlighted code
+    // block is emitted one styled line at a time, so its trailing blank rows arrive as
+    // `\n <reset> \n <colour> \n <reset>` -- stepping over one final run of escapes leaves the
+    // earlier newlines inside the body, where they print as the blank rows the caller is trying to
+    // decide about.
+    loop {
+        if unread > 0 && escapes[unread - 1].1 == end {
+            unread -= 1;
+            let (start, stop) = escapes[unread];
+            peeled.insert_str(0, &text[start..stop]);
+            end = start;
+            continue;
+        }
+        if end > 0 && text.as_bytes()[end - 1] == b'\n' {
+            newlines += 1;
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    (format!("{}{}", &text[..end], peeled), newlines)
+}
+
+/// What the next byte written owes the block it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owes {
+    /// Nothing has been written yet, so the label is still due.
+    Opening,
+    /// A row ended, so the next row starts with the indent.
+    Continuation,
+    /// The cursor is mid-row: a previous write ended without a newline.
+    Nothing,
+}
+
+/// The label and indent worn by a block meka prints *around* model text rather than as the answer.
+///
+/// The indent is a boundary, not decoration. Reasoning printed at column zero in the same grey
+/// `render_session_id` and `render_hint` use renders byte-for-byte like meka's own chrome, and a
+/// model needs no escape sequence to write a line reading `Continuing session: <uuid>`. Applying it
+/// here, at the point bytes leave, is what gives every render mode the boundary from one definition
+/// rather than one per mode.
+#[derive(Debug, Clone, Copy)]
+struct Lead {
+    opening: &'static str,
+    continuation: &'static str,
+    colour: Color,
+}
+
+impl Lead {
+    /// Prefix and colour each row of `text`, returning what to write and what the next write owes.
+    ///
+    /// Pure so the row arithmetic can be tested without a terminal, for the same reason
+    /// [`crate::console::step`] is: a wrong answer here puts model text at column zero, and in a
+    /// dispatch that also prints, the only way to see it is to run a terminal and look.
+    ///
+    /// An empty row wears no prefix and does not spend the opening. Emitting the indent on a blank
+    /// line would leave trailing whitespace, and spending the label there would put it above the
+    /// text instead of in front of it.
+    fn apply(&self, text: &str, mut owes: Owes) -> (String, Owes) {
+        let mut out = String::new();
+        for segment in text.split_inclusive('\n') {
+            let ends_row = segment.ends_with('\n');
+            let content = segment.strip_suffix('\n').unwrap_or(segment);
+            if content.is_empty() {
+                if ends_row {
+                    out.push('\n');
+                    // The row the cursor was mid-way through has ended, so the next one is a
+                    // continuation. An owed opening or continuation survives the blank untouched.
+                    if owes == Owes::Nothing {
+                        owes = Owes::Continuation;
+                    }
+                }
+                continue;
+            }
+            let prefix = match owes {
+                Owes::Opening => self.opening,
+                Owes::Continuation => self.continuation,
+                Owes::Nothing => "",
+            };
+            // Coloured per row rather than per block: a row may be written across several calls,
+            // and crossterm emits the span's closing reset when the value is formatted, so a span
+            // held open across a return has nothing to close it but whatever prints next.
+            out.push_str(&format!(
+                "{}",
+                format!("{}{}", prefix, content).with(self.colour)
+            ));
+            if ends_row {
+                out.push('\n');
+            }
+            owes = if ends_row {
+                Owes::Continuation
+            } else {
+                Owes::Nothing
+            };
+        }
+        (out, owes)
+    }
+}
+
 pub struct StreamingRenderer {
     buffer: String,
     skin: MadSkin,
@@ -292,10 +441,31 @@ pub struct StreamingRenderer {
     pub(crate) started: bool,
     raw_table_lines: Vec<String>,
     code_block_lines: Vec<String>,
-    /// Fixed render width for the termimad path. `None` in production, where the real terminal
-    /// width is the right answer; tests set it so their expected output doesn't depend on the
-    /// terminal the suite happens to run under.
+    /// Fixed render width. `None` for the answer, where the real terminal width is the right
+    /// answer and tests set it so their expected output doesn't depend on the terminal the suite
+    /// happens to run under. Always `Some` for a block wearing a [`Lead`], whose width budget is
+    /// the terminal minus the label.
     width: Option<usize>,
+    sink: Sink,
+    /// The label and indent every row wears, and how much of it the next write owes. `None` for
+    /// the answer, which owns its stream and needs no boundary drawn around it.
+    lead: Option<(Lead, Owes)>,
+    /// Whether a fenced block is syntax-highlighted. False for a block that must stay one colour,
+    /// where [`render_code_block_to_string`]'s 24-bit output would be the one thing in it that
+    /// isn't.
+    highlight_code: bool,
+    /// Blank rows written but not yet released. See [`Self::write`].
+    held_blank_rows: usize,
+    /// Whether the last write left the cursor mid-row. See [`Self::settle_last_row`].
+    row_open: bool,
+    /// Test-only sink standing in for the terminal.
+    ///
+    /// The properties worth testing here -- that no row exceeds the width, and that no row after
+    /// the first starts at column zero -- are properties of the bytes that reach the stream, so a
+    /// test that reconstructed them from the pieces would be asserting about a different function
+    /// than the one that runs.
+    #[cfg(test)]
+    capture: Option<String>,
 }
 
 impl StreamingRenderer {
@@ -303,8 +473,7 @@ impl StreamingRenderer {
         Self {
             buffer: String::new(),
             // Only the termimad path renders through the skin, and building it forces the ~1 MB
-            // syntax-set load. `Raw` and `Silent` otherwise never touch syntect at all, and
-            // `Silent` is what sub-agents run under.
+            // syntax-set load, which `Raw` otherwise never pays for.
             skin: match mode {
                 RenderMode::Termimad => markdown_skin().clone(),
                 _ => MadSkin::default(),
@@ -314,7 +483,50 @@ impl StreamingRenderer {
             raw_table_lines: Vec::new(),
             code_block_lines: Vec::new(),
             width: None,
+            sink: Sink::Stdout,
+            lead: None,
+            highlight_code: true,
+            held_blank_rows: 0,
+            row_open: false,
+            #[cfg(test)]
+            capture: None,
         }
+    }
+
+    /// A renderer for a thinking block: stderr, one colour throughout, behind `Thinking... `.
+    ///
+    /// `Syntect` resolves to `Raw` here, in this one place rather than at each site that would
+    /// otherwise have to remember. Highlighting is that mode's entire content, and its 24-bit theme
+    /// colours cannot be grey, so honouring it would mean reasoning as colourful as the answer.
+    pub fn for_thinking(mode: RenderMode) -> Self {
+        let mode = match mode {
+            RenderMode::Syntect => RenderMode::Raw,
+            other => other,
+        };
+        // Built from `Raw` rather than from `mode`, then given its own skin. Struct-update syntax
+        // evaluates the whole base first, so taking it from `mode` would build `markdown_skin()` --
+        // paying the ~1 MB syntax-set load `Self::new`'s own comment is about -- for a value thrown
+        // away on the next line.
+        let mut renderer = Self::new(RenderMode::Raw);
+        renderer.mode = mode;
+        renderer.skin = match mode {
+            RenderMode::Termimad => thinking_skin().clone(),
+            _ => MadSkin::default(),
+        };
+        // Row one rides behind the label and later rows behind the indent, so budgeting for the
+        // wider of the two makes every row fit: `12 + (width - 12)` and `2 + (width - 12)`.
+        renderer.width = Some(output_width().saturating_sub(display_width(THINKING_PREFIX)));
+        renderer.sink = Sink::Stderr;
+        renderer.lead = Some((
+            Lead {
+                opening: THINKING_PREFIX,
+                continuation: TOOL_PARAM_INDENT,
+                colour: Color::DarkGrey,
+            },
+            Owes::Opening,
+        ));
+        renderer.highlight_code = false;
+        renderer
     }
 
     /// Pin the render width instead of reading the terminal's. Test-only: production always wants
@@ -325,13 +537,125 @@ impl StreamingRenderer {
         self
     }
 
-    pub fn push_delta(&mut self, delta: &str) -> io::Result<()> {
-        // Short-circuit before any buffering; Silent shouldn't even accumulate state since
-        // `finish` will discard it anyway.
-        if matches!(self.mode, RenderMode::Silent) {
+    /// Collect output instead of writing it, and pin the width the terminal would have given.
+    #[cfg(test)]
+    fn capturing(mut self, width: usize) -> Self {
+        self.capture = Some(String::new());
+        self.width = Some(width);
+        self
+    }
+
+    /// Everything written so far.
+    #[cfg(test)]
+    fn captured(&self) -> &str {
+        self.capture.as_deref().unwrap_or_default()
+    }
+
+    /// Write through the sink, wearing the lead when there is one.
+    ///
+    /// **Blank rows** are held back, never the newline that ends a row of text. A markdown chunk
+    /// cut at a paragraph break carries that break as a trailing blank line, which separates it
+    /// from the *next* chunk -- and when no next chunk comes, it is a blank row at the end of
+    /// the block. Separating one block from the next belongs to [`crate::console`], which adds
+    /// its own, so a block ending in one is a doubled gap. Holding them means the question "is
+    /// anything following this?" is answered by what happens next instead of guessed at when it
+    /// cannot be known.
+    ///
+    /// The terminator of an open row goes out immediately, which is what keeps `crate::console`'s
+    /// [`crate::console::RowState`] honest: it tracks who has parked the cursor mid-row, and a
+    /// renderer holding a terminator back would be a third such writer that the state machine does
+    /// not model. A mid-turn `tracing` line would then be appended to the model's last row instead
+    /// of settling it first, and a piped answer would end without a newline.
+    fn write(&mut self, text: &str) -> io::Result<()> {
+        if text.is_empty() {
             return Ok(());
         }
+        let (body, trailing) = split_held_newlines(text);
+        let mut pending = String::new();
+        if !body.is_empty() {
+            for _ in 0..std::mem::take(&mut self.held_blank_rows) {
+                pending.push('\n');
+            }
+            pending.push_str(&body);
+            self.row_open = true;
+        }
+        if trailing > 0 {
+            // Whether the first newline *terminates* a row or *is* a blank one depends on whether a
+            // row is open, not on whether this call wrote the content: the syntect path writes a
+            // highlighted line and its newline in two calls, so a terminator arrives with an empty
+            // body. Reading that as a blank row holds it, and the hold is dropped at close, ending
+            // the answer's last line without a newline on the stream a caller pipes.
+            if self.row_open {
+                pending.push('\n');
+                self.row_open = false;
+                self.held_blank_rows += trailing - 1;
+            } else {
+                self.held_blank_rows += trailing;
+            }
+        }
+        self.write_through(&pending)
+    }
 
+    /// Close the block: drop the blank rows held behind it, and end the row if one is still open.
+    fn settle_last_row(&mut self) -> io::Result<()> {
+        self.held_blank_rows = 0;
+        if !std::mem::take(&mut self.row_open) {
+            return Ok(());
+        }
+        self.write_through("\n")
+    }
+
+    /// The write itself, once what to write has been decided.
+    fn write_through(&mut self, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let text = match self.lead.as_mut() {
+            None => std::borrow::Cow::Borrowed(text),
+            Some((lead, owes)) => {
+                let (led, next) = lead.apply(text, *owes);
+                *owes = next;
+                std::borrow::Cow::Owned(led)
+            }
+        };
+        #[cfg(test)]
+        if let Some(capture) = self.capture.as_mut() {
+            capture.push_str(&text);
+            return Ok(());
+        }
+        self.sink.write(&text)
+    }
+
+    /// Write one line of *plain* text, wrapped to the budget when there is one.
+    ///
+    /// Every line-oriented write goes through here rather than through [`Self::write`] directly,
+    /// because the budget is the only thing keeping a row inside the terminal -- and a row wider
+    /// than the terminal is wrapped by the terminal instead, which puts the continuation at column
+    /// zero with no indent in front of it. A table row and a code fence reach the terminal by
+    /// different routes than a paragraph does, so one definition is what leaves no sibling to
+    /// forget the bound.
+    ///
+    /// Only for text meka has not already laid out. termimad's rows arrive wrapped and carrying
+    /// escapes, and go through [`Self::write`] unmeasured.
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        let Some(width) = self.width else {
+            return self.write(&format!("{}\n", line));
+        };
+        // No ceiling on rows: `show_content = true` is a request to see the whole block, and the
+        // answer this shares a renderer with has never had one either.
+        for row in wrap_to_width(line, width, usize::MAX) {
+            self.write(&format!("{}\n", row))?;
+        }
+        Ok(())
+    }
+
+    /// Syntax-highlight markdown prose and write it. The caller owns any surrounding newlines.
+    fn write_highlighted(&mut self, text: &str) -> io::Result<()> {
+        let highlighted = highlight_markdown_to_string(text);
+        self.write(&highlighted)
+    }
+
+    pub fn push_delta(&mut self, delta: &str) -> io::Result<()> {
         // Streamed assistant text is the largest model-controlled surface meka prints, and it was
         // the only one arriving unfiltered: the tool indicator, thinking block, todo list and
         // approval prompt all sanitise, and each has a regression test for the forgery it prevents.
@@ -342,6 +666,20 @@ impl StreamingRenderer {
         // covers every render mode and every caller, rather than at each of the three mode
         // arms below.
         let sanitized = sanitize_stream_text(delta);
+        // A tab is the one character [`sanitize_stream_text`] keeps that meka cannot measure: a
+        // terminal advances it to the next tab stop, so a row holding one is wider than every width
+        // bound here believes. That is only cosmetic for the answer, which owns its stream, and is
+        // not for a block wearing a [`Lead`] -- an under-measured row is wrapped by the terminal
+        // instead, and the continuation lands at column zero with no indent in front of it.
+        //
+        // Expanded rather than dropped, and to `TAB_WIDTH` rather than to one space, because that
+        // is what CommonMark does with it: a tab is a four-column tab stop, so an indented code
+        // block written with tabs is still one afterwards.
+        let sanitized = if self.lead.is_some() && sanitized.contains('\t') {
+            sanitized.replace('\t', &" ".repeat(TAB_WIDTH))
+        } else {
+            sanitized
+        };
         let delta = sanitized.as_str();
 
         let delta = if self.started {
@@ -361,14 +699,10 @@ impl StreamingRenderer {
             RenderMode::Syntect => self.flush_syntect(),
             RenderMode::Termimad => self.flush_termimad(),
             RenderMode::Raw => self.flush_raw(),
-            RenderMode::Silent => Ok(()),
         }
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
-        if matches!(self.mode, RenderMode::Silent) {
-            return Ok(());
-        }
         match self.mode {
             RenderMode::Syntect => {
                 {
@@ -393,11 +727,11 @@ impl StreamingRenderer {
                             needs_newline = false;
                         } else if line.is_empty() {
                             self.flush_syntect_table()?;
-                            write_stdout("\n")?;
+                            self.write("\n")?;
                             needs_newline = false;
                         } else {
                             self.flush_syntect_table()?;
-                            write_highlighted_markdown(line)?;
+                            self.write_highlighted(line)?;
                             needs_newline = true;
                         }
                     }
@@ -408,7 +742,7 @@ impl StreamingRenderer {
                     self.flush_syntect_code_block()?;
                     self.flush_syntect_table()?;
                     if needs_newline {
-                        write_stdout("\n")?;
+                        self.write("\n")?;
                     }
                 }
             }
@@ -420,7 +754,7 @@ impl StreamingRenderer {
                 let trimmed = remaining.trim_end_matches('\n');
                 let output = self.finish_termimad_output(trimmed);
                 if !output.is_empty() {
-                    write_stdout(&output)?;
+                    self.write(&output)?;
                 }
             }
             RenderMode::Raw => {
@@ -434,15 +768,14 @@ impl StreamingRenderer {
                         self.raw_table_lines.push(line.to_string());
                     } else {
                         self.flush_raw_table()?;
-                        write_stdout_line(line)?;
+                        self.write_line(line)?;
                     }
                 }
                 self.flush_raw_table()?;
             }
-            // Already short-circuited above; included for exhaustiveness.
-            RenderMode::Silent => {}
         }
-        io::stdout().flush()
+        self.settle_last_row()?;
+        self.sink.flush()
     }
 
     fn flush_syntect(&mut self) -> io::Result<()> {
@@ -477,9 +810,9 @@ impl StreamingRenderer {
             } else {
                 self.flush_syntect_table()?;
                 if line.is_empty() {
-                    write_stdout("\n")?;
+                    self.write("\n")?;
                 } else {
-                    write_highlighted_markdown(&format!("{}\n", line))?;
+                    self.write_highlighted(&format!("{}\n", line))?;
                 }
             }
         }
@@ -490,8 +823,8 @@ impl StreamingRenderer {
         if self.code_block_lines.is_empty() {
             return Ok(());
         }
-        let lines = std::mem::take(&mut self.code_block_lines);
-        write_stdout(render_code_block_to_string(&lines))
+        let block = self.take_code_block();
+        self.write(&block)
     }
 
     fn flush_syntect_table(&mut self) -> io::Result<()> {
@@ -502,8 +835,8 @@ impl StreamingRenderer {
         let lines = std::mem::take(&mut self.raw_table_lines);
         let formatted = format_table(&lines);
         let table_text = formatted.join("\n");
-        write_highlighted_markdown(&table_text)?;
-        write_stdout("\n")
+        self.write_highlighted(&table_text)?;
+        self.write("\n")
     }
 
     /// Render markdown prose through termimad.
@@ -516,11 +849,16 @@ impl StreamingRenderer {
         // on minimad's dialect matching what the model wrote.
         let document = markdown::MarkdownDoc::parse(markdown);
         let width = self.width.or_else(|| {
-            // Only wrap when there is a real terminal to wrap to. With stdout redirected,
+            // Only wrap when there is a real terminal to wrap to. With the stream redirected,
             // `termimad::terminal_size()` reports a 50-column fallback, and reflowing an answer to
             // 50 columns on its way into a file or another tool is narrower than anyone asked for.
             // `None` tells termimad not to reflow at all, which is what an unbounded sink wants.
-            std::io::IsTerminal::is_terminal(&std::io::stdout())
+            //
+            // Asked of the sink rather than of stdout: a block wearing a lead writes to stderr, and
+            // measuring the wrong stream is how a piped answer and a live indicator end up
+            // disagreeing about the width they share.
+            self.sink
+                .is_terminal()
                 .then(|| termimad::terminal_size().0 as usize)
         });
         format!(
@@ -540,7 +878,7 @@ impl StreamingRenderer {
     fn flush_termimad(&mut self) -> io::Result<()> {
         let output = self.take_termimad_output();
         if !output.is_empty() {
-            write_stdout(&output)?;
+            self.write(&output)?;
         }
         Ok(())
     }
@@ -712,6 +1050,22 @@ impl StreamingRenderer {
             return String::new();
         }
         let lines = std::mem::take(&mut self.code_block_lines);
+        if !self.highlight_code {
+            // The fence markers stay. They are what the model wrote, and a block that must be one
+            // colour has nothing else left to say "this part is code".
+            //
+            // Wrapped here rather than by the caller, because this returns a string that
+            // [`Self::write`] then emits unmeasured -- the route termimad's already-laid-out rows
+            // take. A code block is the one thing on that route meka has *not* laid out, and a
+            // minified line in one is how model text reaches the terminal wider than the row,
+            // to be wrapped by the terminal at column zero instead.
+            let width = self.width.unwrap_or(usize::MAX);
+            return lines
+                .iter()
+                .flat_map(|line| wrap_to_width(line, width, usize::MAX))
+                .map(|row| format!("{}\n", row))
+                .collect::<String>();
+        }
         render_code_block_to_string(&lines)
     }
 
@@ -726,7 +1080,7 @@ impl StreamingRenderer {
                 self.raw_table_lines.push(line);
             } else {
                 self.flush_raw_table()?;
-                write_stdout_line(&line)?;
+                self.write_line(&line)?;
             }
         }
         Ok(())
@@ -740,7 +1094,7 @@ impl StreamingRenderer {
         let lines = std::mem::take(&mut self.raw_table_lines);
         let formatted = format_table(&lines);
         for line in &formatted {
-            write_stdout_line(line)?;
+            self.write_line(line)?;
         }
         Ok(())
     }
@@ -942,10 +1296,34 @@ fn markdown_skin() -> &'static MadSkin {
     })
 }
 
-/// Syntax-highlight a chunk of markdown and write it to stdout with 24-bit ANSI color escapes. The
-/// caller is responsible for any surrounding newlines.
-fn write_highlighted_markdown(text: &str) -> io::Result<()> {
-    write_stdout(highlight_markdown_to_string(text))
+/// The skin for a block that must read as a footnote rather than as the answer.
+///
+/// Every element resolves to one colour, so emphasis survives only as an attribute: `**a header**`
+/// arrives as bold grey rather than as the theme's heading colour. The grey is how reasoning is
+/// told apart from the reply without reading it, which a block painted in [`markdown_skin`]'s
+/// palette loses.
+///
+/// Built from `MadSkin::default` rather than `default_dark`, because the only thing wanted from the
+/// base is its attributes (`Bold`, `Italic`, `CrossedOut`); every colour it ships is overwritten
+/// below. `MadSkin::set_fg` deliberately skips the code and table styles, so those are set by hand.
+fn thinking_skin() -> &'static MadSkin {
+    static THINKING_SKIN: OnceLock<MadSkin> = OnceLock::new();
+    THINKING_SKIN.get_or_init(|| {
+        let mut skin = MadSkin::default();
+        skin.set_fg(Color::DarkGrey);
+        skin.inline_code.set_fg(Color::DarkGrey);
+        skin.code_block.compound_style.set_fg(Color::DarkGrey);
+        skin.table.compound_style.set_fg(Color::DarkGrey);
+        // `MadSkin::default` gives both code styles a grey background. A background is a second
+        // colour by another name, and it fights any terminal not already using that shade.
+        skin.inline_code.object_style.background_color = None;
+        skin.code_block.compound_style.object_style.background_color = None;
+        for header in &mut skin.headers {
+            // Same reason as `markdown_skin`: a centred heading mid-transcript reads as a glitch.
+            header.align = Alignment::Left;
+        }
+        skin
+    })
 }
 
 /// Returns the ANSI-escaped highlighted text without writing to stdout. Exposed for testing.
@@ -2795,14 +3173,14 @@ pub fn render_message_history(
                 ContentBlock::Thinking { thinking, .. } => {
                     if opts.show_thinking && !thinking.trim().is_empty() {
                         separate(spacing.before_thinking(), &mut pending_leading_blank);
-                        render_thinking_block(thinking, true);
+                        render_thinking_block(thinking, opts.render_mode);
                         emitted_any = true;
                     }
                 }
                 ContentBlock::RedactedThinking { .. } => {
                     if opts.show_thinking {
                         separate(spacing.before_thinking(), &mut pending_leading_blank);
-                        render_thinking_block("[redacted thinking]", true);
+                        render_thinking_block(REDACTED_THINKING, opts.render_mode);
                         emitted_any = true;
                     }
                 }
@@ -2965,21 +3343,24 @@ fn write_own_line_prelude(out: &mut impl std::io::Write) -> std::io::Result<()> 
     out.flush()
 }
 
-/// Rows one line of a fully-shown thinking block may wrap to before it is cut.
-///
-/// A bound rather than a promise of completeness: reasoning carrying a minified blob would
-/// otherwise spend a screen on one line.
-const THINKING_MAX_ROWS_PER_LINE: usize = 20;
-
-/// Rows a whole fully-shown thinking block may occupy.
-///
-/// A per-line ceiling is not enough on its own: one line may wrap to twenty rows, so two thousand
-/// lines of reasoning fill forty thousand rows of terminal. Generous, because `show_content = true`
-/// is a request to see the reasoning, and the cut keeps the end, where a conclusion lives.
-const THINKING_MAX_ROWS: usize = 400;
-
 /// Fixed chrome in `Thinking... <preview>`.
 const THINKING_PREFIX: &str = "Thinking... ";
+
+/// Characters of a block the preview reads in order to show one row of it.
+///
+/// Bounds the parse rather than the display. A block can run to tens of kilobytes and this shows a
+/// line of it, so the read stops somewhere; a span longer than this still prints its marker, which
+/// is no worse than showing the marker for every span. Counted in characters and not scaled to the
+/// terminal, because what it covers is the length of an emphasis span in prose, which has nothing
+/// to do with how wide the window is.
+const PREVIEW_LOOKAHEAD: usize = 1024;
+
+/// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta.
+///
+/// meka's own words rather than the model's, but rendered down the same path so there is one way a
+/// thinking block reaches the terminal. It survives CommonMark unchanged: a bracketed run is a
+/// shortcut reference link only when a matching definition exists, and none does.
+pub const REDACTED_THINKING: &str = "[redacted thinking]";
 
 /// Flatten `text` onto one line, stopping once there is more than `max_chars` to show.
 ///
@@ -2990,95 +3371,149 @@ const THINKING_PREFIX: &str = "Thinking... ";
 /// The early exit is what keeps this from copying a block that can run to tens of kilobytes in
 /// order to show one line of it.
 ///
-/// Deliberately counting *characters* while the real cut is by *column*: a character count is never
-/// greater than the column count of the same text, so stopping one character past the budget can
-/// never leave [`truncate_to_width`] short of material. Measuring columns here would mean widths
-/// per word for no gain.
-fn collapse_to_line(text: &str, max_chars: usize) -> String {
+/// Deliberately counting *characters* while the real cut is by *column*, which is cheap and almost
+/// always leaves [`truncate_to_width`] more material than it needs. Not always: a zero-width
+/// character counts one and measures none, so a run of them can spend the whole budget on nothing.
+/// That is why the cut is *reported* rather than inferred downstream -- the caller cannot tell a
+/// block that ended from one whose remainder measured zero.
+///
+/// Returns whether anything was left behind. Only this loop knows: what it stops short of is
+/// *source*, and the caller sees the source only after it has been rendered, which can be many
+/// times shorter -- a run of zero-width characters is one unbroken "word" that survives as nothing,
+/// an entity renders to a single glyph. A caller judging the cut by the rendered width alone
+/// therefore reports a whole block when it is showing the first few characters of one.
+fn collapse_to_line(text: &str, max_chars: usize) -> (String, bool) {
     let mut collapsed = String::new();
-    for word in text.split_whitespace() {
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
         if !collapsed.is_empty() {
             collapsed.push(' ');
         }
         collapsed.push_str(word);
         if collapsed.chars().count() > max_chars {
-            break;
+            return (collapsed, words.next().is_some());
         }
     }
-    collapsed
+    (collapsed, false)
 }
 
-/// Render a thinking block, in full or as a one-line preview.
+/// Render a whole thinking block that arrived at once: a replayed one, or a turn that streamed
+/// nothing.
+///
+/// Goes through the same [`StreamingRenderer::for_thinking`] the live path streams into, pushed as
+/// one delta, so replay and a live turn cannot render the same block differently. The shape mirrors
+/// [`render_assistant_text`], which does this for the answer.
+pub fn render_thinking_block(thinking: &str, render_mode: RenderMode) {
+    let mut renderer = StreamingRenderer::for_thinking(render_mode);
+    if let Err(error) = renderer.push_delta(thinking) {
+        report_lost_output("a thinking block did not reach the terminal", &error);
+    }
+    if let Err(error) = renderer.finish() {
+        report_lost_output("a thinking block did not reach the terminal", &error);
+    }
+}
+
+/// Render a thinking block as the one dimmed line shown under `show_content = false`.
 ///
 /// Reasoning is model output and gets the same escape-stripping as a tool argument. It is not
 /// merely defensive: a model that has read attacker-controlled text (a fetched page, a tool result)
-/// can be steered into emitting escapes. Streamed assistant text is sanitised for the same reason,
-/// in [`StreamingRenderer::push_delta`] -- passing through the markdown renderer is not a defence,
-/// since termimad writes a `Compound`'s bytes verbatim and syntect passes the source slice through.
-/// The preview sanitises after collapsing rather than before, so the early exit in
-/// [`collapse_to_line`] still bounds the work on a block that can run to tens of kilobytes;
-/// collapsing only concatenates, so nothing an escape could hide behind survives the later pass.
-pub fn render_thinking_block(thinking: &str, show_full: bool) {
-    write_stderr_line(format!(
-        "{}{}",
-        THINKING_PREFIX.with(Color::DarkGrey),
-        thinking_block_text(thinking, show_full, output_width()).with(Color::DarkGrey),
-    ));
+/// can be steered into emitting escapes. Sanitising after collapsing rather than before keeps the
+/// early exit in [`collapse_to_line`] bounding the work on a block that can run to tens of
+/// kilobytes; collapsing only concatenates, so nothing an escape could hide behind survives the
+/// later pass.
+pub fn render_thinking_preview(thinking: &str) {
+    let mut line = format!("{}", THINKING_PREFIX.with(Color::DarkGrey));
+    for run in thinking_preview_runs(thinking, output_width()) {
+        // One colour, emphasis by attribute, exactly as the full block is skinned. Applied per run
+        // rather than once around the line, because a run's attribute has to close with it.
+        let mut styled = run.text.with(Color::DarkGrey);
+        if run.bold {
+            styled = styled.bold();
+        }
+        if run.italic {
+            styled = styled.italic();
+        }
+        if run.strikeout {
+            styled = styled.crossed_out();
+        }
+        line.push_str(&format!("{}", styled));
+    }
+    write_stderr_line(line);
 }
 
-/// The text [`render_thinking_block`] prints, separated from the printing so both branches can be
-/// held to the escape-stripping the doc comment above promises.
-fn thinking_block_text(thinking: &str, show_full: bool, width: usize) -> String {
-    // Only the first line carries `Thinking... `; the rest carry the indent added below.
-    let first_line_budget = width.saturating_sub(display_width(THINKING_PREFIX));
-    let rest_budget = width.saturating_sub(display_width(TOOL_PARAM_INDENT));
-    if show_full {
-        // Sanitised per line, and every line but the first is indented.
-        //
-        // Stripping escapes is not enough on its own here. `Thinking... ` prefixes only the first
-        // line, so line two onward would sit at column zero in the same grey that
-        // `render_session_id` and `render_hint` use, and a model needs no trick at all to write a
-        // second line reading `Continuing session: <uuid>`. It renders byte-for-byte identically to
-        // the real thing. The indent is the same boundary the argument block relies on: meka's own
-        // chrome starts at column zero, so nothing quoted from the model may.
-        //
-        // Wrapped rather than cut. `show_content = true` means "print the block", and reasoning is
-        // prose whose end carries the conclusion, so truncating each line to the width would
-        // silently drop it. The argument block chose wrapping over cutting for the same reason.
-        let mut rows: Vec<String> = thinking
-            .lines()
-            .enumerate()
-            .flat_map(|(index, line)| {
-                let flattened = sanitize_to_line(line, usize::MAX);
-                let budget = if index == 0 {
-                    first_line_budget
-                } else {
-                    rest_budget
-                };
-                wrap_to_width(&flattened, budget, THINKING_MAX_ROWS_PER_LINE)
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(row, text)| {
-                        // Only the very first row rides behind `Thinking... `. Everything else,
-                        // including a continuation of the first line, is indented.
-                        if index == 0 && row == 0 {
-                            text
-                        } else {
-                            format!("{}{}", TOOL_PARAM_INDENT, text)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        cap_rows(&mut rows, THINKING_MAX_ROWS, TOOL_PARAM_INDENT, width);
-        rows.join("\n")
-    } else {
-        // No second truncation: `sanitize_to_line` ends in one, to the same budget.
-        sanitize_to_line(
-            &collapse_to_line(thinking, first_line_budget),
-            first_line_budget,
-        )
+/// The styled runs [`render_thinking_preview`] prints.
+///
+/// Truncated as plain text and only then re-styled, so a cut can never land inside an escape
+/// sequence. Doing it the other way round means measuring a string whose bytes are mostly not
+/// glyphs, and cutting one leaves the terminal holding half a sequence.
+fn thinking_preview_runs(thinking: &str, width: usize) -> Vec<markdown::OwnedCompound> {
+    // The row is the label plus the preview, so the preview gets what the label leaves. Same total
+    // as the tool indicator, which spends the whole width on one line too.
+    let budget = width.saturating_sub(display_width(THINKING_PREFIX));
+    // Collapsed well past what the row can show, because the cut is made on the markdown *source*
+    // and markdown does not survive being cut: a span whose closing `**` falls beyond the budget
+    // never closes, and its opener renders as the text this preview exists to stop showing. A fixed
+    // margin rather than the row's own width, so a span closing just past the edge still closes.
+    let (collapsed, dropped) = collapse_to_line(thinking, budget.saturating_add(PREVIEW_LOOKAHEAD));
+    let runs = markdown::inline_runs(&sanitize_to_line(&collapsed, usize::MAX));
+    let mut plain: String = runs.iter().map(|run| run.text.as_str()).collect();
+    // Two cuts can happen and either must be admitted: the collapse leaves source behind, and
+    // `truncate_to_width` leaves rendered text behind. Only the first can pass unnoticed, because
+    // source compresses -- two thousand zero-width characters are one "word" that renders to
+    // nothing, so a block cut to its first three letters comes back well inside the row and reads
+    // as the whole of it.
+    if dropped {
+        plain.push_str(TRUNCATION_MARKER);
     }
+    restyle(&truncate_to_width(&plain, budget), &runs)
+}
+
+/// The plain text [`thinking_preview_runs`] shows, for the tests that measure it and the ones that
+/// hold it to the escape-stripping [`render_thinking_preview`] promises.
+#[cfg(test)]
+fn thinking_preview_text(thinking: &str, width: usize) -> String {
+    thinking_preview_runs(thinking, width)
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect()
+}
+
+/// Carry `runs`' styling onto `plain`, which is their concatenation after a cut.
+///
+/// Anything past the end of the runs is the cut's own marker rather than the model's text, so it
+/// comes back unstyled: the ellipsis is meka saying there was more, not the model still speaking.
+fn restyle(plain: &str, runs: &[markdown::OwnedCompound]) -> Vec<markdown::OwnedCompound> {
+    let mut out: Vec<markdown::OwnedCompound> = Vec::new();
+    let mut rest = plain;
+    for run in runs {
+        if rest.is_empty() {
+            break;
+        }
+        // The shared prefix of this run and what is left. A cut lands on a character boundary, so
+        // this is a whole number of characters of the run.
+        let taken = rest
+            .char_indices()
+            .zip(run.text.char_indices())
+            .take_while(|((_, left), (_, right))| left == right)
+            .map(|((index, character), _)| index + character.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if taken == 0 {
+            break;
+        }
+        out.push(markdown::OwnedCompound {
+            text: rest[..taken].to_string(),
+            ..run.clone()
+        });
+        rest = &rest[taken..];
+    }
+    if !rest.is_empty() {
+        out.push(markdown::OwnedCompound {
+            text: rest.to_string(),
+            ..Default::default()
+        });
+    }
+    out
 }
 
 /// Render the todo list to stderr. Returns `true` if anything was printed, so the caller only
@@ -4274,7 +4709,10 @@ mod tests {
                 "Key facts:\nthe lock is held by the REPL\nso serve defers",
                 80
             ),
-            "Key facts: the lock is held by the REPL so serve defers"
+            (
+                "Key facts: the lock is held by the REPL so serve defers".to_string(),
+                false
+            )
         );
     }
 
@@ -4282,7 +4720,7 @@ mod tests {
     fn test_collapse_to_line_flattens_blank_lines_and_indentation() {
         assert_eq!(
             collapse_to_line("Plan:\n\n  1. read it\n\n  2. fix it\n", 80),
-            "Plan: 1. read it 2. fix it"
+            ("Plan: 1. read it 2. fix it".to_string(), false)
         );
     }
 
@@ -4290,8 +4728,12 @@ mod tests {
     /// able to tell "exactly full" from "there was more", so the ellipsis is not lost.
     #[test]
     fn test_collapse_to_line_stops_just_past_the_budget() {
-        let collapsed = collapse_to_line("alpha beta gamma delta", 10);
+        let (collapsed, dropped) = collapse_to_line("alpha beta gamma delta", 10);
         assert_eq!(collapsed, "alpha beta gamma");
+        assert!(
+            dropped,
+            "`delta` was left behind and the caller has to hear about it"
+        );
         assert_eq!(truncate_to_width(&collapsed, 10), "alpha b...");
     }
 
@@ -4301,13 +4743,82 @@ mod tests {
     #[test]
     fn test_collapse_to_line_does_not_consume_the_whole_block() {
         let huge = format!("header\n{}", "word ".repeat(100_000));
-        let collapsed = collapse_to_line(&huge, 80);
+        let (collapsed, dropped) = collapse_to_line(&huge, 80);
         assert!(collapsed.chars().count() <= 80 + "word".len() + 1);
+        assert!(dropped);
     }
 
     #[test]
     fn test_collapse_to_line_on_whitespace_only_thinking() {
-        assert_eq!(collapse_to_line("\n\n   \n", 80), "");
+        assert_eq!(collapse_to_line("\n\n   \n", 80), (String::new(), false));
+    }
+
+    /// The bytes a thinking block puts on the terminal, with the styling stripped back off.
+    ///
+    /// Rendered through the real path rather than reassembled from its pieces, because everything
+    /// asserted about a thinking block below -- that no row exceeds the width, that no row after
+    /// the first starts at column zero, that no escape survives -- is a property of what reaches
+    /// the stream and not of any one function on the way there.
+    fn thinking_rows(text: &str, mode: RenderMode, terminal_width: usize) -> String {
+        let budget = terminal_width.saturating_sub(super::display_width(super::THINKING_PREFIX));
+        let mut renderer = super::StreamingRenderer::for_thinking(mode).capturing(budget);
+        renderer
+            .push_delta(text)
+            .expect("a captured write cannot fail");
+        renderer.finish().expect("a captured write cannot fail");
+        super::CSI_PATTERN
+            .replace_all(renderer.captured(), "")
+            .to_string()
+    }
+
+    /// The lead applied across the chunk shapes a stream actually arrives in.
+    ///
+    /// A chunk boundary is not a row boundary, so what the next write owes has to survive between
+    /// calls. Getting it wrong drops model text at column zero, where meka's own chrome lives.
+    #[test]
+    fn test_a_lead_labels_the_first_row_and_indents_the_rest() {
+        let lead = super::Lead {
+            opening: "Thinking... ",
+            continuation: "  ",
+            colour: Color::DarkGrey,
+        };
+        let plain = |text: &str, owes| {
+            let (out, next) = lead.apply(text, owes);
+            (super::CSI_PATTERN.replace_all(&out, "").to_string(), next)
+        };
+
+        // Whole rows in one write.
+        assert_eq!(
+            plain("one\ntwo\n", super::Owes::Opening),
+            (
+                "Thinking... one\n  two\n".to_string(),
+                super::Owes::Continuation
+            )
+        );
+
+        // A chunk that stops mid-row owes nothing until the row ends, so the text resuming it is
+        // not indented a second time.
+        let (first, owes) = plain("one", super::Owes::Opening);
+        assert_eq!(
+            (first.as_str(), owes),
+            ("Thinking... one", super::Owes::Nothing)
+        );
+        assert_eq!(
+            plain(" and more\n", owes),
+            (" and more\n".to_string(), super::Owes::Continuation)
+        );
+
+        // A bare newline ends the row it was on and wears no indent of its own.
+        assert_eq!(
+            plain("\n", super::Owes::Nothing),
+            ("\n".to_string(), super::Owes::Continuation)
+        );
+
+        // A blank row neither spends the label nor leaves an indent behind on an empty line.
+        assert_eq!(
+            plain("\n\ntext", super::Owes::Opening),
+            ("\n\nThinking... text".to_string(), super::Owes::Nothing)
+        );
     }
 
     /// Reasoning is model output, and pulling words up across newlines carries text from below the
@@ -4316,33 +4827,357 @@ mod tests {
     #[test]
     fn test_a_thinking_preview_carries_no_escapes_from_below_the_first_line() {
         let reasoning = "Checking the file.\n\u{1b}[2J\u{1b}[1;1H[ask] Shell cat README (Y/n)";
-        let preview = super::thinking_block_text(reasoning, false, TEST_WIDTH);
+        let preview = super::thinking_preview_text(reasoning, TEST_WIDTH);
         assert!(!preview.contains('\u{1b}'), "{:?}", preview);
         assert!(preview.starts_with("Checking the file."), "{:?}", preview);
+    }
+
+    /// The preview is the line most people see, since `show_content` is off by default, and the
+    /// backends that emit a reasoning summary open every part with `**Bold header**`. The markers
+    /// become styling there too, not text.
+    #[test]
+    fn test_a_thinking_preview_styles_its_markers_rather_than_showing_them() {
+        let runs = super::thinking_preview_runs("**Planning research**\n\nThen check it.", 88);
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "Planning research Then check it."
+        );
+        assert!(
+            runs[0].bold,
+            "the header keeps its emphasis: {:?}",
+            runs[0].text
+        );
+        assert!(
+            runs.iter()
+                .filter(|run| run.bold)
+                .all(|run| run.text == "Planning research"),
+            "and nothing past it inherits the emphasis",
+        );
+    }
+
+    /// A preview whose *source* was cut says so, even when the rendered text fits the row easily.
+    ///
+    /// Source compresses, sometimes enormously, so "does the rendered text fit" is not the same
+    /// question as "was anything dropped". Each of these renders to a fraction of what it was cut
+    /// from, and each showed a few characters of a long block as though that were all of it.
+    #[test]
+    fn test_a_preview_says_so_when_the_source_was_cut_but_the_text_fits() {
+        for (name, reasoning, width) in [
+            // One unbroken "word" -- zero-width characters are not whitespace -- that survives
+            // sanitising as nothing at all.
+            (
+                "zero-width run",
+                format!("{}the actual reasoning", "\u{200b}".repeat(2000)),
+                80,
+            ),
+            // Thirty-three source characters per rendered glyph.
+            (
+                "entities",
+                format!(
+                    "{} and then the conclusion",
+                    "&CounterClockwiseContourIntegral; ".repeat(200)
+                ),
+                80,
+            ),
+            // A wide terminal, where the row itself outruns the lookahead.
+            (
+                "wide row",
+                format!("{}THE END", "**a** ".repeat(2000)),
+                2000,
+            ),
+        ] {
+            let shown = super::thinking_preview_text(&reasoning, width);
+            assert!(
+                shown.ends_with(super::TRUNCATION_MARKER),
+                "{name}: a cut block read as the whole of it: {:?}",
+                shown
+            );
+        }
+    }
+
+    /// The marker says exactly what happened: present when the row could not hold the block, and
+    /// absent when it could.
+    ///
+    /// Both halves matter, and the false-positive half is the one that slipped through. Markers
+    /// count toward the source's length and not the rendered text's, so budgeting the collapse at
+    /// the row's own width gave two different answers to "was anything dropped" -- and a block that
+    /// fit was labelled cut, which is a false statement about the model's output rather than a
+    /// missing one.
+    #[test]
+    fn test_a_preview_says_it_was_cut_exactly_when_it_was() {
+        let budget = 42 - super::display_width(super::THINKING_PREFIX);
+
+        let whole = super::thinking_preview_text("**abcdefghij** **klmnopqrst** uvwxy", 42);
+        assert_eq!(
+            whole, "abcdefghij klmnopqrst uvwxy",
+            "a block the row can hold must not claim a cut",
+        );
+
+        let cut = super::thinking_preview_text(
+            "**Planning the work** and then a great deal more text that follows on and on",
+            42,
+        );
+        assert!(
+            cut.ends_with(super::TRUNCATION_MARKER),
+            "the preview dropped the rest of the block silently: {:?}",
+            cut
+        );
+        assert!(super::display_width(&cut) <= budget, "{:?}", cut);
+    }
+
+    /// An emphasis span wider than the row still resolves to styling.
+    ///
+    /// The cut is made on the markdown source, and a span whose closing `**` falls past it never
+    /// closes -- pulldown-cmark then renders the opener as text, which is the marker this preview
+    /// exists to stop showing. Narrow widths are where it bites: `display.max_width = 40` leaves a
+    /// 28-column row, so an ordinary summary header outruns it.
+    #[test]
+    fn test_a_preview_styles_emphasis_that_outruns_the_row() {
+        let runs = super::thinking_preview_runs(
+            "**Weighing the trade-offs between two candidate approaches** then more.",
+            40,
+        );
+        let shown: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert!(!shown.contains("**"), "the span never closed: {:?}", shown);
+        assert!(
+            runs.first().is_some_and(|run| run.bold),
+            "and its emphasis reached the row: {:?}",
+            runs.first().map(|run| &run.text)
+        );
+    }
+
+    /// The cut is made on the plain text and the styling put back afterwards, so it can never land
+    /// inside an escape sequence. The marker the cut leaves is meka's own word for "there was
+    /// more", so it carries none of the model's styling out with it.
+    #[test]
+    fn test_a_truncated_thinking_preview_cuts_text_rather_than_escapes() {
+        // `bold` without the trailing space: `** ` is not a CommonMark closer, so a span built from
+        // `"bold ".repeat(n)` never closes and the assertion about the marker's styling below has
+        // no bold run to be about.
+        let reasoning = format!("**{}bold** and then some more prose", "bold ".repeat(20));
+        let runs = super::thinking_preview_runs(&reasoning, 40);
+        let shown: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert!(
+            super::display_width(&shown) <= 40 - super::display_width(super::THINKING_PREFIX),
+            "{:?}",
+            shown
+        );
+        assert!(shown.ends_with(super::TRUNCATION_MARKER), "{:?}", shown);
+        // Without this the assertion below is about a case the input cannot produce: an unclosed
+        // span yields no bold run, and a marker cannot inherit emphasis that was never there.
+        assert!(
+            runs.iter().any(|run| run.bold),
+            "the cut has to land inside a styled run for the marker's styling to be in question",
+        );
+        let marker = runs.last().expect("a run");
+        assert!(
+            marker.text.ends_with(super::TRUNCATION_MARKER) && !marker.bold,
+            "the marker wears the model's emphasis: {:?}",
+            marker.text
+        );
     }
 
     /// `show_content = true` prints the block whole, and replayed history always does, so that
     /// branch needs the same stripping. Keeping its line structure is the one difference.
     #[test]
     fn test_a_full_thinking_block_is_stripped_but_keeps_its_lines() {
-        let body = super::thinking_block_text("one\n\u{1b}[2Jtwo\nthree", true, TEST_WIDTH);
-        assert_eq!(body, "one\n  two\n  three");
+        let body = thinking_rows("one\n\u{1b}[2Jtwo\nthree", RenderMode::Raw, TEST_WIDTH);
+        assert_eq!(body, "Thinking... one\n  two\n  three\n");
     }
 
-    /// Stripping escapes is not the whole of it. `Thinking... ` prefixes only the first line, so an
-    /// unindented second line of reasoning lands at column zero in the same grey as
+    /// A paragraph break between two chunks survives, having been held across the gap.
+    ///
+    /// The blank row is written with the chunk *before* it and belongs to the one *after*, so it is
+    /// held until something follows -- and if it is only ever dropped, two paragraphs streamed a
+    /// chunk apart run together. Held and released are separate branches, and the tests that pin
+    /// the block's *end* only ever exercise the dropping one.
+    #[test]
+    fn test_a_paragraph_break_between_two_chunks_survives() {
+        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
+            renderer
+                .push_delta("para one.\n\n")
+                .expect("a captured write cannot fail");
+            renderer
+                .push_delta("para two.\n\n")
+                .expect("a captured write cannot fail");
+            renderer.finish().expect("a captured write cannot fail");
+            let shown = super::CSI_PATTERN
+                .replace_all(renderer.captured(), "")
+                .to_string();
+            assert_eq!(
+                shown, "para one.\n\npara two.\n",
+                "the break between two chunks was lost under {:?}",
+                mode
+            );
+        }
+    }
+
+    /// Reasoning is painted by the dim skin, not the answer's.
+    ///
+    /// Both render the same markdown, so every assertion about *structure* passes either way: what
+    /// separates them is that one resolves every element to one grey and the other to the theme's
+    /// colours. Nothing else here would notice the two being swapped.
+    #[test]
+    fn test_reasoning_is_painted_by_the_dim_skin() {
+        let mut renderer =
+            super::StreamingRenderer::for_thinking(RenderMode::Termimad).capturing(80);
+        renderer
+            .push_delta("**A header** and some prose.\n\n")
+            .expect("a captured write cannot fail");
+        renderer.finish().expect("a captured write cannot fail");
+        let raw = renderer.captured();
+        assert!(raw.contains("38;5;8"), "reasoning is not grey: {:?}", raw);
+        assert!(
+            raw.contains("\u{1b}[1m"),
+            "the header lost its emphasis: {:?}",
+            raw
+        );
+        // The answer's skin resolves elements against the syntect theme, which is 24-bit.
+        assert!(
+            !raw.contains("38;2;"),
+            "reasoning was painted with the answer's palette: {:?}",
+            raw
+        );
+    }
+
+    /// A completed row is terminated before the write returns, not held.
+    ///
+    /// `crate::console::RowState` tracks who has parked the cursor mid-row -- the thinking
+    /// indicator and the MCP progress line -- so that anything printing next settles that row
+    /// first. A renderer holding a row's terminator back is a third such writer the state machine
+    /// does not model, and it reports `Empty` throughout: a mid-turn `tracing` line would be
+    /// appended to the model's last row, and an MCP progress line's carriage return would overwrite
+    /// it. Only *blank* rows may be held, because whether they separate or trail is unknowable
+    /// until something follows.
+    ///
+    /// Asserted on the emitted bytes and nowhere else. The console's `RowState` and the renderer's
+    /// own bookkeeping are both *claims*; a test comparing the two agrees with itself while the
+    /// cursor sits mid-line, which is exactly the state this guards against.
+    #[test]
+    fn test_a_finished_row_is_terminated_before_the_write_returns() {
+        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
+            renderer
+                .push_delta("line one\n\nline two\n\n")
+                .expect("a captured write cannot fail");
+            // A fenced block left unterminated: its rows are highlighted one at a time, so the
+            // trailing blanks arrive with escapes between them. Reached by any answer cut off
+            // inside a fence -- a `max_tokens` stop, an interrupt.
+            let mut fence = super::StreamingRenderer::new(mode).capturing(80);
+            fence
+                .push_delta("```rust\nfn main() {}\n\n")
+                .expect("a captured write cannot fail");
+            fence.finish().expect("a captured write cannot fail");
+            let shown = super::CSI_PATTERN
+                .replace_all(fence.captured(), "")
+                .to_string();
+            assert!(
+                !shown.ends_with("\n\n"),
+                "an unterminated fence ended on a blank row under {:?}: {:?}",
+                mode,
+                shown
+            );
+
+            // Also after the block closes: the syntect path writes a highlighted line and its
+            // newline in two calls, so a terminator arriving with an empty body is the shape that
+            // was held as a blank row and then dropped, ending the answer without a newline.
+            let mut whole = super::StreamingRenderer::new(mode).capturing(80);
+            whole
+                .push_delta("the answer")
+                .expect("a captured write cannot fail");
+            whole.finish().expect("a captured write cannot fail");
+            assert!(
+                whole.captured().ends_with('\n'),
+                "the block ended without terminating its last row under {:?}: {:?}",
+                mode,
+                whole.captured()
+            );
+            assert!(
+                renderer.captured().ends_with('\n'),
+                "the cursor was left parked mid-row under {:?}: {:?}",
+                mode,
+                renderer.captured()
+            );
+            // And the blank rows behind it are still in question, so they have not gone out yet.
+            assert!(
+                !renderer.captured().ends_with("\n\n"),
+                "a trailing blank row escaped before anything followed it under {:?}: {:?}",
+                mode,
+                renderer.captured()
+            );
+        }
+    }
+
+    /// Separating one block from the next belongs to `crate::console`, so a renderer that ends its
+    /// own block with a blank row makes that gap twice as tall.
+    ///
+    /// Reachable from ordinary model output: a chunk cut at a paragraph break carries the break as
+    /// a trailing blank line, which is a separator from the next chunk right up until no next chunk
+    /// comes. Both streamed kinds go through the same writer, so both are pinned here.
+    #[test]
+    fn test_a_block_does_not_end_on_a_blank_row() {
+        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+            let thinking = thinking_rows("one\n\ntwo\n\n", mode, 80);
+            assert!(
+                thinking.ends_with("two\n"),
+                "thinking under {:?} ended on a blank row: {:?}",
+                mode,
+                thinking
+            );
+
+            let mut renderer = super::StreamingRenderer::new(mode).capturing(80);
+            renderer
+                .push_delta("one\n\ntwo\n\n")
+                .expect("a captured write cannot fail");
+            renderer.finish().expect("a captured write cannot fail");
+            let answer = super::CSI_PATTERN
+                .replace_all(renderer.captured(), "")
+                .to_string();
+            assert!(
+                answer.ends_with("two\n"),
+                "the answer under {:?} ended on a blank row: {:?}",
+                mode,
+                answer
+            );
+        }
+    }
+
+    /// A blank line inside a block is a blank row, not an indent nobody can see. The indent is
+    /// spent on rows that carry text, so a paragraph break leaves no trailing whitespace behind.
+    #[test]
+    fn test_a_blank_line_in_a_thinking_block_wears_no_indent() {
+        let body = thinking_rows("one\n\ntwo", RenderMode::Raw, TEST_WIDTH);
+        assert_eq!(body, "Thinking... one\n\n  two\n");
+    }
+
+    /// Stripping escapes is not the whole of it. `Thinking... ` prefixes only the first row, so an
+    /// unindented second row of reasoning lands at column zero in the same grey as
     /// `render_session_id` and reproduces it byte-for-byte, with no escape at all.
+    ///
+    /// Asserted in both modes: the indent is applied where bytes leave, so it must not depend on
+    /// which renderer produced them.
     #[test]
     fn test_a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
         let forged = "Let me check.\nContinuing session: 550e8400-e29b-41d4-a716-446655440000";
-        let body = super::thinking_block_text(forged, true, TEST_WIDTH);
         let chrome = "Continuing session: 550e8400-e29b-41d4-a716-446655440000";
-        assert!(
-            body.lines().skip(1).all(|line| line.starts_with("  ")),
-            "{:?}",
-            body
-        );
-        assert!(!body.lines().any(|line| line == chrome), "{:?}", body);
+        for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
+            let body = thinking_rows(forged, mode, TEST_WIDTH);
+            assert!(
+                body.lines()
+                    .skip(1)
+                    .all(|line| line.is_empty() || line.starts_with(super::TOOL_PARAM_INDENT)),
+                "{:?} under {:?}",
+                body,
+                mode
+            );
+            assert!(
+                !body.lines().any(|line| line == chrome),
+                "{:?} under {:?}",
+                body,
+                mode
+            );
+        }
     }
 
     /// `unicode_width` measures a soft hyphen as zero columns; a terminal following `wcwidth` draws
@@ -4357,15 +5192,15 @@ mod tests {
         }
     }
 
-    /// `sanitize_for_display` keeps `\r` by contract, so stripping escapes was not enough here: a
-    /// carriage return wipes the `Thinking... ` label and leaves grey text at column zero, which is
-    /// exactly the shape of `render_session_id` and `render_hint`.
+    /// A carriage return returns the cursor to column zero without ending the row, so a kept one
+    /// wipes the `Thinking... ` label and leaves grey text where `render_session_id` puts its own.
+    /// It needs no escape sequence at all, which is why [`sanitize_stream_text`] drops it.
     #[test]
     fn test_a_full_thinking_block_cannot_repaint_its_own_label() {
         let forged = "thought\rContinuing session: 4f1e0c2a-0000-4000-8000-deadbeefcafe";
-        let body = super::thinking_block_text(forged, true, TEST_WIDTH);
+        let body = thinking_rows(forged, RenderMode::Raw, TEST_WIDTH);
         assert!(!body.contains('\r'), "{:?}", body);
-        assert!(body.starts_with("thought "), "{:?}", body);
+        assert!(body.starts_with(super::THINKING_PREFIX), "{:?}", body);
     }
 
     /// Replayed history has no tool schemas, so it passes no summary. Showing a bare
@@ -4720,6 +5555,25 @@ mod tests {
             "\u{00ad}\u{200b}\u{202e}\u{feff}",
             "",
             "   ",
+            // A fenced block and a table reach the terminal by routes a paragraph does not: the
+            // fence is pulled out of termimad before it can lay it out, and table rows are padded
+            // to the widest cell. Both were unbounded while the paragraph path was not, which is
+            // the shape this corpus exists to catch and did not.
+            "prose\n\n```\nminified\u{20}line \
+             wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n```\n",
+            "| a | b |\n| --- | --- |\n| c | yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\
+             yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy |\n",
+            // An *indented* code block reaches termimad rather than being pulled out as a fence
+            // does, so it is laid out by a different path again -- and one that pads.
+            "prose\n\n    an indented code line long enough to outrun any terminal meka composes \
+             for, twice over at least\n",
+            // The shapes markdown reinterprets across lines, each of which changes what the row
+            // above it is: a setext underline, a rule, a quote, a nested and an ordered list.
+            "Setext heading\n===\n\nbody\n\n---\n\n> a quoted line that keeps going for a while\n\n\
+             1. ordered\n2. items\n   - nested\n     - deeper\n",
+            // Wide characters inside a padded cell: the pad is counted in columns, the content in
+            // clusters, and a table is where the two most easily disagree.
+            "| 漢字 | 😀😀 |\n| --- | --- |\n| 漢字漢字 | tail |\n",
         ];
         let long_key = "k".repeat(300);
         // Deep nesting and variation selectors are the two shapes that break the invariant while a
@@ -4814,21 +5668,42 @@ mod tests {
                 }
             }
             for text in nasty {
-                for show_full in [false, true] {
-                    let body = super::thinking_block_text(text, show_full, width);
-                    // The first line carries `Thinking... ` from the caller; the rest stand alone.
-                    for (index, line) in body.lines().enumerate() {
-                        let rendered = if index == 0 {
-                            super::display_width(super::THINKING_PREFIX)
-                                + super::display_width(line)
-                        } else {
-                            super::display_width(line)
-                        };
+                assert!(
+                    super::display_width(super::THINKING_PREFIX)
+                        + super::display_width(&super::thinking_preview_text(text, width))
+                        <= width,
+                    "thinking preview at width {}: {:?}",
+                    width,
+                    text
+                );
+                // Every row already carries its own label or indent, so each is measured whole.
+                //
+                // Measured trimmed, for one exception worth naming rather than leaving uncovered:
+                // termimad does not reflow a code block, it lays it out at its widest line and pads
+                // every row to match. On a terminal narrower than that block, the padding runs past
+                // the row. The *text* still wraps to the budget -- verified against an indented
+                // block whose content is a forged `Continuing session:` line, which comes back
+                // broken across rows at the indent -- so what overruns is whitespace, and what the
+                // boundary exists to stop cannot ride it out to column zero.
+                for mode in [RenderMode::Raw, RenderMode::Termimad] {
+                    for line in thinking_rows(text, mode, width).lines() {
+                        let printed = line.trim_end();
                         assert!(
-                            rendered <= width,
-                            "thinking at width {}: {} columns in {:?}",
+                            super::display_width(printed) <= width,
+                            "thinking at width {} under {:?}: {} columns in {:?}",
                             width,
-                            rendered,
+                            mode,
+                            super::display_width(printed),
+                            line
+                        );
+                        // Asked of the untrimmed row: both prefixes end in a space, which trimming
+                        // takes off a row that carries nothing else.
+                        assert!(
+                            printed.is_empty()
+                                || line.starts_with(super::THINKING_PREFIX)
+                                || line.starts_with(super::TOOL_PARAM_INDENT),
+                            "thinking row at column zero under {:?}: {:?}",
+                            mode,
                             line
                         );
                     }
@@ -5103,23 +5978,20 @@ mod tests {
         );
     }
 
-    /// A per-line ceiling is not enough on its own: one line may wrap to twenty rows, so two
-    /// thousand lines of reasoning fill forty thousand rows of terminal.
+    /// A block has no ceiling: `show_content = true` asks to see the reasoning, and the answer it
+    /// shares a renderer with has never had one either. Cutting silently is the failure mode that
+    /// matters, so this pins that the last line survives.
     #[test]
-    fn test_a_full_thinking_block_has_a_ceiling() {
+    fn test_a_full_thinking_block_keeps_everything_it_was_given() {
         let reasoning = (0..2000)
-            .map(|index| format!("reasoning line {} {}", index, "y".repeat(300)))
+            .map(|index| format!("reasoning line {}", index))
             .collect::<Vec<_>>()
             .join("\n");
-        let body = super::thinking_block_text(&reasoning, true, 80);
+        let body = thinking_rows(&reasoning, RenderMode::Raw, 80);
+        assert_eq!(body.lines().count(), 2000, "a row went missing");
         assert!(
-            body.lines().count() <= super::THINKING_MAX_ROWS,
-            "{} rows",
-            body.lines().count()
-        );
-        assert!(
-            body.lines().any(|line| line.contains("more rows")),
-            "the cut was silent"
+            body.ends_with("  reasoning line 1999\n"),
+            "the tail was cut"
         );
     }
 
@@ -6537,15 +7409,10 @@ mod tests {
     /// Whatever the mode and however the stream is chopped, a finished turn must leave nothing
     /// buffered: anything still held after `finish` is content that was never shown. This is the
     /// invariant the old `finish` broke, dropping a table when the last delta ended in a newline.
-    /// Runs every mode, including `Raw` and `Silent`, which share the same buffers.
+    /// Runs every mode: they share the same buffers.
     #[test]
     fn test_finish_leaves_nothing_buffered_in_any_mode() {
-        let modes = [
-            RenderMode::Syntect,
-            RenderMode::Termimad,
-            RenderMode::Raw,
-            RenderMode::Silent,
-        ];
+        let modes = [RenderMode::Syntect, RenderMode::Termimad, RenderMode::Raw];
         for document in STREAMING_CORPUS {
             for mode in modes {
                 for chunk in [1, 3, 17, usize::MAX] {
@@ -6756,6 +7623,10 @@ mod tests {
         // user who asks for a renderer meka doesn't have hears about it.
         assert!("bat".parse::<RenderMode>().is_err());
         assert!("nope".parse::<RenderMode>().is_err());
+        // `silent` gets its own line rather than being left to the two nonsense words above: a
+        // retired name is the one an existing config still holds, so reintroducing it would pass
+        // unnoticed where `bat` would not.
+        assert!("silent".parse::<RenderMode>().is_err());
     }
 
     /// The config tier rejects the same names the flag tier does. A `render_mode` that isn't a mode
@@ -6768,6 +7639,7 @@ mod tests {
             RenderMode::Syntect,
         );
         assert!(serde_json::from_str::<RenderMode>("\"bat\"").is_err());
+        assert!(serde_json::from_str::<RenderMode>("\"silent\"").is_err());
     }
 
     #[test]

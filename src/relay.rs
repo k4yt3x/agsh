@@ -175,7 +175,7 @@ impl RelayWriter {
     /// row is wiped by the next `Settle::Erase`. The warning was the whole point of the retry being
     /// visible, so losing it lost the only evidence the turn was struggling.
     ///
-    /// **`try_lock`, never `lock`.** [`Console`] logs: `text_delta`, `close_text` and the stdout
+    /// **`try_lock`, never `lock`.** [`Console`] logs: `text_delta`, `close_stream` and the stdout
     /// flush all report through `render::report_lost_output` on failure, so a thread already inside
     /// a console method can re-enter here, and a blocking acquire on a non-reentrant `Mutex` would
     /// deadlock the REPL -- a far worse outcome than the cosmetic bug being fixed. Failing to
@@ -273,7 +273,7 @@ mod tests {
 
     /// A console already locked by this thread is written past, not deadlocked on.
     ///
-    /// `Console::text_delta`, `close_text` and the stdout flush all report through
+    /// `Console::text_delta`, `close_stream` and the stdout flush all report through
     /// `render::report_lost_output` when their renderer fails, so a thread inside a console
     /// method reaches this writer while holding the very lock it wants. A blocking acquire
     /// would hang the REPL for good; the fallback is the raw stderr write that was the only

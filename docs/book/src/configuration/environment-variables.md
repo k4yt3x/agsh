@@ -16,7 +16,7 @@ These operational variables override config file values but are overridden by CL
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. Must be absolute; an empty or relative value is ignored with a warning rather than loading `./config.toml` from wherever meka happened to start. | `/tmp/meka-test/meka` |
 | `MEKA_DATA_DIR` | Override the default data directory (where `meka.db` lives). Same cross-platform escape hatch: `dirs::data_dir()` ignores `$XDG_DATA_HOME` on macOS/Windows. Useful for tests, portable installs, and per-project session isolation. Must be absolute, for the same reason as above and more sharply: `meka.db` holds every provider credential. | `/tmp/meka-test/data/meka` |
 | `MEKA_SANDBOX_BACKEND` | Override `[shell].sandbox_backend` (Linux only). Pinning a value also suppresses the "install Bubblewrap" auto-resolve warning. Used by the `mekabox` wrapper to pin Landlock in the container without editing the read-only host config. | `landlock`, `bubblewrap` |
-| `MEKA_RENDER_MODE` | Override `[display].render_mode`. Handy for CI / non-TTY runs that want plain or no output. | `syntect`, `termimad` (default), `raw`, `silent` |
+| `MEKA_RENDER_MODE` | Override `[display].render_mode`. Handy for CI / non-TTY runs that want plain output. | `syntect`, `termimad` (default), `raw` |
 
 ## MCP Variables
 

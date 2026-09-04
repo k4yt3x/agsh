@@ -327,6 +327,50 @@ fn spend_pending(next: &mut State, spacing: Spacing) -> bool {
     next.opened_against == Neighbour::Prompt && spacing.newline_after_prompt
 }
 
+/// A streamed block in progress, and which kind it is.
+///
+/// The kind is what decides whether an arriving delta continues this block or ends it, and whether
+/// closing it owes stdout a flush.
+struct OpenStream {
+    kind: StreamKind,
+    renderer: StreamingRenderer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// The answer, on stdout.
+    Text,
+    /// Reasoning, on stderr, behind `Thinking... `.
+    Thinking,
+}
+
+/// What a failed write of `kind` lost, for the report.
+///
+/// Named per kind rather than once, because the two are not the same loss: an answer that did not
+/// arrive is what a scripted host fails on, and reasoning that did not is chrome. The `Thinking`
+/// arm is unreachable while its sink hands nothing back, and is named anyway so the message cannot
+/// drift from the stream it describes.
+fn lost_output_of(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Text => "an answer did not reach stdout",
+        StreamKind::Thinking => "a thinking block did not reach the terminal",
+    }
+}
+
+/// Whether a thinking indicator may be drawn over what the console is already showing.
+///
+/// Split from the drawing for the same reason [`step`] is: with a terminal in the way, a wrong
+/// answer here is only visible by running one and looking at it.
+///
+/// The block's own text is a better progress signal than a running count of it, and the two cannot
+/// share the row: drawing the indicator closes the streamed block to make room, so a later estimate
+/// cuts the block in half and labels the remainder as a new one. The Claude providers send an
+/// estimate and a text delta from a single wire event whenever the token-count beta meets visible
+/// thinking, which makes that one cut per delta.
+fn indicator_may_draw(open: Option<StreamKind>) -> bool {
+    !matches!(open, Some(StreamKind::Thinking))
+}
+
 /// The single writer for everything that appears between two prompts.
 ///
 /// Shared by the blocking REPL thread and the agent's frontend task, which also gives the two
@@ -335,11 +379,16 @@ pub struct Console {
     state: State,
     spacing: Spacing,
     render_mode: RenderMode,
-    /// Open across consecutive text deltas; closed by any other block, and by the end of the
-    /// episode. Episode-bounded rather than turn-bounded so a turn that dies mid-paragraph still
-    /// shows what it streamed, in its own episode, instead of having it flushed under the next
-    /// prompt.
-    renderer: Option<StreamingRenderer>,
+    /// Open across consecutive deltas of one kind; closed by any other block, and by the end of
+    /// the episode. Episode-bounded rather than turn-bounded so a turn that dies mid-paragraph
+    /// still shows what it streamed, in its own episode, instead of having it flushed under
+    /// the next prompt.
+    ///
+    /// One slot, not one per kind. The two alternate but never overlap -- a provider streams one
+    /// block at a time -- so a second slot could only ever hold a block nothing had closed, and
+    /// the whole point of closing is that the renderer holds a trailing paragraph back until a
+    /// blank line settles it, which would then surface under whatever printed next.
+    stream: Option<OpenStream>,
     /// The first write failure stdout reported.
     ///
     /// Kept rather than discarded because a host that scripts its output has to be able to fail
@@ -354,7 +403,7 @@ impl Console {
             state: State::new(),
             spacing,
             render_mode,
-            renderer: None,
+            stream: None,
             lost_output: None,
         }
     }
@@ -405,7 +454,7 @@ impl Console {
 
     /// End the episode, immediately before the prompt below it is drawn.
     pub fn close_episode(&mut self, precedes: Neighbour) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::CloseEpisode(precedes));
     }
 
@@ -424,39 +473,39 @@ impl Console {
     }
 
     pub fn error(&mut self, error: &dyn std::fmt::Display) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_error(error);
     }
 
     pub fn hint(&mut self, message: &str) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_hint(message);
     }
 
     pub fn session_id(&mut self, label: &str, id: &str) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_session_id(label, id);
     }
 
     /// The heading above a block of command output. See [`render::render_heading`].
     pub fn heading(&mut self, heading: &str) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_heading(heading);
     }
 
     /// A stage direction about the output: `(interrupted)`. See [`render::render_annotation`].
     pub fn annotation(&mut self, note: &str) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_annotation(note);
     }
 
     pub fn line(&mut self, line: &str) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::write_stderr_line(line);
     }
@@ -464,7 +513,7 @@ impl Console {
     /// Print through a closure, for the callers whose painter takes arguments this module has no
     /// reason to model (`render_session_status`, `render_account_usage`, the help text).
     pub fn chrome(&mut self, paint: impl FnOnce()) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         paint();
     }
@@ -476,15 +525,16 @@ impl Console {
         display_summary: Option<&str>,
         params: ToolParams,
     ) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::ToolIndicator(params)));
         render::render_tool_indicator(name, input, display_summary, params);
     }
 
-    pub fn thinking_block(&mut self, content: &str, show_full: bool) {
-        self.close_text();
+    /// The one dimmed line shown for a thinking block under `show_content = false`.
+    pub fn thinking_preview(&mut self, content: &str) {
+        self.close_stream();
         self.act(Action::Block(BlockKind::Thinking));
-        render::render_thinking_block(content, show_full);
+        render::render_thinking_preview(content);
     }
 
     /// An empty list prints nothing and must not claim the trailing blank line that
@@ -494,13 +544,13 @@ impl Console {
         if items.is_empty() {
             return;
         }
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::TodoList));
         render::render_todo_list(title, items);
     }
 
     pub fn token_usage(&mut self, usage: &crate::provider::TokenUsage) {
-        self.close_text();
+        self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_token_usage(usage);
     }
@@ -534,6 +584,9 @@ impl Console {
     /// the line it eventually commits to sits apart from what preceded it. Redraws overwrite their
     /// own row and ask for nothing.
     pub fn thinking_indicator(&mut self, opening: bool, estimate: Option<u64>) -> bool {
+        if !indicator_may_draw(self.open_stream_kind()) {
+            return false;
+        }
         if !render::live_indicator_supported() {
             return false;
         }
@@ -541,7 +594,7 @@ impl Console {
             // The indicator draws from column zero, so an open text run would have its last line
             // overwritten -- and since the indicator is kept rather than erased, that damage would
             // stay on screen.
-            self.close_text();
+            self.close_stream();
             self.act(Action::Block(BlockKind::Thinking));
         }
         self.act(Action::OpenTransient);
@@ -563,11 +616,23 @@ impl Console {
         self.act(Action::EraseTransient);
     }
 
+    /// Which kind of block is streaming, if one is.
+    fn open_stream_kind(&self) -> Option<StreamKind> {
+        self.stream.as_ref().map(|open| open.kind)
+    }
+
     /// Whether a text block is still open, for the frontend's tests: a run left open past the end
     /// of its episode is what flushes a failed turn's tail under the next prompt.
     #[cfg(test)]
     pub fn has_open_text(&self) -> bool {
-        self.renderer.is_some()
+        self.open_stream_kind() == Some(StreamKind::Text)
+    }
+
+    /// The same question for reasoning. Separate rather than one predicate over both, because the
+    /// property under test is that the two never overlap.
+    #[cfg(test)]
+    pub fn has_open_thinking(&self) -> bool {
+        self.open_stream_kind() == Some(StreamKind::Thinking)
     }
 
     /// Whether this episode has printed anything, for [`crate::relay`]'s tests.
@@ -597,26 +662,67 @@ impl Console {
     }
 
     pub fn text_delta(&mut self, text: &str) {
-        if self.renderer.is_none() {
-            self.act(Action::Block(BlockKind::Text));
-            self.renderer = Some(StreamingRenderer::new(self.render_mode));
+        self.stream_delta(StreamKind::Text, text);
+    }
+
+    /// A chunk of reasoning, shown as it arrives under `show_content = true`.
+    pub fn thinking_delta(&mut self, text: &str) {
+        self.stream_delta(StreamKind::Thinking, text);
+    }
+
+    /// Append to the open block of `kind`, opening one and closing any block of the other kind
+    /// first.
+    fn stream_delta(&mut self, kind: StreamKind, text: &str) {
+        if self.stream.as_ref().is_some_and(|open| open.kind != kind) {
+            self.close_stream();
+        }
+        if self.stream.is_none() {
+            self.act(Action::Block(match kind {
+                StreamKind::Text => BlockKind::Text,
+                StreamKind::Thinking => BlockKind::Thinking,
+            }));
+            self.stream = Some(OpenStream {
+                kind,
+                renderer: match kind {
+                    StreamKind::Text => StreamingRenderer::new(self.render_mode),
+                    StreamKind::Thinking => StreamingRenderer::for_thinking(self.render_mode),
+                },
+            });
         }
         let failure = self
-            .renderer
+            .stream
             .as_mut()
-            .and_then(|renderer| renderer.push_delta(text).err());
+            .and_then(|open| open.renderer.push_delta(text).err());
         if let Some(error) = failure {
-            self.lost_output("an answer did not reach stdout", error);
+            self.lost_output(lost_output_of(kind), error);
         }
     }
 
-    /// Flush and drop any open text block, so block types don't interleave.
-    pub fn close_text(&mut self) {
-        let Some(mut renderer) = self.renderer.take() else {
+    /// Close a streamed *thinking* block, leaving an open answer alone.
+    ///
+    /// The thinking events fire on turns that stream no reasoning at all: a block completing with
+    /// nothing readable emits `ThinkingEnded`, which is the ordinary shape under sealed reasoning
+    /// and under Claude's `redact-thinking`. Closing indiscriminately there ends the *answer's*
+    /// run mid-paragraph, and the next delta opens a second one -- splitting one paragraph across
+    /// two on the stream a caller pipes.
+    pub fn close_thinking(&mut self) {
+        if self.open_stream_kind() == Some(StreamKind::Thinking) {
+            self.close_stream();
+        }
+    }
+
+    /// Flush and drop any open streamed block, so block types don't interleave.
+    pub fn close_stream(&mut self) {
+        let Some(mut open) = self.stream.take() else {
             return;
         };
-        if let Err(error) = renderer.finish() {
-            self.lost_output("an answer did not reach stdout", error);
+        if let Err(error) = open.renderer.finish() {
+            self.lost_output(lost_output_of(open.kind), error);
+        }
+        // Only the answer is owed this, and only the answer can report a failure: a thinking block
+        // writes to stderr, where a report would go down the stream that just refused it.
+        if open.kind != StreamKind::Text {
+            return;
         }
         // Redundant on every path `finish` completes, which ends in a flush of its own, and kept
         // for the one it does not: a write that failed part-way leaves `finish` returning early
@@ -1026,6 +1132,27 @@ mod tests {
         ]);
         assert!(!emits[2].separator_blank);
         assert!(!emits[3].separator_blank);
+    }
+
+    /// Claude sends an estimate and a text delta from one wire event once the token-count beta
+    /// meets visible thinking, so the two arrive alternately for the whole block. Redrawing the
+    /// counter over streamed reasoning closes the block to make room, and the next delta opens a
+    /// fresh one behind a second `Thinking... ` label -- once per delta, which shreds the block
+    /// into one labelled fragment per chunk.
+    #[test]
+    fn a_progress_estimate_never_draws_over_reasoning_already_on_screen() {
+        assert!(
+            indicator_may_draw(None),
+            "nothing is streaming, so the counter is the only signal there is",
+        );
+        assert!(
+            indicator_may_draw(Some(StreamKind::Text)),
+            "an answer streams to stdout; the indicator has its own row on stderr",
+        );
+        assert!(
+            !indicator_may_draw(Some(StreamKind::Thinking)),
+            "the block's own text is the progress, and drawing over it would close the block",
+        );
     }
 
     /// `printed` means "the episode did something", not "a blank was written", or turning the

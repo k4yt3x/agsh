@@ -172,6 +172,8 @@ Sessions persist server-side until explicitly deleted or evicted by the idle tim
 | `supports_reasoning_stream` | `false` | Include `thinking.delta` events in the SSE stream |
 | `supports_permission_prompts` | `true` | The client can answer a mid-turn `permission_required` event |
 
+Enabling `supports_reasoning_stream` costs a *streaming* turn its retry on a transient provider failure: the deltas have already reached you and a second attempt would repeat them, and reasoning is the first thing a turn produces. Blocking turns on the same session are unaffected, since they carry whole blocks rather than deltas.
+
 Set `supports_permission_prompts: false` if you stream but have no interface to show an approval
 prompt on, which is the normal case for a service-to-service client streaming for liveness. Gated
 tools are then denied immediately with an explanatory `notice`, the same as blocking mode. Leaving it
@@ -388,7 +390,9 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 | Event | Payload | When |
 |-------|---------|------|
 | `assistant_text.delta` | `text` | Each chunk of assistant text |
-| `thinking.delta` | `text` | Extended thinking content (only when `supports_reasoning_stream: true`) |
+| `thinking.delta` | `text` | A chunk of extended thinking content (only when `supports_reasoning_stream: true`) |
+
+Reasoning streams in chunks, one event per chunk, the way `assistant_text.delta` does; concatenate them to reassemble the block. A turn the provider answered without streaming sends the block as a single delta, so a client never has to tell the two apart. The blocking response (`stream: false`) still reports each block whole, in `thinking`.
 
 #### Tool execution
 

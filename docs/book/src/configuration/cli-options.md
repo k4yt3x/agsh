@@ -197,7 +197,7 @@ meka --no-stream
 
 ### `--render-mode <MODE>`
 
-Set the output render mode. Accepts `termimad` (default, or `rich`), `syntect`, `raw`, or `silent`.
+Set the output render mode. Accepts `termimad` (default, or `rich`), `syntect`, or `raw`.
 
 - `syntect`: Syntax-highlighted markdown source, including per-language code blocks. Nothing is reflowed, so a table with long cells runs past the terminal width.
 - `termimad`: Rendered markdown, reflowed to the terminal: paragraphs re-wrap, wide tables wrap inside their box, and markers are consumed rather than shown. meka parses the CommonMark itself, so `-`/`+` bullets, `__bold__`, `_italic_`, ordered lists, and links all render. Colours come from the same theme as `syntect`, and fenced code blocks are syntax-highlighted by it.

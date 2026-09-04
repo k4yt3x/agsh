@@ -461,7 +461,6 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 | `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
 | `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colours as `syntect`, and code blocks are highlighted by it. Alias: `rich` (default) |
 | `raw` | Raw markdown printed verbatim with aligned tables |
-| `silent` | No assistant output at all. For a run whose only product is its side effects |
 
 Default: `termimad`
 
@@ -917,7 +916,15 @@ Default: `16000`
 
 ### `thinking.show_content`
 
-Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. When `true`, the full block is printed under a dimmed header. Either way the block is still sent on subsequent turns, for reasoning continuity.
+Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. Emphasis on that line is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
+
+When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text, and the live `Thinking... (N tokens)` indicator retires as soon as the first words arrive, since the text is the better progress signal.
+
+Formatting follows [`display.render_mode`](#displayrender_mode), with one difference: reasoning is painted entirely in dark grey, so emphasis carries as bold or italic rather than as colour. That is what keeps a thinking block readable as a footnote rather than as the reply. Under `termimad` the markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; under `raw` and `syntect` the source is shown as written, which for reasoning means those two produce the same output. Fenced code keeps its fences and is not syntax-highlighted, for the same reason.
+
+Either way the block is still sent on subsequent turns, for reasoning continuity.
+
+One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. Under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
 
 Default: `false`
 
