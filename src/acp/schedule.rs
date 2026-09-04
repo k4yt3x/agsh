@@ -197,7 +197,7 @@ async fn deliver_outcomes(
     entry.frontend.push_out_of_band_prompt(&prompt);
 
     let cancellation = tokio_util::sync::CancellationToken::new();
-    entry.publish_cancellation(cancellation.clone());
+    let _turn_cancellation = entry.publish_cancellation(cancellation.clone());
 
     let mut session_uuid = Some(runtime.session_uuid);
     let runtime_inner = &mut *runtime;
@@ -274,7 +274,7 @@ async fn run_wakeup(state: Arc<super::ServerState>, wakeup: Wakeup) -> FireOutco
     // Publish the token the way the prompt handler does, so `session/cancel` from the editor stops
     // a scheduled turn. Under the lock, so a turn already running cannot have its token replaced.
     let cancellation = tokio_util::sync::CancellationToken::new();
-    entry.publish_cancellation(cancellation.clone());
+    let _turn_cancellation = entry.publish_cancellation(cancellation.clone());
 
     // A scheduled fire is a turn that is happening anyway, so an outcome that did not warrant one
     // of its own rides it, as it does on a `session/prompt` the editor sends. Without this a

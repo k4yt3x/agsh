@@ -4905,13 +4905,17 @@ fn acp_session_prompt_cancelled_after_provider_error() {
     );
 }
 
-/// `session/cancel` between turns is latched and applied to the next prompt. Without the
-/// latch, the cancel handler fires on the previous turn's already-dead token and the signal is
-/// lost.
+/// A `session/cancel` sent straight after a `session/prompt` stops that prompt.
+///
+/// The window `cancel_armed_through` exists for. `session/prompt` is spawned off the dispatch
+/// loop while `session/cancel` is handled on it, so the cancel can reach the session before the
+/// turn has published a token. Both interleavings must end the same way: whichever arrives first,
+/// the turn the editor asked to stop is the turn that stops.
 #[test]
-fn acp_session_cancel_between_turns_applied_to_next_prompt() {
-    // First turn: short response (completes immediately). Second turn: a sleep so the cancel can
-    // take effect.
+fn acp_a_cancel_sent_straight_after_a_prompt_stops_it() {
+    // First turn completes, so the second is dispatched with no turn running and nothing in the
+    // cell, which is the state the race needs. The sleep is long enough that the turn cannot
+    // finish on its own.
     let script = serde_json::json!([
         [
             { "kind": "text", "text": "first done" },
@@ -4927,23 +4931,209 @@ fn acp_session_cancel_between_turns_applied_to_next_prompt() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
     let sid = harness.new_session();
 
-    // Drive the first turn to completion.
     let id_1 = harness.prompt(&sid, "first");
     let response_1 = harness.await_response(id_1);
     assert_eq!(response_1["result"]["stopReason"], "end_turn");
 
-    // Cancel arrives before the second prompt. It must be latched.
-    harness.cancel(&sid);
-
-    // Second prompt: the latched cancel applies immediately, so the turn resolves Cancelled even
-    // before the Sleep finishes.
+    // Fired back to back with no wait between them, so the cancel is dispatched while the prompt
+    // is still on its way to its handler.
     let id_2 = harness.prompt(&sid, "second");
+    harness.cancel(&sid);
     let response_2 = harness.await_response(id_2);
     assert_eq!(
         response_2["result"]["stopReason"], "cancelled",
-        "between-turn cancel must be latched and applied to the next prompt: {}",
+        "a cancel racing its own prompt must still stop it: {}",
         response_2,
     );
+}
+
+/// Cancelling a turn that is actually running must not disarm the next one. The latch exists for
+/// the cancel no turn received; a cancel a live turn consumed has already done its work.
+#[test]
+fn acp_cancelling_a_running_turn_leaves_the_next_one_alone() {
+    // First turn sleeps so the cancel lands mid-flight. Second turn is short: it must run.
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "first starting..." },
+            { "kind": "sleep", "ms": 5000 },
+            { "kind": "text", "text": "first done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "second done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+
+    // Cancel only once the turn is provably streaming, so this tests the in-flight door rather
+    // than racing the between-turns one it is meant to be distinguished from.
+    let id_1 = harness.prompt(&sid, "first");
+    let barrier = Instant::now() + Duration::from_secs(3);
+    let started = read_until(&mut harness.reader, barrier, |line| {
+        line.contains("first starting...")
+    });
+    assert!(
+        started
+            .iter()
+            .any(|line| line.contains("first starting...")),
+        "first turn never began streaming",
+    );
+    harness.cancel(&sid);
+    let response_1 = harness.await_response(id_1);
+    assert_eq!(response_1["result"]["stopReason"], "cancelled");
+
+    let id_2 = harness.prompt(&sid, "second");
+    let response_2 = harness.await_response(id_2);
+    assert_eq!(
+        response_2["result"]["stopReason"], "end_turn",
+        "a cancel the previous turn consumed must not carry into the next prompt: {}",
+        response_2,
+    );
+}
+
+/// A cancel with no prompt on its way is spent on nothing, not saved for a later one.
+///
+/// The latch is for a prompt the editor has already sent, so a stop with nothing pending has
+/// nothing to stop. Cancelling twice is the way a user reaches this without meaning to: the second
+/// click lands after the turn resolved, and latching it kills whatever they type next.
+#[test]
+fn acp_a_cancel_with_nothing_pending_does_not_touch_a_later_prompt() {
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "first starting..." },
+            { "kind": "sleep", "ms": 5000 },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "second done" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+
+    let id_1 = harness.prompt(&sid, "first");
+    let barrier = Instant::now() + Duration::from_secs(3);
+    let started = read_until(&mut harness.reader, barrier, |line| {
+        line.contains("first starting...")
+    });
+    assert!(
+        started
+            .iter()
+            .any(|line| line.contains("first starting...")),
+        "first turn never began streaming",
+    );
+    harness.cancel(&sid);
+    assert_eq!(
+        harness.await_response(id_1)["result"]["stopReason"],
+        "cancelled"
+    );
+
+    // The second stop, now that the turn it would have interrupted is already resolved.
+    harness.cancel(&sid);
+    let next = harness.prompt(&sid, "second");
+    let response = harness.await_response(next);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "a stop with nothing to stop must not be saved for the next prompt: {}",
+        response,
+    );
+}
+
+/// A prompt refused before it runs still spends the cancel that was latched for it.
+///
+/// The latch belongs to one prompt. Left set, it is spent on the next prompt instead, which is the
+/// same defect one door along: the editor's stop kills a turn the user typed afterwards.
+#[test]
+fn acp_a_refused_prompt_spends_the_cancel_latched_for_it() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ran" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+
+    // Fired without waiting, then cancelled straight away, so the cancel is handled while this
+    // prompt is still on its way and is latched for it. The `audio` block is then refused during
+    // content validation, before the turn ever resolves a session or publishes a token.
+    let refused_id = harness.send_request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": sid,
+            "prompt": [{ "type": "audio", "data": "AAAA", "mimeType": "audio/wav" }],
+        }),
+    );
+    harness.cancel(&sid);
+    let refused = harness.await_response(refused_id);
+    assert!(
+        refused["error"].is_object(),
+        "an audio block must be refused: {}",
+        refused,
+    );
+
+    let next = harness.prompt(&sid, "after the refusal");
+    let response = harness.await_response(next);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "a refused prompt must not leave its cancel for the next one: {}",
+        response,
+    );
+}
+
+/// A cancel armed for a prompt that is then refused is not handed to a prompt sent after it.
+///
+/// A client that pipelines is the only way to reach this, but it is reachable: the refused prompt
+/// leaves the arming set, and the prompt behind it in the queue spends it. The sequence number is
+/// what separates them, so the second prompt must run even though the first never consumed its own
+/// cancel.
+///
+/// Repeated because one pass is not reliably the case under test. The arming only happens if the
+/// cancel is dequeued before the refused prompt's own turn reaches the check that refuses it, and
+/// the two orderings are externally identical, so a single pass silently tests nothing about one
+/// time in ten. Measured at 45 of 50 with the fix reverted; over ten passes an escape needs every
+/// one of them to fall the same way.
+#[test]
+fn acp_a_refused_prompt_does_not_hand_its_cancel_to_the_next_one() {
+    let turn = serde_json::json!([
+        { "kind": "text", "text": "the queued prompt ran" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]);
+    const PASSES: usize = 10;
+    let script = serde_json::Value::Array(vec![turn; PASSES]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+
+    for pass in 0..PASSES {
+        // All three written back to back with no waiting, so the dispatch loop takes them in
+        // order: the refused prompt is counted, the cancel is armed through it, and only then is
+        // the queued prompt dispatched. Whitespace-only text is refused well after that, past an
+        // await.
+        let refused_id = harness.send_request(
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "   " }],
+            }),
+        );
+        harness.cancel(&sid);
+        let queued_id = harness.prompt(&sid, "queued behind the refusal");
+
+        let refused = harness.await_response(refused_id);
+        assert!(
+            refused["error"].is_object(),
+            "pass {}: a whitespace-only prompt must be refused: {}",
+            pass,
+            refused,
+        );
+        let queued = harness.await_response(queued_id);
+        assert_eq!(
+            queued["result"]["stopReason"], "end_turn",
+            "pass {}: a cancel armed before this prompt existed must not stop it: {}",
+            pass, queued,
+        );
+    }
 }
 
 /// `session/set_mode` no longer needs the runtime mutex. Mid-turn mode change takes effect
@@ -6301,6 +6491,80 @@ poll_interval = "200ms"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// `session/cancel` stops a turn a scheduled job started, not only one the editor prompted.
+///
+/// A scheduled turn publishes its token the same way, so the editor's stop button reaches it. That
+/// was asserted only by a comment: the whole path is driven by the poller, so no prompt response
+/// carries its stop reason and nothing here observed it. What proves it is the far side of the
+/// script's sleep never being reached.
+#[test]
+fn an_acp_scheduled_turn_stops_when_the_editor_cancels() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "job turn running" },
+        { "kind": "sleep", "ms": 5000 },
+        { "kind": "text", "text": "PAST_THE_CANCEL" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let config_toml = r#"
+[providers.mock]
+type = "anthropic-messages"
+model = "claude-sonnet-4-5"
+
+[schedule]
+poll_interval = "200ms"
+"#;
+    let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
+    let sid = harness.new_session();
+    {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let now = chrono::Utc::now();
+        // Due a minute ago, so the very next sweep fires it.
+        connection
+            .execute(
+                "INSERT INTO scheduled_jobs \
+                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec, gate_last_output, \
+                  gate_permission, created_at, last_fired_at, next_fire_at) \
+                 VALUES (?1, ?2, 'every', '3600s', 'PROBE_CANCEL_FIRE', NULL, NULL, NULL, NULL, \
+                         ?3, NULL, ?4)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    &sid,
+                    now.to_rfc3339(),
+                    (now - chrono::Duration::seconds(60)).to_rfc3339(),
+                ],
+            )
+            .expect("seed the due job");
+    }
+
+    // Cancel only once the job's turn is provably streaming, or the cancel lands between turns and
+    // the latch would carry it instead, which is a different path.
+    let barrier = Instant::now() + Duration::from_secs(20);
+    let started = read_until(&mut harness.reader, barrier, |line| {
+        line.contains("job turn running")
+    });
+    assert!(
+        started.iter().any(|line| line.contains("job turn running")),
+        "the scheduled job never started a turn",
+    );
+    harness.cancel(&sid);
+
+    // Past the script's sleep, so an uncancelled turn would have written its far side by now.
+    std::thread::sleep(Duration::from_secs(8));
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let reached: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 \
+             AND content LIKE '%PAST_THE_CANCEL%'",
+            rusqlite::params![&sid],
+            |row| row.get(0),
+        )
+        .expect("count messages");
+    assert_eq!(
+        reached, 0,
+        "session/cancel must stop a scheduled turn; it ran on to the end of its script",
+    );
 }
 
 /// The ACP poller delivers a completed outcome as a turn, exactly once.

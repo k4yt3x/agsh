@@ -218,10 +218,27 @@ pub struct AcpFrontend {
     /// they are added up. Entries are dropped when the call completes.
     live_output: std::sync::Mutex<std::collections::HashMap<String, LiveOutput>>,
     /// The same cell [`SessionEntry::cancellation`] holds, so a client round-trip started by this
-    /// frontend can be abandoned when `session/cancel` fires. Shared rather than copied: the
-    /// prompt handler rewrites the token at every turn start, and a frontend holding a stale
-    /// clone would race against a token nobody signals.
-    cancellation: Arc<std::sync::RwLock<CancellationToken>>,
+    /// frontend can be abandoned when `session/cancel` fires. Shared rather than copied: every
+    /// turn installs a token of its own, and a frontend holding a stale clone would race
+    /// against a token nobody signals.
+    cancellation: TurnCancellationCell,
+}
+
+/// The live turn's cancellation token, or `None` between turns.
+///
+/// `None` is what lets the cancel handler tell a turn that will act on a `session/cancel` from one
+/// that has already finished, which is the difference between cancelling this turn and cancelling
+/// the next one the user submits. Written only by [`SessionEntry::publish_cancellation`] and the
+/// guard it returns.
+type TurnCancellationCell = Arc<std::sync::RwLock<Option<CancellationToken>>>;
+
+/// Read the live token out of a cell, tolerating a poisoned lock the way every other reader here
+/// does: a panicking turn still has to be cancellable.
+fn live_cancellation(cell: &TurnCancellationCell) -> Option<CancellationToken> {
+    match cell.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 /// How a running command's output is shown to this client.
@@ -361,7 +378,7 @@ impl AcpFrontend {
         transport_dead: Arc<std::sync::atomic::AtomicBool>,
         context_tokens: Arc<std::sync::atomic::AtomicU64>,
         context_window: Arc<std::sync::atomic::AtomicU64>,
-        cancellation: Arc<std::sync::RwLock<CancellationToken>>,
+        cancellation: TurnCancellationCell,
     ) -> Self {
         Self {
             connection,
@@ -379,14 +396,19 @@ impl AcpFrontend {
     }
 
     /// The cell itself, so the owning [`SessionEntry`] shares it rather than minting a second one.
-    /// Both sides must see the token the prompt handler installs, or `session/cancel` signals one
-    /// cell while the frontend waits on another.
-    fn cancellation_cell(&self) -> Arc<std::sync::RwLock<CancellationToken>> {
+    /// Both sides must see the token a turn installs, or `session/cancel` signals one cell while
+    /// the frontend waits on another.
+    fn cancellation_cell(&self) -> TurnCancellationCell {
         Arc::clone(&self.cancellation)
     }
 
-    /// The current turn's cancellation token, cloned out of the cell the prompt handler rewrites at
-    /// each turn start.
+    /// The current turn's cancellation token, cloned out of the cell each turn publishes into for
+    /// its duration.
+    ///
+    /// A fresh token when no turn is live, which reads as "never cancelled" and so leaves the
+    /// round-trip waiting on the client alone. Callers reach this from inside a turn, so the case
+    /// is theoretical, but answering with a token some earlier turn had cancelled would abandon a
+    /// request that nobody asked to stop.
     fn current_cancellation(&self) -> CancellationToken {
         // A detached call's own token wins over the session's. See
         // `crate::frontend::scope_call_cancellation`: without this, cancelling any later turn
@@ -394,10 +416,7 @@ impl AcpFrontend {
         if let Some(call) = crate::frontend::current_call_cancellation() {
             return call;
         }
-        match self.cancellation.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        live_cancellation(&self.cancellation).unwrap_or_default()
     }
 
     /// Await a client round-trip, giving up if the turn is cancelled.
@@ -2161,18 +2180,84 @@ struct ServerState {
     vision: bool,
 }
 
+/// Clears the session's live-turn token when the turn ends, however it ends.
+///
+/// A turn returns from a dozen places, and the cell has to be emptied at every one of them or a
+/// later `session/cancel` finds the finished turn's token, fires it, and is never latched, so the
+/// signal is lost. Clearing on drop is what makes that structural rather than a line each exit has
+/// to remember.
+struct TurnCancellationGuard {
+    cell: TurnCancellationCell,
+}
+
+impl Drop for TurnCancellationGuard {
+    fn drop(&mut self) {
+        match self.cell.write() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
+        }
+    }
+}
+
+/// Holds a dispatched `session/prompt` in [`SessionEntry::prompts_pending`] until it publishes a
+/// token or gives up, so the count falls however the prompt ends.
+struct PendingPrompt {
+    /// This prompt's place in the session's dispatch order, which is what decides whether a given
+    /// cancel was meant for it. Starts at 1, so zero can mean "armed for nothing".
+    seq: usize,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    armed_through: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for PendingPrompt {
+    fn drop(&mut self) {
+        // The last prompt out clears an arming nobody is left to consume. A prompt refused for its
+        // content never reaches the token that would spend the cancel meant for it, and a later
+        // prompt is barred from spending it by its own sequence number, so without this it would
+        // sit set forever.
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.armed_through
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Per-session map entry. Most fields live outside `runtime` so the cancel / set_mode / close
 /// handlers can act without waiting for the long-held runtime mutex.
 #[derive(Clone)]
 struct SessionEntry {
     runtime: Arc<Mutex<SessionRuntime>>,
-    /// In-flight turn's cancellation token. Rewritten at turn start inside `runtime`'s lock;
-    /// cancel handler reads-and-clones it without touching `runtime`.
-    cancellation: Arc<std::sync::RwLock<CancellationToken>>,
-    /// Latch for cancels that arrive between turns. The prompt handler checks-and-clears it under
-    /// the runtime lock after installing the new token, so a between-turn cancel signal isn't
-    /// lost. See `acp_session_cancel_between_turns_applied_to_next_prompt`.
-    cancel_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// In-flight turn's cancellation token, `None` between turns. Rewritten at turn start inside
+    /// `runtime`'s lock; cancel handler reads-and-clones it without touching `runtime`.
+    cancellation: TurnCancellationCell,
+    /// A cancel that reached a prompt which had not yet published its token, recorded as the
+    /// dispatch order it was armed through so that prompt stops rather than running unwanted. Zero
+    /// when nothing is armed.
+    ///
+    /// A generation rather than a flag because the cancel belongs to the prompts already
+    /// dispatched when it arrived, and to no prompt sent afterwards. A bare flag cannot say that:
+    /// a prompt refused before it can spend the cancel leaves it set for whatever the user types
+    /// next.
+    ///
+    /// Armed only when `cancellation` holds `None` *and* `prompts_pending` is non-zero. Either
+    /// condition alone spends the cancel on a turn it was never meant for: a running turn consumes
+    /// its own cancel, and a cancel with nothing pending has nothing to stop. See
+    /// `acp_a_cancel_sent_straight_after_a_prompt_stops_it`,
+    /// `acp_cancelling_a_running_turn_leaves_the_next_one_alone`,
+    /// `acp_a_cancel_with_nothing_pending_does_not_touch_a_later_prompt`,
+    /// `acp_a_refused_prompt_spends_the_cancel_latched_for_it` and
+    /// `acp_a_refused_prompt_does_not_hand_its_cancel_to_the_next_one`.
+    cancel_armed_through: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many `session/prompt` requests have been dispatched but have yet to publish a token.
+    ///
+    /// The window `cancel_armed_through` exists for, counted rather than assumed. A
+    /// `session/prompt` is spawned off the dispatch loop while `session/cancel` is handled on it,
+    /// so a cancel sent straight after a prompt can beat that prompt to the cell; outside that
+    /// window an empty cell means there is nothing to stop.
+    prompts_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Dispenses [`PendingPrompt::seq`]. Monotonic per session, never reset, so a number cannot be
+    /// reused by a later prompt and mistaken for the one a cancel was armed for.
+    prompt_seq: Arc<std::sync::atomic::AtomicUsize>,
     /// Set once the session's `session_info_update` title has been emitted. The title is the first
     /// user message preview, stable after the first turn, so it is pushed exactly once (after that
     /// first turn, or at load/resume when history already carries it).
@@ -2200,12 +2285,38 @@ struct SessionEntry {
 
 impl SessionEntry {
     /// Install the cancellation token for a turn this session is about to run, so `session/cancel`
-    /// reaches it. Mirrors what the prompt handler does; a scheduled turn needs it for the same
-    /// reason, and without it the editor's stop button would do nothing.
-    fn publish_cancellation(&self, token: CancellationToken) {
+    /// reaches it. Every path that runs a turn needs this, prompted or scheduled, or the editor's
+    /// stop button does nothing.
+    ///
+    /// The returned guard clears the cell again, so hold it for exactly as long as the turn runs.
+    #[must_use = "dropping the guard immediately ends the turn's claim on session/cancel"]
+    fn publish_cancellation(&self, token: CancellationToken) -> TurnCancellationGuard {
         match self.cancellation.write() {
-            Ok(mut slot) => *slot = token,
-            Err(poisoned) => *poisoned.into_inner() = token,
+            Ok(mut slot) => *slot = Some(token),
+            Err(poisoned) => *poisoned.into_inner() = Some(token),
+        }
+        TurnCancellationGuard {
+            cell: Arc::clone(&self.cancellation),
+        }
+    }
+
+    /// Count a `session/prompt` from the moment it is dispatched until it publishes a token or
+    /// gives up, so `session/cancel` can tell a stop that belongs to a prompt already on its way
+    /// from one with nothing to stop.
+    ///
+    /// Called on the dispatch loop rather than inside the spawned turn: the cancel is handled on
+    /// that same loop, so a turn that counted itself would still be racing it.
+    #[must_use = "the count falls again as soon as the guard is dropped"]
+    fn prompt_dispatched(&self) -> PendingPrompt {
+        self.prompts_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PendingPrompt {
+            seq: self
+                .prompt_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1,
+            count: Arc::clone(&self.prompts_pending),
+            armed_through: Arc::clone(&self.cancel_armed_through),
         }
     }
 
@@ -2444,13 +2555,7 @@ async fn drain_acp_sessions(state: &ServerState) {
         let sessions = state.sessions.read().await;
         sessions
             .values()
-            .map(|entry| {
-                entry
-                    .cancellation
-                    .read()
-                    .map(|guard| guard.clone())
-                    .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
-            })
+            .filter_map(|entry| live_cancellation(&entry.cancellation))
             .collect()
     };
     for token in tokens {
@@ -2752,7 +2857,9 @@ pub async fn run_acp(
                     let entry = SessionEntry {
                         runtime: Arc::new(Mutex::new(runtime)),
                         cancellation,
-                        cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        cancel_armed_through: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        prompt_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        prompts_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         title_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         permission: permission.clone(),
                         frontend,
@@ -2790,10 +2897,20 @@ pub async fn run_acp(
             {
                 let state = Arc::clone(&state);
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
+                    // Counted before the spawn, so a `session/cancel` sent straight after this
+                    // prompt finds it pending. Both run on this dispatch loop, so the count is up
+                    // before the cancel can look, which is not true of anything the turn itself
+                    // does. `None` for an unknown session, which the turn refuses below anyway.
+                    let pending = {
+                        let sessions = state.sessions.read().await;
+                        sessions
+                            .get(req.session_id.0.as_ref())
+                            .map(|entry| entry.prompt_dispatched())
+                    };
                     let state_for_spawn = Arc::clone(&state);
-                    cx.spawn(
-                        async move { run_prompt_turn(state_for_spawn, req, responder).await },
-                    )?;
+                    cx.spawn(async move {
+                        run_prompt_turn(state_for_spawn, req, responder, pending).await
+                    })?;
                     Ok(())
                 }
             },
@@ -2892,25 +3009,38 @@ pub async fn run_acp(
                     // we never touch the per-session runtime mutex, which the prompt handler
                     // holds for the duration of the turn.
                     //
-                    // We also set `cancel_pending`: if the cancel arrives between turns (the cell
-                    // still holds a stale token from the previous turn, which is now a no-op), the
-                    // next prompt handler will check this flag right after installing its fresh
-                    // token and cancel it immediately. Without the latch, the cancel signal is
-                    // lost.
+                    // A live token takes the cancel and that is the end of it. An empty cell with a
+                    // prompt still on its way means the editor cancelled a `session/prompt` that
+                    // has not reached its handler yet, so latch the signal for that prompt to
+                    // apply to its own token. An empty cell with nothing pending has nothing to
+                    // stop, and latching there would arm the cancel against whatever the user
+                    // submitted next instead.
                     let entry = {
                         let sessions = state.sessions.read().await;
                         sessions.get(notif.session_id.0.as_ref()).cloned()
                     };
                     if let Some(entry) = entry {
-                        entry
-                            .cancel_pending
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        let token = entry
-                            .cancellation
-                            .read()
-                            .map(|guard| guard.clone())
-                            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-                        token.cancel();
+                        match live_cancellation(&entry.cancellation) {
+                            Some(token) => token.cancel(),
+                            None => {
+                                if entry
+                                    .prompts_pending
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                    > 0
+                                {
+                                    // Armed through the last prompt dispatched, which is what
+                                    // makes a prompt sent after this one ineligible. Where more
+                                    // than one is already on its way any of them may spend it and
+                                    // only one does, whichever reaches the runtime lock first;
+                                    // one stop stops one turn.
+                                    let dispatched =
+                                        entry.prompt_seq.load(std::sync::atomic::Ordering::SeqCst);
+                                    entry
+                                        .cancel_armed_through
+                                        .store(dispatched, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        }
                     }
                     Ok(())
                 }
@@ -2942,6 +3072,7 @@ async fn run_prompt_turn(
     state: Arc<ServerState>,
     req: PromptRequest,
     responder: agent_client_protocol::Responder<PromptResponse>,
+    pending: Option<PendingPrompt>,
 ) -> Result<(), agent_client_protocol::Error> {
     // This session's profile decides whether an image block is admissible, not the connection's:
     // the `image` prompt capability is answered at `initialize`, before any session exists, but
@@ -3069,27 +3200,40 @@ async fn run_prompt_turn(
     }
 
     // Install a fresh cancellation token inside the locked scope so the cancel handler (which reads
-    // the sibling cell) always sees the token for the turn currently using the runtime.
+    // the sibling cell) always sees the token for the turn currently using the runtime. The guard
+    // lives to the end of this function, which is the end of the turn.
     let cancellation = CancellationToken::new();
-    {
-        let mut guard = entry
-            .cancellation
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = cancellation.clone();
-    }
+    let _turn_cancellation = entry.publish_cancellation(cancellation.clone());
 
-    // Close the between-turns race: if a `session/cancel` arrived after the previous turn finished
-    // but before we installed this turn's token, the cancel handler set `cancel_pending` and fired
-    // the now-dead previous token. Apply the latched signal to the freshly installed token so the
-    // spec-mandated cancel isn't lost. `swap` provides the read-and-clear in one step; SeqCst pairs
-    // with the same ordering in the cancel handler.
-    if entry
-        .cancel_pending
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    // Close the race this prompt was dispatched into: a `session/cancel` that arrived before the
+    // token above existed found nothing to signal and armed a generation instead. Apply it to the
+    // freshly installed token so the spec-mandated cancel isn't lost, but only if this prompt was
+    // already dispatched when the cancel arrived. A cancel armed before that belongs to no prompt
+    // the user has sent yet, and spending it here stops a turn they typed afterwards.
+    //
+    // Read through the guard rather than through `entry`, so the generation and the sequence
+    // number compared against it are always the two the same session handed out. A session closed
+    // and reopened between this prompt's dispatch and its lookup above leaves a fresh entry whose
+    // dispenser has restarted, and the two numbers would then mean nothing to each other.
+    //
+    // Zero is below every sequence number, so "nothing armed" needs no separate test. Exactly one
+    // eligible prompt spends an arming, whichever reaches the lock first; the rest see the zero it
+    // leaves and run.
+    if let Some(prompt) = pending.as_ref()
+        && prompt
+            .armed_through
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= prompt.seq
     {
+        prompt
+            .armed_through
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         cancellation.cancel();
     }
+    // The cell carries the signal from here, so this prompt stops counting as one still on its way.
+    // Released at the handover rather than at the end of the turn, which is where the count stops
+    // describing anything: a cancel arriving later finds the token and needs no arming at all.
+    drop(pending);
 
     // Refresh the slash-command palette before the prompt body resolves. This uses the per-session
     // frontend so the notification routes to the right ACP connection.
@@ -3450,7 +3594,9 @@ async fn handle_load_session(
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
         cancellation,
-        cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_armed_through: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompt_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompts_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         title_sent,
         permission: permission.clone(),
         frontend,
@@ -3709,7 +3855,9 @@ async fn handle_resume_session(
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
         cancellation,
-        cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_armed_through: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompt_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompts_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         title_sent,
         permission: permission.clone(),
         frontend,
@@ -3930,7 +4078,9 @@ async fn handle_fork_session(
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
         cancellation,
-        cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_armed_through: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompt_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prompts_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         title_sent,
         permission: permission.clone(),
         frontend,
@@ -3967,12 +4117,9 @@ async fn handle_close_session(
     };
     // Fire cancel via the sibling cell; never blocks on the runtime mutex (which an in-flight
     // prompt may hold for the whole turn).
-    let token = entry
-        .cancellation
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-    token.cancel();
+    if let Some(token) = live_cancellation(&entry.cancellation) {
+        token.cancel();
+    }
     // Detach the session's tool registry from the MCP manager so tools/list_changed updates stop
     // targeting it.
     //
@@ -4317,7 +4464,7 @@ async fn build_session_runtime(
     let context_window = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Created here rather than beside the `SessionEntry` so the frontend and the entry share one
     // cell: the entry's cancel handler writes it, the frontend's client round-trips read it.
-    let cancellation = Arc::new(std::sync::RwLock::new(CancellationToken::new()));
+    let cancellation: TurnCancellationCell = Arc::new(std::sync::RwLock::new(None));
     let acp_frontend = Arc::new(AcpFrontend::new(
         connection,
         session_id,

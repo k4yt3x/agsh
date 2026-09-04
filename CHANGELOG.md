@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.1] - 2026-09-04
+
+### Fixed
+
+- Cancelling a turn in Zed or another ACP editor no longer cancels the next prompt you submit.
+- A stop in an ACP editor with nothing to stop is discarded, rather than cancelling a later prompt.
+
 ## [0.45.0] - 2026-09-04
 
 ### Added
@@ -1832,7 +1839,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.45.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.45.1...HEAD
+[0.45.1]: https://github.com/k4yt3x/meka/compare/0.45.0...0.45.1
 [0.45.0]: https://github.com/k4yt3x/meka/compare/0.44.4...0.45.0
 [0.44.4]: https://github.com/k4yt3x/meka/compare/0.44.3...0.44.4
 [0.44.3]: https://github.com/k4yt3x/meka/compare/0.44.2...0.44.3
